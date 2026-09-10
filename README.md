@@ -48,8 +48,13 @@ Useful flags: `--app`, `--groups` (which tool families to expose), `--all-tools`
 | After Effects | `@engine-room/after-effects-mcp` over `npx`, talking to the CEP panel on `127.0.0.1:7777` | Node / `npx` on PATH, and the panel installed (`setup_panel`, with AE closed) |
 | DaVinci Resolve | `davinci-resolve-mcp` from `~/davinci-resolve-mcp` | Resolve Studio, with *External scripting using* set to **Local** |
 
+Each tab carries its own system prompt — a briefing on that bridge's ids, units and
+conventions, because the local model knows the app in general but has never seen this
+bridge. It is what keeps After Effects colours in 0..1 and Resolve's track numbering
+off by the right one.
+
 Adding a third app is a registry entry in `studio_agent.py`, not a code change —
-`AGENTS.md` says what an entry has to supply.
+`AGENTS.md` says what an entry has to supply, the briefing included.
 
 ## Requirements
 
@@ -76,5 +81,5 @@ No `pip install` — the whole thing is standard library, deliberately.
 
 Run `python -m unittest discover -s tests` before and after a change. `AGENTS.md`
 documents several non-obvious constraints — a stdlib-only rule, two JSON/schema
-incompatibilities that fail loudly *and* quietly, two Tkinter traps, and a warm-up
-that looks removable and isn't.
+incompatibilities that fail loudly *and* quietly, two Tkinter traps, a warm-up that
+looks removable and isn't, and what each app's system prompt has to tell the model.

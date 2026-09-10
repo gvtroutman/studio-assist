@@ -57,6 +57,37 @@ Two things stay derived, never hand-maintained:
 - `probe` is a strategy *string* (`"port:7777"`, `"process:Resolve.exe"`) rather than a
   callable, so the registry stays data a test can walk.
 
+### What a `system_prompt` has to carry
+
+The model driving these apps is small and local. It knows After Effects and Resolve in
+general; it does not know *this bridge* at all. The prompt is where the bridge's own
+conventions live, so each app's covers, in this order:
+
+- **How the project is shaped** — the object graph, and what addresses each object.
+- **Units — the ones that fail silently.** AE is seconds, RGB 0..1, opacity 0..100,
+  scale in percent, origin top-left. Resolve is frames and timecode, `track_index` from
+  1, `item_index` from 0. A model left to guess these produces something that renders
+  happily and is wrong.
+- **How to make and change things** — the default each creating tool applies, and when
+  to override it.
+- **What to do when a tool cannot reach the app** — one path, and no retry loop.
+
+Two rules for editing them:
+
+**Check every fact against the bridge's tool schema, not against knowledge of the app.**
+The Resolve prompt used to say to start from `media_pool` action `list`. `media_pool`
+has no `list` action — clips come from `folder` `get_clips`. Nothing catches that at
+runtime except a failed call and a model that improvises around it.
+
+**Only name tools the app actually exposes.** `default_groups` is the working set;
+naming a tool outside it strands the instruction and the model answers by inventing a
+call. `tests/test_agent.py` walks each prompt for tool names and fails on one that is
+not exposed.
+
+Length is not a per-message cost. The prompt is the head of every request's prefix, so
+LM Studio caches it after the first call and the warm-up pays for it against the exact
+prefix a real message uses — once per tab, not once per question.
+
 ## Hard-won constraints — read before editing
 
 **Stdlib only.** No `openai`, no `mcp`, no `requests`, no pip step. This runs on a
@@ -139,9 +170,11 @@ them rather than guessing.
 
 - Tool groups keep the exposed tool count down; a 3B-active MoE gets sloppy shown
   everything at once. Each app's `default_groups` is its working set.
-- Identify AE layers by `id`, never `index` — an index shifts on every insert. Identify
-  Resolve clips by `clip_id`, or `track_type` + `track_index` + `item_index`. The system
-  prompts say so; keep them saying so.
+- Identify AE layers by `id`, never `index` — an index shifts on every insert. In
+  Resolve, media pool clips are `clip_id`; timeline clips are positional —
+  `track_type` + `track_index` + `item_index`, the first counting from 1 and the last
+  from 0. The system prompts say all of this; keep them saying it. A test asserts the
+  AE half.
 - **The Resolve prompt forbids `resolve_control` action `quit`.** The tool exists and
   works; closing the user's Resolve mid-session costs unsaved work. A test asserts the
   prohibition is still in the prompt.
