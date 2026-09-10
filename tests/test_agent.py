@@ -7,6 +7,7 @@ Anything needing a display skips itself when there isn't one.
 """
 
 import os
+import re
 import sys
 import unittest
 
@@ -197,6 +198,27 @@ class TestAppRegistry(unittest.TestCase):
         resolve = eng.APPS_BY_ID["resolve"]
         self.assertIn("quit", resolve.system_prompt)
         self.assertIn("NEVER", resolve.system_prompt)
+
+    def test_after_effects_is_told_to_identify_layers_by_id(self):
+        """An index shifts on every insert; the prompt has to keep saying so."""
+        ae = eng.APPS_BY_ID["after-effects"]
+        self.assertIn("`index`", ae.system_prompt)
+        self.assertIn("NEVER", ae.system_prompt)
+
+    def test_prompts_only_name_tools_the_app_exposes(self):
+        """
+        The prompts brief the model on real tools by name. Move one out of
+        default_groups and the prompt is left telling the model to call something
+        that is not in its tool list - which it answers by inventing a call. So:
+        anything a prompt names must be in that app's working set.
+        """
+        for app in eng.APPS:
+            everything = {t for names in app.groups.values() for t in names}
+            for tool in sorted(everything - app.tool_names()):
+                with self.subTest(app=app.id, tool=tool):
+                    self.assertIsNone(
+                        re.search(r"\b%s\b" % re.escape(tool), app.system_prompt),
+                        "prompt names %s, which default_groups does not expose" % tool)
 
     def test_unknown_app_names_the_alternatives(self):
         with self.assertRaises(KeyError) as ctx:
