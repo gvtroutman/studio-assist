@@ -15,7 +15,9 @@ Double-click **Studio Assistant** on the Desktop or in the Start Menu. No termin
 
 Pick the app you want to talk to from the tab strip. Each tab is a separate
 conversation with its own tools — After Effects never sees Resolve's history, and
-neither app's tools are offered to the other model turn. `Ctrl+Tab` cycles tabs.
+neither app's tools are offered to the other model turn. `Ctrl+Tab` cycles tabs,
+`+` opens one for another app and `×` closes one; whatever is open when you quit is
+what comes back next time.
 
 Bridges start **lazily**: a tab connects the first time you open it, then warms the
 model against that app's own tool schemas so your first question there comes back in
@@ -23,8 +25,22 @@ seconds rather than a minute. A session that only touches After Effects never sp
 Resolve's server. If the app itself isn't running, a **Start <app>** button appears in
 the header — one click launches it and waits.
 
-The left rail shows what's installed on this machine and what the agent can currently
-reach, with live status dots per app.
+The left rail shows what's installed on **this machine** — named, so you know which
+one — with each app's own icon and a live status dot for the ones the agent can
+drive. It's your list, not the machine's: **pin** the apps you work in to the top,
+**×** the ones you haven't set up out of the way, and **+** in the heading brings any
+of them back. Click a drivable app to open its tab.
+
+Underneath, **Connections** is two rows. *Inference* is the model host. *Bridges*
+opens a menu of every bridge that exists and what it can currently reach; pick one to
+see every tool it offers, grouped, and which of them this chat puts in front of the
+model.
+
+The menu bar carries the rest: **File** for chats and tabs, **View** to switch
+between dark and light, **Bridges** to jump straight to a tool list.
+**File ▸ Preferences** (`Ctrl+,`) opens the appearance switch and restores hidden
+apps. Preferences, pinned and hidden apps and open tabs are remembered in
+`%APPDATA%\StudioAssistant\settings.json`.
 
 ### From a terminal
 
@@ -72,6 +88,7 @@ No `pip install` — the whole thing is standard library, deliberately.
 |---|---|
 | `studio_chat.py` | The Tkinter GUI: tab strip, one `Session` per app |
 | `studio_agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
+| `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
 | `Studio Assistant.cmd` | Console-free launcher used by the shortcuts |
 | `make_icon.py` | Regenerates `studio-assistant.ico`, the shortcut and taskbar mark |
 | `tests/` | Offline tests — no network, no creative apps |

@@ -8,12 +8,16 @@ editing colours rather than by opening a paint program. Run it after a change:
 
     python make_icon.py
 
-Stdlib only - zlib for the PNG, struct for the ICO container.
+Stdlib only - struct for the ICO container, and studio_icons for the PNGs
+inside it (the same writer the sidebar's app marks come back through).
 """
 
+import os
 import struct
 import sys
-import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from studio_icons import png
 
 SQUARE = (0xD9, 0x77, 0x57)   # ACCENT, the same orange as the Send button
 MARK = (0x16, 0x15, 0x0F)     # the button's foreground, near-black
@@ -91,21 +95,6 @@ def render(size):
     return bytes(out)
 
 
-def png(pixels, size):
-    raw = b"".join(b"\x00" + pixels[y * size * 4:(y + 1) * size * 4]
-                   for y in range(size))
-
-    def chunk(tag, data):
-        body = tag + data
-        return (struct.pack(">I", len(data)) + body
-                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
-
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw, 9))
-            + chunk(b"IEND", b""))
-
-
 def ico(blobs):
     """blobs: [(size, png bytes)]. PNG-in-ICO is fine on Vista and later."""
     head = struct.pack("<HHH", 0, 1, len(blobs))
@@ -121,7 +110,7 @@ def ico(blobs):
 def main():
     blobs = []
     for size in SIZES:
-        blobs.append((size, png(render(size), size)))
+        blobs.append((size, png(render(size), size, size)))
         print("  %dx%d" % (size, size), flush=True)
     with open("studio-assistant.ico", "wb") as f:
         f.write(ico(blobs))

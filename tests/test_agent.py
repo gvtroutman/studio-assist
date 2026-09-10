@@ -6,14 +6,18 @@ Offline tests. No network, no creative apps, no model.
 Anything needing a display skips itself when there isn't one.
 """
 
+import json
 import os
 import re
+import struct
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import studio_agent as eng
+import studio_icons as icons
 
 
 class TestSchemaSanitizing(unittest.TestCase):
@@ -229,9 +233,17 @@ class TestAppRegistry(unittest.TestCase):
 class TestDetection(unittest.TestCase):
     def test_detect_apps_shape(self):
         for a in eng.detect_apps():
-            self.assertEqual({"code", "name", "version", "fg", "bg", "id", "drivable"},
-                             set(a))
+            self.assertEqual({"code", "name", "version", "fg", "bg", "id", "exe",
+                              "drivable"}, set(a))
             self.assertTrue(a["fg"].startswith("#"))
+
+    def test_exe_path_is_real_when_found(self):
+        """The sidebar reads each app's icon out of this file; a stale path
+        would silently fall back to the drawn badge and hide the breakage."""
+        for a in eng.detect_apps():
+            if a["exe"] is not None:
+                with self.subTest(app=a["name"]):
+                    self.assertTrue(os.path.isfile(a["exe"]), a["exe"])
 
     def test_drivable_is_derived_from_the_registry(self):
         self.assertEqual(eng.DRIVABLE, {a.name: a.id for a in eng.APPS})
@@ -245,6 +257,109 @@ class TestDetection(unittest.TestCase):
 
     def test_newest_match_returns_none_when_nothing_exists(self):
         self.assertIsNone(eng.newest_match([r"Z:\nothing\here\*.exe"]))
+
+
+class TestIcons(unittest.TestCase):
+    """
+    The sidebar shows each app's real icon, read out of its .exe. python.exe is
+    the one PE file every machine running these tests is guaranteed to have.
+    """
+
+    def test_reads_an_icon_out_of_a_real_exe(self):
+        data = icons.icon_png(sys.executable, 26)
+        self.assertTrue(data and data.startswith(icons.PNG_MAGIC))
+        self.assertEqual(struct.unpack(">II", data[16:24]), (26, 26))
+
+    def test_size_is_whatever_was_asked_for(self):
+        for size in (16, 20, 48):
+            data = icons.icon_png(sys.executable, size)
+            with self.subTest(size=size):
+                self.assertEqual(struct.unpack(">II", data[16:24]), (size, size))
+
+    def test_a_missing_icon_is_never_an_error(self):
+        """It is a fallback to the drawn badge, so nothing here may raise."""
+        self.assertIsNone(icons.icon_png(None))
+        self.assertIsNone(icons.icon_png(r"Z:\nothing\here.exe"))
+        self.assertIsNone(icons.icon_png(__file__))          # not a PE at all
+
+    def test_png_round_trip(self):
+        px = bytes([255, 0, 0, 255, 0, 255, 0, 128,
+                    0, 0, 255, 255, 9, 9, 9, 0])
+        back, w, h = icons.png_to_rgba(icons.png(px, 2, 2))
+        self.assertEqual((w, h), (2, 2))
+        self.assertEqual(back, px)
+
+    def test_resample_averages_rather_than_drops(self):
+        black_and_white = bytes([0, 0, 0, 255, 255, 255, 255, 255] * 2)
+        out = icons.resample(black_and_white, 2, 2, 1)
+        self.assertEqual(out[0], 127)      # not 0 and not 255
+        self.assertEqual(out[3], 255)
+
+    def test_group_entry_choice_prefers_a_small_source(self):
+        """256px entries are PNGs; inflating one for a 26px badge is waste."""
+        group = struct.pack("<HHH", 0, 1, 3) + b"".join(
+            struct.pack("<BBBBHHIH", w % 256, w % 256, 0, 0, 1, 32, 0, i)
+            for i, w in enumerate((256, 48, 16)))
+        self.assertEqual(icons.best_entry(group, 26)[0], 48)
+        self.assertEqual(icons.best_entry(group, 12)[0], 16)
+
+
+class TestPrefs(unittest.TestCase):
+    """Settings live outside the checkout; nothing here may reach the real one."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "settings.json")
+
+    def _prefs(self):
+        import studio_chat
+        return studio_chat.Prefs(self.path)
+
+    def test_round_trip(self):
+        p = self._prefs()
+        p.set(theme="light", tabs=["resolve"], pinned=["Photoshop"], hidden=["Acrobat"])
+        again = self._prefs()
+        self.assertEqual(again.get("theme"), "light")
+        self.assertEqual(again.get("tabs"), ["resolve"])
+        self.assertEqual(again.get("pinned"), ["Photoshop"])
+
+    def test_missing_file_is_the_default(self):
+        p = self._prefs()
+        self.assertEqual(p.get("theme"), "dark")
+        self.assertIsNone(p.get("tabs"))     # None means "every installed app"
+
+    def test_a_hand_wrecked_file_cannot_stop_the_window_opening(self):
+        for junk in ("{not json", json.dumps([1, 2, 3]),
+                     json.dumps({"theme": "chartreuse", "hidden": "nope",
+                                 "tabs": 7})):
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(junk)
+            with self.subTest(junk=junk[:20]):
+                p = self._prefs()
+                self.assertIn(p.get("theme"), ("dark", "light"))
+                self.assertEqual(p.get("hidden"), [])
+                self.assertIsNone(p.get("tabs"))
+
+    def test_an_unwritable_path_is_survivable(self):
+        import studio_chat
+        p = studio_chat.Prefs(os.path.join(self.dir, "settings.json", "no", "x.json"))
+        p.set(theme="light")                 # must not raise
+
+
+class TestThemes(unittest.TestCase):
+    def test_both_palettes_carry_every_role(self):
+        """A role missing from one palette is a KeyError mid theme switch."""
+        import studio_chat
+        self.assertEqual(set(studio_chat.DARK), set(studio_chat.LIGHT))
+        for palette in studio_chat.THEMES.values():
+            for role, value in palette.items():
+                with self.subTest(role=role):
+                    self.assertRegex(value, r"^#[0-9a-f]{6}$")
+
+    def test_named_themes_are_the_ones_on_offer(self):
+        import studio_chat
+        self.assertEqual([k for k, _label in studio_chat.THEME_NAMES],
+                         list(studio_chat.THEMES))
 
 
 class TestEnvDefaults(unittest.TestCase):
@@ -278,12 +393,18 @@ class TestGui(unittest.TestCase):
     def setUpClass(cls):
         import studio_chat
         cls.mod = studio_chat
+        # Settings are a real file under %APPDATA%; a test run must not touch
+        # the one the user's own window is reading.
+        cls.dir = tempfile.mkdtemp()
+        cls._real_settings = os.environ.get("STUDIO_SETTINGS")
+        os.environ["STUDIO_SETTINGS"] = os.path.join(cls.dir, "settings.json")
         # No npx, no Resolve venv, no network - and always every tab, so the
         # switching tests do not depend on what is installed on this machine.
         cls._real_installed = eng.installed_apps
         eng.installed_apps = lambda: list(eng.APPS)
         studio_chat.Chat._boot_host = lambda self: None
         studio_chat.Chat._ensure = lambda self, s: None
+        studio_chat.Chat._read_icons = lambda self: None
         cls.app = studio_chat.Chat()
         for _ in range(15):
             cls.app.update()
@@ -292,6 +413,17 @@ class TestGui(unittest.TestCase):
     def tearDownClass(cls):
         cls.app.destroy()
         eng.installed_apps = cls._real_installed
+        if cls._real_settings is None:
+            os.environ.pop("STUDIO_SETTINGS", None)
+        else:
+            os.environ["STUDIO_SETTINGS"] = cls._real_settings
+
+    def setUp(self):
+        """Every test starts from every tab open, looking at the first."""
+        for app in eng.APPS:
+            self.app._add_tab(app.id)      # a tab already open is just selected
+        self.app._select(eng.APPS[0].id)
+        self.app.update()
 
     def _bottom_of(self, widget):
         return (widget.winfo_rooty() - self.app.winfo_rooty()
@@ -318,11 +450,18 @@ class TestGui(unittest.TestCase):
             self.app.update()
         self.app.update_idletasks()
         win_h = self.app.winfo_height()
-        self.assertEqual(set(self.app.conn), {"host"} | set(self.app.order))
-        for key, (dot, lbl) in self.app.conn.items():
+        # Two rows whatever the registry grows to: the shared host, and every
+        # bridge behind one entry. The per-bridge detail is in its menu.
+        self.assertEqual(set(self.app.conn), {"host", "bridges"})
+        for key, (lead, lbl) in self.app.conn.items():
             with self.subTest(row=key):
                 self.assertTrue(lbl.winfo_ismapped())
                 self.assertLessEqual(self._bottom_of(lbl), win_h)
+
+    def test_the_bridges_row_counts_every_tab(self):
+        self.app._sync_bridges()
+        _lead, lbl = self.app.conn["bridges"]
+        self.assertIn(str(len(self.app.order)), lbl.cget("text"))
 
     def test_one_tab_per_app(self):
         self.assertEqual(set(self.app.tab_ui), set(self.app.sessions))
@@ -387,6 +526,176 @@ class TestGui(unittest.TestCase):
         self.app.update()
         self.assertIn("host-level-problem",
                       self.app.sessions[self.app.order[0]].view.get("1.0", "end"))
+
+    def test_closing_a_tab_takes_its_session_with_it(self):
+        sid = self.app.order[-1]
+        self.app._close_tab(sid)
+        self.app.update()
+        self.assertNotIn(sid, self.app.order)
+        self.assertNotIn(sid, self.app.sessions)
+        self.assertNotIn(sid, self.app.tab_ui)
+        self.assertNotEqual(self.app.active, sid)
+
+    def test_a_closed_tab_marks_its_session_so_a_late_bridge_shuts_down(self):
+        """A bridge that finishes starting after the tab went would otherwise
+        leave its subprocess running for the rest of the session."""
+        sid = self.app.order[-1]
+        s = self.app.sessions[sid]
+        self.app._close_tab(sid)
+        self.assertTrue(s.closed)
+
+    def test_reopening_a_tab_is_a_fresh_conversation(self):
+        sid = self.app.order[0]
+        self.app.sessions[sid].messages.append({"role": "user", "content": "hello"})
+        self.app._close_tab(sid)
+        self.app._add_tab(sid)
+        self.app.update()
+        self.assertEqual(self.app.active, sid)
+        self.assertEqual(len(self.app.sessions[sid].messages), 1)
+
+    def test_asking_for_an_open_tab_switches_rather_than_duplicates(self):
+        before = list(self.app.order)
+        self.app._add_tab(before[-1])
+        self.assertEqual(self.app.order, before)
+        self.assertEqual(self.app.active, before[-1])
+
+    def test_closing_every_tab_leaves_a_panel_that_can_still_speak(self):
+        for sid in list(self.app.order):
+            self.app._close_tab(sid)
+        self.app.update()
+        self.assertEqual(self.app.order, [])
+        self.assertIsNone(self.app.active)
+        self.assertIsNone(self.app.cur())
+        self.assertTrue(self.app.empty.winfo_ismapped())
+        self.assertEqual(str(self.app.btn_send.cget("state")), "disabled")
+        # a host-level failure still has to reach the user (AGENTS.md)
+        self.app._handle("error", None, "host-level-problem")
+        self.app.update()
+        self.assertIn("host-level-problem", self.app.empty_msg.cget("text"))
+        self.app._on_send()          # must not raise with nothing open
+
+    def test_events_for_a_closed_tab_are_dropped(self):
+        """A turn can still be in flight; it must not write into another app."""
+        gone, other = self.app.order[-1], self.app.order[0]
+        self.app._close_tab(gone)
+        self.app._select(other)
+        self.app._handle("sys", gone, "from-a-closed-tab")
+        self.app.update()
+        self.assertNotIn("from-a-closed-tab",
+                         self.app.sessions[other].view.get("1.0", "end"))
+
+    def test_open_tabs_are_remembered(self):
+        sid = self.app.order[-1]
+        self.app._close_tab(sid)
+        self.assertEqual(self.app.prefs.get("tabs"), list(self.app.order))
+        self.assertNotIn(sid, self.mod.Prefs(self.app.prefs.path).get("tabs"))
+
+    def test_hiding_an_app_removes_its_row_and_sticks(self):
+        rows = [a["name"] for a in self.app.detected]
+        if not rows:
+            self.skipTest("no creative apps on this machine")
+        self.app._hide_app(rows[0])
+        self.app.update()
+        self.assertIn(rows[0], self.mod.Prefs(self.app.prefs.path).get("hidden"))
+        self.assertNotIn(rows[0], self._sidebar_names())
+        self.app._show_app(rows[0])
+        self.assertIn(rows[0], self._sidebar_names())
+
+    def test_pinning_moves_an_app_to_the_top(self):
+        rows = [a["name"] for a in self.app.detected]
+        if len(rows) < 2:
+            self.skipTest("needs two creative apps")
+        self.app._pin_app(rows[-1])
+        self.app.update()
+        self.assertEqual(self._sidebar_names()[0], self.mod.clip(rows[-1], self.mod.APP_NAME_CHARS))
+        self.app._pin_app(rows[-1])          # same control unpins
+        self.assertEqual(self.app.prefs.get("pinned"), [])
+
+    def _sidebar_names(self):
+        """The visible app list: each row's title, in the order it is drawn."""
+        import tkinter
+        out = []
+        for row in self.app.applist.winfo_children():
+            for box in row.winfo_children():
+                if isinstance(box, tkinter.Frame):
+                    labels = [w for w in box.winfo_children()
+                              if isinstance(w, tkinter.Label)]
+                    if labels:
+                        out.append(labels[0].cget("text"))
+                    break
+        return out
+
+    def _labels(self, menu):
+        """Separators have no -label, so ask each entry what it is first."""
+        return [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)
+                if menu.type(i) != "separator"]
+
+    def test_the_new_tab_menu_offers_every_app_and_marks_the_open_ones(self):
+        labels = self._labels(self.app._menu_tabs())
+        self.assertEqual(len(labels), len(eng.APPS))
+        for app in eng.APPS:
+            self.assertTrue(any(app.name in l for l in labels), app.name)
+        self.assertEqual(len([l for l in labels if "(open)" in l]),
+                         len(self.app.order))
+
+    def test_the_bridges_menu_names_every_bridge_whatever_is_open(self):
+        """'What bridges exist' is a registry question, not a tab question."""
+        self.app._close_tab(self.app.order[-1])
+        labels = self._labels(self.app._menu_bridges())
+        for app in eng.APPS:
+            self.assertTrue(any(app.name in l for l in labels), app.name)
+        self.assertTrue(any("no tab open" in l for l in labels))
+
+    def test_the_add_menu_lists_what_was_hidden(self):
+        rows = [a["name"] for a in self.app.detected]
+        if not rows:
+            self.skipTest("no creative apps on this machine")
+        self.assertIn("Nothing is hidden", self._labels(self.app._menu_hidden()))
+        self.app._hide_app(rows[0])
+        self.assertIn(rows[0], self._labels(self.app._menu_hidden()))
+        self.app._show_app(rows[0])
+
+    def test_theme_switch_repaints_the_live_window(self):
+        self.app._theme("light")
+        self.app.update()
+        self.assertEqual(self.app.cget("bg"), self.mod.LIGHT["bg"])
+        self.assertEqual(self.app.sessions[self.app.order[0]].view.cget("bg"),
+                         self.mod.LIGHT["bg"])
+        self.assertEqual(self.app.prefs.get("theme"), "light")
+        self.app._theme("dark")
+        self.app.update()
+        self.assertEqual(self.app.cget("bg"), self.mod.DARK["bg"])
+        self.assertEqual(self.app.lbl_status.cget("bg"), self.mod.DARK["head"])
+
+    def test_a_tools_window_open_across_a_switch_is_repainted(self):
+        sid = eng.APPS[0].id
+        self.app._tools_window(sid)
+        self.app._theme("light")
+        self.app.update()
+        view = self.app.tool_views[sid]
+        self.assertEqual(view.cget("bg"), self.mod.LIGHT["bg"])
+        self.assertEqual(view.tag_cget("group", "foreground"),
+                         self.mod.LIGHT["accent"])
+        self.app._theme("dark")
+        self.app.windows[("tools", sid)].destroy()
+        self.app.update()
+
+    def test_a_theme_switch_keeps_the_transcripts(self):
+        sid = self.app.order[0]
+        self.app._handle("sys", sid, "survives-a-repaint")
+        self.app._theme("light")
+        self.app._theme("dark")
+        self.app.update()
+        self.assertIn("survives-a-repaint",
+                      self.app.sessions[sid].view.get("1.0", "end"))
+
+    def test_status_colours_are_roles_not_hex(self):
+        """Anything that puts a colour on the queue has to survive a theme
+        switch, which means naming a palette role rather than a literal."""
+        for s in self.app.sessions.values():
+            with self.subTest(app=s.id):
+                self.assertIn(s.status[1], self.mod.DARK)
+                self.assertIn(s.bridge[0], self.mod.DARK)
 
     def test_no_method_shadows_tkinter_internals(self):
         import tkinter

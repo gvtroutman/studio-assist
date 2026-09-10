@@ -742,16 +742,25 @@ def installed_apps():
 
 ADOBE_DIR = r"C:\Program Files\Adobe"
 
-# Adobe's own marks are two-letter badges in brand colours, so the UI draws them
-# rather than scraping 32px icons out of the .exe files - crisp at any DPI.
+# Each row carries where the product's own executable sits under its install
+# folder: the UI reads the app's real icon straight out of that PE file
+# (studio_icons.py), and falls back to the two-letter badge when it cannot.
+# The globs are loose because a Beta install renames the exe after itself.
 PRODUCTS = [
-    ("After Effects", "Ae", "After Effects", "#9999FF", "#00005B"),
-    ("Premiere Pro", "Pr", "Premiere Pro", "#EA77FF", "#2A0634"),
-    ("Photoshop", "Ps", "Photoshop", "#31A8FF", "#001E36"),
-    ("Illustrator", "Ai", "Illustrator", "#FF9A00", "#330000"),
-    ("Audition", "Au", "Audition", "#00E4BB", "#00312E"),
-    ("Media Encoder", "Me", "Media Encoder", "#9999FF", "#1D1D2E"),
-    ("Acrobat", "Ac", "Acrobat", "#FF5252", "#3B0000"),
+    ("After Effects", "Ae", "After Effects", "#9999FF", "#00005B",
+     r"Support Files\AfterFX.exe"),
+    ("Premiere Pro", "Pr", "Premiere Pro", "#EA77FF", "#2A0634",
+     r"Adobe Premiere Pro*.exe"),
+    ("Photoshop", "Ps", "Photoshop", "#31A8FF", "#001E36",
+     r"Photoshop.exe"),
+    ("Illustrator", "Ai", "Illustrator", "#FF9A00", "#330000",
+     r"Support Files\Contents\Windows\Illustrator.exe"),
+    ("Audition", "Au", "Audition", "#00E4BB", "#00312E",
+     r"Adobe Audition*.exe"),
+    ("Media Encoder", "Me", "Media Encoder", "#9999FF", "#1D1D2E",
+     r"Adobe Media Encoder*.exe"),
+    ("Acrobat", "Ac", "Acrobat", "#FF5252", "#3B0000",
+     r"Acrobat\Acrobat.exe"),
 ]
 
 OTHER_APPS = [
@@ -771,7 +780,7 @@ def detect_apps():
     except OSError:
         entries = []
     found = []
-    for match, code, name, fg, bg in PRODUCTS:
+    for match, code, name, fg, bg, exe_glob in PRODUCTS:
         hits = [e for e in entries if match.lower() in e.lower()]
         if not hits:
             continue
@@ -786,13 +795,14 @@ def detect_apps():
         label = ", ".join(sorted(years, reverse=True))
         if beta:
             label = (label + ", Beta") if label else "Beta"
+        exe = newest_match([os.path.join(ADOBE_DIR, e, exe_glob) for e in hits])
         found.append({"code": code, "name": name, "version": label, "fg": fg,
-                      "bg": bg, "id": DRIVABLE.get(name),
+                      "bg": bg, "id": DRIVABLE.get(name), "exe": exe,
                       "drivable": name in DRIVABLE})
     for path, code, name, fg, bg in OTHER_APPS:
         if os.path.exists(path):
             found.append({"code": code, "name": name, "version": "", "fg": fg,
-                          "bg": bg, "id": DRIVABLE.get(name),
+                          "bg": bg, "id": DRIVABLE.get(name), "exe": path,
                           "drivable": name in DRIVABLE})
     return found
 
