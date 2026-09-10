@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-ae_agent - a local LLM agent that drives After Effects.
+studio_agent - a local LLM agent that drives creative apps.
 
 Inference runs on the adjoining tailnet box (LM Studio, OpenAI-compatible).
-Tools run here, on the Adobe PC, via the existing @engine-room/after-effects-mcp
-bridge talking to the CEP panel inside AE on port 7777.
+Tools run here, on this workstation, over one MCP bridge per app:
+
+  After Effects    npx @engine-room/after-effects-mcp  ->  CEP panel on :7777
+  DaVinci Resolve  davinci-resolve-mcp (local venv)    ->  Resolve scripting API
+
+Every app the agent can drive lives in APPS below. Adding one is a registry
+entry, not a code change - see AGENTS.md.
 
 Stdlib only. No pip installs.
 """
 
 import argparse
+import glob
 import json
 import os
 import queue
@@ -26,54 +32,13 @@ DEFAULT_HOST = "http://100.127.17.38:1234/v1"
 DEFAULT_MODEL = "qwen3-coder-30b-a3b-instruct"
 MAX_TOOL_RESULT_CHARS = 8000
 
-# Tool groups. A 3B-active MoE gets sloppy when shown all ~76 tools at once,
-# so expose a working set by default and widen with --groups / --all-tools.
-GROUPS = {
-    "discover": [
-        "list_comps", "get_comp", "get_comp_tree", "list_layers", "find_layers",
-        "get_layer_full", "get_project_summary", "get_keyframes", "get_expression",
-        "list_effects", "set_active_comp", "check_setup", "ae_guide",
-    ],
-    "create": [
-        "create_comp", "create_text_layer", "create_shape_layer", "create_solid_layer",
-        "create_null_layer", "create_adjustment_layer", "create_precomp_layer",
-        "create_camera_layer", "create_light_layer", "create_footage_layer",
-    ],
-    "edit": [
-        "set_transform", "set_layer", "set_text", "set_comp", "parent_layer",
-        "reorder_layer", "duplicate_layer", "delete_layer", "duplicate_comp",
-    ],
-    "animate": [
-        "add_keyframe", "remove_keyframe", "set_interpolation", "set_temporal_ease",
-        "set_spatial_tangents", "set_expression", "clear_expression", "toggle_expression",
-    ],
-    "effects": [
-        "add_effect", "remove_effect", "set_effect_param", "set_effect_enabled",
-        "list_available_effects",
-    ],
-    "shapes": [
-        "add_shape_content", "set_shape_path", "set_shape_property",
-        "add_mask", "set_mask", "remove_mask", "add_text_animator",
-    ],
-    "inspect": ["screenshot_frame", "screenshot_layer", "diff_comp", "snapshot_comp"],
-    "assets": ["import_footage", "export_mogrt", "purge_unused_footage", "place_audio_cues"],
-    "raw": ["run_jsx", "run_batch"],
-}
-DEFAULT_GROUPS = ["discover", "create", "edit", "animate", "effects"]
+# Compound tools (Resolve's are all `action` + `params`) document their entire
+# action list in the description - it *is* the API surface. Clipping at 1024
+# silently amputated half of `timeline`'s actions and the model then invented
+# them. Keep this generous; AE's descriptions are short and unaffected.
+MAX_TOOL_DESC_CHARS = 4000
 
-SYSTEM_PROMPT = """You are an agent operating a live After Effects session through tools.
-The user watches every change happen; each call is a real undo step in their project.
-
-Rules that matter:
-- Identify layers by `id`, never by `index` - an index shifts on every insert.
-- Look before you write. Call list_comps / get_comp / list_layers to learn real ids
-  instead of guessing them.
-- Keep reads bounded. Prefer compact output; do not dump whole comp trees without need.
-- After a write, verify it landed if the result is not self-evident.
-- Work in small steps and stop when the user's request is satisfied.
-- If a tool reports it cannot reach After Effects, say so plainly and stop; do not retry in a loop.
-
-When the task is done, reply with a short plain-text summary and no further tool calls."""
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def log(msg, quiet=False):
@@ -86,6 +51,8 @@ class MCPClient:
 
     def __init__(self, command, args, quiet=False):
         exe = shutil.which(command)
+        if not exe and os.path.isfile(command):
+            exe = command  # registry entries may point straight at an interpreter
         if not exe:
             raise RuntimeError("could not find %r on PATH" % command)
         self.quiet = quiet
@@ -93,10 +60,9 @@ class MCPClient:
         self._lock = threading.Lock()
         self._inbox = queue.Queue()
         self.proc = subprocess.Popen(
-            [exe] + args,
+            [exe] + list(args),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            text=True, encoding="utf-8", bufsize=1, creationflags=NO_WINDOW,
         )
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -151,7 +117,7 @@ class MCPClient:
         res = self.request("initialize", timeout=timeout, params={
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "ae_agent", "version": "1.0"},
+            "clientInfo": {"name": "studio_agent", "version": "1.0"},
         })
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return res
@@ -253,7 +219,7 @@ def to_openai_tools(mcp_tools):
         desc = (t.get("description") or "").strip()
         out.append({"type": "function", "function": {
             "name": t["name"],
-            "description": desc[:1024],
+            "description": desc[:MAX_TOOL_DESC_CHARS],
             "parameters": schema,
         }})
     return out
@@ -346,8 +312,38 @@ class LLM:
 
 # ---------------------------------------------------------------- health probes
 
-AE_EXE = r"C:\Program Files\Adobe\Adobe After Effects 2026\Support Files\AfterFX.exe"
-BRIDGE_URL = "http://127.0.0.1:7777/"
+def http_alive(url, timeout=2):
+    """True when something answers - 405 counts, a websocket endpoint says that."""
+    try:
+        urllib.request.urlopen(url, timeout=timeout)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def process_running(image_name, timeout=8):
+    """Resolve has no bridge port - its MCP server talks to it in-process."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq %s" % image_name, "/NH"],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=NO_WINDOW).stdout or ""
+    except Exception:
+        return False
+    return image_name.lower() in out.lower()
+
+
+def newest_match(patterns):
+    """First existing path across the globs, newest-looking name first."""
+    for pattern in patterns:
+        hits = sorted(glob.glob(pattern), reverse=True)
+        for h in hits:
+            if os.path.isfile(h):
+                return h
+    return None
+
 
 # Best tool-callers on the box first; used when nothing is loaded yet.
 PREFERRED_MODELS = [
@@ -391,15 +387,233 @@ def pick_model(loaded, ids, want=None):
     return ids[0] if ids else None
 
 
-def ae_running(timeout=2):
-    """True when something answers on the panel's port - 405 counts, it's a websocket."""
-    try:
-        urllib.request.urlopen(BRIDGE_URL, timeout=timeout)
-        return True
-    except urllib.error.HTTPError:
-        return True
-    except Exception:
+# --------------------------------------------------------------- the app registry
+
+BASE_RULES = """
+Rules that matter:
+- Look before you write. Ask the project what is really there instead of guessing ids.
+- Keep reads bounded. Prefer compact output; do not dump whole trees without need.
+- After a write, verify it landed if the result is not self-evident.
+- Work in small steps and stop when the user's request is satisfied.
+
+When the task is done, reply with a short plain-text summary and no further tool calls."""
+
+AE_PROMPT = """You are an agent operating a live After Effects session through tools.
+The user watches every change happen; each call is a real undo step in their project.
+
+Specific to After Effects:
+- Identify layers by `id`, never by `index` - an index shifts on every insert.
+- Call list_comps / get_comp / list_layers to learn real ids instead of guessing them.
+- If a tool reports it cannot reach After Effects, say so plainly and stop; do not
+  retry in a loop.
+""" + BASE_RULES
+
+RESOLVE_PROMPT = """You are an agent operating a live DaVinci Resolve session through tools.
+The user watches every change happen in their project.
+
+Specific to DaVinci Resolve:
+- Every tool takes `action` (a string) and `params` (an object). Each tool's
+  description lists its actions and the params they take - read it rather than
+  inventing an action name.
+- Identify media pool clips by `clip_id`. Identify timeline clips by `clip_id`, or
+  by track_type + track_index + item_index.
+- Resolve is page-based: colour work needs the Color page, node work the Fusion page.
+  `resolve_control` with action "open_page" switches (edit, cut, color, fusion,
+  fairlight, deliver).
+- Start from `timeline` get_current, `media_pool` list and `project_manager`
+  get_current - they tell you what is actually open.
+- NEVER call `resolve_control` with action "quit". Closing Resolve mid-session costs
+  the user unsaved work. If you believe Resolve must restart, say so and stop.
+- If a tool reports it cannot reach DaVinci Resolve, say so plainly and stop; do not
+  retry in a loop.
+""" + BASE_RULES
+
+CHAT_SUFFIX = """
+
+This is a continuing conversation. The user may refer back to things you made
+earlier - keep track of the ids you have seen so you do not re-derive them.
+Answer questions directly without calling tools when no tool is needed."""
+
+
+class AppSpec:
+    """
+    One drivable app: how to reach it, what to expose, how to talk about it.
+
+    `probe` is a strategy string rather than a callable so the registry stays
+    data the tests can walk: "port:7777" or "process:Resolve.exe".
+    """
+
+    def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
+                 args, bridge_label, groups, default_groups, system_prompt,
+                 examples, launch_note=""):
+        self.id = id
+        self.name = name
+        self.tab = tab                    # short label for a tab strip
+        self.code = code                  # two-letter badge
+        self.fg, self.bg = fg, bg
+        self.exe_globs = exe_globs
+        self.probe = probe
+        self.command, self.args = command, list(args)
+        self.bridge_label = bridge_label
+        self.groups = groups
+        self.default_groups = list(default_groups)
+        self.system_prompt = system_prompt
+        self.examples = list(examples)
+        self.launch_note = launch_note
+
+    def exe(self):
+        return newest_match(self.exe_globs)
+
+    def installed(self):
+        return self.exe() is not None
+
+    def running(self):
+        kind, _, arg = self.probe.partition(":")
+        if kind == "port":
+            return http_alive("http://127.0.0.1:%s/" % arg)
+        if kind == "process":
+            return process_running(arg)
         return False
+
+    def tool_names(self, group_names=None):
+        wanted = set()
+        for g in (group_names if group_names is not None else self.default_groups):
+            wanted |= set(self.groups[g])
+        return wanted
+
+    def chat_prompt(self):
+        return self.system_prompt + CHAT_SUFFIX
+
+    def launch(self):
+        exe = self.exe()
+        if not exe:
+            raise RuntimeError("%s is not installed where this agent looks for it"
+                               % self.name)
+        subprocess.Popen([exe], close_fds=True,
+                         creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+
+    def __repr__(self):
+        return "<AppSpec %s>" % self.id
+
+
+AE_GROUPS = {
+    "discover": [
+        "list_comps", "get_comp", "get_comp_tree", "list_layers", "find_layers",
+        "get_layer_full", "get_project_summary", "get_keyframes", "get_expression",
+        "list_effects", "set_active_comp", "check_setup", "ae_guide",
+    ],
+    "create": [
+        "create_comp", "create_text_layer", "create_shape_layer", "create_solid_layer",
+        "create_null_layer", "create_adjustment_layer", "create_precomp_layer",
+        "create_camera_layer", "create_light_layer", "create_footage_layer",
+    ],
+    "edit": [
+        "set_transform", "set_layer", "set_text", "set_comp", "parent_layer",
+        "reorder_layer", "duplicate_layer", "delete_layer", "duplicate_comp",
+    ],
+    "animate": [
+        "add_keyframe", "remove_keyframe", "set_interpolation", "set_temporal_ease",
+        "set_spatial_tangents", "set_expression", "clear_expression", "toggle_expression",
+    ],
+    "effects": [
+        "add_effect", "remove_effect", "set_effect_param", "set_effect_enabled",
+        "list_available_effects",
+    ],
+    "shapes": [
+        "add_shape_content", "set_shape_path", "set_shape_property",
+        "add_mask", "set_mask", "remove_mask", "add_text_animator",
+    ],
+    "inspect": ["screenshot_frame", "screenshot_layer", "diff_comp", "snapshot_comp"],
+    "assets": ["import_footage", "export_mogrt", "purge_unused_footage", "place_audio_cues"],
+    "raw": ["run_jsx", "run_batch"],
+}
+
+# Resolve ships 27 compound tools rather than ~76 small ones, so the groups are
+# coarser - but the descriptions are long, and the whole set is still ~9k tokens.
+RESOLVE_GROUPS = {
+    "discover": [
+        "resolve_control", "project_manager", "project_settings", "media_pool",
+        "media_storage", "timeline", "timeline_item",
+    ],
+    "media": [
+        "media_pool", "media_pool_item", "media_pool_item_markers", "folder",
+        "media_storage",
+    ],
+    "timeline": [
+        "timeline", "timeline_item", "timeline_markers", "timeline_item_markers",
+        "timeline_item_takes", "timeline_ai",
+    ],
+    "color": [
+        "timeline_item_color", "graph", "color_group", "gallery", "gallery_stills",
+    ],
+    "fusion": ["fusion_comp", "timeline_item_fusion"],
+    "render": ["render", "render_presets"],
+    "manage": [
+        "project_manager", "project_manager_folders", "project_manager_cloud",
+        "project_manager_database", "layout_presets",
+    ],
+}
+
+RESOLVE_MCP = os.environ.get(
+    "RESOLVE_MCP_DIR", os.path.join(os.path.expanduser("~"), "davinci-resolve-mcp"))
+
+APPS = [
+    AppSpec(
+        id="after-effects",
+        name="After Effects",
+        tab="After Effects",
+        code="Ae", fg="#9999FF", bg="#00005B",
+        exe_globs=[r"C:\Program Files\Adobe\Adobe After Effects *\Support Files\AfterFX.exe"],
+        probe="port:7777",
+        command="npx", args=["-y", "@engine-room/after-effects-mcp"],
+        bridge_label="127.0.0.1:7777",
+        groups=AE_GROUPS,
+        default_groups=["discover", "create", "edit", "animate", "effects"],
+        system_prompt=AE_PROMPT,
+        examples=[
+            "What comps are in this project?",
+            "Make a 1920x1080 title card, 5 seconds at 24fps",
+            "Add a drop shadow to the text and fade it in over 12 frames",
+        ],
+        launch_note="After Effects also needs the ae-mcp panel under Window > Extensions.",
+    ),
+    AppSpec(
+        id="resolve",
+        name="DaVinci Resolve",
+        tab="Resolve",
+        code="Dv", fg="#F5A623", bg="#2B2B2B",
+        exe_globs=[r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"],
+        probe="process:Resolve.exe",
+        command=os.path.join(RESOLVE_MCP, "venv", "Scripts", "python.exe"),
+        args=[os.path.join(RESOLVE_MCP, "src", "server.py")],
+        bridge_label="scripting API",
+        groups=RESOLVE_GROUPS,
+        default_groups=["discover", "media", "timeline", "color", "render"],
+        system_prompt=RESOLVE_PROMPT,
+        examples=[
+            "What's on the current timeline?",
+            "Add a marker at the playhead and call it Review",
+            "Set up an H.264 render job and show me the queue",
+        ],
+        launch_note="Resolve takes a while to finish loading, and needs a project open.",
+    ),
+]
+
+APPS_BY_ID = {a.id: a for a in APPS}
+DEFAULT_APP = APPS[0].id
+
+
+def get_app(app_id):
+    try:
+        return APPS_BY_ID[app_id]
+    except KeyError:
+        raise KeyError("unknown app %r; pick from %s"
+                       % (app_id, ", ".join(APPS_BY_ID)))
+
+
+def installed_apps():
+    """Registry apps whose executable is actually on this machine."""
+    return [a for a in APPS if a.installed()]
 
 
 # ------------------------------------------------------- what is on this machine
@@ -423,7 +637,9 @@ OTHER_APPS = [
      "Dv", "DaVinci Resolve", "#F5A623", "#2B2B2B"),
 ]
 
-DRIVABLE = {"After Effects"}  # the only app this agent has a bridge for
+# Derived, never hand-maintained: an app is drivable exactly when the registry
+# has a bridge for it, so the sidebar cannot claim more than the agent can do.
+DRIVABLE = {a.name: a.id for a in APPS}
 
 
 def detect_apps():
@@ -448,24 +664,19 @@ def detect_apps():
         label = ", ".join(sorted(years, reverse=True))
         if beta:
             label = (label + ", Beta") if label else "Beta"
-        found.append({"code": code, "name": name, "version": label,
-                      "fg": fg, "bg": bg, "drivable": name in DRIVABLE})
+        found.append({"code": code, "name": name, "version": label, "fg": fg,
+                      "bg": bg, "id": DRIVABLE.get(name),
+                      "drivable": name in DRIVABLE})
     for path, code, name, fg, bg in OTHER_APPS:
         if os.path.exists(path):
-            found.append({"code": code, "name": name, "version": "",
-                          "fg": fg, "bg": bg, "drivable": name in DRIVABLE})
+            found.append({"code": code, "name": name, "version": "", "fg": fg,
+                          "bg": bg, "id": DRIVABLE.get(name),
+                          "drivable": name in DRIVABLE})
     return found
 
 
-def launch_ae():
-    if not os.path.exists(AE_EXE):
-        raise RuntimeError("After Effects not found at %s" % AE_EXE)
-    subprocess.Popen([AE_EXE], close_fds=True,
-                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
-
-
-def run_agent(llm, mcp, tools, task, max_steps=25, quiet=False):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False):
+    messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": task}]
     for step in range(1, max_steps + 1):
         t0 = time.time()
@@ -510,24 +721,57 @@ def run_agent(llm, mcp, tools, task, max_steps=25, quiet=False):
     return "(stopped: hit the %d-step limit without a final answer)" % max_steps
 
 
+def env_default(*names, fallback=None):
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return fallback
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="Local LLM agent for After Effects. Inference on the tailnet, tools on this PC.")
+        description="Local LLM agent for creative apps. Inference on the tailnet, "
+                    "tools on this PC.")
     p.add_argument("task", nargs="*", help="what to do; omit for an interactive session")
-    p.add_argument("--host", default=os.environ.get("AE_AGENT_HOST", DEFAULT_HOST),
+    p.add_argument("--app", default=DEFAULT_APP, choices=sorted(APPS_BY_ID),
+                   help="which app to drive (default: %(default)s)")
+    p.add_argument("--host", default=env_default("STUDIO_HOST", "AE_AGENT_HOST",
+                                                 fallback=DEFAULT_HOST),
                    help="OpenAI-compatible base URL (default: %(default)s)")
-    p.add_argument("--model", default=os.environ.get("AE_AGENT_MODEL", DEFAULT_MODEL))
-    p.add_argument("--groups", default=",".join(DEFAULT_GROUPS),
-                   help="tool groups to expose: %s" % ", ".join(GROUPS))
-    p.add_argument("--all-tools", action="store_true", help="expose every AE tool")
+    p.add_argument("--model", default=env_default("STUDIO_MODEL", "AE_AGENT_MODEL",
+                                                  fallback=DEFAULT_MODEL))
+    p.add_argument("--groups", default=None,
+                   help="tool groups to expose; app-specific, see --list-groups")
+    p.add_argument("--all-tools", action="store_true", help="expose every tool the app has")
     p.add_argument("--max-steps", type=int, default=25)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--list-tools", action="store_true", help="print exposed tools and exit")
+    p.add_argument("--list-groups", action="store_true",
+                   help="print the tool groups for every app and exit")
     p.add_argument("--quiet", action="store_true", help="hide the step trace")
     a = p.parse_args()
 
-    log(". connecting to the After Effects MCP bridge...", a.quiet)
-    mcp = MCPClient("npx", ["-y", "@engine-room/after-effects-mcp"], quiet=a.quiet)
+    if a.list_groups:
+        for app in APPS:
+            print("%s (--app %s)" % (app.name, app.id))
+            for g, names in app.groups.items():
+                mark = "*" if g in app.default_groups else " "
+                print("  %s %-10s %s" % (mark, g, ", ".join(names)))
+            print()
+        print("* = on by default")
+        return 0
+
+    app = get_app(a.app)
+    groups = [g.strip() for g in (a.groups or ",".join(app.default_groups)).split(",")
+              if g.strip()]
+    for g in groups:
+        if g not in app.groups:
+            p.error("unknown group %r for %s; pick from %s"
+                    % (g, app.name, ", ".join(app.groups)))
+
+    log(". connecting to the %s bridge..." % app.name, a.quiet)
+    mcp = MCPClient(app.command, app.args, quiet=a.quiet)
     try:
         info = mcp.initialize()
         srv = info.get("serverInfo", {})
@@ -537,15 +781,11 @@ def main():
         if a.all_tools:
             wanted, chosen = None, all_tools
         else:
-            wanted = set()
-            for g in [g.strip() for g in a.groups.split(",") if g.strip()]:
-                if g not in GROUPS:
-                    p.error("unknown group %r; pick from %s" % (g, ", ".join(GROUPS)))
-                wanted |= set(GROUPS[g])
+            wanted = app.tool_names(groups)
             chosen = [t for t in all_tools if t["name"] in wanted]
 
         log("  %d of %d tools exposed%s" % (len(chosen), len(all_tools),
-            "" if a.all_tools else " (groups: %s)" % a.groups), a.quiet)
+            "" if a.all_tools else " (groups: %s)" % ",".join(groups)), a.quiet)
 
         if a.list_tools:
             for t in sorted(chosen, key=lambda x: x["name"]):
@@ -560,13 +800,15 @@ def main():
         log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
 
         if a.task:
-            print(run_agent(llm, mcp, tools, " ".join(a.task), a.max_steps, a.quiet))
+            print(run_agent(llm, mcp, tools, " ".join(a.task), app.system_prompt,
+                            a.max_steps, a.quiet))
             return 0
 
-        print("ae_agent - interactive. Ctrl-C or 'exit' to quit.\n")
+        print("studio_agent [%s] - interactive. Ctrl-C or 'exit' to quit.\n" % app.name)
+        prompt = "%s> " % app.id
         while True:
             try:
-                task = input("ae> ").strip()
+                task = input(prompt).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -575,7 +817,8 @@ def main():
             if not task:
                 continue
             try:
-                print("\n" + run_agent(llm, mcp, tools, task, a.max_steps, a.quiet) + "\n")
+                print("\n" + run_agent(llm, mcp, tools, task, app.system_prompt,
+                                       a.max_steps, a.quiet) + "\n")
             except Exception as e:
                 print("error: %s\n" % e, file=sys.stderr)
     finally:
