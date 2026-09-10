@@ -2,9 +2,10 @@
 """
 Studio Assistant - a chat window that drives creative apps with a local model.
 
-One tab per app. Each tab owns its own MCP bridge, its own tool set, its own
-system prompt and its own conversation - switching tabs switches which app you
-are talking to, and nothing leaks between them. Tabs are opened and closed from
+One tab per app, plus a Chat tab with no app behind it. Each tab owns its own
+MCP bridge, its own tool set, its own system prompt and its own conversation -
+switching tabs switches which app you are talking to, and nothing leaks between
+them. Chat is the same window with the bridge and the tools left out. Tabs are opened and closed from
 the tab strip, and which ones are open is remembered between runs.
 
 Bridges start lazily: opening a tab for the first time is what launches that
@@ -25,11 +26,12 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 
 try:
     import tkinter as tk
     from tkinter import font as tkfont
-    from tkinter import messagebox
+    from tkinter import messagebox, filedialog
 except ImportError:
     sys.exit("Tkinter is missing from this Python install; reinstall Python with tcl/tk.")
 
@@ -37,6 +39,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import studio_agent as eng
 import studio_icons as icons
+import studio_tasks as tasks
+import studio_toolsmith as toolsmith
 
 APP_NAME = "Studio Assistant"
 ERROR_LOG = "studio_assistant_error.log"
@@ -70,7 +74,6 @@ THEME_NAMES = [("dark", "Dark"), ("light", "Light")]
 
 SIDEBAR_W = 236
 
-MAX_HISTORY = 40
 MAX_STEPS = 25
 
 
@@ -179,6 +182,14 @@ class Session:
         self.ready = False
         self.booting = False
         self.closed = False
+        self.generation = uuid.uuid4().hex
+        self.cancel = threading.Event()
+        self.record = tasks.TaskRecord()
+        self.record.app_id = app.id
+        self.schemas = []
+        self.library = None               # tools the model made, set by Chat
+        self.groups = list(app.default_groups)
+        self.preview_images = []
         self.status = ("not started", "muted", False)
         self.bridge = ("faint", "%s\nnot started" % app.bridge_label)
         self.frame = None
@@ -191,12 +202,21 @@ class Session:
     def id(self):
         return self.app.id
 
+    @property
+    def event_id(self):
+        return (self.app.id, self.generation)
+
     def reset(self):
         self.messages = [{"role": "system", "content": self.app.chat_prompt()}]
+        self.record = tasks.TaskRecord()
+        self.record.app_id = self.app.id
+        self.cancel.clear()
+        self.preview_images.clear()
         self._stream_open = False
         self._stream_buf = []
 
     def close(self):
+        self.cancel.set()
         if self.mcp:
             try:
                 self.mcp.close()
@@ -261,13 +281,15 @@ class Chat(tk.Tk):
 
     def _opening_tabs(self):
         """
-        Which tabs to open: what was open last time, else every installed app.
-        A registry entry that has since disappeared is dropped silently.
+        Which tabs to open: what was open last time, else every installed app
+        plus chat. A registry entry that has since disappeared is dropped silently.
         """
         want = self.prefs.get("tabs")
         if want is not None:
-            return [eng.APPS_BY_ID[i] for i in want if i in eng.APPS_BY_ID]
-        return eng.installed_apps() or list(eng.APPS)
+            return [eng.TABS_BY_ID[i] for i in want if i in eng.TABS_BY_ID]
+        # Chat needs nothing installed, so it is always worth opening - and on a
+        # machine with neither app it is the only tab that can answer anything.
+        return (eng.installed_apps() or list(eng.APPS)) + [eng.CHAT]
 
     def _fonts(self):
         self.f_ui = tkfont.Font(family="Segoe UI", size=10)
@@ -382,6 +404,8 @@ class Chat(tk.Tk):
         m_file = menu()
         m_file.add_command(label="New chat", accelerator="Ctrl+N",
                            command=self._on_new)
+        m_file.add_command(label="Resume saved task...", command=self._resume_task)
+        m_file.add_command(label="Task progress...", command=self._task_progress)
         m_file.add_command(label="New tab...", accelerator="Ctrl+T",
                            command=lambda: self._tab_menu(self.btn_add))
         m_file.add_command(label="Close tab", accelerator="Ctrl+W",
@@ -409,6 +433,8 @@ class Chat(tk.Tk):
             m_bridge.add_command(label="%s tools..." % app.name,
                                  command=lambda i=app.id: self._tools_window(i))
         m_bridge.add_separator()
+        m_bridge.add_command(label="Choose capabilities for current tab...",
+                             command=self._capabilities)
         m_bridge.add_command(label="Start the current app", command=self._on_fix)
         bar.add_cascade(label="Bridges", menu=m_bridge)
 
@@ -742,10 +768,11 @@ class Chat(tk.Tk):
         self._set_dot(ui["dot"], s.bridge[0])
 
     def _menu_tabs(self):
-        """Which app to talk to. Every drivable app is offered; one already
-        open switches to it rather than opening a second."""
+        """Which app to talk to. Every drivable app is offered, and Chat - the
+        model with no app behind it; one already open switches to it rather
+        than opening a second."""
         m = self._menu()
-        for app in eng.APPS:
+        for app in eng.TABS:
             open_now = app.id in self.sessions
             self._menu_item(m, "%s%s" % (app.name, "   (open)" if open_now else ""),
                             app.id, lambda i=app.id: self._add_tab(i))
@@ -758,7 +785,11 @@ class Chat(tk.Tk):
         if app_id in self.sessions:
             self._select(app_id)
             return
-        s = Session(eng.APPS_BY_ID[app_id])
+        s = Session(eng.TABS_BY_ID[app_id])
+        if s.app.drivable:
+            # Tools the model made for this app, beside its settings and tasks.
+            # A chat tab has no tools to make them from, so it gets no library.
+            s.library = toolsmith.Library.for_app(app_id, self._data_dir())
         self.sessions[app_id] = s
         self.order.append(app_id)
         self._build_transcript(s)
@@ -773,6 +804,7 @@ class Chat(tk.Tk):
             return
         s = self.sessions.pop(sid)
         s.closed = True
+        s.cancel.set()
         self.order.remove(sid)
         ui = self.tab_ui.pop(sid)
         ui["tab"].destroy()
@@ -1038,21 +1070,25 @@ class Chat(tk.Tk):
 
     def _sync_bridges(self):
         """One row for every bridge at once: how many are up, how many tools
-        they are offering. Which bridges exist is in the menu behind it."""
+        they are offering. Which bridges exist is in the menu behind it.
+
+        Only tabs that drive an app count here - a chat tab has no bridge to
+        report, and counting it would make one of two say it was missing."""
         lead, lbl = self.conn["bridges"]
-        live = [s for s in self.sessions.values() if s.ready]
+        bridged = [s for s in self.sessions.values() if s.app.drivable]
+        live = [s for s in bridged if s.ready]
         tools = sum(len(s.tools) for s in live)
-        roles = [s.bridge[0] for s in self.sessions.values()]
-        if not self.sessions:
-            role, detail = "faint", "no tab open\n%d available" % len(eng.APPS)
+        roles = [s.bridge[0] for s in bridged]
+        if not bridged:
+            role, detail = "faint", "no app tab open\n%d available" % len(eng.APPS)
         elif live:
-            role = "ok" if len(live) == len(self.sessions) else "warn"
-            detail = "%d of %d connected\n%d tools" % (len(live), len(self.sessions),
+            role = "ok" if len(live) == len(bridged) else "warn"
+            detail = "%d of %d connected\n%d tools" % (len(live), len(bridged),
                                                        tools)
         else:
             role = "err" if "err" in roles else "faint"
-            detail = "%d bridge%s\nnot started" % (len(self.sessions),
-                                                   "" if len(self.sessions) == 1 else "s")
+            detail = "%d bridge%s\nnot started" % (len(bridged),
+                                                   "" if len(bridged) == 1 else "s")
         lead.config(fg=self.C[role])
         lbl.config(text=detail)
 
@@ -1166,7 +1202,44 @@ class Chat(tk.Tk):
                 view.insert("end", name + "\n", "off")
                 view.insert("end", clip(" ".join(catalog[name].split()), 400) + "\n",
                             "desc")
+
+        library = s.library if s is not None else None
+        if library is None:
+            # No tab open, or one that has not booted: read the app's made tools
+            # off disk and list them all, with no tool set to check them against.
+            library = toolsmith.Library.for_app(app_id, self._data_dir())
+            library.load()
+        made = library.ordered()
+        if made:
+            view.insert("end", "MADE BY THE MODEL   (in this app's tabs)\n", "group")
+            for tool in made:
+                view.insert("end", tool.name, "name")
+                view.insert("end", "   ")
+                view.window_create("end",
+                                   window=self._forget_button(view, app_id, tool.name))
+                view.insert("end", "\n")
+                view.insert("end", clip(" ".join(tool.description.split()), 400)
+                            + "\nruns " + tool.summary() + "\n", "desc")
         view.config(state="disabled")
+
+    def _forget_button(self, parent, app_id, name):
+        """Made tools are the one part of this window the user can change: one
+        the model built badly should not need a text editor to get rid of."""
+        def forget():
+            s = self.sessions.get(app_id)
+            if s is not None and s.busy:
+                return                    # never change the tool list mid-turn
+            library = (s.library if s is not None and s.library is not None else
+                       toolsmith.Library.for_app(app_id, self._data_dir()))
+            library.remove(name)
+            win = self.windows.pop(("tools", app_id), None)
+            if win is not None and win.winfo_exists():
+                win.destroy()
+            self._tools_window(app_id)
+        button = tk.Button(parent, text="forget", command=forget, bd=0, relief="flat",
+                           font=self.f_small, padx=6, pady=0, cursor="hand2")
+        return self._skin(button, bg="card", fg="muted", activebackground="hover",
+                          activeforeground="text")
 
     # ---------------------------------------------------------------- composer
     def _build_composer(self, composer):
@@ -1195,7 +1268,12 @@ class Chat(tk.Tk):
         hint.pack(fill="x", pady=(6, 0))
 
     def _welcome(self, s):
-        self._write(s, "%s. Try:\n" % s.app.name, "sys")
+        if not s.app.drivable:
+            # Say the one thing this tab is not, before the model has to.
+            self._write(s, "Chat with the model alone - no app attached, so "
+                           "nothing here can open or change a project. Try:\n", "sys")
+        else:
+            self._write(s, "%s. Try:\n" % s.app.name, "sys")
         for e in s.app.examples:
             self._write(s, e + "\n", "hint")
 
@@ -1327,8 +1405,9 @@ class Chat(tk.Tk):
         self.btn_fix.config(text="Start %s" % s.app.name)
         self._show_fix(fixable)
         self.btn_new.config(state="normal")
-        self.btn_send.config(text="…" if s.busy else "Send",
-                             state="disabled" if s.busy else "normal")
+        self.btn_send.config(text="Stopping…" if s.busy and s.cancel.is_set() else
+                             "Stop" if s.busy else "Send",
+                             state="disabled" if s.busy and s.cancel.is_set() else "normal")
 
     def _show_fix(self, show):
         if show:
@@ -1376,6 +1455,12 @@ class Chat(tk.Tk):
                 self.q.put(("icon", None, (key, size, data)))
 
     def _handle(self, kind, sid, payload):
+        if isinstance(sid, tuple):
+            app_id, generation = sid
+            live = self.sessions.get(app_id)
+            if live is None or live.generation != generation:
+                return
+            sid = app_id
         # A sid of None means "whatever tab the user is looking at" - startup
         # errors from the shared inference host have no app of their own. A sid
         # whose tab has been closed is dropped: a turn still finishing must not
@@ -1436,6 +1521,8 @@ class Chat(tk.Tk):
             self._write(s, "  " + payload + "\n", "tool")
         elif kind == "tool_result":
             self._write(s, "     " + payload + "\n", "tool")
+        elif kind == "preview":
+            self._show_preview(s, payload)
         elif kind == "stream_start":
             self._role(s, s.app.tab.upper(), "role_asst")
             s._asst_start = s.view.index("end-1c")
@@ -1459,8 +1546,8 @@ class Chat(tk.Tk):
         elif kind == "trace":
             self._log(payload)
         elif kind == "ready":
-            self._write(s, "Connected and warmed up - replies land in a few seconds.\n",
-                        "sys")
+            self._write(s, "Bridge connected; ready for a task.\n"
+                        if s.app.drivable else "Ready.\n", "sys")
             self._sync_bridges()
         elif kind == "idle":
             s.busy = False
@@ -1502,10 +1589,10 @@ class Chat(tk.Tk):
         if s.ready or s.booting:
             return
         s.booting = True
-        self._spawn(s.id, self._boot_session, s)
+        self._spawn(s.event_id, self._boot_session, s)
 
     def _boot_session(self, s):
-        sid = s.id
+        sid = s.event_id
         try:
             if not self.host_ready.is_set():
                 self.q.put(("status", sid, ("waiting for the inference host",
@@ -1516,51 +1603,95 @@ class Chat(tk.Tk):
                 self.q.put(("bridge", sid, ("err", "%s\nno model" % s.app.bridge_label)))
                 return
 
-            self.q.put(("status", sid, ("starting the %s bridge" % s.app.name,
-                                        "muted", False)))
-            try:
-                mcp = eng.MCPClient(s.app.command, s.app.args, quiet=True)
-                mcp.initialize(timeout=75)
-                allt = mcp.list_tools(timeout=45)
-            except Exception as e:
-                self.q.put(("status", sid, ("bridge did not start", "err", False)))
-                self.q.put(("bridge", sid, ("err", "%s\nfailed to start"
-                                            % s.app.bridge_label)))
-                self.q.put(("error", sid, self._bridge_help(s.app, e)))
-                return
-            s.mcp = mcp
-            if s.closed:
-                # The tab was closed while this bridge was starting, so nothing
-                # was there to shut down yet. Do it now or the subprocess
-                # outlives the tab for the rest of the session.
-                s.close()
-                return
-            # the whole catalogue, for the tools window; the model sees the
-            # working set only
-            s.catalog = [{"name": t["name"], "description": t.get("description", "")}
-                         for t in allt]
-
-            wanted = s.app.tool_names()
-            s.tools = eng.to_openai_tools([t for t in allt if t["name"] in wanted])
+            if s.app.drivable:
+                self._boot_bridge(s)
+                if s.mcp is None:         # it reported its own failure
+                    return
+                if s.closed:
+                    return
 
             # Prefill dominates the first call - a full tool schema set takes about a
             # minute cold. Pay it here against the exact prompt prefix a real message
-            # will use, so the first question comes back in seconds. Each app has its
-            # own prefix, so each tab warms up the first time it is opened.
-            self.q.put(("status", sid, ("warming up the model, about a minute",
+            # will use, so the first question comes back in seconds. Each tab has its
+            # own prefix, so each warms up the first time it is opened.
+            self.q.put(("status", sid, ("warming up the model%s"
+                                        % (", about a minute" if s.tools else ""),
                                         "warn", False)))
             try:
                 self.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
                                {"role": "user", "content": "Say ready."}],
-                              s.tools, max_tokens=1)
-            except Exception:
-                pass  # warming is an optimisation; failing here is not fatal
+                              tasks.inference_tools(s.tools, s.library), max_tokens=1)
+            except Exception as e:
+                self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
             s.ready = True
-            self._refresh_bridge(s)
+            if s.app.drivable:
+                self._refresh_bridge(s)
+            else:
+                self.q.put(("status", sid, ("ready", "ok", False)))
+                self.q.put(("bridge", sid, ("ok", "no bridge\nthe model on its own")))
             self.q.put(("ready", sid, None))
         finally:
             s.booting = False
             self.q.put(("idle", sid, None))
+
+    def _boot_bridge(self, s):
+        """
+        Start this tab's bridge and work out what it offers. On failure it says
+        why and leaves `s.mcp` None, which is how the caller knows to stop.
+        """
+        sid = s.event_id
+        self.q.put(("status", sid, ("starting the %s bridge" % s.app.name,
+                                    "muted", False)))
+        mcp = None
+        try:
+            mcp = eng.MCPClient(s.app.command, s.app.args, quiet=True)
+            mcp.initialize(timeout=75)
+            allt = mcp.list_tools(timeout=45)
+        except Exception as e:
+            if mcp is not None:
+                mcp.close()
+            self.q.put(("status", sid, ("bridge did not start", "err", False)))
+            self.q.put(("bridge", sid, ("err", "%s\nfailed to start"
+                                        % s.app.bridge_label)))
+            self.q.put(("error", sid, self._bridge_help(s.app, e)))
+            return
+        s.mcp = mcp
+        if s.closed:
+            # The tab was closed while this bridge was starting, so nothing
+            # was there to shut down yet. Do it now or the subprocess
+            # outlives the tab for the rest of the session.
+            s.close()
+            return
+        # the whole catalogue, for the tools window; the model sees the
+        # working set only
+        s.catalog = [{"name": t["name"], "description": t.get("description", "")}
+                     for t in allt]
+
+        s.schemas = allt
+        wanted = s.app.tool_names(s.groups)
+        s.tools = eng.to_openai_tools([t for t in allt if t["name"] in wanted])
+        self._load_library(s)
+        missing = wanted - {t["name"] for t in allt}
+        if missing:
+            self.q.put(("sys", sid, "This bridge does not provide: " + ", ".join(sorted(missing))))
+
+    def _load_library(self, s):
+        """Read back the tools the model made for this app, against the tools
+        this tab is currently offering. A made tool whose steps are no longer
+        exposed, or whose file has been hand-edited into nonsense, is left out
+        and said aloud - it must never reach the model as a tool that cannot run.
+        """
+        if s.library is None:
+            return
+        allowed, specs = toolsmith.contracts(s.tools, s.schemas)
+        try:
+            problems = s.library.load(allowed, specs)
+        except Exception as e:
+            self.q.put(("sys", s.event_id, "Could not read the tools made here: %s" % e))
+            return
+        if problems:
+            self.q.put(("sys", s.event_id, "Not offering %d tool(s) made here: %s"
+                        % (len(problems), "; ".join(problems))))
 
     def _bridge_help(self, app, err):
         if app.id == "after-effects":
@@ -1576,47 +1707,206 @@ class Chat(tk.Tk):
                 % (app.name, app.command, err))
 
     def _refresh_bridge(self, s):
+        if not s.app.drivable:
+            return
         n = len(s.tools)
         if s.app.running():
-            self.q.put(("status", s.id, ("connected", "ok", False)))
-            self.q.put(("bridge", s.id, ("ok", "%s\n%d tools" % (s.app.bridge_label, n))))
+            self.q.put(("status", s.event_id, ("connected", "ok", False)))
+            self.q.put(("bridge", s.event_id, ("ok", "%s\n%d tools" % (s.app.bridge_label, n))))
         else:
-            self.q.put(("status", s.id, ("%s is not running" % s.app.name, "warn", True)))
-            self.q.put(("bridge", s.id, ("warn", "%s\nnot running" % s.app.bridge_label)))
+            self.q.put(("status", s.event_id, ("%s is not running" % s.app.name, "warn", True)))
+            self.q.put(("bridge", s.event_id, ("warn", "%s\nnot running" % s.app.bridge_label)))
 
     def _on_fix(self):
         s = self.cur()
         if s is None or s.busy:
             return
+        if not s.app.drivable:
+            self._write(s, "This tab has no app to start - it is the model on "
+                           "its own.\n", "sys")
+            return
         s.busy = True
+        s.cancel.clear()
         self._apply_status()
-        self._spawn(s.id, self._fix, s)
+        self._spawn(s.event_id, self._fix, s)
 
     def _fix(self, s):
         try:
             if not s.app.running():
-                self.q.put(("sys", s.id, "Launching %s..." % s.app.name))
-                self.q.put(("status", s.id, ("launching %s" % s.app.name, "warn", False)))
+                self.q.put(("sys", s.event_id, "Launching %s..." % s.app.name))
+                self.q.put(("status", s.event_id, ("launching %s" % s.app.name, "warn", False)))
                 s.app.launch()
                 for _ in range(60):
+                    if s.cancel.is_set():
+                        return
                     if s.app.running():
-                        self.q.put(("sys", s.id, "%s is up. %s"
+                        self.q.put(("sys", s.event_id, "%s is up. %s"
                                     % (s.app.name, s.app.launch_note)))
                         break
                     time.sleep(2)
                 else:
-                    self.q.put(("error", s.id,
+                    self.q.put(("error", s.event_id,
                                 "%s did not come up within two minutes. %s"
                                 % (s.app.name, s.app.launch_note)))
             self._refresh_bridge(s)
         finally:
-            self.q.put(("idle", s.id, None))
+            self.q.put(("idle", s.event_id, None))
 
     # ------------------------------------------------------------------ sending
+    def _data_dir(self):
+        return os.path.dirname(os.path.abspath(self.prefs.path))
+
+    def _task_path(self, s):
+        return os.path.join(self._data_dir(), "tasks", s.id, s.record.id + ".json")
+
+    def _resume_task(self):
+        s = self.cur()
+        if s is None or s.busy:
+            return
+        path = filedialog.askopenfilename(parent=self, title="Resume a saved task",
+            initialdir=os.path.dirname(self._task_path(s)),
+            filetypes=[("Studio task", "*.json")])
+        if not path:
+            return
+        try:
+            record, messages = tasks.TaskRecord.restore(path, s.app.chat_prompt())
+            if record.app_id != s.id:
+                raise ValueError("This task belongs to a different app. Open its tab to resume it.")
+            # Keep the current conversation recoverable when replacing it.
+            if s.record.briefs:
+                s.record.save(self._task_path(s), s.messages)
+            s.record, s.messages = record, messages
+            s.cancel.clear()
+            s.view.config(state="normal")
+            s.view.delete("1.0", "end")
+            s.view.config(state="disabled")
+            for msg in messages:
+                if msg.get("role") in ("user", "assistant") and isinstance(msg.get("content"), str):
+                    self._role(s, "YOU" if msg["role"] == "user" else s.app.tab.upper(), "role_user" if msg["role"] == "user" else "role_asst")
+                    self._write(s, msg["content"] + "\n", "user" if msg["role"] == "user" else "asst")
+            self._write(s, "Task restored. Send a message to continue; the current project must be inspected first.\n", "sys")
+        except Exception as e:
+            self._write(s, "Could not restore task: %s\n" % e, "err")
+
+    def _task_progress(self):
+        s = self.cur()
+        if s is None:
+            return
+        # The worker owns the mutable record while busy; show a stable file snapshot.
+        try:
+            with open(self._task_path(s), encoding="utf-8") as f:
+                record = json.load(f)["record"]
+        except (OSError, ValueError, KeyError):
+            record = {"status": "No saved progress yet."}
+        win = tk.Toplevel(self)
+        win.title("Task progress — " + s.app.tab)
+        view = self._skin(tk.Text(win, wrap="word", font=self.f_body,
+                                  width=75, height=28), bg="bg", fg="text")
+        view.pack(fill="both", expand=True)
+        view.insert("end", str(record.get("status", "No saved progress yet.")) + "\n\n")
+        for key, label in (("briefs", "Your requests"), ("plan", "Plan"), ("issues", "Open issues")):
+            items = record.get(key, [])
+            if items:
+                view.insert("end", label + "\n")
+                for i, item in enumerate(items, 1):
+                    view.insert("end", "%d. %s\n" % (i, item))
+                view.insert("end", "\n")
+        if record.get("checks"):
+            view.insert("end", "Acceptance checks (agent observations)\n")
+            for check in record["checks"]:
+                view.insert("end", str(check.get("requirement", "")) + "\n  " +
+                            (check.get("evidence") or "Not verified yet") + "\n")
+            view.insert("end", "\n")
+        view.insert("end", "Saved task: " + self._task_path(s))
+        view.config(state="disabled")
+
+    def _capabilities(self):
+        s = self.cur()
+        if s is None or s.busy or s.booting or not s.ready:
+            return
+        if not s.app.groups:
+            self._write(s, "This tab has no bridge, so there are no capabilities "
+                           "to choose. Open an app tab for that.\n", "sys")
+            return
+        win = tk.Toplevel(self)
+        win.title("Capabilities — " + s.app.tab)
+        self._skin(win, bg="bg")
+        variables = {}
+        for group in s.app.groups:
+            var = tk.BooleanVar(value=group in s.groups)
+            variables[group] = var
+            control = tk.Checkbutton(win, text=group.capitalize(), variable=var,
+                                     font=self.f_body)
+            self._skin(control, bg="bg", fg="text", selectcolor="card",
+                       activebackground="bg", activeforeground="text")
+            control.pack(anchor="w", padx=self._px(16), pady=self._px(3))
+            # Default tools remain available because the app prompt names them.
+            if group in s.app.default_groups:
+                control.config(state="disabled")
+        def apply():
+            if self.sessions.get(s.id) is not s or s.busy:
+                win.destroy()
+                return
+            s.groups = [g for g, var in variables.items() if var.get()]
+            wanted = s.app.tool_names(s.groups)
+            s.tools = eng.to_openai_tools([t for t in s.schemas if t["name"] in wanted])
+            # A made tool built on a tool this tab no longer offers is dropped
+            # from the model's list rather than failing when it is called.
+            self._load_library(s)
+            s.busy = True
+            s.cancel.clear()
+            s.status = ("warming selected capabilities", "warn", False)
+            self._apply_status()
+            self._spawn(s.event_id, self._warm_capabilities, s)
+            win.destroy()
+        button = self._skin(tk.Button(win, text="Apply", command=apply),
+                            bg="accent", fg="accent_fg")
+        button.pack(padx=self._px(16), pady=self._px(12))
+
+    def _warm_capabilities(self, s):
+        try:
+            self.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
+                           {"role": "user", "content": "Say ready."}],
+                          tasks.inference_tools(s.tools, s.library), max_tokens=1)
+            self.q.put(("sys", s.event_id, "Selected capabilities are ready."))
+        finally:
+            self.q.put(("status", s.event_id, ("ready", "ok", False)))
+            self.q.put(("idle", s.event_id, None))
+
+    def _show_preview(self, s, item):
+        try:
+            data = item.get("data", "")
+            if len(data) > 20_000_000:
+                raise ValueError("preview exceeds the display size limit")
+            photo = tk.PhotoImage(data=data, master=self)
+            factor = max(1, (photo.width() + self._px(639)) // self._px(640),
+                         (photo.height() + self._px(359)) // self._px(360))
+            if factor > 1:
+                photo = photo.subsample(factor)
+            s.preview_images.append(photo)
+            s.view.config(state="normal")
+            s.view.image_create("end", image=photo)
+            s.view.insert("end", "\n")
+            s.view.config(state="disabled")
+            s.view.see("end")
+        except Exception as e:
+            self._write(s, "Preview could not be displayed: %s\n" % e, "sys")
+
+    def _vision_review(self, item, brief):
+        # Explicit configuration: never load a resident model on this workstation.
+        model = os.environ["STUDIO_VISION_MODEL"]
+        reviewer = eng.LLM(self.host, model)
+        response = reviewer.chat([{"role": "user", "content": [
+            {"type": "text", "text": "Review this frame against the brief. Identify concrete visual defects and corrections. Do not claim to assess motion or audio from a still. Brief: " + json.dumps(brief)},
+            {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" %
+                (item.get("mimeType", "image/png"), item["data"])}}]}], max_tokens=700)
+        return response["choices"][0]["message"].get("content") or "No assessment returned."
+
     def _on_return(self, ev):
         if ev.state & 0x0001:  # Shift+Enter = newline
             return None
-        self._on_send()
+        if self.cur() is None or not self.cur().busy:
+            self._on_send()
         return "break"
 
     def _on_new(self):
@@ -1631,7 +1921,12 @@ class Chat(tk.Tk):
 
     def _on_send(self):
         s = self.cur()
-        if s is None or s.busy:
+        if s is None:
+            return
+        if s.busy:
+            s.cancel.set()
+            s.status = ("stopping after the current operation; completed edits remain", "warn", False)
+            self._apply_status()
             return
         task = self.input.get("1.0", "end").strip()
         if not task:
@@ -1644,69 +1939,45 @@ class Chat(tk.Tk):
         self._role(s, "YOU", "role_user")
         self._write(s, task + "\n", "user")
         s.messages.append({"role": "user", "content": task})
+        s.record.briefs.append(task)
+        s.cancel.clear()
         s.busy = True
         s.status = ("working", "warn", False)
         self._apply_status()
-        self._spawn(s.id, self._turn, s)
-
-    def _trim(self, s):
-        if len(s.messages) > MAX_HISTORY + 1:
-            keep = s.messages[1:][-MAX_HISTORY:]
-            while keep and keep[0].get("role") == "tool":
-                keep.pop(0)  # never open on an orphaned tool reply
-            s.messages = s.messages[:1] + keep
+        self._spawn(s.event_id, self._turn, s)
 
     def _turn(self, s):
-        sid = s.id
-        for _ in range(MAX_STEPS):
-            self._trim(s)
-            started = {"v": False}
-
-            def on_text(piece, st=started):
-                if not st["v"]:
-                    st["v"] = True
+        sid = s.event_id
+        started = {"value": False}
+        def emit(kind, payload):
+            if kind == "token":
+                if not started["value"]:
                     self.q.put(("stream_start", sid, None))
-                self.q.put(("token", sid, piece))
-
-            msg = self.llm.stream(s.messages, s.tools, on_text)
+                    started["value"] = True
+            elif kind == "stream_end":
+                started["value"] = False
+            self.q.put((kind, sid, payload))
+        def checkpoint():
+            s.record.save(self._task_path(s), s.messages)
+        try:
+            executor = tasks.Executor(self.llm, s.mcp, s.tools, schemas=s.schemas,
+                record=s.record, cancel=s.cancel, emit=emit, checkpoint=checkpoint,
+                vision=self._vision_review if os.environ.get("STUDIO_VISION_MODEL") else None,
+                library=s.library)
+            executor.run(s.messages, MAX_STEPS)
+        except Exception:
+            s.record.status = "interrupted; inspect project state before continuing"
+            try:
+                checkpoint()
+            except Exception:
+                pass
+            raise
+        finally:
             self.q.put(("stream_end", sid, None))
-            s.messages.append(msg)
-
-            calls = msg.get("tool_calls") or []
-            if not calls:
-                if not (msg.get("content") or "").strip():
-                    self.q.put(("error", sid, "The model returned an empty reply."))
-                self._refresh_bridge(s)
-                self.q.put(("idle", sid, None))
-                return
-
-            for call in calls:
-                fn = call["function"]
-                name = fn["name"]
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except json.JSONDecodeError as e:
-                    out = ("TOOL ERROR: arguments were not valid JSON (%s). "
-                           "Re-issue with valid JSON." % e)
-                    self.q.put(("tool", sid, "%s  [bad arguments]" % name))
-                else:
-                    preview = json.dumps(args)
-                    self.q.put(("tool", sid, "%s %s" % (
-                        name, preview[:110] + ("..." if len(preview) > 110 else ""))))
-                    try:
-                        out = eng.mcp_result_to_text(s.mcp.call_tool(name, args))
-                    except Exception as e:
-                        out = "TOOL ERROR: %s" % e
-                    # collapse to one line - raw JSON's first line is often just "["
-                    flat = " ".join(out.split())
-                    self.q.put(("tool_result", sid,
-                                flat[:110] + ("..." if len(flat) > 110 else "")))
-                s.messages.append({"role": "tool",
-                                   "tool_call_id": call.get("id", name),
-                                   "content": out})
-        self.q.put(("sys", sid, "Stopped - the agent hit its step limit for this turn."))
-        self._refresh_bridge(s)
-        self.q.put(("idle", sid, None))
+            complete = s.record.status.startswith("response complete")
+            status = "stopped" if s.cancel.is_set() else "ready" if complete else "needs attention"
+            self.q.put(("status", sid, (status, "muted" if complete else "warn", False)))
+            self.q.put(("idle", sid, None))
 
     def _quit(self):
         for s in self.sessions.values():
