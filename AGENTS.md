@@ -4,7 +4,8 @@ Working notes for anyone — human or agent — changing this project.
 
 ## What this is
 
-A chat app that drives creative apps with a **local LLM**, one tab per app. Two
+A chat app that drives creative apps with a **local LLM**, one tab per app — plus
+a **Chat** tab with no app behind it, for the questions that need no tools. Two
 moving parts:
 
 - **`studio_agent.py`** — the engine. The **app registry**, an MCP stdio client, an
@@ -14,6 +15,10 @@ moving parts:
 - **`studio_chat.py`** — the Tkinter GUI, and the way the app is actually used.
   Launched with no console via `Studio Assistant.cmd` and the Desktop / Start Menu
   shortcuts.
+- **`studio_tasks.py`** — shared GUI/CLI execution, original-schema validation,
+  bounded request context, cancellation, execution journals and task recovery.
+- **`studio_toolsmith.py`** — tools the model makes for itself, and the per-app
+  library they are kept in.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -52,6 +57,32 @@ bridge (`command`, `args`), what to expose (`groups`, `default_groups`), and how
 talk about it (`system_prompt`, `examples`, badge colours). Adding an app is an entry,
 not a code change; `tests/test_agent.py` walks the registry and fails on a half-filled
 one.
+
+### The tab with no app: `ChatSpec`
+
+`CHAT` is an `AppSpec` subclass with everything bridge-shaped emptied out: no
+`command`, no `groups`, no tools, and `drivable = False`. It duck-types the rest of
+`AppSpec`, so `Session`, the tab strip, the transcript and the executor need no
+special case for it. Two rules keep it honest:
+
+- **It is not in `APPS`.** `DRIVABLE` is derived from that list, and the sidebar must
+  not advertise chat as something the agent can drive. `TABS` / `TABS_BY_ID` are the
+  wider set — everything that can be a tab — and are what the tab strip, the new-tab
+  menu and `--app` read.
+- **`drivable` is the question everything bridge-shaped asks first.** Starting a
+  bridge, probing, launching the app, counting bridges in the sidebar, offering
+  capability groups, `Start <app>`: each checks it. `_boot_session` skips straight to
+  the warm-up, and the bridges row counts drivable tabs only — counting chat would
+  report one of two bridges missing when nothing is missing at all.
+
+Its prompt has one job the app prompts do not: **stop the model claiming work it
+cannot do.** There is no bridge to fail, so nothing else will contradict a confident
+"done — I added the layer". `chat_prompt()` also drops `CHAT_SUFFIX` and
+`QUALITY_RULES`, which brief a tab on its bridge and its tools; with no tools they
+describe something absent. `inference_tools([])` returns `[]` for the same reason —
+no bridge tools means no internal ones either — and the executor then leaves the
+saved-task block out of the request, because a tab that cannot change anything has no
+task to carry.
 
 Two things stay derived, never hand-maintained:
 
@@ -108,7 +139,9 @@ runner (llama.cpp, vLLM grammar mode) will hit the same wall.
 is `(action, params)`, and the description is the entire list of actions it accepts.
 The old 1024-char cap amputated half of `timeline`'s actions, and the model then
 confidently invented the missing ones. That failure is silent: no error, just wrong
-calls. `MAX_TOOL_DESC_CHARS` is 4000 and `tests/test_agent.py` guards it.
+calls. `MAX_TOOL_DESC_CHARS` remains 4000 as a compatibility constant, but conversion
+now preserves full descriptions. The executor budgets the entire request and fails
+explicitly if the fixed tool contract and brief cannot fit.
 
 **Never name a Tk widget method `_w`.** Tkinter's `Misc` uses `self._w` for the
 widget's Tcl pathname. Shadowing it sends `__repr__` into infinite recursion and the
@@ -159,7 +192,9 @@ One `Session` per app: its own `MCPClient`, tool list, message history, transcri
 `tk.Text` and busy flag. Nothing is shared but the `LLM` (one host, one model) and the
 composer.
 
-- **Queue events carry a session id**: `self.q.put((kind, sid, payload))`. A `sid` of
+- **Worker events carry a session generation**: use `s.event_id` (app id, unique
+  generation) in `self.q.put((kind, sid, payload))`. App IDs still key UI dictionaries.
+  Never route worker output with only the reusable app ID. A `sid` of
   `None` means "whatever tab the user is looking at" — startup failures on the shared
   inference host have no app of their own. `_handle` resolves it.
 - **The header describes the active tab only.** Status, the Send button and the
@@ -170,9 +205,9 @@ composer.
   switching away and back.
 - **Tabs come and go.** `_add_tab()` / `_close_tab()` maintain `sessions`, `order`
   and `tab_ui` together, and closing shuts the MCP subprocess down off the UI thread.
-  A turn already in flight keeps running, so `_handle()` **drops any event whose sid
-  is no longer in `sessions`** — otherwise a closed tab's reply lands in whatever app
-  you happen to be looking at.
+  Closing sets cancellation. An operation already in flight may finish;
+  `_handle()` drops events for missing or mismatched generations, including when
+  the same app tab has already been reopened.
 - **Every tab can be closed.** `active` is then `None` and `cur()` returns `None`;
   the stack shows `self.empty`, and host-level errors — which have no app of their
   own — are written into `empty_msg` so the rule that errors reach the user as prose
@@ -183,6 +218,57 @@ composer.
   best-effort: a hand-wrecked or unwritable file costs a preference, never the app,
   and everything loaded off disk is re-validated — `"hidden": "nope"` must not hide
   four apps called n, o, p and e.
+
+## Task execution and recovery
+
+- GUI and CLI use `studio_tasks.Executor`; do not add another tool loop. That
+  includes the chat tab: same executor, same journal, an empty tool list.
+- Keep original MCP schemas in `Session.schemas` for validation. Sanitized schemas
+  are the inference representation only; preserve compound-tool descriptions.
+- `studio_task_update` is an internal tool exposed alongside bridge tools. Warm-up
+  must use the same system prompt and tool list, including that internal tool.
+- GUI task JSON files live beside settings in `tasks/<app>/<task-id>.json`. Persist
+  intent before dispatch and results afterward. A disk failure stops edits. Task
+  records preserve conversational progress, not project backups or undo state.
+- Unknown write outcomes must not trigger blind repeats. Restored tasks need a
+  project read before editing. Read-back guards do not independently prove visual
+  or semantic correctness; distinguish observations from model claims.
+- Stop prevents subsequent dispatches; it cannot undo or guarantee cancellation of
+  an in-flight operation. Complete tool-result envelopes when stopping a batch.
+- Optional `STUDIO_VISION_MODEL` uses the same remote host as the executing model.
+  Never move inference to the workstation. Session-owned preview images keep Tk
+  references alive; stale-generation preview events must be dropped.
+
+## Tools the model makes for itself
+
+`studio_tool_create` lets the model name a run of calls it keeps repeating.
+`studio_toolsmith.py` holds the definition, the per-app library and the checks.
+
+- **A made tool is data, never code.** It names tools already exposed to the tab and
+  fills their arguments from its own declared inputs; `{input}` on its own keeps the
+  input's type, anywhere else it is textual substitution. There is no `eval` here and
+  there must not be one — this runs on the workstation driving a live project.
+- **Steps go back through `Executor._call`.** That is the whole safety argument: a made
+  tool cannot name a tool the tab was not given, cannot skip validation against the
+  bridge's *original* schema or the compound-action contract, cannot get past the
+  Resolve `quit` prohibition, and cannot keep its steps out of the journal — where each
+  carries `via` naming the tool it ran under. Never dispatch a step any other way.
+- **Made tools go last in the tool list.** `inference_tools()` appends them after the
+  fixed contract so making one re-prefills the tail of LM Studio's cached prefix rather
+  than the whole tool set. Keep them last, and keep every warm-up path passing the same
+  library the executor gets, or the warm-up stops matching the request it is warming.
+- **Creation checks the template with sample inputs**, so a structurally wrong step —
+  a missing required argument, a misspelled key, the wrong type — is refused before the
+  tool exists. `relax()` drops value constraints for that check on purpose: a sample
+  cannot satisfy an enum or a pattern, and rejecting on one would block a legitimate
+  tool. Real values are validated on every call like any other tool's.
+- **The library is re-validated on load, against the tools the tab currently offers.**
+  Groups change; a tool built on something no longer exposed is left out and said aloud,
+  never handed to the model as a tool that cannot run. Like the settings file, a wrecked
+  or unwritable file costs one made tool and never the app — and when it cannot be
+  saved, the model is told the tool is session-only rather than left to assume.
+- The chat tab gets no tool maker: `inference_tools([])` is still `[]`, and there would
+  be nothing to make a tool out of.
 
 ## Running and testing
 

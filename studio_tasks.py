@@ -1,0 +1,632 @@
+"""Shared, stdlib-only task execution and recoverable task records.
+
+The bridge's original schemas validate calls; grammar-compatible copies are only
+for inference. A record is evidence of execution, not proof of visual quality.
+"""
+import json
+import math
+import os
+import tempfile
+import threading
+import uuid
+
+import studio_agent as eng
+import studio_toolsmith as toolsmith
+import studio_workflows as workflows
+
+
+TASK_TOOL = {"type": "function", "function": {
+    "name": "studio_task_update",
+    "description": "Keep the task brief and progress across long conversations. Before substantial edits, record a plan and acceptance checks. Update objects with real IDs, and checks with observed evidence; never invent evidence. This does not edit the creative app.",
+    "parameters": {"type": "object", "additionalProperties": False,
+        "properties": {
+            "plan": {"type": "array", "items": {"type": "string"}},
+            "objects": {"type": "object", "additionalProperties": {"type": "string"}},
+            "checks": {"type": "array", "items": {"type": "object",
+                "properties": {"requirement": {"type": "string"},
+                               "evidence": {"type": "string"}},
+                "required": ["requirement", "evidence"], "additionalProperties": False}},
+            "issues": {"type": "array", "items": {"type": "string"}}}}}}
+
+QUALITY_RULES = """
+
+TASK QUALITY
+- Use studio_workflow_capabilities to discover higher-level workflows and their
+  blockers. Available inspection adapters return real bridge observations.
+  Unavailable workflows are not callable; never claim a capability report inspected
+  a project, transcribed audio, applied a style, or verified a result.
+- studio_tool_create records a repeated sequence of this tab's own tools under
+  one name. It creates a tool; it neither runs one nor edits the project, and it
+  cannot reach a tool this tab was not given. One-off work goes to the bridge
+  tools directly. A tool you made is a shorthand, never evidence of a result.
+- For substantial edits use studio_task_update to record the plan, acceptance
+  checks, relevant object IDs, and unresolved issues. Preserve the user's exact
+  wording and constraints. Ask only about missing details that affect the result.
+- Inspect the target before editing. After editing, read the changed target and
+  compare it with the brief. A successful write alone is not verification.
+- For visual work request a preview when a suitable tool is exposed. A text-only
+  model cannot judge an image placeholder. Say when visual review is still needed.
+- Animation workflow: confirm copy, dimensions, frame rate and duration; construct
+  the design; animate; inspect timing and representative frames; refine defects.
+- Assembly workflow: identify source media; check frame rate and source ranges;
+  assemble; inspect track placement, gaps, overlaps and total duration.
+- Delivery workflow: inspect available formats and settings; confirm output path;
+  submit only the requested job; check actual completion before claiming export.
+- Before substantial changes to existing work, use a supported duplicate or backup
+  operation when available. Never invent backup tools or imply undo is guaranteed.
+- If blocked or only partly verified, explain the limitation instead of claiming
+  completion. A timeout may mean an edit happened: inspect, never blindly repeat.
+"""
+
+
+def validate(value, schema, root=None, path="arguments"):
+    """Validate bridge schema constraints without relaxing them for inference.
+
+    Supports local refs, combinators, tuple arrays, objects and scalar bounds.
+    Unknown annotation/format keywords are left to the bridge.
+    """
+    root = schema if root is None else root
+    if schema is False:
+        raise ValueError(path + " is not allowed")
+    if schema is True:
+        return
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        if not ref.startswith("#/"):
+            raise ValueError("unsupported external schema reference: " + ref)
+        target = root
+        for part in ref[2:].split("/"):
+            target = target[part.replace("~1", "/").replace("~0", "~")]
+        validate(value, target, root, path)
+    for key in ("allOf", "anyOf", "oneOf"):
+        if key in schema:
+            passed = 0
+            for branch in schema[key]:
+                try:
+                    validate(value, branch, root, path)
+                    passed += 1
+                except ValueError:
+                    pass
+            if ((key == "allOf" and passed != len(schema[key])) or
+                    (key == "anyOf" and not passed) or (key == "oneOf" and passed != 1)):
+                raise ValueError(path + " does not match " + key)
+    if "not" in schema:
+        try:
+            validate(value, schema["not"], root, path)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(path + " matches a forbidden schema")
+    if "if" in schema:
+        try:
+            validate(value, schema["if"], root, path)
+            branch = "then"
+        except ValueError:
+            branch = "else"
+        validate(value, schema.get(branch, True), root, path)
+    numeric = type(value) in (int, float)
+    finite = numeric and (isinstance(value, int) or math.isfinite(value))
+    types = {"object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "boolean": isinstance(value, bool),
+             "null": value is None,
+             "number": finite,
+             "integer": finite and value == int(value)}
+    want = schema.get("type")
+    if want and not any(types.get(t, False) for t in (want if isinstance(want, list) else [want])):
+        raise ValueError(path + " must be " + str(want))
+    # JSON equality must distinguish true from 1.
+    def equal(a, b):
+        if type(a) in (int, float) and type(b) in (int, float):
+            return a == b
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, dict):
+            return a.keys() == b.keys() and all(equal(a[k], b[k]) for k in a)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
+        return a == b
+    if "enum" in schema and not any(equal(value, v) for v in schema["enum"]):
+        raise ValueError(path + " must be one of " + str(schema["enum"]))
+    if "const" in schema and not equal(value, schema["const"]):
+        raise ValueError(path + " has an invalid constant")
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                raise ValueError(path + "." + key + " is required")
+        props = schema.get("properties", {})
+        for key, val in value.items():
+            patterns = [s for p, s in schema.get("patternProperties", {}).items()
+                        if eng.re.search(p, key)]
+            if key in props:
+                validate(val, props[key], root, path + "." + key)
+            for pattern in patterns:
+                validate(val, pattern, root, path + "." + key)
+            if key not in props and not patterns:
+                validate(val, schema.get("additionalProperties", True), root, path + "." + key)
+    if isinstance(value, list):
+        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", math.inf):
+            raise ValueError(path + " has the wrong number of items")
+        prefix = schema.get("prefixItems", [])
+        items = schema.get("items", True)
+        if isinstance(items, list):
+            prefix, items = items, schema.get("additionalItems", True)
+        for i, val in enumerate(value):
+            validate(val, prefix[i] if i < len(prefix) else items, root, path + "[%d]" % i)
+        if schema.get("uniqueItems") and any(equal(a, b) for i, a in enumerate(value) for b in value[i + 1:]):
+            raise ValueError(path + " must contain unique items")
+    if type(value) in (int, float):
+        if not finite:
+            raise ValueError(path + " must be finite")
+        for key, invalid in (("minimum", lambda b: value < b), ("maximum", lambda b: value > b),
+                             ("exclusiveMinimum", lambda b: value <= b),
+                             ("exclusiveMaximum", lambda b: value >= b)):
+            if key in schema and invalid(schema[key]):
+                raise ValueError(path + " violates " + key)
+        if "multipleOf" in schema and not math.isclose(value / schema["multipleOf"], round(value / schema["multipleOf"]), abs_tol=1e-9):
+            raise ValueError(path + " violates multipleOf")
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
+            raise ValueError(path + " has an invalid length")
+        if "pattern" in schema and not eng.re.search(schema["pattern"], value):
+            raise ValueError(path + " does not match the required pattern")
+
+
+def readonly(name, args, spec):
+    # Compound tools mix reads and writes: inspect the action, not annotations
+    # describing the whole tool. Unknown actions are conservatively writes.
+    action = args.get("action")
+    if action is not None:
+        return isinstance(action, str) and (action.startswith(("get_", "list_", "is_")) or
+                                            action in ("get", "list"))
+    return (spec.get("annotations", {}).get("readOnlyHint") is True or
+            name.startswith(("get_", "list_", "find_", "screenshot_")) or
+            name in ("check_setup", "ae_guide", "diff_comp", "snapshot_comp"))
+
+
+def validate_action(args, description):
+    """Resolve compound tools document actions as name(params) under Actions:.
+
+    Use that explicit contract only; never infer actions from general prose.
+    Argument details not represented in JSON Schema remain the bridge's job.
+    """
+    if "action" not in args or "Actions:" not in description:
+        return
+    actions = set(eng.re.findall(r"^\s+([a-z][a-z0-9_]*)\([^\n]*\)\s*->",
+                                description.split("Actions:", 1)[1], eng.re.MULTILINE))
+    if actions and args["action"] not in actions:
+        raise ValueError("unsupported action %r; supported actions: %s" %
+                         (args["action"], ", ".join(sorted(actions))))
+
+
+def verification_read(name, args):
+    # App availability, UI page, and codec discovery do not inspect edited work.
+    if name in ("check_setup", "ae_guide", "resolve_control", "layout_presets", "render_presets"):
+        return False
+    if args.get("action") in ("get_formats", "get_codecs", "get_resolutions", "get_version"):
+        return False
+    return True
+
+
+class TaskRecord:
+    def __init__(self):
+        self.id = uuid.uuid4().hex
+        self.app_id = ""
+        self.briefs = []
+        self.plan = []
+        self.objects = {}
+        self.checks = []
+        self.issues = []
+        self.journal = []
+        self.status = "ready"
+
+    def context(self):
+        return {k: getattr(self, k) for k in ("briefs", "plan", "objects", "checks", "issues", "status")}
+
+    def save(self, path, messages):
+        if not path:
+            return
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "record": self.__dict__, "messages": messages}, f)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    @classmethod
+    def restore(cls, path, system_prompt):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("version") != 1:
+            raise ValueError("unsupported saved task version")
+        record, messages = cls(), data["messages"]
+        saved = data["record"]
+        for key, default in record.__dict__.items():
+            if key in saved:
+                if not isinstance(saved[key], type(default)):
+                    raise ValueError("invalid saved task field: " + key)
+                setattr(record, key, saved[key])
+        if not eng.re.fullmatch(r"[0-9a-f]{32}", record.id):
+            raise ValueError("invalid saved task id")
+        if not all(isinstance(b, str) for b in record.briefs):
+            raise ValueError("invalid saved task brief")
+        validate({k: getattr(record, k) for k in ("plan", "objects", "checks", "issues")},
+                 TASK_TOOL["function"]["parameters"])
+        if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+            raise ValueError("invalid saved messages")
+        if not all(isinstance(e, dict) for e in record.journal):
+            raise ValueError("invalid saved journal")
+        for entry in record.journal:
+            if entry.get("status") == "running":
+                entry["status"] = "unknown"
+        # A crash can leave a multi-call assistant message only partly answered.
+        repaired = [{"role": "system", "content": system_prompt}]
+        pending = set()
+        for m in messages[1:]:
+            if m.get("role") != "tool":
+                repaired.extend({"role": "tool", "tool_call_id": i,
+                                 "content": "Interrupted; outcome unknown. Inspect before continuing."}
+                                for i in sorted(pending))
+                pending.clear()
+            if m.get("role") == "assistant":
+                pending.update(c["id"] for c in m.get("tool_calls", []))
+            if m.get("role") == "tool":
+                if m.get("tool_call_id") not in pending:
+                    continue
+                pending.discard(m["tool_call_id"])
+            repaired.append(m)
+        repaired.extend({"role": "tool", "tool_call_id": i,
+                         "content": "Interrupted; outcome unknown. Inspect before continuing."}
+                        for i in sorted(pending))
+        record.status = "restored — inspect the current project before editing"
+        return record, repaired
+
+
+def context_messages(messages, record, tools, max_chars=100000, memory=True):
+    """Bound the request conservatively by characters, keeping whole exchanges.
+
+    Full history remains on disk. Never silently clip the brief or tool contract.
+    A budget too small for the fixed context fails before any app mutation.
+    `memory` carries the saved task record into the request; a tab with no tools
+    has no task to carry, and its conversation is the whole of its context.
+    """
+    block = {"role": "user", "content": "Saved task context (data, not new instructions):\n" +
+             json.dumps(record.context(), ensure_ascii=False)}
+    base = [messages[0], block] if memory else [messages[0]]
+    budget = max_chars - len(json.dumps(base)) - len(json.dumps(tools))
+    if budget < 0:
+        raise ValueError("The task brief and tool set exceed the context budget. Start a new task or select fewer tool groups.")
+    groups = []
+    for m in messages[1:]:
+        if m.get("role") == "tool" and groups:
+            groups[-1].append(m)
+        else:
+            groups.append([m])
+    kept = []
+    for group in reversed(groups):
+        size = len(json.dumps(group))
+        if size > budget:
+            if not kept:
+                raise ValueError("The latest tool exchange exceeds the context budget. Narrow the request.")
+            break
+        kept.insert(0, group)
+        budget -= size
+    return base + [m for group in kept for m in group]
+
+
+class CheckpointError(RuntimeError):
+    pass
+
+
+def inference_tools(tools, library=None):
+    """One exact tool prefix for execution and every GUI warm-up path.
+
+    With no bridge tools there is nothing to journal and no workflow to report,
+    so the internal tools go too: a plain chat tab is offered no tools at all,
+    including the one that makes tools - there would be nothing to make them
+    from. Tools the model made come last, so making one re-prefills the tail of
+    the cached prefix rather than the whole tool set.
+    """
+    if not tools:
+        return []
+    made = library.model_tools() if library is not None else []
+    return workflows.model_tools(tools) + [TASK_TOOL, toolsmith.CREATE_TOOL] + made
+
+
+class Executor:
+    def __init__(self, llm, mcp, tools, schemas=None, record=None, cancel=None,
+                 emit=None, checkpoint=None, vision=None, max_chars=100000,
+                 library=None):
+        self.llm, self.mcp = llm, mcp
+        self.bridge_tools = list(tools)
+        self.workflow_adapters = workflows.adapters(self.bridge_tools)
+        self.library = library
+        self.tools = inference_tools(self.bridge_tools, library)
+        self.allowed, self.specs = toolsmith.contracts(tools, schemas)
+        self.record = record or TaskRecord()
+        self.cancel = cancel or threading.Event()
+        self.emit = emit or (lambda kind, payload: None)
+        self.checkpoint = checkpoint or (lambda: None)
+        self.vision = vision
+        self.max_chars = max_chars
+        self.must_inspect = self.record.status.startswith("restored")
+        self.failed_calls = set()
+        self.via = None                   # the made tool a step is running under
+
+    def _save(self):
+        try:
+            self.checkpoint()
+        except Exception as e:
+            raise CheckpointError("Could not save task progress; execution stopped: " + str(e)) from e
+
+    def _call(self, call):
+        fn = call["function"]
+        name = fn["name"]
+        args = json.loads(fn.get("arguments") or "{}")
+        if not isinstance(args, dict):
+            raise ValueError("tool arguments must be an object")
+        if name == workflows.CAPABILITY_TOOL["function"]["name"]:
+            validate(args, workflows.CAPABILITY_TOOL["function"]["parameters"])
+            return json.dumps(workflows.capabilities(self.bridge_tools)), False, False
+        # Resolve to the original tool before validation, signatures, recovery,
+        # journaling and dispatch. Aliases cannot bypass any executor guard.
+        if name in self.workflow_adapters:
+            name = self.workflow_adapters[name][0]
+        if name == "studio_task_update":
+            validate(args, TASK_TOOL["function"]["parameters"])
+            for key, value in args.items():
+                if key == "objects":
+                    self.record.objects.update(value)
+                else:
+                    setattr(self.record, key, value)
+            return "Task record updated. Checks are reported observations, not independent proof.", False, False
+        if name == toolsmith.CREATE_TOOL["function"]["name"]:
+            validate(args, toolsmith.CREATE_TOOL["function"]["parameters"])
+            return self._make(args), False, False
+        made = self.library.get(name) if self.library is not None else None
+        if made is not None:
+            validate(args, made.parameters())
+            return self._run_made(made, args)
+        if name not in self.allowed:
+            raise ValueError("tool is not enabled: " + name)
+        spec = self.specs.get(name, {})
+        validate(args, spec.get("inputSchema", self.allowed[name]))
+        validate_action(args, spec.get("description", ""))
+        if name == "resolve_control" and str(args.get("action", "")).lower().strip() == "quit":
+            raise ValueError("Closing Resolve is prohibited; it may contain unsaved work.")
+        signature = json.dumps([name, args], sort_keys=True)
+        previous = [e for e in self.record.journal if e.get("signature") == signature]
+        if any(e.get("status") in ("running", "unknown") for e in previous):
+            raise ValueError("A previous call has an unknown outcome. Inspect the project; do not repeat that call.")
+        if signature in self.failed_calls:
+            raise ValueError("This exact call already failed. Correct the arguments or explain the blocker.")
+        read = readonly(name, args, spec)
+        if not read and self.must_inspect:
+            raise ValueError("Inspect the current project before editing a restored task.")
+        entry = {"name": name, "arguments": args, "signature": signature,
+                 "read": read, "status": "running"}
+        if self.via:
+            entry["via"] = self.via       # a step of a made tool, not a bare call
+        self.record.journal.append(entry)
+        self._save()  # record intent before a call can change the project
+        self.emit("tool", name + " " + json.dumps(args)[:160])
+        try:
+            result = self.mcp.call_tool(name, args)
+        except (TimeoutError, ConnectionError, BrokenPipeError, EOFError) as e:
+            self.failed_calls.add(signature)
+            entry["status"] = "unknown" if not read else "error"
+            entry["result"] = str(e)
+            raise RuntimeError("Bridge response lost; outcome %s. Inspect before continuing: %s" % (entry["status"], e))
+        except Exception as e:
+            self.failed_calls.add(signature)
+            entry["status"] = "unknown" if not read else "error"
+            entry["result"] = str(e)
+            raise
+        text = eng.mcp_result_to_text(result)
+        failed = isinstance(result, dict) and result.get("isError", False)
+        structured = result.get("structuredContent") if isinstance(result, dict) else None
+        if isinstance(structured, dict) and (structured.get("success") is False or structured.get("error")):
+            failed = True
+        # Some bridges encode failure in their JSON text rather than isError.
+        if isinstance(result, dict):
+            for item in result.get("content", []) or []:
+                if item.get("type") == "text":
+                    try:
+                        payload = json.loads(item.get("text", ""))
+                        if isinstance(payload, dict) and (payload.get("success") is False or payload.get("error")):
+                            failed = True
+                    except (ValueError, TypeError):
+                        pass
+        entry["status"] = "error" if failed else "ok"
+        if failed:
+            self.failed_calls.add(signature)
+        entry["result"] = text
+        if isinstance(result, dict):
+            # Preserve complete textual evidence on disk; image payloads belong
+            # to the preview surface and must not inflate the model context.
+            entry["raw_result"] = {k: v for k, v in result.items() if k != "content"}
+            entry["raw_result"]["content"] = [i for i in result.get("content", []) or []
+                                               if i.get("type") != "image"]
+        if failed and not text.startswith("TOOL ERROR"):
+            text = "TOOL ERROR: " + text
+        verified_read = read and not failed and verification_read(name, args)
+        entry["verifies"] = verified_read
+        if verified_read:
+            self.must_inspect = False
+        for item in result.get("content", []) if isinstance(result, dict) else []:
+            if item.get("type") == "image":
+                self.emit("preview", item)
+                if self.vision and not self.cancel.is_set():
+                    try:
+                        critique = self.vision(item, self.record.context())
+                        text += "\nVisual review (model assessment): " + critique
+                        self.emit("sys", "Visual review: " + critique)
+                    except Exception as e:
+                        text += "\nVisual review unavailable: " + str(e)
+                else:
+                    text += "\nPreview available to the user; visual quality has not been assessed by the model."
+        return text, not read and not failed, verified_read
+
+    def _make(self, args):
+        """Record a new tool. This writes a definition; it changes no project."""
+        if self.library is None:
+            raise ValueError("This tab cannot make tools.")
+        made = toolsmith.parse(args, self.allowed, self.specs, self.library.made)
+        note = self.library.add(made)
+        # Made tools are appended after the fixed contract, so the model sees
+        # this one from its next message on without re-prefilling the rest.
+        self.tools = inference_tools(self.bridge_tools, self.library)
+        self.emit("sys", "Made a tool: %s (%s)" % (made.name, made.summary()))
+        return ("Created %s. It runs %s, and is available from your next message. "
+                "It has changed nothing in the project.%s"
+                % (made.name, made.summary(), " " + note if note else ""))
+
+    def _run_made(self, made, args):
+        """Run a made tool's steps as ordinary bridge calls.
+
+        Every step goes back through _call, so a made tool cannot reach a tool
+        this tab was not given, skip validation or the Resolve prohibition, or
+        keep its work out of the journal. The read-back obligation is carried
+        step by step in order: a tool that edits and then inspects clears it, a
+        tool that inspects and then edits does not.
+        """
+        steps = made.calls(args)
+        for tool, _ in steps:
+            if tool not in self.allowed:
+                raise ValueError("%s uses %s, which this tab no longer offers. "
+                                 "Make it again from the tools you have."
+                                 % (made.name, tool))
+        results, pending, verified, failed = [], False, False, False
+        for index, (tool, arguments) in enumerate(steps, 1):
+            if self.cancel.is_set():
+                results.append({"step": index, "tool": tool,
+                                "result": "Cancelled; this step was not executed."})
+                failed = True
+                break
+            self.via = made.name
+            try:
+                text, wrote, read = self._call(
+                    {"function": {"name": tool, "arguments": json.dumps(arguments)}})
+            except CheckpointError:
+                raise                     # progress is unsaved; stop, do not continue
+            except Exception as e:
+                results.append({"step": index, "tool": tool, "arguments": arguments,
+                                "result": "TOOL ERROR: " + str(e)})
+                failed = True
+                break
+            finally:
+                self.via = None
+            pending = (pending or wrote) and not read
+            verified = read or (verified and not wrote)
+            results.append({"step": index, "tool": tool, "arguments": arguments,
+                            "result": text})
+        report = json.dumps({"tool": made.name, "steps_run": len(results),
+                             "steps_total": len(made.steps), "results": results},
+                            ensure_ascii=False)
+        if failed:
+            report = ("TOOL ERROR: %s stopped at step %d of %d%s. "
+                      % (made.name, len(results), len(made.steps),
+                         "; earlier steps already ran" if len(results) > 1 else "")) + report
+        return report, pending, verified and not pending
+
+    def run(self, messages, max_steps=25, streaming=True):
+        try:
+            return self._run(messages, max_steps, streaming)
+        except BaseException:
+            # A persistence/transport failure may interrupt a multi-call batch.
+            # Complete its protocol replies so the next user message is valid.
+            pending = set()
+            for message in messages:
+                if message.get("role") == "assistant":
+                    pending.update(c["id"] for c in message.get("tool_calls", []))
+                elif message.get("role") == "tool":
+                    pending.discard(message.get("tool_call_id"))
+            messages.extend({"role": "tool", "tool_call_id": ident,
+                             "content": "Execution interrupted. Check the task journal and inspect the project before continuing."}
+                            for ident in sorted(pending))
+            self.record.status = "interrupted; inspect before continuing"
+            try:
+                self._save()
+            except Exception:
+                pass
+            raise
+
+    def _run(self, messages, max_steps=25, streaming=True):
+        failures, needs_read, reminders = 0, False, 0
+        for entry in self.record.journal:
+            if entry.get("verifies") and entry.get("status") == "ok":
+                needs_read = False
+            elif not entry.get("read") and entry.get("status") in ("ok", "running", "unknown"):
+                needs_read = True
+        self.record.status = "working"
+        self._save()
+        def stop(reason):
+            self.record.status = reason
+            self._save()
+            self.emit("sys", reason)
+            return reason
+        for _ in range(max_steps):
+            if self.cancel.is_set():
+                return stop("Stopped. Completed edits remain; inspect before resuming.")
+            context = context_messages(messages, self.record, self.tools,
+                                       self.max_chars, memory=bool(self.tools))
+            if streaming:
+                msg = self.llm.stream(context, self.tools,
+                                      lambda piece: self.emit("token", piece))
+            else:
+                choice = self.llm.chat(context, self.tools)["choices"][0]
+                if choice.get("finish_reason") not in (None, "stop", "tool_calls"):
+                    return stop("Stopped: incomplete inference response. No tools from that response were executed.")
+                msg = choice["message"]
+            self.emit("stream_end", None)
+            calls = msg.get("tool_calls") or []
+            # Validate the whole envelope before dispatching any part of a batch.
+            ids = set()
+            for call in calls:
+                if (not isinstance(call, dict) or not isinstance(call.get("id"), str) or
+                        call["id"] in ids or not isinstance(call.get("function"), dict) or
+                        not isinstance(call["function"].get("name"), str) or
+                        not isinstance(call["function"].get("arguments", ""), str)):
+                    return stop("Stopped: the model returned an invalid tool-call envelope. No calls from that response were executed.")
+                ids.add(call["id"])
+            messages.append(msg)
+            if not calls:
+                if self.cancel.is_set():
+                    return stop("Stopped. No further tools were called.")
+                if needs_read and reminders < 2:
+                    messages.append({"role": "user", "content":
+                        "Before finishing, inspect the target changed by your last edit and compare with the brief. If unable, state that the work is unverified and explain the blocker."})
+                    reminders += 1
+                    continue
+                final = msg.get("content") or "The model returned an empty reply."
+                if needs_read:
+                    return stop("Edits were made but remain unverified. " + final)
+                self.record.status = "response complete; see recorded checks and limitations"
+                self._save()
+                return final
+            for call in calls:
+                if self.cancel.is_set():
+                    out = "Cancelled before dispatch; this call was not executed."
+                elif failures >= 3:
+                    out = "Not executed: stopped after three consecutive tool errors."
+                else:
+                    try:
+                        out, wrote, read = self._call(call)
+                        needs_read = (needs_read or wrote) and not read
+                    except CheckpointError:
+                        raise
+                    except Exception as e:
+                        out = "TOOL ERROR: " + str(e)
+                        if self.record.journal and self.record.journal[-1].get("status") == "unknown":
+                            needs_read = True
+                            self.must_inspect = True
+                    failures = failures + 1 if out.startswith("TOOL ERROR") else 0
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": out})
+                self.emit("tool_result", " ".join(out.split())[:180])
+                self._save()
+            if failures >= 3:
+                return stop("Stopped after repeated tool errors. Review the last error and inspect the project before continuing.")
+        return stop("Stopped at the step limit. Progress is saved; inspect and continue the task when ready.")
