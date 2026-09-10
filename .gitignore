@@ -1,10 +1,11 @@
 __pycache__/
 *.py[cod]
 *.log
-ae_agent_error.log
+studio_assistant_error.log
 .venv/
 venv/
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+studio-assistant-preview.png
