@@ -209,6 +209,16 @@ class TestAppRegistry(unittest.TestCase):
         self.assertIn("`index`", ae.system_prompt)
         self.assertIn("NEVER", ae.system_prompt)
 
+    def test_default_ae_tools_can_finish_and_edit_a_visible_shape(self):
+        # A layer container alone cannot fulfil "make a circle". Guard the
+        # complete workflow, independently of how the groups are organised.
+        ae = eng.APPS_BY_ID["after-effects"]
+        required = {"list_comps", "get_comp", "create_shape_layer",
+                    "add_shape_content", "set_shape_path", "set_shape_property",
+                    "get_layer_full"}
+        self.assertFalse(required - ae.tool_names(),
+                         "Default AE tools must include geometry and paint")
+
     def test_prompts_only_name_tools_the_app_exposes(self):
         """
         The prompts brief the model on real tools by name. Move one out of
@@ -228,6 +238,52 @@ class TestAppRegistry(unittest.TestCase):
         with self.assertRaises(KeyError) as ctx:
             eng.get_app("nope")
         self.assertIn("after-effects", str(ctx.exception))
+
+
+class TestPlainChat(unittest.TestCase):
+    """The one tab with no app behind it: a conversation and nothing else."""
+
+    def test_it_is_a_tab_but_never_a_drivable_app(self):
+        """DRIVABLE is derived from APPS, and the sidebar must not offer chat
+        as something this agent can drive."""
+        self.assertNotIn(eng.CHAT, eng.APPS)
+        self.assertNotIn("chat", eng.APPS_BY_ID)
+        self.assertNotIn(eng.CHAT.name, eng.DRIVABLE)
+        self.assertIn(eng.CHAT, eng.TABS)
+        self.assertIs(eng.TABS_BY_ID["chat"], eng.CHAT)
+        self.assertIs(eng.get_app("chat"), eng.CHAT)
+
+    def test_nothing_tries_to_start_probe_or_find_it(self):
+        self.assertFalse(eng.CHAT.drivable)
+        self.assertTrue(all(app.drivable for app in eng.APPS))
+        self.assertIsNone(eng.CHAT.exe())
+        self.assertTrue(eng.CHAT.installed())    # nothing to install
+        self.assertTrue(eng.CHAT.running())      # the tab is the whole of it
+        with self.assertRaises(RuntimeError):
+            eng.CHAT.launch()
+
+    def test_it_offers_no_tools_and_no_groups(self):
+        self.assertEqual(eng.CHAT.tool_names(), set())
+        self.assertEqual(eng.CHAT.groups, {})
+        self.assertEqual(eng.CHAT.default_groups, [])
+
+    def test_the_prompt_carries_no_tool_rules(self):
+        """The app suffixes brief a tab on its bridge and its tools. This tab
+        has neither, and the rules would be describing something absent."""
+        prompt = eng.CHAT.chat_prompt()
+        self.assertEqual(prompt, eng.CHAT.system_prompt)
+        self.assertEqual(prompt, eng.CHAT.cli_prompt())
+        for absent in ("studio_task_update", "studio_workflow_capabilities",
+                       "TASK QUALITY"):
+            self.assertNotIn(absent, prompt)
+
+    def test_the_prompt_forbids_claiming_work_it_cannot_do(self):
+        """A confident "done - I added the layer" from a tab that cannot reach
+        After Effects is worse than no answer at all."""
+        prompt = eng.CHAT.chat_prompt()
+        self.assertIn("no bridge", prompt)
+        self.assertIn("never describe such a change as done", prompt)
+        self.assertIn("Chat", prompt)
 
 
 class TestDetection(unittest.TestCase):
@@ -419,8 +475,9 @@ class TestGui(unittest.TestCase):
             os.environ["STUDIO_SETTINGS"] = cls._real_settings
 
     def setUp(self):
-        """Every test starts from every tab open, looking at the first."""
-        for app in eng.APPS:
+        """Every test starts from every tab open - chat included - looking at
+        the first."""
+        for app in eng.TABS:
             self.app._add_tab(app.id)      # a tab already open is just selected
         self.app._select(eng.APPS[0].id)
         self.app.update()
@@ -458,14 +515,21 @@ class TestGui(unittest.TestCase):
                 self.assertTrue(lbl.winfo_ismapped())
                 self.assertLessEqual(self._bottom_of(lbl), win_h)
 
-    def test_the_bridges_row_counts_every_tab(self):
+    def test_the_bridges_row_counts_bridges_not_tabs(self):
+        """A chat tab has no bridge; counting it would report one of two
+        bridges missing when nothing is missing at all."""
         self.app._sync_bridges()
         _lead, lbl = self.app.conn["bridges"]
-        self.assertIn(str(len(self.app.order)), lbl.cget("text"))
+        bridges = [i for i in self.app.order if eng.TABS_BY_ID[i].drivable]
+        before = lbl.cget("text")
+        self.assertIn(str(len(bridges)), before)
+        self.app._close_tab(eng.CHAT.id)
+        self.app._sync_bridges()
+        self.assertEqual(lbl.cget("text"), before)
 
     def test_one_tab_per_app(self):
         self.assertEqual(set(self.app.tab_ui), set(self.app.sessions))
-        self.assertEqual(len(self.app.order), len(eng.APPS))
+        self.assertEqual(len(self.app.order), len(eng.TABS))
         for sid in self.app.order:
             self.assertTrue(self.app.tab_ui[sid]["tab"].winfo_ismapped())
 
@@ -482,6 +546,10 @@ class TestGui(unittest.TestCase):
         for sid in self.app.order:
             self.app._select(sid)
             self.app.update()
+            if not self.app.sessions[sid].app.drivable:
+                # Nothing to start, so the button has no business showing.
+                self.assertFalse(self.app.btn_fix.winfo_ismapped())
+                continue
             self.assertIn(self.app.sessions[sid].app.name,
                           self.app.btn_fix.cget("text"))
 
@@ -574,6 +642,50 @@ class TestGui(unittest.TestCase):
         self.assertIn("host-level-problem", self.app.empty_msg.cget("text"))
         self.app._on_send()          # must not raise with nothing open
 
+    def test_a_chat_tab_is_ready_without_starting_a_bridge(self):
+        """No MCP subprocess, no tools - but still warmed against its own
+        prompt prefix, which is the whole reason the first reply is quick."""
+        warmed = []
+
+        class OneReply:
+            def chat(self, messages, tools, max_tokens=None):
+                warmed.append((messages, tools))
+                return {"choices": [{"message": {"content": "ready"}}]}
+
+        self.app.host_ready.set()
+        real_llm, self.app.llm = self.app.llm, OneReply()
+        try:
+            s = self.app.sessions[eng.CHAT.id]
+            self.app._boot_session(s)
+        finally:
+            self.app.llm = real_llm
+        self.app._drain()              # the queue, on the UI thread, now
+        self.app.update()
+        self.assertTrue(s.ready)
+        self.assertIsNone(s.mcp)
+        self.assertEqual(s.tools, [])
+        self.assertEqual(len(warmed), 1)
+        messages, tools = warmed[0]
+        self.assertEqual(tools, [])                    # nothing to offer
+        self.assertEqual(messages[0]["content"], eng.CHAT.chat_prompt())
+        self.assertEqual(s.bridge[0], "ok")
+        self.assertNotIn("Bridge connected", s.view.get("1.0", "end"))
+
+    def test_bridge_only_actions_say_why_they_do_nothing_in_chat(self):
+        """Both are menu items, always enabled. Silence would read as a bug."""
+        s = self.app.sessions[eng.CHAT.id]
+        self.app._select(s.id)
+        was_ready, s.ready = s.ready, True
+        try:
+            self.app._on_fix()
+            self.app._capabilities()
+        finally:
+            s.ready = was_ready
+        body = s.view.get("1.0", "end")
+        self.assertIn("no app to start", body)
+        self.assertIn("no capabilities", body)
+        self.assertFalse(s.busy)
+
     def test_events_for_a_closed_tab_are_dropped(self):
         """A turn can still be in flight; it must not write into another app."""
         gone, other = self.app.order[-1], self.app.order[0]
@@ -632,8 +744,8 @@ class TestGui(unittest.TestCase):
 
     def test_the_new_tab_menu_offers_every_app_and_marks_the_open_ones(self):
         labels = self._labels(self.app._menu_tabs())
-        self.assertEqual(len(labels), len(eng.APPS))
-        for app in eng.APPS:
+        self.assertEqual(len(labels), len(eng.TABS))
+        for app in eng.TABS:
             self.assertTrue(any(app.name in l for l in labels), app.name)
         self.assertEqual(len([l for l in labels if "(open)" in l]),
                          len(self.app.order))
@@ -703,6 +815,66 @@ class TestGui(unittest.TestCase):
                    if not n.startswith("__")
                    and (hasattr(tkinter.Misc, n) or hasattr(tkinter.Tk, n))]
         self.assertEqual(clashes, [], "shadowing Tk internals breaks the widget")
+
+    def test_stop_button_sets_cancellation_without_touching_composer(self):
+        s = self.app.cur()
+        original_status = s.status
+        try:
+            s.busy = True
+            s.cancel.clear()
+            self.app.input.delete("1.0", "end")
+            self.app.input.insert("1.0", "next request")
+            self.app._apply_status()
+            self.assertEqual(self.app.btn_send.cget("text"), "Stop")
+            self.app._on_send()
+            self.assertTrue(s.cancel.is_set())
+            self.assertEqual(self.app.input.get("1.0", "end").strip(), "next request")
+            self.assertEqual(self.app.btn_send.cget("text"), "Stopping…")
+        finally:
+            s.busy = False
+            s.cancel.clear()
+            s.status = original_status
+            self.app.input.delete("1.0", "end")
+            self.app._apply_status()
+
+    def test_old_worker_cannot_write_to_reopened_tab(self):
+        s = self.app.cur()
+        old_event_id, app_id = s.event_id, s.id
+        self.app._close_tab(app_id)
+        self.app._add_tab(app_id)
+        replacement = self.app.cur()
+        self.app._handle("token", old_event_id, "stale-generation-token")
+        self.assertNotIn("stale-generation-token", replacement.view.get("1.0", "end"))
+
+    def test_preview_image_remains_owned_by_session(self):
+        import base64
+        s = self.app.cur()
+        png = icons.png(bytes([255, 0, 0, 255]) * 4, 2, 2)
+        count = len(s.preview_images)
+        self.app._handle("preview", s.event_id, {"type": "image", "mimeType": "image/png",
+                                               "data": base64.b64encode(png).decode()})
+        self.assertEqual(len(s.preview_images), count + 1)
+        self.assertTrue(s.view.image_names())
+
+    def test_gui_executor_saves_completed_task(self):
+        from test_tasks import FakeLLM, answer
+        s = self.app.cur()
+        original_llm = self.app.llm
+        original_messages, original_record = s.messages, s.record
+        try:
+            s.reset()
+            s.record.briefs.append("Explain frame rate")
+            s.messages.append({"role": "user", "content": "Explain frame rate"})
+            self.app.llm = FakeLLM([answer(text="Frames per second.")])
+            self.app._turn(s)
+            self.app.update()
+            with open(self.app._task_path(s), encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["record"]["app_id"], s.id)
+            self.assertEqual(saved["messages"][-1]["content"], "Frames per second.")
+        finally:
+            self.app.llm = original_llm
+            s.messages, s.record = original_messages, original_record
 
     def test_sidebar_labels_do_not_wrap_mid_token(self):
         self.assertEqual(self.mod.pretty_host("http://100.127.17.38:1234/v1"),

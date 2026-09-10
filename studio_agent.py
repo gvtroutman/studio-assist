@@ -58,6 +58,7 @@ class MCPClient:
         self.quiet = quiet
         self._id = 0
         self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
         self._inbox = queue.Queue()
         self.proc = subprocess.Popen(
             [exe] + list(args),
@@ -68,14 +69,19 @@ class MCPClient:
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
     def _read_stdout(self):
-        for line in self.proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                self._inbox.put(json.loads(line))
-            except json.JSONDecodeError:
-                pass  # server chatter that isn't protocol
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                    if isinstance(message, dict):
+                        self._inbox.put(message)
+                except json.JSONDecodeError:
+                    pass  # server chatter that isn't protocol
+        finally:
+            self._inbox.put({"_closed": True})
 
     def _drain_stderr(self):
         for line in self.proc.stderr:
@@ -87,30 +93,34 @@ class MCPClient:
         self.proc.stdin.flush()
 
     def request(self, method, params=None, timeout=180):
+        # One reader owns each response; concurrent calls cannot steal replies.
+        with self._request_lock:
+            return self._request(method, params, timeout)
+
+    def _request(self, method, params=None, timeout=180):
         with self._lock:
             self._id += 1
             rid = self._id
         self._send({"jsonrpc": "2.0", "id": rid, "method": method,
                     "params": params or {}})
-        deadline = time.time() + timeout
-        stash = []
-        try:
-            while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                try:
-                    msg = self._inbox.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if msg.get("id") == rid:
-                    if "error" in msg:
-                        raise RuntimeError("MCP error: %s" % msg["error"])
-                    return msg.get("result", {})
-                stash.append(msg)  # notification or out-of-order reply
-        finally:
-            for m in stash:
-                self._inbox.put(m)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                msg = self._inbox.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if msg.get("_closed"):
+                self._inbox.put(msg)
+                raise EOFError("The MCP bridge exited before returning a result.")
+            if msg.get("id") == rid:
+                if "error" in msg:
+                    raise RuntimeError("MCP error: %s" % msg["error"])
+                return msg.get("result", {})
+            # Notifications and late replies to timed-out serialized requests
+            # must not accumulate forever in the inbox.
         raise TimeoutError("no MCP reply to %s in %ss" % (method, timeout))
 
     def initialize(self, timeout=180):
@@ -151,6 +161,8 @@ def mcp_result_to_text(result):
     if not isinstance(result, dict):
         return str(result)
     parts = []
+    if result.get("structuredContent") is not None:
+        parts.append(json.dumps(result["structuredContent"]))
     for item in result.get("content", []) or []:
         kind = item.get("type")
         if kind == "text":
@@ -219,7 +231,7 @@ def to_openai_tools(mcp_tools):
         desc = (t.get("description") or "").strip()
         out.append({"type": "function", "function": {
             "name": t["name"],
-            "description": desc[:MAX_TOOL_DESC_CHARS],
+            "description": desc,
             "parameters": schema,
         }})
     return out
@@ -272,6 +284,7 @@ class LLM:
             raise RuntimeError("cannot reach inference host %s (%s)" % (self.url, e.reason))
 
         content, calls = [], {}
+        finish_reason, done = None, False
         with resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
@@ -279,12 +292,15 @@ class LLM:
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    done = True
                     break
                 try:
                     chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                delta = ((chunk.get("choices") or [{}])[0]).get("delta") or {}
+                except json.JSONDecodeError as e:
+                    raise RuntimeError("Malformed inference stream; no tools from this response were executed.") from e
+                choice = (chunk.get("choices") or [{}])[0]
+                finish_reason = choice.get("finish_reason") or finish_reason
+                delta = choice.get("delta") or {}
                 piece = delta.get("content")
                 if piece:
                     content.append(piece)
@@ -301,6 +317,9 @@ class LLM:
                     if fn.get("arguments"):
                         slot["args"] += fn["arguments"]
 
+        if not done or finish_reason not in ("stop", "tool_calls"):
+            raise RuntimeError("Incomplete inference response (%s); no tools from this response were executed."
+                               % (finish_reason or "connection ended"))
         msg = {"role": "assistant", "content": "".join(content)}
         if calls:
             msg["tool_calls"] = [
@@ -448,6 +467,28 @@ MAKING THINGS
   in plain comp pixels. Pass position 'center' only if you actually want After
   Effects' own spawn point, which shifts a drawing authored in comp coordinates by
   half a frame.
+- A new shape layer is empty: creating the layer alone does not make visible
+  artwork. Use add_shape_content for geometry AND a fill or stroke. Its arguments
+  are compId, layerId, optional parentGroupPath, and a nested `content` object.
+  For a centred rectangle in a 1920x1080 comp, first create the layer, then use its
+  returned layerId for these two add_shape_content calls:
+  {"compId": C, "layerId": L, "content": {"type": "rect", "name": "Box",
+   "size": [400,240], "position": [960,540], "roundness": 0}}
+  {"compId": C, "layerId": L, "content": {"type": "fill", "color": [1,0,0],
+   "opacity": 100}}
+  C and L stand for real ids returned by tools, not literal argument values.
+  Adapt size, position and colour to the request and the actual comp dimensions.
+  For a circle use type 'ellipse' with equal size dimensions. A custom 'path'
+  takes `vertices`, not `points`, and `closed:true` for a closed outline.
+- Keep independently coloured shapes in separate groups: add content
+  {"type":"group","name":"Badge"}, then put its geometry and paint inside
+  parentGroupPath ['Contents','Badge']. A fill or stroke paints the paths above
+  it in that group. Add foreground groups before background groups.
+- Edit existing content with set_shape_property (contentPath, property, value),
+  or replace vertices with set_shape_path. Discover exact node names with
+  get_layer_full using include:['shape'], shapeDetail:'compact'; request 'full'
+  when exact property values are needed. Do not report a finished shape if only
+  the empty layer succeeded; explain which geometry or paint step failed.
 - Solids, nulls, adjustment layers, cameras and lights each have their own creating
   tool. Use the right one rather than faking a background with a text layer or a
   rig control with an invisible solid.
@@ -557,6 +598,27 @@ only what may have changed since.
 Answer questions directly without calling tools when no tool is needed."""
 
 
+# The one tab with nothing behind it. It has no bridge and no tools, so the
+# prompt's whole job is to keep the model from claiming otherwise: a confident
+# "done - I added the layer" from a tab that cannot reach After Effects is worse
+# than no answer at all.
+CHAT_PROMPT = """You are the Chat tab of Studio Assistant: a plain conversation with
+the local model, with no creative app behind it.
+
+There is no bridge and there are no tools in this tab. You cannot open, read or change
+a project in After Effects, DaVinci Resolve or anything else from here, and you must
+never describe such a change as done. When the user wants work carried out in an app,
+say so plainly and point them at that app's own tab, where the model is briefed on the
+bridge and has its tools.
+
+Be useful with what you do have: answer questions, explain how something in these
+applications works, think an approach through, draft copy or a shot list, do the
+arithmetic on frame rates, timecode and durations, and help the user decide what to
+ask for in an app tab. This is a continuing conversation and the user may refer back
+to earlier messages in it. Say when you are unsure rather than inventing specifics -
+the reader is working to a deadline, and a confident wrong answer costs real time."""
+
+
 class AppSpec:
     """
     One drivable app: how to reach it, what to expose, how to talk about it.
@@ -564,6 +626,10 @@ class AppSpec:
     `probe` is a strategy string rather than a callable so the registry stays
     data the tests can walk: "port:7777" or "process:Resolve.exe".
     """
+
+    # False only for ChatSpec below. Anything that starts, probes, counts or
+    # repairs a bridge asks this before assuming there is one.
+    drivable = True
 
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
@@ -604,7 +670,14 @@ class AppSpec:
         return wanted
 
     def chat_prompt(self):
-        return self.system_prompt + CHAT_SUFFIX
+        return self.system_prompt + CHAT_SUFFIX + self.quality_rules()
+
+    def cli_prompt(self):
+        return self.system_prompt + self.quality_rules()
+
+    def quality_rules(self):
+        from studio_tasks import QUALITY_RULES
+        return QUALITY_RULES
 
     def launch(self):
         exe = self.exe()
@@ -615,7 +688,7 @@ class AppSpec:
                          creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
 
     def __repr__(self):
-        return "<AppSpec %s>" % self.id
+        return "<%s %s>" % (type(self).__name__, self.id)
 
 
 AE_GROUPS = {
@@ -690,11 +763,12 @@ APPS = [
         command="npx", args=["-y", "@engine-room/after-effects-mcp"],
         bridge_label="127.0.0.1:7777",
         groups=AE_GROUPS,
-        default_groups=["discover", "create", "edit", "animate", "effects"],
+        default_groups=["discover", "create", "edit", "animate", "effects", "shapes", "inspect"],
         system_prompt=AE_PROMPT,
         examples=[
             "What comps are in this project?",
             "Make a 1920x1080 title card, 5 seconds at 24fps",
+            "Add a centred red circle, 300 pixels across, to my comp",
             "Add a drop shadow to the text and fade it in over 12 frames",
         ],
         launch_note="After Effects also needs the ae-mcp panel under Window > Extensions.",
@@ -725,12 +799,72 @@ APPS_BY_ID = {a.id: a for a in APPS}
 DEFAULT_APP = APPS[0].id
 
 
+class ChatSpec(AppSpec):
+    """
+    A tab with no app behind it: the model on its own, no bridge, no tools.
+
+    It duck-types AppSpec - id, colours, prompt, examples - so `Session`, the tab
+    strip and the transcript need no special case for it; everything
+    bridge-shaped is empty, and `drivable` is False so nothing tries to start,
+    probe or launch what is not there.
+
+    Deliberately NOT a member of APPS: DRIVABLE is derived from that list, and
+    the sidebar must not advertise chat as something this agent can drive.
+    """
+
+    drivable = False
+
+    def __init__(self):
+        AppSpec.__init__(
+            self, id="chat", name="Chat", tab="Chat",
+            code="Ch", fg="#ecebe8", bg="#3f4a5a",
+            exe_globs=[], probe="", command=None, args=[],
+            bridge_label="no bridge", groups={}, default_groups=[],
+            system_prompt=CHAT_PROMPT,
+            examples=[
+                "What frame rate should I finish this in?",
+                "How long is 240 frames at 23.976?",
+                "Talk me through how to stage a lower third before I build it",
+            ])
+
+    def exe(self):
+        return None
+
+    def installed(self):
+        return True                       # nothing to install, nothing to find
+
+    def running(self):
+        return True                       # the tab is the whole of it
+
+    def tool_names(self, group_names=None):
+        return set()
+
+    def chat_prompt(self):
+        # No CHAT_SUFFIX: it briefs an app tab on its bridge and its tools, and
+        # this tab has neither. CHAT_PROMPT carries its own continuity note.
+        return self.system_prompt
+
+    def quality_rules(self):
+        return ""                         # no tools, so no tool rules
+
+    def launch(self):
+        raise RuntimeError("Chat has no application to start.")
+
+
+CHAT = ChatSpec()
+
+# Everything that can be a tab, apps first. APPS stays the registry of drivable
+# apps; TABS is what the tab strip and the new-tab menu offer.
+TABS = APPS + [CHAT]
+TABS_BY_ID = {a.id: a for a in TABS}
+
+
 def get_app(app_id):
     try:
-        return APPS_BY_ID[app_id]
+        return TABS_BY_ID[app_id]
     except KeyError:
         raise KeyError("unknown app %r; pick from %s"
-                       % (app_id, ", ".join(APPS_BY_ID)))
+                       % (app_id, ", ".join(TABS_BY_ID)))
 
 
 def installed_apps():
@@ -807,50 +941,58 @@ def detect_apps():
     return found
 
 
-def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False):
+def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False,
+              schemas=None, library=None):
+    """One task, start to finish. `system_prompt` is final - see AppSpec.cli_prompt."""
+    from studio_tasks import Executor, TaskRecord
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": task}]
-    for step in range(1, max_steps + 1):
-        t0 = time.time()
-        resp = llm.chat(messages, tools)
-        choice = resp["choices"][0]
-        msg = choice["message"]
-        usage = resp.get("usage", {})
-        log("  . step %d - %.1fs, %s prompt / %s completion tokens"
-            % (step, time.time() - t0, usage.get("prompt_tokens", "?"),
-               usage.get("completion_tokens", "?")), quiet)
+    record = TaskRecord()
+    record.briefs.append(task)
+    def emit(kind, payload):
+        if kind in ("tool", "tool_result", "sys"):
+            log("  " + str(payload), quiet)
+    return Executor(llm, mcp, tools, schemas=schemas, record=record,
+                    emit=emit, library=library).run(messages, max_steps, streaming=False)
 
-        calls = msg.get("tool_calls") or []
-        assistant = {"role": "assistant", "content": msg.get("content") or ""}
-        if calls:
-            assistant["tool_calls"] = calls
-        messages.append(assistant)
 
-        if not calls:
-            return msg.get("content") or "(the model returned nothing)"
+def converse(llm, mcp, tools, app, args, schemas=None):
+    """The task given on the command line, or an interactive session if none.
 
-        for call in calls:
-            fn = call["function"]
-            name = fn["name"]
-            raw = fn.get("arguments") or "{}"
-            try:
-                args = json.loads(raw) if isinstance(raw, str) else raw
-            except json.JSONDecodeError as e:
-                result_text = ("TOOL ERROR: your arguments were not valid JSON (%s). "
-                               "Re-issue the call with valid JSON." % e)
-                log("  -> %s  [bad JSON args]" % name, quiet)
-            else:
-                preview = json.dumps(args)
-                log("  -> %s %s" % (name, preview[:160] + ("..." if len(preview) > 160 else "")), quiet)
-                try:
-                    result_text = mcp_result_to_text(mcp.call_tool(name, args))
-                except Exception as e:
-                    result_text = "TOOL ERROR: %s" % e
-                first = result_text.splitlines()[0] if result_text else ""
-                log("     %s" % (first[:160] + ("..." if len(first) > 160 else "")), quiet)
-            messages.append({"role": "tool", "tool_call_id": call.get("id", name),
-                             "content": result_text})
-    return "(stopped: hit the %d-step limit without a final answer)" % max_steps
+    The CLI shares the GUI's library of made tools: same app, same directory
+    beside the settings file, so a tool made in a tab is offered here too.
+    """
+    import studio_toolsmith as toolsmith
+    system_prompt = app.cli_prompt()
+    library = None
+    if tools:
+        library = toolsmith.Library.for_app(app.id)
+        allowed, specs = toolsmith.contracts(tools, schemas)
+        for problem in library.load(allowed, specs):
+            log("  not offering a made tool - " + problem, args.quiet)
+    if args.task:
+        print(run_agent(llm, mcp, tools, " ".join(args.task), system_prompt,
+                        args.max_steps, args.quiet, schemas=schemas, library=library))
+        return 0
+
+    print("studio_agent [%s] - interactive. Ctrl-C or 'exit' to quit.\n" % app.name)
+    prompt = "%s> " % app.id
+    while True:
+        try:
+            task = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if task.lower() in ("exit", "quit"):
+            return 0
+        if not task:
+            continue
+        try:
+            print("\n" + run_agent(llm, mcp, tools, task, system_prompt,
+                                   args.max_steps, args.quiet, schemas=schemas,
+                                   library=library) + "\n")
+        except Exception as e:
+            print("error: %s\n" % e, file=sys.stderr)
 
 
 def env_default(*names, fallback=None):
@@ -866,8 +1008,9 @@ def main():
         description="Local LLM agent for creative apps. Inference on the tailnet, "
                     "tools on this PC.")
     p.add_argument("task", nargs="*", help="what to do; omit for an interactive session")
-    p.add_argument("--app", default=DEFAULT_APP, choices=sorted(APPS_BY_ID),
-                   help="which app to drive (default: %(default)s)")
+    p.add_argument("--app", default=DEFAULT_APP, choices=sorted(TABS_BY_ID),
+                   help="which app to drive, or 'chat' for no app at all "
+                        "(default: %(default)s)")
     p.add_argument("--host", default=env_default("STUDIO_HOST", "AE_AGENT_HOST",
                                                  fallback=DEFAULT_HOST),
                    help="OpenAI-compatible base URL (default: %(default)s)")
@@ -895,6 +1038,17 @@ def main():
         return 0
 
     app = get_app(a.app)
+    if not app.drivable:
+        # No bridge to start and no tools to expose: the model on its own.
+        if a.groups or a.all_tools:
+            p.error("%s has no bridge, so there are no tool groups to choose" % app.name)
+        if a.list_tools:
+            print("%s has no bridge and exposes no tools." % app.name)
+            return 0
+        llm = LLM(a.host, a.model, a.temperature)
+        log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
+        return converse(llm, None, [], app, a, schemas=[])
+
     groups = [g.strip() for g in (a.groups or ",".join(app.default_groups)).split(",")
               if g.strip()]
     for g in groups:
@@ -931,28 +1085,7 @@ def main():
         llm = LLM(a.host, a.model, a.temperature)
         log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
 
-        if a.task:
-            print(run_agent(llm, mcp, tools, " ".join(a.task), app.system_prompt,
-                            a.max_steps, a.quiet))
-            return 0
-
-        print("studio_agent [%s] - interactive. Ctrl-C or 'exit' to quit.\n" % app.name)
-        prompt = "%s> " % app.id
-        while True:
-            try:
-                task = input(prompt).strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return 0
-            if task.lower() in ("exit", "quit"):
-                return 0
-            if not task:
-                continue
-            try:
-                print("\n" + run_agent(llm, mcp, tools, task, app.system_prompt,
-                                       a.max_steps, a.quiet) + "\n")
-            except Exception as e:
-                print("error: %s\n" % e, file=sys.stderr)
+        return converse(llm, mcp, tools, app, a, schemas=chosen)
     finally:
         mcp.close()
 
