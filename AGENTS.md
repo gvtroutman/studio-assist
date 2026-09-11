@@ -556,18 +556,23 @@ composer.
 - Optional `STUDIO_VISION_MODEL` uses the same remote host as the executing model.
   Never move inference to the workstation. Session-owned preview images keep Tk
   references alive; stale-generation preview events must be dropped.
-- **Pictures the user attaches never enter the messages as pixels.** The picture
-  glyph and Ctrl+O on the shared composer queue paths (`Chat.attachments`, one chip
-  each); `_on_send` appends `picture_note()` to the brief — name, dimensions read
-  from the header by `image_dims()`, size, and the path every bridge on this PC
-  opens files by — and shows the picture in the transcript where Tk can decode it.
-  Base64 in a message would blow `context_messages`' character budget and land in
-  every checkpoint, so what the picture *shows* comes from `STUDIO_VISION_MODEL`
-  when it is set: `_turn` asks it for a description on the worker and appends that
-  to the same brief before the executor starts, so it survives resume. Without it
-  the model has the path only, and is told so. A `ContainerSpec` tab sees one
-  folder: `picture_note` copies the file into `<workspace>/attachments/` and names
-  the `/workspace/...` path the container will see.
+- **What the user attaches never enters the messages as bytes.** The file and
+  folder glyphs, Ctrl+O and Ctrl+Shift+O on the shared composer queue paths
+  (`Chat.attachments`, one chip each — any file, any size, or a folder); `_on_send`
+  appends `attachment_note()` to the brief — name, size, dimensions read from the
+  header by `image_dims()` when it is a picture, and the path every bridge on this
+  PC opens files by; a folder gets a listing capped at `LIST_LIMIT` entries so the
+  model can name a file in it without a tool call — and shows a picture in the
+  transcript where Tk can decode it. Base64 in a message would blow
+  `context_messages`' character budget and land in every checkpoint, so what a
+  picture *shows* comes from `STUDIO_VISION_MODEL` when it is set: `_turn` asks it
+  for a description on the worker — pictures only, `is_picture()` decides — and
+  appends that to the same brief before the executor starts, so it survives resume.
+  Without it the model has the path only, and is told so. `ATTACH_LIMIT` applies to
+  pictures alone, because theirs are the only bytes anything reads. A
+  `ContainerSpec` tab sees one folder: `attachment_note` copies the file (or the
+  folder, whole) into `<workspace>/attachments/` and names the `/workspace/...` path
+  the container will see.
 
 ## Tools the model makes for itself
 
