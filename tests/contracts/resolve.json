@@ -1,0 +1,1200 @@
+{
+ "recorded": "2026-09-11",
+ "app": "resolve",
+ "server": {
+  "name": "DaVinciResolveMCP",
+  "version": "1.27.0"
+ },
+ "protocolVersion": "2025-11-25",
+ "instructions": "DaVinci Resolve MCP Server \u2014 controls Resolve via its Scripting API. Tools automatically launch Resolve if it is not running (may take up to 60s on first call). If a tool returns a connection error, Resolve Studio may not be installed or external scripting is disabled.",
+ "tools": [
+  {
+   "name": "resolve_control",
+   "description": "App-level DaVinci Resolve operations.\n\n    Actions:\n      launch() -> {success, message}  \u2014 Launch DaVinci Resolve if not running. Call this FIRST if any tool returns a 'Not connected' error.\n      get_version() -> {product, version, version_string}\n      get_page() -> {page}\n      open_page(page) -> {success}  \u2014 page: edit, cut, color, fusion, fairlight, deliver\n      get_keyframe_mode() -> {mode}\n      set_keyframe_mode(mode) -> {success}\n      quit() -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "resolve_controlArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "resolve_controlOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "layout_presets",
+   "description": "Manage DaVinci Resolve UI layout presets.\n\n    Actions:\n      save(name) -> {success}\n      load(name) -> {success}\n      update(name) -> {success}\n      export(name, path) -> {success}\n      import_preset(path, name?) -> {success}\n      delete(name) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "layout_presetsArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "layout_presetsOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "render_presets",
+   "description": "Import/export render and burn-in presets.\n\n    Actions:\n      import_render(path) -> {success}\n      export_render(name, path) -> {success}\n      import_burnin(path) -> {success}\n      export_burnin(name, path) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "render_presetsArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "render_presetsOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "project_manager",
+   "description": "Manage DaVinci Resolve projects.\n\n    Actions:\n      list() -> {projects}\n      get_current() -> {name, id}\n      create(name) -> {success, name}\n      load(name) -> {success}\n      save() -> {success}\n      close() -> {success}\n      delete(name) -> {success}\n      import_project(path, name?) -> {success}\n      export_project(name, path, with_stills_and_luts?) -> {success}\n      archive(name, path, src_media?, render_cache?, proxy_media?) -> {success}\n      restore(path, name?) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "project_managerArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "project_managerOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "project_manager_folders",
+   "description": "Navigate and manage project folders in the Project Manager.\n\n    Actions:\n      list() -> {folders}\n      get_current() -> {folder}\n      create(name) -> {success}\n      delete(name) -> {success}\n      open(name) -> {success}\n      goto_root() -> {success}\n      goto_parent() -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "project_manager_foldersArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "project_manager_foldersOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "project_manager_cloud",
+   "description": "Cloud project operations (requires DaVinci Resolve cloud infrastructure).\n\n    Actions:\n      create(settings) -> {success}  \u2014 settings: {CLOUD_SETTING_PROJECT_NAME, ...}\n      load(settings) -> {success}\n      import_project(path, settings) -> {success}\n      restore(folder_path, settings) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "project_manager_cloudArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "project_manager_cloudOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "project_manager_database",
+   "description": "Manage DaVinci Resolve project databases.\n\n    Actions:\n      get_current() -> {db_type, db_name}\n      list() -> {databases}\n      set_current(db_info) -> {success}  \u2014 db_info: {DbType, DbName}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "project_manager_databaseArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "project_manager_databaseOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "project_settings",
+   "description": "Project metadata, settings, and color groups.\n\n    Actions:\n      get_name() -> {name}\n      set_name(name) -> {success}\n      get_setting(name?) -> {settings}  \u2014 omit name for all settings\n      set_setting(name, value) -> {success}\n      get_unique_id() -> {id}\n      get_presets() -> {presets}\n      set_preset(name) -> {success}\n      refresh_luts() -> {success}\n      get_gallery() -> {available}\n      export_frame_as_still(path) -> {success}\n      load_burnin_preset(name) -> {success}\n      insert_audio(media_path, start_offset?, duration?) -> {success}\n      get_color_groups() -> {groups}\n      add_color_group(name) -> {success, name}\n      delete_color_group(name) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "project_settingsArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "project_settingsOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "render",
+   "description": "Render pipeline: jobs, presets, formats, codecs, and rendering.\n\n    Actions:\n      add_job() -> {job_id}\n      delete_job(job_id) -> {success}\n      delete_all_jobs() -> {success}\n      list_jobs() -> {jobs}\n      get_job_status(job_id) -> {status}\n      start(job_ids?, interactive?) -> {success}\n      stop() -> {success}\n      is_rendering() -> {rendering}\n      get_formats() -> {formats}\n      get_codecs(format) -> {codecs}\n      get_format_and_codec() -> {format, codec}\n      set_format_and_codec(format, codec) -> {success}\n      get_mode() -> {mode}\n      set_mode(mode) -> {success}\n      get_resolutions(format, codec) -> {resolutions}\n      get_settings() -> {settings}  (alias for set_render_settings with get)\n      set_settings(settings) -> {success}\n      list_presets() -> {presets}\n      load_preset(name) -> {success}\n      save_preset(name) -> {success}\n      delete_preset(name) -> {success}\n      quick_export_presets() -> {presets}\n      quick_export(preset, params?) -> {status}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "renderArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "renderOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "media_storage",
+   "description": "Browse storage volumes and import media into the Media Pool.\n\n    Actions:\n      get_volumes() -> {volumes}\n      get_subfolders(path) -> {subfolders}\n      get_files(path) -> {files}\n      reveal(path) -> {success}\n      import_to_pool(items) -> {imported}  \u2014 items: list of file paths or [{path, ...}]\n      add_clip_mattes(clip_id, paths, stereo_eye?) -> {success}\n      add_timeline_mattes(paths) -> {items}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "media_storageArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "media_storageOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "media_pool",
+   "description": "Manage the Media Pool: folders, clips, timelines, import/export.\n\n    Actions:\n      get_root_folder() -> {name, id}\n      get_current_folder() -> {name, id}\n      set_current_folder(path) -> {success}  \u2014 path like \"Master/SubFolder\"\n      add_subfolder(name, parent_path?) -> {success, name, id}\n      delete_folders(folder_ids) -> {success}\n      move_folders(folder_ids, target_path) -> {success}\n      refresh() -> {success}\n      create_timeline(name) -> {success, name, id}\n      create_timeline_from_clips(name, clip_ids) -> {success, name, id}\n      import_timeline(path, options?) -> {success, name}\n      delete_timelines(timeline_ids) -> {success}\n      append_to_timeline(clip_ids) -> {success, count}\n      import_media(paths) -> {imported}\n      delete_clips(clip_ids) -> {success}\n      move_clips(clip_ids, target_path) -> {success}\n      relink(clip_ids, folder_path) -> {success}\n      unlink(clip_ids) -> {success}\n      export_metadata(path, clip_ids?) -> {success}\n      get_unique_id() -> {id}\n      create_stereo_clip(left_id, right_id) -> {success, name}\n      auto_sync_audio(clip_ids, settings?) -> {success}\n      get_selected() -> {clips}\n      set_selected(clip_id) -> {success}\n      get_clip_mattes(clip_id) -> {mattes}\n      get_timeline_mattes(folder_path?) -> {mattes}\n      delete_clip_mattes(clip_id, paths) -> {success}\n      import_folder(path, source_clips_path?) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "media_poolArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "media_poolOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "folder",
+   "description": "Operations on Media Pool folders.\n\n    Actions:\n      get_clips(path?) -> {clips}  \u2014 path like \"Master/SubFolder\", omit for current\n      get_name(path?) -> {name}\n      get_subfolders(path?) -> {subfolders}\n      is_stale(path?) -> {stale}\n      get_unique_id(path?) -> {id}\n      export(path?, export_path) -> {success}\n      transcribe_audio(path?) -> {success}\n      clear_transcription(path?) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "folderArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "folderOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "media_pool_item",
+   "description": "Operations on a media pool clip. Identify clip by clip_id.\n\n    Actions:\n      get_name(clip_id) -> {name}\n      get_metadata(clip_id, key?) -> {metadata}\n      set_metadata(clip_id, key, value) OR set_metadata(clip_id, metadata) -> {success}\n      get_third_party_metadata(clip_id, key?) -> {metadata}\n      set_third_party_metadata(clip_id, key, value) -> {success}\n      get_media_id(clip_id) -> {media_id}\n      get_clip_property(clip_id, key?) -> {properties}\n      set_clip_property(clip_id, key, value) -> {success}\n      get_clip_color(clip_id) -> {color}\n      set_clip_color(clip_id, color) -> {success}\n      clear_clip_color(clip_id) -> {success}\n      link_proxy(clip_id, proxy_path) -> {success}\n      unlink_proxy(clip_id) -> {success}\n      replace_clip(clip_id, path) -> {success}\n      get_unique_id(clip_id) -> {id}\n      transcribe_audio(clip_id) -> {success}\n      clear_transcription(clip_id) -> {success}\n      get_audio_mapping(clip_id) -> {mapping}\n      get_mark_in_out(clip_id) -> {mark}\n      set_mark_in_out(clip_id, mark_in, mark_out, type?) -> {success}\n      clear_mark_in_out(clip_id, type?) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "media_pool_itemArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "media_pool_itemOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "media_pool_item_markers",
+   "description": "Markers and flags on media pool clips. Identify clip by clip_id.\n\n    Actions:\n      add(clip_id, frame, color, name, note, duration, custom_data?) -> {success}\n      get_all(clip_id) -> {markers}\n      get_by_custom_data(clip_id, custom_data) -> {markers}\n      update_custom_data(clip_id, frame, custom_data) -> {success}\n      get_custom_data(clip_id, frame) -> {data}\n      delete_by_color(clip_id, color) -> {success}\n      delete_at_frame(clip_id, frame) -> {success}\n      delete_by_custom_data(clip_id, custom_data) -> {success}\n      add_flag(clip_id, color) -> {success}\n      get_flags(clip_id) -> {flags}\n      clear_flags(clip_id, color) -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "media_pool_item_markersArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "media_pool_item_markersOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline",
+   "description": "Timeline operations: tracks, clips, import/export, generators, titles.\n\n    Actions:\n      list() -> {timelines}\n      get_current() -> {name, id, start_frame, end_frame, start_timecode}\n      set_current(index) -> {success}  \u2014 1-based index\n      get_name() -> {name}\n      set_name(name) -> {success}\n      get_start_frame() -> {frame}\n      get_end_frame() -> {frame}\n      get_start_timecode() -> {timecode}\n      set_start_timecode(timecode) -> {success}\n      get_track_count(track_type) -> {count}  \u2014 video, audio, subtitle\n      add_track(track_type, sub_type?) -> {success}\n      delete_track(track_type, index) -> {success}\n      get_track_sub_type(track_type, index) -> {sub_type}\n      set_track_enable(track_type, index, enabled) -> {success}\n      get_track_enabled(track_type, index) -> {enabled}\n      set_track_lock(track_type, index, locked) -> {success}\n      get_track_locked(track_type, index) -> {locked}\n      get_track_name(track_type, index) -> {name}\n      set_track_name(track_type, index, name) -> {success}\n      get_items(track_type, index) -> {items}\n      delete_clips(clip_ids, ripple?) -> {success}  \u2014 clip_ids: list of unique IDs\n      set_clips_linked(clip_ids, linked) -> {success}\n      duplicate(name?) -> {success, name}\n      create_compound_clip(clip_ids, info?) -> {success}\n      create_fusion_clip(clip_ids) -> {success}\n      import_into_timeline(path, options?) -> {success}\n      export(path, type, subtype?) -> {success}  \u2014 type: AAF, EDL, FCPXML, etc.\n      get_setting(name?) -> {settings}\n      set_setting(name, value) -> {success}\n      insert_generator(name) -> {success}\n      insert_fusion_generator(name) -> {success}\n      insert_fusion_composition() -> {success}\n      insert_ofx_generator(name) -> {success}\n      insert_title(name) -> {success}\n      insert_fusion_title(name) -> {success}\n      get_unique_id() -> {id}\n      get_node_graph() -> {available}\n      get_media_pool_item() -> {name, id}\n      get_mark_in_out() -> {mark}\n      set_mark_in_out(mark_in, mark_out, type?) -> {success}\n      clear_mark_in_out(type?) -> {success}\n      convert_to_stereo() -> {success}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timelineArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timelineOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_markers",
+   "description": "Markers and playhead operations on the current timeline.\n\n    Actions:\n      add(frame, color, name, note, duration, custom_data?) -> {success}\n      get_all() -> {markers}\n      get_by_custom_data(custom_data) -> {markers}\n      update_custom_data(frame, custom_data) -> {success}\n      get_custom_data(frame) -> {data}\n      delete_by_color(color) -> {success}\n      delete_at_frame(frame) -> {success}\n      delete_by_custom_data(custom_data) -> {success}\n      get_current_timecode() -> {timecode}\n      set_current_timecode(timecode) -> {success}\n      get_current_video_item() -> {name, id}\n      get_thumbnail() -> {thumbnail}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_markersArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_markersOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_ai",
+   "description": "AI and analysis operations on the current timeline.\n\n    Actions:\n      create_subtitles(settings?) -> {success}  \u2014 auto-caption from audio\n      detect_scene_cuts() -> {success}\n      analyze_dolby_vision(clip_ids?, analysis_type?) -> {success}\n      grab_still() -> {success}\n      grab_all_stills(source?) -> {count}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_aiArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_aiOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_item",
+   "description": "Properties, transforms, speed, keyframes, and metadata for a timeline item.\n    Identify by track_type, track_index, item_index.\n\n    Actions:\n      get_name(track_type?, track_index?, item_index?) -> {name}\n      get_property(key?, ...) -> {properties}\n      set_property(key, value, ...) -> {success}\n      get_duration(...) -> {duration}\n      get_start(...) -> {start}\n      get_end(...) -> {end}\n      get_source_start_frame(...) -> {frame}\n      get_source_end_frame(...) -> {frame}\n      get_source_start_time(...) -> {time}\n      get_source_end_time(...) -> {time}\n      get_left_offset(...) -> {offset}\n      get_right_offset(...) -> {offset}\n      set_clip_enabled(enabled, ...) -> {success}\n      get_clip_enabled(...) -> {enabled}\n      update_sidecar(...) -> {success}\n      get_unique_id(...) -> {id}\n      get_media_pool_item(...) -> {name, id}\n      get_stereo_convergence(...) -> {values}\n      get_stereo_left_window(...) -> {params}\n      get_stereo_right_window(...) -> {params}\n      get_linked_items(...) -> {items}\n      get_track_type_and_index(...) -> {track_type, track_index}\n      get_source_audio_mapping(...) -> {mapping}\n      load_burnin_preset(name, ...) -> {success}\n      get_retime(...) -> {process, motion_estimation}\n      set_retime(process?, motion_estimation?, ...) -> {success}  \u2014 process: nearest, frame_blend, optical_flow (or 0-3); motion_estimation: 0-6\n      get_transform(...) -> {Pan, Tilt, ZoomX, ZoomY, RotationAngle, ...}\n      set_transform(Pan?, Tilt?, ZoomX?, ZoomY?, RotationAngle?, AnchorPointX?, AnchorPointY?, Pitch?, Yaw?, FlipX?, FlipY?, ...) -> {success}\n      get_crop(...) -> {CropLeft, CropRight, CropTop, CropBottom, CropSoftness, CropRetain}\n      set_crop(CropLeft?, CropRight?, CropTop?, CropBottom?, CropSoftness?, CropRetain?, ...) -> {success}\n      get_composite(...) -> {Opacity, CompositeMode}\n      set_composite(Opacity?, CompositeMode?, ...) -> {success}\n      get_audio(...) -> {Volume, Pan, AudioSyncOffset, ...}\n      set_audio(Volume?, Pan?, ...) -> {success}\n      get_keyframes(property, ...) -> {property, count, keyframes}\n      add_keyframe(property, frame, value, ...) -> {success}\n      modify_keyframe(property, frame, new_value?, new_frame?, ...) -> {success}\n      delete_keyframe(property, frame, ...) -> {success}\n      set_keyframe_interpolation(property, frame, interpolation, ...) -> {success}  \u2014 Linear, Bezier, EaseIn, EaseOut, EaseInOut\n\n    Default: track_type=\"video\", track_index=1, item_index=0\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_itemArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_itemOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_item_markers",
+   "description": "Markers, flags, and clip color on timeline items. Identify by track_type, track_index, item_index.\n\n    Actions:\n      add(frame, color, name, note, duration, custom_data?, ...) -> {success}\n      get_all(...) -> {markers}\n      get_by_custom_data(custom_data, ...) -> {markers}\n      update_custom_data(frame, custom_data, ...) -> {success}\n      get_custom_data(frame, ...) -> {data}\n      delete_by_color(color, ...) -> {success}\n      delete_at_frame(frame, ...) -> {success}\n      delete_by_custom_data(custom_data, ...) -> {success}\n      add_flag(color, ...) -> {success}\n      get_flags(...) -> {flags}\n      clear_flags(color, ...) -> {success}\n      get_clip_color(...) -> {color}\n      set_clip_color(color, ...) -> {success}\n      clear_clip_color(...) -> {success}\n\n    Default: track_type=\"video\", track_index=1, item_index=0\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_item_markersArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_item_markersOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_item_fusion",
+   "description": "Fusion composition operations on timeline items. Identify by track_type, track_index, item_index.\n\n    Actions:\n      add_comp(...) -> {success}\n      get_comp_count(...) -> {count}\n      get_comp_names(...) -> {names}\n      get_comp_by_name(name, ...) -> {available}\n      get_comp_by_index(index, ...) -> {available}\n      export_comp(path, index, ...) -> {success}\n      import_comp(path, ...) -> {success}\n      delete_comp(name, ...) -> {success}\n      load_comp(name, ...) -> {success}\n      rename_comp(old_name, new_name, ...) -> {success}\n      get_cache_enabled(...) -> {enabled}  \u2014 Fusion output cache status\n      set_cache(value, ...) -> {success}  \u2014 value: \"Auto\", \"On\", or \"Off\"\n\n    Default: track_type=\"video\", track_index=1, item_index=0\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_item_fusionArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_item_fusionOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_item_color",
+   "description": "Color grading, versions, LUTs, cache, and AI tools on timeline items. Identify by track_type, track_index, item_index.\n\n    Actions:\n      set_cdl(cdl, ...) -> {success}  \u2014 cdl: {NodeIndex, Slope, Offset, Power, Saturation}\n      copy_grades(target_ids, ...) -> {success}\n      add_version(name, type?, ...) -> {success}  \u2014 type: 0=local, 1=remote\n      get_current_version(...) -> {version}\n      get_version_names(type?, ...) -> {names}\n      load_version(name, type?, ...) -> {success}\n      rename_version(old_name, new_name, type?, ...) -> {success}\n      delete_version(name, type?, ...) -> {success}\n      get_node_graph(layer_index?, ...) -> {available}\n      get_color_group(...) -> {name}\n      assign_color_group(group_name, ...) -> {success}\n      remove_from_color_group(...) -> {success}\n      export_lut(type, path, ...) -> {success}\n      get_color_cache(...) -> {enabled}\n      set_color_cache(enabled, ...) -> {success}\n      get_fusion_cache(...) -> {enabled}\n      set_fusion_cache(enabled, ...) -> {success}\n      stabilize(...) -> {success}\n      smart_reframe(...) -> {success}\n      create_magic_mask(mode, ...) -> {success}  \u2014 mode: \"F\" forward, \"B\" backward, \"BI\" bidirectional\n      regenerate_magic_mask(...) -> {success}\n\n    Default: track_type=\"video\", track_index=1, item_index=0\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_item_colorArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_item_colorOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "timeline_item_takes",
+   "description": "Take management on timeline items. Identify by track_type, track_index, item_index.\n\n    Actions:\n      add(clip_id, start_frame?, end_frame?, ...) -> {success}\n      get_count(...) -> {count}\n      get_selected_index(...) -> {index}\n      get_by_index(index, ...) -> {take}\n      select(index, ...) -> {success}\n      delete(index, ...) -> {success}\n      finalize(...) -> {success}\n\n    Default: track_type=\"video\", track_index=1, item_index=0\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "timeline_item_takesArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "timeline_item_takesOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "gallery",
+   "description": "Gallery album management.\n\n    Actions:\n      get_album_name(album_index?) -> {name}\n      set_album_name(name, album_index?) -> {success}\n      get_current_album() -> {available}\n      set_current_album(album_index) -> {success}\n      get_still_albums() -> {albums}\n      get_power_grade_albums() -> {albums}\n      create_still_album() -> {success}\n      create_power_grade_album() -> {success}\n\n    album_index is 0-based into the still albums list.\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "galleryArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "galleryOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "gallery_stills",
+   "description": "Manage stills in gallery albums (best results on Color page).\n\n    Actions:\n      get_stills(album_index?) -> {count}\n      get_label(still_index, album_index?) -> {label}\n      set_label(still_index, label, album_index?) -> {success}\n      import_stills(paths, album_index?) -> {success}\n      export_stills(folder_path, prefix?, format?, album_index?) -> {success}\n      grab_and_export(folder_path, prefix?, format?, album_index?, delete_after?, cleanup?) -> {files}\n      delete_stills(still_indices, album_index?) -> {success}\n\n    album_index defaults to current album. still_index is 0-based.\n    format for export: dpx, cin, tif, jpg, png, ppm, bmp, xpm, drx (default: dpx).\n    grab_and_export grabs a still from the current frame and exports it immediately,\n    keeping the live GalleryStill reference (more reliable than separate grab + export).\n    Requires Color page. Automatically produces a companion .drx grade file.\n    File data is inlined in the response (DRX as text, images as base64).\n    cleanup (default true) deletes exported files from disk after inlining.\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "gallery_stillsArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "gallery_stillsOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "graph",
+   "description": "Node graph operations (color grading nodes). Source can be timeline, timeline item, or color group.\n\n    Actions:\n      get_num_nodes(source?, ...) -> {count}\n      get_lut(node_index, source?, ...) -> {lut}\n      set_lut(node_index, lut_path, source?, ...) -> {success}\n      get_node_cache(node_index, source?, ...) -> {cache}\n      set_node_cache(node_index, cache_value, source?, ...) -> {success}\n      get_node_label(node_index, source?, ...) -> {label}\n      get_tools_in_node(node_index, source?, ...) -> {tools}\n      set_node_enabled(node_index, enabled, source?, ...) -> {success}\n      apply_grade_from_drx(path, grade_mode?, source?, ...) -> {success}\n        grade_mode: 0=\"No keyframes\" (default), 1=\"Source Timecode aligned\", 2=\"Start Frames aligned\"\n        Note: All modes replace the entire node graph \u2014 there is no append mode.\n      apply_arri_cdl_lut(source?, ...) -> {success}\n      reset_all_grades(source?, ...) -> {success}\n\n    source: \"timeline\" (default), \"item\" (needs track_type/track_index/item_index),\n            \"color_group_pre\"/\"color_group_post\" (needs group_name)\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "graphArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "graphOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "color_group",
+   "description": "Manage color groups and their node graphs.\n\n    Actions:\n      list() -> {groups}\n      get_name(group_name) -> {name}\n      set_name(group_name, new_name) -> {success}\n      get_clips(group_name) -> {clips}\n      get_pre_clip_graph(group_name) -> {available, num_nodes}\n      get_post_clip_graph(group_name) -> {available, num_nodes}\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "color_groupArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "color_groupOutput",
+    "type": "object"
+   }
+  },
+  {
+   "name": "fusion_comp",
+   "description": "Fusion composition node graph operations on the currently active comp.\n\n    Operates on the comp open in the Fusion page. Use timeline_item_fusion to\n    manage comp lifecycle (add/delete/import/export). Use this tool to manipulate\n    the node graph inside a composition.\n\n    Actions:\n      add_tool(tool_type, x?, y?, name?) -> {tool_name, tool_type}\n      delete_tool(tool_name) -> {success}\n      get_tool_list(type?) -> {tools, count}\n      find_tool(name) -> {found, name, type, attrs}\n      connect(target_tool, input_name, source_tool, output_name?) -> {success}\n      disconnect(tool_name, input_name) -> {success}\n      get_inputs(tool_name) -> {inputs}\n      get_outputs(tool_name) -> {outputs}\n      set_input(tool_name, input_name, value, time?) -> {success}\n      get_input(tool_name, input_name, time?) -> {value}\n      set_attrs(tool_name, attrs) -> {success}\n      get_attrs(tool_name) -> {attrs}\n      add_keyframe(tool_name, input_name, time, value) -> {success}\n      get_keyframes(tool_name, input_name) -> {keyframes}\n      delete_keyframe(tool_name, input_name, time) -> {success}\n      get_comp_info() -> {name, tool_count, attrs}\n      set_frame_range(start, end) -> {success}\n      render() -> {success}\n      start_undo(name?) -> {success}\n      end_undo(keep?) -> {success}\n\n    Common tool_type values: Merge, Background, TextPlus, Transform, Blur,\n      ColorCorrector, RectangleMask, EllipseMask, Tracker, MediaIn, MediaOut,\n      Loader, Saver, Glow, FilmGrain, CornerPositioner, DeltaKeyer, UltraKeyer\n    ",
+   "inputSchema": {
+    "properties": {
+     "action": {
+      "title": "Action",
+      "type": "string"
+     },
+     "params": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Params"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "fusion_compArguments",
+    "type": "object"
+   },
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "additionalProperties": true,
+      "title": "Result",
+      "type": "object"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "fusion_compOutput",
+    "type": "object"
+   }
+  }
+ ]
+}

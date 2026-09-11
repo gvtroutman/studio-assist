@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -74,6 +75,23 @@ THEME_NAMES = [("dark", "Dark"), ("light", "Light")]
 
 SIDEBAR_W = 236
 
+# Apps this machine may have that no bridge here drives, and where a bridge
+# for each has been seen. Hints for the connect dialog, not commands: each of
+# these installs a CEP panel inside the app and starts differently, so the
+# command line has to come from the one the user actually installed.
+SUGGESTED_BRIDGES = {
+    "Premiere Pro": "Bridges seen for Premiere Pro: antipaster/Adobe-Premiere-Pro-MCP and "
+                    "leancoderkavy/premiere-pro-mcp on GitHub. Both need their CEP panel "
+                    "installed in Premiere (Window > Extensions) and the panel open; the "
+                    "command line is in each README.",
+    "Audition": "No standalone Audition bridge is known. mikechambers/adb-mcp on GitHub "
+                "covers several Adobe apps through one proxy; check whether its current "
+                "release lists Audition before installing it.",
+    "Media Encoder": "Media Encoder is normally driven from Premiere or After Effects "
+                     "(their render queues hand off to it) rather than by a bridge of its "
+                     "own. A Premiere bridge that lists AME tools is the usual route.",
+}
+
 MAX_STEPS = 25
 
 
@@ -95,13 +113,150 @@ def rounded(canvas, x1, y1, x2, y2, r, **kw):
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
+class Pill(tk.Canvas):
+    """
+    A rounded button. Tk's Button is a rectangle and nothing on it bends, so
+    this draws its own: a smoothed polygon with the label on top. `roles` are
+    palette role names; `paint(C)` is called with the palette on every theme
+    switch, and `set()` covers what _apply_status used to config() on the
+    Button - the text and whether it takes clicks.
+    """
+
+    def __init__(self, parent, text, command, font, roles, padx=18, pady=6, r=12,
+                 **kw):
+        tk.Canvas.__init__(self, parent, highlightthickness=0, bd=0, cursor="hand2",
+                           **kw)
+        self.command, self.font, self.roles = command, font, roles
+        self.padx, self.pady, self.r = padx, pady, r
+        self.text, self.lit, self.C = text, False, None
+        self.bind("<Button-1>", self._click)
+        self.bind("<Enter>", lambda ev: self._light(True))
+        self.bind("<Leave>", lambda ev: self._light(False))
+
+    @property
+    def state(self):
+        return str(tk.Canvas.cget(self, "state")) or "normal"
+
+    def cget(self, key):
+        """Reads like the Button it replaced: `text` and `state` answer."""
+        return self.text if key == "text" else tk.Canvas.cget(self, key)
+
+    def _click(self, _ev):
+        if self.state == "normal":
+            self.command()
+        return "break"
+
+    def _light(self, on):
+        self.lit = on
+        if self.C:
+            self.paint(self.C)
+
+    def set(self, text=None, state=None):
+        if text is not None:
+            self.text = text
+        if state is not None:
+            self.config(state=state)      # the canvas's own option
+        if self.C:
+            self.paint(self.C)
+
+    def paint(self, C):
+        self.C = C
+        bg, fg, active, off, off_fg = (C[r] for r in self.roles)
+        w = self.font.measure(self.text) + 2 * self.padx
+        h = self.font.metrics("linespace") + 2 * self.pady
+        self.config(width=w, height=h)
+        self.delete("all")
+        fill = off if self.state != "normal" else active if self.lit else bg
+        rounded(self, 0, 0, w, h, self.r, fill=fill, outline=fill)
+        self.create_text(w / 2, h / 2, text=self.text, font=self.font,
+                         fill=off_fg if self.state != "normal" else fg)
+        self.config(cursor="hand2" if self.state == "normal" else "arrow")
+
+
 APP_NAME_CHARS = 16                       # sidebar rows, before the ellipsis
+LLM_PC = "LLM PC"                         # the sidebar's second group: remote apps
 
 
 def app_subtitle(a):
     """The second line of a sidebar row. Also what the rail is measured on."""
-    sub = a["version"] or "installed"
+    sub = a["version"] or ("remote" if a.get("remote") else "installed")
     return sub + "  ·  drivable" if a["drivable"] else sub
+
+
+IMAGE_TYPES = [("Pictures", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"),
+               ("All files", "*.*")]
+PREVIEWABLE = (".png", ".gif")            # what Tk 8.6 can decode without PIL
+ATTACH_LIMIT = 200_000_000                # bytes; a picture, not a video
+
+
+def image_dims(path):
+    """(width, height) from the file header, or None. PNG, GIF and JPEG only -
+    the formats a camera, a screenshot or an export actually produces - and
+    read without decoding, so a 200 MB TIFF costs nothing to attach."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(32)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                return (int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big"))
+            if head[:6] in (b"GIF87a", b"GIF89a"):
+                return (int.from_bytes(head[6:8], "little"), int.from_bytes(head[8:10], "little"))
+            if head[:2] == b"\xff\xd8":
+                f.seek(2)
+                while True:
+                    marker = f.read(2)
+                    if len(marker) < 2 or marker[0] != 0xFF:
+                        return None
+                    if marker[1] in (0xD8, 0x01) or 0xD0 <= marker[1] <= 0xD7:
+                        continue
+                    size = int.from_bytes(f.read(2), "big")
+                    if marker[1] in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                                     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        sof = f.read(5)
+                        return (int.from_bytes(sof[3:5], "big"), int.from_bytes(sof[1:3], "big"))
+                    f.seek(size - 2, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def describe_picture(path):
+    """One line a text model can act on: name, size, dimensions, and the path
+    every bridge on this PC opens files by."""
+    ext = os.path.splitext(path)[1].lstrip(".").upper() or "file"
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    detail = ["%.1f MB" % (size / 1e6) if size >= 1e6 else "%d KB" % max(1, size // 1000)]
+    dims = image_dims(path)
+    if dims:
+        detail.insert(0, "%d x %d" % dims)
+    return "%s (%s %s) at %s" % (os.path.basename(path), ", ".join(detail), ext, path)
+
+
+def picture_note(paths, app):
+    """The paragraph appended to the brief when pictures are attached. Bridges
+    on this PC take the path as it is; the OpenCode container sees only its
+    workspace, so the pictures are copied in and named by the path the
+    container will see."""
+    if not paths:
+        return ""
+    lines = []
+    if getattr(app, "container", False):
+        folder = os.path.join(app.workspace, "attachments")
+        os.makedirs(folder, exist_ok=True)
+        for p in paths:
+            dest = os.path.join(folder, os.path.basename(p))
+            if os.path.abspath(dest) != os.path.abspath(p):
+                shutil.copy2(p, dest)
+            lines.append("- %s (copied into the workspace; the container sees it as "
+                         "/workspace/attachments/%s)" % (describe_picture(dest), os.path.basename(p)))
+        head = "Attached pictures, copied into the workspace:"
+    else:
+        head = ("Attached pictures - files on this PC; tools that take a file path "
+                "(import, place, upload) take these paths as written:")
+        lines = ["- " + describe_picture(p) for p in paths]
+    return "\n\n" + head + "\n" + "\n".join(lines)
 
 
 def this_pc():
@@ -124,7 +279,7 @@ class Prefs:
     read-only or locked-down profile costs you the preference, never the app.
     """
 
-    DEFAULTS = {"theme": "dark", "tabs": None, "pinned": [], "hidden": []}
+    DEFAULTS = {"theme": "dark", "tabs": None, "pinned": [], "hidden": [], "bridges": []}
 
     def __init__(self, path=None):
         self.path = path or settings_path()
@@ -149,6 +304,11 @@ class Prefs:
         tabs = self.data.get("tabs")
         self.data["tabs"] = ([x for x in tabs if isinstance(x, str)]
                              if isinstance(tabs, list) else None)
+        # Bridges the user entered by hand. Each record is re-validated by the
+        # engine when it is turned into a registry entry; here only the shape.
+        bridges = self.data.get("bridges")
+        self.data["bridges"] = ([x for x in bridges if isinstance(x, dict)]
+                                if isinstance(bridges, list) else [])
 
     def get(self, key):
         return self.data.get(key)
@@ -187,6 +347,7 @@ class Session:
         self.record = tasks.TaskRecord()
         self.record.app_id = app.id
         self.schemas = []
+        self.llm = None                   # this tab's model; set by Chat at boot
         self.library = None               # tools the model made, set by Chat
         self.groups = list(app.default_groups)
         self.preview_images = []
@@ -249,17 +410,20 @@ class Chat(tk.Tk):
         self.dot_role = {}                # canvas -> palette role
         self.marks = {}                   # icon key -> [(canvas, size, spec)]
         self.photos = {}                  # (icon key, size) -> PhotoImage
+        self.attachments = []             # picture paths waiting in the composer
         self.windows = {}                 # ("tools", app id) / "prefs" -> Toplevel
         self.tool_views = {}              # app id -> that window's Text
         self.configure(bg=self.C["bg"])
 
         self.q = queue.Queue()
         self.llm = None
+        self.model_ids = []               # what the host serves, for per-app picks
         self.host = eng.env_default("STUDIO_HOST", "AE_AGENT_HOST",
                                     fallback=eng.DEFAULT_HOST)
         self.want_model = eng.env_default("STUDIO_MODEL", "AE_AGENT_MODEL")
         self.host_ready = threading.Event()
 
+        eng.load_bridges(self.prefs.get("bridges"))
         self.detected = eng.detect_apps()
         self.hidden = list(self.prefs.get("hidden"))
         self.pinned = list(self.prefs.get("pinned"))
@@ -310,9 +474,9 @@ class Chat(tk.Tk):
         # By codepoint: these are private-use characters that paste into an
         # editor as blanks, and MDL2 is documented by its hex codes anyway.
         mdl2 = {"pin": 0xE718, "unpin": 0xE77A, "close": 0xE8BB,
-                "add": 0xE710, "link": 0xE71B, "more": 0xE70D}
+                "add": 0xE710, "link": 0xE71B, "more": 0xE70D, "picture": 0xEB9F}
         plain = {"pin": 0x2191, "unpin": 0x2193, "close": 0x00D7,
-                 "add": 0x002B, "link": 0x21C4, "more": 0x02C5}
+                 "add": 0x002B, "link": 0x21C4, "more": 0x02C5, "picture": 0x25A3}
         self.g = {k: chr(v) for k, v in (mdl2 if have else plain).items()}
 
     def _px(self, n):
@@ -325,15 +489,15 @@ class Chat(tk.Tk):
         is actually going to draw - version lines run from "Beta" to
         "2024, 2025, 2026, Beta" - so nothing is clipped at any display scale.
         """
-        self.marks_px = {"row": self._px(26), "tab": self._px(20),
-                         "menu": self._px(16)}
+        self.marks_px = {"row": self._px(30), "tab": self._px(22),
+                         "menu": self._px(18)}
         self.dot_px = self._px(8)
         widest = 0
         for a in self.detected:
             widest = max(widest, self.f_ui.measure(clip(a["name"], APP_NAME_CHARS)),
                          self.f_small.measure(app_subtitle(a)))
         # mark, both glyph buttons, the status dot and every gap between them
-        self.side_w = max(self._px(SIDEBAR_W), widest + self._px(122))
+        self.side_w = max(self._px(SIDEBAR_W), widest + self._px(126))
 
     # ------------------------------------------------------------------ theming
     def _skin(self, widget, **roles):
@@ -373,6 +537,8 @@ class Chat(tk.Tk):
                 self.skin.pop(widget, None)
         for canvas in list(self.dot_role):
             self._set_dot(canvas, self.dot_role[canvas])
+        self.btn_send.paint(self.C)
+        self.composer_paint()
         for s in self.sessions.values():
             self._tags(s.view)
         for app_id, view in list(self.tool_views.items()):
@@ -411,6 +577,9 @@ class Chat(tk.Tk):
         m_file.add_command(label="Close tab", accelerator="Ctrl+W",
                            command=self._close_tab)
         m_file.add_separator()
+        m_file.add_command(label="Connect an MCP bridge...",
+                           command=lambda: self._bridge_dialog())
+        m_file.add_separator()
         m_file.add_command(label="Preferences...", accelerator="Ctrl+,",
                            command=self._prefs_window)
         m_file.add_separator()
@@ -428,14 +597,25 @@ class Chat(tk.Tk):
                            command=self._on_next_tab)
         bar.add_cascade(label="View", menu=m_view)
 
+        # Rebuilt each time it opens: a bridge connected by hand is a new entry.
         m_bridge = menu()
-        for app in eng.APPS:
-            m_bridge.add_command(label="%s tools..." % app.name,
-                                 command=lambda i=app.id: self._tools_window(i))
-        m_bridge.add_separator()
-        m_bridge.add_command(label="Choose capabilities for current tab...",
-                             command=self._capabilities)
-        m_bridge.add_command(label="Start the current app", command=self._on_fix)
+        self.m_bridge = m_bridge
+
+        def fill_bridges():
+            m_bridge.delete(0, "end")
+            for app in eng.APPS:
+                m_bridge.add_command(label="%s tools..." % app.name,
+                                     command=lambda i=app.id: self._tools_window(i))
+            m_bridge.add_separator()
+            m_bridge.add_command(label="Choose capabilities for current tab...",
+                                 command=self._capabilities)
+            m_bridge.add_command(label="Start the current app", command=self._on_fix)
+            m_bridge.add_separator()
+            m_bridge.add_command(label="Connect an MCP bridge...",
+                                 command=lambda: self._bridge_dialog())
+        self._fill_bridge_menu = fill_bridges
+        fill_bridges()
+        m_bridge.config(postcommand=fill_bridges)
         bar.add_cascade(label="Bridges", menu=m_bridge)
 
         m_help = menu()
@@ -448,6 +628,7 @@ class Chat(tk.Tk):
         for seq, fn in (("<Control-n>", self._on_new),
                         ("<Control-t>", lambda: self._tab_menu(self.btn_add)),
                         ("<Control-w>", self._close_tab),
+                        ("<Control-o>", self._on_attach),
                         ("<Control-comma>", self._prefs_window)):
             self.bind_all(seq, lambda ev, f=fn: (f(), "break")[1])
             self.input.bind(seq, lambda ev, f=fn: (f(), "break")[1])
@@ -610,14 +791,28 @@ class Chat(tk.Tk):
         c = tk.Canvas(parent, width=size + 2, height=size + 2, highlightthickness=0,
                       bd=0)
         self._skin(c, bg=bg)
-        c.create_oval(1, 1, size, size, fill=self.C[role], outline=self.C[role])
+        c.create_image(size / 2 + 1, size / 2 + 1, image=self._disc(role, size))
         self.dot_role[c] = role
         return c
+
+    def _disc(self, role, size):
+        """The status dot as an antialiased image - a canvas oval this small
+        comes out as an octagon. Cached by colour, since a theme switch
+        changes what every role means."""
+        key = ("disc", self.C[role], size)
+        photo = self.photos.get(key)
+        if photo is None:
+            data = icons.disc_png(self.C[role], size)
+            photo = tk.PhotoImage(data=base64.b64encode(data).decode("ascii"),
+                                  master=self)
+            self.photos[key] = photo
+        return photo
 
     def _set_dot(self, canvas, role):
         self.dot_role[canvas] = role
         try:
-            canvas.itemconfig(1, fill=self.C[role], outline=self.C[role])
+            size = int(canvas.cget("width")) - 2
+            canvas.itemconfig(1, image=self._disc(role, size))
         except tk.TclError:
             self.dot_role.pop(canvas, None)
 
@@ -666,10 +861,12 @@ class Chat(tk.Tk):
         for child in widget.winfo_children():
             self._hook_click(child, fn)
 
-    def _hover(self, row, widgets, base, lit):
+    def _hover(self, row, widgets, base, lit, on=None):
         """
         Light a whole row on hover. <Leave> also fires when the pointer moves
         onto a child, so check where it actually went before unlighting.
+        `on`, if given, is told whether the row is lit - for controls that
+        only appear while the pointer is over the row.
         """
         def paint(role):
             for w in widgets:
@@ -677,6 +874,8 @@ class Chat(tk.Tk):
                     w.config(bg=self.C[role])
                 except tk.TclError:
                     pass
+            if on is not None:
+                on(role == lit)
 
         def leave(ev):
             under = row.winfo_containing(ev.x_root, ev.y_root)
@@ -724,6 +923,7 @@ class Chat(tk.Tk):
         self.btn_add.pack(side="left", padx=(4, 0), pady=(6, 7))
         for sid in self.order:
             self._make_tab(sid)
+        strip.bind("<Configure>", self._fit_tabs)
 
     def _make_tab(self, sid):
         app = self.sessions[sid].app
@@ -746,11 +946,51 @@ class Chat(tk.Tk):
         self._skin(close, bg="bg", fg="faint")
         close.pack(side="left", padx=(8, 0))
         self.tab_ui[sid] = {"tab": tab, "rule": rule, "label": lbl, "dot": dot,
-                            "close": close,
+                            "close": close, "mark": mark, "compact": False,
                             "bgs": [tab, inner, lbl, mark, dot, close]}
         self._hook_click(tab, lambda ev, i=sid: self._select(i))
         # after _hook_click, so the close glyph keeps its own handler
         close.bind("<Button-1>", lambda ev, i=sid: (self._close_tab(i), "break")[1])
+        self._tip(mark, app.name)         # the name, once the label is folded away
+        self._fit_tabs()
+
+    def _compact_tab(self, sid, on):
+        """Fold a tab down to its mark and dot, or unfold it. Pack order is
+        mark, label, dot, close; the label goes back in before the dot."""
+        ui = self.tab_ui[sid]
+        if ui["compact"] == on:
+            return
+        ui["compact"] = on
+        if on:
+            ui["label"].pack_forget()
+            ui["close"].pack_forget()
+        else:
+            ui["label"].pack(side="left", padx=(8, 8), before=ui["dot"])
+            ui["close"].pack(side="left", padx=(8, 0))
+
+    def _fit_tabs(self, _ev=None):
+        """
+        Seven apps do not fit across a small window as labelled tabs, and Tk's
+        packer answers overflow by pushing the last tabs off the edge, unmapped
+        and unreachable. So the strip folds instead: when the labelled row is
+        wider than the strip, every tab but the active one drops to its mark
+        and status dot - the mark carries the name as a tooltip - and unfolds
+        again when there is room. Called on every add, close, select and resize.
+        """
+        strip = self.tabbar.master
+        avail = strip.winfo_width() - self.btn_add.winfo_reqwidth() - 8
+        if avail <= 1 or not self.tab_ui:
+            return                        # not laid out yet; <Configure> will call back
+        # Measured from the parts, not the packed tab: a part's requested width
+        # is known at once, while the tab's own needs an idle pass - and an idle
+        # pass from inside a <Configure> handler re-enters this method.
+        # Paddings are the literal ones _make_tab packs with.
+        def labelled(ui):
+            return (ui["mark"].winfo_reqwidth() + ui["dot"].winfo_reqwidth() + 22
+                    + ui["label"].winfo_reqwidth() + ui["close"].winfo_reqwidth() + 24)
+        fold = sum(labelled(ui) for ui in self.tab_ui.values()) > avail
+        for sid in self.tab_ui:
+            self._compact_tab(sid, fold and sid != self.active)
 
     def _spec_for(self, app):
         """The mark for a registry app - keyed by app id, same as its sidebar row."""
@@ -809,6 +1049,7 @@ class Chat(tk.Tk):
         ui = self.tab_ui.pop(sid)
         ui["tab"].destroy()
         s.frame.destroy()
+        self._fit_tabs()
         # Shutting an MCP subprocess down can block for a moment; a turn still
         # in flight keeps running and its events are dropped by _handle.
         self._spawn(None, s.close)
@@ -833,6 +1074,7 @@ class Chat(tk.Tk):
             self.sessions[sid].frame.pack(side="top", fill="both", expand=True)
         for i in self.order:
             self._paint_tab(i)
+        self._fit_tabs()
         self._apply_status()
         self._sync_bridges()
         if sid is not None:
@@ -925,15 +1167,27 @@ class Chat(tk.Tk):
         self.app_dots = {}
 
         rows = [a for a in self.detected if a["name"] not in self.hidden]
+        # Pinning orders a row within its own group: a remote app pinned to the
+        # top still lives on the LLM PC, and the heading has to stay true.
         rows.sort(key=lambda a: self.pinned.index(a["name"])
                   if a["name"] in self.pinned else len(self.pinned))
-        for a in rows:
+        local = [a for a in rows if not a.get("remote")]
+        remote = [a for a in rows if a.get("remote")]
+        for a in local:
             self._app_row(a)
-        if not rows:
-            msg = ("every app is hidden" if self.detected
+        if not local:
+            msg = ("every app is hidden"
+                   if any(not a.get("remote") for a in self.detected)
                    else "no creative apps found")
             self._skin(tk.Label(self.applist, text=msg, font=self.f_small),
                        bg="side", fg="faint").pack(padx=18, pady=2, anchor="w")
+        # The second group, under its own heading. The first heading is the
+        # rail's header and stays put; this one comes and goes with its rows.
+        if remote:
+            self._cap(self.applist, "ON %s" % LLM_PC).pack(
+                fill="x", padx=(18, 12), pady=(16, 8))
+            for a in remote:
+                self._app_row(a)
 
     def _app_row(self, a):
         name = a["name"]
@@ -949,14 +1203,34 @@ class Chat(tk.Tk):
         # whatever is left over, so packing it first shoves the pin, the hide
         # and the status dot off the right-hand edge - the same pack-order trap
         # that hid the Send button. Right to left: hide, pin, dot.
-        hide = self._glyph(row, "close", lambda w, n=name: self._hide_app(n),
+        # The glyphs only appear while the pointer is over the row. Each sits
+        # in a slot frozen at the glyph's own size, so unmapping the glyph
+        # leaves the slot - and the dot beside it - exactly where they were.
+        # (Painting the glyph in the row colour instead leaves a ClearType
+        # ghost.) A pinned app's pin is state, and stays put.
+        def slot():
+            f = self._skin(tk.Frame(row), bg="side")
+            f.pack(side="right")
+            return f
+        hide_slot, pin_slot = slot(), slot()
+        hide = self._glyph(hide_slot, "close", lambda w, n=name: self._hide_app(n),
                            tip="Remove %s from this list" % name)
-        hide.pack(side="right")
-        pin = self._glyph(row, "unpin" if pinned else "pin",
+        pin = self._glyph(pin_slot, "unpin" if pinned else "pin",
                           lambda w, n=name: self._pin_app(n),
                           fg="accent" if pinned else "faint",
                           tip="Unpin %s" % name if pinned else "Pin %s to the top" % name)
-        pin.pack(side="right")
+        for f, g in ((hide_slot, hide), (pin_slot, pin)):
+            f.config(width=g.winfo_reqwidth(), height=g.winfo_reqheight())
+            f.pack_propagate(False)
+            g.pack()
+
+        def reveal(lit):
+            for g in (hide,) if pinned else (hide, pin):
+                if lit:
+                    g.pack()
+                else:
+                    g.pack_forget()
+        reveal(False)
         dot = None
         if a["drivable"]:
             dot = self._dot(row, "faint")
@@ -972,22 +1246,34 @@ class Chat(tk.Tk):
                                        anchor="w"), bg="side", fg="faint")
         subtitle.pack(fill="x")
 
-        widgets = [row, box, title, subtitle, mark, hide, pin]
+        widgets = [row, box, title, subtitle, mark, hide, pin, hide_slot, pin_slot]
         if dot is not None:
             widgets.append(dot)
             row.config(cursor="hand2")
             for w in (row, box, title, subtitle, mark):
                 w.bind("<Button-1>", lambda ev, i=a["id"]: self._add_tab(i))
-        self._hover(row, widgets, "side", "hover")
+        self._hover(row, widgets, "side", "hover", on=reveal)
         for w in widgets:
             w.bind("<Button-3>", lambda ev, r=a: self._app_context(ev, r), add="+")
 
     def _app_context(self, ev, a):
         name = a["name"]
         m = self._menu()
+        spec = eng.APPS_BY_ID.get(a["id"]) if a["drivable"] else None
         if a["drivable"]:
             m.add_command(label="Chat with %s" % name,
                           command=lambda i=a["id"]: self._add_tab(i))
+            if spec is not None and spec.custom:
+                m.add_command(label="Edit the bridge...",
+                              command=lambda sp=spec: self._bridge_dialog(spec=sp))
+                m.add_command(label="Forget the bridge",
+                              command=lambda sp=spec: self._forget_bridge(sp))
+            m.add_separator()
+        else:
+            # No bridge written here. The user may have one - installed from
+            # anywhere - and can connect it as a command line.
+            m.add_command(label="Connect an MCP bridge for %s..." % name,
+                          command=lambda r=a: self._bridge_dialog(row=r))
             m.add_separator()
         m.add_command(label="Unpin" if name in self.pinned else "Pin to the top",
                       command=lambda n=name: self._pin_app(n))
@@ -1243,18 +1529,49 @@ class Chat(tk.Tk):
 
     # ---------------------------------------------------------------- composer
     def _build_composer(self, composer):
-        shell = self._skin(tk.Frame(composer), bg="border")
+        # The input's rounded outline is drawn on a canvas, with the real
+        # widgets in a frame placed on top of it. The frame sits far enough
+        # inside the curve (INSET against radius R) that its square corners
+        # never poke out; the canvas follows the frame's height, so the
+        # outline grows with the chip strip and shrinks back with it.
+        INSET, R = 7, 14
+        shell = tk.Canvas(composer, highlightthickness=0, bd=0)
+        self._skin(shell, bg="bg")
         shell.pack(fill="x")
         inner = self._skin(tk.Frame(shell), bg="card")
-        inner.pack(fill="x", padx=1, pady=1)
+        item = shell.create_window(INSET, INSET, window=inner, anchor="nw")
+
+        def paint(_ev=None):
+            w = shell.winfo_width()
+            h = inner.winfo_reqheight() + 2 * INSET
+            shell.config(height=h)
+            shell.itemconfig(item, width=max(1, w - 2 * INSET))
+            shell.delete("frame")
+            rounded(shell, 0, 0, w, h, R, fill=self.C["border"],
+                    outline=self.C["border"], tags="frame")
+            rounded(shell, 1, 1, w - 1, h - 1, R - 1, fill=self.C["card"],
+                    outline=self.C["card"], tags="frame")
+            shell.tag_lower("frame")
+        shell.bind("<Configure>", paint)
+        inner.bind("<Configure>", paint)
+        self.composer_paint = paint
+
+        # Pictures waiting to go with the next message sit above the input,
+        # one chip each; the strip is packed only while it has something in it.
+        self.chips = self._skin(tk.Frame(inner), bg="card")
+        self.row = self._skin(tk.Frame(inner), bg="card")
+        self.row.pack(fill="x")
+        row = self.row
         # button first, then the expanding input - same rule as above
-        self.btn_send = tk.Button(inner, text="Send", command=self._on_send,
-                                  font=self.f_bold, relief="flat", padx=18, pady=6,
-                                  cursor="hand2", bd=0)
-        self._skin(self.btn_send, bg="accent", fg="accent_fg",
-                   activebackground="accent_dk", activeforeground="accent_fg")
-        self.btn_send.pack(side="right", padx=10, pady=10)
-        self.input = tk.Text(inner, height=2, font=self.f_body, wrap="word", bd=0,
+        self.btn_send = Pill(row, "Send", self._on_send, self.f_bold,
+                             ("accent", "accent_fg", "accent_dk", "border", "faint"))
+        self._skin(self.btn_send, bg="card")
+        self.btn_send.paint(self.C)
+        self.btn_send.pack(side="right", padx=(10, 4), pady=4)
+        self.btn_attach = self._glyph(row, "picture", self._on_attach, bg="card",
+                                      tip="Attach pictures (Ctrl+O)")
+        self.btn_attach.pack(side="left", padx=(12, 0))
+        self.input = tk.Text(row, height=2, font=self.f_body, wrap="word", bd=0,
                              padx=14, pady=11, highlightthickness=0)
         self._skin(self.input, bg="card", fg="text", insertbackground="accent",
                    selectbackground="sel")
@@ -1262,10 +1579,95 @@ class Chat(tk.Tk):
         self.input.bind("<Return>", self._on_return)
         self.input.focus_set()
         hint = tk.Label(composer, text="Enter to send   ·   Shift+Enter for a new line"
+                                       "   ·   Ctrl+O to attach a picture"
                                        "   ·   Ctrl+Tab to switch app",
                         font=self.f_small, anchor="w")
         self._skin(hint, bg="bg", fg="faint")
         hint.pack(fill="x", pady=(6, 0))
+
+    # ------------------------------------------------------------- attachments
+    def _on_attach(self, _widget=None):
+        paths = filedialog.askopenfilenames(parent=self, title="Attach pictures",
+                                            filetypes=IMAGE_TYPES)
+        if paths:
+            self._add_attachments(paths)
+
+    def _add_attachments(self, paths):
+        """Queue pictures for the next message. Bad files are refused here,
+        with a line in the transcript, rather than at send time."""
+        s = self.cur()
+        for p in paths:
+            p = os.path.abspath(p)
+            if p in self.attachments:
+                continue
+            try:
+                size = os.path.getsize(p)
+            except OSError as e:
+                if s:
+                    self._write(s, "Could not attach %s: %s\n" % (p, e.strerror or e), "err")
+                continue
+            if size > ATTACH_LIMIT:
+                if s:
+                    self._write(s, "Not attaching %s: %.0f MB is a file to import, not a "
+                                   "picture to talk about.\n" % (p, size / 1e6), "err")
+                continue
+            self.attachments.append(p)
+        self._paint_chips()
+
+    def _drop_attachment(self, path):
+        if path in self.attachments:
+            self.attachments.remove(path)
+        self._paint_chips()
+
+    def _paint_chips(self):
+        for w in self.chips.winfo_children():
+            w.destroy()
+        if not self.attachments:
+            self.chips.pack_forget()
+            return
+        for p in self.attachments:
+            chip = self._skin(tk.Frame(self.chips), bg="side")
+            chip.pack(side="left", padx=(12, 0), pady=(10, 0))
+            dims = image_dims(p)
+            text = os.path.basename(p) + ("  %d\u00d7%d" % dims if dims else "")
+            lbl = tk.Label(chip, text=clip(text, 44), font=self.f_small, padx=8, pady=3)
+            self._skin(lbl, bg="side", fg="text")
+            lbl.pack(side="left")
+            self._tip(lbl, p)
+            self._glyph(chip, "close", lambda _w, p=p: self._drop_attachment(p),
+                        bg="side", tip="Remove").pack(side="left", padx=(0, 4))
+        self.chips.pack(fill="x", before=self.row)
+
+    def _show_attachment(self, s, path):
+        """The picture in the transcript under the message it went with - inline
+        where Tk can decode it, its name where it cannot."""
+        if path.lower().endswith(PREVIEWABLE):
+            try:
+                self._show_preview(s, {"file": path})
+                return
+            except Exception:
+                pass
+        self._write(s, "[%s]\n" % os.path.basename(path), "hint")
+
+    def _describe_pictures(self, paths):
+        """What is in the pictures, from the vision model, for the text model
+        that cannot see them. Runs on the worker; one failure is one line."""
+        model = os.environ["STUDIO_VISION_MODEL"]
+        reviewer = eng.LLM(self.host, model)
+        out = []
+        for p in paths:
+            mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                    ".webp": "image/webp", ".bmp": "image/bmp"}.get(
+                        os.path.splitext(p)[1].lower(), "image/png")
+            with open(p, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+            response = reviewer.chat([{"role": "user", "content": [
+                {"type": "text", "text": "Describe this picture for someone who cannot see it and has to work with it: subject, composition, colours, text, anything notable. Be concrete and brief."},
+                {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (mime, data)}}]}],
+                max_tokens=400)
+            text = response["choices"][0]["message"].get("content") or "No description returned."
+            out.append("%s: %s" % (os.path.basename(p), text.strip()))
+        return "\n\nWhat the pictures show (described by the vision model):\n" + "\n".join(out)
 
     def _welcome(self, s):
         if not s.app.drivable:
@@ -1276,6 +1678,161 @@ class Chat(tk.Tk):
             self._write(s, "%s. Try:\n" % s.app.name, "sys")
         for e in s.app.examples:
             self._write(s, e + "\n", "hint")
+
+    # ---------------------------------------------------- bridges entered by hand
+    def _bridge_dialog(self, row=None, spec=None):
+        """
+        Connect any MCP stdio bridge as an app tab. `row` is a sidebar app with
+        no bridge written here (the name, program and process are filled in);
+        `spec` is an existing hand-entered bridge to edit. The dialog is built
+        by this method and applied by `_save_bridge`, so a test can drive it
+        without posting a window.
+        """
+        win = tk.Toplevel(self)
+        win.title("Connect an MCP bridge")
+        win.resizable(False, False)
+        win.transient(self)
+        self._skin(win, bg="bg")
+        body = self._skin(tk.Frame(win), bg="bg")
+        body.pack(fill="both", expand=True, padx=22, pady=18)
+
+        name = (spec.name if spec else row["name"] if row else "")
+        exe = (spec.exe_path if spec else (row or {}).get("exe") or "")
+        probe = spec.probe if spec else ("process:" + os.path.basename(exe) if exe else "")
+        command = " ".join([spec.command] + [
+            ('"%s"' % a if " " in a else a) for a in spec.args]) if spec else ""
+        if spec and " " in spec.command:
+            command = '"%s"' % spec.command + command[len(spec.command):]
+
+        self._cap(body, "BRIDGE", bg="bg").pack(fill="x", pady=(0, 8))
+        intro = ("Any MCP server that speaks over stdio can drive a tab. Enter the command "
+                 "line that starts it - the same one its README puts in an MCP client "
+                 "config. Its tools and its own instructions are read when the tab opens.")
+        lbl = tk.Label(body, text=intro, font=self.f_small, anchor="w", justify="left",
+                       wraplength=self._px(460))
+        self._skin(lbl, bg="bg", fg="muted")
+        lbl.pack(fill="x", pady=(0, 12))
+
+        fields = {}
+
+        def field(key, label, value, hint):
+            self._skin(tk.Label(body, text=label, font=self.f_ui, anchor="w"),
+                       bg="bg", fg="text").pack(fill="x")
+            var = tk.StringVar(value=value)
+            entry = tk.Entry(body, textvariable=var, font=self.f_ui, bd=0,
+                             highlightthickness=1, width=58)
+            self._skin(entry, bg="card", fg="text", insertbackground="accent",
+                       highlightbackground="border", highlightcolor="accent")
+            entry.pack(fill="x", ipady=5, pady=(3, 2))
+            h = tk.Label(body, text=hint, font=self.f_small, anchor="w", justify="left",
+                         wraplength=self._px(460))
+            self._skin(h, bg="bg", fg="faint")
+            h.pack(fill="x", pady=(0, 10))
+            fields[key] = var
+            return entry
+
+        first = field("name", "App", name, "What the tab and the sidebar call it.")
+        cmd = field("command", "Command line", command,
+              'e.g.  npx -y some-mcp-server   or   "C:\\path\\python.exe" server.py')
+        field("exe", "Program (optional)", exe,
+              "Path of the app's .exe, so the Start button can launch it and the tab "
+              "gets its icon.")
+        field("probe", "Running check (optional)", probe,
+              "process:<Name.exe>, port:<number> or url:<http://...> - how to tell the "
+              "app is up. Leave empty if the bridge itself is the only evidence.")
+        if row and row["name"] in SUGGESTED_BRIDGES:
+            tip = tk.Label(body, text=SUGGESTED_BRIDGES[row["name"]], font=self.f_small,
+                           anchor="w", justify="left", wraplength=self._px(460))
+            self._skin(tip, bg="bg", fg="muted")
+            tip.pack(fill="x", pady=(0, 10))
+
+        err = tk.Label(body, text="", font=self.f_small, anchor="w", justify="left",
+                       wraplength=self._px(460))
+        self._skin(err, bg="bg", fg="err")
+        err.pack(fill="x")
+
+        def save():
+            values = {k: v.get() for k, v in fields.items()}
+            problem = self._save_bridge(values, replacing=spec)
+            if problem:
+                err.config(text=problem)
+            else:
+                win.destroy()
+
+        row_b = self._skin(tk.Frame(body), bg="bg")
+        row_b.pack(fill="x", pady=(12, 0))
+        ok = tk.Button(row_b, text="Connect" if spec is None else "Save", command=save,
+                       font=self.f_ui, relief="flat", padx=16, pady=5, cursor="hand2", bd=0)
+        self._skin(ok, bg="accent", fg="accent_fg", activebackground="accent_dk",
+                   activeforeground="accent_fg")
+        ok.pack(side="right")
+        cancel = tk.Button(row_b, text="Cancel", command=win.destroy, font=self.f_ui,
+                           relief="flat", padx=12, pady=5, cursor="hand2", bd=0)
+        self._skin(cancel, bg="card", fg="text", activebackground="border",
+                   activeforeground="text")
+        cancel.pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda ev: save())
+        win.bind("<Escape>", lambda ev: win.destroy())
+        (first if not name else cmd).focus_set()
+        return win
+
+    def _save_bridge(self, values, replacing=None):
+        """
+        Register a bridge from the dialog's values and open its tab. Returns a
+        sentence for the dialog when the values will not do, else None. The
+        command line is split the way a shell would; the program and the
+        running check are optional.
+        """
+        name = (values.get("name") or "").strip()
+        line = (values.get("command") or "").strip()
+        exe = (values.get("exe") or "").strip().strip('"')
+        probe = (values.get("probe") or "").strip()
+        if not name:
+            return "Give the app a name."
+        if not line:
+            return "Enter the command line that starts the bridge."
+        owner = eng.APPS_BY_ID.get(eng.DRIVABLE.get(name))
+        if owner is not None and not owner.custom:
+            return "%s already has a bridge written into this program; give this one another name." % name
+        try:
+            command, args = eng.split_command(line)
+        except ValueError as e:
+            return "That command line does not parse: %s" % e
+        if not (shutil.which(command) or os.path.isfile(command)):
+            return "%r is not on PATH and is not a file. Use the full path." % command
+        if exe and not os.path.isfile(exe):
+            return "There is no program at %s." % exe
+        if probe and probe.partition(":")[0] not in ("process", "port", "url"):
+            return "The running check must start with process:, port: or url:."
+        if replacing is not None:
+            if replacing.id in self.sessions:
+                self._close_tab(replacing.id)
+            eng.remove_bridge(replacing.id)
+        rec = {"name": name, "command": command, "args": args, "exe": exe, "probe": probe}
+        if replacing is not None:
+            rec["id"] = replacing.id
+        spec = eng.bridge_from_record(rec)
+        if spec is None:
+            return "Those values do not make a bridge."
+        if spec.id in self.sessions:
+            self._close_tab(spec.id)      # an older entry with the same id
+        eng.add_bridge(spec)
+        self._remember_bridges()
+        self.detected = eng.detect_apps()
+        self._build_apps()
+        self._add_tab(spec.id)
+        return None
+
+    def _forget_bridge(self, spec):
+        if spec.id in self.sessions:
+            self._close_tab(spec.id)
+        eng.remove_bridge(spec.id)
+        self._remember_bridges()
+        self.detected = eng.detect_apps()
+        self._build_apps()
+
+    def _remember_bridges(self):
+        self.prefs.set(bridges=[a.record() for a in eng.custom_bridges()])
 
     # ------------------------------------------------------------- preferences
     def _prefs_window(self):
@@ -1397,17 +1954,17 @@ class Chat(tk.Tk):
         if s is None:
             self.lbl_status.config(text="no app open", fg=self.C["muted"])
             self._show_fix(False)
-            self.btn_send.config(text="Send", state="disabled")
+            self.btn_send.set(text="Send", state="disabled")
             self.btn_new.config(state="disabled")
             return
         text, role, fixable = s.status
         self.lbl_status.config(text=text, fg=self.C[role])
-        self.btn_fix.config(text="Start %s" % s.app.name)
+        self.btn_fix.config(text=("Check %s" if s.app.remote else "Start %s") % s.app.name)
         self._show_fix(fixable)
         self.btn_new.config(state="normal")
-        self.btn_send.config(text="Stopping…" if s.busy and s.cancel.is_set() else
-                             "Stop" if s.busy else "Send",
-                             state="disabled" if s.busy and s.cancel.is_set() else "normal")
+        self.btn_send.set(text="Stopping…" if s.busy and s.cancel.is_set() else
+                          "Stop" if s.busy else "Send",
+                          state="disabled" if s.busy and s.cancel.is_set() else "normal")
 
     def _show_fix(self, show):
         if show:
@@ -1580,9 +2137,27 @@ class Chat(tk.Tk):
             self.host_ready.set()
             return
         self.llm = eng.LLM(self.host, model)
+        self.model_ids = ids
         self.q.put(("host", None, ("ok", "%s\n%d models\n%s"
                                    % (pretty_host(self.host), len(ids), clip(model, 24)))))
         self.host_ready.set()
+
+    def _llm_for(self, s):
+        """The shared model, unless this app prefers one the host serves.
+
+        A tab's model is fixed at boot: the executor, both warm-ups and the
+        cached prefix on the host all have to agree, and swapping mid-session
+        would throw the prefix away. Explains a departure once, in the tab.
+        """
+        shared = getattr(self.llm, "model", None)
+        if shared is None:
+            return self.llm
+        model, note = s.app.model_for(self.model_ids, shared)
+        if note:
+            self.q.put(("sys", s.event_id, "Model for this tab: %s (%s)." % (model, note)))
+        if model == shared:
+            return self.llm
+        return eng.LLM(self.host, model, self.llm.temperature, self.llm.timeout)
 
     def _ensure(self, s):
         """First view of a tab is what starts that app's bridge."""
@@ -1602,6 +2177,7 @@ class Chat(tk.Tk):
                 self.q.put(("status", sid, ("no inference host", "err", False)))
                 self.q.put(("bridge", sid, ("err", "%s\nno model" % s.app.bridge_label)))
                 return
+            s.llm = self._llm_for(s)
 
             if s.app.drivable:
                 self._boot_bridge(s)
@@ -1618,9 +2194,9 @@ class Chat(tk.Tk):
                                         % (", about a minute" if s.tools else ""),
                                         "warn", False)))
             try:
-                self.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
-                               {"role": "user", "content": "Say ready."}],
-                              tasks.inference_tools(s.tools, s.library), max_tokens=1)
+                s.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
+                            {"role": "user", "content": "Say ready."}],
+                           tasks.inference_tools(s.tools, s.library), max_tokens=1)
             except Exception as e:
                 self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
             s.ready = True
@@ -1668,6 +2244,14 @@ class Chat(tk.Tk):
                      for t in allt]
 
         s.schemas = allt
+        if s.app.custom:
+            # Nothing was known about this bridge until it answered: its groups
+            # come from its tool names and its briefing from `instructions`, so
+            # the system prompt - built at Session() - is rebuilt now, before
+            # the warm-up pays for the prefix a real message will use.
+            s.app.learn(allt, mcp.instructions)
+            s.groups = list(s.app.default_groups)
+            s.messages[0] = {"role": "system", "content": s.app.chat_prompt()}
         wanted = s.app.tool_names(s.groups)
         s.tools = eng.to_openai_tools([t for t in allt if t["name"] in wanted])
         self._load_library(s)
@@ -1694,6 +2278,16 @@ class Chat(tk.Tk):
                         % (len(problems), "; ".join(problems))))
 
     def _bridge_help(self, app, err):
+        if app.custom:
+            return ("Could not start the bridge you connected for %s.\n"
+                    "Its command line is:\n    %s\nRun that in a terminal to see the real "
+                    "error, or right-click %s in the sidebar to edit or forget the bridge."
+                    "\n\n(%s)" % (app.name, " ".join([app.command] + app.args), app.name, err))
+        if app.id in ("photoshop", "illustrator", "premiere"):
+            return ("Could not start the %s bridge.\n"
+                    "It is a script beside this program and needs only Python (and "
+                    "PowerShell); run this in a terminal to see the real error:\n"
+                    "    python %s --list-tools\n\n(%s)" % (app.name, app.args[0], err))
         if app.id == "after-effects":
             return ("Could not start the After Effects bridge.\n"
                     "Usually this is npx on a cold cache, or Node missing from PATH. "
@@ -1713,6 +2307,10 @@ class Chat(tk.Tk):
         if s.app.running():
             self.q.put(("status", s.event_id, ("connected", "ok", False)))
             self.q.put(("bridge", s.event_id, ("ok", "%s\n%d tools" % (s.app.bridge_label, n))))
+        elif s.app.remote:
+            # Nothing here can start it; the button re-probes instead.
+            self.q.put(("status", s.event_id, ("%s is not reachable" % s.app.name, "warn", True)))
+            self.q.put(("bridge", s.event_id, ("warn", "%s\nnot reachable" % s.app.bridge_label)))
         else:
             self.q.put(("status", s.event_id, ("%s is not running" % s.app.name, "warn", True)))
             self.q.put(("bridge", s.event_id, ("warn", "%s\nnot running" % s.app.bridge_label)))
@@ -1732,7 +2330,13 @@ class Chat(tk.Tk):
 
     def _fix(self, s):
         try:
-            if not s.app.running():
+            if s.app.remote:
+                # A remote app cannot be launched from here: re-probe, and say
+                # where it has to be started if it still does not answer.
+                if not s.app.running():
+                    self.q.put(("sys", s.event_id, "%s is not answering at %s. %s"
+                                % (s.app.name, s.app.bridge_label, s.app.launch_note)))
+            elif not s.app.running():
                 self.q.put(("sys", s.event_id, "Launching %s..." % s.app.name))
                 self.q.put(("status", s.event_id, ("launching %s" % s.app.name, "warn", False)))
                 s.app.launch()
@@ -1865,9 +2469,9 @@ class Chat(tk.Tk):
 
     def _warm_capabilities(self, s):
         try:
-            self.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
-                           {"role": "user", "content": "Say ready."}],
-                          tasks.inference_tools(s.tools, s.library), max_tokens=1)
+            s.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
+                        {"role": "user", "content": "Say ready."}],
+                       tasks.inference_tools(s.tools, s.library), max_tokens=1)
             self.q.put(("sys", s.event_id, "Selected capabilities are ready."))
         finally:
             self.q.put(("status", s.event_id, ("ready", "ok", False)))
@@ -1875,10 +2479,13 @@ class Chat(tk.Tk):
 
     def _show_preview(self, s, item):
         try:
-            data = item.get("data", "")
-            if len(data) > 20_000_000:
-                raise ValueError("preview exceeds the display size limit")
-            photo = tk.PhotoImage(data=data, master=self)
+            if item.get("file"):
+                photo = tk.PhotoImage(file=item["file"], master=self)
+            else:
+                data = item.get("data", "")
+                if len(data) > 20_000_000:
+                    raise ValueError("preview exceeds the display size limit")
+                photo = tk.PhotoImage(data=data, master=self)
             factor = max(1, (photo.width() + self._px(639)) // self._px(640),
                          (photo.height() + self._px(359)) // self._px(360))
             if factor > 1:
@@ -1890,6 +2497,8 @@ class Chat(tk.Tk):
             s.view.config(state="disabled")
             s.view.see("end")
         except Exception as e:
+            if item.get("file"):
+                raise
             self._write(s, "Preview could not be displayed: %s\n" % e, "sys")
 
     def _vision_review(self, item, brief):
@@ -1929,24 +2538,35 @@ class Chat(tk.Tk):
             self._apply_status()
             return
         task = self.input.get("1.0", "end").strip()
-        if not task:
+        pictures = list(self.attachments)
+        if not task and not pictures:
             return
         if not s.ready:
             self._write(s, "%s is still starting up - give it a moment.\n"
                         % s.app.tab, "err")
             return
+        task = task or "Take a look at what I attached."
+        try:
+            note = picture_note(pictures, s.app)
+        except OSError as e:
+            self._write(s, "Could not hand the pictures over: %s\n" % e, "err")
+            return
         self.input.delete("1.0", "end")
+        self.attachments = []
+        self._paint_chips()
         self._role(s, "YOU", "role_user")
         self._write(s, task + "\n", "user")
-        s.messages.append({"role": "user", "content": task})
-        s.record.briefs.append(task)
+        for p in pictures:
+            self._show_attachment(s, p)
+        s.messages.append({"role": "user", "content": task + note})
+        s.record.briefs.append(task + note)
         s.cancel.clear()
         s.busy = True
         s.status = ("working", "warn", False)
         self._apply_status()
-        self._spawn(s.event_id, self._turn, s)
+        self._spawn(s.event_id, self._turn, s, pictures)
 
-    def _turn(self, s):
+    def _turn(self, s, pictures=()):
         sid = s.event_id
         started = {"value": False}
         def emit(kind, payload):
@@ -1960,7 +2580,16 @@ class Chat(tk.Tk):
         def checkpoint():
             s.record.save(self._task_path(s), s.messages)
         try:
-            executor = tasks.Executor(self.llm, s.mcp, s.tools, schemas=s.schemas,
+            if pictures and os.environ.get("STUDIO_VISION_MODEL"):
+                # The executing model reads text. Put what the pictures show
+                # into the brief itself, so it survives checkpoints and resume.
+                try:
+                    s.messages[-1]["content"] += self._describe_pictures(pictures)
+                    s.record.briefs[-1] = s.messages[-1]["content"]
+                except Exception as e:
+                    emit("sys", "The vision model could not describe the pictures (%s); "
+                                "the model has their paths only." % e)
+            executor = tasks.Executor(s.llm or self.llm, s.mcp, s.tools, schemas=s.schemas,
                 record=s.record, cancel=s.cancel, emit=emit, checkpoint=checkpoint,
                 vision=self._vision_review if os.environ.get("STUDIO_VISION_MODEL") else None,
                 library=s.library)
