@@ -1159,15 +1159,24 @@ class TestGui(unittest.TestCase):
         real_running, real_exe = eng.AppSpec.running, eng.docker_exe
         eng.AppSpec.running = lambda self: False
         eng.docker_exe = lambda: None
+        logged = []
+        self.app._log = logged.append
         try:
             self.app._guard(s.event_id, self.app._fix, s)
             self.app._drain()
         finally:
             eng.AppSpec.running, eng.docker_exe = real_running, real_exe
+            del self.app._log
         body = s.view.get("1.0", "end")
         self.assertIn("Launching OpenCode", body)
         self.assertIn("Docker Desktop is not installed", body)
+        self.assertNotIn("RuntimeError", body)
         self.assertNotIn("Traceback", body)
+        # A refusal is not a crash: nothing for the error log, and the header
+        # falls back from "launching" so the button comes back.
+        self.assertEqual(logged, [])
+        self.assertEqual(s.status[0], "OpenCode is not running")
+        self.assertTrue(s.status[2], "the button stays, to try again")
 
     def test_events_for_a_closed_tab_are_dropped(self):
         """A turn can still be in flight; it must not write into another app."""
