@@ -56,7 +56,14 @@ class FakePanel:
                     return self._reply(panel.status, {"error": "boom"})
                 self._reply(200, {"result": panel.answer})
 
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        class Server(http.server.HTTPServer):
+            def handle_error(self, request, client_address):
+                # A client that gave up (the timeout test) leaves the handler
+                # writing to a dead socket; that is the point, not a failure.
+                if not isinstance(sys.exc_info()[1], (ConnectionError, OSError)):
+                    super().handle_error(request, client_address)
+
+        self.server = Server(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
@@ -390,7 +397,11 @@ class TestTools(unittest.TestCase):
         self.addCleanup(shutil.rmtree, ppro.PREVIEW_DIR, True)
         self.addCleanup(setattr, ppro, "PREVIEW_DIR", real)
         real_wait = ppro.com.wait_for_file
-        ppro.com.wait_for_file = lambda path, timeout=30: open(path, "wb").write(b"png") or True
+        def fake_wait(path, timeout=30):
+            with open(path, "wb") as fh:
+                fh.write(b"png")
+            return True
+        ppro.com.wait_for_file = fake_wait
         self.addCleanup(setattr, ppro.com, "wait_for_file", real_wait)
         res = ppro.call_tool("ppro_screenshot", {"time": 1})
         self.assertFalse(res.get("isError"), res["content"][0]["text"])
