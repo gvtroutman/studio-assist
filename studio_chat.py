@@ -2339,7 +2339,16 @@ class Chat(tk.Tk):
             elif not s.app.running():
                 self.q.put(("sys", s.event_id, "Launching %s..." % s.app.name))
                 self.q.put(("status", s.event_id, ("launching %s" % s.app.name, "warn", False)))
-                s.app.launch()
+                try:
+                    s.app.launch()
+                except RuntimeError as e:
+                    # launch() refuses in prose (nothing installed, no program
+                    # path): that is an answer for the transcript, not a crash
+                    # for the log, and the header must fall back to "not
+                    # running" so the button comes back.
+                    self.q.put(("error", s.event_id, str(e)))
+                    self._refresh_bridge(s)
+                    return
                 for _ in range(60):
                     if s.cancel.is_set():
                         return
