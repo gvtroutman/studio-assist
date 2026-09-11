@@ -19,6 +19,35 @@ moving parts:
   bounded request context, cancellation, execution journals and task recovery.
 - **`studio_toolsmith.py`** — tools the model makes for itself, and the per-app
   library they are kept in.
+- **`studio_mcp.py`** — the MCP harness. `Server` is the protocol every bridge written
+  here runs on (framing, revision negotiation, validation, annotations, logging,
+  progress, cancellation); `Loopback` is `MCPClient`'s interface over a `Server` in
+  this process; `check_tools()` / `check_live()` hold any bridge — ours or installed —
+  to what the executor and the inference host need. `python studio_mcp.py check --app
+  <id>` is the command; see *The MCP harness* below.
+- **`studio_comfy_mcp.py`** — our own MCP stdio bridge to ComfyUI's HTTP API. The
+  one bridge written here rather than installed, because ComfyUI has no MCP server
+  of its own and the stdlib-only rule bars the ones on PyPI. `--list-tools` prints
+  its contract.
+- **`studio_opencode_mcp.py`** — our MCP stdio bridge to an OpenCode server, which
+  `ContainerSpec` runs in a Docker container built from `opencode/Dockerfile`. Its file
+  tools are confined to the workspace folder the container is given. `--list-tools`
+  prints its contract.
+- **`studio_com.py`** — the road into an Adobe app that registers COM automation: a
+  PowerShell worker holding `Photoshop.Application` / `Illustrator.Application`, an
+  ExtendScript prelude (JSON serializer, error folding, unit pinning), and `ComHost.run()`
+  which turns a script body into a decoded value or a `ComError`. See *The COM bridges*.
+- **`studio_photoshop_mcp.py`**, **`studio_illustrator_mcp.py`** — our bridges to the
+  Photoshop and Illustrator on this machine, each a table of tools whose bodies are
+  ExtendScript run through `studio_com`. Nothing is installed inside either app.
+- **`studio_cep.py`** — the road into an Adobe app that registers no COM: a CEP panel
+  inside the app running a loopback HTTP server. `CepHost.run()` wraps a script body
+  exactly as `studio_com` does and posts it; `install_panel()` copies a panel folder
+  under `%APPDATA%\Adobe\CEP\extensions`; `explain_unreachable()` says the one
+  thing to do when nothing answers. See *The CEP bridge*.
+- **`studio_premiere_mcp.py`**, **`premiere_panel/`** — our bridge to Premiere Pro (the
+  Beta this studio cuts in): a table of tools whose bodies are ExtendScript run through
+  `studio_cep`, and the panel that evaluates them. `--install-panel` installs the panel.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -38,16 +67,47 @@ this PC (the workstation)                       tailnet peer
 │   │            ▼
 │   │  CEP panel inside After Effects
 │   │
-│   └ MCP stdio ─┐
-│                ▼
-│      davinci-resolve-mcp  ── in-process ──►  DaVinci Resolve
+│   ├ MCP stdio ─┐                   │
+│   │            ▼                   │
+│   │  davinci-resolve-mcp ── in-process ──►  DaVinci Resolve
+│   │                                │
+│   ├ MCP stdio ─┐                   │
+│   │            ▼                   │
+│   │  studio_photoshop_mcp.py ── powershell.exe ── COM ──► Photoshop
+│   │  studio_illustrator_mcp.py ─ powershell.exe ── COM ──► Illustrator
+│   │                                │
+│   ├ MCP stdio ─┐                   │
+│   │            ▼                   │
+│   │  studio_premiere_mcp.py        │
+│   │            │ http 127.0.0.1:7787
+│   │            ▼                   │
+│   │  premiere_panel (CEP) inside Premiere Pro
+│   │                                │
+│   ├ MCP stdio ─┐                   │         ┌──────────────────────┐
+│   │            ▼                   │  HTTP   │ ComfyUI              │
+│   │  studio_comfy_mcp.py           │ ──────► │ 100.127.17.38:8188   │
+│   │                                │         └──────────────────────┘
+│   └ MCP stdio ─┐                   │
+│                ▼                   │
+│      studio_opencode_mcp.py        │
+│                │ HTTP 127.0.0.1:4096
+│                ▼                   │
+│   ┌ Docker container ────────────┐ │
+│   │ opencode serve               │ │ ──────► LM Studio (same host as above)
+│   │ /workspace ◄─ one folder     │ │
+│   └──────────────────────────────┘ │
 └────────────────────────────────────┘
 ```
 
-Both bridges **must** run on this machine — one talks to a CEP panel on port 7777,
-the other links against Resolve's scripting API in-process. Only inference is remote,
-because the RTX 5090 here is reserved for AE/Resolve rendering and must not be
-occupied by a resident model.
+Every bridge runs on this machine — two talk to a CEP panel (After Effects on 7777,
+Premiere on 7787), one links against Resolve's scripting API in-process, two run
+ExtendScript inside Photoshop and Illustrator over COM, and the ComfyUI one is a plain
+HTTP client.
+Only inference and image generation are remote, because the RTX 5090 here is reserved
+for AE/Resolve rendering and must not be occupied by a resident model. ComfyUI is
+therefore the one *app* that is not on this machine: the registry calls that
+`remote`, below. OpenCode is on this machine but *not on its disk*: it runs in a Docker
+container that is handed one folder, the registry calls that `container`, below.
 
 ## The app registry
 
@@ -88,8 +148,238 @@ Two things stay derived, never hand-maintained:
 
 - `DRIVABLE` is built from `APPS`, so the sidebar cannot advertise more than the agent
   can actually do. **Only add an entry when a bridge really exists.**
-- `probe` is a strategy *string* (`"port:7777"`, `"process:Resolve.exe"`) rather than a
-  callable, so the registry stays data a test can walk.
+- `probe` is a strategy *string* (`"port:7777"`, `"process:Resolve.exe"`,
+  `"url:http://host:port/path"`) rather than a callable, so the registry stays data a
+  test can walk.
+
+### The app on another machine: `remote`
+
+An entry with **no `exe_globs`** is remote. ComfyUI is the only one: it lives on the
+LLM PC, so there is no `.exe` here to find, no icon to read (the badge is drawn), and
+nothing to launch. `installed()` is True for it — the tab is always worth offering —
+`running()` probes its `url:`, and `launch()` raises with the `launch_note`, which for a
+remote app has to say *where* to start it. The GUI asks `app.remote` before it offers
+to start anything: the header button becomes **Check ComfyUI**, `_fix()` re-probes
+instead of launching, and the status reads "not reachable" rather than "not running".
+`tests/test_agent.py` holds a remote entry to all of that.
+
+In the sidebar a remote app is a row like any other, but in its own group:
+`detect_apps()` appends every remote registry entry with `"remote": True` and no
+`exe`, and `_build_apps()` draws those last under a second heading, **ON LLM PC**
+(`LLM_PC` in `studio_chat.py`), after the rows for this machine. Pinning orders a row
+within its group rather than across them - a pinned ComfyUI is still on the other
+PC, and the heading has to stay true. The heading appears and disappears with its
+rows, so hiding ComfyUI hides the group.
+
+The URL is `COMFYUI_URL` (default `http://100.127.17.38:8188`), read once in the
+engine for the probe and the bridge label, and again by `studio_comfy_mcp.py` in its
+own process — keep both reading the same variable. ComfyUI must be started with
+`--listen` on that machine or it binds to its own loopback and the probe fails.
+
+### The app the user connects by hand: `BridgeSpec`
+
+Not every app has a bridge written here, and the user may already have one installed —
+a Premiere Pro CEP bridge, a Blender server. `BridgeSpec` is an `AppSpec` built from a
+command line the user typed, in the dialog `Chat._bridge_dialog()` builds (right-click
+a non-drivable sidebar row, or *File → Connect an MCP bridge…*) or from `--mcp` on the
+CLI. Two things about it are unlike every other entry:
+
+- **It is filled in twice.** At construction it knows only what the user typed: name,
+  command line, optional exe and probe. Its `groups` are `{}` and `tool_names()` is
+  empty. When its bridge answers, `learn(tools, instructions)` derives groups from the
+  tool names (`group_by_prefix()`: one level of prefix when that makes at least two
+  families, else `all`) and keeps the bridge's `instructions`; `system_prompt` is a
+  property that folds those instructions into `BRIDGE_PROMPT`. `_boot_bridge()` calls
+  `learn()` and then **replaces `s.messages[0]`**, because `Session()` built the prompt
+  from the empty entry and the warm-up must pay for the prefix a real message uses.
+  The CLI does the same before choosing groups, which is why `--list-groups` cannot
+  show a custom bridge's groups.
+- **It joins the registry at runtime.** `add_bridge()` / `remove_bridge()` maintain
+  `APPS`, `APPS_BY_ID`, `TABS` (chat stays last), `TABS_BY_ID` and `DRIVABLE` together;
+  never append to one of those by hand. `DRIVABLE` is re-derived on every change, and a
+  bridge written here keeps its sidebar row: a hand-entered bridge named "After Effects"
+  gets a tab but not the row, and `_save_bridge()` refuses the name outright. Its id is
+  the name's slug, suffixed `-bridge` if that would shadow a built-in id.
+
+Entries live in the settings file under `bridges` as `record()` dicts, re-validated by
+`bridge_from_record()` on load (junk is skipped, never fatal), and `custom` is the flag
+the GUI asks before offering *Edit the bridge…* / *Forget the bridge*. `installed()` is
+True (the user said so), `running()` is True with no probe (the bridge answering is the
+evidence), and `launch()` needs an exe or explains that it has none. `tests/test_agent.py`
+(`TestHandEnteredBridges`, and the GUI tests around `_save_bridge`) hold all of this.
+
+### The app in a box: `container`
+
+OpenCode is a coding agent — it edits and runs whatever it is pointed at — and this is
+a production workstation. So `ContainerSpec` never runs it on the bare filesystem:
+`launch()` builds `opencode/Dockerfile` into the image `OPENCODE_IMAGE` (once; the
+first Start takes minutes), writes an `opencode.json` into the workspace that points
+OpenCode at the studio's LM Studio, and runs the container with `docker_run_args()`.
+Read that function before changing anything about isolation; it is the whole of it:
+
+- **One bind mount.** `OPENCODE_WORKSPACE` (default
+  `%LOCALAPPDATA%\StudioAssistant\opencode-workspace`) at `/workspace`, and nothing
+  else from this PC. A named volume holds OpenCode's own session store so its history
+  survives a restart. `tests/test_agent.py` asserts the mount list is exactly that.
+- **Loopback only.** The port is published as `127.0.0.1:4096`, so nothing on the LAN
+  reaches the server. `--cap-drop ALL`, `no-new-privileges`, a memory cap and a pid cap.
+- **The bridge is confined the same way.** `opencode_put_file` / `read_file` /
+  `list_files` resolve every path under the workspace with `realpath` and refuse one
+  that lands outside it — `..`, an absolute path, a drive letter. A `/workspace/...`
+  path is accepted and mapped, because that is how OpenCode names files in its
+  replies. `tests/test_opencode.py` walks the escapes.
+- **Nothing here reaches the creative apps.** The tab has no AE or Resolve tools, and
+  the container cannot see their projects. The prompt says so, so the model does not
+  offer.
+
+In the registry it is a `ContainerSpec`: `exe_globs=[]` like a remote app, but
+`remote` is overridden to False and `container` is True, so the GUI's `Start <app>`
+button applies (`launch()` is what it calls), the sidebar lists it under **this PC**
+with `container` where a year would go, and `installed()` asks whether Docker is here —
+`docker_exe()` also looks in Docker Desktop's own folder, since a window launched from a
+shortcut does not always have it on PATH. Neither Docker nor OpenCode is needed to run
+the tests: `test_launch_builds_once_then_runs_the_container` swaps `eng.docker` for a
+recorder.
+
+`OPENCODE_URL` is read once in the engine (probe, bridge label, published port) and
+again in `studio_opencode_mcp.py`; keep both reading the same variable, and the same
+for `OPENCODE_WORKSPACE`. A loopback LM Studio host is rewritten to
+`host.docker.internal` in the config, because `127.0.0.1` inside the container is the
+container.
+
+The server's routes live in one table, `ROUTES`, at the top of the bridge.
+`opencode_status` fetches the server's own OpenAPI document (`/doc`) and names any
+route in that table the document does not list, so an OpenCode release that renames
+one is a sentence in the transcript rather than a 404 the model improvises around.
+Older servers without `/global/health` are read from `/doc` instead.
+
+The window does not stop the container when it closes, just as it does not close After
+Effects. `docker stop studio-opencode` does; the workspace and the session volume stay.
+
+### The COM bridges: Photoshop and Illustrator
+
+Both apps register out-of-process COM servers on Windows whose `DoJavaScript` runs
+ExtendScript inside the live app and returns the last expression as a string. That is
+the entire bridge; no CEP panel, no UXP plugin, nothing to keep in step with an app
+update. Python's stdlib has no COM client, so `studio_com.ComHost` keeps one
+`powershell.exe -Sta` worker per app holding the COM object, and sends it one request
+per line: the script file to run and the file to write the answer to. Things to know
+before changing either bridge:
+
+- **A tool is a script body.** `HOST.run(body)` wraps it in `studio_com.PRELUDE` (a JSON
+  serializer — ExtendScript is ES3 and has none — plus `__px`, `__round`, `__fail`), each
+  bridge's `HELPERS` (`__doc`, `__layer` / `__item`, `__info`, `__color`) and a
+  `SETUP`/`TEARDOWN` pair, and decodes the JSON that comes back. `return` a plain value.
+  A thrown error, from the script or from COM, arrives as `ComError` and the harness
+  turns it into an `isError` result. Arguments go in with `json.dumps` (`J()`), never by
+  string concatenation.
+- **Units are pinned per call and restored.** Photoshop's `SETUP` sets ruler and type
+  units to pixels and `displayDialogs` to `NO`; Illustrator's sets the coordinate system
+  to the active artboard's and suppresses alerts. Without the first, `doc.width` comes
+  back in whatever the user's rulers show. `UnitValue`s are recognised with `instanceof`
+  — `typename` is not set on them.
+- **Illustrator's y is flipped.** Illustrator counts y upward even in artboard
+  coordinates; every helper negates it so the model sees y down from the artboard's
+  top-left, the same as Photoshop and After Effects. `ai_run_jsx` is the one place the
+  native convention leaks, and its description and the prompt say so. Adding an artboard
+  makes it active in Illustrator; `ai_add_artboard` puts the previous one back unless
+  asked, because "active" is what positions are measured from.
+- **Never let a status tool touch COM.** `New-Object -ComObject` starts a closed app.
+  `ps_status` / `ai_status` check the process with `tasklist` first and answer without
+  attaching when it is down; every other tool is allowed to start the app, and `run()`
+  extends its timeout by `LAUNCH_GRACE` when it does. A worker that stays silent past
+  the timeout — a modal dialog inside the app — is killed and restarted on the next
+  call, and the error names the dialog.
+- **An unsaved document has a bogus `fullName`.** Both apps answer `fullName` for a
+  document that was never saved (Illustrator points into `system32`); `__path()` checks
+  the file exists before reporting a path, and `ps_save` / `ai_save` refuse and point at
+  `save_as`.
+- **Layers by `layer_id`, items by `uuid`, layers and artboards by name.** Photoshop's
+  `Layer.id` and Illustrator's `PageItem.uuid` are stable across a session and what
+  every edit tool takes; `getPageItemFromUuid` is used when present and a walk of
+  `pageItems` when not. Names repeat; indices shift.
+- **Screenshots are files returned as image blocks.** `ps_screenshot` duplicates,
+  flattens, converts to 8-bit RGB, resizes and saves a PNG, then closes the duplicate
+  and restores the active document; `ai_screenshot` exports the artboard with
+  `ExportOptionsPNG24`. Both are `READ_ONLY`, so the executor treats them as the
+  observation rather than nagging for one.
+
+`tests/test_agent.py` (`TestComBridges`) covers the bridges with `HOST.run` replaced;
+`tests/test_mcp.py` runs both (and the Premiere bridge) through `Loopback` against their
+registry entries. One
+test starts a real PowerShell worker with a ProgID nobody registered, to prove the COM
+error path is a sentence and not a hang; nothing in the suite attaches to an app. The
+live smoke — every tool against the real apps — is a script run by hand.
+
+### The CEP bridge: Premiere Pro
+
+Premiere registers no COM automation (`Adobe.Premiere.Pro.Beta.Project.27` and friends
+are file types), so its road in is the one After Effects' bridge uses: a CEP panel that
+runs a loopback HTTP server inside the app. Ours is `premiere_panel/` — a manifest, a
+page and one `main.js` — and it is deliberately dumb: `POST /run {"script"}` evaluates
+the ExtendScript through `window.__adobe_cep__.evalScript` and answers with the string
+it returned. Every tool body, helper and the JSON serializer stay in Python, so the panel
+never changes when a tool does, and `tests/test_premiere.py` can read the bodies as
+text. Things to know before changing it:
+
+- **The same wrapper as the COM bridges.** `CepHost.run()` calls `studio_com.script()`,
+  so a body `return`s a plain value, `__fail()` is a sentence, and a thrown error comes
+  back as `CepError`. `UnitValue` is core ExtendScript, so the prelude runs unchanged.
+  Premiere's `Time` objects never reach the serializer: `__sec()` reads them as rounded
+  seconds and `__time()` makes one; `__tc()` renders a timecode for the QE calls that
+  want one (`razor`, `exportFramePNG`).
+- **A call cannot start the app.** COM starts a closed Photoshop; a panel exists only
+  while Premiere runs with it open. So `ppro_status` checks the process with `tasklist`,
+  then pings the panel, and `explain_unreachable()` answers with the one thing missing —
+  the process, the installed panel, CEP's `PlayerDebugMode` (checked through `winreg`,
+  never set), or the panel not yet opened from *Window > Extensions*. The prompt tells
+  the model to relay that text word for word.
+- **Loopback only, JSON only.** The panel binds `127.0.0.1` and refuses a POST without
+  `Content-Type: application/json`, which a browser page cannot send cross-origin
+  without a preflight nobody answers — so a web page open on this PC cannot drive
+  Premiere through it. The port is `STUDIO_PREMIERE_PORT` (default 7787), read by the
+  engine for the probe, by the bridge for its URL and by `main.js` from Premiere's
+  environment; keep all three reading the same variable.
+- **The panel is unsigned.** CEP loads it only with `PlayerDebugMode=1` under
+  `HKCU\Software\Adobe\CSXS.11` and `.12`; this workstation has both. `--install-panel`
+  prints the `reg add` lines for any that are missing rather than running them. Premiere
+  reads the extensions folder at startup, so install with it closed. A double hyphen
+  inside an XML comment is illegal, and CEP refuses the whole manifest over one; a test
+  parses it.
+- **Ids are `nodeId`s.** Timeline clips go by `clip_id`, project items by `item_id`, both
+  Premiere's own `nodeId`; sequences by name. `ppro_razor` changes the ids on the tracks
+  it cuts and its result says so; `ppro_add_to_sequence` diffs the id set before and
+  after to report what landed, because Premiere's insert methods return a boolean.
+- **QE is used where the main DOM has no verb** — cutting, adding an effect, exporting a
+  frame. `__qeclip()` matches the QE item by name and start ticks rather than by index,
+  because QE's `getItemAt` counts gaps. A wrong match is a sentence pointing at
+  `ppro_run_jsx`, not a cut in the wrong place.
+- **Export presets are files.** `ppro_export` takes a `.epr` path or a preset name and
+  resolves the name through `list_presets()`, which globs Premiere's and Media Encoder's
+  `systempresets` folders and the user's; the folder name's last eight hex digits are
+  the format's four-character code (`48323634` is `H264`). An ambiguous name lists the
+  matches and refuses. Rendering in Premiere blocks it and the call waits (`EXPORT_TIMEOUT`);
+  `queue=true` hands the job to Media Encoder instead.
+- **Learned against the real Premiere 27 Beta, and held by tests:**
+  `app.project.createNewSequence()` opens the *New Sequence* dialog and every later
+  `evalScript` queues behind it — the panel's GET still answers, so it looks alive while
+  nothing runs. Sequences are therefore made from a `.sqpreset` through QE's
+  `newSequence()`, which is silent, and `setSettings()` then applies width/height/fps
+  (any size works; HD 1080p at the nearest fps is the base). QE takes paths only as
+  `File(...).fsName` — a forward-slash string returns false or "Unknown error" — so every
+  path handed to Premiere goes through `fs()`; `exportFramePNG` appends `.png` itself.
+  `marker.end` takes a number of seconds and refuses a `Time`. `getSpeed()` is a ratio.
+  Premiere 27 renamed the old blur to "Gaussian Blur (Legacy)"; the new "Gaussian Blur"
+  has different parameters, and effect parameter lists carry blank and `_ `-prefixed
+  internal names that `__shown()` drops. An unset sequence in/out reads as a negative
+  sentinel, mapped to null. And `tasklist`'s table view truncates image names at 25
+  characters — `Adobe Premiere Pro (Beta).exe` lost its `.exe` and the running check
+  failed — so both `process_running()` helpers ask for CSV.
+- **`tests/test_premiere.py` starts a fake panel** on a random loopback port to prove the
+  transport — the wrapper, the decode, a silent panel becoming a "dialog may be open"
+  sentence, nothing listening becoming "not running" — and a temp `%APPDATA%` to prove
+  the install; nothing in it touches Premiere. The live smoke — every tool against the
+  real app — is done by hand with `python studio_mcp.py check --app premiere --call`.
 
 ### What a `system_prompt` has to carry
 
@@ -100,8 +390,9 @@ conventions live, so each app's covers, in this order:
 - **How the project is shaped** — the object graph, and what addresses each object.
 - **Units — the ones that fail silently.** AE is seconds, RGB 0..1, opacity 0..100,
   scale in percent, origin top-left. Resolve is frames and timecode, `track_index` from
-  1, `item_index` from 0. A model left to guess these produces something that renders
-  happily and is wrong.
+  1, `item_index` from 0. Premiere is seconds, tracks from 1, and Motion's Position is
+  normalised 0..1 across the frame. A model left to guess these produces something that
+  renders happily and is wrong.
 - **How to make and change things** — the default each creating tool applies, and when
   to override it.
 - **What to do when a tool cannot reach the app** — one path, and no retry loop.
@@ -116,7 +407,11 @@ runtime except a failed call and a model that improvises around it.
 **Only name tools the app actually exposes.** `default_groups` is the working set;
 naming a tool outside it strands the instruction and the model answers by inventing a
 call. `tests/test_agent.py` walks each prompt for tool names and fails on one that is
-not exposed.
+not exposed. ComfyUI's `workflows` group (arbitrary API-format graphs and the node
+catalogue) is off by default for exactly this reason: a 3B-active model handed the
+whole node catalogue builds broken graphs, and `comfy_generate` covers the ordinary
+work. `tests/test_comfy.py` also asserts the bridge's tool list and the registry's
+groups are the same set, so a tool added to one and not the other fails loudly.
 
 Length is not a per-message cost. The prompt is the head of every request's prefix, so
 LM Studio caches it after the first call and the warm-up pays for it against the exact
@@ -147,6 +442,15 @@ explicitly if the fixed tool contract and brief cannot fit.
 widget's Tcl pathname. Shadowing it sends `__repr__` into infinite recursion and the
 window never opens. `Misc._bind` and `Misc.quit` are the same kind of trap. Audit new
 method names against `tkinter.Misc` / `tkinter.Tk` — a test does it for you.
+
+**The tab strip folds; it never overflows.** Seven labelled tabs are wider than the
+strip at the window's minimum size, and Tk's packer answers by pushing the last ones
+off the edge, unmapped and unreachable. `_fit_tabs()` measures the labelled row from
+its parts' requested widths — not from the packed tab, which needs an idle pass, and an
+idle pass from inside the `<Configure>` handler re-enters the method (it did; the test
+suite went from 4 s to 56 s) — and when it does not fit, every tab but the active one
+drops to mark and dot, the mark carrying the name as a tooltip. Called on add, close,
+select and resize. A test asserts every tab stays mapped at the minimum width.
 
 **Tk pack order: fixed-size widgets first.** An expanding sibling packed *before* a
 fixed one claims the leftover space and pushes it off the edge. This bug has shipped
@@ -233,11 +537,37 @@ composer.
 - Unknown write outcomes must not trigger blind repeats. Restored tasks need a
   project read before editing. Read-back guards do not independently prove visual
   or semantic correctness; distinguish observations from model claims.
+- `readonly()` decides which calls owe a read-back from the tool's name prefix or its
+  MCP `readOnlyHint` annotation. A bridge written here must annotate its reads
+  (`READ_ONLY` in every bridge here); unannotated, `comfy_status` counted as an
+  edit and the model was nagged to "inspect" until it cycled on `studio_task_update`.
+  A successful call that returns an image has done its own read-back — a generate
+  that waited for its files is the observation, not something to inspect afterwards.
 - Stop prevents subsequent dispatches; it cannot undo or guarantee cancellation of
   an in-flight operation. Complete tool-result envelopes when stopping a batch.
+- An `AppSpec` may carry `models`, small models it prefers, best first; ComfyUI does,
+  because a 30B model resident beside a diffusion model on the same GPU is VRAM the
+  pictures could have had. `AppSpec.model_for(ids, shared)` resolves it against what
+  the host serves — `STUDIO_MODEL_<APP>` pin, then the list, then the shared model,
+  never a model that is not served — and returns a note the tab prints once. The GUI
+  keeps one `Session.llm` per tab, fixed at boot: the executor, both warm-ups and the
+  host's cached prefix must agree, and tabs with no preference share the window's
+  handle (`Chat._llm_for`). The CLI resolves the same way unless `--model` is given.
 - Optional `STUDIO_VISION_MODEL` uses the same remote host as the executing model.
   Never move inference to the workstation. Session-owned preview images keep Tk
   references alive; stale-generation preview events must be dropped.
+- **Pictures the user attaches never enter the messages as pixels.** The picture
+  glyph and Ctrl+O on the shared composer queue paths (`Chat.attachments`, one chip
+  each); `_on_send` appends `picture_note()` to the brief — name, dimensions read
+  from the header by `image_dims()`, size, and the path every bridge on this PC
+  opens files by — and shows the picture in the transcript where Tk can decode it.
+  Base64 in a message would blow `context_messages`' character budget and land in
+  every checkpoint, so what the picture *shows* comes from `STUDIO_VISION_MODEL`
+  when it is set: `_turn` asks it for a description on the worker and appends that
+  to the same brief before the executor starts, so it survives resume. Without it
+  the model has the path only, and is told so. A `ContainerSpec` tab sees one
+  folder: `picture_note` copies the file into `<workspace>/attachments/` and names
+  the `/workspace/...` path the container will see.
 
 ## Tools the model makes for itself
 
@@ -270,16 +600,102 @@ composer.
 - The chat tab gets no tool maker: `inference_tools([])` is still `[]`, and there would
   be nothing to make a tool out of.
 
+## The MCP harness
+
+`studio_mcp.py` is the one place the protocol lives. A bridge written here is a table
+of `(name, fn, description, schema)` rows and a `Server`; the two bridges in this
+folder are exactly that, and their `serve()` loops are gone.
+
+- **`Server.handle()` is the protocol as a pure function.** A message in, a reply (or
+  `None`) out. `serve()` only adds streams, a reader thread and a write lock. Test
+  the protocol through `handle()` or `Loopback`; test stdio only for the things
+  stdio adds — the parse error, the stdout guard, a cancel arriving mid-call.
+- **Revisions are negotiated, not pinned.** `PROTOCOL_VERSIONS` is what the harness
+  speaks, newest first; `initialize` echoes the client's revision when it is one of
+  them and offers the newest otherwise. `MCPClient` asks for the newest and keeps
+  whatever the bridge answers on `protocol_version`, `server_info`, `instructions`
+  and `capabilities`. Both installed bridges answer 2025-11-25 today. Add a revision
+  to the tuple when a feature here needs one; never pin.
+- **Two kinds of "no".** Unknown tool, arguments the schema refuses, a parse error, a
+  JSON-RPC batch: protocol errors, with the JSON-RPC code the spec names, because a
+  caller that sends them skipped the executor's own validation. A tool's own refusal
+  — `ComfyError`, `OpenCodeError`, the classes a bridge lists in `errors=` — is an
+  `isError` result in the bridge's words, and any other exception is an `isError`
+  result naming it with the traceback on stderr. The server keeps serving through
+  all of it. The bridges' Python-level `call_tool()` folds the first kind into a
+  result too, for callers that are not on the wire.
+- **The validator is shared.** `studio_mcp.validate` is what the executor runs
+  before a call and what a `Server` runs on arrival; `studio_tasks.validate` is the
+  same function. One validator, so the two sides cannot disagree about a schema. It
+  caught a test calling `comfy_generate` with a `timeout` under the schema's minimum
+  the day it went in.
+- **Annotations are the spec's defaults unless a tool says otherwise.** A `Tool` is
+  assumed to write, to be destructive and to touch the outside world; `read_only=True`
+  sets the three hints a read implies, and `HINTS` in each bridge overrides the rest
+  (a generate is not destructive; a clear-queue is). `readOnlyHint` is the one the
+  executor reads — see *Task execution and recovery* — so a read left unannotated
+  is nagged for read-backs.
+- **stdout is the wire.** `Server.call_tool` swaps `sys.stdout` for `sys.stderr`
+  around the handler, so a `print` inside a tool reaches the client's log rather than
+  the middle of a reply. Both stdio streams are reconfigured to UTF-8 with `\n`
+  newlines before serving; the console default on this workstation is cp1252.
+- **Progress and cancellation are opt-in per tool.** `studio_mcp.progress()` sends
+  `notifications/progress` on the client's `progressToken` and does nothing without
+  one; `studio_mcp.cancelled()` is True once the client sent `notifications/cancelled`
+  for the call in flight. The reader thread acts on cancels while the main thread is
+  inside a tool, which is the only reason it is a thread. `comfy_wait` polls both.
+  `MCPClient` sends a cancel when it gives up waiting; a bridge built here then
+  stops and never replies to a request nobody owns. A cancel for a request that
+  already finished is ignored, as the spec asks.
+- **`check` judges a tool list the way the executor and the host will**, and nothing
+  else: the sanitizer's rewrite, `'items': false` surviving it, descriptions over the
+  budget, keywords the grammar converter does not enforce, hints that contradict a
+  name, groups naming tools the bridge lacks, tools no group exposes, prompts
+  teaching a tool outside the working set, and the executor's own arithmetic —
+  brief plus contract off `REQUEST_CHARS`, the rest for conversation. Pass the
+  engine's `sanitize_schema` and `readonly` in; the module does not import the
+  engine, so a bridge process can check itself with `--check`.
+- **Installed bridges are held to recordings.** `python studio_mcp.py snapshot --app
+  <id> tests/contracts/<id>.json` writes what the bridge exposes, and
+  `tests/test_mcp.py` checks every recording against the registry's groups and
+  prompts — offline, with the app closed. Re-record when a bridge updates; a
+  recording older than the bridge is a test that passes for the wrong reason. The AE
+  recording shows 14 tools no group exposes (markers, house style, jobs, the issue
+  journal, `delete_comp`, `init_project`, `setup_panel`); some of that is deliberate
+  and the rest is a decision nobody has made yet — the check will keep saying so.
+
 ## Running and testing
 
 ```bash
 python -m unittest discover -s tests -v      # no network, no apps needed
 python studio_agent.py --list-groups         # registry sanity, no bridge started
 python studio_agent.py --app resolve --list-tools   # needs the Resolve venv
+python studio_agent.py --app comfyui --list-tools   # no ComfyUI needed for the list
+python studio_comfy_mcp.py --list-tools      # the bridge's own contract
+python studio_comfy_mcp.py --check           # ...held to the harness's checks
+python studio_opencode_mcp.py --list-tools   # likewise; no Docker needed for the list
+python studio_photoshop_mcp.py --check       # the COM bridges; no app is touched by --check
+python studio_illustrator_mcp.py --list-tools
+python studio_premiere_mcp.py --check        # the CEP bridge; no app is touched by --check
+python studio_premiere_mcp.py --install-panel   # copy premiere_panel/ under CEP/extensions (Premiere closed)
+python studio_mcp.py check --app premiere --in-process
+python studio_mcp.py check --app photoshop --in-process   # against the registry entry
+python studio_agent.py --mcp "npx -y some-mcp" --name Blender --list-tools  # any bridge
+python studio_mcp.py check --app comfyui     # start a registry bridge, report on it
+python studio_mcp.py check --app after-effects --call   # ...and call its harmless reads
+python studio_mcp.py check --app resolve --snapshot tests/contracts/resolve.json
+python studio_mcp.py snapshot --app resolve tests/contracts/resolve.json  # re-record
 python studio_chat.py                        # the real app (console attached)
 ```
 
-`tests/` never touches the network, the creative apps, or the model. Tests that would
+`tests/` never touches the network, the creative apps, Docker, or the model — the
+COM bridges are tested with `HOST.run` replaced, the one PowerShell worker a test
+starts is given a ProgID nothing answers to, and the Premiere bridge talks to a fake
+panel on a random loopback port —
+`test_comfy.py` and `test_opencode.py` swap `urllib.request.urlopen` for an in-memory
+server that answers the routes the bridge uses, and the OpenCode one works in a temp
+workspace. `test_mcp.py` drives both bridges through `Loopback` — the real server
+objects, in process — and holds the installed bridges to `tests/contracts/`. Tests that would
 need a display skip themselves when there isn't one; the GUI tests stub
 `installed_apps` so tab behaviour doesn't depend on what this machine has, stub
 `_read_icons` so no .exe is opened, and point `STUDIO_SETTINGS` at a temp file so the
@@ -299,8 +715,9 @@ them rather than guessing.
 - Identify AE layers by `id`, never `index` — an index shifts on every insert. In
   Resolve, media pool clips are `clip_id`; timeline clips are positional —
   `track_type` + `track_index` + `item_index`, the first counting from 1 and the last
-  from 0. The system prompts say all of this; keep them saying it. A test asserts the
-  AE half.
+  from 0. Photoshop layers are `layer_id`, Illustrator items are `uuid`, Premiere
+  timeline clips are `clip_id` and project items `item_id`. The system prompts say all
+  of this; keep them saying it. A test asserts the AE half.
 - **The Resolve prompt forbids `resolve_control` action `quit`.** The tool exists and
   works; closing the user's Resolve mid-session costs unsaved work. A test asserts the
   prohibition is still in the prompt.

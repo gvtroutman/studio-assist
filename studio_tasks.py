@@ -4,13 +4,13 @@ The bridge's original schemas validate calls; grammar-compatible copies are only
 for inference. A record is evidence of execution, not proof of visual quality.
 """
 import json
-import math
 import os
 import tempfile
 import threading
 import uuid
 
 import studio_agent as eng
+import studio_mcp
 import studio_toolsmith as toolsmith
 import studio_workflows as workflows
 
@@ -59,118 +59,10 @@ TASK QUALITY
 """
 
 
-def validate(value, schema, root=None, path="arguments"):
-    """Validate bridge schema constraints without relaxing them for inference.
-
-    Supports local refs, combinators, tuple arrays, objects and scalar bounds.
-    Unknown annotation/format keywords are left to the bridge.
-    """
-    root = schema if root is None else root
-    if schema is False:
-        raise ValueError(path + " is not allowed")
-    if schema is True:
-        return
-    if "$ref" in schema:
-        ref = schema["$ref"]
-        if not ref.startswith("#/"):
-            raise ValueError("unsupported external schema reference: " + ref)
-        target = root
-        for part in ref[2:].split("/"):
-            target = target[part.replace("~1", "/").replace("~0", "~")]
-        validate(value, target, root, path)
-    for key in ("allOf", "anyOf", "oneOf"):
-        if key in schema:
-            passed = 0
-            for branch in schema[key]:
-                try:
-                    validate(value, branch, root, path)
-                    passed += 1
-                except ValueError:
-                    pass
-            if ((key == "allOf" and passed != len(schema[key])) or
-                    (key == "anyOf" and not passed) or (key == "oneOf" and passed != 1)):
-                raise ValueError(path + " does not match " + key)
-    if "not" in schema:
-        try:
-            validate(value, schema["not"], root, path)
-        except ValueError:
-            pass
-        else:
-            raise ValueError(path + " matches a forbidden schema")
-    if "if" in schema:
-        try:
-            validate(value, schema["if"], root, path)
-            branch = "then"
-        except ValueError:
-            branch = "else"
-        validate(value, schema.get(branch, True), root, path)
-    numeric = type(value) in (int, float)
-    finite = numeric and (isinstance(value, int) or math.isfinite(value))
-    types = {"object": isinstance(value, dict), "array": isinstance(value, list),
-             "string": isinstance(value, str), "boolean": isinstance(value, bool),
-             "null": value is None,
-             "number": finite,
-             "integer": finite and value == int(value)}
-    want = schema.get("type")
-    if want and not any(types.get(t, False) for t in (want if isinstance(want, list) else [want])):
-        raise ValueError(path + " must be " + str(want))
-    # JSON equality must distinguish true from 1.
-    def equal(a, b):
-        if type(a) in (int, float) and type(b) in (int, float):
-            return a == b
-        if type(a) is not type(b):
-            return False
-        if isinstance(a, dict):
-            return a.keys() == b.keys() and all(equal(a[k], b[k]) for k in a)
-        if isinstance(a, list):
-            return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
-        return a == b
-    if "enum" in schema and not any(equal(value, v) for v in schema["enum"]):
-        raise ValueError(path + " must be one of " + str(schema["enum"]))
-    if "const" in schema and not equal(value, schema["const"]):
-        raise ValueError(path + " has an invalid constant")
-    if isinstance(value, dict):
-        for key in schema.get("required", []):
-            if key not in value:
-                raise ValueError(path + "." + key + " is required")
-        props = schema.get("properties", {})
-        for key, val in value.items():
-            patterns = [s for p, s in schema.get("patternProperties", {}).items()
-                        if eng.re.search(p, key)]
-            if key in props:
-                validate(val, props[key], root, path + "." + key)
-            for pattern in patterns:
-                validate(val, pattern, root, path + "." + key)
-            if key not in props and not patterns:
-                validate(val, schema.get("additionalProperties", True), root, path + "." + key)
-    if isinstance(value, list):
-        if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", math.inf):
-            raise ValueError(path + " has the wrong number of items")
-        prefix = schema.get("prefixItems", [])
-        items = schema.get("items", True)
-        if isinstance(items, list):
-            prefix, items = items, schema.get("additionalItems", True)
-        for i, val in enumerate(value):
-            validate(val, prefix[i] if i < len(prefix) else items, root, path + "[%d]" % i)
-        if schema.get("uniqueItems") and any(equal(a, b) for i, a in enumerate(value) for b in value[i + 1:]):
-            raise ValueError(path + " must contain unique items")
-    if type(value) in (int, float):
-        if not finite:
-            raise ValueError(path + " must be finite")
-        for key, invalid in (("minimum", lambda b: value < b), ("maximum", lambda b: value > b),
-                             ("exclusiveMinimum", lambda b: value <= b),
-                             ("exclusiveMaximum", lambda b: value >= b)):
-            if key in schema and invalid(schema[key]):
-                raise ValueError(path + " violates " + key)
-        if "multipleOf" in schema and not math.isclose(value / schema["multipleOf"], round(value / schema["multipleOf"]), abs_tol=1e-9):
-            raise ValueError(path + " violates multipleOf")
-    if isinstance(value, str):
-        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
-            raise ValueError(path + " has an invalid length")
-        if "pattern" in schema and not eng.re.search(schema["pattern"], value):
-            raise ValueError(path + " does not match the required pattern")
-
-
+# The executor validates every call against the bridge's original schema with
+# the harness's validator - the same one a bridge built on studio_mcp runs on
+# arrival, so the two sides cannot disagree about what a schema allows.
+validate = studio_mcp.validate
 def readonly(name, args, spec):
     # Compound tools mix reads and writes: inspect the action, not annotations
     # describing the whole tool. Unknown actions are conservatively writes.
@@ -452,11 +344,16 @@ class Executor:
                                                if i.get("type") != "image"]
         if failed and not text.startswith("TOOL ERROR"):
             text = "TOOL ERROR: " + text
-        verified_read = read and not failed and verification_read(name, args)
+        # A tool that hands back the thing it made - a generation that waited
+        # for its run and returned the picture - has done its own read-back.
+        # Asking for another inspection would only be answered with the record.
+        content = result.get("content", []) if isinstance(result, dict) else []
+        observed = any(i.get("type") == "image" for i in content or [])
+        verified_read = not failed and ((read and verification_read(name, args)) or observed)
         entry["verifies"] = verified_read
         if verified_read:
             self.must_inspect = False
-        for item in result.get("content", []) if isinstance(result, dict) else []:
+        for item in content or []:
             if item.get("type") == "image":
                 self.emit("preview", item)
                 if self.vision and not self.cancel.is_set():

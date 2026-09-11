@@ -7,6 +7,7 @@ Tools run here, on this workstation, over one MCP bridge per app:
 
   After Effects    npx @engine-room/after-effects-mcp  ->  CEP panel on :7777
   DaVinci Resolve  davinci-resolve-mcp (local venv)    ->  Resolve scripting API
+  ComfyUI          studio_comfy_mcp.py (this folder)   ->  HTTP API on the LLM PC
 
 Every app the agent can drive lives in APPS below. Adding one is a registry
 entry, not a code change - see AGENTS.md.
@@ -20,15 +21,35 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
+import studio_mcp
+
 DEFAULT_HOST = "http://100.127.17.38:1234/v1"
+# ComfyUI shares the inference box: its GPU does the image work so the 5090
+# here stays free for rendering. Same variable the bridge reads.
+COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://100.127.17.38:8188").rstrip("/")
+
+# OpenCode runs in a Docker container on this machine, never on its bare
+# filesystem. The port is published on loopback only; the workspace is the one
+# folder the container is given. studio_opencode_mcp.py reads the same two
+# variables in its own process - keep them agreeing.
+OPENCODE_URL = os.environ.get("OPENCODE_URL", "http://127.0.0.1:4096").rstrip("/")
+OPENCODE_WORKSPACE = os.environ.get(
+    "OPENCODE_WORKSPACE",
+    os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                 "StudioAssistant", "opencode-workspace"))
+OPENCODE_IMAGE = os.environ.get("OPENCODE_IMAGE", "studio-opencode")
+OPENCODE_CONTAINER = "studio-opencode"
+OPENCODE_HOME_VOLUME = "studio-opencode-home"    # its sessions survive a restart
 DEFAULT_MODEL = "qwen3-coder-30b-a3b-instruct"
 MAX_TOOL_RESULT_CHARS = 8000
 
@@ -47,7 +68,15 @@ def log(msg, quiet=False):
 
 
 class MCPClient:
-    """Minimal MCP stdio client: newline-delimited JSON-RPC over a child process."""
+    """Minimal MCP stdio client: newline-delimited JSON-RPC over a child process.
+
+    Requests are serialized - one in flight, its reply owned by one reader.
+    What the server said at `initialize` (revision, serverInfo, instructions)
+    is kept on the client; the harness's `check` command reports it, and the
+    executor never needs it. Server notifications - logging, progress - are
+    written to the log as they pass, so a bridge that waits on a render is
+    seen to be waiting.
+    """
 
     def __init__(self, command, args, quiet=False):
         exe = shutil.which(command)
@@ -59,7 +88,12 @@ class MCPClient:
         self._id = 0
         self._lock = threading.Lock()
         self._request_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._inbox = queue.Queue()
+        self.protocol_version = None
+        self.server_info = {}
+        self.instructions = ""
+        self.capabilities = {}
         self.proc = subprocess.Popen(
             [exe] + list(args),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -89,8 +123,9 @@ class MCPClient:
                 log("  [mcp] " + line.rstrip(), self.quiet)
 
     def _send(self, payload):
-        self.proc.stdin.write(json.dumps(payload) + "\n")
-        self.proc.stdin.flush()
+        with self._send_lock:
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+            self.proc.stdin.flush()
 
     def request(self, method, params=None, timeout=180):
         # One reader owns each response; concurrent calls cannot steal replies.
@@ -101,8 +136,11 @@ class MCPClient:
         with self._lock:
             self._id += 1
             rid = self._id
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method,
-                    "params": params or {}})
+        params = dict(params or {})
+        if method == "tools/call":
+            # Ask for progress under our own id; a bridge that waits reports on it.
+            params.setdefault("_meta", {})["progressToken"] = rid
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -117,18 +155,43 @@ class MCPClient:
                 raise EOFError("The MCP bridge exited before returning a result.")
             if msg.get("id") == rid:
                 if "error" in msg:
-                    raise RuntimeError("MCP error: %s" % msg["error"])
+                    raise RuntimeError("MCP error: " + studio_mcp.error_text(msg["error"]))
                 return msg.get("result", {})
-            # Notifications and late replies to timed-out serialized requests
-            # must not accumulate forever in the inbox.
+            if msg.get("id") is None and msg.get("method"):
+                self._notification(msg["method"], msg.get("params") or {})
+            # Late replies to timed-out serialized requests must not
+            # accumulate forever in the inbox.
+        # Tell the bridge we stopped listening; one built on studio_mcp stops
+        # waiting too, and never replies to a request nobody owns.
+        try:
+            self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": rid, "reason": "timeout"}})
+        except Exception:
+            pass
         raise TimeoutError("no MCP reply to %s in %ss" % (method, timeout))
+
+    def _notification(self, method, params):
+        if method == "notifications/message":
+            log("  [mcp %s] %s" % (params.get("level", "info"),
+                                   json.dumps(params.get("data"))[:300]), self.quiet)
+        elif method == "notifications/progress":
+            text = params.get("message") or "%s/%s" % (params.get("progress"),
+                                                        params.get("total", "?"))
+            log("  [mcp] ... " + str(text)[:200], self.quiet)
 
     def initialize(self, timeout=180):
         res = self.request("initialize", timeout=timeout, params={
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": studio_mcp.LATEST,
             "capabilities": {},
-            "clientInfo": {"name": "studio_agent", "version": "1.0"},
+            "clientInfo": {"name": "studio_agent", "version": "1.1"},
         })
+        self.protocol_version = res.get("protocolVersion")
+        self.server_info = res.get("serverInfo") or {}
+        self.instructions = res.get("instructions") or ""
+        self.capabilities = res.get("capabilities") or {}
+        if self.protocol_version not in studio_mcp.PROTOCOL_VERSIONS:
+            log("  [mcp] bridge speaks protocol %s, which this client does not know; "
+                "continuing on tools/list and tools/call" % self.protocol_version, self.quiet)
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return res
 
@@ -343,10 +406,14 @@ def http_alive(url, timeout=2):
 
 
 def process_running(image_name, timeout=8):
-    """Resolve has no bridge port - its MCP server talks to it in-process."""
+    """Resolve has no bridge port - its MCP server talks to it in-process.
+
+    CSV output: the table view cuts image names at 25 characters, which loses
+    the ".exe" of "Adobe Premiere Pro (Beta).exe" and the match with it.
+    """
     try:
         out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq %s" % image_name, "/NH"],
+            ["tasklist", "/FI", "IMAGENAME eq %s" % image_name, "/NH", "/FO", "CSV"],
             capture_output=True, text=True, timeout=timeout,
             creationflags=NO_WINDOW).stdout or ""
     except Exception:
@@ -588,6 +655,308 @@ CARE
   retry in a loop - this window has a Start DaVinci Resolve button for the user.
 """ + BASE_RULES
 
+COMFY_PROMPT = """You are an agent generating images on a ComfyUI server through tools.
+ComfyUI runs on another machine on the studio network; the pictures it makes are
+copied back to this workstation, where the user can open them and the other apps
+can import them.
+
+HOW COMFYUI IS SHAPED
+- ComfyUI runs graphs of nodes. A base model encodes the prompt and negative
+  through its text encoder; a KSampler denoises a latent using them; the VAE
+  decodes the latent into pixels; a save node writes a file. comfy_generate
+  builds exactly that graph for you.
+- A base model is either one checkpoint file, or a SPLIT model: a diffusion model,
+  a text encoder and a VAE as three files (Z-Image, Qwen-Image, Flux are all split).
+  comfy_generate handles both and picks the right recipe for a split model's
+  family on its own; comfy_status says which model it will use by default.
+- Every run is a prompt_id. A run is queued, then running, then in history with
+  its output files. comfy_generate waits for the run and returns the files, so you
+  normally never see the queue; comfy_queue and comfy_history are for looking.
+- Model files are addressed by filename, exactly as comfy_list_models prints them,
+  including the extension: "sd_xl_base_1.0.safetensors", not "SDXL".
+
+SETTINGS - the ones that silently produce poor output
+- Call comfy_status before the first generation in a session: it says which
+  model comfy_generate will use. Only name a different model when the user asks
+  for one, and then with the exact filename from comfy_list_models.
+- Sizes: Z-Image, Qwen-Image, Flux and anything named xl, sdxl, pony or
+  illustrious want 1024x1024 or a nearby aspect such as 1152x896, 1344x768 or
+  832x1216; a 1.5-era checkpoint wants 512x512 or 512x768. The wrong size gives
+  doubled figures or mush, not an error.
+- Steps and cfg come from the model's recipe when you leave them out, and that is
+  the right thing to do. Z-Image Turbo is 8 steps at cfg 1, where the negative
+  prompt is ignored - do not "fix" that by raising cfg. Only a checkpoint named
+  turbo, lightning, hyper or lcm wants few steps and low cfg set by hand.
+- width and height are pixels and must be multiples of 16.
+- The seed is what makes a result reproducible. To vary one image slightly keep
+  the seed and change the prompt; to get a different take keep the prompt and
+  change the seed. Every result reports the seed it used - keep it.
+- Prompts are descriptive phrases, not instructions: "a lighthouse at dusk, long
+  exposure, film grain" rather than "please draw a lighthouse". The negative is
+  the same: things to avoid, such as "blurry, text, watermark, extra fingers".
+
+MAKING THINGS
+- comfy_generate is the whole ordinary workflow: text to image, or image to image
+  when init_image names a file first sent up with comfy_upload_image. For image to
+  image, denoise is how far to depart from the source: 0.3 keeps its structure,
+  0.75 keeps little but the palette.
+- A LoRA is applied by filename with `lora`; list them with comfy_list_models
+  kind=loras. Most want their trigger word in the prompt, and a LoRA only fits
+  the family it was trained for - a Qwen-Image LoRA does nothing useful on
+  Z-Image.
+- batch_size makes several variations of one prompt in one run. Prefer it to
+  calling generate repeatedly.
+- Generation takes real time - seconds to a few minutes depending on size, steps
+  and batch. If a call reports the run is still going, use comfy_wait with the
+  prompt_id it gave you; do not queue the same prompt again.
+- Every result lists the file paths on this workstation. Tell the user those
+  paths - that is how they open the picture and how another tab imports it.
+- Uploads and outputs are files on this workstation; the model files live with
+  ComfyUI and cannot be added from here.
+
+WHEN SOMETHING IS WRONG
+- If a tool reports it cannot reach ComfyUI, call comfy_status once. If that
+  fails too, say so plainly and stop: ComfyUI must be started on the LLM PC, with
+  --listen, by the user. This window cannot start it. Do not retry in a loop.
+- A "HTTP 400" on a generation names the node and the input ComfyUI rejected:
+  most often a model filename that does not exist. Re-list the models and use an
+  exact name; do not guess at a corrected spelling.
+- comfy_interrupt stops the run in progress; comfy_clear_queue drops the waiting
+  ones. Ask before clearing a queue you did not fill.
+""" + BASE_RULES
+
+OPENCODE_PROMPT = """You are an agent delegating programming work to OpenCode through tools.
+OpenCode is a coding agent - it reads, writes and runs code on its own. It runs in a
+Docker container on this workstation whose ONLY folder is the workspace; it cannot see
+the rest of this PC, and nothing it does touches After Effects, Resolve or their
+projects. Your job is to brief it well, wait, and tell the user what came back.
+
+HOW THE WORK IS SHAPED
+- The workspace is one folder, shared between this PC and the container. On this PC
+  it is where opencode_status says; inside the container it is /workspace. Every
+  path you pass to a tool here is relative to it: "src/main.py", not a drive letter.
+  There is nothing outside it to name.
+- A session is one piece of work with its own history. opencode_ask sends a task to
+  a session and waits for OpenCode to finish; with no session_id it starts a new
+  one and returns its id. Pass that id back to continue the same work, so
+  OpenCode remembers what it built. Start a new session for an unrelated job.
+- OpenCode's reply comes back as prose plus one line per tool it ran and the files
+  it touched. That is what it SAYS it did; the files in the workspace are what it
+  actually did.
+
+BRIEFING - what silently produces poor work
+- Brief OpenCode like a programmer: what to build or change, in which files, in what
+  language, and what finished looks like. "Make a Python script that renames the
+  PNGs in frames/ to a 4-digit sequence" works; "fix the script" does not.
+  Put the user's exact wording, constraints and examples into the prompt.
+- Anything OpenCode needs from outside must be put into the workspace first with
+  opencode_put_file - it cannot be told a path on this PC. Tell the user the
+  workspace path when they should drop files in themselves.
+- Work takes real time: seconds for a question, minutes for a build. If an ask
+  reports OpenCode is still going, collect the result with opencode_get_session using
+  the same session id; do not send the same task again.
+- Read what came back before reporting it: opencode_list_files, then
+  opencode_read_file on what it says it changed. Report the files by their
+  workspace path, so the user can open them.
+
+WHEN SOMETHING IS WRONG
+- If a tool reports it cannot reach OpenCode, call opencode_status once. If that
+  fails too, say so plainly and stop: the container is started by the user with the
+  Start OpenCode button in this window. Do not retry in a loop.
+- opencode_abort stops a session that is running away. Files it has already
+  written stay in the workspace.
+- Ask before overwriting a file the user put in the workspace themselves.
+""" + BASE_RULES
+
+PS_PROMPT = """You are an agent operating a live Photoshop session through tools.
+The user watches every change happen; each call is a real step in their document's
+history. The tools run Photoshop's own scripting engine, so anything Photoshop can
+do by script, you can do - but only through the tools listed.
+
+HOW A DOCUMENT IS SHAPED
+- Photoshop holds open documents; one is active. Each document is a stack of
+  layers, top of the stack first, and a layer may be a group holding more layers.
+  Kinds: pixel, text, smartobject, group, and adjustment layers.
+- Every layer has a stable integer layer_id. Address layers by layer_id, never by
+  index or name - names repeat and positions shift on every insert. ps_get_document
+  is where layer_ids come from; call it before the first edit and after anything
+  that adds or removes layers.
+- Documents are addressed by name as ps_list_documents prints it; leaving
+  `document` out means the active one.
+
+UNITS - the ones that fail silently
+- Everything is pixels with the origin at the top-left, y down. Bounds are
+  [left, top, right, bottom]. Font size is pixels too.
+- Opacity is 0..100. Colours are "#RRGGBB". Blend modes are lower-case names
+  such as "multiply" or "soft light".
+- A text layer's x,y is the left end of its first baseline, not its top-left
+  corner; its bounds tell you where the glyphs actually landed.
+
+MAKING AND CHANGING THINGS
+- New content: ps_new_document, then ps_add_text_layer, ps_add_fill_layer (a
+  colour block, whole canvas or a rectangle) and ps_place_file (any image as a
+  smart object, centred and fitted - the way to bring in a ComfyUI picture).
+- Change without recreating: ps_set_layer for name, visibility, opacity, blend
+  mode, lock and a text layer's contents, font, size and colour; ps_move_layer
+  for position; ps_reorder_layer for stacking; ps_adjust_layer for tone and colour
+  (it rasterizes text and smart objects first - say so before doing it to one).
+- Whole-image operations: ps_resize_image resamples, ps_resize_canvas pads or
+  trims without scaling, ps_crop cuts to a rectangle.
+- ps_screenshot returns a flattened picture of the document; use it once after a
+  run of visual changes to check the result, not after every call.
+- Files: ps_save_as writes a copy by default and refuses to overwrite unless told
+  to; ps_save writes the document's own file. Say the full path afterwards.
+- ps_run_jsx is for what no other tool covers. Keep the script short, `return`
+  a plain value, and address layers by id inside it as well.
+
+WHEN SOMETHING IS WRONG
+- If a tool reports it could not reach Photoshop, call ps_status once. If
+  Photoshop is not running, say so and stop - any tool call starts it, but the
+  user may not want that; the Start button is theirs. Do not retry in a loop.
+- "A dialog may be open" means Photoshop is waiting on the user. Tell them,
+  and wait for them to dismiss it.
+- Deleting a layer or closing a document without saving loses work: ask first
+  unless the user asked for exactly that.
+""" + BASE_RULES
+
+AI_PROMPT = """You are an agent operating a live Illustrator session through tools.
+The user watches every change happen; each call is a real undo step in their
+document. The tools run Illustrator's own scripting engine, so anything Illustrator
+can do by script, you can do - but only through the tools listed.
+
+HOW A DOCUMENT IS SHAPED
+- Illustrator holds open documents; one is active. A document has one or more
+  artboards (named; one is active) and a stack of layers, top first. Layers hold
+  page items: path, compound_path, text, group, placed (a linked file), raster,
+  symbol and a few rarer kinds.
+- Every item has a stable string uuid. Address items by uuid, never by index or
+  name. ai_list_items is where uuids come from; call it before the first edit and
+  after anything that adds or removes items. Layers and artboards go by name.
+- New items land on the active layer unless `layer` names another; a locked or
+  hidden layer refuses them - ai_set_layer unlocks or shows it.
+
+UNITS - the ones that fail silently
+- Everything is points (a point is a pixel at 72 ppi). The origin is the top-left
+  of the ACTIVE artboard and y goes DOWN - the same direction as Photoshop and
+  After Effects. Bounds are [left, top, right, bottom]. An item on another
+  artboard shows negative or oversize numbers; ai_activate_artboard changes which
+  artboard is the reference.
+- Opacity is 0..100. Colours are "#RRGGBB" or "none" for no fill / no stroke.
+  Stroke width is points. Rotation is degrees clockwise.
+- ai_add_text's x,y is the top-left of the text; ai_add_shape's x,y is the
+  top-left of the shape's box.
+
+MAKING AND CHANGING THINGS
+- New content: ai_new_document, then ai_add_shape (rectangle, rounded_rectangle,
+  ellipse, line, polygon, star), ai_add_text, ai_place_file (an image or PDF as a
+  linked item - the way to bring in a ComfyUI or Photoshop picture), ai_add_layer
+  and ai_add_artboard.
+- Change without recreating: ai_set_item for name, visibility, lock, opacity,
+  fill, stroke, position, size and a text item's contents, font and size;
+  ai_transform_item to move by an offset, scale or rotate; ai_reorder_item for
+  stacking; ai_duplicate_item to copy.
+- ai_screenshot returns a picture of one artboard; use it once after a run of
+  visual changes to check the result, not after every call.
+- Files: ai_save_as with format ai or pdf makes the file the document's own;
+  png, jpg and svg export one artboard and leave the document as it was. It
+  refuses to overwrite unless told to. Say the full path afterwards.
+- ai_run_jsx is for what no other tool covers. Inside raw script Illustrator's
+  own convention applies - y is UP - so prefer the tools for geometry.
+
+WHEN SOMETHING IS WRONG
+- If a tool reports it could not reach Illustrator, call ai_status once. If
+  Illustrator is not running, say so and stop - any tool call starts it, but the
+  user may not want that; the Start button is theirs. Do not retry in a loop.
+- "A dialog may be open" means Illustrator is waiting on the user. Tell them,
+  and wait for them to dismiss it.
+- Deleting an item or closing a document without saving loses work: ask first
+  unless the user asked for exactly that.
+""" + BASE_RULES
+
+PPRO_PROMPT = """You are an agent operating a live Premiere Pro session through tools.
+The user watches every change happen in their timeline; each call is a real undo step.
+The tools run Premiere's own scripting engine through a bridge panel, so anything
+Premiere can do by script, you can do - but only through the tools listed.
+
+HOW A PROJECT IS SHAPED
+- Premiere holds one open project. Its project panel is a tree of bins and items
+  (clips, stills, audio, and the sequences themselves). A sequence is the timeline:
+  video tracks V1 upward and audio tracks A1 upward, each holding clips in time.
+- Project items are addressed by item_id and timeline clips by clip_id - Premiere's
+  own stable ids. Never address either by index or name: names repeat and indices
+  shift on every insert or cut. ppro_get_project is where item_ids come from,
+  ppro_get_sequence where clip_ids come from; call them before the first edit and
+  again after anything that imports, adds, removes or cuts.
+- Sequences are addressed by name as ppro_get_project shows it; leaving `sequence`
+  out means the active one. Putting an item on the timeline makes one clip per track
+  it lands on - a video clip with sound is two clip_ids, linked.
+
+UNITS - the ones that fail silently
+- Time is SECONDS from the start of the sequence, everywhere: starts, ends, markers,
+  the playhead, keyframe times. Convert timecode yourself: at 25fps 00:00:02:12 is
+  2.48 s. A clip's in_point / out_point are seconds into its SOURCE media, not the
+  timeline.
+- Tracks count from 1: V1 is video_track 1, A1 is audio_track 1.
+- Motion's Position is NORMALISED across the frame: [0.5, 0.5] is the centre, [0, 0]
+  the top-left, [1, 1] the bottom-right. Scale and Opacity are percent (100 is
+  unchanged); Rotation is degrees clockwise.
+- Frame sizes are pixels; fps is a number such as 23.976, 25 or 29.97.
+
+MAKING AND CHANGING THINGS
+- Bringing media in is two steps: ppro_import_files puts files in the project panel
+  and returns item_ids; ppro_add_to_sequence puts an item on the timeline at a time.
+  insert pushes later clips along, overwrite replaces what is there. Nothing is in the
+  edit until it is on a sequence.
+- ppro_new_sequence with item_ids builds a sequence from those clips, taking its
+  settings from the first - the right way to start a cut from footage. Without them
+  it makes an empty sequence, at the width, height and fps you give.
+- Change without recreating: ppro_set_clip for name, enable/disable, moving (start),
+  trimming (end, in_point, out_point); ppro_razor to cut at a time; ppro_remove_clip
+  to take a clip out, with ripple to close the gap.
+- Effects live on clips. Every clip already has Motion and Opacity; ppro_get_clip
+  shows their properties and current values, and ppro_set_clip_property sets one -
+  flat, or as a keyframe when you give a time. Movement needs at least two keyframes
+  at different times. ppro_add_effect adds any other effect by its Effects-panel name,
+  and its properties then appear in ppro_get_clip.
+- ppro_screenshot returns the rendered frame at a time; use it once after a run of
+  visual changes to check the result, not after every call.
+- Rendering: ppro_list_presets shows the installed export presets, and ppro_export
+  renders a sequence with one. Rendering here blocks Premiere and the call waits;
+  queue=true hands it to Media Encoder instead. Say the output path afterwards.
+- ppro_save writes the project file; ppro_save_as moves it. Say the path.
+- ppro_run_jsx is for what no other tool covers. Keep the script short, `return` a
+  plain value, and use nodeIds inside it as well.
+
+WHEN SOMETHING IS WRONG
+- If a tool reports it could not reach Premiere Pro, call ppro_status once and relay
+  what it says word for word: it names the one thing to do - start Premiere, install
+  the bridge panel, or open it from Window > Extensions. Do not retry in a loop; this
+  window has a Start Premiere Pro button for the user.
+- "A dialog may be open" means Premiere is waiting on the user. Tell them, and wait
+  for them to dismiss it.
+- Removing a clip, deleting a bin or closing a project without saving loses work: ask
+  first unless the user asked for exactly that.
+""" + BASE_RULES
+
+BRIDGE_PROMPT = """You are an agent operating %(name)s through tools.
+The tools come from an MCP bridge the user connected to this window by hand -
+not one written for this app here - so the tool descriptions are the whole of what
+is known about it. Read them as the contract: names, argument names, units and
+ids all come from there, and a plausible guess is the commonest way a call fails.
+
+HOW TO BEGIN
+- Start with the bridge's own overview or status tool if it has one, then a read
+  that lists what the project or document holds. Learn the ids the bridge uses
+  before the first edit, and address things by those ids rather than by position.
+- If the bridge documents units (seconds or frames, pixels or points, 0..1 or
+  0..100), follow them exactly; if it does not, say which you assumed.
+- Prefer a tool that does one small thing to one that runs arbitrary script.
+
+WHEN SOMETHING IS WRONG
+- If a tool reports it cannot reach %(name)s, say so plainly and stop; the user
+  starts the app and any panel or plugin the bridge needs. Do not retry in a loop.
+%(instructions)s""" + BASE_RULES
+
 CHAT_SUFFIX = """
 
 This is a continuing conversation, in a window with one tab per app. You are this
@@ -624,16 +993,24 @@ class AppSpec:
     One drivable app: how to reach it, what to expose, how to talk about it.
 
     `probe` is a strategy string rather than a callable so the registry stays
-    data the tests can walk: "port:7777" or "process:Resolve.exe".
+    data the tests can walk: "port:7777", "process:Resolve.exe" or, for an app
+    on another machine, "url:http://host:port/".
+
+    An app with no `exe_globs` is remote: nothing here to find or start, so it
+    counts as installed, and `launch()` explains where it runs instead.
     """
 
     # False only for ChatSpec below. Anything that starts, probes, counts or
     # repairs a bridge asks this before assuming there is one.
     drivable = True
+    # True only for ContainerSpec below: on this machine, but behind Docker.
+    container = False
+    # True only for BridgeSpec below: a bridge the user entered by hand.
+    custom = False
 
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
-                 examples, launch_note=""):
+                 examples, launch_note="", models=()):
         self.id = id
         self.name = name
         self.tab = tab                    # short label for a tab strip
@@ -648,12 +1025,45 @@ class AppSpec:
         self.system_prompt = system_prompt
         self.examples = list(examples)
         self.launch_note = launch_note
+        # Models this app would rather drive than the shared one, best first.
+        # ComfyUI shares its GPU with the inference box: a 30B model resident
+        # beside a diffusion model is VRAM the pictures could have had, and the
+        # tab's work - one generate call and a filename - does not need it.
+        self.models = list(models)
+
+    def model_for(self, ids, shared):
+        """The model this app's tab should use, given what the host serves.
+
+        STUDIO_MODEL_<APP> pins one for the app, then the registry preference
+        list, then whatever the window is using. Only a model the host serves
+        is chosen; a preference that is not served falls through, so a tab
+        never fails to open because a small model was uninstalled. Returns
+        (model, note) where note says why it differs from the shared one.
+        """
+        pinned = os.environ.get("STUDIO_MODEL_" + self.id.upper())
+        if pinned:
+            if pinned in ids:
+                return pinned, "pinned by STUDIO_MODEL_%s" % self.id.upper()
+            return shared, ("STUDIO_MODEL_%s names %s, which the host does not serve; "
+                            "using %s" % (self.id.upper(), pinned, shared))
+        for m in self.models:
+            if m in ids:
+                return m, ("this app prefers a small model so the GPU stays free for it"
+                           if m != shared else "")
+        if self.models:
+            return shared, ("none of this app's preferred models (%s) is served; using %s"
+                            % (", ".join(self.models), shared))
+        return shared, ""
 
     def exe(self):
         return newest_match(self.exe_globs)
 
+    @property
+    def remote(self):
+        return not self.exe_globs
+
     def installed(self):
-        return self.exe() is not None
+        return self.remote or self.exe() is not None
 
     def running(self):
         kind, _, arg = self.probe.partition(":")
@@ -661,6 +1071,8 @@ class AppSpec:
             return http_alive("http://127.0.0.1:%s/" % arg)
         if kind == "process":
             return process_running(arg)
+        if kind == "url":
+            return http_alive(arg, timeout=4)
         return False
 
     def tool_names(self, group_names=None):
@@ -680,6 +1092,9 @@ class AppSpec:
         return QUALITY_RULES
 
     def launch(self):
+        if self.remote:
+            raise RuntimeError("%s runs on another machine; this window cannot start "
+                               "it. %s" % (self.name, self.launch_note))
         exe = self.exe()
         if not exe:
             raise RuntimeError("%s is not installed where this agent looks for it"
@@ -689,6 +1104,86 @@ class AppSpec:
 
     def __repr__(self):
         return "<%s %s>" % (type(self).__name__, self.id)
+
+
+class ContainerSpec(AppSpec):
+    """
+    An app that runs on this machine but inside a Docker container, so that it
+    can touch nothing here but the one folder it is given. OpenCode is the only
+    one: a coding agent that edits and runs whatever it is pointed at is not
+    something to loose on the workstation's own disk.
+
+    Not remote - it runs here and this window starts it - and not installed as
+    an .exe: `installed()` is whether Docker is here, `launch()` builds the
+    image once and runs the container, and the probe is the loopback port
+    that container publishes.
+    """
+
+    container = True
+
+    def __init__(self, workspace, image, dockerfile, **kw):
+        AppSpec.__init__(self, exe_globs=[], **kw)
+        self.workspace = workspace
+        self.image = image
+        self.dockerfile = dockerfile            # folder holding the Dockerfile
+
+    @property
+    def remote(self):
+        return False
+
+    def exe(self):
+        return None                           # no .exe, so no icon to read
+
+    def installed(self):
+        return docker_exe() is not None
+
+    def image_exists(self):
+        try:
+            return bool(docker("image", "inspect", "--format", "{{.Id}}", self.image,
+                               timeout=60).strip())
+        except RuntimeError as e:
+            if "No such" in str(e):
+                return False
+            raise
+
+    def write_config(self, host, model, ids):
+        os.makedirs(self.workspace, exist_ok=True)
+        path = os.path.join(self.workspace, "opencode.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(opencode_config(host, model, ids), f, indent=2)
+        return path
+
+    def launch(self, host=None, model=None):
+        """
+        Build the image if this PC has never built it, write the workspace's
+        opencode.json, and run the container. Blocks through the build - the
+        caller is already on a worker thread - and returns once `docker run`
+        has; the caller then polls `running()` like any other app.
+        """
+        if not self.installed():
+            raise RuntimeError("Docker Desktop is not installed, so %s has nowhere "
+                               "isolated to run. %s" % (self.name, self.launch_note))
+        host = host or env_default("STUDIO_HOST", "AE_AGENT_HOST", fallback=DEFAULT_HOST)
+        _, loaded, ids, _ = probe_models(host)
+        shared = pick_model(loaded, ids, model or env_default("STUDIO_MODEL", "AE_AGENT_MODEL"))
+        chosen, _ = self.model_for(ids, shared or model or DEFAULT_MODEL)
+        self.write_config(host, chosen, ids)
+        if not self.image_exists():
+            docker("build", "-t", self.image, self.dockerfile, timeout=1800)
+        # A container left over from a window that closed uncleanly holds the
+        # name and the port; --rm normally clears it, but be sure.
+        try:
+            docker("rm", "-f", OPENCODE_CONTAINER, timeout=60)
+        except RuntimeError:
+            pass
+        docker(*docker_run_args(self.workspace, self.image), timeout=120)
+
+    def stop(self):
+        """Stop the container. --rm removes it; the workspace and home volume stay."""
+        try:
+            docker("stop", "-t", "5", OPENCODE_CONTAINER, timeout=60)
+        except RuntimeError:
+            pass
 
 
 AE_GROUPS = {
@@ -749,8 +1244,144 @@ RESOLVE_GROUPS = {
     ],
 }
 
+COMFY_GROUPS = {
+    "discover": ["comfy_status", "comfy_list_models", "comfy_queue", "comfy_history"],
+    "generate": ["comfy_generate", "comfy_upload_image", "comfy_wait", "comfy_fetch_output"],
+    "control": ["comfy_interrupt", "comfy_clear_queue"],
+    # Arbitrary graphs and the node catalogue: powerful, verbose, and easy for a
+    # small model to get wrong. Off by default; switch the group on for a session
+    # that really needs a custom workflow.
+    "workflows": ["comfy_run_workflow", "comfy_search_nodes", "comfy_node_info"],
+}
+
+OPENCODE_GROUPS = {
+    "discover": ["opencode_status", "opencode_list_sessions", "opencode_get_session",
+                 "opencode_list_files", "opencode_read_file"],
+    "work": ["opencode_new_session", "opencode_ask", "opencode_abort"],
+    # The one way anything enters the sandbox. Confined to the workspace on this
+    # side too, so it is safe to expose by default.
+    "files": ["opencode_put_file"],
+}
+
+PS_GROUPS = {
+    "discover": ["ps_status", "ps_list_documents", "ps_get_document", "ps_get_layer",
+                 "ps_screenshot"],
+    "create": ["ps_new_document", "ps_open", "ps_add_text_layer", "ps_add_fill_layer",
+               "ps_place_file"],
+    "edit": ["ps_set_layer", "ps_move_layer", "ps_reorder_layer", "ps_duplicate_layer",
+             "ps_delete_layer", "ps_adjust_layer", "ps_resize_image", "ps_resize_canvas",
+             "ps_crop"],
+    "files": ["ps_save", "ps_save_as", "ps_close_document"],
+    # The escape hatch: Photoshop's whole scripting surface. On by default because
+    # the coder model writes usable ExtendScript and the prompt tells it to prefer
+    # the shaped tools; switch the group off for a session that should not improvise.
+    "script": ["ps_run_jsx"],
+}
+
+AI_GROUPS = {
+    "discover": ["ai_status", "ai_list_documents", "ai_get_document", "ai_list_items",
+                 "ai_get_item", "ai_screenshot"],
+    "create": ["ai_new_document", "ai_open", "ai_add_text", "ai_add_shape", "ai_place_file",
+               "ai_add_layer", "ai_add_artboard"],
+    "edit": ["ai_set_item", "ai_transform_item", "ai_reorder_item", "ai_duplicate_item",
+             "ai_delete_item", "ai_set_layer", "ai_activate_artboard"],
+    "files": ["ai_save", "ai_save_as", "ai_close_document"],
+    "script": ["ai_run_jsx"],
+}
+
+PPRO_GROUPS = {
+    "discover": ["ppro_status", "ppro_get_project", "ppro_get_sequence", "ppro_get_clip",
+                 "ppro_screenshot", "ppro_list_presets"],
+    "create": ["ppro_open_project", "ppro_new_project", "ppro_import_files", "ppro_create_bin",
+               "ppro_new_sequence", "ppro_add_to_sequence", "ppro_add_marker"],
+    "edit": ["ppro_set_clip", "ppro_remove_clip", "ppro_set_clip_property", "ppro_add_effect",
+             "ppro_razor", "ppro_set_track", "ppro_set_sequence", "ppro_set_item",
+             "ppro_delete_bin"],
+    "files": ["ppro_save", "ppro_save_as", "ppro_export", "ppro_close_project"],
+    "script": ["ppro_run_jsx"],
+}
+
+# The panel inside Premiere listens here; studio_premiere_mcp.py and the panel's
+# main.js both read STUDIO_PREMIERE_PORT, so one variable moves every end.
+PREMIERE_PORT = os.environ.get("STUDIO_PREMIERE_PORT") or "7787"
+
 RESOLVE_MCP = os.environ.get(
     "RESOLVE_MCP_DIR", os.path.join(os.path.expanduser("~"), "davinci-resolve-mcp"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def docker_exe():
+    """Docker's CLI, or None. Docker Desktop is not always on PATH for a window
+    launched from a shortcut, so its own install folder is tried too."""
+    found = shutil.which("docker")
+    if found:
+        return found
+    for p in (r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+              os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                           "Docker", "Docker", "resources", "bin", "docker.exe")):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def docker(*args, timeout=120):
+    """Run one docker command; stdout, or a RuntimeError carrying its stderr."""
+    exe = docker_exe()
+    if not exe:
+        raise RuntimeError("Docker Desktop is not installed, so OpenCode has nowhere "
+                           "isolated to run. Install it from docker.com and start it.")
+    try:
+        r = subprocess.run([exe] + list(args), capture_output=True, text=True,
+                           timeout=timeout, creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("docker %s took longer than %ds" % (args[0], timeout))
+    if r.returncode:
+        err = (r.stderr or r.stdout or "").strip()
+        if "docker daemon" in err.lower() or "pipe" in err.lower():
+            err = "Docker Desktop is not running. Start it, then try again. (%s)" % err
+        raise RuntimeError("docker %s failed: %s" % (" ".join(args[:2]), err[:600]))
+    return r.stdout
+
+
+def opencode_config(host, model, ids):
+    """
+    The opencode.json written into the workspace before the container starts:
+    it makes OpenCode use the studio's LM Studio, with the served models
+    declared and one chosen. A loopback host is rewritten to the name Docker
+    gives the machine, since 127.0.0.1 inside the container is the container.
+    """
+    base = host.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    for lo in ("127.0.0.1", "localhost"):
+        base = base.replace("//%s:" % lo, "//host.docker.internal:")
+    models = {m: {"name": m} for m in (ids or [model]) if m}
+    if model and model not in models:
+        models[model] = {"name": model}
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {"lmstudio": {"npm": "@ai-sdk/openai-compatible", "name": "LM Studio",
+                                  "options": {"baseURL": base}, "models": models}},
+        "model": "lmstudio/%s" % model if model else None,
+    }
+
+
+def docker_run_args(workspace, image=None, port=None):
+    """
+    The `docker run` that isolates OpenCode. The workspace is the only bind
+    mount; the home volume keeps its session store between runs; the port is
+    published to loopback only; capabilities are dropped and privilege
+    escalation is off. Nothing here names another folder on this PC.
+    """
+    host_port = port or urllib.parse.urlsplit(OPENCODE_URL).port or 4096
+    return ["run", "-d", "--rm", "--name", OPENCODE_CONTAINER,
+            "-p", "127.0.0.1:%d:4096" % host_port,
+            "-v", "%s:/workspace" % workspace,
+            "-v", "%s:/home/node" % OPENCODE_HOME_VOLUME,
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--memory", "4g", "--pids-limit", "512",
+            "-w", "/workspace",
+            image or OPENCODE_IMAGE]
 
 APPS = [
     AppSpec(
@@ -792,6 +1423,123 @@ APPS = [
             "Set up an H.264 render job and show me the queue",
         ],
         launch_note="Resolve takes a while to finish loading, and needs a project open.",
+    ),
+    AppSpec(
+        id="comfyui",
+        name="ComfyUI",
+        tab="ComfyUI",
+        code="Cf", fg="#E6E6E6", bg="#1F5F8B",
+        exe_globs=[],                        # remote: lives on the LLM PC
+        probe="url:%s/system_stats" % COMFYUI_URL,
+        command=sys.executable,
+        args=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "studio_comfy_mcp.py")],
+        bridge_label=COMFYUI_URL.split("//", 1)[-1],
+        groups=COMFY_GROUPS,
+        default_groups=["discover", "generate", "control"],
+        system_prompt=COMFY_PROMPT,
+        examples=[
+            "Which checkpoints are installed?",
+            "Make a moody lighthouse at dusk, 1152x896, and show me four variations",
+            "Same seed, but make the sky orange",
+            "Turn the sketch in my Pictures folder into a painted version",
+        ],
+        launch_note="Start ComfyUI on the LLM PC with --listen so it accepts connections "
+                    "from this machine, then click Start again to re-check.",
+        # Small models that still make tool calls; the first one served wins.
+        models=["qwen3-1.7b", "qwen2.5-1.5b-instruct"],
+    ),
+    ContainerSpec(
+        id="opencode",
+        name="OpenCode",
+        tab="OpenCode",
+        code="Oc", fg="#F0F0F0", bg="#3B3B3B",
+        workspace=OPENCODE_WORKSPACE,
+        image=OPENCODE_IMAGE,
+        dockerfile=os.path.join(HERE, "opencode"),
+        probe="port:%s" % (urllib.parse.urlsplit(OPENCODE_URL).port or 4096),
+        command=sys.executable,
+        args=[os.path.join(HERE, "studio_opencode_mcp.py")],
+        bridge_label="container on %s" % OPENCODE_URL.split("//", 1)[-1],
+        groups=OPENCODE_GROUPS,
+        default_groups=["discover", "work", "files"],
+        system_prompt=OPENCODE_PROMPT,
+        examples=[
+            "Write a Python script that renames the PNGs in frames/ to a 4-digit sequence",
+            "Read the CSV in the workspace and make a script that plots each column",
+            "What did OpenCode change in the last session?",
+            "Add tests for the script it wrote, then run them",
+        ],
+        launch_note="OpenCode runs in a Docker container that can only see its workspace "
+                    "folder; the first start builds the image, which takes a few minutes.",
+    ),
+    AppSpec(
+        id="photoshop",
+        name="Photoshop",
+        tab="Photoshop",
+        code="Ps", fg="#31A8FF", bg="#001E36",
+        exe_globs=[r"C:\Program Files\Adobe\Adobe Photoshop *\Photoshop.exe"],
+        probe="process:Photoshop.exe",
+        command=sys.executable,
+        args=[os.path.join(HERE, "studio_photoshop_mcp.py")],
+        bridge_label="COM scripting",
+        groups=PS_GROUPS,
+        default_groups=["discover", "create", "edit", "files", "script"],
+        system_prompt=PS_PROMPT,
+        examples=[
+            "What layers are in this document?",
+            "Make a 1920x1080 document with a dark blue band along the bottom",
+            "Add the title 'Method & Form' in white, 96px, near the top left",
+            "Place the latest ComfyUI picture and show me how it looks",
+        ],
+        launch_note="Photoshop takes a moment to finish loading; the first tool call "
+                    "after that is slower while the bridge attaches.",
+    ),
+    AppSpec(
+        id="illustrator",
+        name="Illustrator",
+        tab="Illustrator",
+        code="Ai", fg="#FF9A00", bg="#330000",
+        exe_globs=[r"C:\Program Files\Adobe\Adobe Illustrator *\Support Files\Contents\Windows\Illustrator.exe"],
+        probe="process:Illustrator.exe",
+        command=sys.executable,
+        args=[os.path.join(HERE, "studio_illustrator_mcp.py")],
+        bridge_label="COM scripting",
+        groups=AI_GROUPS,
+        default_groups=["discover", "create", "edit", "files", "script"],
+        system_prompt=AI_PROMPT,
+        examples=[
+            "What's on the artboard?",
+            "Make a 1080x1080 artboard with a centred orange circle and a title under it",
+            "Change every red fill to #2255AA",
+            "Export the active artboard as a PNG at 2x to my Desktop",
+        ],
+        launch_note="Illustrator takes a moment to finish loading; the first tool call "
+                    "after that is slower while the bridge attaches.",
+    ),
+    AppSpec(
+        id="premiere",
+        name="Premiere Pro",
+        tab="Premiere",
+        code="Pr", fg="#E979FF", bg="#2A0634",
+        # The Beta first: it is the Premiere this studio cuts in, and its exe has
+        # a different name from a release build's.
+        exe_globs=[r"C:\Program Files\Adobe\Adobe Premiere Pro (Beta)\Adobe Premiere Pro (Beta).exe",
+                   r"C:\Program Files\Adobe\Adobe Premiere Pro *\Adobe Premiere Pro.exe"],
+        probe="port:%s" % PREMIERE_PORT,
+        command=sys.executable,
+        args=[os.path.join(HERE, "studio_premiere_mcp.py")],
+        bridge_label="127.0.0.1:%s" % PREMIERE_PORT,
+        groups=PPRO_GROUPS,
+        default_groups=["discover", "create", "edit", "files", "script"],
+        system_prompt=PPRO_PROMPT,
+        examples=[
+            "What's on the timeline?",
+            "Import the clips in my Footage folder and build a sequence from them",
+            "Cut at the playhead and drop the second half's opacity to 50%",
+            "Export the active sequence as H.264 to my Desktop",
+        ],
+        launch_note="Premiere Pro also needs the Studio Assistant Bridge panel under Window > "
+                    "Extensions; `python studio_premiere_mcp.py --install-panel` installs it.",
     ),
 ]
 
@@ -859,6 +1607,187 @@ TABS = APPS + [CHAT]
 TABS_BY_ID = {a.id: a for a in TABS}
 
 
+# --------------------------------------------------- bridges entered by hand
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "bridge"
+
+
+def split_command(line):
+    """A command line as the user typed it -> (command, args). Windows quoting."""
+    parts = shlex.split(line, posix=False)
+    return parts[0].strip('"'), [p.strip('"') for p in parts[1:]]
+
+
+class BridgeSpec(AppSpec):
+    """
+    An app the user connected by hand: any MCP stdio bridge, installed by them,
+    entered as a command line. Nothing is known about it until it starts, so the
+    registry entry is filled in two steps - what the user typed now, and what the
+    bridge answers at boot (`learn()`): its tools, grouped by name prefix, and its
+    own `instructions`, which become the second half of the prompt.
+
+    `custom` is what the GUI asks before offering to edit or forget an entry.
+    An entry is data (`record()`), kept in the settings file and rebuilt by
+    `load_bridges()` when the window opens.
+    """
+
+    custom = True
+
+    def __init__(self, name, command, args=(), exe="", probe="", note="", id=None,
+                 code="", fg="#E6E6E6", bg="#4A4A4A"):
+        words = [w for w in re.split(r"\W+", name) if w]
+        initials = (words[0][0] + (words[1][0] if len(words) > 1 else words[0][1:2])
+                    if words else "Mc").title()
+        AppSpec.__init__(
+            self, id=id or slug(name), name=name, tab=name, code=code or initials,
+            fg=fg, bg=bg, exe_globs=[exe] if exe else [], probe=probe,
+            command=command, args=list(args), bridge_label=_label(command, args),
+            groups={}, default_groups=[], system_prompt="", examples=[
+                "What can you do with %s?" % name,
+                "What is open in %s right now?" % name,
+            ], launch_note=note or ("Start %s yourself, with whatever panel or plugin "
+                                    "its bridge needs." % name))
+        self.exe_path = exe
+        self.instructions = ""
+        self.learned = False
+
+    @property
+    def remote(self):
+        return False                      # an exe-less entry still runs here
+
+    def installed(self):
+        return True                       # the user said so by entering it
+
+    def running(self):
+        # No probe means nothing to check: the bridge answering is the evidence.
+        return True if not self.probe else AppSpec.running(self)
+
+    def launch(self):
+        if not self.exe_globs:
+            raise RuntimeError("%s has no program path to start. %s"
+                               % (self.name, self.launch_note))
+        AppSpec.launch(self)
+
+    def learn(self, tools, instructions=""):
+        """Fill in what only the running bridge knows: tools and its briefing."""
+        names = [t["name"] for t in tools]
+        self.groups = group_by_prefix(names)
+        self.default_groups = list(self.groups)
+        self.instructions = (instructions or "").strip()
+        self.learned = True
+
+    @property
+    def system_prompt(self):
+        brief = ("\nWHAT THE BRIDGE SAYS ABOUT ITSELF\n" + self.instructions + "\n"
+                 if self.instructions else "")
+        return BRIDGE_PROMPT % {"name": self.name, "instructions": brief}
+
+    @system_prompt.setter
+    def system_prompt(self, value):
+        pass                              # AppSpec.__init__ assigns; the property derives
+
+    def record(self):
+        return {"id": self.id, "name": self.name, "command": self.command,
+                "args": list(self.args), "exe": self.exe_path, "probe": self.probe,
+                "note": self.launch_note if self.exe_path else ""}
+
+
+def _label(command, args):
+    line = " ".join([os.path.basename(command)] + list(args))
+    return line if len(line) <= 28 else line[:27] + "…"
+
+
+def group_by_prefix(names):
+    """Tool groups a bridge never declared, from the names it did.
+
+    `ppro_timeline_add`, `ppro_timeline_list` -> group "ppro_timeline"? No -
+    one level: everything before the first underscore, when that makes at least
+    two groups with something in them; otherwise one group, "all". The
+    capabilities dialog then lets a thousand-tool bridge be narrowed to the
+    families a session needs, which the request budget may require.
+    """
+    if not names:
+        return {}
+    buckets = {}
+    for n in names:
+        head = n.split("_", 1)[0] if "_" in n else "other"
+        buckets.setdefault(head, []).append(n)
+    if len(buckets) < 2 or any(len(v) < 2 for v in buckets.values()):
+        return {"all": list(names)}
+    return buckets
+
+
+def add_bridge(spec):
+    """Put a hand-entered bridge in the registry - APPS, the tab list and the
+    sidebar's drivable map - replacing an earlier entry with the same id."""
+    remove_bridge(spec.id)
+    APPS.append(spec)
+    APPS_BY_ID[spec.id] = spec
+    TABS.insert(len(TABS) - 1, spec)      # chat stays last
+    TABS_BY_ID[spec.id] = spec
+    _rederive_drivable()
+    return spec
+
+
+def _rederive_drivable():
+    """DRIVABLE stays derived from APPS - and a bridge written here keeps its
+    row: a hand-entered bridge with the same app name gets a tab but does not
+    take the sidebar row over."""
+    DRIVABLE.clear()
+    for a in APPS:
+        if not a.custom:
+            DRIVABLE[a.name] = a.id
+    for a in APPS:
+        if a.custom:
+            DRIVABLE.setdefault(a.name, a.id)
+
+
+def remove_bridge(app_id):
+    spec = APPS_BY_ID.get(app_id)
+    if spec is None or not spec.custom:
+        return None
+    APPS.remove(spec)
+    del APPS_BY_ID[app_id]
+    TABS.remove(spec)
+    del TABS_BY_ID[app_id]
+    _rederive_drivable()
+    return spec
+
+
+def bridge_from_record(rec):
+    """A BridgeSpec from a settings record, or None for one that cannot be."""
+    if not isinstance(rec, dict):
+        return None
+    name, command = rec.get("name"), rec.get("command")
+    if not (isinstance(name, str) and name.strip() and isinstance(command, str) and command.strip()):
+        return None
+    args = rec.get("args") or []
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        args = []
+    want = rec.get("id") if isinstance(rec.get("id"), str) else slug(name)
+    if want in APPS_BY_ID and not APPS_BY_ID[want].custom:
+        want += "-bridge"                 # never shadow a bridge written here
+    return BridgeSpec(name.strip(), command.strip(), args, exe=str(rec.get("exe") or ""),
+                      probe=str(rec.get("probe") or ""), note=str(rec.get("note") or ""),
+                      id=want)
+
+
+def load_bridges(records):
+    """Register every valid record; return the specs. Bad records are skipped,
+    never fatal - this is read from a file the user may have edited."""
+    out = []
+    for rec in records or []:
+        spec = bridge_from_record(rec)
+        if spec is not None:
+            out.append(add_bridge(spec))
+    return out
+
+
+def custom_bridges():
+    return [a for a in APPS if a.custom]
+
+
 def get_app(app_id):
     try:
         return TABS_BY_ID[app_id]
@@ -908,7 +1837,11 @@ DRIVABLE = {a.name: a.id for a in APPS}
 
 
 def detect_apps():
-    """Installed creative apps, newest label first. Pure filesystem, no registry."""
+    """
+    Installed creative apps, newest label first, then the remote ones. Pure
+    filesystem, no Windows registry; `remote` says which group a row belongs
+    to in the sidebar - this PC, or the LLM PC.
+    """
     try:
         entries = os.listdir(ADOBE_DIR)
     except OSError:
@@ -932,12 +1865,36 @@ def detect_apps():
         exe = newest_match([os.path.join(ADOBE_DIR, e, exe_glob) for e in hits])
         found.append({"code": code, "name": name, "version": label, "fg": fg,
                       "bg": bg, "id": DRIVABLE.get(name), "exe": exe,
-                      "drivable": name in DRIVABLE})
+                      "drivable": name in DRIVABLE, "remote": False})
     for path, code, name, fg, bg in OTHER_APPS:
         if os.path.exists(path):
             found.append({"code": code, "name": name, "version": "", "fg": fg,
                           "bg": bg, "id": DRIVABLE.get(name), "exe": path,
-                          "drivable": name in DRIVABLE})
+                          "drivable": name in DRIVABLE, "remote": False})
+    # A container app is on this machine but has no .exe: the registry is the
+    # only evidence, and the row says "container" where a year would go. No
+    # exe means no icon to read - the badge stays.
+    for a in APPS:
+        if a.container:
+            found.append({"code": a.code, "name": a.name, "version": "container",
+                          "fg": a.fg, "bg": a.bg, "id": a.id, "exe": None,
+                          "drivable": True, "remote": False})
+    # A bridge the user entered by hand for something not detected above -
+    # Blender, a DAW, a bridge with no app behind it. One whose name matches a
+    # detected row (Premiere Pro, say) has already made that row drivable.
+    named = {f["name"] for f in found}
+    for a in APPS:
+        if a.custom and a.name not in named:
+            found.append({"code": a.code, "name": a.name, "version": "bridge",
+                          "fg": a.fg, "bg": a.bg, "id": a.id, "exe": a.exe(),
+                          "drivable": True, "remote": False})
+    # Remote apps last: nothing on this disk to find, so the registry is the
+    # only evidence they exist.
+    for a in APPS:
+        if a.remote:
+            found.append({"code": a.code, "name": a.name, "version": "", "fg": a.fg,
+                          "bg": a.bg, "id": a.id, "exe": None, "drivable": True,
+                          "remote": True})
     return found
 
 
@@ -1014,8 +1971,9 @@ def main():
     p.add_argument("--host", default=env_default("STUDIO_HOST", "AE_AGENT_HOST",
                                                  fallback=DEFAULT_HOST),
                    help="OpenAI-compatible base URL (default: %(default)s)")
-    p.add_argument("--model", default=env_default("STUDIO_MODEL", "AE_AGENT_MODEL",
-                                                  fallback=DEFAULT_MODEL))
+    p.add_argument("--model", default=env_default("STUDIO_MODEL", "AE_AGENT_MODEL"),
+                   help="model id on the host (default: the app's preferred small model "
+                        "if served, else %s)" % DEFAULT_MODEL)
     p.add_argument("--groups", default=None,
                    help="tool groups to expose; app-specific, see --list-groups")
     p.add_argument("--all-tools", action="store_true", help="expose every tool the app has")
@@ -1024,12 +1982,23 @@ def main():
     p.add_argument("--list-tools", action="store_true", help="print exposed tools and exit")
     p.add_argument("--list-groups", action="store_true",
                    help="print the tool groups for every app and exit")
+    p.add_argument("--mcp", metavar="COMMAND",
+                   help="drive any MCP stdio bridge instead of a registry app: the "
+                        "command line that starts it, quoted as one argument")
+    p.add_argument("--name", default="the app",
+                   help="with --mcp, what to call the app the bridge drives")
     p.add_argument("--quiet", action="store_true", help="hide the step trace")
     a = p.parse_args()
+    if a.mcp:
+        command, args = split_command(a.mcp)
+        add_bridge(BridgeSpec(a.name, command, args, id="mcp"))
+        a.app = "mcp"
 
     if a.list_groups:
         for app in APPS:
             print("%s (--app %s)" % (app.name, app.id))
+            if app.custom:
+                print("    groups are learned from the bridge when it starts; see --list-tools")
             for g, names in app.groups.items():
                 mark = "*" if g in app.default_groups else " "
                 print("  %s %-10s %s" % (mark, g, ", ".join(names)))
@@ -1038,6 +2007,12 @@ def main():
         return 0
 
     app = get_app(a.app)
+    if not a.model:
+        # The GUI does the same: an app may prefer a small model the host serves.
+        _, _, ids, _ = probe_models(a.host)
+        a.model, note = app.model_for(ids, DEFAULT_MODEL) if app.drivable else (DEFAULT_MODEL, "")
+        if note:
+            log("  " + note, a.quiet)
     if not app.drivable:
         # No bridge to start and no tools to expose: the model on its own.
         if a.groups or a.all_tools:
@@ -1049,13 +2024,6 @@ def main():
         log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
         return converse(llm, None, [], app, a, schemas=[])
 
-    groups = [g.strip() for g in (a.groups or ",".join(app.default_groups)).split(",")
-              if g.strip()]
-    for g in groups:
-        if g not in app.groups:
-            p.error("unknown group %r for %s; pick from %s"
-                    % (g, app.name, ", ".join(app.groups)))
-
     log(". connecting to the %s bridge..." % app.name, a.quiet)
     mcp = MCPClient(app.command, app.args, quiet=a.quiet)
     try:
@@ -1064,6 +2032,16 @@ def main():
         log("  bridge up: %s %s" % (srv.get("name", "?"), srv.get("version", "")), a.quiet)
 
         all_tools = mcp.list_tools()
+        if app.custom:
+            # Nothing was known about this bridge until now; its groups and its
+            # briefing come from what it just answered.
+            app.learn(all_tools, mcp.instructions)
+        groups = [g.strip() for g in (a.groups or ",".join(app.default_groups)).split(",")
+                  if g.strip()]
+        for g in groups:
+            if g not in app.groups:
+                p.error("unknown group %r for %s; pick from %s"
+                        % (g, app.name, ", ".join(app.groups)))
         if a.all_tools:
             wanted, chosen = None, all_tools
         else:

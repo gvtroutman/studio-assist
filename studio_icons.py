@@ -46,6 +46,32 @@ def png(pixels, width, height):
             + chunk(b"IEND", b""))
 
 
+def disc_png(colour, size, over=4):
+    """
+    A filled circle with antialiased edges, as a PNG with alpha. Tk's canvas
+    draws an 8px oval as an octagon - it has no antialiasing - so the status
+    dots are images instead, like the app icons. `over` is the supersampling
+    factor: each pixel's alpha is the share of its sub-samples inside the disc.
+    """
+    r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+    out = bytearray(size * size * 4)
+    radius = size / 2.0
+    step = 1.0 / over
+    for y in range(size):
+        for x in range(size):
+            hits = 0
+            for sy in range(over):
+                dy = y + (sy + 0.5) * step - radius
+                for sx in range(over):
+                    dx = x + (sx + 0.5) * step - radius
+                    if dx * dx + dy * dy <= radius * radius:
+                        hits += 1
+            i = (y * size + x) * 4
+            out[i], out[i + 1], out[i + 2] = r, g, b
+            out[i + 3] = hits * 255 // (over * over)
+    return png(bytes(out), size, size)
+
+
 # ---------------------------------------------------------------- PE structure
 
 class _PE:
