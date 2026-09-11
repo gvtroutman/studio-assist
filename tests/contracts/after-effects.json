@@ -1,0 +1,4100 @@
+{
+ "recorded": "2026-09-11",
+ "app": "after-effects",
+ "server": {
+  "name": "after-effects-mcp",
+  "version": "0.5.0"
+ },
+ "protocolVersion": "2025-11-25",
+ "instructions": "You are driving a live After Effects session through this server. The user sees\nevery change as it happens and every call is a real undo step in their project.\n\nRead the guidance before you build. `ae_guide({topic: \"after-effects\"})` is the\ncore \u2014 orienting, bounded reads, verifying a write, screenshots, the bridge\nfailures \u2014 and points at one topic per subject (shapes, text, animation, raw\nscripting, sound, \u2026). In Claude Code and claude.ai the `after-effects` skill is\nthe same text \u2014 load one carrier, not both.\nTopics: ae-setup, after-effects, animation, assembly, extendscript-gotchas, issue-journal, mogrt-and-footage, shapes, sound, style-guide, text, whats-new.\n\nThree habits that matter before that call returns:\n\n- Identify by `id`, never by `index` \u2014 a layer's index shifts on every insert.\n- Bound your reads (`include`, `shapeDetail: \"compact\"`) and treat screenshots as\n  one-off diagnostics rather than a feedback loop. Every tool result is re-sent\n  to you on every later request in the session.\n- If a tool reports it cannot reach After Effects, call `check_setup` and relay\n  its `nextSteps` verbatim; do not diagnose CEP by hand.",
+ "tools": [
+  {
+   "name": "list_comps",
+   "description": "All comps: id, name, dims, duration, fps, layer count. Pass `include` to trim it \u2014 `include: []` returns the id+name map alone, which is all orientation usually needs.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "include": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "enum": [
+        "size",
+        "timing",
+        "bg",
+        "counts"
+       ]
+      },
+      "description": "Sections to return: size, timing, bg, counts. Omit for all of them; [] for id + name only."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_comp",
+   "description": "Single comp summary by id (no layers).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_comp_tree",
+   "description": "Comp + nested layer tree, recursing pre-comps to `depth`.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "depth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8,
+      "default": 2
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_comp",
+   "description": "Create a new comp. Returns id.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string",
+      "default": "Untitled"
+     },
+     "width": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 1920
+     },
+     "height": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 1080
+     },
+     "frameRate": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 30
+     },
+     "duration": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 5
+     },
+     "pixelAspect": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 1
+     },
+     "bgColor": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_comp",
+   "description": "Modify a comp (name, dims, fps, duration, work area, bg). Undefined fields unchanged.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     },
+     "width": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "height": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "frameRate": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "duration": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "workAreaStart": {
+      "type": "number"
+     },
+     "workAreaDuration": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "bgColor": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "delete_comp",
+   "description": "Delete a comp. Reversible only via AE's Undo. The solids its layers used are project items, not part of the comp, and After Effects leaves them behind in the Solids folder \u2014 the result counts them in `unusedSolidsLeft`. Pass `purgeUnusedSolids:true` to remove, in the same undo step, the ones nothing else uses; a solid another comp still uses is kept and reported in `keptSolids` with that comp's id. Only this comp's own solids are ever considered \u2014 for the whole project's orphans use purge_unused_footage.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "purgeUnusedSolids": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also remove the solid footage items this comp's own layers used, once nothing else uses them. Off by default because a solid can be shared: one another comp still uses is kept and reported with the comps using it."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_active_comp",
+   "description": "Focus a comp in the viewer/timeline.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "duplicate_comp",
+   "description": "Copy a comp. Returns the new comp id, so you never have to find it by name. Use this instead of run_jsx + CompItem.duplicate(). By default the copy is SHALLOW, exactly like AE's own Duplicate: its precomp layers point at the same nested comps as the original, so editing one of those edits both. `deep:true` duplicates the nested comps too and re-points the copy at them \u2014 that is what 'a variant of this rig' means. A nested comp used by several layers is duplicated once and reused. `folderId` files the copy in a project folder; `nameSuffix` names the nested copies '<original><suffix>'.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string",
+      "description": "Name for the copy. Omit to take AE's own ('<name> 2')."
+     },
+     "folderId": {
+      "type": "number",
+      "description": "Project folder to put the copy in. Must be a folder item id from get_project_summary."
+     },
+     "deep": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also duplicate the nested precomps and re-point the copy's layers at them. Off by default, which matches AE's own Duplicate: a shallow copy shares its nested comps with the original, so editing one edits both."
+     },
+     "nameSuffix": {
+      "type": "string",
+      "description": "With deep:true, name each duplicated nested comp '<original><nameSuffix>'. Omit to let AE name them."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "snapshot_comp",
+   "description": "Take a cheap structural fingerprint of a comp and keep it in this server's memory. Returns a snapshotId and nothing else worth tokens \u2014 call it BEFORE a write, then diff_comp afterwards to learn what the write actually did, instead of reading the comp back and comparing by eye. It records per layer: id, name, index, type, in/out/start, parent, enabled, keyframe counts, expression count, effect count; per comp: size, duration, frame rate, work area, markers. It does NOT record property values, expression text, effect parameters, masks or shape contents. Nothing is written into the AE project, and snapshots are gone when the session ends.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "includeFingerprint": {
+      "type": "boolean",
+      "default": false,
+      "description": "Return the fingerprint itself as well as its id. Off by default \u2014 returning it reintroduces exactly the context cost a snapshot exists to avoid."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "diff_comp",
+   "description": "What changed in a comp since a snapshot: layers added, removed, renamed, retimed, re-parented, keyframe counts that moved, expressions and effects gained or lost \u2014 and nothing at all for unchanged layers, which are only counted. A few dozen tokens where list_layers + get_layer_full is thousands, and it answers the three questions worth asking after a write: which layer is the new one, where did a failed script stop, and did the assembly land. Only the recorded fields are compared, so 'no differences' means none of THOSE moved, not that the comp is identical. Returns a fresh snapshotId so you can keep diffing forward.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "since": {
+      "type": "string",
+      "description": "A snapshotId from an earlier snapshot_comp or diff_comp."
+     },
+     "compId": {
+      "type": "number",
+      "description": "Defaults to the comp the snapshot was taken of; pass it only to assert which comp you mean."
+     },
+     "includeFingerprint": {
+      "type": "boolean",
+      "default": false,
+      "description": "Return the new fingerprint as well as the diff. Off by default."
+     }
+    },
+    "required": [
+     "since"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "list_layers",
+   "description": "Layers in a comp, one-line each. Use get_layer_full for details. Pass `include` to trim it \u2014 `include: []` returns just id/index/name/type, the cheapest way to learn what is in a comp.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "include": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "enum": [
+        "flags",
+        "timing",
+        "parent"
+       ]
+      },
+      "description": "Sections to return: flags, timing, parent. Omit for all of them; [] for the id/index/name/type map alone."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_layer_full",
+   "description": "Full state of one layer: transform + keyframes + expressions, effects, masks, markers, parenting, text/shape/footage extras, and sourceRect (visible bounds). Always prefer over multiple smaller queries. Bound the answer on a heavy layer: `include` picks the sections you need, `maxKeyframes` caps the keyframes per property, `shapeDepth` limits the Contents walk. Anything dropped is named and counted in the response, so a bounded read is never mistaken for a complete one. On a shape layer, `shapeDetail: 'compact'` returns one indented line per group \u2014 `name  matchName  prop=value prop=value`, with `[3 keys]`/`[expr]` marking animated properties and `(at defaults)` a group Transform nobody has touched \u2014 which is a fraction of the size and still names every node the write tools address. Material Options (48 3D-extrusion properties per group, inert on a 2D shape layer) is left out of both forms and counted in `materialsOmitted`; pass `shapeMaterials:true` for the extruded-3D case.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "includeChildren": {
+      "type": "boolean",
+      "default": false
+     },
+     "include": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "enum": [
+        "transform",
+        "effects",
+        "masks",
+        "markers",
+        "bounds",
+        "text",
+        "shape",
+        "source"
+       ]
+      },
+      "description": "Sections to return: transform, effects, masks, markers, bounds, text, shape, source. Omit for all of them; [] for the layer header alone."
+     },
+     "maxKeyframes": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "description": "Cap the keyframes serialized per property. Over the cap you get the first and last few plus a count of what was omitted \u2014 never a silent truncation. Omit for all of them."
+     },
+     "shapeDepth": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4,
+      "description": "How deep to walk a shape layer's Contents tree. Default 4; drop to 1-2 on heavy shape layers."
+     },
+     "shapeMaterials": {
+      "type": "boolean",
+      "default": false,
+      "description": "Include each shape group's Material Options \u2014 the 48-property 3D extrusion block. Off by default: it applies only to an extruded shape under the Cinema 4D renderer, and on an ordinary 2D shape layer it is most of the bytes of the read. What was skipped is counted in the response."
+     },
+     "shapeDetail": {
+      "type": "string",
+      "enum": [
+       "full",
+       "compact"
+      ],
+      "description": "How to serialize a shape layer's Contents. 'full' (default) is one JSON node per property. 'compact' is one indented line per group with that group's own properties folded onto it as name=value \u2014 several times smaller, and enough to see what a layer is made of and address its nodes by name."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_text_layer",
+   "description": "Text layer with optional font/size/color/position/tracking. anchorAlign (default 'left') aligns the text by setting paragraph justification and leaving the anchor at [0,0], so position means the start of the baseline AND stays right when the text is changed later. Tracking is set to 0 unless you pass one, because AE otherwise inherits the user's Character panel. anchorAlign 'none' keeps AE's raw defaults. The justification is read back after the write (AE 26.3 has been seen to store a different alignment from the one set \u2014 issues #93/#94): the result carries `justification` as read and `justificationReasserted` when a second write was needed, and if it still disagrees the layer is removed and the call throws, so a success result is a layer aligned the way it says.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "text": {
+      "type": "string",
+      "default": ""
+     },
+     "font": {
+      "type": "string"
+     },
+     "size": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "color": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "position": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     },
+     "tracking": {
+      "type": "number",
+      "description": "Letter-spacing. Omit it and the layer is created with tracking 0, because AE's addText() otherwise inherits whatever the user's Character panel was last left on (-20 is common) and the same call then renders differently on two machines. Not normalised when anchorAlign is 'none'."
+     },
+     "anchorAlign": {
+      "type": "string",
+      "enum": [
+       "left",
+       "center",
+       "right",
+       "none"
+      ],
+      "default": "left",
+      "description": "How the text aligns to `position`, implemented as live paragraph justification with the anchor point left at [0,0]. Default 'left' makes `position` the start of the first baseline; 'center' and 'right' put it at the centre/end. Because it is justification rather than a measured anchor offset, the alignment stays correct when the Source Text changes later \u2014 retyped, driven by an expression, or edited through Essential Graphics. 'none' leaves AE's raw defaults alone: no justification, no anchor move, no tracking reset."
+     },
+     "name": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_shape_layer",
+   "description": "Empty shape layer; fill via add_shape_content. Position defaults to [0,0] with Anchor Point [0,0], so the layer's coordinate space IS the comp's and every vertex, rect/ellipse position and path you add afterwards is in comp pixels. (After Effects' own default is the comp centre, which silently offsets a drawing authored in comp coordinates by half a frame \u2014 pass position:'center' if you want that, or any [x,y] to place the origin yourself.) The result echoes the position and anchor point it ended up with.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     },
+     "shapes": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": {}
+      },
+      "default": []
+     },
+     "fill": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "stroke": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "strokeWidth": {
+      "type": "number",
+      "minimum": 0
+     },
+     "position": {
+      "anyOf": [
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "string",
+        "const": "center"
+       }
+      ],
+      "description": "Where the layer's origin goes. Defaults to [0,0], which makes the layer's coordinate space the comp's \u2014 so vertices and shape positions you write afterwards are in comp pixels. 'center' is After Effects' own spawn point (the comp centre), which offsets every path you add by half a frame. The Anchor Point stays at [0,0] either way. A new shape layer is 2D, so use [x,y]; a three-component position needs set_layer threeDLayer:true first."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_solid_layer",
+   "description": "Solid-color layer. color is RGB 0..1.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     },
+     "color": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "width": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "height": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "duration": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     }
+    },
+    "required": [
+     "compId",
+     "color"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_null_layer",
+   "description": "Null parent layer.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_adjustment_layer",
+   "description": "Adjustment layer \u2014 effects on it apply to layers below.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_precomp_layer",
+   "description": "Insert an existing comp into another as a pre-comp layer.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "sourceCompId": {
+      "type": "number"
+     },
+     "position": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     }
+    },
+    "required": [
+     "compId",
+     "sourceCompId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_camera_layer",
+   "description": "Camera. 3D layers below view through it.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     },
+     "oneNode": {
+      "type": "boolean",
+      "default": false
+     },
+     "position": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_light_layer",
+   "description": "Light (parallel|spot|point|ambient).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     },
+     "lightType": {
+      "type": "string",
+      "enum": [
+       "parallel",
+       "spot",
+       "point",
+       "ambient"
+      ],
+      "default": "point"
+     },
+     "color": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "intensity": {
+      "type": "number"
+     },
+     "position": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "duplicate_layer",
+   "description": "Duplicate a layer N times; each has a fresh id.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "count": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 1
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "delete_layer",
+   "description": "Remove a layer.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_layer",
+   "description": "Update layer metadata (name/enabled/locked/shy/solo/3D/blend/label/in-out/stretch/trackMatte). Undefined fields unchanged.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "name": {
+      "type": "string"
+     },
+     "enabled": {
+      "type": "boolean"
+     },
+     "locked": {
+      "type": "boolean"
+     },
+     "shy": {
+      "type": "boolean"
+     },
+     "solo": {
+      "type": "boolean"
+     },
+     "threeDLayer": {
+      "type": "boolean"
+     },
+     "blendingMode": {
+      "type": "string",
+      "description": "After Effects' BlendingMode constant name, upper case with underscores: NORMAL, MULTIPLY, SCREEN, OVERLAY, ADD, SUBTRACT, DIFFERENCE, DARKEN, LIGHTEN, COLOR_DODGE, COLOR_BURN, LINEAR_DODGE, LINEAR_BURN, SOFT_LIGHT, HARD_LIGHT, VIVID_LIGHT, LINEAR_LIGHT, PIN_LIGHT, HUE, SATURATION, COLOR, LUMINOSITY, STENCIL_ALPHA, STENCIL_LUMA, ALPHA_ADD, DISSOLVE. A name After Effects does not recognise leaves the mode unchanged without erroring, so read it back with get_layer_full if you are guessing."
+     },
+     "label": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16
+     },
+     "inPoint": {
+      "type": "number"
+     },
+     "outPoint": {
+      "type": "number"
+     },
+     "startTime": {
+      "type": "number"
+     },
+     "stretch": {
+      "type": "number"
+     },
+     "preserveTransparency": {
+      "type": "boolean"
+     },
+     "trackMatte": {
+      "type": "object",
+      "properties": {
+       "type": {
+        "type": "string",
+        "description": "NO_TRACK_MATTE, ALPHA, ALPHA_INVERTED, LUMA or LUMA_INVERTED. Anything else leaves the matte unchanged without erroring."
+       },
+       "layerId": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "type"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "parent_layer",
+   "description": "Set/clear a layer's parent (parentLayerId=null to unparent). The layer stays visually put: AE's own compensation double-counts when the parent was itself re-parented in the same call, so this recomputes the world transform and corrects position/scale/rotation, reporting any correction in `correction`. Read `correction.notes` \u2014 3D layers, cameras and lights are not corrected, and with a keyframed ancestor the fix is only exact at the comp's current time. Pass preserveTransform:false to let the layer jump instead.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "parentLayerId": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "preserveTransform": {
+      "type": "boolean",
+      "default": true,
+      "description": "Keep the layer visually where it is (what AE's UI does). Leave on unless you want the layer to jump into the parent's coordinate space."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "parentLayerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "reorder_layer",
+   "description": "Move a layer in the render stack. Pass exactly one destination: `beforeLayerId` puts it directly in front of (above) that layer, `afterLayerId` directly behind it, `toIndex` at an absolute 1-based position where 1 is the front and numLayers the back. `toIndex` is where the layer ENDS UP, not the slot it displaces \u2014 the two differ by one when moving down the stack. Prefer the id forms: this is the op that shifts every index below it, so an index you read earlier may already be stale. The result carries `movedFrom` and the landed `index`, read back off the layer; equal values mean it was already there.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "toIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "description": "Where the layer ENDS UP: its 1-based index after the move, counting from the front (1 renders in front of everything, numLayers is the back). Clamped to the stack. Prefer beforeLayerId/afterLayerId when you are placing this layer relative to another one \u2014 an index you read earlier may already be stale."
+     },
+     "beforeLayerId": {
+      "type": "number",
+      "description": "Put this layer directly IN FRONT OF (above) the layer with this id."
+     },
+     "afterLayerId": {
+      "type": "number",
+      "description": "Put this layer directly BEHIND (below) the layer with this id."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+     {
+      "required": [
+       "toIndex"
+      ]
+     },
+     {
+      "required": [
+       "beforeLayerId"
+      ]
+     },
+     {
+      "required": [
+       "afterLayerId"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "set_transform",
+   "description": "Set any of position/scale/rotation/anchorPoint/opacity (+3D orientation/per-axis on 3D). keyframe:true + time sets keyframes.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "time": {
+      "type": "number"
+     },
+     "keyframe": {
+      "type": "boolean",
+      "default": false
+     },
+     "properties": {
+      "type": "object",
+      "properties": {
+       "position": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         {
+          "type": "array",
+          "items": {
+           "type": "number"
+          }
+         }
+        ]
+       },
+       "scale": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         {
+          "type": "array",
+          "items": {
+           "type": "number"
+          }
+         }
+        ]
+       },
+       "rotation": {
+        "type": "number"
+       },
+       "anchorPoint": {
+        "anyOf": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         {
+          "type": "array",
+          "items": {
+           "type": "number"
+          }
+         }
+        ]
+       },
+       "opacity": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100
+       },
+       "orientation": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       "xRotation": {
+        "type": "number"
+       },
+       "yRotation": {
+        "type": "number"
+       },
+       "zRotation": {
+        "type": "number"
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "properties"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "add_keyframe",
+   "description": "Keyframe at `time` on propertyPath (e.g. ['Transform','Position']). Optional in/out interpolation + ease \u2014 one influence/speed pair, expanded to however many entries the property needs (see set_temporal_ease). The count used comes back as `easeDimensions`.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "time": {
+      "type": "number"
+     },
+     "value": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     },
+     "interpolation": {
+      "type": "object",
+      "properties": {
+       "in": {
+        "type": "string",
+        "enum": [
+         "linear",
+         "bezier",
+         "hold"
+        ]
+       },
+       "out": {
+        "type": "string",
+        "enum": [
+         "linear",
+         "bezier",
+         "hold"
+        ]
+       },
+       "easeIn": {
+        "type": "object",
+        "properties": {
+         "influence": {
+          "type": "number"
+         },
+         "speed": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "influence",
+         "speed"
+        ],
+        "additionalProperties": false
+       },
+       "easeOut": {
+        "type": "object",
+        "properties": {
+         "influence": {
+          "type": "number"
+         },
+         "speed": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "influence",
+         "speed"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "time",
+     "value"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "remove_keyframe",
+   "description": "Remove keyframe at `time`.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "time": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "time"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_keyframes",
+   "description": "All keyframes on a property: time, value, interpolation, ease, spatial tangents.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_interpolation",
+   "description": "Set in/out interpolation type of a specific keyframe.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "keyIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "in": {
+      "type": "string",
+      "enum": [
+       "linear",
+       "bezier",
+       "hold"
+      ]
+     },
+     "out": {
+      "type": "string",
+      "enum": [
+       "linear",
+       "bezier",
+       "hold"
+      ]
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "keyIndex"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_temporal_ease",
+   "description": "Set influence+speed for the in/out ease of one keyframe. Pass at least one of `easeIn`/`easeOut` \u2014 neither is refused, since it would change nothing. Pass ONE {influence, speed} pair per side and it is applied to every dimension of the property \u2014 you never size the ease array yourself. That matters because AE's own setTemporalEaseAtKey wants a per-property number of entries that is not derivable from the value (2D Scale takes 2, a shape Ellipse Size takes 3, Opacity and sliders take 1, and spatial Position takes 1 whether the layer is 2D or 3D), and the wrong count throws a bare 'parameter 2'. This derives the count, retries the alternatives, and reports what worked as `easeDimensions` \u2014 worth reading if you are also easing that property from run_jsx.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "keyIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "easeIn": {
+      "type": "object",
+      "properties": {
+       "influence": {
+        "type": "number"
+       },
+       "speed": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "influence",
+       "speed"
+      ],
+      "additionalProperties": false,
+      "description": "One influence/speed pair, applied to every dimension of the property. At least one of easeIn/easeOut is required."
+     },
+     "easeOut": {
+      "type": "object",
+      "properties": {
+       "influence": {
+        "type": "number"
+       },
+       "speed": {
+        "type": "number"
+       }
+      },
+      "required": [
+       "influence",
+       "speed"
+      ],
+      "additionalProperties": false,
+      "description": "One influence/speed pair, applied to every dimension of the property."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "keyIndex"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+     {
+      "required": [
+       "easeIn"
+      ]
+     },
+     {
+      "required": [
+       "easeOut"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "set_spatial_tangents",
+   "description": "Set in/out spatial tangents for a position-style keyframe.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "keyIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "inTangent": {
+      "type": "array",
+      "items": {
+       "type": "number"
+      },
+      "minItems": 2,
+      "maxItems": 3
+     },
+     "outTangent": {
+      "type": "array",
+      "items": {
+       "type": "number"
+      },
+      "minItems": 2,
+      "maxItems": 3
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "keyIndex",
+     "inTangent",
+     "outTangent"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_expression",
+   "description": "Expression text, enabled state and `expressionError` on a property. `expressionError` is After Effects' own message when the expression cannot be compiled or evaluated \u2014 the text of the warning banner in the AE UI \u2014 or an empty string when it runs clean. A non-empty one means the property is not being driven by that expression, whatever `enabled` says.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_expression",
+   "description": "Set + enable an expression on a property, and verify it: after the write the property is evaluated and, if After Effects reports an error on it, the call THROWS with that message and the property path. So a success result means the expression compiles and runs; a failure means the text was written but AE cannot evaluate it \u2014 fix it and call set_expression again, or clear_expression to remove it. A broken expression never comes back as ok.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "expression": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "expression"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "toggle_expression",
+   "description": "Enable/disable an expression without clearing. Enabling verifies the same way set_expression does: if AE reports an error on the expression once it is enabled, the call throws with the message rather than returning ok.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "enabled": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath",
+     "enabled"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "clear_expression",
+   "description": "Remove an expression.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "propertyPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "propertyPath"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "list_effects",
+   "description": "All effects on a layer with current param values + keyframes/expressions.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "add_effect",
+   "description": "Add effect by matchName (use list_available_effects \u2014 matchNames are stable across AE versions; display names aren't). A wrong matchName fails immediately and cheaply, so try the standard one (ADBE Gaussian Blur 2, ADBE Slider Control) before searching.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "matchName": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "matchName"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "remove_effect",
+   "description": "Remove effect by 1-based index.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "effectIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "effectIndex"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_effect_param",
+   "description": "Set one parameter of one effect. Pass at least one of `paramName` (the display name, e.g. 'Blurriness') or `paramMatchName` (e.g. 'ADBE Gaussian Blur 2-0001'); list_effects reports both for every parameter on the layer. Give both and the matchName wins, with the name as fallback \u2014 worth doing when a display name is ambiguous or the user's After Effects is localised. `keyframe:true` plus `time` writes a keyframed value instead of a static one.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "effectIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "paramName": {
+      "type": "string",
+      "description": "The parameter's display name as list_effects reports it, e.g. 'Blurriness'."
+     },
+     "paramMatchName": {
+      "type": "string",
+      "description": "The parameter's matchName, e.g. 'ADBE Gaussian Blur 2-0001'. Tried before paramName when both are given, so it is the one to use when a display name is ambiguous or localised."
+     },
+     "value": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     },
+     "time": {
+      "type": "number"
+     },
+     "keyframe": {
+      "type": "boolean",
+      "default": false
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "effectIndex",
+     "value"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+     {
+      "required": [
+       "paramName"
+      ]
+     },
+     {
+      "required": [
+       "paramMatchName"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "set_effect_enabled",
+   "description": "Toggle an effect on/off without removing.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "effectIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "enabled": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "effectIndex",
+     "enabled"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "list_available_effects",
+   "description": "Effects installed in this AE: displayName, matchName, category. **Always pass `filter`** to substring-search: the full list is 250-450+ entries and the cost is in returning them, not in reading them, so an unfiltered call takes seconds every time while a filtered one takes a fraction of one (measured on AE 26.3: 446 entries in 3.9s, 22 filtered in 0.17s). `refresh:true` re-reads after installing a plugin; the enumeration is cached per AE session, which is why refresh exists. Never loop over `app.effects` in run_jsx: it is slow enough to block the bridge past its timeout and looks like a crash.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "filter": {
+      "type": "string"
+     },
+     "refresh": {
+      "type": "boolean"
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_text",
+   "description": "Set text content + styling (font, size, fill/stroke, tracking, leading, justification). Undefined fields unchanged \u2014 and for justification that is verified, not assumed: on AE 26.3 the Source Text round trip has been seen to reset a left-aligned layer to centre when only `text` was changed (issue #93), so after writing, the justification is read back and compared with what should be there (the one you passed, or the one the layer had). If it moved it is written again on its own; if it still disagrees the call throws naming expected and actual rather than reporting a success the layer does not show. The result carries `justification` (the name read back) and `justificationReasserted` (true when the second write was needed).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "text": {
+      "type": "string"
+     },
+     "font": {
+      "type": "string"
+     },
+     "size": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "fillColor": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "strokeColor": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": false,
+      "description": "RGB 0..1",
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "strokeWidth": {
+      "type": "number",
+      "minimum": 0
+     },
+     "tracking": {
+      "type": "number"
+     },
+     "leading": {
+      "type": "number"
+     },
+     "justification": {
+      "type": "string",
+      "enum": [
+       "left",
+       "center",
+       "right",
+       "full"
+      ]
+     },
+     "applyFill": {
+      "type": "boolean"
+     },
+     "applyStroke": {
+      "type": "boolean"
+     },
+     "fauxBold": {
+      "type": "boolean"
+     },
+     "fauxItalic": {
+      "type": "boolean"
+     },
+     "allCaps": {
+      "type": "boolean"
+     },
+     "smallCaps": {
+      "type": "boolean"
+     },
+     "baselineShift": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "add_text_animator",
+   "description": "Add a text animator group (position/scale/rotation/opacity/tracking/skew/fillColor/strokeColor). Optional range selector.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "type": {
+      "type": "string",
+      "enum": [
+       "position",
+       "scale",
+       "rotation",
+       "opacity",
+       "tracking",
+       "skew",
+       "fillColor",
+       "strokeColor"
+      ]
+     },
+     "range": {
+      "type": "object",
+      "properties": {
+       "start": {
+        "type": "number",
+        "default": 0
+       },
+       "end": {
+        "type": "number",
+        "default": 100
+       },
+       "offset": {
+        "type": "number",
+        "default": 0
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "type"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_shape_path",
+   "description": "Replace a shape path with new vertices/tangents/closed.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "shapePath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "vertices": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "inTangents": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "outTangents": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "closed": {
+      "type": "boolean",
+      "default": true
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "shapePath",
+     "vertices"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "add_shape_content",
+   "description": "Add shape content under Contents or a sub-group. `content.type` picks the node (rect/ellipse/star/path/fill/stroke/trim/repeater/merge/group); the other keys set its properties by friendly name (e.g. rect: size/position/roundness; fill: color/opacity; stroke: color/width/lineCap; path: vertices/inTangents/outTangents/closed). Unknown or unsettable keys are NOT ignored \u2014 the whole node is rolled back and an error lists them, so trust a success result. Use get_layer_full to see exact property names. ORDER MATTERS: index 1 renders in FRONT and each call appends behind the last, so add front-to-back \u2014 details and dots first, big background rects last. `zOrder:'front'` can override that, but it needs an internal moveTo which has disturbed nested renders in AE 26.3, so prefer call order. A reference to one node goes stale once a sibling is added to the same group (add a Stroke and an earlier Fill reference throws 'Object is invalid'): add every node first, then address them by name.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "parentGroupPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "content": {
+      "anyOf": [
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "rect"
+         },
+         "name": {
+          "type": "string"
+         },
+         "size": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         "position": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         "roundness": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "ellipse"
+         },
+         "name": {
+          "type": "string"
+         },
+         "size": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         "position": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "star"
+         },
+         "name": {
+          "type": "string"
+         },
+         "starType": {
+          "type": "number",
+          "description": "1 = star, 2 = polygon"
+         },
+         "points": {
+          "type": "number",
+          "description": "Number of points/sides"
+         },
+         "position": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": false,
+          "prefixItems": [
+           {
+            "type": "number"
+           },
+           {
+            "type": "number"
+           }
+          ]
+         },
+         "rotation": {
+          "type": "number"
+         },
+         "innerRadius": {
+          "type": "number"
+         },
+         "outerRadius": {
+          "type": "number"
+         },
+         "innerRoundness": {
+          "type": "number"
+         },
+         "outerRoundness": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "path"
+         },
+         "name": {
+          "type": "string"
+         },
+         "vertices": {
+          "type": "array",
+          "items": {
+           "type": "array",
+           "minItems": 2,
+           "maxItems": 2,
+           "items": false,
+           "prefixItems": [
+            {
+             "type": "number"
+            },
+            {
+             "type": "number"
+            }
+           ]
+          },
+          "description": "Bezier vertices in layer space"
+         },
+         "inTangents": {
+          "type": "array",
+          "items": {
+           "type": "array",
+           "minItems": 2,
+           "maxItems": 2,
+           "items": false,
+           "prefixItems": [
+            {
+             "type": "number"
+            },
+            {
+             "type": "number"
+            }
+           ]
+          }
+         },
+         "outTangents": {
+          "type": "array",
+          "items": {
+           "type": "array",
+           "minItems": 2,
+           "maxItems": 2,
+           "items": false,
+           "prefixItems": [
+            {
+             "type": "number"
+            },
+            {
+             "type": "number"
+            }
+           ]
+          }
+         },
+         "closed": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "fill"
+         },
+         "name": {
+          "type": "string"
+         },
+         "color": {
+          "anyOf": [
+           {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": false,
+            "description": "RGB 0..1",
+            "prefixItems": [
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             }
+            ]
+           },
+           {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": false,
+            "prefixItems": [
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             }
+            ]
+           }
+          ]
+         },
+         "opacity": {
+          "type": "number",
+          "description": "0..100"
+         },
+         "fillRule": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "stroke"
+         },
+         "name": {
+          "type": "string"
+         },
+         "color": {
+          "anyOf": [
+           {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": false,
+            "description": "RGB 0..1",
+            "prefixItems": [
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             }
+            ]
+           },
+           {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": false,
+            "prefixItems": [
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             },
+             {
+              "type": "number"
+             }
+            ]
+           }
+          ]
+         },
+         "opacity": {
+          "type": "number",
+          "description": "0..100"
+         },
+         "width": {
+          "type": "number"
+         },
+         "lineCap": {
+          "type": "number"
+         },
+         "lineJoin": {
+          "type": "number"
+         },
+         "miterLimit": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "trim"
+         },
+         "name": {
+          "type": "string"
+         },
+         "start": {
+          "type": "number",
+          "description": "0..100"
+         },
+         "end": {
+          "type": "number",
+          "description": "0..100"
+         },
+         "offset": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "repeater"
+         },
+         "name": {
+          "type": "string"
+         },
+         "copies": {
+          "type": "number"
+         },
+         "offset": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "merge"
+         },
+         "name": {
+          "type": "string"
+         },
+         "mode": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       },
+       {
+        "type": "object",
+        "properties": {
+         "type": {
+          "type": "string",
+          "const": "group"
+         },
+         "name": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "type"
+        ],
+        "additionalProperties": false
+       }
+      ]
+     },
+     "zOrder": {
+      "type": "string",
+      "enum": [
+       "front",
+       "back"
+      ],
+      "description": "Where the new node sits in its group's render stack. Index 1 renders in FRONT, and AE appends new content to the end \u2014 so the default, 'back', puts each node behind everything already there. 'front' moves it to index 1. Prefer ordering your calls front-to-back (details first, background rects last) over reaching for 'front': it needs an internal moveTo, which has been seen to disturb nested renders of the comp in AE 26.3."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "content"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_shape_property",
+   "description": "Set a property on a shape content node. Optional keyframe at time.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "contentPath": {
+      "type": "array",
+      "items": {
+       "type": [
+        "string",
+        "number"
+       ]
+      },
+      "minItems": 1,
+      "description": "Dotted property path into a layer, e.g. ['Transform','Position'] or ['Effects','Gaussian Blur','Blurriness']."
+     },
+     "property": {
+      "type": "string"
+     },
+     "value": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     },
+     "time": {
+      "type": "number"
+     },
+     "keyframe": {
+      "type": "boolean",
+      "default": false
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "contentPath",
+     "property",
+     "value"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "add_mask",
+   "description": "Add a mask with vertices/tangents/closed/mode.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "vertices": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "inTangents": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "outTangents": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "closed": {
+      "type": "boolean",
+      "default": true
+     },
+     "mode": {
+      "type": "string",
+      "default": "ADD",
+      "description": "Mask blend mode: ADD (default), NONE, SUBTRACT, INTERSECT, LIGHTEN, DARKEN or DIFFERENCE. Anything else leaves the mode unchanged without erroring."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "vertices"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_mask",
+   "description": "Modify mask vertices/tangents/closed/mode/inverted/expansion/feather/opacity.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "maskIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     },
+     "vertices": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "inTangents": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "outTangents": {
+      "type": "array",
+      "items": {
+       "type": "array",
+       "minItems": 2,
+       "maxItems": 2,
+       "items": false,
+       "prefixItems": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "number"
+        }
+       ]
+      }
+     },
+     "closed": {
+      "type": "boolean"
+     },
+     "mode": {
+      "type": "string",
+      "description": "Mask blend mode: ADD, NONE, SUBTRACT, INTERSECT, LIGHTEN, DARKEN or DIFFERENCE. Anything else leaves the mode unchanged without erroring."
+     },
+     "inverted": {
+      "type": "boolean"
+     },
+     "expansion": {
+      "type": "number"
+     },
+     "feather": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": false,
+      "prefixItems": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "number"
+       }
+      ]
+     },
+     "opacity": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "maskIndex"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "remove_mask",
+   "description": "Remove a mask by 1-based index.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "maskIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     }
+    },
+    "required": [
+     "compId",
+     "layerId",
+     "maskIndex"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "add_marker",
+   "description": "Add a marker on a layer (layerId) or on the comp. time + optional duration/comment/label/chapter/url/frameTarget.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "time": {
+      "type": "number"
+     },
+     "duration": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0
+     },
+     "comment": {
+      "type": "string"
+     },
+     "label": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16
+     },
+     "chapter": {
+      "type": "string"
+     },
+     "url": {
+      "type": "string"
+     },
+     "frameTarget": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "compId",
+     "time"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "remove_marker",
+   "description": "Remove a marker by 1-based index.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "markerIndex": {
+      "type": "integer",
+      "exclusiveMinimum": 0
+     }
+    },
+    "required": [
+     "compId",
+     "markerIndex"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "screenshot_frame",
+   "description": "ONE-OFF visual check of a comp. Base64 PNG. Use only at key moments \u2014 never per-frame or in a loop. To judge MOTION, pass `times` (2-6 values) and get one tiled contact sheet with the time burned into each tile: one call, one image, about the pixel cost of a single frame \u2014 always cheaper and safer than several separate calls. `time` and `times` are mutually exclusive. Confirm the numbers with get_layer_full / get_keyframes; a picture is not exact. A downsample is chosen from the comp size (per tile, for a sheet) unless you pass one \u2014 omit it, and pass downsample:1 only when you genuinely need full resolution. Not every result is an image: 'Stale frame' means AE re-served an earlier render, 'Corrupt frame' means the file AE wrote is not a whole PNG (retry at downsample 6-8, or screenshot the precomps separately), 'Render timed out' means it is still rendering (wait, don't retry immediately), and `empty:true` means every pixel is transparent \u2014 check the time, in/out points and enabled state. On a sheet, a bad tile is drawn as a marked block and named in `warning`; the rest of the sheet is still good. Never disable layers to make a frame render.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "time": {
+      "type": "number"
+     },
+     "times": {
+      "type": "array",
+      "items": {
+       "type": "number"
+      },
+      "minItems": 2,
+      "maxItems": 6,
+      "description": "2-6 times to render into one tiled contact sheet, in order, with the time burned into each tile. Cheaper than one call per frame and the whole point of it is judging motion. Mutually exclusive with `time`."
+     },
+     "downsample": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8,
+      "description": "Render at 1/N resolution. Omit and one is chosen from the comp size (long edge ~1280px: 2 at 1080p, 3 at 4K). Pass 1 for a full-resolution frame. The factor is always exactly what you asked for: the render sets the comp's resolution and puts it back, so a viewer left on Quarter or Third does not change the size of the frame you get."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "not": {
+     "required": [
+      "time",
+      "times"
+     ]
+    }
+   }
+  },
+  {
+   "name": "screenshot_layer",
+   "description": "ONE-OFF visual check of a single layer (solo'd) at a time. Same one-off rule and same downsample guidance as screenshot_frame. The same 'Stale frame', 'Corrupt frame', 'Render timed out' and `empty:true` non-image results apply. No `times` here \u2014 contact sheets are screenshot_frame only.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "layerId": {
+      "type": "number"
+     },
+     "time": {
+      "type": "number"
+     },
+     "downsample": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8,
+      "description": "Render at 1/N resolution. Omit and one is chosen from the comp size (long edge ~1280px: 2 at 1080p, 3 at 4K). Pass 1 for a full-resolution frame. The factor is always exactly what you asked for: the render sets the comp's resolution and puts it back, so a viewer left on Quarter or Third does not change the size of the frame you get."
+     }
+    },
+    "required": [
+     "compId",
+     "layerId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "run_batch",
+   "description": "Many ops in one ExtendScript pass \u2014 far faster than the same ops as separate calls, and far fewer undo steps. **Up to 500 ops it is exactly one undo step.** Over 500 it is chunked into a background job \u2014 this call returns a jobId at once, before the first chunk runs; finish with await_job, which blocks for the job and is where its progress is delivered (pass a progressToken on THAT call, not on this one; get_job polls without one) \u2014 and lands as **one undo step per chunk of 25** \u2014 around 24 steps for 600 ops \u2014 because After Effects discards an undo group that spans two script calls. Every result reports the measured count in `undoSteps` with a `note`: read it before you tell anyone how to undo the work, and never say \"one Cmd-Z\" for a chunked batch. `singleUndo:true` forces one undo step at any size up to 2000 ops, by running the whole batch in one blocking call \u2014 After Effects' interface is frozen for the duration and no progress is reported, so use it only when a single Cmd-Z actually matters to the user. Over 2000 it is refused rather than freezing AE. transactional:true (default) stops at the first error; nothing rolls back either way \u2014 the ops before it stay applied, so read the state back rather than re-running. `diff:true` appends a structural diff of the comps the batch touched \u2014 what it added, retimed, re-parented and keyframed \u2014 and on a failure that diff rides on the error, which is the cheapest way to find where a half-applied batch stopped.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "ops": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "op": {
+         "type": "string"
+        },
+        "args": {}
+       },
+       "required": [
+        "op"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "transactional": {
+      "type": "boolean",
+      "default": true,
+      "description": "Stop at the first failing op instead of running the rest. Nothing rolls back either way \u2014 the ops before the failure stay applied, and the error says where it stopped."
+     },
+     "undoGroupName": {
+      "type": "string",
+      "default": "AE MCP Batch",
+      "description": "What the user sees in After Effects' Edit > Undo menu. A chunked batch numbers its steps from this, e.g. \"AE MCP Batch (3)\"."
+     },
+     "singleUndo": {
+      "type": "boolean",
+      "default": false,
+      "description": "Force the whole batch into ONE undo step, whatever its size, by running it in a single blocking ExtendScript call. Up to 2000 ops. The cost is real: After Effects' interface is frozen for the entire batch and no progress is reported, so the user sees nothing until it finishes. Without it a batch over 500 ops is chunked and lands as one undo step per chunk of 25 \u2014 the result reports the exact count. Reach for this only when the user has to be able to undo the work with a single Cmd-Z."
+     },
+     "diff": {
+      "type": "boolean",
+      "default": false,
+      "description": "Fingerprint the comp before and after this call and append only what changed (layers added/removed/renamed/retimed/re-parented, keyframe counts, expression and effect counts). A few dozen tokens instead of reading the comp back. If the call fails, the diff of what landed before it stopped is appended to the error."
+     },
+     "diffCompId": {
+      "type": "number",
+      "description": "Which comp `diff` should fingerprint. Defaults to the comps this call names, else the comp open in the viewer."
+     }
+    },
+    "required": [
+     "ops"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_project_summary",
+   "description": "Project state: path, item count, active item, flat item list with type (comp | footage | solid | folder | unknown \u2014 same vocabulary as a layer's sourceType).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "find_layers",
+   "description": "Search one comp (`compId`) or every comp for layers matching name (regex, case-insensitive), type and/or effect matchName filters. Returns `{matches, count, compsSearched, included}`; each match is id/index/name/sourceType plus compId/compName \u2014 enough to address the layer with any other tool. That is the whole record by default: pass `include` (flags, timing, parent \u2014 the same names as list_layers) to add sections to every match, and note that unlike list_layers an omitted `include` here means the bounded form, not everything. For one layer's details use get_layer_full on the id it gives you.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "namePattern": {
+      "type": "string"
+     },
+     "type": {
+      "type": "string"
+     },
+     "hasEffectMatchName": {
+      "type": "string"
+     },
+     "include": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "enum": [
+        "flags",
+        "timing",
+        "parent"
+       ]
+      },
+      "description": "Sections to add to each match: flags, timing, parent \u2014 the same names as list_layers. Omit it (or pass []) for id/index/name/sourceType plus compId/compName only; unlike list_layers, omitting it here does NOT return every section. The result echoes what was included."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "import_footage",
+   "description": "Import a file (video, image, audio, SVG, PSD/AI) into the project. Returns the item id \u2014 pass it to create_footage_layer to place it. Validates what AE actually produced: an SVG whose viewBox asks for one aspect ratio and imports at another is a known AE bug that renders as nothing with no error, so the item is deleted and the call throws with the workaround. `force:true` keeps it and reports the problem in `validation` instead.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Absolute path to the file to import."
+     },
+     "name": {
+      "type": "string",
+      "description": "Rename the project item after import. Omit to keep the filename."
+     },
+     "sequence": {
+      "type": "boolean",
+      "default": false,
+      "description": "Import a numbered still as an image sequence rather than a single frame."
+     },
+     "force": {
+      "type": "boolean",
+      "default": false,
+      "description": "Keep an item that failed validation instead of deleting it and throwing. The problem is still reported in `validation`. Only pass this when you know the dimensions are wrong and want the item anyway."
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "create_footage_layer",
+   "description": "Place an imported project item into a comp as a layer. Takes the itemId from import_footage or get_project_summary. For a comp use create_precomp_layer instead.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "itemId": {
+      "type": "number",
+      "description": "Project item id from import_footage or get_project_summary."
+     },
+     "name": {
+      "type": "string"
+     },
+     "position": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "items": false,
+        "prefixItems": [
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         },
+         {
+          "type": "number"
+         }
+        ]
+       },
+       {
+        "type": "array",
+        "items": {
+         "type": "number"
+        }
+       }
+      ]
+     },
+     "startTime": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "compId",
+     "itemId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "purge_unused_footage",
+   "description": "Remove footage items no comp uses. By default only solids \u2014 the items behind solid and adjustment layers, which delete_comp and delete_layer leave behind in the Solids folder, so a session that builds and discards comps can leave hundreds. `solidsOnly:false` removes every unused footage item, imported files and placeholders too, which is what AE's own Remove Unused Footage does. Comps and folders are never touched: a nested comp nothing uses is not footage. `dryRun:true` lists what would go (`wouldRemove`) without removing anything or adding an undo step \u2014 use it first on a project you did not build. `folderId` limits the sweep to one folder and its subfolders. Reports `scanned`, `inUse` and `removed` (id, name, kind); a real run is one undo step. If one removal fails, the error names it, what was already removed and what was not attempted, since nothing rolls back.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "solidsOnly": {
+      "type": "boolean",
+      "default": true,
+      "description": "Only remove solids \u2014 the items behind solid and adjustment layers. Pass false to remove every footage item no comp uses, imported files and placeholders included, which is what AE's own Remove Unused Footage does. Comps and folders are never removed either way."
+     },
+     "dryRun": {
+      "type": "boolean",
+      "default": false,
+      "description": "List what would be removed without removing anything \u2014 not even an undo step."
+     },
+     "folderId": {
+      "type": "number",
+      "description": "Restrict the sweep to one project folder and everything nested under it. A folder id from get_project_summary; omit for the whole project."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "place_audio_cues",
+   "description": "Score a scene in one call: a list of cues, each a sound at a comp time with a level in dB, becomes one audio layer each \u2014 imported if needed, named, trimmed, labelled \u2014 in a single undo step. Reach for it whenever you are placing more than two or three sound effects; the alternative is dozens of round trips or a run_jsx loop that has to know that `layer.property('ADBE Audio Levels')` returns null on an audio layer. Every cue names its sound with **exactly one** of `path` (a file to use \u2014 imported once however many cues name it, and an item already in the project from that path is reused) or `footageId` (one already imported); both together, or neither, is reported against that cue's index with nothing placed. `time` is when the cue starts; `levelDb` is decibels (0 = the file as recorded, negative = quieter), defaulting to 0. `inPoint`/`outPoint` trim in COMP time, not file time. Three per-cue options cover what scoring passes otherwise redo in run_jsx: `loop:true` repeats the sound to `outPoint` or the comp's end (time remapping plus a wrap-around expression on Time Remap; AE's own remap keyframes are kept, since removing them breaks the property); `fadeIn`/`fadeOut` in seconds put Audio Levels keyframes at the layer's real in/out, fading between `fadeFloorDb` (call-level, default -48) and `levelDb`; `stretch` is a percentage (100 unchanged, 200 half speed and lower pitch) and the start time and trims are re-asserted after it. A loop that is also stretched has the factor baked into its expression, so changing stretch by hand later leaves the loop at the old rate. A fade longer than the cue's placed length, a stretch of 0 or below, or a floor at or above the cue's level is refused by cue index with nothing placed; for a file not yet imported the fade is checked right after the import, before any layer exists. It is all-or-nothing: every cue is validated \u2014 file exists, item has audio, time inside the comp, options sane \u2014 before a single layer is made, and if a later one still fails, everything this call created is removed and the error names the cue. The result carries one small entry per cue (layerId, name, time, plus `looped`/`stretch`/`fadeIn`/`fadeOut` and read-back in/out only where an option set them) and `sources` naming what was imported or reused \u2014 not an echo of the request. Use `dryRun:true` to check a cue list against the project without touching anything, including the undo stack; it answers with counts, `wouldImport`, `wouldReuse` and the failing cues by index, never the whole resolved list. Max 200 cues per call.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "cues": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "footageId": {
+         "type": "number",
+         "description": "Project item id of an already-imported sound. Give this or `path`, not both."
+        },
+        "path": {
+         "type": "string",
+         "minLength": 1,
+         "description": "Absolute path to a sound file. Imported once per call however many cues name it, and an item already in the project from that path is reused rather than imported again."
+        },
+        "time": {
+         "type": "number",
+         "description": "Comp time in seconds where the cue starts."
+        },
+        "levelDb": {
+         "type": "number",
+         "description": "Level in decibels, the same unit After Effects shows. 0 is the file untouched, -6 is roughly half as loud, negative is quieter. Defaults to 0, written explicitly so the result is the same on every machine."
+        },
+        "name": {
+         "type": "string",
+         "description": "Layer name. Defaults to namePrefix + the file's basename without its extension."
+        },
+        "inPoint": {
+         "type": "number",
+         "description": "Trim the layer's in point to this COMP time. Must not be earlier than `time`. Omit to play from the start of the file."
+        },
+        "outPoint": {
+         "type": "number",
+         "description": "Trim the layer's out point to this COMP time. Omit to play to the end of the file."
+        },
+        "label": {
+         "anyOf": [
+          {
+           "type": "integer",
+           "minimum": 0,
+           "maximum": 16
+          },
+          {
+           "type": "string"
+          }
+         ],
+         "description": "AE label colour, as an index 0-16 or a name (red, yellow, aqua, pink, lavender, peach, seafoam, blue, green, purple, orange, brown, fuchsia, cyan, sandstone, darkgreen)."
+        },
+        "loop": {
+         "type": "boolean",
+         "description": "Loop the sound until `outPoint`, or until the end of the comp when no outPoint is given \u2014 for beds and ambiences. Enables time remapping with a wrap-around expression on Time Remap; the layer's in point still trims the front of the file the way it does on any layer. Default false: the file plays once."
+        },
+        "fadeIn": {
+         "type": "number",
+         "minimum": 0,
+         "description": "Seconds to fade in from `fadeFloorDb` up to `levelDb`, as keyframes on Audio Levels starting at the layer's in point. Default 0 (no fade). fadeIn + fadeOut must fit inside the cue's placed length or the cue is refused by index."
+        },
+        "fadeOut": {
+         "type": "number",
+         "minimum": 0,
+         "description": "Seconds to fade out from `levelDb` down to `fadeFloorDb`, ending at the layer's out point. Default 0 (no fade). fadeIn + fadeOut must fit inside the cue's placed length or the cue is refused by index."
+        },
+        "stretch": {
+         "type": "number",
+         "exclusiveMinimum": 0,
+         "description": "Time stretch as a percentage: 100 is unchanged, 200 plays at half speed (lower pitch, twice as long), 50 at double speed. Must be greater than 0. The layer's start time and any trim are re-asserted after it, since After Effects moves them when stretch changes. Default 100."
+        }
+       },
+       "required": [
+        "time"
+       ],
+       "additionalProperties": false
+      },
+      "minItems": 1,
+      "maxItems": 200
+     },
+     "namePrefix": {
+      "type": "string",
+      "default": "SFX_",
+      "description": "Prefix for cues that do not name themselves. Pass \"\" for no prefix."
+     },
+     "fadeFloorDb": {
+      "type": "number",
+      "description": "The level in decibels that every fadeIn starts from and every fadeOut ends at. Default -48, the bottom of After Effects' own Audio Levels slider and 1/256 of the recorded amplitude \u2014 near-silence. Must be below each faded cue's levelDb. One floor for the whole list."
+     },
+     "dryRun": {
+      "type": "boolean",
+      "default": false,
+      "description": "Resolve and check the whole list without importing, creating or changing anything \u2014 not even an undo step. Returns counts, the files it would import, the items it would reuse and the failing cues by index \u2014 never the whole resolved list."
+     }
+    },
+    "required": [
+     "compId",
+     "cues"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "export_mogrt",
+   "description": "Export a comp as a .mogrt for Premiere. Handles the three things that make a scripted export look like a hung connection: it saves the project first (removes AE's modal save prompt), suppresses the modal font warning that otherwise freezes this connection until someone clicks OK in AE, and runs outside the undo group. **The comp needs at least one property in its Essential Graphics panel** \u2014 After Effects will not build a template from an empty one, and it refuses silently, so this tool checks the controller count first and refuses before exporting rather than reporting a cause it cannot know. Fix it in AE: Window > Essential Graphics, pick the comp, drag a layer property in. `name` defaults to the comp name \u2014 AE's own default is the literal 'Untitled', so every export would otherwise overwrite the same file. Pass `posterTime` to render that frame as the template's thumbnail, replacing the black one AE writes; the export still succeeds if only the thumbnail fails. Needs the project saved once by hand first. `fonts` in the result lists the fonts the template will require \u2014 tell the user, since non-Adobe ones make Premiere flag the template. If an export still fails, read the message before acting: it lists what was checked, and it only names a modal dialog when dialogs were left unsuppressed. Under the default suppression a dialog is impossible, the cause is genuinely unknown, and the way to see AE's own reason is for the user to run the same export by hand from the Essential Graphics panel.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "compId": {
+      "type": "number"
+     },
+     "destDir": {
+      "type": "string",
+      "description": "Folder to write the .mogrt into. Defaults to the folder holding the .aep."
+     },
+     "name": {
+      "type": "string",
+      "description": "Template name, which is also the output filename. Defaults to the comp name \u2014 AE's own default is the literal 'Untitled', so every scripted export would otherwise overwrite the same file."
+     },
+     "overwrite": {
+      "type": "boolean",
+      "default": false,
+      "description": "Required to replace an existing .mogrt at that path."
+     },
+     "posterTime": {
+      "type": "number",
+      "description": "Comp time to render as the template's still thumbnail, replacing the black one AE writes. Omit to leave AE's thumbnail alone."
+     },
+     "suppressDialogs": {
+      "type": "boolean",
+      "default": true,
+      "description": "Suppress the modal font warning during export. Leave true: an unsuppressed dialog freezes the bridge until someone clicks it in AE. Set false only to see the dialog deliberately."
+     }
+    },
+    "required": [
+     "compId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "run_jsx",
+   "description": "Escape hatch: arbitrary ExtendScript in an undo group. Pass exactly one of `code` (inline) or `scriptPath` (absolute) to run a .jsx file the server reads \u2014 use the path for anything long, so the script never enters the conversation. `libraries` (absolute .jsx paths) are read by the server too and inlined ahead of the script in the same scope, so their functions are callable from it; they are re-evaluated on every call, so keep them to declarations rather than to work. Keep shared helpers there instead of pasting them into every script. In scope: `app`, the full `OPS` table (every tool on this server, e.g. `OPS.set_transform({compId, layerId, position:[0,0]})`), and these helpers \u2014 `compById(id)`, `getCompById(id)`, `layerById(compOrId, layerId)`, `getLayerById(comp, layerId)`, `walkProperty(layer, [\"Transform\",\"Position\"])`, `addKeys(prop, [[t, v], \u2026])` \u2192 key indices, `ease(prop, keyIndex, easeIn, easeOut)` which sizes the KeyframeEase array itself (a bare number means influence; omit easeOut for the same both sides), `shape(comp, {name, position})` which lands the layer at [0,0] rather than the comp centre, and `withoutUndoGroup(fn)`. `app.executeCommand()` menu commands silently no-op here \u2014 they depend on host focus and the active selection, neither of which this bridge has \u2014 so use the API equivalents (`CompItem.duplicate()`, `layer.duplicate()`). `return X` sends a value back \u2014 arrays and nested objects come back whole. Anything that cannot be JSON is replaced in place by a marker string, never dropped: `\"[function]\"`, `\"[undefined]\"`, `\"[circular]\"`, `\"[max depth]\"`, `\"[NaN]\"`, and live AE objects as `\"[CompItem \\\"Main\\\" #12]\"` \u2014 a handle to pass to a real read tool, not a walk of the object. An empty result therefore means the script really returned nothing. A script with no explicit `return` \u2014 including one ending in a bare expression, which does NOT return its value \u2014 comes back as `{ok:true, returned:null, undoGroup, note}`. That means it ran to completion; it did **not** fail, so do not re-run it. Nothing rolls back, so re-running a mutating script applies it twice. A failure names the line of YOUR script and prints its text; when the number cannot be mapped it says so rather than guessing. Everything before that line already ran and nothing rolls back, so read the state back \u2014 never re-run the script to see if it fails again. AE refuses copyToComp for a layer with a parent or a linked expression while an undo group is open: call `withoutUndoGroup(function(){ \u2026 })` around just that part, or pass undoGroup:false for the whole script (its changes then land as whatever undo steps AE records on its own, not one). Keep loops short \u2014 ExtendScript is single-threaded and freezes the user's UI. `diff:true` fingerprints the comp before and after the script and appends only what changed, so the script reports what it actually did instead of you reading the comp back; with it the answer is always `{ok, returned, diff}`. If the script throws, that diff is appended to the error \u2014 which is how you find where a half-applied script stopped, since nothing rolls back.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "code": {
+      "type": "string",
+      "description": "The ExtendScript to run. Exactly one of `code` or `scriptPath`."
+     },
+     "scriptPath": {
+      "type": "string",
+      "description": "Absolute path to a .jsx file to run instead of `code`. The server reads it, so a long script never enters the conversation. Exactly one of `code` or `scriptPath`."
+     },
+     "libraries": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Absolute paths to .jsx files inlined ahead of the script, sharing its scope, so their functions are callable from it. The server reads them, so their text never enters the conversation. They are re-evaluated on every call \u2014 keep them to declarations, not to work. Put shared helpers here rather than pasting them into every script."
+     },
+     "undoGroup": {
+      "type": "boolean",
+      "default": true,
+      "description": "Wrap the script in one undo step. Set false only for the operations AE refuses while an undo group is open \u2014 copyToComp on a layer with a parent or a linked expression. The script's changes then land as whatever undo steps AE records on its own."
+     },
+     "diff": {
+      "type": "boolean",
+      "default": false,
+      "description": "Fingerprint the comp before and after this call and append only what changed (layers added/removed/renamed/retimed/re-parented, keyframe counts, expression and effect counts). A few dozen tokens instead of reading the comp back. If the call fails, the diff of what landed before it stopped is appended to the error."
+     },
+     "diffCompId": {
+      "type": "number",
+      "description": "Which comp `diff` should fingerprint. Defaults to the comps this call names, else the comp open in the viewer."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+     {
+      "required": [
+       "code"
+      ]
+     },
+     {
+      "required": [
+       "scriptPath"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "get_house_style",
+   "description": "The user's palette, type, motion and layout defaults for the project that is open, read from `house-style.md` beside the .aep. Call it once before building anything so your work matches the rest of theirs. Returns a few-hundred-token summary by default \u2014 palette as named hexes, type, motion, layout, and a note naming anything it could not summarise; pass `detail:'full'` for the whole document, which you need before editing the guide with set_house_style. `found:false` means none exists yet \u2014 build with sensible defaults and offer to capture one afterwards. Cheap; never a reason to skip.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "detail": {
+      "type": "string",
+      "enum": [
+       "summary",
+       "full"
+      ],
+      "default": "summary",
+      "description": "'summary' (default) is a few hundred tokens: palette as named hexes, type, motion defaults, layout rules, and what it could not summarise. 'full' returns the whole document \u2014 use it before editing the guide with set_house_style, or when the summary is not enough."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "set_house_style",
+   "description": "Write the project's style guide. Replaces the whole file, so read it first and send the merged document \u2014 `overwrite:true` is required to replace an existing one. The project must have been saved at least once, since the file lives beside the .aep. Use the style-guide topic of ae_guide for how to capture a style worth writing down.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "content": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The complete style guide as markdown. Replaces the file, so send the whole document."
+     },
+     "overwrite": {
+      "type": "boolean",
+      "default": false,
+      "description": "Required to replace an existing guide. Read it with get_house_style and merge first \u2014 this is not a patch."
+     }
+    },
+    "required": [
+     "content"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "await_job",
+   "description": "Block until a chunked run_batch job is done. Default 10min timeout. Returns the same payload the tool would have, `undoSteps` included. **This is the call that carries progress**: send it with a progressToken and notifications/progress arrive while it waits, every one before its response. run_batch's own response is back before the first chunk runs, so no progress can ride on that call \u2014 a token there is ignored.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "jobId": {
+      "type": "string"
+     },
+     "timeoutMs": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 600000
+     }
+    },
+    "required": [
+     "jobId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "get_job",
+   "description": "Non-blocking job status: progress/total/state/error. Poll this when you cannot keep an await_job open. It never sends notifications/progress \u2014 that is await_job's job.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "jobId": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "jobId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "cancel_job",
+   "description": "Set cancel flag; chunked loop stops at next boundary.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "jobId": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "jobId"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "check_setup",
+   "description": "Diagnose the After Effects connection: panel installed, up to date, the version AE is actually running, Adobe debug preference on, AE running, bridge answering \u2014 on whichever port it answers, since the port file is only a hint \u2014 plus `portAgreement` (do tool calls go to the port the panel answers on?) and, when nothing answers at all, `panelSignature` (did CEP's own log say it refused to load the panel?). Read-only and safe to call any time. Call this FIRST whenever another tool reports it cannot reach After Effects or says the panel is out of date, then relay `nextSteps` to the user in plain language. `panelRunningCurrent` is the one that predicts whether calls will work \u2014 it can fail while `panelUpToDate` passes, which means an update is installed but AE has not been restarted. A failing `portAgreement` means the server's port went stale, not the panel: retry the call (the server re-discovers the port whenever a call is refused) or reconnect the MCP server \u2014 never restart After Effects for it, a panel is listening. A failing `panelSignature` means no restart and no reinstall will help; `nextSteps` carries the self-signing fix.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "setup_panel",
+   "description": "Install or refresh the After Effects panel and enable the Adobe preference AE needs to load it. Run this when check_setup reports the panel is missing, out of date, or older than what AE is running. It writes to the user's Adobe CEP extensions folder and sets two user-level Adobe preferences \u2014 PlayerDebugMode, and CEP's LogLevel where it was never set, so that if AE ever refuses to load the panel its CEP log says why \u2014 tell the user what it will do before calling it. Prefer running it while AE is CLOSED: the panel then loads when they open it, with no restart. If AE is already open they must quit and reopen it, and until they do, the old panel keeps answering. If the preference was newly enabled, a one-time Mac reboot may also be needed. If the existing install had been self-signed (check_setup's `panelInstalled` says so), the fresh copy is unsigned and the result says the signing has to be redone \u2014 on a machine that needed signing, tell the user before calling this.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "enableDebugMode": {
+      "type": "boolean",
+      "default": true,
+      "description": "Also set Adobe's PlayerDebugMode preference, which AE requires to load this unsigned panel, and CEP's LogLevel where it was never set, so CEP's own log records why a panel failed to load (issue #91). Default true."
+     },
+     "force": {
+      "type": "boolean",
+      "default": false,
+      "description": "Replace an existing symlinked (development) install with a copy. Default false."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "init_project",
+   "description": "Set up a working folder for one video, series or client: a project brief and a pointer to the house style, written in whichever layout this client reads. Run it when the user is starting out or asks to set up a project. It writes files to disk \u2014 say which folder before calling, and pass `dir` explicitly unless the client already told the server where it is working. It never overwrites anything and reports every path it wrote. AGENTS.md carries a `Tools version last absorbed: <version>` line stamped with this server's version; the absorb-release prompt reads it after an upgrade to apply only what changed since, then moves it on \u2014 leave the line in place.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "dir": {
+      "type": "string",
+      "description": "Folder to create or fill, absolute or relative to the server's working directory. Ask the user if you do not know; do not invent one."
+     },
+     "name": {
+      "type": "string",
+      "description": "Project name for the generated docs. Defaults to the folder name."
+     },
+     "client": {
+      "type": "string",
+      "enum": [
+       "auto",
+       "claude-code",
+       "claude-desktop",
+       "cursor",
+       "vscode",
+       "windsurf",
+       "codex",
+       "generic"
+      ],
+      "default": "auto",
+      "description": "Which client's layout to write. 'auto' detects it from the MCP handshake \u2014 leave it alone unless the user says otherwise."
+     },
+     "withMcpConfig": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also write a client MCP config pointing at this server. Default false: you are already connected, so the user does not need one."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "ae_guide",
+   "description": "The full working guidance for these tools, by topic. Read `after-effects` before a first substantial build in a session, `style-guide` when capturing or editing the user's look, `ae-setup` when a tool cannot reach After Effects, `whats-new` when a call behaves differently from what you expected. Covers the traps that silently produce wrong output and are not visible from any single tool's schema. `whats-new` is one section per release, newest first, each entry leading with the rule as it now stands and a `supersedes:` line quoting the old rule a project's notes may still carry; pass `since` (a version, e.g. '0.4.0') to get only the releases after it, or one line saying nothing is newer \u2014 that is how the absorb-release prompt brings a project's docs up to date once per upgrade. The whats-new answer always opens with this server's own version. `since` is rejected on any other topic.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "topic": {
+      "type": "string",
+      "enum": [
+       "ae-setup",
+       "after-effects",
+       "animation",
+       "assembly",
+       "extendscript-gotchas",
+       "issue-journal",
+       "mogrt-and-footage",
+       "shapes",
+       "sound",
+       "style-guide",
+       "text",
+       "whats-new"
+      ],
+      "description": "after-effects: the core \u2014 orienting, bounded reads, verifying a write, screenshots, the bridge failures \u2014 start here; it points at one topic per subject. animation: keyframes, easing, rigging, expressions. shapes: shape layers and their Contents. text: text layers. assembly: shots placed into a master comp, markers, retiming. extendscript-gotchas: read before writing raw ExtendScript for run_jsx. sound: sound effects and levels. mogrt-and-footage: exporting a .mogrt, importing footage. issue-journal: when a tool fought back. whats-new: what changed, one section per release, when a call behaves differently from what you expected or a project is being brought up to date after an upgrade. style-guide: capturing the user's look. ae-setup: connecting to AE when a tool cannot reach it."
+     },
+     "since": {
+      "type": "string",
+      "pattern": "^v?\\d+\\.\\d+\\.\\d+$",
+      "description": "whats-new only: return just the releases newer than this version \u2014 the version named is the one already absorbed and is excluded \u2014 behind the guide's preamble, or one line saying nothing is newer. Use the version a project's docs record as last absorbed. The answer opens with the server's own version. Rejected on any other topic, since there is nothing there to filter."
+     }
+    },
+    "required": [
+     "topic"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "log_issue",
+   "description": "Record a problem you hit and the workaround that got past it, so the next session doesn't rediscover it. Log only what cost real effort and will recur: a tool failing for a non-obvious reason, an argument shape the schema didn't imply, AE behaving unlike the docs. Not your own typos, not one-off user mistakes. Pass `tools` and the exact `errorText`: that is what lets a later failure be answered with this entry, and it is what merges a re-log into the existing entry even under a different title (the result says `mergedBy` and keeps the existing title). Reusing an existing title extends it too. Pass `kind:'ae-quirk'` for a permanent After Effects behaviour, so a new release does not archive it as fixed; the default `tool-bug` is presumed fixed once it was last seen on an older server than the one running. Choose the scope by what the entry is *about*: leave it at the default `project` for this project's footage, comps or files, and pass `scope:'user'` when it is about how these tools or After Effects behave, so the next project starts already knowing it. If the result says `reopened:true`, an entry that had been retired is back \u2014 tell the user the problem was supposed to be gone. If the result comes back with reported:false, then AFTER you have finished the actual work, close your reply by telling the user in plain language that something took much longer than it should have and offering to pass it to the people who maintain this tool \u2014 phrase it for a motion designer, in terms of what actually happened, and don't say 'GitHub issue' or 'bug report' unless they say it first.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "title": {
+      "type": "string",
+      "minLength": 3,
+      "description": "One line naming the problem, specific enough to recognise again. Becomes the entry's id."
+     },
+     "symptom": {
+      "type": "string",
+      "minLength": 3,
+      "description": "What went wrong, including the exact error text and the call that produced it."
+     },
+     "workaround": {
+      "type": "string",
+      "minLength": 3,
+      "description": "What actually worked \u2014 concrete enough for the next session to apply without rediscovering it."
+     },
+     "cause": {
+      "type": "string",
+      "description": "Why it happens, if you worked it out."
+     },
+     "tools": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Tool names involved, e.g. ['set_temporal_ease']. With errorText, this is what a later failure is matched on."
+     },
+     "errorText": {
+      "type": "string",
+      "description": "The exact error text the failing call returned, verbatim. The next time a call to one of `tools` fails with matching text, its error names this entry \u2014 and a later log_issue with the same tool and error text extends this entry instead of creating a second one under a different title."
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "tool-bug",
+       "ae-quirk"
+      ],
+      "default": "tool-bug",
+      "description": "'tool-bug' (default): something these tools get wrong, which a later release may fix \u2014 so the entry is archived once it was last seen on an older server than the one running. 'ae-quirk': After Effects itself behaving unlike its documentation; no release changes that, so it is never archived by version."
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "project",
+       "user"
+      ],
+      "default": "project",
+      "description": "'project' (default) for this project's footage, comps or files. 'user' for how these tools or After Effects behave \u2014 that journal travels with the person, so every future project starts knowing it. Reported back as 'home' when there is no project folder to write into."
+     }
+    },
+    "required": [
+     "title",
+     "symptom",
+     "workaround"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "list_known_issues",
+   "description": "Problems earlier sessions hit with these tools, with the workarounds that worked. You do not need to read this ahead of time: a failed call names the entries that match its tool and error text in the error itself, under `Known from earlier sessions:`. Call this when you are planning something that has bitten before (pass `tool` or `query`), when a failure's pointer names an entry you want to open, or when the user asks what is known. Merges two journals and tags every entry with the one it came from: `project` (or `home`, the fallback when there is no project folder) for this project's own notes, `user` for tool and After Effects behaviour carried across every project. Returns a one-line index by default, entries naming `tool` first and then most recently seen first; the cause and the workaround are in the entry, so follow up with `id` on anything that looks like your problem \u2014 ids are unique only within a journal, so use the `scope:id` form the `next` pointer shows. Archived entries (not seen for 30 days, last seen on an older server, or retired with archive_issue) are hidden and counted in `archivedCount`; `includeArchived:true` lists them, and an `id` read always works. `detail:'full'` dumps every matching entry and is rarely worth it. Also returns the repo and server version needed to report one.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "status": {
+      "type": "string",
+      "enum": [
+       "all",
+       "unreported",
+       "reported"
+      ],
+      "default": "all"
+     },
+     "tool": {
+      "type": "string",
+      "description": "Only entries about this tool, e.g. 'set_temporal_ease'. Omit for everything."
+     },
+     "query": {
+      "type": "string",
+      "description": "Free-text filter: every whitespace-separated term must appear in an entry's title, symptom or tools."
+     },
+     "id": {
+      "type": "string",
+      "description": "Read one entry in full \u2014 cause and workaround included \u2014 by the id from a previous listing. Ignores the filters. Ids are unique only within a journal, so prefix with the entry's scope ('user:my-entry') when the listing shows one in each."
+     },
+     "detail": {
+      "type": "string",
+      "enum": [
+       "index",
+       "full"
+      ],
+      "default": "index",
+      "description": "'index' (default) is one line per entry: id, title, tools, kind, when and on which version it was last seen, counts \u2014 read the one you need with `id`. 'full' returns every matching entry's whole body and costs thousands of tokens."
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "all",
+       "project",
+       "user"
+      ],
+      "default": "all",
+      "description": "Which journal to read. 'all' (default) merges this project's with the user's cross-project one and tags every entry with the scope it came from."
+     },
+     "limit": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 500,
+      "default": 50,
+      "description": "Most entries to return. Anything held back is counted in `omitted`."
+     },
+     "includeArchived": {
+      "type": "boolean",
+      "default": false,
+      "description": "Also list archived entries \u2014 not seen for 30 days, last seen on an older server than this one, or retired with archive_issue \u2014 each flagged with its reason. Default false: they are hidden and only counted in `archivedCount`. An `id` read always returns the entry, archived or not."
+     }
+    },
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "mark_issue_reported",
+   "description": "Record that a journal entry has been sent to the maintainers, with the resulting URL. Call it only once the issue really exists, so later sessions don't ask the user to report the same thing twice.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "description": "The entry id returned by log_issue or list_known_issues. Prefix with its scope ('user:my-entry') when the same id exists in both journals."
+     },
+     "url": {
+      "type": "string",
+      "description": "Link to the issue that was opened."
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  },
+  {
+   "name": "archive_issue",
+   "description": "Retire a journal entry for good: it leaves the index (and the pointers a failed call shows still name it, marked archived with this reason) but the file stays, hand-editable, with `reason` in its frontmatter. Use it when a report already covers the problem (pass that URL as the reason), when a release fixed it, or when the lesson has been moved into the project's own notes. Entries that merely go quiet archive themselves \u2014 30 days unseen, or last seen on an older server \u2014 so this is for a decision, not for tidying. Use the scope-qualified id (`user:my-entry`) when both journals hold the slug; only the one named moves. A later log_issue with the same title or the same tool and error text brings it back and says so.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string",
+      "description": "The entry id from log_issue or list_known_issues. Prefix with its scope ('user:my-entry') when the same id exists in both journals \u2014 only the one named moves."
+     },
+     "reason": {
+      "type": "string",
+      "minLength": 3,
+      "description": "Why it is being retired, one line \u2014 the URL of the report that already covers it, the release that fixed it, or where the lesson was moved to."
+     }
+    },
+    "required": [
+     "id",
+     "reason"
+    ],
+    "additionalProperties": false,
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+   }
+  }
+ ]
+}

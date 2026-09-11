@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Studio Assistant Bridge</title>
+  <style>
+    body { font-family: "Segoe UI", sans-serif; background: #232323; color: #ddd; padding: 12px; margin: 0; font-size: 12px; }
+    h1 { font-size: 13px; margin: 0 0 8px 0; color: #fff; }
+    .row { margin: 4px 0; }
+    .label { color: #888; }
+    .ok { color: #6f6; } .err { color: #f66; }
+    #log { margin-top: 8px; font-family: Consolas, monospace; font-size: 10px; background: #1a1a1a; padding: 6px; border-radius: 4px; max-height: 200px; overflow: auto; }
+    #log div { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Studio Assistant Bridge</h1>
+  <div class="row"><span class="label">Status:</span> <span id="status">starting...</span></div>
+  <div class="row"><span class="label">Listening on:</span> <span id="addr">-</span></div>
+  <div class="row"><span class="label">Requests:</span> <span id="reqs">0</span></div>
+  <div id="log"></div>
+  <script src="./main.js"></script>
+</body>
+</html>
