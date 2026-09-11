@@ -183,10 +183,17 @@ def app_subtitle(a):
     return sub + "  ·  drivable" if a["drivable"] else sub
 
 
-IMAGE_TYPES = [("Pictures", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"),
-               ("All files", "*.*")]
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+ATTACH_TYPES = [("All files", "*.*"), ("Pictures", " ".join("*" + e for e in IMAGE_EXTS))]
 PREVIEWABLE = (".png", ".gif")            # what Tk 8.6 can decode without PIL
 ATTACH_LIMIT = 200_000_000                # bytes; a picture, not a video
+LIST_LIMIT = 40                           # folder entries named in the brief
+
+
+def is_picture(path):
+    """Whether an attachment is a picture - the ones the vision model is
+    asked about and the transcript tries to show."""
+    return os.path.splitext(path)[1].lower() in IMAGE_EXTS
 
 
 def image_dims(path):
@@ -219,9 +226,31 @@ def image_dims(path):
     return None
 
 
-def describe_picture(path):
-    """One line a text model can act on: name, size, dimensions, and the path
-    every bridge on this PC opens files by."""
+def describe_folder(path):
+    """A folder as a heading and a bounded listing: what is in it, so the
+    model can name a file without a tool call, and how much was left out."""
+    try:
+        names = sorted(os.listdir(path), key=str.lower)
+    except OSError as e:
+        return "%s (folder, unreadable: %s) at %s" % (os.path.basename(path) or path,
+                                                     e.strerror or e, path)
+    files = [n for n in names if os.path.isfile(os.path.join(path, n))]
+    dirs = [n for n in names if os.path.isdir(os.path.join(path, n))]
+    head = "%s (folder, %d files, %d folders) at %s" % (
+        os.path.basename(path) or path, len(files), len(dirs), path)
+    shown = [n + "/" for n in dirs] + files
+    lines = ["    " + n for n in shown[:LIST_LIMIT]]
+    if len(shown) > LIST_LIMIT:
+        lines.append("    ... and %d more" % (len(shown) - LIST_LIMIT))
+    return "\n".join([head] + lines)
+
+
+def describe_attachment(path):
+    """One line a text model can act on: name, size, dimensions when it is a
+    picture, and the path every bridge on this PC opens files by. A folder
+    gets its listing."""
+    if os.path.isdir(path):
+        return describe_folder(path)
     ext = os.path.splitext(path)[1].lstrip(".").upper() or "file"
     try:
         size = os.path.getsize(path)
@@ -234,11 +263,11 @@ def describe_picture(path):
     return "%s (%s %s) at %s" % (os.path.basename(path), ", ".join(detail), ext, path)
 
 
-def picture_note(paths, app):
-    """The paragraph appended to the brief when pictures are attached. Bridges
-    on this PC take the path as it is; the OpenCode container sees only its
-    workspace, so the pictures are copied in and named by the path the
-    container will see."""
+def attachment_note(paths, app):
+    """The paragraph appended to the brief when files or folders are attached.
+    Bridges on this PC take the path as it is; the OpenCode container sees
+    only its workspace, so attachments are copied in and named by the path
+    the container will see."""
     if not paths:
         return ""
     lines = []
@@ -246,16 +275,20 @@ def picture_note(paths, app):
         folder = os.path.join(app.workspace, "attachments")
         os.makedirs(folder, exist_ok=True)
         for p in paths:
-            dest = os.path.join(folder, os.path.basename(p))
+            name = os.path.basename(os.path.normpath(p))
+            dest = os.path.join(folder, name)
             if os.path.abspath(dest) != os.path.abspath(p):
-                shutil.copy2(p, dest)
+                if os.path.isdir(p):
+                    shutil.copytree(p, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(p, dest)
             lines.append("- %s (copied into the workspace; the container sees it as "
-                         "/workspace/attachments/%s)" % (describe_picture(dest), os.path.basename(p)))
-        head = "Attached pictures, copied into the workspace:"
+                         "/workspace/attachments/%s)" % (describe_attachment(dest), name))
+        head = "Attached files and folders, copied into the workspace:"
     else:
-        head = ("Attached pictures - files on this PC; tools that take a file path "
-                "(import, place, upload) take these paths as written:")
-        lines = ["- " + describe_picture(p) for p in paths]
+        head = ("Attached files and folders - on this PC; tools that take a path "
+                "(import, place, upload, open) take these paths as written:")
+        lines = ["- " + describe_attachment(p) for p in paths]
     return "\n\n" + head + "\n" + "\n".join(lines)
 
 
@@ -410,7 +443,7 @@ class Chat(tk.Tk):
         self.dot_role = {}                # canvas -> palette role
         self.marks = {}                   # icon key -> [(canvas, size, spec)]
         self.photos = {}                  # (icon key, size) -> PhotoImage
-        self.attachments = []             # picture paths waiting in the composer
+        self.attachments = []             # file and folder paths waiting in the composer
         self.windows = {}                 # ("tools", app id) / "prefs" -> Toplevel
         self.tool_views = {}              # app id -> that window's Text
         self.configure(bg=self.C["bg"])
@@ -474,9 +507,11 @@ class Chat(tk.Tk):
         # By codepoint: these are private-use characters that paste into an
         # editor as blanks, and MDL2 is documented by its hex codes anyway.
         mdl2 = {"pin": 0xE718, "unpin": 0xE77A, "close": 0xE8BB,
-                "add": 0xE710, "link": 0xE71B, "more": 0xE70D, "picture": 0xEB9F}
+                "add": 0xE710, "link": 0xE71B, "more": 0xE70D, "picture": 0xEB9F,
+                "file": 0xE8A5, "folder": 0xE8B7}
         plain = {"pin": 0x2191, "unpin": 0x2193, "close": 0x00D7,
-                 "add": 0x002B, "link": 0x21C4, "more": 0x02C5, "picture": 0x25A3}
+                 "add": 0x002B, "link": 0x21C4, "more": 0x02C5, "picture": 0x25A3,
+                 "file": 0x2750, "folder": 0x25AD}
         self.g = {k: chr(v) for k, v in (mdl2 if have else plain).items()}
 
     def _px(self, n):
@@ -629,6 +664,7 @@ class Chat(tk.Tk):
                         ("<Control-t>", lambda: self._tab_menu(self.btn_add)),
                         ("<Control-w>", self._close_tab),
                         ("<Control-o>", self._on_attach),
+                        ("<Control-O>", self._on_attach_folder),
                         ("<Control-comma>", self._prefs_window)):
             self.bind_all(seq, lambda ev, f=fn: (f(), "break")[1])
             self.input.bind(seq, lambda ev, f=fn: (f(), "break")[1])
@@ -1568,9 +1604,12 @@ class Chat(tk.Tk):
         self._skin(self.btn_send, bg="card")
         self.btn_send.paint(self.C)
         self.btn_send.pack(side="right", padx=(10, 4), pady=4)
-        self.btn_attach = self._glyph(row, "picture", self._on_attach, bg="card",
-                                      tip="Attach pictures (Ctrl+O)")
+        self.btn_attach = self._glyph(row, "file", self._on_attach, bg="card",
+                                      tip="Attach files (Ctrl+O)")
         self.btn_attach.pack(side="left", padx=(12, 0))
+        self.btn_folder = self._glyph(row, "folder", self._on_attach_folder, bg="card",
+                                      tip="Attach a folder (Ctrl+Shift+O)")
+        self.btn_folder.pack(side="left", padx=(4, 0))
         self.input = tk.Text(row, height=2, font=self.f_body, wrap="word", bd=0,
                              padx=14, pady=11, highlightthickness=0)
         self._skin(self.input, bg="card", fg="text", insertbackground="accent",
@@ -1579,7 +1618,7 @@ class Chat(tk.Tk):
         self.input.bind("<Return>", self._on_return)
         self.input.focus_set()
         hint = tk.Label(composer, text="Enter to send   ·   Shift+Enter for a new line"
-                                       "   ·   Ctrl+O to attach a picture"
+                                       "   ·   Ctrl+O to attach files"
                                        "   ·   Ctrl+Tab to switch app",
                         font=self.f_small, anchor="w")
         self._skin(hint, bg="bg", fg="faint")
@@ -1587,26 +1626,33 @@ class Chat(tk.Tk):
 
     # ------------------------------------------------------------- attachments
     def _on_attach(self, _widget=None):
-        paths = filedialog.askopenfilenames(parent=self, title="Attach pictures",
-                                            filetypes=IMAGE_TYPES)
+        paths = filedialog.askopenfilenames(parent=self, title="Attach files",
+                                            filetypes=ATTACH_TYPES)
         if paths:
             self._add_attachments(paths)
 
+    def _on_attach_folder(self, _widget=None):
+        path = filedialog.askdirectory(parent=self, title="Attach a folder", mustexist=True)
+        if path:
+            self._add_attachments([path])
+
     def _add_attachments(self, paths):
-        """Queue pictures for the next message. Bad files are refused here,
-        with a line in the transcript, rather than at send time."""
+        """Queue files and folders for the next message. Bad paths are refused
+        here, with a line in the transcript, rather than at send time. Only
+        pictures have a size limit: they are the attachments whose bytes are
+        read (by the vision model); anything else travels as its path."""
         s = self.cur()
         for p in paths:
             p = os.path.abspath(p)
             if p in self.attachments:
                 continue
             try:
-                size = os.path.getsize(p)
+                size = 0 if os.path.isdir(p) else os.path.getsize(p)
             except OSError as e:
                 if s:
                     self._write(s, "Could not attach %s: %s\n" % (p, e.strerror or e), "err")
                 continue
-            if size > ATTACH_LIMIT:
+            if is_picture(p) and size > ATTACH_LIMIT:
                 if s:
                     self._write(s, "Not attaching %s: %.0f MB is a file to import, not a "
                                    "picture to talk about.\n" % (p, size / 1e6), "err")
@@ -1630,6 +1676,8 @@ class Chat(tk.Tk):
             chip.pack(side="left", padx=(12, 0), pady=(10, 0))
             dims = image_dims(p)
             text = os.path.basename(p) + ("  %d\u00d7%d" % dims if dims else "")
+            if os.path.isdir(p):
+                text = self.g["folder"] + "  " + os.path.basename(p)
             lbl = tk.Label(chip, text=clip(text, 44), font=self.f_small, padx=8, pady=3)
             self._skin(lbl, bg="side", fg="text")
             lbl.pack(side="left")
@@ -1639,8 +1687,12 @@ class Chat(tk.Tk):
         self.chips.pack(fill="x", before=self.row)
 
     def _show_attachment(self, s, path):
-        """The picture in the transcript under the message it went with - inline
-        where Tk can decode it, its name where it cannot."""
+        """The attachment in the transcript under the message it went with - a
+        picture inline where Tk can decode it, a name where it cannot, a
+        folder by name with a trailing separator."""
+        if os.path.isdir(path):
+            self._write(s, "[%s%s]\n" % (os.path.basename(path), os.sep), "hint")
+            return
         if path.lower().endswith(PREVIEWABLE):
             try:
                 self._show_preview(s, {"file": path})
@@ -2547,8 +2599,8 @@ class Chat(tk.Tk):
             self._apply_status()
             return
         task = self.input.get("1.0", "end").strip()
-        pictures = list(self.attachments)
-        if not task and not pictures:
+        attached = list(self.attachments)
+        if not task and not attached:
             return
         if not s.ready:
             self._write(s, "%s is still starting up - give it a moment.\n"
@@ -2556,16 +2608,16 @@ class Chat(tk.Tk):
             return
         task = task or "Take a look at what I attached."
         try:
-            note = picture_note(pictures, s.app)
+            note = attachment_note(attached, s.app)
         except OSError as e:
-            self._write(s, "Could not hand the pictures over: %s\n" % e, "err")
+            self._write(s, "Could not hand the attachments over: %s\n" % e, "err")
             return
         self.input.delete("1.0", "end")
         self.attachments = []
         self._paint_chips()
         self._role(s, "YOU", "role_user")
         self._write(s, task + "\n", "user")
-        for p in pictures:
+        for p in attached:
             self._show_attachment(s, p)
         s.messages.append({"role": "user", "content": task + note})
         s.record.briefs.append(task + note)
@@ -2573,7 +2625,8 @@ class Chat(tk.Tk):
         s.busy = True
         s.status = ("working", "warn", False)
         self._apply_status()
-        self._spawn(s.event_id, self._turn, s, pictures)
+        # The vision model is asked about pictures only; the rest are paths.
+        self._spawn(s.event_id, self._turn, s, [p for p in attached if is_picture(p)])
 
     def _turn(self, s, pictures=()):
         sid = s.event_id

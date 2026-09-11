@@ -1379,22 +1379,27 @@ class TestGui(unittest.TestCase):
             photo = tk.PhotoImage(width=320, height=180, master=self.app)
             photo.write(path, format="png")
         else:
-            open(path, "wb").write(b"\xff\xd8\xff\xe0\x00\x04\x00\x00"      # APP0
-                                   b"\xff\xc0\x00\x11\x08\x04\x38\x07\x80\x03"
-                                   b"\x01\x22\x00\x02\x11\x01\x03\x11\x01\xff\xd9")
+            self._blob(path, b"\xff\xd8\xff\xe0\x00\x04\x00\x00"           # APP0
+                             b"\xff\xc0\x00\x11\x08\x04\x38\x07\x80\x03"
+                             b"\x01\x22\x00\x02\x11\x01\x03\x11\x01\xff\xd9")
         return path
+
+    @staticmethod
+    def _blob(path, data):
+        with open(path, "wb") as fh:
+            fh.write(data)
 
     def test_picture_dimensions_come_from_the_header(self):
         self.assertEqual(self.mod.image_dims(self._picture("a.png")), (320, 180))
         self.assertEqual(self.mod.image_dims(self._picture("b.jpg", "jpg")), (1920, 1080))
         gif = os.path.join(self.dir, "c.gif")
-        open(gif, "wb").write(b"GIF89a\x40\x01\xf0\x00" + b"\x00" * 6)
+        self._blob(gif, b"GIF89a\x40\x01\xf0\x00" + b"\x00" * 6)
         self.assertEqual(self.mod.image_dims(gif), (320, 240))
         txt = os.path.join(self.dir, "d.txt")
-        open(txt, "wb").write(b"not a picture")
+        self._blob(txt, b"not a picture")
         self.assertIsNone(self.mod.image_dims(txt))
         self.assertIsNone(self.mod.image_dims(os.path.join(self.dir, "missing.png")))
-        line = self.mod.describe_picture(self._picture("frame 12.png"))
+        line = self.mod.describe_attachment(self._picture("frame 12.png"))
         self.assertIn("frame 12.png (320 x 180, 1 KB PNG) at ", line)
         self.assertTrue(line.endswith(os.path.join(self.dir, "frame 12.png")))
 
@@ -1435,7 +1440,7 @@ class TestGui(unittest.TestCase):
                     self.app.update()
                     self.assertEqual(spawned[0][1:], (self.app._turn, s, [png]))
                     brief = s.messages[-1]["content"]
-                    self.assertTrue(brief.startswith("Match this\n\nAttached pictures"))
+                    self.assertTrue(brief.startswith("Match this\n\nAttached files and folders"))
                     self.assertIn("board.png (320 x 180, 1 KB PNG) at " + png, brief)
                     self.assertNotIn("base64", brief)
                     self.assertEqual(s.record.briefs[-1], brief)
@@ -1464,18 +1469,76 @@ class TestGui(unittest.TestCase):
         real = spec.workspace
         spec.workspace = os.path.join(self.dir, "ws")
         try:
-            note = self.mod.picture_note([png], spec)
+            note = self.mod.attachment_note([png], spec)
             copy = os.path.join(spec.workspace, "attachments", "sketch.png")
             self.assertTrue(os.path.exists(copy))
             self.assertIn("/workspace/attachments/sketch.png", note)
             self.assertIn(copy, note)
             self.assertNotIn(png + ")", note)
-            self.assertEqual(self.mod.picture_note([], spec), "")
-            plain = self.mod.picture_note([png], eng.APPS[0])
+            self.assertEqual(self.mod.attachment_note([], spec), "")
+            plain = self.mod.attachment_note([png], eng.APPS[0])
             self.assertIn(png, plain)
             self.assertNotIn("/workspace", plain)
+            # A folder is copied whole, and named by its folder path inside.
+            src = os.path.join(self.dir, "refs")
+            os.makedirs(os.path.join(src, "inner"))
+            self._blob(os.path.join(src, "inner", "a.txt"), b"a")
+            note = self.mod.attachment_note([src + os.sep], spec)
+            self.assertTrue(os.path.exists(os.path.join(spec.workspace, "attachments",
+                                                        "refs", "inner", "a.txt")))
+            self.assertIn("/workspace/attachments/refs)", note)
+            self.assertIn("refs (folder, 0 files, 1 folders)", note)
         finally:
             spec.workspace = real
+
+    def test_any_file_or_folder_can_be_attached(self):
+        """Files travel as paths whatever their type or size, and a folder
+        goes as a bounded listing so the model can name what is in it
+        without a tool call. Only pictures reach the vision model."""
+        big = os.path.join(self.dir, "render.mov")
+        with open(big, "wb") as fh:
+            fh.seek(self.mod.ATTACH_LIMIT + 1)
+            fh.write(b"\0")
+        folder = os.path.join(self.dir, "footage")
+        os.makedirs(os.path.join(folder, "audio"))
+        for i in range(self.mod.LIST_LIMIT + 5):
+            self._blob(os.path.join(folder, "clip%03d.mp4" % i), b"x")
+        png = self._picture("still.png")
+        line = self.mod.describe_attachment(big)
+        self.assertTrue(line.startswith("render.mov (200.0 MB MOV) at "))
+        listing = self.mod.describe_attachment(folder)
+        self.assertTrue(listing.startswith("footage (folder, %d files, 1 folders) at %s\n"
+                                           % (self.mod.LIST_LIMIT + 5, folder)))
+        self.assertIn("\n    audio/\n    clip000.mp4\n", listing)
+        self.assertIn("\n    ... and 6 more", listing)
+        self.assertNotIn("clip044", listing)
+        self.app._select(eng.APPS[0].id)
+        s = self.app.cur()
+        self.app._add_attachments([big, folder, png])
+        self.app.update()
+        self.assertEqual(self.app.attachments, [big, folder, png])
+        self.assertEqual(len(self.app.chips.winfo_children()), 3)
+        self.assertTrue(self.app.btn_folder.winfo_ismapped())
+        spawned = []
+        original = self.app._spawn
+        self.app._spawn = lambda *a: spawned.append(a)
+        messages, record, ready = s.messages, s.record, s.ready
+        try:
+            s.reset()
+            s.ready = True
+            self.app.input.insert("1.0", "Cut these together")
+            self.app._on_send()
+            self.assertEqual(spawned[0][1:], (self.app._turn, s, [png]))
+            brief = s.messages[-1]["content"]
+            self.assertIn("- " + line, brief)
+            self.assertIn("- " + listing, brief)
+            self.assertIn("[footage%s]" % os.sep, s.view.get("1.0", "end"))
+        finally:
+            s.busy = False
+            self.app.attachments = []
+            self.app._paint_chips()
+            s.messages, s.record, s.ready = messages, record, ready
+            self.app._spawn = original
 
     def test_vision_description_lands_in_the_brief_before_the_turn(self):
         """With STUDIO_VISION_MODEL set the worker asks the vision model what
@@ -1489,7 +1552,7 @@ class TestGui(unittest.TestCase):
         os.environ["STUDIO_VISION_MODEL"] = "some-vl"
         try:
             s.reset()
-            brief = "Match this" + self.mod.picture_note([png], s.app)
+            brief = "Match this" + self.mod.attachment_note([png], s.app)
             s.messages.append({"role": "user", "content": brief})
             s.record.briefs.append(brief)
             self.app.llm = FakeLLM([answer(text="Done.")])
@@ -1662,6 +1725,7 @@ class TestSingleInstance(unittest.TestCase):
         import studio_chat
         port = 57999
         self.assertTrue(studio_chat.claim_single_instance(port))
+        self.addCleanup(studio_chat._LOCK.close)
         self.assertFalse(studio_chat.claim_single_instance(port))
 
 
