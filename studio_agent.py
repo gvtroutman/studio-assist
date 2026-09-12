@@ -16,6 +16,7 @@ Stdlib only. No pip installs.
 """
 
 import argparse
+import base64
 import glob
 import json
 import os
@@ -231,7 +232,8 @@ def mcp_result_to_text(result):
         if kind == "text":
             parts.append(item.get("text", ""))
         elif kind == "image":
-            parts.append("[image returned: %s, %d bytes base64 - not shown to a text model]"
+            parts.append("[image returned: %s, %d bytes - a text model sees only the "
+                         "visual review below, if there is one]"
                          % (item.get("mimeType", "?"), len(item.get("data", ""))))
         else:
             parts.append(json.dumps(item)[:500])
@@ -443,22 +445,41 @@ def api_root(base_url):
     return root[:-3].rstrip("/") if root.endswith("/v1") else root
 
 
+# Names that mark a model as able to look at a picture, for a host whose model
+# list carries no type. LM Studio's own list says "vlm" and needs no guessing.
+VISION_HINTS = ("-vl", "vl-", "vision", "llava", "pixtral", "minicpm-v", "moondream",
+                "gemma-3", "gemma3", "idefics", "florence", "internvl", "smolvlm")
+
+
+def looks_vision(model_id):
+    m = (model_id or "").lower()
+    return any(h in m for h in VISION_HINTS)
+
+
 def probe_models(base_url, timeout=8):
-    """-> (reachable, loaded_id_or_None, [ids], error_or_None)"""
-    try:  # LM Studio's REST API reports load state; plain /v1/models does not.
+    """-> (reachable, loaded_id_or_None, [ids], [vision ids], error_or_None)
+
+    The vision ids are the served models that can take a picture in a message:
+    what LM Studio types as "vlm", or, from a host that does not say, what the
+    name suggests."""
+    try:  # LM Studio's REST API reports load state and type; plain /v1/models does not.
         with urllib.request.urlopen(api_root(base_url) + "/api/v0/models",
                                     timeout=timeout) as r:
             data = json.load(r).get("data", [])
         ids = [m.get("id") for m in data if m.get("id")]
         loaded = next((m.get("id") for m in data if m.get("state") == "loaded"), None)
-        return True, loaded, ids, None
+        vision = [m.get("id") for m in data
+                  if m.get("id") and (m.get("type") == "vlm" or
+                                      (not m.get("type") and looks_vision(m.get("id"))))]
+        return True, loaded, ids, vision, None
     except Exception:
         pass
     try:
         with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=timeout) as r:
-            return True, None, [m.get("id") for m in json.load(r).get("data", [])], None
+            ids = [m.get("id") for m in json.load(r).get("data", [])]
+        return True, None, ids, [i for i in ids if looks_vision(i)], None
     except Exception as e:
-        return False, None, [], str(e)
+        return False, None, [], [], str(e)
 
 
 def pick_model(loaded, ids, want=None):
@@ -471,6 +492,141 @@ def pick_model(loaded, ids, want=None):
         if m in ids:
             return m
     return ids[0] if ids else None
+
+
+# Vision models that describe a picture well and fit beside the executing model.
+PREFERRED_VISION_MODELS = [
+    "qwen3-vl-8b-instruct", "qwen2.5-vl-7b-instruct", "gemma-3-12b-it", "gemma-3-4b-it",
+    "qwen3-vl-4b-instruct", "qwen2.5-vl-3b-instruct",
+]
+
+
+def pick_vision_model(vision_ids, executing, want=None, loaded=None):
+    """The model that looks at pictures for the executing model.
+
+    STUDIO_VISION_MODEL when the host serves it; else the executing model itself
+    when it can see, which costs no second model in VRAM; else one already in
+    VRAM, which costs no load; else a known-good vision model; else any the host
+    has. None means nothing on the host can see, and every tab says so.
+    """
+    if want and want in vision_ids:
+        return want
+    if executing in vision_ids:
+        return executing
+    if loaded in vision_ids:
+        return loaded
+    for m in PREFERRED_VISION_MODELS:
+        if m in vision_ids:
+            return m
+    return vision_ids[0] if vision_ids else None
+
+
+class Vision:
+    """The eyes of a text model: a vision-capable model on the same host.
+
+    Every bridge answers a screenshot with an image, and the user attaches
+    pictures to briefs, but the executing model reads text - so a frame it is
+    handed is a placeholder unless something looks at it. This looks: it
+    describes an attached picture for the brief, and reviews a returned frame
+    against the brief so the executor's next step is informed by what is
+    actually on screen rather than by a successful write.
+    """
+    DESCRIBE = ("Describe this picture for someone who cannot see it and has to "
+                "recreate or work with it: subject, composition, every distinct "
+                "shape and where it sits, colours, any text, anything notable. "
+                "Be concrete and brief.")
+    REVIEW = ("First say plainly what this frame shows. Then judge it against the "
+              "brief: name concrete visual defects and the corrections, and say if "
+              "the frame is not what was asked for at all - for instance the original "
+              "picture placed unchanged when a remake was wanted. Do not claim to "
+              "assess motion or audio from a still. Brief: ")
+    MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+            ".webp": "image/webp", ".bmp": "image/bmp"}
+
+    def __init__(self, base_url, model, timeout=300):
+        self.model = model
+        self.needs_load = False
+        self.llm = LLM(base_url, model, timeout=timeout)
+
+    def _ask(self, text, mime, data, max_tokens):
+        response = self.llm.chat([{"role": "user", "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (mime, data)}}]}],
+            max_tokens=max_tokens)
+        return (response["choices"][0]["message"].get("content") or "").strip()
+
+    @staticmethod
+    def _encode(raw, mime):
+        # Transparent PNGs go onto white first: the model sees alpha as black.
+        if mime == "image/png":
+            import studio_icons
+            raw = studio_icons.flatten_png(raw)
+        return base64.b64encode(raw).decode("ascii")
+
+    def describe(self, path):
+        """What one picture file shows, in a sentence or a few."""
+        mime = self.MIME.get(os.path.splitext(path)[1].lower(), "image/png")
+        with open(path, "rb") as f:
+            data = self._encode(f.read(), mime)
+        return self._ask(self.DESCRIBE, mime, data, 400) or "No description returned."
+
+    def describe_all(self, paths):
+        """The block `_turn` appends to a brief: one line per picture."""
+        out = ["%s: %s" % (os.path.basename(p), self.describe(p)) for p in paths]
+        return ("\n\nWhat the pictures show (described by the vision model %s):\n"
+                % self.model + "\n".join(out))
+
+    def review(self, item, brief):
+        """An MCP image content item, judged against the task record."""
+        mime = item.get("mimeType", "image/png")
+        data = item["data"]
+        if mime == "image/png":
+            try:
+                data = self._encode(base64.b64decode(data), mime)
+            except (ValueError, TypeError):
+                pass
+        return self._ask(self.REVIEW + json.dumps(brief), mime, data, 700) \
+            or "No assessment returned."
+
+
+def load_model(base_url, model, timeout=600):
+    """Ask LM Studio to load a model it has on disk. -> error text, or None.
+
+    The vision model is picked from everything the host has downloaded, so it
+    is usually not in VRAM when the window opens. LM Studio's REST API loads
+    on request; a host without that endpoint still loads just-in-time on the
+    first chat call, so a failure here is a note, never a stop.
+    """
+    req = urllib.request.Request(
+        api_root(base_url) + "/api/v1/models/load",
+        data=json.dumps({"model": model}).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            json.load(r)
+        return None
+    except urllib.error.HTTPError as e:
+        return "HTTP %s - %s" % (e.code, e.read()[:200].decode("utf-8", "replace"))
+    except Exception as e:
+        return str(e)
+
+
+def resolve_vision(base_url, executing, vision_ids, loaded=None):
+    """A `Vision` for this host, or None with the reason every tab should print.
+
+    Picks from everything the host has, loaded or not; `Vision.needs_load` says
+    whether the caller should `load_model` it before the first picture."""
+    want = os.environ.get("STUDIO_VISION_MODEL")
+    model = pick_vision_model(vision_ids, executing, want, loaded)
+    if model:
+        vision = Vision(base_url, model)
+        vision.needs_load = model not in (executing, loaded)
+        return vision, None
+    why = ("STUDIO_VISION_MODEL names %s, which the host does not have" % want
+           if want else "the host has no vision-capable model downloaded")
+    return None, ("%s, so the model cannot see: attached pictures reach it as paths "
+                  "and previews go unreviewed. Download a vision model in LM Studio "
+                  "(one of %s) and reopen." % (why, ", ".join(PREFERRED_VISION_MODELS[:3])))
 
 
 # --------------------------------------------------------------- the app registry
@@ -1010,6 +1166,20 @@ ask for in an app tab. This is a continuing conversation and the user may refer 
 to earlier messages in it. Say when you are unsure rather than inventing specifics -
 the reader is working to a deadline, and a confident wrong answer costs real time."""
 
+# The chat tab's counterpart to QUALITY_RULES: read-only tools owe no read-back
+# and record no edits, so the app rules about inspecting and verifying edits
+# would describe something absent. What is left is the task record, for the long
+# research jobs, and the rule about tools the model makes.
+CHAT_RULES = """
+
+WORKING NOTES
+- studio_task_update keeps a brief, a plan and findings across a long piece of
+  research. Record what you read (path or URL) as the evidence for a finding; never
+  invent evidence.
+- studio_tool_create names a run of this tab's own reads you keep repeating. It
+  creates a tool and reads nothing itself.
+- Answer questions directly without calling tools when no tool is needed."""
+
 
 class AppSpec:
     """
@@ -1208,7 +1378,7 @@ class ContainerSpec(AppSpec):
             raise RuntimeError("Docker Desktop is not installed, so %s has nowhere "
                                "isolated to run. %s" % (self.name, self.launch_note))
         host = host or env_default("STUDIO_HOST", "AE_AGENT_HOST", fallback=DEFAULT_HOST)
-        _, loaded, ids, _ = probe_models(host)
+        _, loaded, ids, _, _ = probe_models(host)
         shared = pick_model(loaded, ids, model or env_default("STUDIO_MODEL", "AE_AGENT_MODEL"))
         chosen, _ = self.model_for(ids, shared or model or DEFAULT_MODEL)
         self.write_config(host, chosen, ids)
@@ -1959,7 +2129,7 @@ def detect_apps():
 
 
 def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False,
-              schemas=None, library=None):
+              schemas=None, library=None, vision=None):
     """One task, start to finish. `system_prompt` is final - see AppSpec.cli_prompt."""
     from studio_tasks import Executor, TaskRecord
     messages = [{"role": "system", "content": system_prompt},
@@ -1969,8 +2139,9 @@ def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False,
     def emit(kind, payload):
         if kind in ("tool", "tool_result", "sys"):
             log("  " + str(payload), quiet)
-    return Executor(llm, mcp, tools, schemas=schemas, record=record,
-                    emit=emit, library=library).run(messages, max_steps, streaming=False)
+    return Executor(llm, mcp, tools, schemas=schemas, record=record, emit=emit,
+                    library=library, vision=vision.review if vision else None
+                    ).run(messages, max_steps, streaming=False)
 
 
 def converse(llm, mcp, tools, app, args, schemas=None):
@@ -1989,7 +2160,8 @@ def converse(llm, mcp, tools, app, args, schemas=None):
             log("  not offering a made tool - " + problem, args.quiet)
     if args.task:
         print(run_agent(llm, mcp, tools, " ".join(args.task), system_prompt,
-                        args.max_steps, args.quiet, schemas=schemas, library=library))
+                        args.max_steps, args.quiet, schemas=schemas, library=library,
+                        vision=getattr(args, "vision", None)))
         return 0
 
     print("studio_agent [%s] - interactive. Ctrl-C or 'exit' to quit.\n" % app.name)
@@ -2007,7 +2179,8 @@ def converse(llm, mcp, tools, app, args, schemas=None):
         try:
             print("\n" + run_agent(llm, mcp, tools, task, system_prompt,
                                    args.max_steps, args.quiet, schemas=schemas,
-                                   library=library) + "\n")
+                                   library=library, vision=getattr(args, "vision", None))
+                  + "\n")
         except Exception as e:
             print("error: %s\n" % e, file=sys.stderr)
 
@@ -2067,13 +2240,21 @@ def main():
         return 0
 
     app = get_app(a.app)
+    _, loaded, ids, vision_ids, _ = probe_models(a.host)
     if not a.model:
         # The GUI does the same: an app may prefer a small model the host serves.
-        _, _, ids, _ = probe_models(a.host)
-        a.model, note = app.model_for(ids, DEFAULT_MODEL) if app.drivable else (DEFAULT_MODEL, "")
+        a.model, note = app.model_for(ids, DEFAULT_MODEL)
         if note:
             log("  " + note, a.quiet)
-    if not app.drivable:
+    a.vision, note = resolve_vision(a.host, a.model, vision_ids, loaded)
+    log("  " + (note or "vision: " + a.vision.model), a.quiet)
+    if a.vision and a.vision.needs_load:
+        log(". loading %s on the host..." % a.vision.model, a.quiet)
+        err = load_model(a.host, a.vision.model)
+        if err:
+            log("  could not load it (%s); the host may still load it on first use" % err,
+                a.quiet)
+    if not app.bridged:
         # No bridge to start and no tools to expose: the model on its own.
         if a.groups or a.all_tools:
             p.error("%s has no bridge, so there are no tool groups to choose" % app.name)

@@ -218,15 +218,24 @@ attaches files to the next message, in every tab. The model is given each file's
 name, dimensions and path, so "place this in my comp" or "turn this sketch into a
 painted version" can hand the file to the app's own import tool; the picture is shown
 in the transcript under your message. What the picture *looks like* reaches the
-model only when `STUDIO_VISION_MODEL` is set (below) — it describes each picture and
-that description goes into the brief. OpenCode sees only its workspace, so pictures
-attached there are copied into `attachments/` inside it.
-For optional visual critique, set `STUDIO_VISION_MODEL` to the ID of a vision-capable
-model served by the **same remote inference host**, then restart Studio Assistant.
-Returned image frames and the task brief go to that model; critique comes back to
-the executing model for refinement. No model is loaded on the workstation. Without
-that setting, the user can review previews and the text model is told that it has
-not assessed their visual quality. Still frames cannot verify motion or audio.
+model through the **vision model**: it describes each picture and that description
+goes into the brief. OpenCode sees only its workspace, so pictures attached there
+are copied into `attachments/` inside it.
+
+The executing model reads text, and every app answers a screenshot with a picture,
+so a vision model is part of every tab, not an option. At start-up Studio Assistant
+picks one from what the **same remote inference host** serves: `STUDIO_VISION_MODEL`
+if you pin one and it is served, else the executing model itself when it can see,
+else one already in VRAM, else a known-good vision model (Qwen-VL, Gemma), else any
+the host has downloaded. It need not be loaded: Studio Assistant asks LM Studio to
+load it while the tabs start (the Inference row says `loading …`, then `sees: …`),
+and a host that cannot be asked loads it on first use. Returned frames and the task
+brief go to it; it says what the frame actually shows and how it falls short, and
+that comes back to the executing model for the next step. No model is loaded on the
+workstation. Only if the host has no vision model downloaded at all does the row
+turn amber; every tab says so once, and the model works blind: attached pictures are
+names and paths to it, and previews reach only you — download one in LM Studio and
+reopen the window. Still frames cannot verify motion or audio.
 
 ## Layout
 
