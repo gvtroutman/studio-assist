@@ -990,7 +990,8 @@ def _cli(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("check", "snapshot"):
         s = sub.add_parser(name)
-        s.add_argument("--app", help="registry id (after-effects, resolve, comfyui, opencode, photoshop, illustrator)")
+        s.add_argument("--app", help="registry id (after-effects, resolve, comfyui, opencode, photoshop, "
+                                     "illustrator, premiere, or chat for the Chat tab's bridge)")
         s.add_argument("--command", help="start this bridge instead of a registry entry")
         s.add_argument("--args", nargs=argparse.REMAINDER, default=[])
         if name == "check":
@@ -1008,9 +1009,9 @@ def _cli(argv=None):
     import studio_tasks
     app = None
     if a.app:
-        app = eng.APPS_BY_ID.get(a.app)
+        app = eng.TABS_BY_ID.get(a.app)
         if app is None:
-            p.error("no app %r; one of %s" % (a.app, ", ".join(eng.APPS_BY_ID)))
+            p.error("no app %r; one of %s" % (a.app, ", ".join(eng.TABS_BY_ID)))
     if a.cmd == "check" and a.snapshot:
         with open(a.snapshot, encoding="utf-8") as fh:
             snap = json.load(fh)

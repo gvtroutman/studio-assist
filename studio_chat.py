@@ -287,7 +287,7 @@ def attachment_note(paths, app):
         head = "Attached files and folders, copied into the workspace:"
     else:
         head = ("Attached files and folders - on this PC; tools that take a path "
-                "(import, place, upload, open) take these paths as written:")
+                "(import, place, upload, open, read_file) take these paths as written:")
         lines = ["- " + describe_attachment(p) for p in paths]
     return "\n\n" + head + "\n" + "\n".join(lines)
 
@@ -462,7 +462,7 @@ class Chat(tk.Tk):
         self.pinned = list(self.prefs.get("pinned"))
 
         apps = self._opening_tabs()
-        self.sessions = {a.id: Session(a) for a in apps}
+        self.sessions = {a.id: self._session(a) for a in apps}
         self.order = [a.id for a in apps]
         self.active = self.order[0] if self.order else None
 
@@ -475,6 +475,16 @@ class Chat(tk.Tk):
         self._spawn(None, self._boot_host)
         self._select(self.active)
         self.protocol("WM_DELETE_WINDOW", self._quit)
+
+    def _session(self, app):
+        """A tab's session - the one place one is made, at startup and from the
+        new-tab menu alike, so every tab with a bridge gets the library of tools
+        the model made for it, beside its settings and tasks. (Restored tabs
+        once missed it, and the tool maker worked only in tabs opened later.)"""
+        s = Session(app)
+        if app.bridged:
+            s.library = toolsmith.Library.for_app(app.id, self._data_dir())
+        return s
 
     def _opening_tabs(self):
         """
@@ -1061,11 +1071,7 @@ class Chat(tk.Tk):
         if app_id in self.sessions:
             self._select(app_id)
             return
-        s = Session(eng.TABS_BY_ID[app_id])
-        if s.app.drivable:
-            # Tools the model made for this app, beside its settings and tasks.
-            # A chat tab has no tools to make them from, so it gets no library.
-            s.library = toolsmith.Library.for_app(app_id, self._data_dir())
+        s = self._session(eng.TABS_BY_ID[app_id])
         self.sessions[app_id] = s
         self.order.append(app_id)
         self._build_transcript(s)
@@ -1394,15 +1400,15 @@ class Chat(tk.Tk):
         """One row for every bridge at once: how many are up, how many tools
         they are offering. Which bridges exist is in the menu behind it.
 
-        Only tabs that drive an app count here - a chat tab has no bridge to
-        report, and counting it would make one of two say it was missing."""
+        Every tab with a bridge counts, the chat tab's in-process one included:
+        it is connected or it is not, and its tools are tools."""
         lead, lbl = self.conn["bridges"]
-        bridged = [s for s in self.sessions.values() if s.app.drivable]
+        bridged = [s for s in self.sessions.values() if s.app.bridged]
         live = [s for s in bridged if s.ready]
         tools = sum(len(s.tools) for s in live)
         roles = [s.bridge[0] for s in bridged]
         if not bridged:
-            role, detail = "faint", "no app tab open\n%d available" % len(eng.APPS)
+            role, detail = "faint", "no tab open\n%d available" % len(eng.TABS)
         elif live:
             role = "ok" if len(live) == len(bridged) else "warn"
             detail = "%d of %d connected\n%d tools" % (len(live), len(bridged),
@@ -1417,7 +1423,9 @@ class Chat(tk.Tk):
     def _menu_bridges(self):
         """What bridges exist, and what each one can currently do."""
         m = self._menu()
-        for app in eng.APPS:
+        for app in eng.TABS:
+            if not app.bridged:
+                continue
             s = self.sessions.get(app.id)
             if s is None:
                 note = "no tab open"
@@ -1724,8 +1732,9 @@ class Chat(tk.Tk):
     def _welcome(self, s):
         if not s.app.drivable:
             # Say the one thing this tab is not, before the model has to.
-            self._write(s, "Chat with the model alone - no app attached, so "
-                           "nothing here can open or change a project. Try:\n", "sys")
+            self._write(s, "Chat with the model - no app attached, so nothing here can "
+                           "open or change a project. It can read files and folders on "
+                           "this PC and look things up on the web. Try:\n", "sys")
         else:
             self._write(s, "%s. Try:\n" % s.app.name, "sys")
         for e in s.app.examples:
@@ -2155,8 +2164,13 @@ class Chat(tk.Tk):
         elif kind == "trace":
             self._log(payload)
         elif kind == "ready":
-            self._write(s, "Bridge connected; ready for a task.\n"
-                        if s.app.drivable else "Ready.\n", "sys")
+            if s.app.drivable:
+                note = "Bridge connected; ready for a task.\n"
+            elif s.app.bridged:           # chat: tools, but no app behind them
+                note = "Ready; files on this PC and the web are within reach.\n"
+            else:
+                note = "Ready.\n"
+            self._write(s, note, "sys")
             self._sync_bridges()
         elif kind == "idle":
             s.busy = False
@@ -2231,7 +2245,7 @@ class Chat(tk.Tk):
                 return
             s.llm = self._llm_for(s)
 
-            if s.app.drivable:
+            if s.app.bridged:
                 self._boot_bridge(s)
                 if s.mcp is None:         # it reported its own failure
                     return
@@ -2252,7 +2266,7 @@ class Chat(tk.Tk):
             except Exception as e:
                 self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
             s.ready = True
-            if s.app.drivable:
+            if s.app.bridged:
                 self._refresh_bridge(s)
             else:
                 self.q.put(("status", sid, ("ready", "ok", False)))
@@ -2272,7 +2286,7 @@ class Chat(tk.Tk):
                                     "muted", False)))
         mcp = None
         try:
-            mcp = eng.MCPClient(s.app.command, s.app.args, quiet=True)
+            mcp = s.app.connect()
             mcp.initialize(timeout=75)
             allt = mcp.list_tools(timeout=45)
         except Exception as e:
@@ -2353,10 +2367,10 @@ class Chat(tk.Tk):
                 % (app.name, app.command, err))
 
     def _refresh_bridge(self, s):
-        if not s.app.drivable:
+        if not s.app.bridged:
             return
         n = len(s.tools)
-        if s.app.running():
+        if s.app.running():           # always, for a tab with no app to run
             self.q.put(("status", s.event_id, ("connected", "ok", False)))
             self.q.put(("bridge", s.event_id, ("ok", "%s\n%d tools" % (s.app.bridge_label, n))))
         elif s.app.remote:
