@@ -451,6 +451,8 @@ class Chat(tk.Tk):
         self.q = queue.Queue()
         self.llm = None
         self.model_ids = []               # what the host serves, for per-app picks
+        self.vision = None                # eng.Vision, or None when nothing served can see
+        self.vision_note = None           # why, said once per tab
         self.host = eng.env_default("STUDIO_HOST", "AE_AGENT_HOST",
                                     fallback=eng.DEFAULT_HOST)
         self.want_model = eng.env_default("STUDIO_MODEL", "AE_AGENT_MODEL")
@@ -1709,26 +1711,6 @@ class Chat(tk.Tk):
                 pass
         self._write(s, "[%s]\n" % os.path.basename(path), "hint")
 
-    def _describe_pictures(self, paths):
-        """What is in the pictures, from the vision model, for the text model
-        that cannot see them. Runs on the worker; one failure is one line."""
-        model = os.environ["STUDIO_VISION_MODEL"]
-        reviewer = eng.LLM(self.host, model)
-        out = []
-        for p in paths:
-            mime = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
-                    ".webp": "image/webp", ".bmp": "image/bmp"}.get(
-                        os.path.splitext(p)[1].lower(), "image/png")
-            with open(p, "rb") as f:
-                data = base64.b64encode(f.read()).decode("ascii")
-            response = reviewer.chat([{"role": "user", "content": [
-                {"type": "text", "text": "Describe this picture for someone who cannot see it and has to work with it: subject, composition, colours, text, anything notable. Be concrete and brief."},
-                {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" % (mime, data)}}]}],
-                max_tokens=400)
-            text = response["choices"][0]["message"].get("content") or "No description returned."
-            out.append("%s: %s" % (os.path.basename(p), text.strip()))
-        return "\n\nWhat the pictures show (described by the vision model):\n" + "\n".join(out)
-
     def _welcome(self, s):
         if not s.app.drivable:
             # Say the one thing this tab is not, before the model has to.
@@ -2185,7 +2167,7 @@ class Chat(tk.Tk):
     def _boot_host(self):
         """Shared across every tab: one inference host, one model."""
         self.q.put(("status", None, ("checking the inference host", "muted", False)))
-        ok, loaded, ids, err = eng.probe_models(self.host)
+        ok, loaded, ids, vision_ids, err = eng.probe_models(self.host)
         if not ok:
             self.q.put(("host", None, ("err", "%s\nunreachable" % pretty_host(self.host))))
             self.q.put(("error", None,
@@ -2204,9 +2186,32 @@ class Chat(tk.Tk):
             return
         self.llm = eng.LLM(self.host, model)
         self.model_ids = ids
-        self.q.put(("host", None, ("ok", "%s\n%d models\n%s"
-                                   % (pretty_host(self.host), len(ids), clip(model, 24)))))
+        # Every bridge answers a screenshot with a picture and every tab takes
+        # attachments; the executing model reads text. One vision model on the
+        # same host serves every tab, and its absence is a status, not a silence.
+        self.vision, self.vision_note = eng.resolve_vision(self.host, model, vision_ids, loaded)
+        def host_row(role, last):
+            self.q.put(("host", None, (role, "%s\n%d models\n%s\n%s"
+                                       % (pretty_host(self.host), len(ids), clip(model, 24), last))))
+        if not self.vision:
+            host_row("warn", "no vision model")
+            self.host_ready.set()
+            return
+        seeing = "sees: " + clip(self.vision.model, 18)
+        if not self.vision.needs_load:
+            host_row("ok", seeing)
+            self.host_ready.set()
+            return
+        # The tabs can boot meanwhile: a picture before the load finishes is
+        # loaded just-in-time by the host, only slower.
+        host_row("muted", "loading " + clip(self.vision.model, 16))
         self.host_ready.set()
+        err = eng.load_model(self.host, self.vision.model)
+        if err:
+            self.q.put(("sys", None, "Could not load the vision model %s on the host (%s); "
+                                     "it will be loaded on first use instead."
+                                     % (self.vision.model, err)))
+        host_row("ok", seeing)
 
     def _llm_for(self, s):
         """The shared model, unless this app prefers one the host serves.
@@ -2244,6 +2249,8 @@ class Chat(tk.Tk):
                 self.q.put(("bridge", sid, ("err", "%s\nno model" % s.app.bridge_label)))
                 return
             s.llm = self._llm_for(s)
+            if self.vision_note:
+                self.q.put(("sys", sid, self.vision_note))
 
             if s.app.bridged:
                 self._boot_bridge(s)
@@ -2576,16 +2583,6 @@ class Chat(tk.Tk):
                 raise
             self._write(s, "Preview could not be displayed: %s\n" % e, "sys")
 
-    def _vision_review(self, item, brief):
-        # Explicit configuration: never load a resident model on this workstation.
-        model = os.environ["STUDIO_VISION_MODEL"]
-        reviewer = eng.LLM(self.host, model)
-        response = reviewer.chat([{"role": "user", "content": [
-            {"type": "text", "text": "Review this frame against the brief. Identify concrete visual defects and corrections. Do not claim to assess motion or audio from a still. Brief: " + json.dumps(brief)},
-            {"type": "image_url", "image_url": {"url": "data:%s;base64,%s" %
-                (item.get("mimeType", "image/png"), item["data"])}}]}], max_tokens=700)
-        return response["choices"][0]["message"].get("content") or "No assessment returned."
-
     def _on_return(self, ev):
         if ev.state & 0x0001:  # Shift+Enter = newline
             return None
@@ -2656,19 +2653,22 @@ class Chat(tk.Tk):
         def checkpoint():
             s.record.save(self._task_path(s), s.messages)
         try:
-            if pictures and os.environ.get("STUDIO_VISION_MODEL"):
+            if pictures and self.vision:
                 # The executing model reads text. Put what the pictures show
                 # into the brief itself, so it survives checkpoints and resume.
+                emit("status", ("looking at the pictures", "muted", True))
                 try:
-                    s.messages[-1]["content"] += self._describe_pictures(pictures)
+                    s.messages[-1]["content"] += self.vision.describe_all(pictures)
                     s.record.briefs[-1] = s.messages[-1]["content"]
                 except Exception as e:
                     emit("sys", "The vision model could not describe the pictures (%s); "
                                 "the model has their paths only." % e)
+            elif pictures:
+                emit("sys", "No vision model is served, so the model has only the names "
+                            "and paths of the pictures - it cannot see what is in them.")
             executor = tasks.Executor(s.llm or self.llm, s.mcp, s.tools, schemas=s.schemas,
                 record=s.record, cancel=s.cancel, emit=emit, checkpoint=checkpoint,
-                vision=self._vision_review if os.environ.get("STUDIO_VISION_MODEL") else None,
-                library=s.library)
+                vision=self.vision.review if self.vision else None, library=s.library)
             executor.run(s.messages, MAX_STEPS)
         except Exception:
             s.record.status = "interrupted; inspect project state before continuing"

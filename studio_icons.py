@@ -282,6 +282,48 @@ def png_to_rgba(data):
     return bytes(out), width, height
 
 
+FLATTEN_LIMIT = 4_000_000   # pixels; the loop below is pure Python
+
+
+def flatten_png(data, background=(255, 255, 255)):
+    """A PNG with transparency, composited onto a colour; any other PNG as is.
+
+    A vision model flattens alpha onto black, so a black-on-transparent icon -
+    most logos, glyphs and Illustrator artboards exported without a background -
+    reaches it as a black square and comes back described as one. Anything
+    this cannot decode (16-bit, interlaced, huge) goes through unchanged: a
+    wrong guess about the picture beats no picture.
+    """
+    if data[:8] != PNG_MAGIC or len(data) < 33:
+        return data
+    width, height, depth, color = struct.unpack_from(">IIBB", data, 16)
+    if color in (0, 2) and b"tRNS" not in data:
+        return data                                   # nothing to see through
+    if width * height > FLATTEN_LIMIT:
+        return data
+    try:
+        rgba, width, height = png_to_rgba(data)
+    except (ValueError, KeyError, zlib.error, struct.error, IndexError):
+        return data
+    if min(rgba[3::4]) == 255:
+        return data                                   # alpha channel, all opaque
+    br, bg, bb = background
+    out = bytearray(len(rgba))
+    for i in range(0, len(rgba), 4):
+        a = rgba[i + 3]
+        if a == 255:
+            out[i:i + 3] = rgba[i:i + 3]
+        elif a == 0:
+            out[i], out[i + 1], out[i + 2] = br, bg, bb
+        else:
+            inv = 255 - a
+            out[i] = (rgba[i] * a + br * inv) // 255
+            out[i + 1] = (rgba[i + 1] * a + bg * inv) // 255
+            out[i + 2] = (rgba[i + 2] * a + bb * inv) // 255
+        out[i + 3] = 255
+    return png(bytes(out), width, height)
+
+
 def resample(pixels, width, height, size):
     """
     Area-average down to size x size. Colours are weighted by alpha, so a

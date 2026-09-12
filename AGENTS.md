@@ -583,9 +583,31 @@ composer.
   keeps one `Session.llm` per tab, fixed at boot: the executor, both warm-ups and the
   host's cached prefix must agree, and tabs with no preference share the window's
   handle (`Chat._llm_for`). The CLI resolves the same way unless `--model` is given.
-- Optional `STUDIO_VISION_MODEL` uses the same remote host as the executing model.
-  Never move inference to the workstation. Session-owned preview images keep Tk
-  references alive; stale-generation preview events must be dropped.
+- **The executing model reads text; `eng.Vision` is its eyes, and every tab has
+  one or is told it does not.** Every bridge answers a screenshot with an image
+  content item and every tab takes picture attachments, so `_boot_host` resolves
+  a vision model beside the executing one — `probe_models` now also returns the
+  served ids that can take a picture (LM Studio types them `vlm`; a plainer host
+  is judged by `looks_vision()` name hints), and `pick_vision_model` prefers
+  `STUDIO_VISION_MODEL` when served, then the executing model itself if it can see
+  (no second model in VRAM), then one already loaded (no load), then
+  `PREFERRED_VISION_MODELS`, then anything the host has downloaded. Not-loaded is
+  fine: `Vision.needs_load` says so and `load_model` posts to LM Studio's
+  `/api/v1/models/load` — the GUI does it on the worker after `host_ready` so the
+  tabs boot meanwhile, the CLI before the task; a host without that endpoint
+  loads just-in-time on the first chat call, so a load failure is a line in the
+  tab, never a stop. Pictures go through `studio_icons.flatten_png` first: a vision
+  model sees alpha as black, so a black glyph on a transparent PNG - most logos,
+  and an Illustrator artboard exported without a background - was being described
+  as "entirely black"; it is composited onto white, opaque PNGs pass through
+  untouched, and anything the decoder cannot read goes as is. The CLI resolves
+  the same way. One `Vision` on the same remote host serves every tab
+  — never move inference to the workstation — and `Executor(vision=Vision.review)`
+  gets a review of every returned frame; `Vision.describe_all` is what `_turn`
+  appends to a brief. When nothing served can see, `resolve_vision` returns the
+  reason: the Inference row goes amber, `_boot_session` prints it once per tab,
+  and `_turn` says it again whenever pictures are attached. Session-owned preview
+  images keep Tk references alive; stale-generation preview events must be dropped.
 - **What the user attaches never enters the messages as bytes.** The file and
   folder glyphs, Ctrl+O and Ctrl+Shift+O on the shared composer queue paths
   (`Chat.attachments`, one chip each — any file, any size, or a folder); `_on_send`
@@ -595,10 +617,10 @@ composer.
   model can name a file in it without a tool call — and shows a picture in the
   transcript where Tk can decode it. Base64 in a message would blow
   `context_messages`' character budget and land in every checkpoint, so what a
-  picture *shows* comes from `STUDIO_VISION_MODEL` when it is set: `_turn` asks it
-  for a description on the worker — pictures only, `is_picture()` decides — and
-  appends that to the same brief before the executor starts, so it survives resume.
-  Without it the model has the path only, and is told so. `ATTACH_LIMIT` applies to
+  picture *shows* comes from `Chat.vision`: `_turn` asks it for a description on
+  the worker — pictures only, `is_picture()` decides — and appends that to the same
+  brief before the executor starts, so it survives resume. With no vision model
+  the model has the path only, and both it and the user are told so. `ATTACH_LIMIT` applies to
   pictures alone, because theirs are the only bytes anything reads. A
   `ContainerSpec` tab sees one folder: `attachment_note` copies the file (or the
   folder, whole) into `<workspace>/attachments/` and names the `/workspace/...` path
