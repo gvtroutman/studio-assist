@@ -87,7 +87,7 @@ class TestExecutor(unittest.TestCase):
                             specs=[spec("set_transform", schema)])
         ex.run(self.messages)
         self.bridge.call_tool.assert_not_called()
-        self.assertIn("minimum", self.messages[3]["content"])
+        self.assertIn("p[1] must be >= 10, not 2", self.messages[3]["content"])
 
     def test_resolve_quit_blocked_even_if_exposed(self):
         ex = self.setup_run([answer(call("resolve_control", {"action": "quit"})), answer(text="Cannot quit")],
@@ -200,6 +200,101 @@ class TestExecutor(unittest.TestCase):
         ex = self.setup_run([answer(call("create_comp"))] + [answer(text="Done") for _ in range(3)])
         self.assertIn("remain unverified", ex.run(self.messages))
 
+
+class TestVerifyingTheWrite(unittest.TestCase):
+    """The read-back reminder names the exact call; with a vision model the
+    executor looks at the work itself before accepting "done"."""
+
+    ANY = {"type": "object", "additionalProperties": True}
+    AE = [("get_layer_full", ["compId", "layerId"]), ("get_comp", ["compId"])]
+    SPECS = [spec("set_transform", ANY), spec("get_layer_full", ANY), spec("get_comp", ANY),
+             spec("screenshot_frame", ANY), spec("create_comp", ANY)]
+    setup_run = TestExecutor.setup_run
+    # messages: system, brief, the write, its result, "Done", then what the
+    # executor put back - index 5.
+
+    def test_the_reminder_names_the_read_and_the_ids_from_the_write(self):
+        ex = self.setup_run([answer(call("set_transform", {"compId": 12, "layerId": 40, "opacity": 50})),
+                             answer(text="Done"), answer(call("get_layer_full", ident="c2")),
+                             answer(text="Verified")],
+                            specs=self.SPECS, readback=self.AE)
+        self.assertEqual(ex.run(self.messages), "Verified")
+        hint = self.messages[5]["content"]
+        self.assertIn("verify the edit you made with set_transform", hint)
+        self.assertIn('call get_layer_full with {"compId": 12, "layerId": 40}', hint)
+
+    def test_a_write_without_the_ids_gets_the_less_specific_read(self):
+        # create_comp carries no compId; get_comp needs one; nothing in the
+        # journal has one yet - so the reminder is the generic sentence.
+        ex = self.setup_run([answer(call("create_comp", {"name": "Title"}))] +
+                            [answer(text="Done") for _ in range(3)],
+                            specs=self.SPECS, readback=self.AE)
+        ex.run(self.messages)
+        hint = self.messages[5]["content"]
+        self.assertIn("inspect the target changed by create_comp", hint)
+        self.assertNotIn("get_comp", hint)
+
+    def test_a_read_that_needs_no_ids_fits_any_write(self):
+        ex = self.setup_run([answer(call("ps_set_layer", {"layer_id": 7, "opacity": 40})),
+                             answer(text="Done"), answer(text="Done"), answer(text="Done")],
+                            specs=[spec("ps_set_layer", self.ANY), spec("ps_get_document", self.ANY)],
+                            readback=[("ps_get_layer", ["layer_id"]), ("ps_get_document", [])])
+        ex.run(self.messages)
+        # ps_get_layer is not in this tab's tools, so the document read is named.
+        self.assertIn("call ps_get_document with {}", self.messages[5]["content"])
+
+    def test_with_a_vision_model_the_executor_looks_before_accepting_done(self):
+        bridge = Mock()
+        image = {"type": "image", "mimeType": "image/png", "data": "fake"}
+        bridge.call_tool.side_effect = [{"content": [{"type": "text", "text": "ok"}]},
+                                        {"content": [image]}]
+        ex = self.setup_run([answer(call("set_transform", {"compId": 12, "layerId": 40})),
+                             answer(text="Done"), answer(text="Done, and the review agrees")],
+                            specs=self.SPECS, bridge=bridge, readback=self.AE,
+                            review=("screenshot_frame", ["compId"]),
+                            vision=lambda image, brief: "A red circle, centred, as asked")
+        self.assertEqual(ex.run(self.messages), "Done, and the review agrees")
+        self.assertEqual(bridge.call_tool.call_args_list[1].args, ("screenshot_frame", {"compId": 12}))
+        shown = self.messages[5]["content"]
+        self.assertIn("Automatic review of the work after set_transform", shown)
+        self.assertIn("A red circle, centred", shown)
+        self.assertIn(("preview", image), self.events)
+        self.assertTrue(ex.record.journal[1]["auto"])
+        self.assertNotIn("auto", ex.record.journal[0])
+
+    def test_without_a_vision_model_nobody_looks_so_the_read_is_asked_for(self):
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": "ok"}]}
+        ex = self.setup_run([answer(call("set_transform", {"compId": 12, "layerId": 40}))] +
+                            [answer(text="Done") for _ in range(3)],
+                            specs=self.SPECS, bridge=bridge, readback=self.AE,
+                            review=("screenshot_frame", ["compId"]))
+        self.assertIn("remain unverified", ex.run(self.messages))
+        self.assertEqual(bridge.call_tool.call_count, 1)
+        self.assertIn("call get_layer_full", self.messages[5]["content"])
+
+    def test_a_screenshot_that_fails_falls_back_to_the_reminder(self):
+        bridge = Mock()
+        bridge.call_tool.side_effect = [{"content": [{"type": "text", "text": "ok"}]},
+                                        {"isError": True, "content": [{"type": "text", "text": "no comp"}]}]
+        ex = self.setup_run([answer(call("set_transform", {"compId": 12, "layerId": 40}))] +
+                            [answer(text="Done") for _ in range(3)],
+                            specs=self.SPECS, bridge=bridge, readback=self.AE,
+                            review=("screenshot_frame", ["compId"]), vision=lambda i, b: "x")
+        self.assertIn("remain unverified", ex.run(self.messages))
+        self.assertIn("call get_layer_full", self.messages[5]["content"])
+
+    def test_a_review_tool_the_tab_does_not_offer_is_never_called(self):
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": "ok"}]}
+        ex = self.setup_run([answer(call("set_transform", {"compId": 12}))] +
+                            [answer(text="Done") for _ in range(3)],
+                            specs=[spec("set_transform", self.ANY)], bridge=bridge,
+                            review=("screenshot_frame", ["compId"]), vision=lambda i, b: "x")
+        ex.run(self.messages)
+        self.assertEqual(bridge.call_tool.call_count, 1)
+        self.assertIsNone(ex.review)
+
     def test_cli_uses_same_executor(self):
         llm = FakeLLM([answer(call("unknown")), answer(text="Not available")])
         bridge = Mock()
@@ -211,8 +306,8 @@ class TestPlainChat(unittest.TestCase):
     """A tab with no bridge runs through the same executor, with nothing in it."""
 
     def test_a_tab_with_no_tools_is_offered_none_at_all(self):
-        """Not even the internal ones: there is nothing to journal and no
-        workflow to report when nothing can be called."""
+        """Not even the internal ones: there is nothing to journal when
+        nothing can be called."""
         self.assertEqual(tasks.inference_tools([]), [])
         names = [t["function"]["name"]
                  for t in tasks.inference_tools(eng.to_openai_tools([spec("get_comp")]))]
@@ -270,11 +365,32 @@ class TestMemory(unittest.TestCase):
             messages.extend([answer(call("get_comp", ident=str(i))),
                              {"role": "tool", "tool_call_id": str(i), "content": "x" * 100}])
         result = tasks.context_messages(messages, record, [], 1300)
-        self.assertIn("Exact wording", result[1]["content"])
+        self.assertIn("Exact wording", result[-1]["content"])
         self.assertLess(len(result), len(messages))
-        self.assertEqual(result[2]["role"], "assistant")
-        self.assertEqual(result[-1]["tool_call_id"], "19")
+        self.assertEqual(result[1]["role"], "assistant")
+        self.assertEqual(result[-2]["tool_call_id"], "19")
         self.assertEqual(len(messages), 41)
+
+    def test_the_task_record_is_the_last_message_so_the_history_stays_cached(self):
+        """The record changes every turn; the host caches by prefix. Everything
+        before the record in turn N must be, message for message, a prefix of
+        turn N+1 - which it cannot be with the record at position 1."""
+        record = tasks.TaskRecord()
+        record.briefs = ["Make a title"]
+        messages = [{"role": "system", "content": "rules"},
+                    {"role": "user", "content": "Make a title"}]
+        first = tasks.context_messages(messages, record, [])
+        self.assertEqual(first[-1]["role"], "user")
+        self.assertIn("Saved task context", first[-1]["content"])
+        # A turn happens: the record changes and the history grows.
+        record.status = "working"
+        record.objects["title"] = "12"
+        messages.extend([answer(call("get_comp", ident="1")),
+                         {"role": "tool", "tool_call_id": "1", "content": "ok"}])
+        second = tasks.context_messages(messages, record, [])
+        self.assertEqual(second[:len(first) - 1], first[:-1])
+        self.assertIn('"title": "12"', second[-1]["content"])
+        self.assertNotIn("Saved task context", json.dumps(second[:-1]))
 
     def test_fixed_context_is_never_silently_clipped(self):
         record = tasks.TaskRecord()

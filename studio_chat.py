@@ -39,6 +39,7 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import studio_agent as eng
+import studio_lessons as lessons
 import studio_icons as icons
 import studio_tasks as tasks
 import studio_toolsmith as toolsmith
@@ -382,6 +383,11 @@ class Session:
         self.schemas = []
         self.llm = None                   # this tab's model; set by Chat at boot
         self.library = None               # tools the model made, set by Chat
+        self.notebook = None              # lessons kept for this app, set by Chat
+        self.studio = ""                  # the studio brief's text, set by Chat
+        self.sidecar = None               # the research bridge, in process
+        self.sidecar_names = frozenset()  # its tools, riding beside the bridge's
+        self.ask_buttons = []             # the question form waiting for a click
         self.groups = list(app.default_groups)
         self.preview_images = []
         self.status = ("not started", "muted", False)
@@ -400,8 +406,22 @@ class Session:
     def event_id(self):
         return (self.app.id, self.generation)
 
+    def prompt(self):
+        """This tab's system prompt: the app's, with the studio brief and every
+        lesson kept for the app. Built at boot and on New chat, never mid-way -
+        it is the head of the host's cached prefix."""
+        kept = self.notebook.brief() if self.notebook is not None else ""
+        return self.app.chat_prompt(self.studio, kept)
+
+    def offered(self, wanted):
+        """The tools this tab offers the model: the bridge's in `wanted`, then
+        the research sidecar's, in schema order."""
+        return eng.to_openai_tools([t for t in self.schemas
+                                    if t["name"] in wanted or t["name"] in self.sidecar_names])
+
     def reset(self):
-        self.messages = [{"role": "system", "content": self.app.chat_prompt()}]
+        self.messages = [{"role": "system", "content": self.prompt()}]
+        self.ask_buttons = []
         self.record = tasks.TaskRecord()
         self.record.app_id = self.app.id
         self.cancel.clear()
@@ -458,6 +478,9 @@ class Chat(tk.Tk):
         self.want_model = eng.env_default("STUDIO_MODEL", "AE_AGENT_MODEL")
         self.host_ready = threading.Event()
 
+        # What the user wrote about the studio: File > About this studio...
+        self.studio = eng.read_studio_brief(self._studio_path())
+
         eng.load_bridges(self.prefs.get("bridges"))
         self.detected = eng.detect_apps()
         self.hidden = list(self.prefs.get("hidden"))
@@ -484,8 +507,12 @@ class Chat(tk.Tk):
         the model made for it, beside its settings and tasks. (Restored tabs
         once missed it, and the tool maker worked only in tabs opened later.)"""
         s = Session(app)
+        s.studio = self.studio
         if app.bridged:
             s.library = toolsmith.Library.for_app(app.id, self._data_dir())
+            s.notebook = lessons.Notebook.for_app(app.id, self._data_dir())
+            s.notebook.load()             # a problem is said at boot, in the tab
+        s.messages[0] = {"role": "system", "content": s.prompt()}
         return s
 
     def _opening_tabs(self):
@@ -619,6 +646,8 @@ class Chat(tk.Tk):
                            command=self._on_new)
         m_file.add_command(label="Resume saved task...", command=self._resume_task)
         m_file.add_command(label="Task progress...", command=self._task_progress)
+        m_file.add_command(label="Lessons for this tab...", command=self._lessons_window)
+        m_file.add_command(label="About this studio...", command=self._studio_window)
         m_file.add_command(label="New tab...", accelerator="Ctrl+T",
                            command=lambda: self._tab_menu(self.btn_add))
         m_file.add_command(label="Close tab", accelerator="Ctrl+W",
@@ -2123,6 +2152,8 @@ class Chat(tk.Tk):
             self._write(s, "     " + payload + "\n", "tool")
         elif kind == "preview":
             self._show_preview(s, payload)
+        elif kind == "ask":
+            self._show_ask(s, payload)
         elif kind == "stream_start":
             self._role(s, s.app.tab.upper(), "role_asst")
             s._asst_start = s.view.index("end-1c")
@@ -2251,6 +2282,13 @@ class Chat(tk.Tk):
             s.llm = self._llm_for(s)
             if self.vision_note:
                 self.q.put(("sys", sid, self.vision_note))
+            if s.notebook is not None and s.notebook.problem:
+                self.q.put(("sys", sid, "Could not read this app's lessons: " + s.notebook.problem))
+            elif s.notebook is not None and s.notebook.lessons:
+                self.q.put(("sys", sid, "%d lesson%s from earlier work in %s are in the briefing "
+                                        "(File > Lessons for this tab)."
+                            % (len(s.notebook.lessons), "" if len(s.notebook.lessons) == 1 else "s",
+                               s.app.name)))
 
             if s.app.bridged:
                 self._boot_bridge(s)
@@ -2267,8 +2305,7 @@ class Chat(tk.Tk):
                                         % (", about a minute" if s.tools else ""),
                                         "warn", False)))
             try:
-                s.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
-                            {"role": "user", "content": "Say ready."}],
+                s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
                            tasks.inference_tools(s.tools, s.library), max_tokens=1)
             except Exception as e:
                 self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
@@ -2317,6 +2354,21 @@ class Chat(tk.Tk):
                      for t in allt]
 
         s.schemas = allt
+        if s.app.research:
+            # The research sidecar - this PC's files and the web, read-only, in
+            # process - rides beside the bridge: its tools after the bridge's,
+            # its schemas with them, and one Router in front of both so the
+            # executor sees one client.
+            try:
+                s.sidecar = eng.research_client()
+                extra = s.sidecar.list_tools()
+            except Exception as e:
+                extra = []
+                self.q.put(("sys", sid, "The files-and-web tools are not available in this tab: %s" % e))
+            s.schemas = allt + extra
+            s.sidecar_names = frozenset(t["name"] for t in extra)
+            if extra:
+                s.mcp = eng.Router(mcp, s.sidecar)
         if s.app.custom:
             # Nothing was known about this bridge until it answered: its groups
             # come from its tool names and its briefing from `instructions`, so
@@ -2324,9 +2376,9 @@ class Chat(tk.Tk):
             # the warm-up pays for the prefix a real message will use.
             s.app.learn(allt, mcp.instructions)
             s.groups = list(s.app.default_groups)
-            s.messages[0] = {"role": "system", "content": s.app.chat_prompt()}
+            s.messages[0] = {"role": "system", "content": s.prompt()}
         wanted = s.app.tool_names(s.groups)
-        s.tools = eng.to_openai_tools([t for t in allt if t["name"] in wanted])
+        s.tools = s.offered(wanted)
         self._load_library(s)
         missing = wanted - {t["name"] for t in allt}
         if missing:
@@ -2455,7 +2507,7 @@ class Chat(tk.Tk):
         if not path:
             return
         try:
-            record, messages = tasks.TaskRecord.restore(path, s.app.chat_prompt())
+            record, messages = tasks.TaskRecord.restore(path, s.prompt())
             if record.app_id != s.id:
                 raise ValueError("This task belongs to a different app. Open its tab to resume it.")
             # Keep the current conversation recoverable when replacing it.
@@ -2535,7 +2587,7 @@ class Chat(tk.Tk):
                 return
             s.groups = [g for g, var in variables.items() if var.get()]
             wanted = s.app.tool_names(s.groups)
-            s.tools = eng.to_openai_tools([t for t in s.schemas if t["name"] in wanted])
+            s.tools = s.offered(wanted)
             # A made tool built on a tool this tab no longer offers is dropped
             # from the model's list rather than failing when it is called.
             self._load_library(s)
@@ -2551,8 +2603,7 @@ class Chat(tk.Tk):
 
     def _warm_capabilities(self, s):
         try:
-            s.llm.chat([{"role": "system", "content": s.app.chat_prompt()},
-                        {"role": "user", "content": "Say ready."}],
+            s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
                        tasks.inference_tools(s.tools, s.library), max_tokens=1)
             self.q.put(("sys", s.event_id, "Selected capabilities are ready."))
         finally:
@@ -2626,6 +2677,13 @@ class Chat(tk.Tk):
         self.input.delete("1.0", "end")
         self.attachments = []
         self._paint_chips()
+        self._send(s, task, attached, note)
+
+    def _send(self, s, task, attached=(), note=""):
+        """One message into a tab's conversation - typed, or a click on the
+        model's question - and the turn that answers it. An open question form
+        is closed either way: a typed reply is an answer too."""
+        self._settle_ask(s)
         self._role(s, "YOU", "role_user")
         self._write(s, task + "\n", "user")
         for p in attached:
@@ -2638,6 +2696,95 @@ class Chat(tk.Tk):
         self._apply_status()
         # The vision model is asked about pictures only; the rest are paths.
         self._spawn(s.event_id, self._turn, s, [p for p in attached if is_picture(p)])
+
+    # ------------------------------------------------------ the model's question
+    def _show_ask(self, s, asked):
+        """studio_ask, as a form in the transcript: a button per option - boxes
+        to tick when several may apply - and one for an answer of the user's
+        own. A click is the user's next message; the form then stays, greyed,
+        so the transcript still shows what was asked and chosen."""
+        self._settle_ask(s)
+        view = s.view
+        frame = self._skin(tk.Frame(view, padx=self._px(12), pady=self._px(10)), bg="card")
+        wrap = self._px(520)
+        self._skin(tk.Label(frame, text=asked["question"], font=self.f_body,
+                            wraplength=wrap, justify="left", anchor="w"),
+                   bg="card", fg="text").pack(fill="x", pady=(0, self._px(6)))
+        buttons = []
+
+        def answer(text):
+            if self.sessions.get(s.id) is not s or s.busy:
+                return
+            self._send(s, text)
+
+        if asked.get("multiple"):
+            picks = []
+            for option in asked["options"]:
+                var = tk.BooleanVar(master=self, value=False)
+                text = option["label"]
+                if option.get("description"):
+                    text += "  -  " + option["description"]
+                box = tk.Checkbutton(frame, text=text, variable=var, font=self.f_body,
+                                     anchor="w", justify="left", wraplength=wrap,
+                                     cursor="hand2", bd=0, highlightthickness=0)
+                self._skin(box, bg="card", fg="text", selectcolor="bg",
+                           activebackground="card", activeforeground="text")
+                box.pack(fill="x")
+                picks.append((option["label"], var))
+                buttons.append(box)
+
+            def send_picks():
+                chosen = [label for label, var in picks if var.get()]
+                if chosen:
+                    answer("; ".join(chosen))
+            go = tk.Button(frame, text="Send these", command=send_picks, bd=0,
+                           relief="flat", font=self.f_body, padx=10, pady=3, cursor="hand2")
+            self._skin(go, bg="accent", fg="accent_fg", activebackground="accent_dk",
+                       activeforeground="accent_fg")
+            go.pack(anchor="w", pady=(self._px(6), 0))
+            buttons.append(go)
+        else:
+            for option in asked["options"]:
+                button = tk.Button(frame, text=option["label"], anchor="w",
+                                   command=lambda t=option["label"]: answer(t), bd=0,
+                                   relief="flat", font=self.f_body, padx=10, pady=3,
+                                   cursor="hand2", wraplength=wrap, justify="left")
+                self._skin(button, bg="bg", fg="text", activebackground="hover",
+                           activeforeground="text")
+                button.pack(fill="x", pady=(0, self._px(2)))
+                buttons.append(button)
+                if option.get("description"):
+                    self._skin(tk.Label(frame, text=option["description"], font=self.f_small,
+                                        wraplength=wrap, justify="left", anchor="w"),
+                               bg="card", fg="faint").pack(fill="x", padx=(10, 0),
+                                                           pady=(0, self._px(4)))
+        other = tk.Button(frame, text="Something else…", command=self.input.focus_set,
+                          bd=0, relief="flat", font=self.f_small, padx=6, pady=2, cursor="hand2")
+        self._skin(other, bg="card", fg="muted", activebackground="hover",
+                   activeforeground="text")
+        other.pack(anchor="w", pady=(self._px(4), 0))
+        buttons.append(other)
+
+        view.config(state="normal")
+        view.insert("end", "\n")
+        view.window_create("end", window=frame, padx=self._px(4))
+        view.insert("end", "\n")
+        view.config(state="disabled")
+        # The form has no height until Tk lays it out, so a scroll now stops
+        # short of it; scroll again once it has one.
+        view.see("end")
+        view.after_idle(lambda: view.winfo_exists() and view.see("end"))
+        s.ask_buttons = buttons
+
+    def _settle_ask(self, s):
+        """Grey the question form once it has been answered - by a click or by
+        a typed message - so it cannot send a second answer."""
+        for button in s.ask_buttons:
+            try:
+                button.config(state="disabled")
+            except tk.TclError:
+                pass
+        s.ask_buttons = []
 
     def _turn(self, s, pictures=()):
         sid = s.event_id
@@ -2668,8 +2815,10 @@ class Chat(tk.Tk):
                             "and paths of the pictures - it cannot see what is in them.")
             executor = tasks.Executor(s.llm or self.llm, s.mcp, s.tools, schemas=s.schemas,
                 record=s.record, cancel=s.cancel, emit=emit, checkpoint=checkpoint,
-                vision=self.vision.review if self.vision else None, library=s.library)
+                vision=self.vision.review if self.vision else None, library=s.library,
+                readback=s.app.readback, review=s.app.review, notebook=s.notebook)
             executor.run(s.messages, MAX_STEPS)
+            self._learn(s, executor, emit)
         except Exception:
             s.record.status = "interrupted; inspect project state before continuing"
             try:
@@ -2683,6 +2832,154 @@ class Chat(tk.Tk):
             status = "stopped" if s.cancel.is_set() else "ready" if complete else "needs attention"
             self.q.put(("status", sid, (status, "muted" if complete else "warn", False)))
             self.q.put(("idle", sid, None))
+
+    def _learn(self, s, executor, emit):
+        """What the run leaves in the app's notebook, said in the tab. The
+        reflection is one more short request, made only after a run with an
+        error in it or a brief that read as a correction - a clean run has
+        nothing to teach and pays nothing."""
+        if s.notebook is None or s.cancel.is_set():
+            return
+        brief = s.record.briefs[-1] if s.record.briefs else ""
+        if executor.trouble or lessons.looks_like_correction(brief):
+            emit("status", ("thinking about what to remember", "muted", True))
+        for text in eng.learn_from_run(executor, s.messages, s.notebook,
+                                       s.llm or self.llm, s.app.name):
+            emit("sys", "Lesson kept for %s: %s" % (s.app.name, text))
+
+    # ------------------------------------------------ the studio and the lessons
+    def _studio_path(self):
+        return eng.studio_brief_path(self._data_dir())
+
+    def _studio_window(self):
+        """The studio brief, in an editor. Saved, it is the last part of every
+        tab's briefing: a tab whose conversation has not started takes it at
+        once, the rest on their next New chat - rewriting a prompt mid-way
+        would throw away the host's cached prefix and the transcript's sense."""
+        key = "studio"
+        win = self.windows.get(key)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        win = tk.Toplevel(self)
+        self.windows[key] = win
+        win.title("About this studio")
+        win.geometry("%dx%d" % (self._px(640), self._px(560)))
+        self._skin(win, bg="bg")
+        self._skin(tk.Label(win, text="What every tab is told about this studio before any "
+                                      "task. Plain text or Markdown; saved to %s."
+                                      % self._studio_path(),
+                            font=self.f_small, anchor="w", justify="left",
+                            wraplength=self._px(600)),
+                   bg="bg", fg="faint").pack(fill="x", padx=self._px(16), pady=(self._px(12), 0))
+        bar = tk.Scrollbar(win, highlightthickness=0, bd=0, width=11)
+        self._skin(bar, bg="bg", troughcolor="bg", activebackground="faint")
+        bar.pack(side="right", fill="y")
+        editor = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=14, pady=12,
+                         undo=True, yscrollcommand=bar.set, highlightthickness=0,
+                         insertwidth=2)
+        self._skin(editor, bg="card", fg="text", insertbackground="text", selectbackground="sel")
+        editor.pack(fill="both", expand=True, padx=self._px(16), pady=self._px(12))
+        bar.config(command=editor.yview)
+        editor.insert("1.0", self.studio or eng.STUDIO_TEMPLATE)
+        note = self._skin(tk.Label(win, text="", font=self.f_small, anchor="w"),
+                          bg="bg", fg="muted")
+        note.pack(fill="x", padx=self._px(16))
+
+        def save():
+            text = editor.get("1.0", "end").strip()
+            if text == eng.STUDIO_TEMPLATE.strip():
+                text = ""                 # the template itself is not a brief
+            try:
+                os.makedirs(os.path.dirname(self._studio_path()), exist_ok=True)
+                with open(self._studio_path(), "w", encoding="utf-8") as f:
+                    f.write(text + ("\n" if text else ""))
+            except OSError as e:
+                note.config(text="Could not save: %s" % e)
+                return
+            self.studio = text
+            fresh = 0
+            for s in self.sessions.values():
+                s.studio = text
+                if not s.busy and len(s.messages) == 1:
+                    s.messages[0] = {"role": "system", "content": s.prompt()}
+                    fresh += 1
+            waiting = len(self.sessions) - fresh
+            note.config(text="Saved. %s" % (
+                "Every tab has it." if not waiting else
+                "%d tab%s take%s it on their next New chat (Ctrl+N)."
+                % (waiting, "" if waiting == 1 else "s", "s" if waiting == 1 else "")))
+        button = self._skin(tk.Button(win, text="Save", command=save, bd=0, relief="flat",
+                                      font=self.f_body, padx=14, pady=4),
+                            bg="accent", fg="accent_fg", activebackground="accent_dk",
+                            activeforeground="accent_fg")
+        button.pack(anchor="e", padx=self._px(16), pady=(0, self._px(12)))
+        self.studio_editor = editor       # for the tests
+
+    def _lessons_window(self):
+        """Every lesson kept for the current tab's app, each with a way to
+        forget it - a lesson learned from a bad run should not need a text
+        editor to get rid of."""
+        s = self.cur()
+        if s is None:
+            return
+        if s.notebook is None:
+            self._write(s, "This tab keeps no lessons.\n", "sys")
+            return
+        key = ("lessons", s.id)
+        win = self.windows.get(key)
+        if win is not None and win.winfo_exists():
+            win.destroy()                 # rebuilt: a forget changed the list
+        win = tk.Toplevel(self)
+        self.windows[key] = win
+        win.title("Lessons - %s" % s.app.name)
+        win.geometry("%dx%d" % (self._px(560), self._px(480)))
+        self._skin(win, bg="bg")
+        bar = tk.Scrollbar(win, highlightthickness=0, bd=0, width=11)
+        self._skin(bar, bg="bg", troughcolor="bg", activebackground="faint")
+        bar.pack(side="right", fill="y")
+        view = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=18, pady=14,
+                       yscrollcommand=bar.set, state="disabled", cursor="arrow",
+                       highlightthickness=0)
+        self._skin(view, bg="bg", fg="text", selectbackground="sel")
+        view.pack(side="left", fill="both", expand=True)
+        bar.config(command=view.yview)
+        self._tool_tags(view)
+        view.config(state="normal")
+        kept = s.notebook.ordered()
+        if not kept:
+            view.insert("end", "Nothing kept yet for %s.\n\n" % s.app.name, "group")
+            view.insert("end", "Lessons arrive after a task: a call the validator refused, "
+                               "a correction you gave, a sentence the model chose to keep "
+                               "(studio_remember), or something you told it to remember "
+                               "- start a message with \"remember\" or \"from now on\".\n",
+                        "desc")
+        else:
+            view.insert("end", "%d lesson%s, oldest first. Every tab for %s carries them.\n"
+                        % (len(kept), "" if len(kept) == 1 else "s", s.app.name), "group")
+            for lesson in kept:
+                view.insert("end", "\n")
+                view.window_create("end", window=self._forget_lesson_button(view, s, lesson["text"]))
+                view.insert("end", "  " + lesson["text"] + "\n", "name")
+                view.insert("end", "      %s%s\n" % (
+                    {"user": "you said so", "model": "the model kept it",
+                     "review": "reflected after a task", "error": "a refused call"}[lesson["source"]],
+                    "  ·  came up %d more time%s" % (lesson["hits"], "" if lesson["hits"] == 1 else "s")
+                    if lesson["hits"] else ""), "desc")
+        view.config(state="disabled")
+        self.lessons_view = view          # for the tests
+
+    def _forget_lesson_button(self, parent, s, text):
+        def forget():
+            if s.busy:
+                return                    # the worker may be writing the notebook
+            s.notebook.remove(text)
+            self._lessons_window()
+        button = tk.Button(parent, text="forget", command=forget, bd=0, relief="flat",
+                           font=self.f_small, padx=6, pady=0, cursor="hand2")
+        return self._skin(button, bg="card", fg="muted", activebackground="hover",
+                          activeforeground="text")
 
     def _quit(self):
         for s in self.sessions.values():

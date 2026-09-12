@@ -78,7 +78,8 @@ class ToolsmithTests(unittest.TestCase):
     def test_a_made_tool_is_offered_after_the_fixed_contract(self):
         ex = self.executor()
         before = [t["function"]["name"] for t in ex.tools]
-        self.assertEqual(before[-2:], ["studio_task_update", "studio_tool_create"])
+        self.assertEqual(before[-4:], ["studio_task_update", "studio_tool_create",
+                                       "studio_ask", "studio_remember"])
         text = self.make(ex)
         self.assertIn("retitle_card", text)
         names = [t["function"]["name"] for t in ex.tools]
@@ -97,7 +98,7 @@ class ToolsmithTests(unittest.TestCase):
 
     def test_a_step_may_only_name_a_tool_this_tab_has(self):
         ex = self.executor()
-        for tool in ("delete_comp", "studio_task_update", "inspect_layer", "retitle_card"):
+        for tool in ("delete_comp", "studio_task_update", "retitle_card"):
             with self.assertRaises(ValueError) as caught:
                 self.make(ex, steps=[{"tool": tool, "arguments": {}}])
             self.assertIn("not a tool you have", str(caught.exception))
@@ -105,7 +106,7 @@ class ToolsmithTests(unittest.TestCase):
     def test_a_made_tool_cannot_take_an_existing_name(self):
         ex = self.executor()
         for name in ("set_text", "studio_task_update", "studio_tool_create",
-                     "inspect_layer", "verify_comp", "studio_workflow_capabilities"):
+                     "studio_anything_else"):
             with self.assertRaises(ValueError):
                 self.make(ex, name=name)
 

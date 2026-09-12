@@ -171,7 +171,7 @@ class TestProtocol(unittest.TestCase):
         err = s.handle(req(3, "tools/call", name="echo", arguments={"text": "x", "more": 1}))["error"]
         self.assertIn("more", err["message"])
         err = s.handle(req(4, "tools/call", name="counted", arguments={"n": -1}))["error"]
-        self.assertIn("minimum", err["message"])
+        self.assertIn("must be >= 0, not -1", err["message"])
         self.assertEqual(s.handle(req(5, "tools/call", arguments={}))["error"]["code"],
                          mcp.INVALID_PARAMS)
 
@@ -306,6 +306,56 @@ class TestProtocol(unittest.TestCase):
     def test_duplicate_tool_names_are_refused_at_construction(self):
         with self.assertRaises(ValueError):
             mcp.Server("t", "0", [mcp.Tool("a", None, "A.", {}), mcp.Tool("a", None, "A.", {})])
+
+
+class TestValidatorTeaches(unittest.TestCase):
+    """A refusal names what the schema wanted and what was sent. The reader is
+    a small model with one more try; "is not allowed" left it guessing."""
+
+    SCHEMA = {"type": "object", "additionalProperties": False, "required": ["compId"],
+              "properties": {
+                  "compId": {"type": "integer", "description": "The comp id from list_comps."},
+                  "layerId": {"type": "integer"},
+                  "color": {"type": "array", "minItems": 3, "maxItems": 3,
+                            "items": {"type": "number", "minimum": 0, "maximum": 1,
+                                      "description": "RGB 0..1, never 0..255"}},
+                  "mode": {"type": "string", "enum": ["linear", "hold"]},
+                  "name": {"type": "string", "minLength": 1, "pattern": "^[a-z]+$"}}}
+
+    def refusal(self, args):
+        with self.assertRaises(ValueError) as caught:
+            mcp.validate(args, self.SCHEMA)
+        return str(caught.exception)
+
+    def test_a_misspelt_key_is_corrected_and_the_keys_listed(self):
+        text = self.refusal({"compID": 1})
+        self.assertIn("compID is not a key arguments takes", text)
+        self.assertIn("did you mean compId?", text)
+        self.assertIn("it takes color, compId, layerId, mode, name", text)
+
+    def test_an_unknown_key_beats_a_missing_required_one(self):
+        # The misspelling is the mistake; "compId is required" would hide it.
+        self.assertIn("did you mean compId", self.refusal({"compID": 1}))
+        self.assertIn("compId is required (The comp id from list_comps.)",
+                      self.refusal({"layerId": 3}))
+
+    def test_type_range_and_enum_refusals_quote_the_value(self):
+        self.assertIn("compId must be an integer, not 1.5 (The comp id", self.refusal({"compId": 1.5}))
+        self.assertIn("compId must be an integer, not \"12\"", self.refusal({"compId": "12"}))
+        self.assertIn("color[0] must be <= 1, not 255 (RGB 0..1, never 0..255)",
+                      self.refusal({"compId": 1, "color": [255, 0, 0]}))
+        self.assertIn("color must have 3 items, not 2", self.refusal({"compId": 1, "color": [1, 0]}))
+        self.assertIn('mode must be one of ["linear", "hold"], not "bezier"',
+                      self.refusal({"compId": 1, "mode": "bezier"}))
+        self.assertIn("name must be at least 1 character long, not 0",
+                      self.refusal({"compId": 1, "name": ""}))
+        self.assertIn('name must match the pattern ^[a-z]+$; "A1" does not',
+                      self.refusal({"compId": 1, "name": "A1"}))
+
+    def test_a_long_value_is_clipped_in_the_sentence(self):
+        text = self.refusal({"compId": "x" * 500})
+        self.assertLess(len(text), 200)
+        self.assertIn("...", text)
 
 
 class TestLoopback(unittest.TestCase):
@@ -474,6 +524,42 @@ class TestOurBridges(unittest.TestCase):
                 self.assertEqual(described["tools"], module.tool_list())
                 self.assertEqual(described["initialize"]["serverInfo"]["name"], module.SERVER.name)
                 self.assertIn("0 error(s)", checked)
+
+
+class TestVerificationHints(unittest.TestCase):
+    """Each app's `readback` and `review` name reads the tab really offers,
+    with id arguments those reads really take - checked against the recorded
+    contract for an installed bridge and the tool table for one written here."""
+
+    OURS = {"photoshop": photoshop, "illustrator": illustrator, "premiere": premiere}
+
+    def tools_for(self, app):
+        if app.id in self.OURS:
+            return self.OURS[app.id].tool_list()
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "contracts", app.id + ".json")
+        if not os.path.isfile(path):
+            self.skipTest("no recorded contract for " + app.id)
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["tools"]
+
+    def test_every_hint_is_a_read_the_tab_offers_with_ids_it_takes(self):
+        for app in eng.APPS:
+            hints = list(app.readback) + ([app.review] if app.review else [])
+            if not hints:
+                continue
+            by_name = {t["name"]: t for t in self.tools_for(app)}
+            for tool, names in hints:
+                with self.subTest(app=app.id, tool=tool):
+                    self.assertIn(tool, app.tool_names(), "not in the default groups")
+                    self.assertIn(tool, by_name, "the bridge has no such tool")
+                    self.assertTrue(studio_tasks.readonly(tool, {}, by_name[tool]), "not a read")
+                    props = by_name[tool]["inputSchema"].get("properties", {})
+                    for name in names:
+                        self.assertIn(name, props, "%s takes no %s" % (tool, name))
+
+    def test_the_apps_that_show_pictures_have_a_review_tool(self):
+        for app_id in ("after-effects", "photoshop", "illustrator", "premiere"):
+            self.assertIsNotNone(eng.APPS_BY_ID[app_id].review, app_id)
 
 
 class TestSnapshots(unittest.TestCase):
