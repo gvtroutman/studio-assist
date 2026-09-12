@@ -19,7 +19,6 @@ import tempfile
 import time
 
 import studio_agent as eng
-import studio_workflows as workflows
 
 
 NAME_PATTERN = r"^[a-z][a-z0-9_]{2,47}$"
@@ -178,11 +177,8 @@ def contracts(tools, schemas=None):
 
 
 def reserved(allowed):
-    """Every name a made tool must not take: bridge, workflow and internal."""
+    """Every name a made tool must not take: the bridge's and the internal ones."""
     names = set(allowed)
-    names.update(workflows.INSPECTIONS)
-    names.update(workflows.PENDING)
-    names.add(workflows.CAPABILITY_TOOL["function"]["name"])
     names.add(CREATE_TOOL["function"]["name"])
     names.add("studio_task_update")
     return names
