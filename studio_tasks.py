@@ -44,8 +44,12 @@ TASK QUALITY
   wording and constraints. Ask only about missing details that affect the result.
 - Inspect the target before editing. After editing, read the changed target and
   compare it with the brief. A successful write alone is not verification.
-- For visual work request a preview when a suitable tool is exposed. A text-only
-  model cannot judge an image placeholder. Say when visual review is still needed.
+- For visual work request a preview when a suitable tool is exposed. You read
+  text: a returned picture reaches you as the "Visual review" appended to that
+  result, written by a model that looked at it. Treat that review as what is on
+  screen - fix what it names, and if it says the frame is not what was asked for,
+  it is not done. If a result says no review was made, say visual review is still
+  needed rather than claiming the result looks right.
 - Animation workflow: confirm copy, dimensions, frame rate and duration; construct
   the design; animate; inspect timing and representative frames; refine defects.
 - Assembly workflow: identify source media; check frame rate and source ranges;

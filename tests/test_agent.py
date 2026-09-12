@@ -103,6 +103,140 @@ class TestModelChoice(unittest.TestCase):
         self.assertIsNone(eng.pick_model(None, []))
 
 
+class TestVisionChoice(unittest.TestCase):
+    """Every bridge answers a screenshot with a picture and the executing model
+    reads text, so a vision model is resolved from the host like the executing
+    one is - never left to an environment variable nobody set."""
+
+    def test_pin_wins_when_served(self):
+        self.assertEqual(eng.pick_vision_model(["a-vl", "b-vl"], "coder", want="b-vl"), "b-vl")
+
+    def test_executing_model_sees_for_itself(self):
+        # No second model in VRAM when the one already there can look.
+        self.assertEqual(eng.pick_vision_model(["qwen3-vl-8b-instruct", "gemma-3-4b-it"],
+                                               "gemma-3-4b-it"), "gemma-3-4b-it")
+
+    def test_prefers_known_good_then_anything(self):
+        good = eng.PREFERRED_VISION_MODELS[0]
+        self.assertEqual(eng.pick_vision_model(["odd-vl", good], "coder"), good)
+        self.assertEqual(eng.pick_vision_model(["odd-vl"], "coder"), "odd-vl")
+
+    def test_one_already_in_vram_beats_a_load(self):
+        good = eng.PREFERRED_VISION_MODELS[0]
+        self.assertEqual(eng.pick_vision_model(["odd-vl", good], "coder", loaded="odd-vl"),
+                         "odd-vl")
+
+    def test_resolve_says_when_a_load_is_needed(self):
+        real = os.environ.pop("STUDIO_VISION_MODEL", None)
+        try:
+            v, _ = eng.resolve_vision("http://h/v1", "coder", ["odd-vl"], loaded="coder")
+            self.assertTrue(v.needs_load)
+            v, _ = eng.resolve_vision("http://h/v1", "coder", ["odd-vl"], loaded="odd-vl")
+            self.assertFalse(v.needs_load)
+            v, _ = eng.resolve_vision("http://h/v1", "odd-vl", ["odd-vl"], loaded=None)
+            self.assertFalse(v.needs_load)   # the executing model sees for itself
+        finally:
+            if real:
+                os.environ["STUDIO_VISION_MODEL"] = real
+
+    def test_load_model_posts_to_lm_studio_and_reports_failure(self):
+        import urllib.request
+        import urllib.error
+        import io
+        calls = []
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_open(req, timeout=None):
+            calls.append((req.full_url, json.loads(req.data)))
+            if "bad" in req.data.decode():
+                raise urllib.error.HTTPError(req.full_url, 404, "nope", {}, io.BytesIO(b"no such model"))
+            return Resp(b'{"status": "loaded"}')
+
+        real = urllib.request.urlopen
+        urllib.request.urlopen = fake_open
+        try:
+            self.assertIsNone(eng.load_model("http://h:1234/v1", "odd-vl"))
+            self.assertEqual(calls[0], ("http://h:1234/api/v1/models/load", {"model": "odd-vl"}))
+            err = eng.load_model("http://h:1234/v1", "bad-vl")
+            self.assertIn("404", err)
+            self.assertIn("no such model", err)
+        finally:
+            urllib.request.urlopen = real
+
+    def test_unserved_pin_falls_through(self):
+        self.assertEqual(eng.pick_vision_model(["odd-vl"], "coder", want="nope"), "odd-vl")
+
+    def test_nothing_served_is_none(self):
+        self.assertIsNone(eng.pick_vision_model([], "coder"))
+
+    def test_resolve_explains_absence(self):
+        real = os.environ.pop("STUDIO_VISION_MODEL", None)
+        try:
+            vision, note = eng.resolve_vision("http://h/v1", "coder", [])
+            self.assertIsNone(vision)
+            self.assertIn("cannot see", note)
+            os.environ["STUDIO_VISION_MODEL"] = "ghost"
+            vision, note = eng.resolve_vision("http://h/v1", "coder", ["odd-vl"])
+            # A pin the host does not serve is not a reason to go blind.
+            self.assertEqual(vision.model, "odd-vl")
+            self.assertIsNone(note)
+        finally:
+            os.environ.pop("STUDIO_VISION_MODEL", None)
+            if real:
+                os.environ["STUDIO_VISION_MODEL"] = real
+
+    def test_name_hints_when_host_gives_no_type(self):
+        self.assertTrue(eng.looks_vision("Qwen2.5-VL-7B-Instruct"))
+        self.assertTrue(eng.looks_vision("gemma-3-12b-it"))
+        self.assertFalse(eng.looks_vision("qwen3-coder-30b-a3b-instruct"))
+
+    def test_transparent_pictures_go_onto_white(self):
+        """A vision model sees alpha as black, so a black glyph on nothing is
+        described as a black square. Opaque pictures pass through untouched."""
+        glyph = bytes([0, 0, 0, 255]) * 2 + bytes([0, 0, 0, 0]) * 2   # 2x2: black row, clear row
+        flat = icons.flatten_png(icons.png(glyph, 2, 2))
+        rgba, w, h = icons.png_to_rgba(flat)
+        self.assertEqual(rgba[:8], bytes([0, 0, 0, 255]) * 2)
+        self.assertEqual(rgba[8:], bytes([255, 255, 255, 255]) * 2)
+        half = bytes([0, 0, 0, 128])
+        rgba, _, _ = icons.png_to_rgba(icons.flatten_png(icons.png(half, 1, 1)))
+        self.assertEqual(tuple(rgba), (127, 127, 127, 255))
+        opaque = icons.png(bytes([10, 20, 30, 255]) * 4, 2, 2)
+        self.assertIs(icons.flatten_png(opaque), opaque)
+        self.assertEqual(icons.flatten_png(b"not a png"), b"not a png")
+
+    def test_vision_describes_and_reviews_through_the_host(self):
+        sent = []
+
+        class FakeLLM:
+            def chat(self, messages, tools=None, max_tokens=None):
+                sent.append(messages[0]["content"])
+                return {"choices": [{"message": {"content": "  a red bridge  "}}]}
+
+        v = eng.Vision("http://h/v1", "odd-vl")
+        v.llm = FakeLLM()
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "bridge.png")
+        with open(path, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+        try:
+            block = v.describe_all([path])
+            self.assertIn("bridge.png: a red bridge", block)
+            self.assertIn("odd-vl", block)
+            self.assertEqual(sent[0][1]["image_url"]["url"][:22], "data:image/png;base64,")
+            review = v.review({"data": "AAAA", "mimeType": "image/jpeg"}, {"briefs": ["remake"]})
+            self.assertEqual(review, "a red bridge")
+            self.assertIn("remake", sent[1][0]["text"])
+            self.assertTrue(sent[1][1]["image_url"]["url"].startswith("data:image/jpeg"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestPerAppModel(unittest.TestCase):
     """ComfyUI shares its GPU with the inference box, so its tab prefers a
     small model. The preference is a preference: it never stops a tab opening."""
@@ -321,7 +455,7 @@ class TestAppRegistry(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         real = (eng.docker, eng.docker_exe, eng.probe_models, oc.workspace)
         eng.docker, eng.docker_exe = fake_docker, lambda: "docker"
-        eng.probe_models = lambda host, timeout=8: (True, "m1", ["m1", "m2"], None)
+        eng.probe_models = lambda host, timeout=8: (True, "m1", ["m1", "m2"], [], None)
         oc.workspace = os.path.join(tmp, "ws")
         try:
             oc.launch(host="http://100.127.17.38:1234/v1")
@@ -1577,22 +1711,30 @@ class TestGui(unittest.TestCase):
             self.app._spawn = original
 
     def test_vision_description_lands_in_the_brief_before_the_turn(self):
-        """With STUDIO_VISION_MODEL set the worker asks the vision model what
-        the pictures show and appends it to the brief - the executing model
-        reads text. A vision failure is one line, and the turn still runs."""
+        """When the host serves a vision model the worker asks it what the
+        pictures show and appends that to the brief - the executing model
+        reads text. A vision failure is one line, and the turn still runs.
+        With no vision model the tab says so, once per turn with pictures."""
         from test_tasks import FakeLLM, answer
+
+        class FakeVision:
+            model = "some-vl"
+            def __init__(self, fn):
+                self.describe_all = fn
+            def review(self, item, brief):
+                return "looks fine"
+
         png = self._picture("still.png")
         s = self.app.cur()
         original_llm, saved = self.app.llm, (s.messages, s.record)
-        real_env = os.environ.get("STUDIO_VISION_MODEL")
-        os.environ["STUDIO_VISION_MODEL"] = "some-vl"
+        original_vision = self.app.vision
         try:
             s.reset()
             brief = "Match this" + self.mod.attachment_note([png], s.app)
             s.messages.append({"role": "user", "content": brief})
             s.record.briefs.append(brief)
             self.app.llm = FakeLLM([answer(text="Done.")])
-            self.app._describe_pictures = lambda paths: "\n\nWhat the pictures show: a blue card"
+            self.app.vision = FakeVision(lambda paths: "\n\nWhat the pictures show: a blue card")
             self.app._turn(s, [png])
             self.assertTrue(s.messages[1]["content"].endswith("a blue card"))
             self.assertEqual(s.record.briefs[-1], s.messages[1]["content"])
@@ -1603,18 +1745,23 @@ class TestGui(unittest.TestCase):
             self.app.llm = FakeLLM([answer(text="Done anyway.")])
             def fail(paths):
                 raise RuntimeError("host busy")
-            self.app._describe_pictures = fail
+            self.app.vision = FakeVision(fail)
             self.app._turn(s, [png])
             self.assertEqual(s.messages[1]["content"], brief)
             self.assertEqual(s.messages[-1]["content"], "Done anyway.")
+            s.reset()
+            s.messages.append({"role": "user", "content": brief})
+            s.record.briefs.append(brief)
+            self.app.llm = FakeLLM([answer(text="Blind.")])
+            self.app.vision = None
+            self.app._turn(s, [png])
+            self.app._drain()
+            self.assertIn("No vision model is served", s.view.get("1.0", "end"))
+            self.assertEqual(s.messages[-1]["content"], "Blind.")
         finally:
-            del self.app._describe_pictures
+            self.app.vision = original_vision
             self.app.llm = original_llm
             s.messages, s.record = saved
-            if real_env is None:
-                os.environ.pop("STUDIO_VISION_MODEL", None)
-            else:
-                os.environ["STUDIO_VISION_MODEL"] = real_env
 
     def test_gui_executor_saves_completed_task(self):
         from test_tasks import FakeLLM, answer
