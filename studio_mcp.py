@@ -48,6 +48,7 @@ contract, `--describe` dumps it as JSON, `--check` runs the checks on itself.
 
 import argparse
 import base64
+import difflib
 import json
 import math
 import os
@@ -126,10 +127,15 @@ def validate(value, schema, root=None, path="arguments"):
     Unknown annotation and format keywords are left to the bridge. The executor
     validates every call with this before dispatch; a `Server` validates again
     on arrival, so a bridge written here holds its contract whoever calls it.
+
+    Every message says what the schema wanted as well as what was wrong: the
+    keys an object takes, the type or range a value needed, the value that was
+    sent. The reader is a small model that gets one more try, and "is not
+    allowed" on its own left it guessing again.
     """
     root = schema if root is None else root
     if schema is False:
-        raise ValueError(path + " is not allowed")
+        raise ValueError(path + " is not allowed here")
     if schema is True:
         return
     if "$ref" in schema:
@@ -175,7 +181,8 @@ def validate(value, schema, root=None, path="arguments"):
              "integer": finite and value == int(value)}
     want = schema.get("type")
     if want and not any(types.get(t, False) for t in (want if isinstance(want, list) else [want])):
-        raise ValueError(path + " must be " + str(want))
+        raise ValueError("%s must be %s, not %s%s"
+                         % (path, _want(want), _shown(value), _hint(schema)))
 
     # JSON equality must distinguish true from 1.
     def equal(a, b):
@@ -189,14 +196,24 @@ def validate(value, schema, root=None, path="arguments"):
             return len(a) == len(b) and all(equal(x, y) for x, y in zip(a, b))
         return a == b
     if "enum" in schema and not any(equal(value, v) for v in schema["enum"]):
-        raise ValueError(path + " must be one of " + str(schema["enum"]))
+        raise ValueError("%s must be one of %s, not %s"
+                         % (path, json.dumps(schema["enum"]), _shown(value)))
     if "const" in schema and not equal(value, schema["const"]):
-        raise ValueError(path + " has an invalid constant")
+        raise ValueError("%s must be %s, not %s"
+                         % (path, json.dumps(schema["const"]), _shown(value)))
     if isinstance(value, dict):
+        # Unknown keys first: a misspelt compId reads better as "did you mean
+        # compId" than as "compId is required".
+        props = schema.get("properties", {})
+        for key in value:
+            if (key not in props and schema.get("additionalProperties", True) is False and
+                    not any(re.search(p, key) for p in schema.get("patternProperties", {}))):
+                raise ValueError("%s.%s is not a key %s takes%s%s"
+                                 % (path, key, path, _closest(key, props), _keys(props)))
         for key in schema.get("required", []):
             if key not in value:
-                raise ValueError(path + "." + key + " is required")
-        props = schema.get("properties", {})
+                raise ValueError("%s.%s is required%s"
+                                 % (path, key, _hint(props.get(key, {}))))
         for key, val in value.items():
             patterns = [s for p, s in schema.get("patternProperties", {}).items()
                         if re.search(p, key)]
@@ -208,7 +225,9 @@ def validate(value, schema, root=None, path="arguments"):
                 validate(val, schema.get("additionalProperties", True), root, path + "." + key)
     if isinstance(value, list):
         if len(value) < schema.get("minItems", 0) or len(value) > schema.get("maxItems", math.inf):
-            raise ValueError(path + " has the wrong number of items")
+            raise ValueError("%s must have %s, not %d"
+                             % (path, _count(schema.get("minItems"), schema.get("maxItems"),
+                                             "item"), len(value)))
         prefix = schema.get("prefixItems", [])
         items = schema.get("items", True)
         if isinstance(items, list):
@@ -216,22 +235,69 @@ def validate(value, schema, root=None, path="arguments"):
         for i, val in enumerate(value):
             validate(val, prefix[i] if i < len(prefix) else items, root, path + "[%d]" % i)
         if schema.get("uniqueItems") and any(equal(a, b) for i, a in enumerate(value) for b in value[i + 1:]):
-            raise ValueError(path + " must contain unique items")
+            raise ValueError(path + " must not repeat an item")
     if type(value) in (int, float):
         if not finite:
             raise ValueError(path + " must be finite")
-        for key, invalid in (("minimum", lambda b: value < b), ("maximum", lambda b: value > b),
-                             ("exclusiveMinimum", lambda b: value <= b),
-                             ("exclusiveMaximum", lambda b: value >= b)):
+        for key, sign, invalid in (("minimum", ">=", lambda b: value < b),
+                                   ("maximum", "<=", lambda b: value > b),
+                                   ("exclusiveMinimum", ">", lambda b: value <= b),
+                                   ("exclusiveMaximum", "<", lambda b: value >= b)):
             if key in schema and invalid(schema[key]):
-                raise ValueError(path + " violates " + key)
+                raise ValueError("%s must be %s %s, not %s%s"
+                                 % (path, sign, schema[key], _shown(value), _hint(schema)))
         if "multipleOf" in schema and not math.isclose(value / schema["multipleOf"], round(value / schema["multipleOf"]), abs_tol=1e-9):
-            raise ValueError(path + " violates multipleOf")
+            raise ValueError("%s must be a multiple of %s, not %s"
+                             % (path, schema["multipleOf"], _shown(value)))
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", math.inf):
-            raise ValueError(path + " has an invalid length")
+            raise ValueError("%s must be %s long, not %d%s"
+                             % (path, _count(schema.get("minLength"), schema.get("maxLength"),
+                                             "character"), len(value), _hint(schema)))
         if "pattern" in schema and not re.search(schema["pattern"], value):
-            raise ValueError(path + " does not match the required pattern")
+            raise ValueError("%s must match the pattern %s; %s does not%s"
+                             % (path, schema["pattern"], _shown(value), _hint(schema)))
+
+
+def _shown(value):
+    """The offending value, as JSON, short enough to quote in a sentence."""
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = repr(value)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def _want(want):
+    article = lambda t: ("an " if t[0] in "aeiou" else "a ") + t
+    return " or ".join(article(t) for t in want) if isinstance(want, list) else article(want)
+
+
+def _hint(schema):
+    """The property's own description, when it has one: usually the units."""
+    desc = schema.get("description") if isinstance(schema, dict) else None
+    if not desc:
+        return ""
+    desc = " ".join(desc.split())
+    return " (%s)" % (desc if len(desc) <= 140 else desc[:137] + "...")
+
+
+def _keys(props):
+    return "; it takes %s" % ", ".join(sorted(props)) if props else ""
+
+
+def _closest(key, props):
+    match = difflib.get_close_matches(key, list(props), n=1, cutoff=0.6)
+    return " - did you mean %s?" % match[0] if match else ""
+
+
+def _count(low, high, unit):
+    plural = lambda n: "%d %s%s" % (n, unit, "" if n == 1 else "s")
+    if low is not None and high is not None:
+        return plural(low) if low == high else "%d to %d %ss" % (low, high, unit)
+    if low is not None:
+        return "at least " + plural(low)
+    return "at most " + plural(high)
 
 
 def sample(schema, root=None, depth=0):

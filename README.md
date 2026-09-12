@@ -237,30 +237,53 @@ turn amber; every tab says so once, and the model works blind: attached pictures
 names and paths to it, and previews reach only you — download one in LM Studio and
 reopen the window. Still frames cannot verify motion or audio.
 
+## What it knows, learns and asks
+
+The model behind every tab is small and local. Four things stand between it and
+guessing:
+
+**It looks things up.** Every app tab carries the Chat tab's read-only tools beside
+its own bridge: list, search and read files on this PC, search the web, read a page
+as text. The prompt tells it to read the brief rather than imagine it, to look a
+feature or an expression up before guessing, and to say which page it relied on;
+each app's entry names its own documentation (the After Effects scripting guide and
+expression reference, the Premiere and Illustrator scripting guides, Resolve's
+scripting API reference, ComfyUI's docs and examples, Photoshop's scripting
+reference). Adobe's `helpx.adobe.com` refuses direct reads, so it is reached through
+search results only. Reading a page never counts as checking that an edit landed.
+
+**It learns.** Each app has a notebook of one-line lessons, kept beside the settings
+in `lessons/<app>.json` and folded into the app's briefing at the start of every
+session. Lessons arrive four ways: a call the validator refused (an invented action,
+a misspelled key) is learned as it stands; a message of yours that begins "remember"
+or "from now on" is kept in your words; the model keeps one itself with
+`studio_remember` when you correct it or tell it how you work; and after a run that
+had an error in it, or a brief that read as a correction ("no, I meant…"), one extra
+short request asks the model what it should remember — a clean run costs nothing.
+Lessons kept mid-session ride at the tail of the request until the next New chat.
+**File → Lessons for this tab** lists them, with a **forget** for the ones that
+turned out wrong.
+
+**It knows the studio.** **File → About this studio** opens a short Markdown brief —
+who you are, what the studio makes, brands and house styles, deliverables and
+formats, how projects and timelines are organised, what to ask before doing. Saved,
+it is the last part of every tab's briefing (a tab whose conversation has not started
+takes it at once; the rest on their next New chat). Nothing of the template reaches
+the model until you have written over it. Beside it every tab carries the craft of
+its kind of work — how an edit is cut (read the whole timeline first, plan the
+assembly as a list, handles, J- and L-cuts, track discipline, durations in frames),
+how motion and design work is built, how images are prompted — and a rule set for
+open briefs: name directions, choose, say why, build the simplest version, look,
+refine.
+
+**It asks properly.** When an answer changes what it would build and cannot be read
+from the project — which frame rate, which take, which platforms — the model calls
+`studio_ask`, and the question appears in the transcript as a form: a button per
+choice with its description, tick-boxes and **Send these** when several may apply,
+and **Something else…** to type your own. A click is your next message; the form
+then greys out. On the CLI the same question is a numbered list.
+
 ## Layout
-
-### Workflow layer (first increment)
-
-The GUI and CLI expose `studio_workflow_capabilities`, reporting availability and
-specific blockers for the thirteen planned production workflows. Currently
-`inspect_project`, `inspect_comp`, and `inspect_layer` adapt the enabled AE bridge
-tools `get_project_summary`, `get_comp`, and `get_layer_full`. They inherit the
-bridge's argument schemas and full descriptions; comp inspection returns comp
-metadata, not a recursive inspection of all its layers. These adapters use the
-shared executor's original-schema validation, journal, recovery and preview path.
-They are exposed only when their underlying tool is enabled. Resolve adapters
-are not implemented yet.
-
-Audio inspection, transcripts, media matching/placement, Miter and Ellwood styling,
-red-card construction, speech synchronization, and verification evaluators are
-explicitly unavailable in this first increment. They are not placeholder callable
-tools. The capability report explains each missing integration. A style/template
-reference for each brand and a timestamped transcript provider are needed before those workflows
-can be implemented accurately. Inspection results are observations, not automatic
-visual or timing verification. Inference remains on the remote host.
-
-Styling has two separate workflows: `apply_miter_style` and
-`apply_ellwood_style`, each with its own brand reference and implementation.
 
 ### Tools the model makes for itself
 
@@ -279,8 +302,8 @@ out badly.
 |---|---|
 | `studio_chat.py` | The Tkinter GUI: tab strip, one `Session` per app, plus the app-less Chat tab |
 | `studio_tasks.py` | Shared executor, argument checks, task records, context budgeting and recovery |
-| `studio_workflows.py` | Capability catalog and schema-backed inspection adapters |
 | `studio_toolsmith.py` | Tools the model makes for itself: named sequences of the tools it already has |
+| `studio_lessons.py` | What the model learns per app: the notebook, `studio_remember`, the end-of-task reflection |
 | `studio_agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
 | `studio_mcp.py` | The MCP harness: the server our bridges run on, an in-process client, and `check` — holds any bridge to what the executor and the model need |
 | `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |

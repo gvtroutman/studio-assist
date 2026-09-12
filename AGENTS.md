@@ -19,6 +19,9 @@ this PC's files and the web instead. Two moving parts:
   bounded request context, cancellation, execution journals and task recovery.
 - **`studio_toolsmith.py`** — tools the model makes for itself, and the per-app
   library they are kept in.
+- **`studio_lessons.py`** — what the model learns per app: the `Notebook` of one-line
+  lessons, the `studio_remember` tool, the reading of the user's corrections and the
+  end-of-task reflection. See *What the model learns, asks and looks up*.
 - **`studio_mcp.py`** — the MCP harness. `Server` is the protocol every bridge written
   here runs on (framing, revision negotiation, validation, annotations, logging,
   progress, cancellation); `Loopback` is `MCPClient`'s interface over a `Server` in
@@ -561,12 +564,35 @@ composer.
   are the inference representation only; preserve compound-tool descriptions.
 - `studio_task_update` is an internal tool exposed alongside bridge tools. Warm-up
   must use the same system prompt and tool list, including that internal tool.
+- **The task record is the last message of every request, never the second.**
+  `context_messages` appends it after the conversation. It changes every turn -
+  `status` alone flips to "working" before each run - and LM Studio caches by
+  prefix, so with the record at position 1 the cache matched only through the
+  system prompt and tools and the whole history was prefilled again on every
+  message. A test asserts that turn N's request, minus its record, is a prefix of
+  turn N+1's. Anything else that changes per turn goes at the tail too.
 - GUI task JSON files live beside settings in `tasks/<app>/<task-id>.json`. Persist
   intent before dispatch and results afterward. A disk failure stops edits. Task
   records preserve conversational progress, not project backups or undo state.
 - Unknown write outcomes must not trigger blind repeats. Restored tasks need a
   project read before editing. Read-back guards do not independently prove visual
   or semantic correctness; distinguish observations from model claims.
+- **The read-back reminder names the call, and the executor looks for itself
+  when it can.** An `AppSpec` carries `readback` - `(read tool, [id argument
+  names])` pairs, most specific first - and `review` - the read-only screenshot
+  tool and the ids it needs. When the model says it is done with an unverified
+  edit, `Executor._auto_review` takes the screenshot (ids from the last write,
+  else the latest call that carried them) and appends the vision model's review
+  as the next user message, journaled with `auto: true`; that clears the
+  read-back obligation because something looked. It runs only with a vision
+  model - without one the picture would clear the obligation while nobody saw
+  it - and at most twice a run. Otherwise `_readback_hint` names the exact read
+  with the write's own ids (`call get_layer_full with {"compId": 12, "layerId":
+  40}`), because a 3B model copies an instruction it can copy and skips one it
+  must translate. Both tables are checked against the recorded contracts and
+  the bridge tool tables (`tests/test_mcp.py`, `TestVerificationHints`): a read
+  the default groups do not expose, or an id the tool does not take, fails.
+  Resolve has neither yet - its compound tools do not fit the id-argument shape.
 - `readonly()` decides which calls owe a read-back from the tool's name prefix or its
   MCP `readOnlyHint` annotation. A bridge written here must annotate its reads
   (`READ_ONLY` in every bridge here); unannotated, `comfy_status` counted as an
@@ -625,6 +651,98 @@ composer.
   `ContainerSpec` tab sees one folder: `attachment_note` copies the file (or the
   folder, whole) into `<workspace>/attachments/` and names the `/workspace/...` path
   the container will see.
+
+## What the model learns, asks and looks up
+
+Four mechanisms, all in service of one fact: the executing model is small and
+starts every session knowing the app in general and nothing about this studio,
+this bridge's failures, or what the user said last time.
+
+### The research sidecar: files and the web on every tab
+
+`studio_research_mcp.SERVER` — the Chat tab's bridge — is offered to every app tab
+beside its own bridge. `AppSpec.research` is True for every entry (`ChatSpec` says
+False: its bridge *is* the server); `_boot_bridge` and the CLI's `main()` make a
+`Loopback` over it (`eng.research_client()`), append its tools after the bridge's
+and its schemas with them, and put one `eng.Router` in front of both so the executor
+still sees one client. Things that follow:
+
+- **The sidecar's tools are not in `app.groups`.** `tool_names()` is the bridge's
+  working set; `Session.offered(wanted)` is what the model gets — the bridge tools
+  in `wanted` plus `s.sidecar_names` — and both `_boot_bridge` and the capabilities
+  window build `s.tools` through it. Rebuild `s.tools` any other way and the tab
+  silently loses the web. The tools window still lists the bridge alone.
+- **`verification_read` says no to every sidecar tool.** A page or a brief on disk
+  says nothing about whether an edit landed; without that, `fetch_page` after a
+  write cleared the read-back obligation.
+- **`AppSpec.docs` lists only pages the bridge can read.** `helpx.adobe.com` answers
+  the bridge's browser user agent with 403, so Adobe's user guides are reached
+  through `search_web` snippets only, and the prompt says so; the scripting guides
+  on docsforadobe.dev, the Resolve API mirror, ComfyUI's docs and aereference.com
+  all answer. `tests/test_lessons.py` refuses a helpx URL in `docs`. Verify a new
+  URL with `fetch_page` before adding it: a 403 in the list teaches the model that
+  looking things up does not work.
+- The briefing is `AppSpec.briefing()`: the app's `craft` block (`CRAFT_EDITING`
+  for Resolve and Premiere, `CRAFT_MOTION`, `CRAFT_DESIGN`, `CRAFT_IMAGES`), then
+  `CREATIVE_RULES`, then `LOOKUP_RULES` with the docs folded in. Craft is written as
+  rules the model can apply, not taste it is assumed to have.
+
+### The notebook: lessons per app
+
+`studio_lessons.Notebook` is `lessons/<app>.json` beside the settings, loaded by
+`Chat._session()` and by the CLI, and best-effort in both directions like the tool
+library. Four sources, marked on each lesson and ranked when the notebook is full:
+`user` (a message that begins "remember" / "from now on", kept in the user's words
+by `explicit_lesson`), `model` (`studio_remember`), `review` (the reflection) and
+`error` (a validator refusal, learned deterministically from `Executor.refusals` —
+a fact about the contract the model got wrong once). `eng.learn_from_run()` is the
+one place a run teaches; it never raises.
+
+- **The reflection runs only after trouble.** `Executor.trouble` is any TOOL ERROR
+  in the run; `looks_like_correction(brief)` is the other trigger. A clean run makes
+  no extra request. The reflection is one non-streaming `chat` with the whole
+  exchanges that fit in `REFLECT_CHARS`, no tools, `max_tokens` capped, and its
+  reply is **never appended to the conversation** — it must not cost the next turn.
+  `parse_reflection` accepts only a reply carrying `Lesson:`; anything else is NONE.
+- **Lessons are in the system prompt at boot and at the tail mid-session.**
+  `Session.prompt()` builds `messages[0]` from `app.chat_prompt(studio, notebook.brief())`
+  at `_session()`, on `reset()` and on a learned bridge; `brief()` marks what it
+  carried, and `Executor._fresh_lessons()` puts the rest into `context_messages`'s
+  tail (`extra=`) after the task record. Never rewrite `messages[0]` mid-way to add
+  a lesson — the prefix cache, again. Every warm-up passes `s.messages[0]` itself,
+  not a rebuilt prompt, for the same reason.
+- `studio_ask` and `studio_remember` are `INTERNAL_TOOLS` with the task-record and
+  tool-maker tools, in that order, before the made tools; `toolsmith.reserved()`
+  already refuses `studio_` names. The Lessons window (`File > Lessons for this
+  tab...`) is rebuilt on every forget; a forget while the tab is busy is ignored,
+  because the worker may be writing the notebook.
+
+### The studio brief
+
+`studio.md` beside the settings (`eng.studio_brief_path()`, `read_studio_brief()`),
+edited in `Chat._studio_window()`. `STUDIO_TEMPLATE` is what the editor opens with
+when there is no file; saving it unchanged saves nothing, and `studio_section("")`
+is empty, so no prompt ever carries the template's questions. The section is
+bounded (`STUDIO_BRIEF_CHARS`) and goes after the quality rules and before the
+lessons — the two parts that change between sessions come last. On save, a tab
+whose conversation has not started (`len(messages) == 1`) takes the new brief at
+once; the rest keep theirs until New chat, and the editor says how many.
+
+### The question form: `studio_ask`
+
+A question with two to five choices and an optional `multiple`. `Executor._call`
+records it in `self.asked`, emits `("ask", payload)` and answers the model with an
+instruction to stop; `_run` ends the run after that batch with status `response
+complete; waiting for the user's answer`, so the GUI shows *ready* and the CLI
+(`ask_at_terminal`) prints a numbered list and continues the same task with the
+reply. In the GUI `_show_ask` embeds a frame in the transcript with
+`window_create` — buttons, or Checkbuttons and a Send, and *Something else…* which
+focuses the composer — and a click goes through `Chat._send`, the same path a typed
+message takes; `_settle_ask` greys the form on either. Two things learned building
+it: a frame embedded in a `Text` has no height until an idle pass, so `see("end")`
+has to be repeated from `after_idle` or the form sits below the fold; and the
+answer must go to the session that asked, not `cur()` — the user may have switched
+tabs.
 
 ## Tools the model makes for itself
 
@@ -687,7 +805,13 @@ folder are exactly that, and their `serve()` loops are gone.
   before a call and what a `Server` runs on arrival; `studio_tasks.validate` is the
   same function. One validator, so the two sides cannot disagree about a schema. It
   caught a test calling `comfy_generate` with a `timeout` under the schema's minimum
-  the day it went in.
+  the day it went in. **Its refusals teach**: an unknown key names the keys the
+  object takes and the closest one (`compID ... did you mean compId?`), a wrong
+  type or range quotes the value sent and the property's own description (which is
+  where the units live), and the unknown-key check runs before the required-key
+  check so a misspelling is reported as one. The reader is a 3B model with one more
+  try; `is not allowed` on its own sent it guessing again, and the guess landed in
+  `failed_calls`. Keep every new refusal in that shape.
 - **Annotations are the spec's defaults unless a tool says otherwise.** A `Tool` is
   assumed to write, to be destructive and to touch the outside world; `read_only=True`
   sets the three hints a read implies, and `HINTS` in each bridge overrides the rest
@@ -740,6 +864,7 @@ python studio_premiere_mcp.py --install-panel   # copy premiere_panel/ under CEP
 python studio_research_mcp.py --check        # the Chat tab's bridge; reads nothing by itself
 python studio_mcp.py check --app chat --in-process --call   # ...and list_folder on the home folder
 python studio_agent.py --app chat "find the brief in my Documents folder"   # the chat tab from the CLI
+python studio_agent.py --app resolve "look up the ProRes flavours and say which to deliver in"   # the sidecar in an app tab
 python studio_mcp.py check --app premiere --in-process
 python studio_mcp.py check --app photoshop --in-process   # against the registry entry
 python studio_agent.py --mcp "npx -y some-mcp" --name Blender --list-tools  # any bridge
@@ -752,6 +877,8 @@ python studio_chat.py                        # the real app (console attached)
 
 `tests/` never touches the network, the creative apps, Docker, or the model — the
 research bridge's `urlopen` is swapped for a fake with a table of pages,
+`test_lessons.py` drives the notebook, the reflection and the question form with the
+same fake inference `test_tasks.py` uses and a temp notebook directory,
 the COM bridges are tested with `HOST.run` replaced, the one PowerShell worker a test
 starts is given a ProgID nothing answers to, and the Premiere bridge talks to a fake
 panel on a random loopback port —

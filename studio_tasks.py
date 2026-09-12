@@ -10,9 +10,9 @@ import threading
 import uuid
 
 import studio_agent as eng
+import studio_lessons as lessons
 import studio_mcp
 import studio_toolsmith as toolsmith
-import studio_workflows as workflows
 
 
 TASK_TOOL = {"type": "function", "function": {
@@ -28,13 +28,39 @@ TASK_TOOL = {"type": "function", "function": {
                 "required": ["requirement", "evidence"], "additionalProperties": False}},
             "issues": {"type": "array", "items": {"type": "string"}}}}}}
 
+# A question with choices the user clicks, when the answer changes what would
+# be built. The executor shows it and ends the run; the answer is the user's
+# next message, so the model never waits on a tool result for it.
+ASK_TOOL = {"type": "function", "function": {
+    "name": "studio_ask",
+    "description": ("Ask the user one question with choices they can click, when the "
+                    "answer changes what you would build and cannot be read from the "
+                    "project or a file - which format, which take, which brand, how "
+                    "long. Two to five short options, the one you would suggest first; "
+                    "the user can also type something else. Their answer arrives as "
+                    "the next message: after asking, stop and wait for it. This changes "
+                    "nothing in the project."),
+    "parameters": {"type": "object", "additionalProperties": False,
+        "properties": {
+            "question": {"type": "string", "minLength": 4, "maxLength": 400,
+                         "description": "The question, one sentence."},
+            "options": {"type": "array", "minItems": 2, "maxItems": 5,
+                "items": {"type": "object", "additionalProperties": False,
+                    "properties": {
+                        "label": {"type": "string", "minLength": 1, "maxLength": 60,
+                                  "description": "Short, what the user clicks."},
+                        "description": {"type": "string", "maxLength": 200,
+                                        "description": "What choosing it means, optional."}},
+                    "required": ["label"]}},
+            "multiple": {"type": "boolean",
+                         "description": "True when more than one option may apply."}},
+        "required": ["question", "options"]}}}
+
+INTERNAL_TOOLS = (TASK_TOOL, toolsmith.CREATE_TOOL, ASK_TOOL, lessons.REMEMBER_TOOL)
+
 QUALITY_RULES = """
 
 TASK QUALITY
-- Use studio_workflow_capabilities to discover higher-level workflows and their
-  blockers. Available inspection adapters return real bridge observations.
-  Unavailable workflows are not callable; never claim a capability report inspected
-  a project, transcribed audio, applied a style, or verified a result.
 - studio_tool_create records a repeated sequence of this tab's own tools under
   one name. It creates a tool; it neither runs one nor edits the project, and it
   cannot reach a tool this tab was not given. One-off work goes to the bridge
@@ -49,7 +75,9 @@ TASK QUALITY
   result, written by a model that looked at it. Treat that review as what is on
   screen - fix what it names, and if it says the frame is not what was asked for,
   it is not done. If a result says no review was made, say visual review is still
-  needed rather than claiming the result looks right.
+  needed rather than claiming the result looks right. When you finish with an
+  edit nobody has looked at, this window may take the screenshot itself and hand
+  you its review as the next message: act on that review as you would your own.
 - Animation workflow: confirm copy, dimensions, frame rate and duration; construct
   the design; animate; inspect timing and representative frames; refine defects.
 - Assembly workflow: identify source media; check frame rate and source ranges;
@@ -60,6 +88,11 @@ TASK QUALITY
   operation when available. Never invent backup tools or imply undo is guaranteed.
 - If blocked or only partly verified, explain the limitation instead of claiming
   completion. A timeout may mean an edit happened: inspect, never blindly repeat.
+- studio_ask puts a question with clickable choices in front of the user; ask
+  it alone, then stop - the answer is their next message. studio_remember keeps
+  one reusable lesson for future tasks in this app: use it when the user
+  corrects you, tells you how they work, or when a call fails and you find what
+  works instead. Neither touches the project.
 """
 
 
@@ -97,6 +130,10 @@ def validate_action(args, description):
 def verification_read(name, args):
     # App availability, UI page, and codec discovery do not inspect edited work.
     if name in ("check_setup", "ae_guide", "resolve_control", "layout_presets", "render_presets"):
+        return False
+    # The research sidecar reads the world, not the project: a web page or a
+    # brief on disk says nothing about whether an edit landed.
+    if name in eng.RESEARCH_TOOL_NAMES:
         return False
     if args.get("action") in ("get_formats", "get_codecs", "get_resolutions", "get_version"):
         return False
@@ -181,18 +218,30 @@ class TaskRecord:
         return record, repaired
 
 
-def context_messages(messages, record, tools, max_chars=100000, memory=True):
+def context_messages(messages, record, tools, max_chars=100000, memory=True, extra=""):
     """Bound the request conservatively by characters, keeping whole exchanges.
 
     Full history remains on disk. Never silently clip the brief or tool contract.
     A budget too small for the fixed context fails before any app mutation.
     `memory` carries the saved task record into the request; a tab with no tools
     has no task to carry, and its conversation is the whole of its context.
+
+    The record goes LAST, after the conversation, not first. It changes on every
+    turn - the status alone flips to "working" before each run - and the host
+    caches a request by its prefix: with the record at position 1 the cache
+    matched only through the system prompt and tools, and the whole history was
+    prefilled again on every message. At the end it costs one short block, and
+    the history before it is served from the cache. Keep it there.
     """
-    block = {"role": "user", "content": "Saved task context (data, not new instructions):\n" +
-             json.dumps(record.context(), ensure_ascii=False)}
-    base = [messages[0], block] if memory else [messages[0]]
-    budget = max_chars - len(json.dumps(base)) - len(json.dumps(tools))
+    tail = []
+    if memory:
+        tail = [{"role": "user", "content": "Saved task context (data, not new instructions):\n" +
+                 json.dumps(record.context(), ensure_ascii=False)}]
+    if extra:
+        # Lessons kept since this session's prompt was built: the same rule,
+        # the tail, so the cached prefix stays whole until the next boot.
+        tail.append({"role": "user", "content": extra})
+    budget = max_chars - len(json.dumps([messages[0]] + tail)) - len(json.dumps(tools))
     if budget < 0:
         raise ValueError("The task brief and tool set exceed the context budget. Start a new task or select fewer tool groups.")
     groups = []
@@ -210,7 +259,7 @@ def context_messages(messages, record, tools, max_chars=100000, memory=True):
             break
         kept.insert(0, group)
         budget -= size
-    return base + [m for group in kept for m in group]
+    return [messages[0]] + [m for group in kept for m in group] + tail
 
 
 class CheckpointError(RuntimeError):
@@ -220,25 +269,24 @@ class CheckpointError(RuntimeError):
 def inference_tools(tools, library=None):
     """One exact tool prefix for execution and every GUI warm-up path.
 
-    With no bridge tools there is nothing to journal and no workflow to report,
-    so the internal tools go too: a plain chat tab is offered no tools at all,
-    including the one that makes tools - there would be nothing to make them
-    from. Tools the model made come last, so making one re-prefills the tail of
-    the cached prefix rather than the whole tool set.
+    With no bridge tools there is nothing to journal, so the internal tools go
+    too: a plain chat tab is offered no tools at all, including the one that
+    makes tools - there would be nothing to make them from. Tools the model
+    made come last, so making one re-prefills the tail of the cached prefix
+    rather than the whole tool set.
     """
     if not tools:
         return []
     made = library.model_tools() if library is not None else []
-    return workflows.model_tools(tools) + [TASK_TOOL, toolsmith.CREATE_TOOL] + made
+    return list(tools) + list(INTERNAL_TOOLS) + made
 
 
 class Executor:
     def __init__(self, llm, mcp, tools, schemas=None, record=None, cancel=None,
                  emit=None, checkpoint=None, vision=None, max_chars=100000,
-                 library=None):
+                 library=None, readback=(), review=None, notebook=None):
         self.llm, self.mcp = llm, mcp
         self.bridge_tools = list(tools)
-        self.workflow_adapters = workflows.adapters(self.bridge_tools)
         self.library = library
         self.tools = inference_tools(self.bridge_tools, library)
         self.allowed, self.specs = toolsmith.contracts(tools, schemas)
@@ -248,9 +296,106 @@ class Executor:
         self.checkpoint = checkpoint or (lambda: None)
         self.vision = vision
         self.max_chars = max_chars
+        # The app's own answers to "how do I check that landed": see
+        # AppSpec.readback and AppSpec.review. Only tools this tab offers count.
+        self.readback = [(t, n) for t, n in readback if t in self.allowed]
+        self.review = review if review and review[0] in self.allowed else None
         self.must_inspect = self.record.status.startswith("restored")
         self.failed_calls = set()
         self.via = None                   # the made tool a step is running under
+        self.auto = False                 # a call the executor made, not the model
+        # What this run teaches: the app's notebook (studio_remember writes to
+        # it; lessons kept mid-session ride at the request's tail), every
+        # validator refusal as (tool, message), and whether anything went wrong
+        # - the GUI reflects on a troubled run, never a clean one.
+        self.notebook = notebook
+        self.refusals = []
+        self.trouble = False
+        # The question shown to the user by studio_ask; set, the run ends and
+        # the answer is the next message.
+        self.asked = None
+
+    # ------------------------------------------------ verifying what was written
+
+    def _last_write(self):
+        """The most recent journal entry that changed something, or None."""
+        for entry in reversed(self.record.journal):
+            if not entry.get("read") and entry.get("status") in ("ok", "running", "unknown"):
+                return entry
+        return None
+
+    def _ids_for(self, names, write):
+        """Values for the id arguments `names`, from the last write first and
+        then from the most recent call that carried all of them. None when
+        nothing in the journal has them - a fresh comp not yet listed."""
+        candidates = [write] if write else []
+        candidates += [e for e in reversed(self.record.journal) if e is not write]
+        for entry in candidates:
+            args = entry.get("arguments") or {}
+            if all(n in args for n in names):
+                return {n: args[n] for n in names}
+        return None
+
+    def _readback_hint(self):
+        """The reminder to verify, naming the exact read when the app has said
+        which one: a call the model can copy, not an instruction to translate."""
+        write = self._last_write()
+        made = write["name"] if write else "your last edit"
+        for tool, names in self.readback:
+            ids = self._ids_for(names, write)
+            if ids is not None:
+                return ("Before finishing, verify the edit you made with %s: call %s with "
+                        "%s and compare what it returns with the brief. If it did not land "
+                        "as asked, fix it; if you cannot check, say the work is unverified "
+                        "and why." % (made, tool, json.dumps(ids)))
+        return ("Before finishing, inspect the target changed by %s and compare with the "
+                "brief. If unable, state that the work is unverified and explain the "
+                "blocker." % made)
+
+    def _auto_review(self, messages):
+        """Look at the work before accepting "done": take the app's screenshot
+        and hand the vision model's review back as the next message.
+
+        The prompt asks the model to request a preview; a small model forgets,
+        and a nag is an instruction it has to translate. This is the
+        observation itself. Only with a vision model - without one the picture
+        would clear the read-back obligation while nobody had looked - and only
+        when the screenshot's ids are in the journal. Returns True when a review
+        was appended; the ordinary read-back reminder is the fallback.
+        """
+        if not (self.review and self.vision) or self.cancel.is_set():
+            return False
+        tool, names = self.review
+        ids = self._ids_for(names, self._last_write())
+        if ids is None:
+            return False
+        self.emit("sys", "Looking at the result before accepting it: %s" % tool)
+        self.auto = True
+        try:
+            text, _, read = self._call({"function": {"name": tool, "arguments": json.dumps(ids)}})
+        except CheckpointError:
+            raise
+        except Exception as e:
+            self.emit("sys", "Could not take the screenshot (%s); asking for a read-back instead." % e)
+            return False
+        finally:
+            self.auto = False
+        if not read or "Visual review (model assessment)" not in text:
+            return False
+        write = self._last_write()
+        messages.append({"role": "user", "content":
+            "Automatic review of the work after %s - I called %s with %s:\n%s\n\n"
+            "This is what is on screen now. Fix what the review names, then finish; "
+            "if it says the work is as asked, finish with your summary. Do not claim "
+            "anything the review did not show."
+            % (write["name"] if write else "your edits", tool, json.dumps(ids), text)})
+        return True
+
+    def _fresh_lessons(self):
+        if self.notebook is None:
+            return ""
+        fresh = self.notebook.fresh()
+        return eng.lessons_section(fresh).strip() if fresh else ""
 
     def _save(self):
         try:
@@ -264,13 +409,6 @@ class Executor:
         args = json.loads(fn.get("arguments") or "{}")
         if not isinstance(args, dict):
             raise ValueError("tool arguments must be an object")
-        if name == workflows.CAPABILITY_TOOL["function"]["name"]:
-            validate(args, workflows.CAPABILITY_TOOL["function"]["parameters"])
-            return json.dumps(workflows.capabilities(self.bridge_tools)), False, False
-        # Resolve to the original tool before validation, signatures, recovery,
-        # journaling and dispatch. Aliases cannot bypass any executor guard.
-        if name in self.workflow_adapters:
-            name = self.workflow_adapters[name][0]
         if name == "studio_task_update":
             validate(args, TASK_TOOL["function"]["parameters"])
             for key, value in args.items():
@@ -282,6 +420,22 @@ class Executor:
         if name == toolsmith.CREATE_TOOL["function"]["name"]:
             validate(args, toolsmith.CREATE_TOOL["function"]["parameters"])
             return self._make(args), False, False
+        if name == ASK_TOOL["function"]["name"]:
+            validate(args, ASK_TOOL["function"]["parameters"])
+            self.asked = {"question": args["question"], "options": args["options"],
+                          "multiple": bool(args.get("multiple"))}
+            self.emit("ask", self.asked)
+            return ("The question is in front of the user with its choices. Their answer "
+                    "will be the next message: finish this reply now, with no further "
+                    "tool calls and no work on the question's outcome.", False, False)
+        if name == lessons.REMEMBER_TOOL["function"]["name"]:
+            validate(args, lessons.REMEMBER_TOOL["function"]["parameters"])
+            if self.notebook is None:
+                raise ValueError("This tab keeps no notebook; nothing was recorded.")
+            lesson, note = self.notebook.add(args["lesson"], "model")
+            self.emit("sys", "Remembered: " + lesson["text"])
+            return ("Kept for future tasks in this app: %s%s" % (
+                lesson["text"], "" if not note else " (" + note + ")"), False, False)
         made = self.library.get(name) if self.library is not None else None
         if made is not None:
             validate(args, made.parameters())
@@ -289,8 +443,14 @@ class Executor:
         if name not in self.allowed:
             raise ValueError("tool is not enabled: " + name)
         spec = self.specs.get(name, {})
-        validate(args, spec.get("inputSchema", self.allowed[name]))
-        validate_action(args, spec.get("description", ""))
+        try:
+            validate(args, spec.get("inputSchema", self.allowed[name]))
+            validate_action(args, spec.get("description", ""))
+        except ValueError as e:
+            # A refusal is a fact about the contract the model got wrong once;
+            # the notebook learns it after the run so it is wrong once only.
+            self.refusals.append((name, str(e)))
+            raise
         if name == "resolve_control" and str(args.get("action", "")).lower().strip() == "quit":
             raise ValueError("Closing Resolve is prohibited; it may contain unsaved work.")
         signature = json.dumps([name, args], sort_keys=True)
@@ -306,6 +466,8 @@ class Executor:
                  "read": read, "status": "running"}
         if self.via:
             entry["via"] = self.via       # a step of a made tool, not a bare call
+        if self.auto:
+            entry["auto"] = True          # the executor's own look, not the model's
         self.record.journal.append(entry)
         self._save()  # record intent before a call can change the project
         self.emit("tool", name + " " + json.dumps(args)[:160])
@@ -456,7 +618,7 @@ class Executor:
             raise
 
     def _run(self, messages, max_steps=25, streaming=True):
-        failures, needs_read, reminders = 0, False, 0
+        failures, needs_read, reminders, reviews = 0, False, 0, 0
         for entry in self.record.journal:
             if entry.get("verifies") and entry.get("status") == "ok":
                 needs_read = False
@@ -473,7 +635,8 @@ class Executor:
             if self.cancel.is_set():
                 return stop("Stopped. Completed edits remain; inspect before resuming.")
             context = context_messages(messages, self.record, self.tools,
-                                       self.max_chars, memory=bool(self.tools))
+                                       self.max_chars, memory=bool(self.tools),
+                                       extra=self._fresh_lessons())
             if streaming:
                 msg = self.llm.stream(context, self.tools,
                                       lambda piece: self.emit("token", piece))
@@ -497,9 +660,16 @@ class Executor:
             if not calls:
                 if self.cancel.is_set():
                     return stop("Stopped. No further tools were called.")
+                # An unverified edit and a model that says it is done: look at
+                # the work ourselves when the app has a picture and something
+                # to see it with, else name the read that would verify it.
+                if needs_read and reviews < 2 and self._auto_review(messages):
+                    reviews += 1
+                    needs_read = False
+                    self._save()
+                    continue
                 if needs_read and reminders < 2:
-                    messages.append({"role": "user", "content":
-                        "Before finishing, inspect the target changed by your last edit and compare with the brief. If unable, state that the work is unverified and explain the blocker."})
+                    messages.append({"role": "user", "content": self._readback_hint()})
                     reminders += 1
                     continue
                 final = msg.get("content") or "The model returned an empty reply."
@@ -525,9 +695,17 @@ class Executor:
                             needs_read = True
                             self.must_inspect = True
                     failures = failures + 1 if out.startswith("TOOL ERROR") else 0
+                    self.trouble = self.trouble or out.startswith("TOOL ERROR")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": out})
                 self.emit("tool_result", " ".join(out.split())[:180])
                 self._save()
             if failures >= 3:
                 return stop("Stopped after repeated tool errors. Review the last error and inspect the project before continuing.")
+            if self.asked is not None:
+                # The user has a question to answer; the model has nothing to
+                # do until they do. Any unverified edit stays in the journal
+                # and is picked up when the answer starts the next run.
+                self.record.status = "response complete; waiting for the user's answer"
+                self._save()
+                return self.asked["question"]
         return stop("Stopped at the step limit. Progress is saved; inspect and continue the task when ready.")

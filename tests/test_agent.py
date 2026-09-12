@@ -583,8 +583,9 @@ class TestPlainChat(unittest.TestCase):
         must verify. This tab edits nothing; its rules are its own, and every
         tool the prompt names is one the tab actually offers."""
         prompt = eng.CHAT.chat_prompt()
-        self.assertEqual(prompt, eng.CHAT.system_prompt + eng.CHAT_RULES)
+        self.assertEqual(prompt, eng.CHAT.system_prompt + eng.CREATIVE_RULES + eng.CHAT_RULES)
         self.assertEqual(prompt, eng.CHAT.cli_prompt())
+        self.assertNotIn("LOOKING THINGS UP", prompt)   # CHAT_PROMPT teaches those itself
         for absent in ("TASK QUALITY", "continuing conversation, in a window", "Inspect the target"):
             self.assertNotIn(absent, prompt)
         for tool in eng.CHAT.tool_names():
@@ -1859,10 +1860,14 @@ class TestGui(unittest.TestCase):
             self.app._boot_bridge(s)
             self.assertTrue(spec.learned)
             self.assertEqual(s.groups, ["scene", "obj"])
-            self.assertEqual(len(s.tools), 4)
+            # The bridge's four, then the research sidecar's beside them.
+            names = [t["function"]["name"] for t in s.tools]
+            self.assertEqual(names[:4], ["scene_list", "scene_get", "obj_add", "obj_del"])
+            self.assertEqual(set(names[4:]), set(eng.RESEARCH_TOOL_NAMES))
             self.assertNotEqual(s.messages[0]["content"], before)
             self.assertIn("Blender counts in metres.", s.messages[0]["content"])
-            self.assertEqual(s.messages[0]["content"], spec.chat_prompt())
+            self.assertEqual(s.messages[0]["content"], s.prompt())
+            self.assertTrue(s.messages[0]["content"].startswith(spec.chat_prompt()))
         finally:
             eng.MCPClient = real
             self.app._forget_bridge(spec)
