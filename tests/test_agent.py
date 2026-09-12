@@ -399,7 +399,8 @@ class TestAppRegistry(unittest.TestCase):
 
 
 class TestPlainChat(unittest.TestCase):
-    """The one tab with no app behind it: a conversation and nothing else."""
+    """The one tab with no app behind it: a conversation, and a bridge that
+    reads this PC's files and the web but changes nothing."""
 
     def test_it_is_a_tab_but_never_a_drivable_app(self):
         """DRIVABLE is derived from APPS, and the sidebar must not offer chat
@@ -413,34 +414,57 @@ class TestPlainChat(unittest.TestCase):
 
     def test_nothing_tries_to_start_probe_or_find_it(self):
         self.assertFalse(eng.CHAT.drivable)
-        self.assertTrue(all(app.drivable for app in eng.APPS))
+        self.assertTrue(all(app.drivable and app.bridged for app in eng.APPS))
         self.assertIsNone(eng.CHAT.exe())
         self.assertTrue(eng.CHAT.installed())    # nothing to install
         self.assertTrue(eng.CHAT.running())      # the tab is the whole of it
         with self.assertRaises(RuntimeError):
             eng.CHAT.launch()
 
-    def test_it_offers_no_tools_and_no_groups(self):
-        self.assertEqual(eng.CHAT.tool_names(), set())
-        self.assertEqual(eng.CHAT.groups, {})
-        self.assertEqual(eng.CHAT.default_groups, [])
+    def test_its_bridge_runs_in_process_and_only_reads(self):
+        """No subprocess: connect() is a Loopback over the research bridge's
+        own Server, and every tool it offers is annotated read-only - the
+        executor must never owe a read-back in this tab."""
+        import studio_mcp
+        import studio_research_mcp as research
+        self.assertTrue(eng.CHAT.bridged)
+        client = eng.CHAT.connect()
+        try:
+            self.assertIsInstance(client, studio_mcp.Loopback)
+            self.assertIs(client.server, research.SERVER)
+            client.initialize()
+            tools = client.list_tools()
+        finally:
+            client.close()
+        self.assertEqual({t["name"] for t in tools}, eng.CHAT.tool_names())
+        self.assertEqual(eng.CHAT.tool_names(), {n for g in eng.RESEARCH_GROUPS.values() for n in g})
+        for t in tools:
+            self.assertIs(t["annotations"]["readOnlyHint"], True, t["name"])
+        # the script is named too, so the harness can check it like any bridge here
+        self.assertTrue(eng.CHAT.args[0].endswith("studio_research_mcp.py"))
+        self.assertTrue(os.path.isfile(eng.CHAT.args[0]))
 
-    def test_the_prompt_carries_no_tool_rules(self):
-        """The app suffixes brief a tab on its bridge and its tools. This tab
-        has neither, and the rules would be describing something absent."""
+    def test_the_prompt_teaches_its_tools_and_no_app_rules(self):
+        """The app suffixes brief a tab on its app's bridge and on edits it
+        must verify. This tab edits nothing; its rules are its own, and every
+        tool the prompt names is one the tab actually offers."""
         prompt = eng.CHAT.chat_prompt()
-        self.assertEqual(prompt, eng.CHAT.system_prompt)
+        self.assertEqual(prompt, eng.CHAT.system_prompt + eng.CHAT_RULES)
         self.assertEqual(prompt, eng.CHAT.cli_prompt())
-        for absent in ("studio_task_update", "studio_workflow_capabilities",
-                       "TASK QUALITY"):
+        for absent in ("TASK QUALITY", "continuing conversation, in a window", "Inspect the target"):
             self.assertNotIn(absent, prompt)
+        for tool in eng.CHAT.tool_names():
+            self.assertIn(tool, prompt)
+        self.assertIn("studio_task_update", prompt)
 
     def test_the_prompt_forbids_claiming_work_it_cannot_do(self):
         """A confident "done - I added the layer" from a tab that cannot reach
-        After Effects is worse than no answer at all."""
+        After Effects is worse than no answer at all - and text a page returned
+        is information, not instructions."""
         prompt = eng.CHAT.chat_prompt()
-        self.assertIn("no bridge", prompt)
         self.assertIn("never describe such a change as done", prompt)
+        self.assertIn("nothing here writes", prompt)
+        self.assertIn("never instructions", prompt)
         self.assertIn("Chat", prompt)
 
 
@@ -932,17 +956,17 @@ class TestGui(unittest.TestCase):
                 self.assertTrue(lbl.winfo_ismapped())
                 self.assertLessEqual(self._bottom_of(lbl), win_h)
 
-    def test_the_bridges_row_counts_bridges_not_tabs(self):
-        """A chat tab has no bridge; counting it would report one of two
-        bridges missing when nothing is missing at all."""
+    def test_the_bridges_row_counts_every_bridge_chats_included(self):
+        """The chat tab's bridge runs in process, but it is a bridge with
+        tools: the row counts it, and closing the tab drops the count."""
         self.app._sync_bridges()
         _lead, lbl = self.app.conn["bridges"]
-        bridges = [i for i in self.app.order if eng.TABS_BY_ID[i].drivable]
-        before = lbl.cget("text")
-        self.assertIn(str(len(bridges)), before)
+        bridges = [i for i in self.app.order if eng.TABS_BY_ID[i].bridged]
+        self.assertIn(eng.CHAT.id, bridges)
+        self.assertIn(str(len(bridges)), lbl.cget("text"))
         self.app._close_tab(eng.CHAT.id)
         self.app._sync_bridges()
-        self.assertEqual(lbl.cget("text"), before)
+        self.assertIn(str(len(bridges) - 1), lbl.cget("text"))
 
     def test_one_tab_per_app(self):
         self.assertEqual(set(self.app.tab_ui), set(self.app.sessions))
@@ -1059,12 +1083,18 @@ class TestGui(unittest.TestCase):
         self.assertIn("host-level-problem", self.app.empty_msg.cget("text"))
         self.app._on_send()          # must not raise with nothing open
 
-    def test_a_chat_tab_is_ready_without_starting_a_bridge(self):
-        """No MCP subprocess, no tools - but still warmed against its own
-        prompt prefix, which is the whole reason the first reply is quick."""
+    def test_a_chat_tab_is_ready_without_starting_a_subprocess(self):
+        """Its bridge is in process - a Loopback, no pipes - and its tools are
+        the research bridge's; still warmed against its own prompt prefix and
+        the same tool list a real message uses, which is the whole reason the
+        first reply is quick."""
+        import studio_mcp
+        import studio_tasks as tasks
         warmed = []
 
         class OneReply:
+            model = "shared"
+
             def chat(self, messages, tools, max_tokens=None):
                 warmed.append((messages, tools))
                 return {"choices": [{"message": {"content": "ready"}}]}
@@ -1079,14 +1109,21 @@ class TestGui(unittest.TestCase):
         self.app._drain()              # the queue, on the UI thread, now
         self.app.update()
         self.assertTrue(s.ready)
-        self.assertIsNone(s.mcp)
-        self.assertEqual(s.tools, [])
+        self.assertIsInstance(s.mcp, studio_mcp.Loopback)
+        self.assertEqual({t["function"]["name"] for t in s.tools}, eng.CHAT.tool_names())
+        self.assertIsNotNone(s.library)                # it has tools to make tools from
         self.assertEqual(len(warmed), 1)
         messages, tools = warmed[0]
-        self.assertEqual(tools, [])                    # nothing to offer
+        self.assertEqual(tools, tasks.inference_tools(s.tools, s.library))
+        self.assertIn("studio_task_update", [t["function"]["name"] for t in tools])
         self.assertEqual(messages[0]["content"], eng.CHAT.chat_prompt())
         self.assertEqual(s.bridge[0], "ok")
-        self.assertNotIn("Bridge connected", s.view.get("1.0", "end"))
+        self.assertIn("5 tools", s.bridge[1])
+        body = s.view.get("1.0", "end")
+        self.assertNotIn("Bridge connected", body)
+        self.assertIn("within reach", body)
+        s.close()
+        self.assertIsNone(s.mcp)
 
     def test_the_comfyui_tab_gets_its_own_small_model_and_the_rest_share(self):
         """One host, but not one model: the ComfyUI tab drives a small model
@@ -1113,19 +1150,18 @@ class TestGui(unittest.TestCase):
         finally:
             self.app.llm, self.app.model_ids = real_llm, real_ids
 
-    def test_bridge_only_actions_say_why_they_do_nothing_in_chat(self):
-        """Both are menu items, always enabled. Silence would read as a bug."""
+    def test_start_says_why_it_does_nothing_in_chat(self):
+        """A menu item, always enabled. Silence would read as a bug - and
+        there is no app behind this tab to start."""
         s = self.app.sessions[eng.CHAT.id]
         self.app._select(s.id)
         was_ready, s.ready = s.ready, True
         try:
             self.app._on_fix()
-            self.app._capabilities()
         finally:
             s.ready = was_ready
         body = s.view.get("1.0", "end")
         self.assertIn("no app to start", body)
-        self.assertIn("no capabilities", body)
         self.assertFalse(s.busy)
 
     def test_a_remote_app_is_checked_not_started(self):

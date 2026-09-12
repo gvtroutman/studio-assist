@@ -3,7 +3,8 @@
 A chat window that drives your creative apps with a **local LLM**. One tab per app —
 **After Effects**, **Premiere Pro**, **Photoshop**, **Illustrator**, **DaVinci Resolve**,
 **ComfyUI** and **OpenCode** today, plus **any app you have an MCP bridge for** — and a
-**Chat** tab for everything that needs no app at all.
+**Chat** tab for everything that needs no app at all — it reads your files and the web
+instead.
 
 Ask in plain language — *"make a 1920x1080 title card, 5 seconds at 24fps"* — and it
 builds it in the app the current tab points at, one real undo step at a time.
@@ -21,11 +22,14 @@ neither app's tools are offered to the other model turn. `Ctrl+Tab` cycles tabs,
 `+` opens one for another app and `×` closes one; whatever is open when you quit is
 what comes back next time.
 
-**Chat** is the same window with the bridge and the tools left out: the model on its
-own, for the questions between the work — what frame rate to finish in, how long 240
-frames runs at 23.976, talking an approach through before you build it. It starts
-instantly, needs nothing installed, and it will tell you to use an app tab rather
-than pretend it changed your project.
+**Chat** is the same window with no creative app behind it, for the questions between
+the work — what frame rate to finish in, how long 240 frames runs at 23.976, talking
+an approach through before you build it. What it has instead are read-only tools for
+looking things up: it can list and search folders on this PC, read a brief, a script or
+a `.docx`, search the web and read a page, and it cites what it read. It writes
+nothing, refuses files that hold credentials, starts instantly, needs nothing
+installed, and it will tell you to use an app tab rather than pretend it changed your
+project.
 
 Bridges start **lazily**: a tab connects the first time you open it, then warms the
 model against that app's own tool schemas so your first question there comes back in

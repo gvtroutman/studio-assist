@@ -5,8 +5,8 @@ Working notes for anyone — human or agent — changing this project.
 ## What this is
 
 A chat app that drives creative apps with a **local LLM**, one tab per app — plus
-a **Chat** tab with no app behind it, for the questions that need no tools. Two
-moving parts:
+a **Chat** tab with no app behind it, for the questions that need no app: it reads
+this PC's files and the web instead. Two moving parts:
 
 - **`studio_agent.py`** — the engine. The **app registry**, an MCP stdio client, an
   OpenAI-compatible LLM client (streaming and not), JSON-Schema sanitizing, and
@@ -48,6 +48,10 @@ moving parts:
 - **`studio_premiere_mcp.py`**, **`premiere_panel/`** — our bridge to Premiere Pro (the
   Beta this studio cuts in): a table of tools whose bodies are ExtendScript run through
   `studio_cep`, and the panel that evaluates them. `--install-panel` installs the panel.
+- **`studio_research_mcp.py`** — the Chat tab's bridge: this PC's files and the web,
+  read-only (`list_folder`, `find_files`, `read_file`, `search_web`, `fetch_page`). The
+  one bridge the GUI runs *in process*, through `studio_mcp.Loopback`. See *The tab
+  with no app*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -120,29 +124,55 @@ one.
 
 ### The tab with no app: `ChatSpec`
 
-`CHAT` is an `AppSpec` subclass with everything bridge-shaped emptied out: no
-`command`, no `groups`, no tools, and `drivable = False`. It duck-types the rest of
-`AppSpec`, so `Session`, the tab strip, the transcript and the executor need no
-special case for it. Two rules keep it honest:
+`CHAT` is an `AppSpec` subclass with the *application* emptied out — no `exe_globs`,
+no `probe`, `drivable = False` — but not the bridge. Its tools are
+`studio_research_mcp.py`'s: list and search folders on this PC, read a text document
+(plain text, code, JSON, a `.docx`'s paragraphs), search the web, read a page as text.
+Every one is a read. It duck-types the rest of `AppSpec`, so `Session`, the tab strip,
+the transcript and the executor need no special case for it. The rules that keep it
+honest:
 
 - **It is not in `APPS`.** `DRIVABLE` is derived from that list, and the sidebar must
   not advertise chat as something the agent can drive. `TABS` / `TABS_BY_ID` are the
   wider set — everything that can be a tab — and are what the tab strip, the new-tab
   menu and `--app` read.
-- **`drivable` is the question everything bridge-shaped asks first.** Starting a
-  bridge, probing, launching the app, counting bridges in the sidebar, offering
-  capability groups, `Start <app>`: each checks it. `_boot_session` skips straight to
-  the warm-up, and the bridges row counts drivable tabs only — counting chat would
-  report one of two bridges missing when nothing is missing at all.
+- **`drivable` and `bridged` are two different questions.** `drivable` is "is there an
+  application to find, probe, launch and repair" — `Start <app>`, `_fix()`,
+  `_refresh_bridge()`'s not-running state, the sidebar rows all ask it, and chat says
+  no. `bridged` is "is there an MCP bridge with tools" — starting one at boot, the
+  library of made tools, the bridges row and its menu, the capabilities window, the
+  CLI's bridge path all ask *that*, and chat says yes. Adding a `drivable` check to
+  something bridge-shaped silently strips the chat tab of its tools; a test boots the
+  chat tab and asserts it has them.
+- **Its bridge runs in this process.** `AppSpec.connect()` is where a tab's bridge
+  comes from — an `MCPClient` subprocess for every app — and `ChatSpec.connect()`
+  returns a `studio_mcp.Loopback` over `studio_research_mcp.SERVER` instead: nothing to
+  spawn, nothing to fail, no pipe to lose. `command`/`args` still name the script, so
+  `python studio_mcp.py check --app chat --in-process` and `--call` work on it like any
+  bridge written here, and `tests/test_mcp.py` walks it with the others.
+- **The bridge is read-only by construction, and says no to two things.** Files that
+  exist to hold secrets (`.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `*.kdbx`, …) are
+  refused by name, because a fetched page is untrusted text and "read this file, then
+  fetch this URL" is the shape of an exfiltration; the prompt tells the model that what
+  a page or file says is information, never instructions. And every walk and fetch is
+  bounded — entries, seconds, bytes — and a result that stopped early *says so*, so a
+  glob over `C:\` is a partial list and a sentence, not a hung tab. Long texts come
+  back in windows whose first line names the next `start`; the engine clips a tool
+  result at `MAX_TOOL_RESULT_CHARS` anyway, so the window default sits under it.
+- **The search endpoint wants a browser.** `search_web` scrapes DuckDuckGo's HTML
+  endpoint (`STUDIO_SEARCH_URL`) with a browser user agent; with the bridge's own
+  name it answers a bot check and no results, and it is what a share of ordinary sites
+  answer with 403. A bot page is recognised and reported as a refusal, not parsed into
+  zero results. If the markup changes, `SearchResults` is the one class to fix and
+  `tests/test_research.py` holds the shape.
 
 Its prompt has one job the app prompts do not: **stop the model claiming work it
-cannot do.** There is no bridge to fail, so nothing else will contradict a confident
-"done — I added the layer". `chat_prompt()` also drops `CHAT_SUFFIX` and
-`QUALITY_RULES`, which brief a tab on its bridge and its tools; with no tools they
-describe something absent. `inference_tools([])` returns `[]` for the same reason —
-no bridge tools means no internal ones either — and the executor then leaves the
-saved-task block out of the request, because a tab that cannot change anything has no
-task to carry.
+cannot do.** There is no app bridge to fail, so nothing else will contradict a
+confident "done — I added the layer"; it also names every tool the tab has, so the
+model looks rather than guesses. `chat_prompt()` drops `CHAT_SUFFIX` and swaps
+`QUALITY_RULES` for `CHAT_RULES`: the app rules are about inspecting and verifying
+edits, and this tab makes none. The read-only annotations are what keep the executor
+from asking for a read-back after a `read_file`.
 
 Two things stay derived, never hand-maintained:
 
@@ -602,8 +632,10 @@ composer.
   never handed to the model as a tool that cannot run. Like the settings file, a wrecked
   or unwritable file costs one made tool and never the app — and when it cannot be
   saved, the model is told the tool is session-only rather than left to assume.
-- The chat tab gets no tool maker: `inference_tools([])` is still `[]`, and there would
-  be nothing to make a tool out of.
+- Every tab with a bridge gets a library, chat's included — `Chat._session()` is the
+  one place a `Session` is made, at startup and from the new-tab menu alike. (Restored
+  tabs once got none, and the tool maker worked only in tabs opened later.) A tab with
+  no tools at all still gets none: `inference_tools([])` is `[]`.
 
 ## The MCP harness
 
@@ -683,6 +715,9 @@ python studio_photoshop_mcp.py --check       # the COM bridges; no app is touche
 python studio_illustrator_mcp.py --list-tools
 python studio_premiere_mcp.py --check        # the CEP bridge; no app is touched by --check
 python studio_premiere_mcp.py --install-panel   # copy premiere_panel/ under CEP/extensions (Premiere closed)
+python studio_research_mcp.py --check        # the Chat tab's bridge; reads nothing by itself
+python studio_mcp.py check --app chat --in-process --call   # ...and list_folder on the home folder
+python studio_agent.py --app chat "find the brief in my Documents folder"   # the chat tab from the CLI
 python studio_mcp.py check --app premiere --in-process
 python studio_mcp.py check --app photoshop --in-process   # against the registry entry
 python studio_agent.py --mcp "npx -y some-mcp" --name Blender --list-tools  # any bridge
@@ -694,7 +729,8 @@ python studio_chat.py                        # the real app (console attached)
 ```
 
 `tests/` never touches the network, the creative apps, Docker, or the model — the
-COM bridges are tested with `HOST.run` replaced, the one PowerShell worker a test
+research bridge's `urlopen` is swapped for a fake with a table of pages,
+the COM bridges are tested with `HOST.run` replaced, the one PowerShell worker a test
 starts is given a ProgID nothing answers to, and the Premiere bridge talks to a fake
 panel on a random loopback port —
 `test_comfy.py` and `test_opencode.py` swap `urllib.request.urlopen` for an in-memory

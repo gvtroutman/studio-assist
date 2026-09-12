@@ -242,7 +242,7 @@ class TestPlainChat(unittest.TestCase):
         with patch("sys.stdout", new=io.StringIO()) as out:
             self.assertEqual(eng.converse(llm, None, [], eng.CHAT, args), 0)
         self.assertIn("Finish at 23.976.", out.getvalue())
-        self.assertEqual(llm.requests[0][0]["content"], eng.CHAT.system_prompt)
+        self.assertEqual(llm.requests[0][0]["content"], eng.CHAT.cli_prompt())
 
 
 class TestMemory(unittest.TestCase):

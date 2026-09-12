@@ -23,6 +23,7 @@ import studio_opencode_mcp as opencode      # noqa: E402
 import studio_photoshop_mcp as photoshop    # noqa: E402
 import studio_illustrator_mcp as illustrator  # noqa: E402
 import studio_premiere_mcp as premiere      # noqa: E402
+import studio_research_mcp as research      # noqa: E402
 
 
 # ------------------------------------------------------------ a test bridge
@@ -427,7 +428,7 @@ class TestOurBridges(unittest.TestCase):
     entry - in process, with no ComfyUI, no container, no COM, no subprocess."""
 
     def check(self, module, app_id):
-        app = eng.APPS_BY_ID[app_id]
+        app = eng.TABS_BY_ID[app_id]
         client = mcp.Loopback(module.SERVER)
         out = io.StringIO()
         tools, findings = mcp.check_live(client, app, out=out, sanitize=eng.sanitize_schema,
@@ -454,8 +455,11 @@ class TestOurBridges(unittest.TestCase):
     def test_premiere(self):
         self.check(premiere, "premiere")
 
+    def test_research(self):
+        self.check(research, "chat")
+
     def test_the_bridges_command_line_describes_the_same_contract(self):
-        for module in (comfy, opencode, photoshop, illustrator, premiere):
+        for module in (comfy, opencode, photoshop, illustrator, premiere, research):
             with self.subTest(bridge=module.SERVER.name):
                 real = sys.stdout
                 sys.stdout = io.StringIO()
