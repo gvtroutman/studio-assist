@@ -591,7 +591,7 @@ def t_fetch_output(a):
 
 
 def t_upload_image(a):
-    path = a["path"]
+    path = studio_mcp.local_path(a["path"])
     if not os.path.isfile(path):
         return result("No file at %s on this workstation." % path, error=True)
     with open(path, "rb") as fh:

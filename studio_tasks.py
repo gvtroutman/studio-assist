@@ -285,6 +285,10 @@ class CheckpointError(RuntimeError):
     pass
 
 
+class RepeatedCall(ValueError):
+    """The same read, with the same arguments, for the third time running."""
+
+
 def inference_tools(tools, library=None):
     """One exact tool prefix for execution and every GUI warm-up path.
 
@@ -502,6 +506,34 @@ class Executor:
         read = readonly(name, args, spec)
         if not read and self.must_inspect:
             raise ValueError("Inspect the current project before editing a restored task.")
+        if read:
+            # The same read with the same arguments, straight after itself,
+            # answers the same. A model that asks again did not take the
+            # answer in - a window too small for its own tool results, most
+            # often, which the warm-up now fits, but a small model loops on
+            # its own too. The second time it gets the first answer back,
+            # marked as such; the third ends the run rather than the step
+            # limit. A write is never short-circuited: a second generate
+            # with the same prompt is another picture.
+            again = 0
+            for e in reversed(self.record.journal):
+                if e.get("signature") == signature and e.get("status") == "ok":
+                    again += 1
+                else:
+                    break
+            if again >= 2:
+                raise RepeatedCall("%s was called three times in a row with the same "
+                                   "arguments, and the answer has not changed." % name)
+            if again == 1:
+                text = (self.record.journal[-1].get("result") or "") + (
+                    "\n\n(The same call as the step before, with the same arguments: "
+                    "this is the same answer. Use it, or call something else.)")
+                self.record.journal.append({
+                    "name": name, "arguments": args, "signature": signature,
+                    "read": True, "status": "ok", "result": text, "repeat": True,
+                    "verifies": False})
+                self._save()
+                return text, False, True
         entry = {"name": name, "arguments": args, "signature": signature,
                  "read": read, "status": "running"}
         if self.via:
@@ -670,7 +702,7 @@ class Executor:
 
     def _run(self, messages, max_steps=25, streaming=True):
         failures, needs_read, reminders, reviews = 0, False, 0, 0
-        called, nudged = 0, False
+        called, nudged, repeated = 0, False, False
         for entry in self.record.journal:
             if entry.get("verifies") and entry.get("status") == "ok":
                 needs_read = False
@@ -741,9 +773,10 @@ class Executor:
                 self._save()
                 return final
             for call in calls:
-                if self.cancel.is_set() or failures >= 3:
+                if self.cancel.is_set() or failures >= 3 or repeated:
                     out = ("Cancelled before dispatch; this call was not executed."
                            if self.cancel.is_set() else
+                           "Not executed: the model is repeating itself." if repeated else
                            "Not executed: stopped after three consecutive tool errors.")
                     self._skipped(call, out)
                 else:
@@ -753,6 +786,11 @@ class Executor:
                         needs_read = (needs_read or wrote) and not read
                     except CheckpointError:
                         raise
+                    except RepeatedCall as e:
+                        # Not a tool error: nothing for the failure count, and
+                        # nothing for the notebook to learn a platitude from.
+                        out = "Not executed: " + str(e)
+                        repeated = True
                     except Exception as e:
                         out = "TOOL ERROR: " + str(e)
                         if self.record.journal and self.record.journal[-1].get("status") == "unknown":
@@ -762,6 +800,10 @@ class Executor:
                     self.trouble = self.trouble or out.startswith("TOOL ERROR")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": out})
                 self._save()
+            if repeated:
+                return stop("Stopped: the model made the same read three times in a row, with the "
+                            "same arguments and the same answer, so it is not taking its results "
+                            "in. Try again with a shorter request, or New chat.")
             if failures >= 3:
                 return stop("Stopped after repeated tool errors. Review the last error and inspect the project before continuing.")
             if self.asked is not None:

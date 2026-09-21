@@ -325,6 +325,7 @@ class LLM:
     them, for the status line.
     """
     def __init__(self, base_url, model, temperature=0.2, timeout=300, draft=None):
+        self.base_url = base_url
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.temperature = temperature
@@ -554,17 +555,19 @@ def looks_vision(model_id):
 
 
 def probe_models(base_url, timeout=8):
-    """-> (reachable, loaded_id_or_None, [ids], [vision ids], error_or_None)
+    """-> (reachable, [loaded ids], [ids], [vision ids], error_or_None)
 
-    The vision ids are the served models that can take a picture in a message:
-    what LM Studio types as "vlm", or, from a host that does not say, what the
-    name suggests."""
+    `loaded` is every model in VRAM, in the host's order - not the first one,
+    which after the LLM PC restarts is whichever helper got loaded first: the
+    vision model, or the draft. The vision ids are the served models that can
+    take a picture in a message: what LM Studio types as "vlm", or, from a
+    host that does not say, what the name suggests."""
     try:  # LM Studio's REST API reports load state and type; plain /v1/models does not.
         with urllib.request.urlopen(api_root(base_url) + "/api/v0/models",
                                     timeout=timeout) as r:
             data = json.load(r).get("data", [])
         ids = [m.get("id") for m in data if m.get("id")]
-        loaded = next((m.get("id") for m in data if m.get("state") == "loaded"), None)
+        loaded = [m.get("id") for m in data if m.get("id") and m.get("state") == "loaded"]
         vision = [m.get("id") for m in data
                   if m.get("id") and (m.get("type") == "vlm" or
                                       (not m.get("type") and looks_vision(m.get("id"))))]
@@ -574,17 +577,43 @@ def probe_models(base_url, timeout=8):
     try:
         with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=timeout) as r:
             ids = [m.get("id") for m in json.load(r).get("data", [])]
-        return True, None, ids, [i for i in ids if looks_vision(i)], None
+        return True, [], ids, [i for i in ids if looks_vision(i)], None
     except Exception as e:
-        return False, None, [], [], str(e)
+        return False, [], [], [], str(e)
+
+
+def in_vram(loaded):
+    """`loaded` as a list, from a caller that has one id or none."""
+    return [loaded] if isinstance(loaded, str) else list(loaded or [])
+
+
+def helper_models():
+    """Models the app has the host load for itself - a vision model, a draft -
+    which being in VRAM says nothing about what the user wants to run."""
+    return set(PREFERRED_VISION_MODELS) | {d for _, drafts in DRAFT_MODELS for d in drafts}
 
 
 def pick_model(loaded, ids, want=None):
-    """Prefer what the user asked for, then what is already in VRAM, then a known-good."""
+    """The executing model: what the user asked for; else the default when it
+    is in VRAM; else whatever else is in VRAM that the app did not put there;
+    else a known-good the host has; else the first.
+
+    "What is in VRAM" came before the known-good list from the start, so a
+    model loaded by hand in LM Studio is the one used. Once the window loaded a
+    vision model of its own and LM Studio a draft, the first loaded id after
+    an LLM-PC restart was qwen2.5-vl-7b-instruct, and every tab ran on it -
+    a 7B at 8,192 that answered the warm-up with HTTP 500. Those are helpers,
+    not choices.
+    """
+    loaded = in_vram(loaded)
     if want and want in ids:
         return want
-    if loaded:
-        return loaded
+    if DEFAULT_MODEL in loaded:
+        return DEFAULT_MODEL
+    helpers = helper_models()
+    for m in loaded:
+        if m not in helpers:
+            return m
     for m in PREFERRED_MODELS:
         if m in ids:
             return m
@@ -739,8 +768,9 @@ def pick_vision_model(vision_ids, executing, want=None, loaded=None):
         return want
     if executing in vision_ids:
         return executing
-    if loaded in vision_ids:
-        return loaded
+    for m in in_vram(loaded):
+        if m in vision_ids:
+            return m
     for m in PREFERRED_VISION_MODELS:
         if m in vision_ids:
             return m
@@ -815,17 +845,25 @@ class Vision:
             or "No assessment returned."
 
 
-def load_model(base_url, model, timeout=600):
+def load_model(base_url, model, timeout=600, context_length=None):
     """Ask LM Studio to load a model it has on disk. -> error text, or None.
 
     The vision model is picked from everything the host has downloaded, so it
     is usually not in VRAM when the window opens. LM Studio's REST API loads
     on request; a host without that endpoint still loads just-in-time on the
     first chat call, so a failure here is a note, never a stop.
+
+    `context_length` is the window to load it with. Without it LM Studio uses
+    the model's default, 8,192 for most - under every tab's prefix here. A
+    model already loaded is not reloaded by this call: LM Studio starts a
+    second instance beside the first, so `fit_model` unloads first.
     """
+    body = {"model": model}
+    if isinstance(context_length, int) and context_length > 0:
+        body["context_length"] = context_length
     req = urllib.request.Request(
         api_root(base_url) + "/api/v1/models/load",
-        data=json.dumps({"model": model}).encode("utf-8"),
+        data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -837,6 +875,115 @@ def load_model(base_url, model, timeout=600):
         return str(e)
 
 
+def loaded_instances(base_url, model, timeout=5):
+    """[(instance_id, context_length)] of one model's loaded instances on the
+    host, from LM Studio's /api/v1/models; [] when none, or from a host that
+    does not say. The first instance's id is the model's; a second is
+    "<model>:2", and requests by model id go to the first."""
+    try:
+        with urllib.request.urlopen(api_root(base_url) + "/api/v1/models",
+                                    timeout=timeout) as r:
+            models = json.load(r).get("models", [])
+    except Exception:
+        return []
+    for m in models:
+        if isinstance(m, dict) and m.get("key") == model:
+            out = []
+            for inst in m.get("loaded_instances") or []:
+                if isinstance(inst, dict) and isinstance(inst.get("id"), str):
+                    ctx = (inst.get("config") or {}).get("context_length")
+                    out.append((inst["id"], ctx if isinstance(ctx, int) else None))
+            return out
+    return []
+
+
+def unload_model(base_url, instance_id, timeout=60):
+    """Unload one instance from the host. -> error text, or None."""
+    req = urllib.request.Request(
+        api_root(base_url) + "/api/v1/models/unload",
+        data=json.dumps({"instance_id": instance_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            json.load(r)
+        return None
+    except urllib.error.HTTPError as e:
+        return "HTTP %s - %s" % (e.code, e.read()[:200].decode("utf-8", "replace"))
+    except Exception as e:
+        return str(e)
+
+
+# What a conversation needs after the fixed prefix, when this app chooses the
+# window: several tool exchanges, a screenshot's description, a reply.
+ROOM = 8192
+
+
+def wanted_context(prompt_tokens, maximum=None):
+    """The window to load a model with for a prefix of `prompt_tokens`: a
+    power of two, 16,384 at least, with ROOM after the prefix; never past the
+    model's own maximum."""
+    want = 16384
+    need = (prompt_tokens if isinstance(prompt_tokens, int) else 0) + ROOM
+    while want < need:
+        want *= 2
+    if isinstance(maximum, int) and maximum > 0:
+        want = min(want, maximum)
+    return want
+
+
+def estimate_tokens(system_prompt, tools):
+    """A prefix's cost before the host has counted it. Tool JSON tokenizes at
+    about 3.5 characters a token (measured on the ComfyUI tab: 27,500 chars,
+    7,707 tokens); 3 keeps the estimate on the high side."""
+    return (len(system_prompt or "") + len(json.dumps(tools or []))) // 3
+
+
+def fit_model(base_url, model, prompt_tokens, timeout=600, exact=True):
+    """Load `model` on the host with a window that fits a prefix of
+    `prompt_tokens` - or reload it if the window it has leaves under MIN_ROOM.
+    -> (context length now, note for the tab or "").
+
+    `prompt_tokens` is exact after a warm-up (`usage.prompt_tokens`) and an
+    `estimate_tokens` before one, which `exact=False` says so the note does
+    not quote a guess as a count. Nothing is done when the window fits, when
+    the model is already at its maximum (the note says it needs a bigger
+    model), or when the host has no REST API (the note is the old advice:
+    reload it by hand). A reload drops the host's prefix cache; the caller
+    warms up again after.
+    """
+    loaded, maximum = context_window(base_url, model)
+    if loaded is None and maximum is None:
+        return None, ""       # a host that does not say: nothing to fit against
+    if isinstance(loaded, int) and (not isinstance(prompt_tokens, int) or
+                                    loaded - prompt_tokens >= MIN_ROOM):
+        return loaded, ""
+    if isinstance(loaded, int) and isinstance(maximum, int) and maximum <= loaded:
+        return loaded, headroom_note(model, prompt_tokens, loaded, maximum)
+    want = wanted_context(prompt_tokens, maximum)
+    if isinstance(loaded, int) and want <= loaded:
+        return loaded, headroom_note(model, prompt_tokens, loaded, maximum)
+    for instance, _ in loaded_instances(base_url, model):
+        err = unload_model(base_url, instance)
+        if err:
+            return loaded, ("Could not unload %s on the host to reload it with a larger "
+                            "context window (%s). %s" % (model, err,
+                            headroom_note(model, prompt_tokens, loaded, maximum)))
+    err = load_model(base_url, model, timeout=timeout, context_length=want)
+    if err:
+        return loaded, ("Could not load %s with a %s-token context window (%s). %s"
+                        % (model, "{:,}".format(want), err,
+                           headroom_note(model, prompt_tokens, loaded, maximum)))
+    if isinstance(loaded, int):
+        return want, ("Reloaded %s with a %s-token context window: this tab's briefing and "
+                      "tools take %s%s, and the %s it was loaded with left %s for the "
+                      "conversation." % (model, "{:,}".format(want),
+                      "" if exact else "about ", "{:,}".format(prompt_tokens),
+                      "{:,}".format(loaded),
+                      "about {:,} tokens".format(loaded - prompt_tokens)
+                      if loaded > prompt_tokens else "nothing"))
+    return want, "Loaded %s with a %s-token context window." % (model, "{:,}".format(want))
+
+
 def resolve_vision(base_url, executing, vision_ids, loaded=None):
     """A `Vision` for this host, or None with the reason every tab should print.
 
@@ -846,7 +993,7 @@ def resolve_vision(base_url, executing, vision_ids, loaded=None):
     model = pick_vision_model(vision_ids, executing, want, loaded)
     if model:
         vision = Vision(base_url, model)
-        vision.needs_load = model not in (executing, loaded)
+        vision.needs_load = model != executing and model not in in_vram(loaded)
         return vision, None
     why = ("STUDIO_VISION_MODEL names %s, which the host does not have" % want
            if want else "the host has no vision-capable model downloaded")
@@ -2161,8 +2308,11 @@ APPS = [
         ],
         launch_note="Start ComfyUI on the LLM PC with --listen so it accepts connections "
                     "from this machine, then click Start again to re-check.",
-        # Small models that still make tool calls; the first one served wins.
-        models=["qwen3-1.7b", "qwen2.5-1.5b-instruct"],
+        # No `models` preference: this tab ran on qwen3-1.7b to leave the GPU
+        # to the pictures, and that model talked about generating instead of
+        # calling comfy_generate. The shared model does the job; ComfyUI and
+        # LM Studio each page what they need. STUDIO_MODEL_COMFYUI pins a
+        # smaller one for a host that cannot hold both.
         docs=[("ComfyUI documentation", "https://docs.comfy.org/"),
               ("ComfyUI workflow examples", "https://comfyanonymous.github.io/ComfyUI_examples/")],
         craft=CRAFT_IMAGES,
@@ -2772,6 +2922,16 @@ def converse(llm, mcp, tools, app, args, schemas=None):
         allowed, specs = toolsmith.contracts(tools, schemas)
         for problem in library.load(allowed, specs):
             log("  not offering a made tool - " + problem, args.quiet)
+    import studio_tasks as tasks
+    # The window the model is loaded with has to hold this briefing, these
+    # tools and a conversation; LM Studio's default does not. The GUI fits it
+    # after its warm-up, exactly; the CLI has no warm-up, so from an estimate.
+    if getattr(llm, "base_url", None):
+        _, note = fit_model(llm.base_url, llm.model,
+                            estimate_tokens(system_prompt, tasks.inference_tools(tools, library)),
+                            exact=False)
+        if note:
+            log("  " + note, args.quiet)
     if args.task:
         print(run_agent(llm, mcp, tools, " ".join(args.task), system_prompt,
                         args.max_steps, args.quiet, schemas=schemas, library=library,
