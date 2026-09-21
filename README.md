@@ -46,10 +46,32 @@ drive. It's your list, not the machine's: **pin** the apps you work in to the to
 **×** the ones you haven't set up out of the way, and **+** in the heading brings any
 of them back. Click a drivable app to open its tab.
 
-Underneath, **Connections** is two rows. *Inference* is the model host. *Bridges*
-opens a menu of every bridge that exists and what it can currently reach; pick one to
-see every tool it offers, grouped, and which of them this chat puts in front of the
-model.
+Underneath, **Connections** is two rows. *Inference* is the model host; its menu has
+one thing in it, **Connect**. *Bridges* opens a menu of every bridge that exists and
+what it can currently reach; pick one to see every tool it offers, grouped, and which
+of them this chat puts in front of the model.
+
+**When the model host is not there.** The window probes it as it opens, with a short
+timeout, so a PC still waking, a tailnet still coming up or an LM Studio server not yet
+started all read as *no inference host — trying again*. Nothing is lost, and nothing
+needs pressing: the window probes again every 30 seconds, quietly, and the tab you are
+looking at starts the moment the host answers; the others start when you switch to
+them. **Connect** — the header button that appears in place of *Start*, the Inference
+row, or **Bridges ▸ Connect to the inference host** — tries now instead of in 30
+seconds. The same happens if the host drops away in the middle of a conversation (the
+Inference row goes red and says *unreachable*); sending again would do just as well,
+since every request is a fresh connection.
+
+The transcript says *which* half is missing, because the probe alone cannot tell:
+Windows drops a port with no listener rather than refusing it, so a PC that is asleep
+and a PC that is up with LM Studio's server stopped both look like a timeout. The
+window asks the tailnet (`tailscale ping`) and then says either *the LLM PC is not
+answering at all* — it is asleep, off, or off the tailnet — or *the LLM PC is up, but
+LM Studio's server is not answering*. A locked screen does not stop LM Studio; sleep
+does, and a restart brings the PC back without it. On the LLM PC, the lasting fix is
+`powercfg /change standby-timeout-ac 0` (lock all you like, just don't sleep) and LM
+Studio's *Enable Local LLM Service on Login* (Settings ▸ Developer), so the server is
+there after any restart with nobody signed in.
 
 The menu bar carries the rest: **File** for chats and tabs, **View** to switch
 between dark and light, **Bridges** to jump straight to a tool list.
@@ -72,10 +94,26 @@ python studio_agent.py --mcp "npx -y some-mcp-server" --name Blender "what's in 
 ```
 
 Useful flags: `--app`, `--groups` (which tool families to expose), `--all-tools`,
-`--model`, `--host`, `--max-steps`, and `--mcp "<command line>"` to drive any MCP
+`--model`, `--draft` (the speculative-decoding draft model, or `off`), `--host`,
+`--max-steps`, and `--mcp "<command line>"` to drive any MCP
 stdio bridge that is not in the registry (`--name` says what to call the app). Environment overrides: `STUDIO_HOST`,
 `STUDIO_MODEL`, `STUDIO_MODEL_<APP>` (one app's model, e.g. `STUDIO_MODEL_COMFYUI`),
+`STUDIO_DRAFT_MODEL`, `STUDIO_VISION_MODEL`,
 `RESOLVE_MCP_DIR`, `COMFYUI_URL`, `COMFYUI_OUTPUT_DIR`.
+
+**Speculative decoding is on when the host can pair the model.** A small model of
+the same family — `qwen3-0.6b` beside `qwen3-coder-30b-a3b-instruct`,
+`qwen2.5-coder-0.5b-instruct` beside `qwen2.5-coder-14b-instruct` — drafts the next
+few tokens and the big model checks them in one pass, so answers read the same and
+arrive sooner. Studio Assistant asks LM Studio for it on every request
+(`draft_model`), and LM Studio loads the draft the first time it is asked for, so
+download one in LM Studio and it is used from the next window. The
+Inference row names it (`draft: qwen3-0.6b`) and, once LM Studio reports how the
+draft is doing, the share of its guesses the model kept — a draft that is mostly
+wrong is slower than none, and that number says so. `STUDIO_DRAFT_MODEL` pins a
+different one (the two must share a vocabulary — LM Studio refuses a mismatch, and
+the tab says so once and carries on without) or `off` turns it off. A tab on a
+small model, ComfyUI's, runs without one.
 
 **ComfyUI uses a small model.** It shares the inference PC's GPU with the diffusion
 model, and its work — a generate call and a filename — does not need a 30B model
@@ -235,7 +273,7 @@ that comes back to the executing model for the next step. No model is loaded on 
 workstation. Only if the host has no vision model downloaded at all does the row
 turn amber; every tab says so once, and the model works blind: attached pictures are
 names and paths to it, and previews reach only you — download one in LM Studio and
-reopen the window. Still frames cannot verify motion or audio.
+press **Connect**. Still frames cannot verify motion or audio.
 
 ## What it knows, learns and asks
 

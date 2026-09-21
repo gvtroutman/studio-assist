@@ -198,6 +198,23 @@ class ToolsmithTests(unittest.TestCase):
         ex._call(call("get_layer_full", {"layerId": 12}))
         self.assertIsNone(ex.record.journal[-1].get("via"))
 
+    def test_every_step_is_announced_under_the_tool_it_ran_for(self):
+        """The transcript shows a made tool's steps as rows of their own, one
+        indent in: each step's event names the tool it ran under, and the made
+        tool's own result arrives last, after its steps' results."""
+        events = []
+        ex = self.executor(emit=lambda k, p: events.append((k, p)))
+        self.make(ex)
+        events.clear()
+        ex._call(call("retitle_card", {"layer": 12, "words": "Hello"}))
+        told = [(k, p["name"], p.get("via")) for k, p in events if k in ("tool", "tool_result")]
+        self.assertEqual(told, [("tool", "retitle_card", None),
+                                ("tool", "set_text", "retitle_card"),
+                                ("tool_result", "set_text", None),
+                                ("tool", "get_layer_full", "retitle_card"),
+                                ("tool_result", "get_layer_full", None),
+                                ("tool_result", "retitle_card", None)])
+
     def test_arguments_are_validated_against_the_original_bridge_schema(self):
         ex = self.executor()
         self.make(ex, name="tint_card", inputs=[
