@@ -377,6 +377,19 @@ def image_block(data, mime_type):
     return {"type": "image", "data": data, "mimeType": mime_type}
 
 
+def local_path(path):
+    r"""A path as the model wrote it, made to exist when its JSON doubled the
+    backslashes: a small model writes "C:\\\\Users\\\\x" in the arguments
+    string for C:\Users\x, which decodes to a path with two backslashes
+    and nothing at it. Collapsed only when that makes something exist, so a
+    path that is right is never touched."""
+    if isinstance(path, str) and "\\\\" in path and not os.path.exists(path):
+        single = re.sub(r"\\{2,}", r"\\", path)
+        if os.path.exists(single):
+            return single
+    return path
+
+
 def result(text=None, blocks=(), error=False, structured=None):
     """A tools/call result. `blocks` are content blocks after the text."""
     content = ([text_block(text)] if text is not None else []) + list(blocks)

@@ -112,17 +112,27 @@ Inference row names it (`draft: qwen3-0.6b`) and, once LM Studio reports how the
 draft is doing, the share of its guesses the model kept — a draft that is mostly
 wrong is slower than none, and that number says so. `STUDIO_DRAFT_MODEL` pins a
 different one (the two must share a vocabulary — LM Studio refuses a mismatch, and
-the tab says so once and carries on without) or `off` turns it off. A tab on a
-small model, ComfyUI's, runs without one.
+the tab says so once and carries on without) or `off` turns it off. Newer LM Studio
+takes the draft only when the model is loaded, not per request; it refuses the
+request, the tab says so once, and runs without — `off` skips the asking.
 
-**ComfyUI uses a small model.** It shares the inference PC's GPU with the diffusion
-model, and its work — a generate call and a filename — does not need a 30B model
-resident beside the pictures. When the host serves `qwen3-1.7b` (or
-`qwen2.5-1.5b-instruct`) the ComfyUI tab drives that instead; the other tabs keep the
-shared model. It says so once in the tab. `STUDIO_MODEL_COMFYUI` pins a different one;
-if nothing preferred is served the tab uses the shared model and says that instead.
-Whether the big model is unloaded to make room is LM Studio's call — set its JIT
-loading and auto-evict so a request for the small model does not keep both resident.
+**The model is loaded with room to work.** Every tab's briefing and tool schemas
+take 8,000–20,000 tokens before you have typed anything, and LM Studio loads a model
+with an 8,192-token window unless told otherwise — under that the model loses its own
+tool results and asks the same question again, or is cut off mid-reply. So when a tab
+starts, Studio Assistant loads the model itself (or unloads and reloads it) with a
+window that holds the tab's briefing and a conversation — 16,384 or 32,768, never
+more than the model supports — and the tab says so in one line. Nothing to set on the
+LLM PC. A tab that starts while another is mid-request leaves the model alone and
+prints the `lms load … --context-length` to run by hand instead.
+
+**Which model.** `STUDIO_MODEL` if you set it; else `qwen3-coder-30b-a3b-instruct`
+when the host has it in VRAM; else whatever else you have loaded in LM Studio, apart
+from the vision model and the draft the app itself asks for; else the first known-good
+model the host has downloaded. Every tab, ComfyUI's included, uses that one model —
+the tab used to prefer a 1.7B so the GPU stayed free for the pictures, and the 1.7B
+talked about generating instead of doing it. `STUDIO_MODEL_COMFYUI` pins a smaller one
+on a host that cannot hold the diffusion model and the 30B together.
 
 ## The apps it drives
 
@@ -204,8 +214,10 @@ for now is the dialog above.
 - Windows, with at least one of the apps above.
 - **Python 3.9+** with Tkinter — the standard python.org build is fine.
 - An OpenAI-compatible endpoint reachable on the network. Built and tested against
-  **LM Studio**; the default model is `qwen3-coder-30b-a3b-instruct`, but whatever is
-  loaded gets picked automatically.
+  **LM Studio**; the default model is `qwen3-coder-30b-a3b-instruct`, and a model you
+  load by hand is used when that one is not loaded (see *Which model* above). The
+  window loads and reloads models on the host itself, so LM Studio's server has to be
+  the one with the REST API (`/api/v1`), which any recent build is.
 
 No `pip install` — the whole thing is standard library, deliberately.
 

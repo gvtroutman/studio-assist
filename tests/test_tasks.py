@@ -123,6 +123,56 @@ class TestExecutor(unittest.TestCase):
         self.assertIn("repeated tool errors", ex.run(self.messages))
         self.assertEqual(bridge.call_tool.call_count, 1)
 
+    def test_the_same_read_three_times_running_ends_the_run(self):
+        """The 30B, loaded at 8,192 under a 7,700-token prefix, lost its own
+        list_folder result to truncation and asked ten times until the step
+        limit. Now the second identical read gets the first answer back,
+        marked, without a dispatch; the third ends the run and says why."""
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": '{"files": 6}'}]}
+        ex = self.setup_run([answer(call("get_comp", ident="c%d" % i)) for i in range(1, 5)],
+                            bridge=bridge)
+        out = ex.run(self.messages)
+        self.assertIn("same read three times", out)
+        self.assertEqual(bridge.call_tool.call_count, 1)
+        tool_replies = [m for m in self.messages if m.get("role") == "tool"]
+        self.assertEqual(len(tool_replies), 3)
+        self.assertIn('{"files": 6}', tool_replies[1]["content"])
+        self.assertIn("same call as the step before", tool_replies[1]["content"])
+        self.assertIn("three times in a row", tool_replies[2]["content"])
+        self.assertFalse(ex.trouble, "a repeat is not an error for the notebook to learn from")
+        statuses = [e.get("status") for e in ex.record.journal]
+        self.assertEqual(statuses, ["ok", "ok"])
+        self.assertTrue(ex.record.journal[1].get("repeat"))
+        self.assertFalse(ex.record.journal[1].get("verifies"))
+
+    def test_a_repeated_write_and_an_interleaved_read_are_dispatched(self):
+        """Two generates with the same prompt are two pictures; a read after
+        a write is a fresh look, not a repeat."""
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": '{"id": 1}'}]}
+        ex = self.setup_run([answer(call("create_comp", ident="c1")),
+                             answer(call("create_comp", ident="c2")),
+                             answer(call("get_comp", ident="c3")),
+                             answer(call("create_comp", ident="c4")),
+                             answer(call("get_comp", ident="c5")),
+                             answer(text="Done, both made and checked.")], bridge=bridge)
+        self.assertIn("Done", ex.run(self.messages))
+        self.assertEqual(bridge.call_tool.call_count, 5)
+
+    def test_a_repeat_in_a_batch_skips_the_rest_of_the_batch(self):
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": "x"}]}
+        ex = self.setup_run([answer(call("get_comp", ident="c1")),
+                             answer(call("get_comp", ident="c2")),
+                             answer(call("get_comp", ident="c3"), call("create_comp", ident="c4"))],
+                            bridge=bridge)
+        ex.run(self.messages)
+        self.assertEqual(bridge.call_tool.call_count, 1)
+        skipped = [p for k, p in self.events if k == "tool_result" and p.get("status") == "skipped"]
+        self.assertEqual([p["name"] for p in skipped], ["create_comp"])
+        self.assertIn("repeating itself", skipped[0]["text"])
+
     def test_timeout_cannot_duplicate_write_even_in_later_turn(self):
         bridge = Mock()
         bridge.call_tool.side_effect = [TimeoutError("no response"), {"content": [{"type": "text", "text": "found"}]}]

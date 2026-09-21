@@ -429,6 +429,9 @@ class TestGuiForms(unittest.TestCase):
         studio_chat.Chat._boot_host = lambda self: None
         studio_chat.Chat._ensure = lambda self, s: None
         studio_chat.Chat._read_icons = lambda self: None
+        cls._real_fit = (eng.loaded_instances, eng.fit_model)
+        eng.loaded_instances = lambda *a, **k: [("m", 8192)]
+        eng.fit_model = lambda *a, **k: (8192, "")
         try:
             cls.app = studio_chat.Chat()
         except Exception as e:                # no display
@@ -441,6 +444,7 @@ class TestGuiForms(unittest.TestCase):
         if getattr(cls, "app", None) is not None:
             cls.app.destroy()
         eng.installed_apps = cls._real_installed
+        eng.loaded_instances, eng.fit_model = cls._real_fit
         if cls._real_settings is None:
             os.environ.pop("STUDIO_SETTINGS", None)
         else:

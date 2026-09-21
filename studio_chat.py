@@ -309,6 +309,12 @@ def settings_path():
         "StudioAssistant", "settings.json")
 
 
+def error_log_path():
+    """Beside the settings file, so STUDIO_SETTINGS moves it with everything
+    else - the tests' tracebacks used to land in the source tree's log."""
+    return os.path.join(os.path.dirname(settings_path()), ERROR_LOG)
+
+
 class Prefs:
     """
     A small JSON file under %APPDATA%. Best-effort in both directions: a
@@ -487,6 +493,7 @@ class Chat(tk.Tk):
                                     fallback=eng.DEFAULT_HOST)
         self.want_model = eng.env_default("STUDIO_MODEL", "AE_AGENT_MODEL")
         self.host_ready = threading.Event()
+        self.fit_lock = threading.Lock()   # one tab fits the shared model at a time
         self.host_booting = False         # a probe is running; Connect waits its turn
         self.host_timer = None            # the next quiet probe, while the host is down
 
@@ -2412,8 +2419,13 @@ class Chat(tk.Tk):
                 self._apply_status()
 
     def _log(self, text):
-        with open(os.path.join(HERE, ERROR_LOG), "a", encoding="utf-8") as f:
-            f.write("\n---- %s ----\n%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        try:
+            path = error_log_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n---- %s ----\n%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+        except OSError:
+            pass                  # the transcript already has the error as prose
 
     # --------------------------------------------------------------- preflight
     def _boot_host(self, first=True, quiet=False):
@@ -2576,17 +2588,41 @@ class Chat(tk.Tk):
                          if offered else "draft: " + clip(draft, 17))
         self.q.put(("host", None, (self.host_role, "\n".join(lines))))
 
+    def _fit(self, s, prompt_tokens, exact=True):
+        """Load, or reload, this tab's model on the host with a window that
+        holds its prefix and a conversation. -> (reloaded, note).
+
+        LM Studio loads a model at its default, 8,192 for most, and every tab's
+        briefing and tools take most or all of that: the model then loses its
+        own tool results to truncation and asks again, or is cut off. The host
+        can be told the window at load time, so the app tells it - the same
+        call that loads the vision model. A reload while another tab is
+        mid-request would cut that request off, so then this tab gets the
+        advice instead and is fitted on its next boot. Two tabs booting at
+        once take turns: the second looks again once the first has loaded,
+        and finds nothing to do - a load beside a load is a second instance."""
+        if any(o.busy for o in self.sessions.values() if o is not s):
+            loaded, top = eng.context_window(self.host, s.llm.model)
+            return False, eng.headroom_note(s.llm.model, prompt_tokens, loaded, top)
+        with self.fit_lock:
+            before, _ = eng.context_window(self.host, s.llm.model)
+            now, note = eng.fit_model(self.host, s.llm.model, prompt_tokens, exact=exact)
+        return (before != now and not note.startswith("Could not")), note
+
     def _headroom(self, s, reply):
         """After a warm-up: the prefix's exact token cost, which the host
         reports as `usage.prompt_tokens`, against the window the model was
-        loaded with. A tab that cannot fit a reply is told so now, with the
-        fix, rather than on its first message; a host that gives neither
-        number says nothing."""
+        loaded with. A tab that cannot fit a reply gets the model reloaded
+        with a window that can, now, rather than cut off on its first
+        message; a host that gives neither number says nothing. -> whether
+        the model was reloaded, so the caller warms up again."""
         used = ((reply or {}).get("usage") or {}).get("prompt_tokens")
-        loaded, top = eng.context_window(self.host, s.llm.model)
-        note = eng.headroom_note(s.llm.model, used, loaded, top)
+        if not isinstance(used, int):
+            return False
+        reloaded, note = self._fit(s, used)
         if note:
             self.q.put(("sys", s.event_id, note))
+        return reloaded
 
     def _draft_check(self, s, llm):
         """After a request: a pair the host refused is said once, in the tab
@@ -2666,24 +2702,41 @@ class Chat(tk.Tk):
                 if s.closed:
                     return
 
+            # The model has to be in VRAM with a window that holds this tab's
+            # prefix before the warm-up pays for that prefix: loaded here, with
+            # the window from an estimate, rather than just in time by the
+            # warm-up at LM Studio's default and reloaded straight after.
+            offered = tasks.inference_tools(s.tools, s.library)
+            if not eng.loaded_instances(self.host, s.llm.model):
+                self.q.put(("status", sid, ("loading %s on the host" % s.llm.model,
+                                            "warn", False)))
+            _, note = self._fit(s, eng.estimate_tokens(s.messages[0]["content"], offered),
+                                exact=False)
+            if note:
+                self.q.put(("sys", sid, note))
             # Prefill dominates the first call - a full tool schema set takes about a
             # minute cold. Pay it here against the exact prompt prefix a real message
             # will use, so the first question comes back in seconds. Each tab has its
-            # own prefix, so each warms up the first time it is opened.
-            self.q.put(("status", sid, ("warming up the model%s"
-                                        % (", about a minute" if s.tools else ""),
-                                        "warn", False)))
-            try:
-                reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
-                                   tasks.inference_tools(s.tools, s.library), max_tokens=1)
-            except eng.HostUnreachable as e:
-                self._host_lost()
-                self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
-            except Exception as e:
-                self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
-            else:
+            # own prefix, so each warms up the first time it is opened. The reply
+            # carries the prefix's exact cost; a window the estimate got wrong is
+            # fitted on it and the warm-up paid once more.
+            for attempt in (1, 2):
+                self.q.put(("status", sid, ("warming up the model%s"
+                                            % (", about a minute" if s.tools else ""),
+                                            "warn", False)))
+                try:
+                    reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
+                                       offered, max_tokens=1)
+                except eng.HostUnreachable as e:
+                    self._host_lost()
+                    self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
+                    break
+                except Exception as e:
+                    self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
+                    break
                 self._host_back()
-                self._headroom(s, reply)
+                if attempt == 2 or not self._headroom(s, reply):
+                    break
             self._draft_check(s, s.llm)
             s.ready = True
             if s.app.bridged:
