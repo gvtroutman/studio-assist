@@ -94,6 +94,7 @@ SUGGESTED_BRIDGES = {
 }
 
 MAX_STEPS = 25
+CALL_TEXT_LIMIT = 12_000                  # chars of one argument or result shown in a folded call row
 
 
 def pretty_host(url):
@@ -175,6 +176,7 @@ class Pill(tk.Canvas):
 
 
 APP_NAME_CHARS = 16                       # sidebar rows, before the ellipsis
+HOST_RETRY_MS = 30000                     # between probes while the host is down
 LLM_PC = "LLM PC"                         # the sidebar's second group: remote apps
 
 
@@ -388,10 +390,13 @@ class Session:
         self.sidecar = None               # the research bridge, in process
         self.sidecar_names = frozenset()  # its tools, riding beside the bridge's
         self.ask_buttons = []             # the question form waiting for a click
+        self.call_seq = 0                 # folded call rows in the transcript, numbered
+        self.open_calls = {}              # tool name -> rows still awaiting a result
         self.groups = list(app.default_groups)
         self.preview_images = []
         self.status = ("not started", "muted", False)
         self.bridge = ("faint", "%s\nnot started" % app.bridge_label)
+        self.host_down = False            # stuck without the inference host; Connect fixes it
         self.frame = None
         self.view = None
         self._stream_open = False
@@ -422,6 +427,8 @@ class Session:
     def reset(self):
         self.messages = [{"role": "system", "content": self.prompt()}]
         self.ask_buttons = []
+        self.call_seq = 0
+        self.open_calls = {}
         self.record = tasks.TaskRecord()
         self.record.app_id = self.app.id
         self.cancel.clear()
@@ -473,10 +480,15 @@ class Chat(tk.Tk):
         self.model_ids = []               # what the host serves, for per-app picks
         self.vision = None                # eng.Vision, or None when nothing served can see
         self.vision_note = None           # why, said once per tab
+        self.draft_note = None            # a STUDIO_DRAFT_MODEL the host lacks, said once per tab
+        self.host_role, self.host_last = "faint", ""   # the Inference row, re-posted per turn
+        self.host_ok = None               # the row as the probe left it, restored after a loss
         self.host = eng.env_default("STUDIO_HOST", "AE_AGENT_HOST",
                                     fallback=eng.DEFAULT_HOST)
         self.want_model = eng.env_default("STUDIO_MODEL", "AE_AGENT_MODEL")
         self.host_ready = threading.Event()
+        self.host_booting = False         # a probe is running; Connect waits its turn
+        self.host_timer = None            # the next quiet probe, while the host is down
 
         # What the user wrote about the studio: File > About this studio...
         self.studio = eng.read_studio_brief(self._studio_path())
@@ -547,10 +559,10 @@ class Chat(tk.Tk):
         # editor as blanks, and MDL2 is documented by its hex codes anyway.
         mdl2 = {"pin": 0xE718, "unpin": 0xE77A, "close": 0xE8BB,
                 "add": 0xE710, "link": 0xE71B, "more": 0xE70D, "picture": 0xEB9F,
-                "file": 0xE8A5, "folder": 0xE8B7}
+                "file": 0xE8A5, "folder": 0xE8B7, "closed": 0xE76C, "open": 0xE70D}
         plain = {"pin": 0x2191, "unpin": 0x2193, "close": 0x00D7,
                  "add": 0x002B, "link": 0x21C4, "more": 0x02C5, "picture": 0x25A3,
-                 "file": 0x2750, "folder": 0x25AD}
+                 "file": 0x2750, "folder": 0x25AD, "closed": 0x203A, "open": 0x02C5}
         self.g = {k: chr(v) for k, v in (mdl2 if have else plain).items()}
 
     def _px(self, n):
@@ -686,6 +698,8 @@ class Chat(tk.Tk):
             m_bridge.add_command(label="Choose capabilities for current tab...",
                                  command=self._capabilities)
             m_bridge.add_command(label="Start the current app", command=self._on_fix)
+            m_bridge.add_command(label="Connect to the inference host",
+                                 command=self._connect_host)
             m_bridge.add_separator()
             m_bridge.add_command(label="Connect an MCP bridge...",
                                  command=lambda: self._bridge_dialog())
@@ -825,6 +839,19 @@ class Chat(tk.Tk):
                         spacing3=10)
         v.tag_configure("tool", foreground=C["faint"], font=self.f_mono, lmargin1=22,
                         lmargin2=36, rmargin=16, spacing1=2, spacing3=2)
+        # A tool call is one folded row: the header in "tool", the glyph that
+        # opens it, a red word when it failed, and the body - the call as the
+        # model made it, then the result - hidden by a per-row elide tag until
+        # the header is clicked. Steps of a made tool sit one indent in.
+        v.tag_configure("glyph", font=self.f_glyph)
+        v.tag_configure("call_failed", foreground=C["err"])
+        v.tag_configure("call_step", lmargin1=40, lmargin2=54)
+        v.tag_configure("tool_body", foreground=C["muted"], font=self.f_mono, lmargin1=36,
+                        lmargin2=36, rmargin=16, spacing3=2)
+        v.tag_configure("tool_body_step", lmargin1=54, lmargin2=54)
+        v.tag_bind("call_head", "<Button-1>", self._on_call_click)
+        v.tag_bind("call_head", "<Enter>", lambda e: e.widget.config(cursor="hand2"))
+        v.tag_bind("call_head", "<Leave>", lambda e: e.widget.config(cursor="arrow"))
         v.tag_configure("err", foreground=C["err"], lmargin1=16, lmargin2=16,
                         rmargin=40, spacing3=10)
         v.tag_configure("sys", foreground=C["muted"], lmargin1=16, lmargin2=16,
@@ -1224,7 +1251,8 @@ class Chat(tk.Tk):
 
         self._cap(conns, "CONNECTIONS").pack(fill="x", padx=18, pady=(18, 8))
         self.conn = {"host": self._conn_row(conns, "Inference",
-                                            pretty_host(self.host))}
+                                            pretty_host(self.host),
+                                            command=self._host_menu)}
         self.conn["bridges"] = self._conn_row(
             conns, "Bridges", "not started", glyph="link",
             command=self._bridges_menu)
@@ -1472,6 +1500,24 @@ class Chat(tk.Tk):
 
     def _bridges_menu(self, widget):
         self._popup(self._menu_bridges(), widget)
+
+    def _menu_host(self):
+        """The inference host, and the one thing to do about it: connect
+        again. Reopening the window used to be the only way back after a
+        probe that timed out; this is that, without losing the tabs."""
+        m = self._menu()
+        if self.host_booting:
+            m.add_command(label="Connecting to the inference host...", state="disabled")
+        else:
+            m.add_command(label="Connect to the inference host" if self.llm is None
+                          else "Connect again", command=self._connect_host)
+        m.add_separator()
+        m.add_command(label="Inference runs on %s" % pretty_host(self.host),
+                      state="disabled")
+        return m
+
+    def _host_menu(self, widget):
+        self._popup(self._menu_host(), widget)
 
     def _tool_tags(self, view):
         """Tag colours are copied out of the palette, so a tools window left
@@ -2000,6 +2046,17 @@ class Chat(tk.Tk):
     def _role(self, s, name, tag):
         self._write(s, "\n%s\n" % name, tag)
 
+    def _clear_view(self, s):
+        """Empty a transcript - the folded call rows' own tags with it, and
+        the rows still waiting for a result, which now has nowhere to land."""
+        s.view.config(state="normal")
+        s.view.delete("1.0", "end")
+        s.view.config(state="disabled")
+        for tag in s.view.tag_names():
+            if tag.partition(":")[0] in ("call", "mark", "status", "body"):
+                s.view.tag_delete(tag)
+        s.open_calls = {}
+
     _MD = re.compile(r"\*\*(.+?)\*\*|`([^`\n]+)`")
 
     def _insert_md(self, s, text, base):
@@ -2016,6 +2073,123 @@ class Chat(tk.Tk):
         if pos < len(text):
             self._write(s, text[pos:], base)
 
+    # ------------------------------------------------------------ tool calls
+    def _show_call(self, s, payload):
+        """A tool call as one folded row: the tool's name to read at a glance,
+        and behind a click the call as the model made it - the script, for
+        the tools that take one - with its result once that arrives. The
+        whole header line takes the click; the body is elided under its own
+        tag until then."""
+        s.call_seq += 1
+        n = s.call_seq
+        name, args = payload["name"], payload["arguments"]
+        head = name
+        if isinstance(args, dict) and isinstance(args.get("action"), str):
+            head += " " + args["action"]  # a compound tool: say which action
+        step = bool(payload.get("via"))
+        row = ("tool", "call_head", "call:%d" % n) + (("call_step",) if step else ())
+        body = ("tool_body", "body:%d" % n) + (("tool_body_step",) if step else ())
+        v = s.view
+        v.tag_configure("body:%d" % n, elide=True)
+        v.config(state="normal")
+        v.insert("end", self.g["closed"], row + ("glyph", "mark:%d" % n))
+        v.insert("end", " " + head, row)
+        v.insert("end", " \u2026", row + ("status:%d" % n,))
+        v.insert("end", "\n", row)
+        v.insert("end", self._call_text(args), body)
+        v.config(state="disabled")
+        v.see("end")
+        s.open_calls.setdefault(name, []).append(n)
+
+    def _show_result(self, s, payload):
+        """The outcome of the latest call of that name still waiting for one:
+        the header loses its ellipsis - or gains a word when the call failed -
+        and the result joins the folded body under the arguments."""
+        name, status = payload["name"], payload.get("status", "ok")
+        waiting = s.open_calls.get(name)
+        if not waiting:                   # a result nothing announced: its own row
+            self._show_call(s, {"name": name, "arguments": {}, "via": None})
+            waiting = s.open_calls[name]
+        n = waiting.pop()
+        v = s.view
+        v.config(state="normal")
+        rng = v.tag_ranges("status:%d" % n)
+        if rng:
+            at = v.index(rng[0])
+            v.delete(rng[0], rng[1])
+            word = {"error": " failed", "skipped": " not run"}.get(status, "")
+            if word:
+                v.insert(at, word, ("tool", "call_head", "call:%d" % n, "call_failed"))
+        rng = v.tag_ranges("body:%d" % n)
+        if rng:
+            body = ("tool_body", "body:%d" % n)
+            if "tool_body_step" in v.tag_names(rng[0]):
+                body += ("tool_body_step",)
+            v.insert(rng[-1], "\n" + self._field("result", payload["text"]) + "\n", body)
+        v.config(state="disabled")
+
+    def _call_text(self, args):
+        """The arguments as the model made them, one per line - a value with
+        lines of its own, a script, printed whole under its name."""
+        if not isinstance(args, dict):    # not an object: shown as it was written
+            return self._field("arguments", str(args)) + "\n"
+        if not args:
+            return "no arguments\n"
+        return "\n".join(self._field(k, v) for k, v in args.items()) + "\n"
+
+    def _field(self, key, value):
+        """`key: value` on one line while it fits; a longer one, or one with
+        lines of its own, under the key. JSON - an object argument, or the
+        result most bridges return - is laid out once it is too long for a line."""
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                value = parsed if isinstance(parsed, (dict, list)) else value
+            except ValueError:
+                pass
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+            if len(value) > 72:
+                value = json.dumps(json.loads(value), ensure_ascii=False, indent=2)
+        value = value.rstrip()
+        if len(value) > CALL_TEXT_LIMIT:
+            value = (value[:CALL_TEXT_LIMIT].rstrip()
+                     + "\n\u2026 %d more characters; the whole text is in the task record."
+                     % (len(value) - CALL_TEXT_LIMIT))
+        if "\n" in value or len(value) > 72:
+            return "%s:\n%s" % (key, value)
+        return "%s: %s" % (key, value)
+
+    def _on_call_click(self, ev):
+        v = ev.widget
+        for tag in v.tag_names("@%d,%d" % (ev.x, ev.y)):
+            if tag.startswith("call:"):
+                self._toggle_call(v, int(tag[5:]))
+                break
+        return "break"                    # not a place to start a selection
+
+    def _toggle_call(self, v, n):
+        """Open a folded call row, or close it: flip the body's elide and turn
+        the chevron to match."""
+        body = "body:%d" % n
+        hidden = str(v.tag_cget(body, "elide")) in ("1", "true")
+        v.tag_configure(body, elide=not hidden)
+        rng = v.tag_ranges("mark:%d" % n)
+        if rng:
+            at = v.index(rng[0])
+            tags = v.tag_names(rng[0])
+            v.config(state="normal")
+            v.delete(rng[0], rng[1])
+            v.insert(at, self.g["open" if hidden else "closed"], tags)
+            v.config(state="disabled")
+        if hidden and rng:
+            # Opened near the fold, the body would land below it. Bring as
+            # much of it up as fits, the header staying in view.
+            shown = v.tag_ranges(body)
+            if shown:
+                v.see(shown[-1])
+            v.see(at)
+
     def cur(self):
         """The session the user is looking at, or None with every tab closed."""
         return self.sessions.get(self.active)
@@ -2031,12 +2205,55 @@ class Chat(tk.Tk):
             return
         text, role, fixable = s.status
         self.lbl_status.config(text=text, fg=self.C[role])
-        self.btn_fix.config(text=("Check %s" if s.app.remote else "Start %s") % s.app.name)
+        if s.host_down:
+            self.btn_fix.config(text="Connect")
+        else:
+            self.btn_fix.config(text=("Check %s" if s.app.remote else "Start %s") % s.app.name)
         self._show_fix(fixable)
         self.btn_new.config(state="normal")
         self.btn_send.set(text="Stopping…" if s.busy and s.cancel.is_set() else
                           "Stop" if s.busy else "Send",
                           state="disabled" if s.busy and s.cancel.is_set() else "normal")
+
+    def _host_probed(self, ok):
+        """A probe is over. Answered, every tab that was stuck without the
+        host is unstuck - the active one starts now, a ready one is ready
+        again, the rest start when selected. Not, they keep their Connect,
+        and the window tries again by itself: the LLM PC drops off on a
+        timer, and nobody should have to press a button every time it
+        comes back."""
+        stuck = [t for t in self.sessions.values() if t.host_down]
+        for t in stuck:
+            if not ok:
+                t.status = ("no inference host - trying again", "err", True)
+                continue
+            t.host_down = False
+            if t.ready:
+                t.status = ("ready", "muted", False)
+            else:
+                t.status = ("not started", "muted", False)
+                self._handle("bridge", t.id, ("faint", "%s\nnot started" % t.app.bridge_label))
+        self._apply_status()
+        s = self.cur()
+        if ok and s is not None and s in stuck:
+            self._ensure(s)
+        if not ok:
+            self._arm_retry()
+
+    def _host_wanted(self):
+        """Is anything waiting on the host: no model yet, or a tab stuck."""
+        return self.llm is None or any(t.host_down for t in self.sessions.values())
+
+    def _arm_retry(self):
+        """One quiet probe, HOST_RETRY_MS from now, unless one is pending."""
+        if self.host_timer is None:
+            self.host_timer = self.after(HOST_RETRY_MS, self._retry_host)
+
+    def _retry_host(self):
+        self.host_timer = None
+        if self.host_booting or not self._host_wanted():
+            return                        # Connect is at it, or nothing needs it
+        self._spawn(None, self._boot_host, False, True)
 
     def _show_fix(self, show):
         if show:
@@ -2137,6 +2354,10 @@ class Chat(tk.Tk):
             self._set_dot(dot, role)
             if detail:
                 lbl.config(text=detail)
+        elif kind == "host_probed":
+            self._host_probed(payload)
+        elif kind == "host_retry":
+            self._arm_retry()
         elif kind == "bridge":
             s.bridge = payload
             role, detail = payload
@@ -2147,9 +2368,9 @@ class Chat(tk.Tk):
         elif kind == "sys":
             self._write(s, payload + "\n", "sys")
         elif kind == "tool":
-            self._write(s, "  " + payload + "\n", "tool")
+            self._show_call(s, payload)
         elif kind == "tool_result":
-            self._write(s, "     " + payload + "\n", "tool")
+            self._show_result(s, payload)
         elif kind == "preview":
             self._show_preview(s, payload)
         elif kind == "ask":
@@ -2195,54 +2416,188 @@ class Chat(tk.Tk):
             f.write("\n---- %s ----\n%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
 
     # --------------------------------------------------------------- preflight
-    def _boot_host(self):
-        """Shared across every tab: one inference host, one model."""
-        self.q.put(("status", None, ("checking the inference host", "muted", False)))
+    def _boot_host(self, first=True, quiet=False):
+        """Shared across every tab: one inference host, one model.
+
+        Run at startup, again by Connect, and every HOST_RETRY_MS by the
+        window itself while the host is down. The probe is one HTTP call
+        with a short timeout, and a PC still waking or a server not yet
+        started fails it once; that used to cost the window, because nothing
+        probed again. Now `host_ready` says the first probe is over,
+        `host_booting` keeps two probes from running at once, and
+        `host_probed` tells the UI thread to give the tabs stuck without a
+        host their start - or to schedule the next try. A `quiet` probe is
+        one of those tries: it moves the row and the status, and writes
+        nothing into the transcript unless it succeeds.
+        """
+        self.host_booting = True
+        ok = False
+        try:
+            ok = self._probe_host(first, quiet)
+        finally:
+            self.host_booting = False
+            self.host_ready.set()
+            self.q.put(("host_probed", None, ok))
+        if ok and self.vision is not None and self.vision.needs_load:
+            self._load_vision()
+
+    def _probe_host(self, first, quiet=False):
+        """-> True with `self.llm` set. A probe that fails after an earlier
+        one succeeded leaves the model in place: the tabs that have it keep
+        working the moment the host is back, without another Connect."""
+        if first:
+            self.q.put(("status", None, ("checking the inference host", "muted", False)))
         ok, loaded, ids, vision_ids, err = eng.probe_models(self.host)
         if not ok:
+            self.host_role, self.host_last = "err", "unreachable"
             self.q.put(("host", None, ("err", "%s\nunreachable" % pretty_host(self.host))))
-            self.q.put(("error", None,
-                        "Cannot reach the inference host at %s.\n"
-                        "Check that the other PC is awake, Tailscale is up on both "
-                        "ends, and LM Studio's server is started.\n(%s)"
-                        % (self.host, err)))
-            self.host_ready.set()
-            return
+            if not quiet:
+                self.q.put(("error", None, self._explain_unreachable(err)))
+            return False
         model = eng.pick_model(loaded, ids, self.want_model)
         if not model:
+            self.host_role, self.host_last = "err", "no models"
             self.q.put(("host", None, ("err", "%s\nno models" % pretty_host(self.host))))
-            self.q.put(("error", None, "The inference host is up but serving no models. "
-                                       "Load one in LM Studio and reopen this window."))
-            self.host_ready.set()
-            return
-        self.llm = eng.LLM(self.host, model)
+            if not quiet:
+                self.q.put(("error", None, "The inference host is up but serving no models. "
+                                           "Load one in LM Studio; this window tries again "
+                                           "every %d seconds, and Connect tries now."
+                                           % (HOST_RETRY_MS // 1000)))
+            return False
+        # Speculative decoding: a small model of the same family runs ahead of
+        # this one when the host serves it. Nothing to load - LM Studio takes
+        # it per request - and a pair the host refuses is dropped by the client.
+        # The same model on a second probe keeps its client: the tabs booted
+        # on it hold that object, and its draft score is the row's.
+        draft, self.draft_note = eng.resolve_draft(model, ids)
+        if self.llm is None or self.llm.model != model:
+            self.llm = eng.LLM(self.host, model, draft=draft)
         self.model_ids = ids
         # Every bridge answers a screenshot with a picture and every tab takes
         # attachments; the executing model reads text. One vision model on the
         # same host serves every tab, and its absence is a status, not a silence.
         self.vision, self.vision_note = eng.resolve_vision(self.host, model, vision_ids, loaded)
-        def host_row(role, last):
-            self.q.put(("host", None, (role, "%s\n%d models\n%s\n%s"
-                                       % (pretty_host(self.host), len(ids), clip(model, 24), last))))
+        if not first:
+            self.q.put(("sys", None, "Connected to the inference host at %s: %s, %d model%s served."
+                        % (pretty_host(self.host), model, len(ids), "" if len(ids) == 1 else "s")))
         if not self.vision:
-            host_row("warn", "no vision model")
-            self.host_ready.set()
-            return
-        seeing = "sees: " + clip(self.vision.model, 18)
-        if not self.vision.needs_load:
-            host_row("ok", seeing)
-            self.host_ready.set()
-            return
-        # The tabs can boot meanwhile: a picture before the load finishes is
-        # loaded just-in-time by the host, only slower.
-        host_row("muted", "loading " + clip(self.vision.model, 16))
-        self.host_ready.set()
+            self._host_healthy("warn", "no vision model")
+        elif self.vision.needs_load:
+            # The tabs can boot meanwhile: a picture before the load finishes
+            # is loaded just-in-time by the host, only slower.
+            self._host_healthy("muted", "loading " + clip(self.vision.model, 16))
+        else:
+            self._host_healthy("ok", "sees: " + clip(self.vision.model, 18))
+        return True
+
+    def _explain_unreachable(self, err):
+        """Which half is down. The probe alone cannot say: Windows Firewall
+        drops a port with no listener rather than refusing it, so a PC that
+        is asleep and a PC that is up with LM Studio's server not running
+        both read as "timed out". The tailnet can say, so it is asked."""
+        retry = ("This window tries again every %d seconds; Connect - the button, "
+                 "or the Inference row - tries now." % (HOST_RETRY_MS // 1000))
+        alive = eng.host_alive(self.host)
+        if alive is True:
+            what = ("The LLM PC is up, but LM Studio's server is not answering at %s.\n"
+                    "Start the server in LM Studio - and to have it back after a restart "
+                    "with nobody signed in, turn on its service on login (Settings > "
+                    "Developer). A locked screen does not stop it; sleep does."
+                    % pretty_host(self.host))
+        elif alive is False:
+            what = ("The LLM PC is not answering at all at %s - asleep, off, or off "
+                    "the tailnet.\nWake it, and if it sleeps on a timer, turn that off "
+                    "there (powercfg /change standby-timeout-ac 0); locking is fine."
+                    % pretty_host(self.host))
+        else:
+            what = ("Cannot reach the inference host at %s.\n"
+                    "Check that the other PC is awake, Tailscale is up on both ends, "
+                    "and LM Studio's server is started." % self.host)
+        return "%s\n%s\n(%s)" % (what, retry, err)
+
+    def _load_vision(self):
+        """After the probe, off the path the tabs wait on."""
         err = eng.load_model(self.host, self.vision.model)
         if err:
             self.q.put(("sys", None, "Could not load the vision model %s on the host (%s); "
                                      "it will be loaded on first use instead."
                                      % (self.vision.model, err)))
-        host_row("ok", seeing)
+        self.vision.needs_load = False
+        self._host_healthy("ok", "sees: " + clip(self.vision.model, 18))
+
+    def _host_healthy(self, role, last):
+        """The Inference row with the host answering - kept, so that a loss
+        mid-conversation can be undone by the next request that gets through
+        rather than by another probe."""
+        self.host_ok = (role, last)
+        self._host_line(role, last)
+
+    def _host_lost(self):
+        """The Inference row, after a request found nothing at the host."""
+        self._host_line("err", "unreachable")
+
+    def _host_back(self):
+        """...and after the next one that got through."""
+        if self.host_role == "err" and self.host_ok:
+            self._host_line(*self.host_ok)
+
+    def _connect_host(self):
+        """Connect: the header button while a tab is stuck without the host,
+        the Inference row, and the Bridges menu. Probes again and, when the
+        host answers, starts the tab you are looking at; the others start
+        when selected, as they always have. Reopening the window used to be
+        the only way to get here."""
+        if self.host_booting:
+            return
+        for t in self.sessions.values():
+            if t.host_down:
+                t.status = ("connecting to the inference host", "muted", False)
+        self._apply_status()
+        self._spawn(None, self._boot_host, False)
+
+    def _host_line(self, role=None, last=None):
+        """The Inference row: host, how many models, the shared model, what
+        sees for it, and the draft model running ahead of it - with the share
+        of its guesses the model kept, once the host has reported any. Posted
+        from the worker at boot and again after a turn, so the score is live.
+        """
+        if role is not None:
+            self.host_role = role
+        if last is not None:
+            self.host_last = last
+        if self.llm is None:
+            return
+        lines = [pretty_host(self.host), "%d models" % len(self.model_ids),
+                 clip(self.llm.model, 24), self.host_last]
+        draft = getattr(self.llm, "draft", None)
+        if draft:
+            kept, offered = getattr(self.llm, "drafted", (0, 0))
+            lines.append("draft: %s · %d%%" % (clip(draft, 11), 100 * kept // offered)
+                         if offered else "draft: " + clip(draft, 17))
+        self.q.put(("host", None, (self.host_role, "\n".join(lines))))
+
+    def _headroom(self, s, reply):
+        """After a warm-up: the prefix's exact token cost, which the host
+        reports as `usage.prompt_tokens`, against the window the model was
+        loaded with. A tab that cannot fit a reply is told so now, with the
+        fix, rather than on its first message; a host that gives neither
+        number says nothing."""
+        used = ((reply or {}).get("usage") or {}).get("prompt_tokens")
+        loaded, top = eng.context_window(self.host, s.llm.model)
+        note = eng.headroom_note(s.llm.model, used, loaded, top)
+        if note:
+            self.q.put(("sys", s.event_id, note))
+
+    def _draft_check(self, s, llm):
+        """After a request: a pair the host refused is said once, in the tab
+        where it happened, and the Inference row stops naming a draft the
+        shared model no longer runs - or shows how the one it runs is doing."""
+        note = getattr(llm, "draft_note", None)
+        if note:
+            llm.draft_note = None
+            self.q.put(("sys", s.event_id, note))
+        if llm is self.llm and (note or getattr(llm, "draft", None)):
+            self._host_line()
 
     def _llm_for(self, s):
         """The shared model, unless this app prefers one the host serves.
@@ -2250,6 +2605,8 @@ class Chat(tk.Tk):
         A tab's model is fixed at boot: the executor, both warm-ups and the
         cached prefix on the host all have to agree, and swapping mid-session
         would throw the prefix away. Explains a departure once, in the tab.
+        A model of the tab's own gets a draft model of its own, resolved the
+        same way as the shared one's.
         """
         shared = getattr(self.llm, "model", None)
         if shared is None:
@@ -2259,7 +2616,10 @@ class Chat(tk.Tk):
             self.q.put(("sys", s.event_id, "Model for this tab: %s (%s)." % (model, note)))
         if model == shared:
             return self.llm
-        return eng.LLM(self.host, model, self.llm.temperature, self.llm.timeout)
+        draft, note = eng.resolve_draft(model, self.model_ids)
+        if note:
+            self.q.put(("sys", s.event_id, note))
+        return eng.LLM(self.host, model, self.llm.temperature, self.llm.timeout, draft=draft)
 
     def _ensure(self, s):
         """First view of a tab is what starts that app's bridge."""
@@ -2276,12 +2636,21 @@ class Chat(tk.Tk):
                                             "muted", False)))
                 self.host_ready.wait(timeout=240)
             if self.llm is None:
-                self.q.put(("status", sid, ("no inference host", "err", False)))
+                # Set before the status is posted: the header reads it to
+                # label the button Connect rather than Start <app>. The
+                # retry loop may have stopped with no tab to serve; this
+                # tab wants it.
+                s.host_down = True
+                self.q.put(("status", sid, ("no inference host - trying again", "err", True)))
                 self.q.put(("bridge", sid, ("err", "%s\nno model" % s.app.bridge_label)))
+                self.q.put(("host_retry", None, None))
                 return
+            s.host_down = False
             s.llm = self._llm_for(s)
             if self.vision_note:
                 self.q.put(("sys", sid, self.vision_note))
+            if self.draft_note and s.llm is self.llm:
+                self.q.put(("sys", sid, self.draft_note))
             if s.notebook is not None and s.notebook.problem:
                 self.q.put(("sys", sid, "Could not read this app's lessons: " + s.notebook.problem))
             elif s.notebook is not None and s.notebook.lessons:
@@ -2305,10 +2674,17 @@ class Chat(tk.Tk):
                                         % (", about a minute" if s.tools else ""),
                                         "warn", False)))
             try:
-                s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
-                           tasks.inference_tools(s.tools, s.library), max_tokens=1)
+                reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
+                                   tasks.inference_tools(s.tools, s.library), max_tokens=1)
+            except eng.HostUnreachable as e:
+                self._host_lost()
+                self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
             except Exception as e:
                 self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
+            else:
+                self._host_back()
+                self._headroom(s, reply)
+            self._draft_check(s, s.llm)
             s.ready = True
             if s.app.bridged:
                 self._refresh_bridge(s)
@@ -2444,6 +2820,9 @@ class Chat(tk.Tk):
         s = self.cur()
         if s is None or s.busy:
             return
+        if s.host_down:                   # the button reads Connect
+            self._connect_host()
+            return
         if not s.app.drivable:
             self._write(s, "This tab has no app to start - it is the model on "
                            "its own.\n", "sys")
@@ -2515,9 +2894,7 @@ class Chat(tk.Tk):
                 s.record.save(self._task_path(s), s.messages)
             s.record, s.messages = record, messages
             s.cancel.clear()
-            s.view.config(state="normal")
-            s.view.delete("1.0", "end")
-            s.view.config(state="disabled")
+            self._clear_view(s)
             for msg in messages:
                 if msg.get("role") in ("user", "assistant") and isinstance(msg.get("content"), str):
                     self._role(s, "YOU" if msg["role"] == "user" else s.app.tab.upper(), "role_user" if msg["role"] == "user" else "role_asst")
@@ -2603,9 +2980,11 @@ class Chat(tk.Tk):
 
     def _warm_capabilities(self, s):
         try:
-            s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
-                       tasks.inference_tools(s.tools, s.library), max_tokens=1)
+            reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
+                               tasks.inference_tools(s.tools, s.library), max_tokens=1)
             self.q.put(("sys", s.event_id, "Selected capabilities are ready."))
+            self._draft_check(s, s.llm)
+            self._headroom(s, reply)
         finally:
             self.q.put(("status", s.event_id, ("ready", "ok", False)))
             self.q.put(("idle", s.event_id, None))
@@ -2646,9 +3025,7 @@ class Chat(tk.Tk):
         if s is None or s.busy:
             return
         s.reset()
-        s.view.config(state="normal")
-        s.view.delete("1.0", "end")
-        s.view.config(state="disabled")
+        self._clear_view(s)
         self._welcome(s)
 
     def _on_send(self):
@@ -2789,6 +3166,7 @@ class Chat(tk.Tk):
     def _turn(self, s, pictures=()):
         sid = s.event_id
         started = {"value": False}
+        lost = False
         def emit(kind, payload):
             if kind == "token":
                 if not started["value"]:
@@ -2819,18 +3197,31 @@ class Chat(tk.Tk):
                 readback=s.app.readback, review=s.app.review, notebook=s.notebook)
             executor.run(s.messages, MAX_STEPS)
             self._learn(s, executor, emit)
-        except Exception:
+        except Exception as e:
             s.record.status = "interrupted; inspect project state before continuing"
             try:
                 checkpoint()
             except Exception:
                 pass
+            lost = isinstance(e, eng.HostUnreachable)
             raise
         finally:
             self.q.put(("stream_end", sid, None))
-            complete = s.record.status.startswith("response complete")
-            status = "stopped" if s.cancel.is_set() else "ready" if complete else "needs attention"
-            self.q.put(("status", sid, (status, "muted" if complete else "warn", False)))
+            self._draft_check(s, s.llm or self.llm)
+            if lost:
+                # The host went away mid-conversation: the row says so, the
+                # button offers Connect, and the window keeps trying. Sending
+                # again would also do.
+                s.host_down = True
+                self._host_lost()
+                self.q.put(("status", sid, ("inference host unreachable - trying again", "err", True)))
+                self.q.put(("host_retry", None, None))
+            else:
+                s.host_down = False
+                self._host_back()
+                complete = s.record.status.startswith("response complete")
+                status = "stopped" if s.cancel.is_set() else "ready" if complete else "needs attention"
+                self.q.put(("status", sid, (status, "muted" if complete else "warn", False)))
             self.q.put(("idle", sid, None))
 
     def _learn(self, s, executor, emit):

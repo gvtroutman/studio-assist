@@ -196,9 +196,106 @@ class TestExecutor(unittest.TestCase):
         self.assertIn(("preview", image), self.events)
         self.assertIn("clipped", self.messages[3]["content"])
 
+    def test_every_call_is_told_whole_with_its_outcome_under_its_name(self):
+        """The transcript folds each call to its name, so the event carries
+        the arguments entire - the script a run_jsx took, not 160 characters
+        of it - and the result comes back under the same name with a status."""
+        code = "\n".join("var line%d = app.project.item(%d);" % (i, i) for i in range(40))
+        schema = {"type": "object", "required": ["code"], "additionalProperties": False,
+                  "properties": {"code": {"type": "string"}}}
+        ex = self.setup_run([answer(call("run_jsx", {"code": code})),
+                             answer(call("no_such_tool")), answer(text="Done")],
+                            specs=[spec("run_jsx", schema, annotations={"readOnlyHint": True})])
+        ex.run(self.messages)
+        calls = [p for k, p in self.events if k == "tool"]
+        results = [p for k, p in self.events if k == "tool_result"]
+        self.assertEqual([c["name"] for c in calls], ["run_jsx", "no_such_tool"])
+        self.assertEqual(calls[0]["arguments"], {"code": code})
+        self.assertIsNone(calls[0]["via"])
+        self.assertEqual([(r["name"], r["status"]) for r in results],
+                         [("run_jsx", "ok"), ("no_such_tool", "error")])
+        self.assertEqual(results[0]["text"], '{"id": 12}')
+        self.assertTrue(results[1]["text"].startswith("TOOL ERROR: tool is not enabled"))
+
+    def test_a_call_the_executor_will_not_run_is_still_shown_as_one(self):
+        cancel = threading.Event()
+        bridge = Mock()
+        def execute(*args):
+            cancel.set()
+            return {"content": [{"type": "text", "text": "ok"}]}
+        bridge.call_tool.side_effect = execute
+        ex = self.setup_run([answer(call("create_comp"), call("get_comp", ident="c2"))],
+                            bridge=bridge, cancel=cancel)
+        ex.run(self.messages)
+        pairs = [(k, p["name"], p.get("status")) for k, p in self.events
+                 if k in ("tool", "tool_result")]
+        self.assertEqual(pairs, [("tool", "create_comp", None), ("tool_result", "create_comp", "ok"),
+                                 ("tool", "get_comp", None), ("tool_result", "get_comp", "skipped")])
+
     def test_unverified_work_is_not_silently_accepted(self):
         ex = self.setup_run([answer(call("create_comp"))] + [answer(text="Done") for _ in range(3)])
         self.assertIn("remain unverified", ex.run(self.messages))
+
+
+class TestPromisedWork(unittest.TestCase):
+    """A reply that announces the call instead of making it does not end the
+    run looking finished: one reminder, then the emptiness is named."""
+
+    setup_run = TestExecutor.setup_run
+    PROMISE = ("I've selected the first image. Now I'll generate an image of a man in "
+               "lederhosen using this background. Once it completes, I'll provide the path.")
+
+    def test_a_promise_is_nudged_once_and_the_call_then_runs(self):
+        ex = self.setup_run([answer(text=self.PROMISE), answer(call("get_comp")),
+                             answer(text="Here it is: C:\out\a.png")])
+        self.assertEqual(ex.run(self.messages), "Here it is: C:\out\a.png")
+        self.assertEqual(self.messages[3]["role"], "user")
+        self.assertIn("called no tool", self.messages[3]["content"])
+        self.assertEqual(self.bridge.call_tool.call_count, 1)
+        self.assertIn(("sys", "The model described a step without calling a tool; asked once to make the call."),
+                      self.events)
+
+    def test_a_second_promise_ends_the_run_with_nothing_done_named(self):
+        ex = self.setup_run([answer(text=self.PROMISE), answer(text="Now I will generate it.")])
+        out = ex.run(self.messages)
+        self.assertTrue(out.startswith("Nothing was done"), out)
+        self.assertEqual(ex.record.status, out)
+        self.bridge.call_tool.assert_not_called()
+        # Two replies, one reminder, no third request.
+        self.assertEqual(len(self.llm.requests), 2)
+
+    def test_a_question_and_a_plain_answer_are_not_promises(self):
+        for text in ("Which background should I use - I'll take the first unless you say?",
+                     "The default model is Z-Image Turbo at 8 steps."):
+            with self.subTest(text=text):
+                ex = self.setup_run([answer(text=text)])
+                self.assertEqual(ex.run(self.messages), text)
+                self.assertEqual(len(self.llm.requests), 1)
+
+    def test_a_sign_off_after_real_work_is_not_nudged(self):
+        ex = self.setup_run([answer(call("get_comp")),
+                             answer(text="Done. I'll be here if you want another seed.")])
+        self.assertIn("another seed", ex.run(self.messages))
+        self.assertEqual(len(self.llm.requests), 2)
+
+    def test_with_no_tools_at_all_a_promise_is_just_a_reply(self):
+        # setup_run substitutes its default tools for an empty list, so build
+        # the toolless tab by hand: there is nothing it could have called.
+        llm = FakeLLM([answer(text=self.PROMISE)])
+        ex = tasks.Executor(llm, Mock(), [], schemas=[])
+        messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}]
+        self.assertEqual(ex.run(messages), self.PROMISE)
+        self.assertEqual(len(llm.requests), 1)
+
+    def test_the_detector(self):
+        for text, hit in [("Next, I'll generate the image.", True),
+                          ("Let me check the queue first.", True),
+                          ("I will now upload the background.", True),
+                          ("24 fps means 24 frames per second.", False),
+                          ("Shall I go ahead and generate it?", False),
+                          ("", False), (None, False)]:
+            with self.subTest(text=text):
+                self.assertEqual(tasks.announces_work(text), hit)
 
 
 class TestVerifyingTheWrite(unittest.TestCase):

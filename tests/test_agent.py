@@ -6,6 +6,7 @@ Offline tests. No network, no creative apps, no model.
 Anything needing a display skips itself when there isn't one.
 """
 
+import io
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import tkinter as tk
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -280,6 +282,318 @@ class TestPerAppModel(unittest.TestCase):
         for app in eng.APPS:
             if not app.models:
                 self.assertEqual(app.model_for(["x", "big"], "big"), ("big", ""))
+
+
+class TestDraftChoice(unittest.TestCase):
+    """Speculative decoding: a small model of the executing model's family
+    runs ahead of it. The pair is resolved from what the host serves, as the
+    executing and vision models are, and never guessed across families - a
+    pair with different vocabularies is refused by the host."""
+
+    IDS = ["qwen3-coder-30b-a3b-instruct", "qwen3-0.6b", "qwen3-1.7b",
+           "qwen2.5-coder-14b-instruct", "qwen2.5-coder-0.5b-instruct", "gpt-oss-20b"]
+    BIG = "qwen3-coder-30b-a3b-instruct"
+
+    def setUp(self):
+        self._pin = os.environ.pop("STUDIO_DRAFT_MODEL", None)
+
+    def tearDown(self):
+        os.environ.pop("STUDIO_DRAFT_MODEL", None)
+        if self._pin is not None:
+            os.environ["STUDIO_DRAFT_MODEL"] = self._pin
+
+    def test_the_smallest_served_model_of_the_family(self):
+        self.assertEqual(eng.pick_draft_model(self.BIG, self.IDS), "qwen3-0.6b")
+        self.assertEqual(eng.pick_draft_model("qwen2.5-coder-14b-instruct", self.IDS),
+                         "qwen2.5-coder-0.5b-instruct")
+        without = [i for i in self.IDS if i != "qwen3-0.6b"]
+        self.assertEqual(eng.pick_draft_model(self.BIG, without), "qwen3-1.7b")
+
+    def test_a_family_is_a_whole_name_not_a_prefix(self):
+        self.assertEqual(eng.draft_family(self.BIG), "qwen3")
+        self.assertEqual(eng.draft_family("lmstudio-community/Qwen3-30B-A3B"), "qwen3")
+        self.assertEqual(eng.draft_family("meta-llama-3.1-8b-instruct"), "llama-3.1")
+        self.assertEqual(eng.draft_family("qwen2.5-coder-14b-instruct"), "qwen2.5-coder")
+        # qwen3.6 is not qwen3, and gemma-3n is not gemma-3: different vocabularies
+        self.assertIsNone(eng.draft_family("qwen3.6-27b"))
+        self.assertIsNone(eng.draft_family("gemma-3n-e4b-it"))
+        self.assertIsNone(eng.draft_family("gpt-oss-20b"))
+
+    def test_no_family_or_nothing_served_means_no_draft(self):
+        self.assertIsNone(eng.pick_draft_model("gpt-oss-20b", self.IDS))
+        self.assertIsNone(eng.pick_draft_model("qwen3.6-27b", self.IDS + ["qwen3.6-27b"]))
+        self.assertIsNone(eng.pick_draft_model(self.BIG, [self.BIG, "gpt-oss-20b"]))
+
+    def test_a_draft_sized_model_runs_alone(self):
+        # The ComfyUI tab's 1.7B: nothing smaller is worth running ahead of it.
+        self.assertIsNone(eng.pick_draft_model("qwen3-1.7b", self.IDS))
+        self.assertIsNone(eng.pick_draft_model("qwen3-0.6b", self.IDS))
+
+    def test_the_pin_wins_when_served_and_off_is_off(self):
+        self.assertEqual(eng.pick_draft_model(self.BIG, self.IDS, want="qwen3-1.7b"), "qwen3-1.7b")
+        # a pair the table does not know is the user's call
+        self.assertEqual(eng.pick_draft_model("gpt-oss-20b", self.IDS, want="qwen3-0.6b"),
+                         "qwen3-0.6b")
+        for off in ("off", "none", "0", "OFF", " no "):
+            self.assertIsNone(eng.pick_draft_model(self.BIG, self.IDS, want=off), off)
+
+    def test_resolve_reads_the_pin_and_explains_one_the_host_lacks(self):
+        self.assertEqual(eng.resolve_draft(self.BIG, self.IDS), ("qwen3-0.6b", ""))
+        self.assertEqual(eng.resolve_draft("gpt-oss-20b", self.IDS), (None, ""))
+        os.environ["STUDIO_DRAFT_MODEL"] = "ghost-0.5b"
+        draft, note = eng.resolve_draft(self.BIG, self.IDS)
+        self.assertEqual(draft, "qwen3-0.6b")   # a stale pin is not a reason to go slow
+        self.assertIn("ghost-0.5b", note)
+        self.assertIn("qwen3-0.6b", note)
+        draft, note = eng.resolve_draft("gpt-oss-20b", self.IDS)
+        self.assertIsNone(draft)
+        self.assertIn("no draft model", note)
+        os.environ["STUDIO_DRAFT_MODEL"] = "off"
+        self.assertEqual(eng.resolve_draft(self.BIG, self.IDS), (None, ""))
+
+
+class TestSpeculativeRequests(unittest.TestCase):
+    """The draft model rides on every request as LM Studio's `draft_model`,
+    which the host loads just in time; a pair it refuses is dropped after one
+    retry and explained, rather than failing every request after it."""
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def setUp(self):
+        import urllib.request
+        self.calls = []
+        self.refuse = None        # (status, text) for a request carrying a draft
+        self.refuse_all = False   # ...or for every request
+        self.stats = None
+        self.cut = False          # the host stops the reply with "length"
+        real = urllib.request.urlopen
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data)
+            self.calls.append(body)
+            if self.cut:
+                chunks = [{"choices": [{"delta": {"content": "<think>"}, "finish_reason": None}]},
+                          {"choices": [{"delta": {}, "finish_reason": "length"}]}]
+                lines = ["data: " + json.dumps(c) for c in chunks] + ["data: [DONE]"]
+                return self.Resp("\n".join(lines).encode("utf-8"))
+            if self.refuse and (self.refuse_all or body.get("draft_model")):
+                code, text = self.refuse
+                raise urllib.error.HTTPError(req.full_url, code, "bad", {},
+                                             io.BytesIO(text.encode("utf-8")))
+            msg = {"role": "assistant", "content": "ok"}
+            if body.get("stream"):
+                chunks = [{"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]},
+                          {"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+                if self.stats:
+                    chunks[-1]["stats"] = self.stats
+                lines = ["data: " + json.dumps(c) for c in chunks] + ["data: [DONE]"]
+                return self.Resp("\n".join(lines).encode("utf-8"))
+            reply = {"choices": [{"message": msg, "finish_reason": "stop"}]}
+            if self.stats:
+                reply["stats"] = self.stats
+            return self.Resp(json.dumps(reply).encode("utf-8"))
+        urllib.request.urlopen = fake_open
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        self.llm = eng.LLM("http://h:1234/v1", "big-30b", draft="tiny-0.6b")
+        self.messages = [{"role": "user", "content": "hi"}]
+
+    def test_the_draft_rides_on_every_request_and_only_when_there_is_one(self):
+        self.llm.chat(self.messages, max_tokens=1)
+        self.llm.stream(self.messages, on_text=lambda _: None)
+        self.assertEqual([c.get("draft_model") for c in self.calls], ["tiny-0.6b"] * 2)
+        self.assertEqual(self.calls[0]["max_tokens"], 1)
+        self.assertTrue(self.calls[1]["stream"])
+        plain = eng.LLM("http://h:1234/v1", "big-30b")
+        plain.chat(self.messages)
+        self.assertNotIn("draft_model", self.calls[-1])
+
+    def test_a_refused_pair_is_dropped_once_and_explained(self):
+        self.refuse = (400, "draft model vocabulary does not match")
+        data = self.llm.chat(self.messages)
+        self.assertEqual(data["choices"][0]["message"]["content"], "ok")
+        # the same request, once more, without the draft
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[0]["draft_model"], "tiny-0.6b")
+        self.assertNotIn("draft_model", self.calls[1])
+        self.assertEqual(self.calls[0]["messages"], self.calls[1]["messages"])
+        self.assertIsNone(self.llm.draft)
+        for word in ("tiny-0.6b", "big-30b", "400", "vocabulary"):
+            self.assertIn(word, self.llm.draft_note)
+        # and never again: the next request goes out plain, first time
+        self.llm.stream(self.messages, on_text=lambda _: None)
+        self.assertEqual(len(self.calls), 3)
+        self.assertNotIn("draft_model", self.calls[2])
+
+    def test_an_error_that_is_not_the_drafts_keeps_the_draft_and_the_error(self):
+        self.refuse, self.refuse_all = (400, "Unrecognized schema: false"), True
+        with self.assertRaises(RuntimeError) as cm:
+            self.llm.chat(self.messages)
+        self.assertIn("Unrecognized schema", str(cm.exception))
+        self.assertIn("400", str(cm.exception))
+        self.assertEqual(len(self.calls), 2)          # tried once without, no better
+        self.assertEqual(self.llm.draft, "tiny-0.6b")
+        self.assertIsNone(self.llm.draft_note)
+
+    def test_a_length_cutoff_names_the_model_and_the_window(self):
+        # The ComfyUI tab on qwen3-1.7b at 8,192 tokens: the prefix left the
+        # model no room, the host stopped it with "length", and the bare
+        # finish_reason told the user nothing they could act on.
+        self.cut = True
+        with self.assertRaises(RuntimeError) as cm:
+            self.llm.stream(self.messages, on_text=lambda _: None)
+        text = str(cm.exception)
+        self.assertIn("Incomplete inference response (length)", text)
+        for word in ("big-30b", "context", "no tools from it were executed", "16384"):
+            self.assertIn(word, text)
+
+    def test_the_hosts_score_is_kept_when_it_reports_one(self):
+        self.stats = {"draft_model": "tiny-0.6b", "total_draft_tokens_count": 10,
+                      "accepted_draft_tokens_count": 8, "tokens_per_second": 50}
+        self.llm.chat(self.messages)
+        self.assertEqual(self.llm.drafted, (8, 10))
+        self.llm.stream(self.messages, on_text=lambda _: None)
+        self.assertEqual(self.llm.drafted, (16, 20))
+        # a host that says nothing, or an empty stats object: nothing counted
+        self.stats = {"tokens_per_second": 50}
+        self.llm.chat(self.messages)
+        self.stats = None
+        self.llm.chat(self.messages)
+        self.assertEqual(self.llm.drafted, (16, 20))
+
+
+class TestHeadroom(unittest.TestCase):
+    """A tab whose prefix fills the model's window is told at warm-up, with
+    the numbers and the fix, rather than cut off on its first message."""
+
+    def test_too_little_room_is_named_with_the_fix(self):
+        note = eng.headroom_note("qwen3-1.7b", 7178, 8192, 32768)
+        for word in ("7,178", "8,192", "about 1,014 tokens", "qwen3-1.7b",
+                     "lms load qwen3-1.7b --context-length 16384", "up to 32,768"):
+            self.assertIn(word, note)
+
+    def test_enough_room_or_no_numbers_says_nothing(self):
+        self.assertEqual(eng.headroom_note("m", 3000, 8192, 32768), "")
+        self.assertEqual(eng.headroom_note("m", 8192 - eng.MIN_ROOM, 8192), "")
+        self.assertEqual(eng.headroom_note("m", None, 8192), "")
+        self.assertEqual(eng.headroom_note("m", 7000, None), "")
+
+    def test_a_prefix_past_the_window_leaves_nothing(self):
+        self.assertIn("leaving nothing", eng.headroom_note("m", 9000, 8192, 32768))
+
+    def test_a_model_already_at_its_maximum_needs_replacing_not_reloading(self):
+        note = eng.headroom_note("tiny", 7178, 8192, 8192)
+        self.assertIn("needs a model with a larger context window", note)
+        self.assertNotIn("lms load", note)
+
+    def test_the_asked_for_window_never_exceeds_the_models_own(self):
+        self.assertIn("--context-length 12288", eng.headroom_note("m", 7000, 8192, 12288))
+
+    def test_the_window_comes_from_the_hosts_model_list(self):
+        import urllib.request
+        real = urllib.request.urlopen
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        seen = []
+
+        def fake_open(url, timeout=None):
+            seen.append(url)
+            return Resp(json.dumps({"data": [
+                {"id": "qwen3-1.7b", "state": "loaded", "loaded_context_length": 8192,
+                 "max_context_length": 32768},
+                {"id": "other", "state": "not-loaded"}]}).encode("utf-8"))
+        urllib.request.urlopen = fake_open
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        self.assertEqual(eng.context_window("http://h:1234/v1", "qwen3-1.7b"), (8192, 32768))
+        self.assertEqual(seen, ["http://h:1234/api/v0/models"])
+        self.assertEqual(eng.context_window("http://h:1234/v1", "other"), (None, None))
+        self.assertEqual(eng.context_window("http://h:1234/v1", "absent"), (None, None))
+
+    def test_a_host_that_does_not_answer_gives_no_numbers(self):
+        import urllib.request
+        real = urllib.request.urlopen
+
+        def gone(url, timeout=None):
+            raise urllib.error.URLError("timed out")
+        urllib.request.urlopen = gone
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        self.assertEqual(eng.context_window("http://h:1234/v1", "m"), (None, None))
+
+
+class TestHostUnreachable(unittest.TestCase):
+    """Nothing answering is its own error, still a RuntimeError for anyone
+    catching that, because the GUI answers it with Connect rather than with
+    the message alone."""
+
+    def test_a_url_error_is_host_unreachable(self):
+        import urllib.request
+        real = urllib.request.urlopen
+
+        def gone(req, timeout=None):
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        urllib.request.urlopen = gone
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        llm = eng.LLM("http://h:1234/v1", "big-30b")
+        with self.assertRaises(eng.HostUnreachable) as cm:
+            llm.chat([{"role": "user", "content": "hi"}])
+        self.assertIsInstance(cm.exception, RuntimeError)
+        self.assertIn("cannot reach inference host", str(cm.exception))
+        self.assertIn("timed out", str(cm.exception))
+        with self.assertRaises(eng.HostUnreachable):
+            llm.stream([{"role": "user", "content": "hi"}])
+
+
+class TestHostAlive(unittest.TestCase):
+    """The tailnet is asked whether the LLM PC is there at all - only a
+    Tailscale address, only with the CLI on PATH, and never with a network
+    call from a test."""
+
+    def setUp(self):
+        self.ran = []
+        real_run, real_which = eng.subprocess.run, eng.shutil.which
+        self.addCleanup(setattr, eng.subprocess, "run", real_run)
+        self.addCleanup(setattr, eng.shutil, "which", real_which)
+        eng.shutil.which = lambda name: r"C:\Program Files\Tailscale\tailscale.exe"
+
+        class Done:
+            def __init__(self, code, out):
+                self.returncode, self.stdout = code, out
+        self.answer = Done(0, "pong from desktop-4rkl10b (100.127.17.38) via 192.168.40.43:41641 in 2ms\n")
+
+        def fake_run(args, **kw):
+            self.ran.append(args)
+            return self.answer
+        eng.subprocess.run = fake_run
+        self.Done = Done
+
+    def test_a_tailnet_peer_is_pinged(self):
+        self.assertIs(eng.host_alive("http://100.127.17.38:1234/v1"), True)
+        args = self.ran[-1]
+        self.assertTrue(args[0].endswith("tailscale.exe"))
+        self.assertEqual(args[1:3], ["ping", "--c"])
+        self.assertEqual(args[-1], "100.127.17.38")
+        self.answer = self.Done(1, "")
+        self.assertIs(eng.host_alive("http://100.127.17.38:1234/v1"), False)
+
+    def test_anything_else_is_not_asked(self):
+        for url in ("http://192.168.40.43:1234/v1", "http://llm.local:1234/v1",
+                    "http://localhost:1234/v1"):
+            with self.subTest(url=url):
+                self.assertIsNone(eng.host_alive(url))
+        self.assertEqual(self.ran, [])
+        eng.shutil.which = lambda name: None
+        self.assertIsNone(eng.host_alive("http://100.127.17.38:1234/v1"))
+        self.assertEqual(self.ran, [])
 
 
 class TestToolResults(unittest.TestCase):
@@ -1034,7 +1348,9 @@ class TestGui(unittest.TestCase):
         # switching tests do not depend on what is installed on this machine.
         cls._real_installed = eng.installed_apps
         eng.installed_apps = lambda: list(eng.APPS)
-        studio_chat.Chat._boot_host = lambda self: None
+        # Connect runs the real one against a stubbed probe; see the tests.
+        cls.real_boot_host = staticmethod(studio_chat.Chat._boot_host)
+        studio_chat.Chat._boot_host = lambda self, *a, **k: None
         studio_chat.Chat._ensure = lambda self, s: None
         studio_chat.Chat._read_icons = lambda self: None
         cls.app = studio_chat.Chat()
@@ -1148,6 +1464,72 @@ class TestGui(unittest.TestCase):
         self.assertEqual(len(set(prompts)), len(self.app.order))
         histories = [id(self.app.sessions[i].messages) for i in self.app.order]
         self.assertEqual(len(set(histories)), len(self.app.order))
+
+    def test_tool_calls_fold_to_their_name_and_open_on_the_script(self):
+        """A call is one row: the tool's name to read, the call as the model
+        made it - the whole script - and its result behind a click."""
+        sid = self.app.order[0]
+        s = self.app.sessions[sid]
+        view = s.view
+        self.app._on_new()
+        script = "\n".join("var layer%d = comp.layer(%d);" % (i, i) for i in range(30))
+        self.app._handle("tool", s.event_id, {"name": "run_jsx", "via": None,
+                                              "arguments": {"code": script, "timeout": 60}})
+        self.app._handle("tool_result", s.event_id, {"name": "run_jsx", "status": "ok",
+                                                     "text": '{"layer": 1}'})
+        self.app.update()
+        body = view.get("1.0", "end")
+        self.assertIn("run_jsx", body)
+        self.assertIn(script, body)                      # entire, not clipped
+        self.assertIn("result: {\"layer\": 1}", body)
+        self.assertNotIn("\u2026", body)                  # the ellipsis left with the result
+        n = s.call_seq
+        # Folded: the body is elided, the header is not, and the header is clickable.
+        self.assertEqual(str(view.tag_cget("body:%d" % n, "elide")), "1")
+        head = view.tag_ranges("call:%d" % n)[0]
+        self.assertIn("call_head", view.tag_names(head))
+        self.assertIsNotNone(view.bbox(head))
+        self.assertIsNone(view.bbox(view.tag_ranges("body:%d" % n)[0]))
+        self.assertEqual(view.get(view.tag_ranges("mark:%d" % n)[0]), self.app.g["closed"])
+        # Opened: the script is on screen and the chevron turned.
+        self.app._toggle_call(view, n)
+        self.app.update()
+        self.assertEqual(str(view.tag_cget("body:%d" % n, "elide")), "0")
+        self.assertIsNotNone(view.bbox(view.tag_ranges("body:%d" % n)[0]))
+        self.assertEqual(view.get(view.tag_ranges("mark:%d" % n)[0]), self.app.g["open"])
+        self.app._toggle_call(view, n)
+        self.assertEqual(str(view.tag_cget("body:%d" % n, "elide")), "1")
+
+    def test_a_failed_call_says_so_on_its_row_and_a_step_sits_in(self):
+        sid = self.app.order[0]
+        s = self.app.sessions[sid]
+        view = s.view
+        self.app._on_new()
+        self.app._handle("tool", s.event_id, {"name": "timeline", "via": None,
+                                              "arguments": {"action": "add_marker", "params": {"frame": 25}}})
+        self.app._handle("tool_result", s.event_id, {"name": "timeline", "status": "error",
+                                                     "text": "TOOL ERROR: no such frame"})
+        self.app._handle("tool", s.event_id, {"name": "set_text", "via": "lower_third",
+                                              "arguments": {"layerId": 4, "text": "Producer"}})
+        self.app._handle("tool_result", s.event_id, {"name": "set_text", "status": "ok", "text": "ok"})
+        self.app._handle("tool", s.event_id, {"name": "get_comp", "via": None, "arguments": {}})
+        self.app._handle("tool_result", s.event_id, {"name": "get_comp", "status": "skipped",
+                                                     "text": "Cancelled before dispatch"})
+        self.app.update()
+        failed = view.tag_ranges("call_failed")
+        self.assertEqual(view.get(failed[0], failed[1]), " failed")
+        self.assertEqual(view.get(failed[2], failed[3]), " not run")
+        # The compound tool's header names its action; the step is indented.
+        first = view.tag_ranges("call:%d" % (s.call_seq - 2))[0]
+        self.assertIn("timeline add_marker", view.get(first, str(first) + " lineend"))
+        step = view.tag_ranges("call:%d" % (s.call_seq - 1))[0]
+        self.assertIn("call_step", view.tag_names(step))
+        self.assertNotIn("call_step", view.tag_names(first))
+        # New chat takes the rows and their tags with it.
+        self.app._on_new()
+        self.assertFalse([t for t in view.tag_names() if t.startswith(("call:", "body:", "mark:"))])
+        self.assertEqual(s.call_seq, 0)
+        self.assertEqual(s.open_calls, {})
 
     def test_markdown_rendered_not_literal(self):
         sid = self.app.order[0]
@@ -1285,6 +1667,76 @@ class TestGui(unittest.TestCase):
         finally:
             self.app.llm, self.app.model_ids = real_llm, real_ids
 
+    def test_a_tab_with_its_own_model_gets_its_own_draft(self):
+        """The draft pairs with the executing model, so a tab that departs
+        from the shared model resolves a draft for its own - and a 1.7B gets
+        none unless the pin insists."""
+        real_llm, real_ids = self.app.llm, self.app.model_ids
+        pin = os.environ.pop("STUDIO_DRAFT_MODEL", None)
+        big, small = "qwen3-coder-30b-a3b-instruct", eng.APPS_BY_ID["comfyui"].models[0]
+        self.app.llm = eng.LLM(self.app.host, big, draft="qwen3-0.6b")
+        self.app.model_ids = [big, small, "qwen3-0.6b"]
+        try:
+            comfy = self.app.sessions["comfyui"]
+            chosen = self.app._llm_for(comfy)
+            self.assertEqual((chosen.model, chosen.draft), (small, None))
+            os.environ["STUDIO_DRAFT_MODEL"] = "qwen3-0.6b"
+            self.assertEqual(self.app._llm_for(comfy).draft, "qwen3-0.6b")
+            os.environ["STUDIO_DRAFT_MODEL"] = "ghost"
+            chosen = self.app._llm_for(comfy)
+            self.assertIsNone(chosen.draft)
+            self.app._drain()
+            self.app.update()
+            self.assertIn("STUDIO_DRAFT_MODEL names ghost", comfy.view.get("1.0", "end"))
+        finally:
+            self.app.llm, self.app.model_ids = real_llm, real_ids
+            os.environ.pop("STUDIO_DRAFT_MODEL", None)
+            if pin is not None:
+                os.environ["STUDIO_DRAFT_MODEL"] = pin
+
+    def test_the_inference_row_names_the_draft_and_its_score(self):
+        """Speculative decoding can backfire - a draft the model keeps
+        rejecting is slower than none - so the row says which draft runs and,
+        once the host reports it, how much of its work is kept."""
+        real_llm, real_ids = self.app.llm, self.app.model_ids
+        lbl = self.app.conn["host"][1]
+        self.app.llm = eng.LLM(self.app.host, "big-30b", draft="qwen3-0.6b")
+        self.app.model_ids = ["big-30b", "qwen3-0.6b"]
+        try:
+            self.app._host_line("ok", "sees: eyes-vl")
+            self.app._drain()
+            lines = lbl.cget("text").split("\n")
+            self.assertEqual(lines[1:], ["2 models", "big-30b", "sees: eyes-vl", "draft: qwen3-0.6b"])
+            self.app.llm.drafted = (78, 100)
+            self.app._host_line()                # role and last line kept
+            self.app._drain()
+            lines = lbl.cget("text").split("\n")
+            self.assertEqual(lines[-2:], ["sees: eyes-vl", "draft: qwen3-0.6b · 78%"])
+            self.assertTrue(all(len(line) <= 24 for line in lines), lines)
+            self.app.llm.draft = None
+            self.app._host_line()
+            self.app._drain()
+            self.assertNotIn("draft", lbl.cget("text"))
+            self.assertIn("sees: eyes-vl", lbl.cget("text"))
+        finally:
+            self.app.llm, self.app.model_ids = real_llm, real_ids
+
+    def test_a_refused_draft_is_said_once_in_the_tab_it_happened_in(self):
+        real_llm = self.app.llm
+        s = self.app.sessions[eng.APPS[0].id]
+        self.app.llm = eng.LLM(self.app.host, "big-30b", draft=None)
+        self.app.llm.draft_note = "The host refused tiny as a draft model for big-30b (HTTP 400 - no); speculative decoding is off for this model."
+        try:
+            self.app._draft_check(s, self.app.llm)
+            self.app._draft_check(s, self.app.llm)
+            self.app._drain()
+            self.app.update()
+            body = s.view.get("1.0", "end")
+            self.assertEqual(body.count("The host refused tiny"), 1)
+            self.assertIsNone(self.app.llm.draft_note)
+        finally:
+            self.app.llm = real_llm
+
     def test_start_says_why_it_does_nothing_in_chat(self):
         """A menu item, always enabled. Silence would read as a bug - and
         there is no app behind this tab to start."""
@@ -1348,6 +1800,295 @@ class TestGui(unittest.TestCase):
         self.assertEqual(logged, [])
         self.assertEqual(s.status[0], "OpenCode is not running")
         self.assertTrue(s.status[2], "the button stays, to try again")
+
+    def _host_state(self):
+        """Everything a probe writes, so a test can put it back."""
+        a = self.app
+        return (a.llm, a.model_ids, a.vision, a.vision_note, a.draft_note,
+                a.host_role, a.host_last, a.host_ok)
+
+    def _restore_host(self, state):
+        a = self.app
+        (a.llm, a.model_ids, a.vision, a.vision_note, a.draft_note,
+         a.host_role, a.host_last, a.host_ok) = state
+        if a.host_timer is not None:      # no quiet probe firing into a later test
+            a.after_cancel(a.host_timer)
+            a.host_timer = None
+
+    def _stuck(self, s):
+        """Boot a tab with no model: how every tab ends up when the probe at
+        startup times out."""
+        self.app.host_ready.set()
+        self.app._boot_session(s)
+        self.app._drain()
+        self.app.update()
+
+    def test_a_tab_stuck_without_the_host_offers_connect(self):
+        """The startup probe is one call with a short timeout, and a PC still
+        waking fails it. That used to leave every tab at 'no inference host'
+        with no button, and reopening the window as the only way on."""
+        state = self._host_state()
+        s = self.app.sessions[eng.CHAT.id]
+        self.app._select(s.id)
+        self.app.llm = None
+        try:
+            self._stuck(s)
+            self.assertFalse(s.ready)
+            self.assertTrue(s.host_down)
+            self.assertEqual(s.status, ("no inference host - trying again", "err", True))
+            self.assertEqual(self.app.btn_fix.cget("text"), "Connect")
+            self.assertTrue(self.app.btn_fix.winfo_ismapped())
+            self.assertIsNotNone(self.app.host_timer, "a tab stuck is a retry scheduled")
+        finally:
+            s.host_down = False
+            self._restore_host(state)
+
+    def test_connect_probes_again_and_starts_the_tab_you_are_looking_at(self):
+        """Connect is the probe again. Failing, the tab keeps its button and
+        the transcript says what to check; answering, the stuck tabs are
+        unstuck - the active one starts now, a ready one that lost the host
+        mid-conversation is ready again, the rest wait to be selected."""
+        state = self._host_state()
+        real_probe, real_alive = eng.probe_models, eng.host_alive
+        eng.host_alive = lambda host, timeout=3: None
+        a, b, c = (self.app.sessions[i] for i in self.app.order[:3])
+        ensured = []
+        self.app.llm = None
+        try:
+            self.app._select(a.id)
+            self._stuck(a)
+            self._stuck(b)
+            c.ready, c.host_down = True, True   # lost the host after a turn
+            c.status = ("inference host unreachable", "err", True)
+            self.app._ensure = ensured.append   # after _select, which ensures too
+
+            eng.probe_models = lambda host, timeout=8: (False, None, [], [], "timed out")
+            self.app._connect_host()
+            self.assertEqual(a.status[0], "connecting to the inference host")
+            self.assertFalse(self.app.btn_fix.winfo_ismapped(), "no second click meanwhile")
+            self.real_boot_host(self.app, False)   # what _connect_host spawned
+            self.app._drain()
+            self.app.update()
+            self.assertIsNone(self.app.llm)
+            self.assertEqual(a.status, ("no inference host - trying again", "err", True))
+            self.assertEqual(self.app.btn_fix.cget("text"), "Connect")
+            self.assertTrue(a.host_down and b.host_down and c.host_down)
+            body = a.view.get("1.0", "end")
+            self.assertIn("Cannot reach the inference host", body)
+            self.assertIn("tries again every 30 seconds", body)
+            self.assertIn("Connect", body)
+            self.assertIn("unreachable", self.app.conn["host"][1].cget("text"))
+            self.assertEqual(ensured, [])
+            self.assertIsNotNone(self.app.host_timer)
+
+            eng.probe_models = lambda host, timeout=8: (True, "m1", ["m1", "m2"], [], None)
+            self.app._connect_host()
+            self.real_boot_host(self.app, False)
+            self.app._drain()
+            self.app.update()
+            self.assertEqual(self.app.llm.model, "m1")
+            self.assertEqual(ensured, [a], "the active tab starts; the rest when selected")
+            self.assertFalse(a.host_down or b.host_down or c.host_down)
+            self.assertEqual(a.status, ("not started", "muted", False))
+            self.assertEqual(b.status, ("not started", "muted", False))
+            self.assertEqual(b.bridge[0], "faint", "no longer 'no model' on its dot")
+            self.assertEqual(c.status, ("ready", "muted", False))
+            self.assertFalse(self.app.btn_fix.winfo_ismapped())
+            self.assertIn("Connected to the inference host", a.view.get("1.0", "end"))
+            row = self.app.conn["host"][1].cget("text")
+            self.assertIn("m1", row)
+            self.assertIn("2 models", row)
+            self.assertNotIn("unreachable", row)
+            self.assertFalse(self.app.host_booting)
+        finally:
+            eng.probe_models, eng.host_alive = real_probe, real_alive
+            self.app.__dict__.pop("_ensure", None)
+            for s in (a, b, c):
+                s.ready, s.host_down = False, False
+            self._restore_host(state)
+
+    def test_the_window_keeps_trying_while_the_host_is_down(self):
+        """The LLM PC drops off on a timer. A failed probe schedules a quiet
+        one - the row and the status move, the transcript does not fill with
+        the same paragraph every half minute - and the loop ends by itself
+        once nothing is waiting on the host."""
+        state = self._host_state()
+        real_probe, real_alive = eng.probe_models, eng.host_alive
+        eng.probe_models = lambda host, timeout=8: (False, None, [], [], "timed out")
+        eng.host_alive = lambda host, timeout=3: None
+        spawned = []
+        self.app._spawn = lambda *a: spawned.append(a)
+        s = self.app.cur()
+        self.app.llm = None
+        try:
+            self.app._host_probed(False)
+            first = self.app.host_timer
+            self.assertIsNotNone(first)
+            self.app._host_probed(False)
+            self.assertEqual(self.app.host_timer, first, "one pending probe, not two")
+
+            self.app.host_timer = None    # as the timer firing does
+            self.app._retry_host()
+            self.assertEqual(spawned, [(None, self.app._boot_host, False, True)])
+            self.assertIsNone(self.app.host_timer, "the probe itself re-arms, on failure")
+
+            s.host_down = True
+            before = s.view.get("1.0", "end")
+            self.real_boot_host(self.app, False, True)   # what the retry spawned
+            self.app._drain()
+            self.app.update()
+            self.assertEqual(s.view.get("1.0", "end"), before, "a quiet probe says nothing")
+            self.assertEqual(s.status, ("no inference host - trying again", "err", True))
+            self.assertIn("unreachable", self.app.conn["host"][1].cget("text"))
+            self.assertIsNotNone(self.app.host_timer, "...and the next is scheduled")
+
+            spawned.clear()
+            self.app.host_timer = None
+            self.app.host_booting = True  # Connect is already probing
+            self.app._retry_host()
+            self.assertEqual(spawned, [])
+            self.app.host_booting = False
+            self.app.llm = eng.LLM(self.app.host, "m1")
+            s.host_down = False           # nothing waits on the host any more
+            self.app._retry_host()
+            self.assertEqual(spawned, [])
+            self.assertIsNone(self.app.host_timer)
+        finally:
+            eng.probe_models, eng.host_alive = real_probe, real_alive
+            self.app.__dict__.pop("_spawn", None)
+            s.host_down = False
+            self._restore_host(state)
+
+    def test_unreachable_is_explained_by_which_half_is_down(self):
+        """A locked PC keeps serving; a sleeping one does not; a restarted
+        one comes back without LM Studio's server. The probe cannot tell a
+        PC that is gone from one that is up with nothing listening - the
+        firewall drops both - so the tailnet is asked and the paragraph says
+        which, and what to change over there."""
+        real_alive = eng.host_alive
+        try:
+            eng.host_alive = lambda host, timeout=3: True
+            up = self.app._explain_unreachable("timed out")
+            self.assertIn("LM Studio's server is not answering", up)
+            self.assertIn("service on login", up)
+            self.assertIn("A locked screen does not stop it", up)
+            eng.host_alive = lambda host, timeout=3: False
+            gone = self.app._explain_unreachable("timed out")
+            self.assertIn("not answering at all", gone)
+            self.assertIn("standby-timeout-ac 0", gone)
+            eng.host_alive = lambda host, timeout=3: None
+            unknown = self.app._explain_unreachable("timed out")
+            self.assertIn("Cannot reach the inference host", unknown)
+            for text in (up, gone, unknown):
+                self.assertIn("tries again every 30 seconds", text)
+                self.assertIn("Connect", text)
+                self.assertTrue(text.endswith("(timed out)"))
+        finally:
+            eng.host_alive = real_alive
+
+    def test_a_second_probe_keeps_the_model_the_tabs_booted_on(self):
+        """Connect again with the host fine: the same model keeps its client,
+        so the tabs that hold it stay in step with the Inference row."""
+        state = self._host_state()
+        real_probe = eng.probe_models
+        self.app.llm = eng.LLM(self.app.host, "m1")
+        try:
+            eng.probe_models = lambda host, timeout=8: (True, "m1", ["m1"], [], None)
+            before = self.app.llm
+            self.real_boot_host(self.app, False)
+            self.app._drain()
+            self.assertIs(self.app.llm, before)
+            eng.probe_models = lambda host, timeout=8: (True, "m2", ["m2"], [], None)
+            self.real_boot_host(self.app, False)
+            self.app._drain()
+            self.assertIsNot(self.app.llm, before)
+            self.assertEqual(self.app.llm.model, "m2")
+        finally:
+            eng.probe_models = real_probe
+            self._restore_host(state)
+
+    def test_a_turn_that_loses_the_host_says_so_and_offers_connect(self):
+        """Mid-conversation the host can go away too. The row goes red, the
+        header offers Connect, and the next request that gets through - a
+        Connect or just sending again - puts both back."""
+        from test_tasks import FakeLLM, answer
+        state = self._host_state()
+        s = self.app.cur()
+        saved = s.messages, s.record, s.ready
+        self.app.llm = eng.LLM(self.app.host, "m1")
+        self.app.model_ids = ["m1"]
+
+        class Gone:
+            model = "m1"
+
+            def stream(self, messages, tools, on_text):
+                raise eng.HostUnreachable("cannot reach inference host h (timed out)")
+
+        class Back(FakeLLM):
+            model = "m1"                  # the Inference row names it
+        try:
+            self.app._host_healthy("ok", "sees: eyes")
+            self.app._drain()
+            s.reset()
+            s.ready = True
+            s.record.briefs.append("hello")
+            s.messages.append({"role": "user", "content": "hello"})
+            self.app.llm = Gone()
+            self.app._guard(s.event_id, self.app._turn, s)
+            self.app._drain()
+            self.app.update()
+            self.assertTrue(s.host_down)
+            self.assertEqual(s.status, ("inference host unreachable - trying again", "err", True))
+            self.assertEqual(self.app.btn_fix.cget("text"), "Connect")
+            self.assertIsNotNone(self.app.host_timer, "the window will try by itself")
+            self.assertTrue(self.app.btn_fix.winfo_ismapped())
+            self.assertIn("cannot reach inference host", s.view.get("1.0", "end"))
+            self.assertNotIn("Traceback", s.view.get("1.0", "end"))
+            self.assertIn("unreachable", self.app.conn["host"][1].cget("text"))
+            self.assertEqual(self.app.dot_role[self.app.conn["host"][0]], "err")
+
+            # Not a correction - "again" reads as one and would start the
+            # reflection, one more request the fake has no answer for.
+            s.record.briefs.append("once more please")
+            s.messages.append({"role": "user", "content": "once more please"})
+            self.app.llm = Back([answer(text="Back.")])
+            self.app._guard(s.event_id, self.app._turn, s)
+            self.app._drain()
+            self.app.update()
+            self.assertFalse(s.host_down)
+            self.assertEqual(s.status[0], "ready")
+            self.assertFalse(self.app.btn_fix.winfo_ismapped())
+            self.assertIn("sees: eyes", self.app.conn["host"][1].cget("text"))
+            self.assertEqual(self.app.dot_role[self.app.conn["host"][0]], "ok")
+        finally:
+            s.messages, s.record, s.ready = saved
+            s.host_down = False
+            self._restore_host(state)
+
+    def test_the_inference_row_and_the_bridges_menu_offer_connect(self):
+        """The row is a menu like the Bridges row; its one action is Connect,
+        worded for the state, and disabled while a probe runs."""
+        state = self._host_state()
+        try:
+            self.app.llm = None
+            m = self.app._menu_host()
+            self.assertEqual(m.entrycget(0, "label"), "Connect to the inference host")
+            self.assertEqual(str(m.entrycget(0, "state")), "normal")
+            self.app.llm = eng.LLM(self.app.host, "m1")
+            m = self.app._menu_host()
+            self.assertEqual(m.entrycget(0, "label"), "Connect again")
+            self.app.host_booting = True
+            m = self.app._menu_host()
+            self.assertIn("Connecting", m.entrycget(0, "label"))
+            self.assertEqual(str(m.entrycget(0, "state")), "disabled")
+            self.app._connect_host()              # a probe already running: nothing
+        finally:
+            self.app.host_booting = False
+            self._restore_host(state)
+        labels = [self.app.m_bridge.entrycget(i, "label")
+                  for i in range(self.app.m_bridge.index("end") + 1)
+                  if self.app.m_bridge.type(i) == "command"]
+        self.assertIn("Connect to the inference host", labels)
 
     def test_events_for_a_closed_tab_are_dropped(self):
         """A turn can still be in flight; it must not write into another app."""
