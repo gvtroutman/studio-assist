@@ -5,6 +5,7 @@ for inference. A record is evidence of execution, not proof of visual quality.
 """
 import json
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -94,6 +95,24 @@ TASK QUALITY
   corrects you, tells you how they work, or when a call fails and you find what
   works instead. Neither touches the project.
 """
+
+# A reply that announces the next step instead of taking it: "Now I'll generate
+# the image" with no tool call attached. A small model does this at the top of a
+# task and the run would otherwise end there, looking finished. A question to
+# the user is not a promise, and the phrases are first-person future only, so a
+# plain answer ("24 fps means...") is left alone.
+PROMISE = re.compile(r"\b(?:I(?:'ll| will|'m going to| am going to| shall)|let(?:'s| us| me)|"
+                     r"(?:now|next|then|first)[,:]? I)\b", re.I)
+PROMISE_HINT = ("You described what you would do, but this reply called no tool, so "
+                "nothing happened. Make the call now - the first step, with real "
+                "arguments - or, if no tool you have fits the task, say so plainly "
+                "instead of describing work.")
+
+
+def announces_work(text):
+    """True when a reply promises action rather than answering or asking."""
+    text = (text or "").strip()
+    return bool(text) and not text.endswith("?") and PROMISE.search(text) is not None
 
 
 # The executor validates every call against the bridge's original schema with
@@ -404,9 +423,30 @@ class Executor:
             raise CheckpointError("Could not save task progress; execution stopped: " + str(e)) from e
 
     def _call(self, call):
+        """One dispatch, told to the user as it happens: the call as the model
+        made it - the whole of it, the script included, since the transcript
+        folds it - then its outcome under the same name. Every route in comes
+        through here, so a made tool's steps and the executor's own look are
+        announced like the model's direct calls."""
         fn = call["function"]
-        name = fn["name"]
-        args = json.loads(fn.get("arguments") or "{}")
+        name, raw = fn["name"], fn.get("arguments") or "{}"
+        try:
+            shown = json.loads(raw)
+        except ValueError:
+            shown = raw                   # not JSON; shown as the model wrote it
+        self.emit("tool", {"name": name, "arguments": shown, "via": self.via})
+        try:
+            text, wrote, read = self._dispatch(name, raw)
+        except Exception as e:
+            self.emit("tool_result", {"name": name, "text": "TOOL ERROR: " + str(e),
+                                      "status": "error"})
+            raise
+        self.emit("tool_result", {"name": name, "text": text,
+                                  "status": "error" if text.startswith("TOOL ERROR") else "ok"})
+        return text, wrote, read
+
+    def _dispatch(self, name, raw):
+        args = json.loads(raw)
         if not isinstance(args, dict):
             raise ValueError("tool arguments must be an object")
         if name == "studio_task_update":
@@ -470,7 +510,6 @@ class Executor:
             entry["auto"] = True          # the executor's own look, not the model's
         self.record.journal.append(entry)
         self._save()  # record intent before a call can change the project
-        self.emit("tool", name + " " + json.dumps(args)[:160])
         try:
             result = self.mcp.call_tool(name, args)
         except (TimeoutError, ConnectionError, BrokenPipeError, EOFError) as e:
@@ -595,6 +634,18 @@ class Executor:
                          "; earlier steps already ran" if len(results) > 1 else "")) + report
         return report, pending, verified and not pending
 
+    def _skipped(self, call, why):
+        """A call the model made and the executor will not dispatch - after a
+        stop, or three errors in a row - still shows in the transcript as the
+        call it was, with why it did not run where its result would be."""
+        fn = call["function"]
+        try:
+            shown = json.loads(fn.get("arguments") or "{}")
+        except ValueError:
+            shown = fn.get("arguments")
+        self.emit("tool", {"name": fn["name"], "arguments": shown, "via": None})
+        self.emit("tool_result", {"name": fn["name"], "text": why, "status": "skipped"})
+
     def run(self, messages, max_steps=25, streaming=True):
         try:
             return self._run(messages, max_steps, streaming)
@@ -619,6 +670,7 @@ class Executor:
 
     def _run(self, messages, max_steps=25, streaming=True):
         failures, needs_read, reminders, reviews = 0, False, 0, 0
+        called, nudged = 0, False
         for entry in self.record.journal:
             if entry.get("verifies") and entry.get("status") == "ok":
                 needs_read = False
@@ -675,17 +727,29 @@ class Executor:
                 final = msg.get("content") or "The model returned an empty reply."
                 if needs_read:
                     return stop("Edits were made but remain unverified. " + final)
+                if self.tools and not called and announces_work(final):
+                    # The model described the call instead of making it. One
+                    # reminder it can act on; a second promise ends the run
+                    # with its emptiness named rather than looking finished.
+                    if not nudged:
+                        nudged = True
+                        self.emit("sys", "The model described a step without calling a tool; asked once to make the call.")
+                        messages.append({"role": "user", "content": PROMISE_HINT})
+                        continue
+                    return stop("Nothing was done: the model described work but called no tool. " + final)
                 self.record.status = "response complete; see recorded checks and limitations"
                 self._save()
                 return final
             for call in calls:
-                if self.cancel.is_set():
-                    out = "Cancelled before dispatch; this call was not executed."
-                elif failures >= 3:
-                    out = "Not executed: stopped after three consecutive tool errors."
+                if self.cancel.is_set() or failures >= 3:
+                    out = ("Cancelled before dispatch; this call was not executed."
+                           if self.cancel.is_set() else
+                           "Not executed: stopped after three consecutive tool errors.")
+                    self._skipped(call, out)
                 else:
                     try:
                         out, wrote, read = self._call(call)
+                        called += 1
                         needs_read = (needs_read or wrote) and not read
                     except CheckpointError:
                         raise
@@ -697,7 +761,6 @@ class Executor:
                     failures = failures + 1 if out.startswith("TOOL ERROR") else 0
                     self.trouble = self.trouble or out.startswith("TOOL ERROR")
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": out})
-                self.emit("tool_result", " ".join(out.split())[:180])
                 self._save()
             if failures >= 3:
                 return stop("Stopped after repeated tool errors. Review the last error and inspect the project before continuing.")

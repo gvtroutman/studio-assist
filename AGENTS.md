@@ -517,6 +517,18 @@ returns in seconds. LM Studio's prefix cache survives across processes, which is
 this works at all. Each tab has its own prefix and so warms up separately, the first
 time it is opened.
 
+**The warm-up's reply is also the tab's token budget; read it.** `usage.prompt_tokens`
+on that 1-token call is the exact cost of the briefing, the tools and one short message
+on the tab's model. `Chat._headroom()` sets it against the window LM Studio loaded the
+model with (`context_window()`, from `/api/v0/models`' `loaded_context_length`) and,
+under `MIN_ROOM` (2,048 tokens), prints `headroom_note()` in the tab: the numbers, the
+`lms load <model> --context-length N` that fixes it, or "needs a bigger model" when the
+model is already at its maximum. The ComfyUI tab found this: its prefix is ~7,200 tokens
+on qwen3-1.7b, which LM Studio loads at 8,192 by default, so a thinking model had ~1,000
+tokens to think and call a tool and the host cut it off with `finish_reason: length` -
+which `LLM.stream` now explains in the same terms instead of reporting the bare word.
+Nothing here reloads the model: that is the user's GPU on another machine.
+
 **Never test the GUI with synthetic keystrokes.** `SendKeys` types into whatever
 window has focus, not the one you meant. It has already leaked a test sentence into
 the user's chat window mid-run. Test by constructing `Chat()` in-process and calling
@@ -537,6 +549,45 @@ composer.
 - **The header describes the active tab only.** Status, the Send button and the
   `Start <app>` button all come from `_apply_status()` reading the active session, so a
   background tab finishing work never rewrites the header you are looking at.
+- **The host probe is re-runnable; nothing about the host is final.** `_boot_host()`
+  is one `probe_models` call with an 8 s timeout, and a PC still waking or a server
+  not yet started fails it once. It used to leave `self.llm` None for the life of the
+  window, every tab at `no inference host` with no button, and reopening the window as
+  the only way on. Now `_boot_host(first=False)` is **Connect**: the header button
+  (`Session.host_down` makes `_apply_status()` label it `Connect` and `_on_fix()` send
+  it to `_connect_host()`), the Inference row's menu (`_menu_host()`, built apart from
+  its posting like the others so tests can read it) and Bridges ▸ Connect to the
+  inference host. `host_booting` keeps two probes from running at once; `host_ready`
+  still means only "the first probe is over", which is all `_boot_session` waits for.
+  The probe ends by posting `host_probed` with whether it succeeded, and
+  `_host_probed()` on the UI thread unsticks every `host_down` tab: the active one is
+  `_ensure`d now, a ready one is ready again, the rest wait to be selected — boot stays
+  lazy. A probe that fails after an earlier success leaves `self.llm` in place, and one
+  that finds the same model keeps the same `LLM` object, so the tabs booted on it stay
+  in step with the row (`_draft_check` compares by identity). Mid-conversation,
+  `LLM._open` raises `eng.HostUnreachable` (a `RuntimeError`, so nothing that caught
+  one before changes) for a `URLError`; `_turn` and the warm-up answer it with
+  `_host_lost()` (the row red, `unreachable`) and a fixable `inference host
+  unreachable` status, and the next request that gets through calls `_host_back()`,
+  which restores the row the probe left in `host_ok`.
+  **The window retries by itself.** The LLM PC drops off on a timer, so a button
+  alone would be pressed every time. A failed probe, a tab booting with no model and
+  a turn that lost the host all end in `_arm_retry()` (the worker paths post
+  `host_retry`), which schedules one *quiet* probe with `after(HOST_RETRY_MS)`;
+  `host_timer` keeps it to one pending at a time, `_retry_host()` gives way to a
+  Connect already running and stops when `_host_wanted()` is false (a model, and no
+  `host_down` tab). A quiet probe (`_boot_host(False, quiet=True)`) moves the row and
+  the status and writes nothing — the transcript must not gain the same paragraph
+  every half minute; success is said once, as for Connect. The paragraph itself comes
+  from `_explain_unreachable()`, which asks `eng.host_alive()` — `tailscale ping` for
+  a 100.64/10 address with the CLI on PATH, `None` otherwise — because Windows
+  Firewall drops a port with no listener rather than refusing it, so "asleep" and "up
+  with LM Studio's server stopped" are the same `timed out` to `probe_models`; the
+  wording names which, and what to change on the LLM PC (no sleep timer; LM Studio's
+  service on login). Loud probes only: the ping is a subprocess. Tests:
+  `TestHostUnreachable`, `TestHostAlive`, and the `connect`, `keeps_trying` and
+  `which_half` tests in `TestGui`, which keep the real `_boot_host` behind the
+  fixture's stub as `real_boot_host` and cancel `host_timer` in `_restore_host`.
 - **Boot is lazy and idempotent.** `_ensure()` fires on first `_select()`; `booting`
   guards re-entry and is cleared in a `finally` so a failed bridge can be retried by
   switching away and back.
@@ -593,6 +644,19 @@ composer.
   the bridge tool tables (`tests/test_mcp.py`, `TestVerificationHints`): a read
   the default groups do not expose, or an id the tool does not take, fails.
   Resolve has neither yet - its compound tools do not fit the id-argument shape.
+- **A reply that announces the call instead of making it does not end the run.**
+  "Now I'll generate the image" with no `tool_calls` used to be accepted as the
+  answer whenever nothing had been written yet, so the ComfyUI tab twice promised
+  a picture and stopped, journal empty, looking finished. `announces_work()`
+  reads first-person future phrases (`PROMISE`) in a reply that is not a
+  question; when the tab has tools and this run has called none, the executor
+  appends `PROMISE_HINT` as the next user message once and lets the model act.
+  A second promise ends the run with `Nothing was done: ...` as the status and
+  the `sys` line, so the user sees an empty run named rather than a plan. A
+  sign-off after real work ("I'll be here if you want another seed") is not
+  nudged - the count is per run - and `BASE_RULES` says the same thing in the
+  prompt, for the models that read it. `tests/test_tasks.py`
+  `TestPromisedWork` replays the transcript that found it.
 - `readonly()` decides which calls owe a read-back from the tool's name prefix or its
   MCP `readOnlyHint` annotation. A bridge written here must annotate its reads
   (`READ_ONLY` in every bridge here); unannotated, `comfy_status` counted as an
@@ -609,6 +673,25 @@ composer.
   keeps one `Session.llm` per tab, fixed at boot: the executor, both warm-ups and the
   host's cached prefix must agree, and tabs with no preference share the window's
   handle (`Chat._llm_for`). The CLI resolves the same way unless `--model` is given.
+- **Speculative decoding is a request field, not a load.** LM Studio takes
+  `draft_model` in the `/v1/chat/completions` body and loads the draft just in time;
+  its `/api/v1/models/load` has no draft field, so there is nothing to load at boot.
+  `LLM(draft=...)` puts it on every request, streamed or not. `resolve_draft(model,
+  ids)` picks it the way the vision model is picked: `STUDIO_DRAFT_MODEL` when served
+  (`off` disables), else the smallest served model of the executing model's family
+  from `DRAFT_MODELS`, else none — a draft has to share the main model's vocabulary,
+  and `draft_family` matches a whole name (`qwen3` is not `qwen3.6`), never a prefix.
+  A draft-sized model gets no draft. A tab with a model of its own resolves its own
+  draft (`_llm_for`); `--draft` is the CLI's pin. **A pair the host refuses must not
+  cost the tab:** `LLM._open` retries an HTTP error once without the draft, and only
+  when that succeeds drops the draft for good and sets `draft_note`; the retry failing
+  too means the error was not the draft's, and the original is raised with the draft
+  kept. `_draft_check` says the note once, in the tab the request was made from, after
+  each warm-up and turn. The Inference row names the draft and, when the host reports
+  `accepted_draft_tokens_count`, the share kept (`LLM.drafted`, `_host_line`) —
+  speculative decoding backfires when the draft is mostly wrong, and that is how to
+  see it. Never pair across families by guessing: the host answers a mismatch with an
+  HTTP error for the entire request.
 - **The executing model reads text; `eng.Vision` is its eyes, and every tab has
   one or is told it does not.** Every bridge answers a screenshot with an image
   content item and every tab takes picture attachments, so `_boot_host` resolves
@@ -743,6 +826,35 @@ it: a frame embedded in a `Text` has no height until an idle pass, so `see("end"
 has to be repeated from `after_idle` or the form sits below the fold; and the
 answer must go to the session that asked, not `cur()` — the user may have switched
 tabs.
+
+### The folded call rows
+
+Every tool call is one row in the transcript: the tool's name (and its `action`,
+for a compound tool), a red *failed* or *not run* when it went wrong, and behind a
+click the call as the model made it - every argument whole, so a `run_jsx` /
+`ps_run_jsx` script reads as the script - with the result under it.
+
+- **`Executor._call` is the one place a call is announced.** It emits `("tool",
+  {"name", "arguments", "via"})` before dispatch and `("tool_result", {"name",
+  "text", "status"})` after - `status` is `ok`, `error` or, from `_skipped`, the
+  `skipped` of a call the executor refused after a stop or three errors. Every
+  route in goes through `_call`, so a made tool's steps (`via` naming it) and the
+  auto-review's screenshot are announced like the model's own calls; a step's
+  result arrives before the made tool's own. The CLI prints the same events
+  clipped; the GUI keeps them whole (`CALL_TEXT_LIMIT` per value is the only cap -
+  the task record has the rest).
+- **In the GUI a row is text, not a widget.** `_show_call` writes the header under
+  `tool` + `call_head` + `call:<n>` and the body under `tool_body` + `body:<n>`
+  with `elide` on; `_show_result` finds the newest row of that name still in
+  `Session.open_calls` (a stack, so nested steps pair up) and inserts the result
+  at the end of that body tag. Tag bindings on `call_head` do the click and the
+  hand cursor, and `_toggle_call` flips the elide and the chevron (`g["closed"]` /
+  `g["open"]`, MDL2 by codepoint like the rest). Elided text is invisible but
+  present: `view.get` returns it, `bbox` is `None` for it, and a `see("end")`
+  after an expand near the fold is what keeps the header on screen.
+- **Per-row tags go with the text.** `_clear_view` deletes `call:`, `body:`,
+  `mark:` and `status:` tags and empties `open_calls`; use it, not a bare
+  `delete("1.0", "end")`, wherever a transcript is emptied.
 
 ## Tools the model makes for itself
 

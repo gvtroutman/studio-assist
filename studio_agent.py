@@ -18,6 +18,7 @@ Stdlib only. No pip installs.
 import argparse
 import base64
 import glob
+import ipaddress
 import json
 import os
 import queue
@@ -302,51 +303,101 @@ def to_openai_tools(mcp_tools):
     return out
 
 
+class HostUnreachable(RuntimeError):
+    """Nothing answered at the inference host: the tailnet, the other PC or
+    LM Studio's server is down, or the connection timed out. Distinct from
+    an HTTP error, which is the host answering with a problem, because the
+    GUI treats the two differently: this one gets a Connect button."""
+
+
 class LLM:
-    def __init__(self, base_url, model, temperature=0.2, timeout=300):
+    """One model on the OpenAI-compatible host, and the draft model that runs
+    ahead of it.
+
+    `draft` is speculative decoding: a small model sharing the executing
+    model's vocabulary guesses the next few tokens and the big one checks
+    them in a single pass, so the answer reads the same and arrives sooner.
+    LM Studio takes it per request as `draft_model` and loads it just in
+    time; there is nothing to load beforehand. A pair the host refuses is
+    dropped after one retry and explained in `draft_note`, so a bad pairing
+    costs a line in the tab rather than every request. `drafted` is the
+    running (accepted, offered) count of draft tokens when the host reports
+    them, for the status line.
+    """
+    def __init__(self, base_url, model, temperature=0.2, timeout=300, draft=None):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        self.draft = draft
+        self.draft_note = None
+        self.drafted = (0, 0)
 
-    def chat(self, messages, tools=None, max_tokens=None):
+    def _body(self, messages, tools, **extra):
         body = {"model": self.model, "messages": messages,
                 "temperature": self.temperature}
-        if max_tokens:
-            body["max_tokens"] = max_tokens
+        if self.draft:
+            body["draft_model"] = self.draft
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
-        req = urllib.request.Request(
+        body.update(extra)
+        return body
+
+    def _request(self, body):
+        return urllib.request.Request(
             self.url, data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"})
+
+    def _open(self, body):
+        """POST and return the response, still open.
+
+        An HTTP error with a draft model in the request is tried once more
+        without it: the same request succeeding then is proof the pairing was
+        the problem, and speculative decoding is switched off for this model
+        rather than failing every request after. The retry failing too means
+        the draft was not the trouble, and the original error is reported.
+        """
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.load(r)
+            return urllib.request.urlopen(self._request(body), timeout=self.timeout)
         except urllib.error.HTTPError as e:
-            raise RuntimeError("inference host %s: HTTP %s - %s"
-                               % (self.url, e.code, e.read()[:400].decode("utf-8", "replace")))
+            detail = e.read()[:400].decode("utf-8", "replace")
+            if body.get("draft_model"):
+                plain = {k: v for k, v in body.items() if k != "draft_model"}
+                try:
+                    resp = urllib.request.urlopen(self._request(plain), timeout=self.timeout)
+                except (urllib.error.HTTPError, urllib.error.URLError):
+                    pass
+                else:
+                    self.draft_note = ("The host refused %s as a draft model for %s (HTTP %s - "
+                                       "%s); speculative decoding is off for this model."
+                                       % (self.draft, self.model, e.code, detail.strip()))
+                    self.draft = None
+                    return resp
+            raise RuntimeError("inference host %s: HTTP %s - %s" % (self.url, e.code, detail))
         except urllib.error.URLError as e:
-            raise RuntimeError("cannot reach inference host %s (%s). Is the tailnet up "
-                               "and LM Studio serving?" % (self.url, e.reason))
+            raise HostUnreachable("cannot reach inference host %s (%s). Is the tailnet up "
+                                  "and LM Studio serving?" % (self.url, e.reason))
+
+    def _count(self, stats):
+        """The draft's score, when the host says: LM Studio reports how many
+        draft tokens were offered and how many the model kept."""
+        if not isinstance(stats, dict) or "accepted_draft_tokens_count" not in stats:
+            return
+        kept, offered = self.drafted
+        self.drafted = (kept + int(stats.get("accepted_draft_tokens_count") or 0),
+                        offered + int(stats.get("total_draft_tokens_count") or 0))
+
+    def chat(self, messages, tools=None, max_tokens=None):
+        extra = {"max_tokens": max_tokens} if max_tokens else {}
+        with self._open(self._body(messages, tools, **extra)) as r:
+            data = json.load(r)
+        self._count(data.get("stats"))
+        return data
 
     def stream(self, messages, tools=None, on_text=None):
         """Streamed completion. on_text(str) fires per token; returns the final message."""
-        body = {"model": self.model, "messages": messages,
-                "temperature": self.temperature, "stream": True}
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
-        req = urllib.request.Request(
-            self.url, data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"})
-        try:
-            resp = urllib.request.urlopen(req, timeout=self.timeout)
-        except urllib.error.HTTPError as e:
-            raise RuntimeError("inference host: HTTP %s - %s"
-                               % (e.code, e.read()[:400].decode("utf-8", "replace")))
-        except urllib.error.URLError as e:
-            raise RuntimeError("cannot reach inference host %s (%s)" % (self.url, e.reason))
+        resp = self._open(self._body(messages, tools, stream=True))
 
         content, calls = [], {}
         finish_reason, done = None, False
@@ -363,6 +414,7 @@ class LLM:
                     chunk = json.loads(data)
                 except json.JSONDecodeError as e:
                     raise RuntimeError("Malformed inference stream; no tools from this response were executed.") from e
+                self._count(chunk.get("stats"))
                 choice = (chunk.get("choices") or [{}])[0]
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta") or {}
@@ -382,6 +434,18 @@ class LLM:
                     if fn.get("arguments"):
                         slot["args"] += fn["arguments"]
 
+        if finish_reason == "length":
+            # The host stopped the model, not the model itself: the reply hit
+            # the context window it was loaded with (or a response-length
+            # limit set in LM Studio). Nothing partial is executed; say what
+            # the host would not.
+            raise RuntimeError(
+                "Incomplete inference response (length): %s ran out of room before its reply "
+                "finished, and no tools from it were executed. The reply hit the context "
+                "window the model was loaded with - or LM Studio's response-length limit, if "
+                "one is set. On the LLM PC, reload %s with a larger context length (16384 or "
+                "more); if the conversation is long, New chat starts a shorter one."
+                % (self.model, self.model))
         if not done or finish_reason not in ("stop", "tool_calls"):
             raise RuntimeError("Incomplete inference response (%s); no tools from this response were executed."
                                % (finish_reason or "connection ended"))
@@ -395,6 +459,39 @@ class LLM:
 
 
 # ---------------------------------------------------------------- health probes
+
+TAILNET = ipaddress.ip_network("100.64.0.0/10")   # every Tailscale address
+
+
+def host_alive(base_url, timeout=3):
+    """Whether the machine behind the inference host answers at all, as
+    distinct from its server: True, False, or None when it cannot be told.
+
+    The difference is the whole diagnosis. A PC that is asleep, off or off
+    the tailnet answers nothing; a PC that is up with LM Studio's server not
+    running answers the tailnet and drops port 1234 - Windows Firewall
+    drops a port with no listener rather than refusing it, so both read as
+    "timed out" from the probe alone. A Tailscale peer is asked with
+    `tailscale ping` (ICMP needs raw sockets; the disco ping needs nothing);
+    any other address is not asked.
+    """
+    host = urllib.parse.urlsplit(base_url).hostname
+    try:
+        if ipaddress.ip_address(host) not in TAILNET:
+            return None
+    except ValueError:
+        return None
+    exe = shutil.which("tailscale")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "ping", "--c", "1", "--timeout", "%ds" % timeout, host],
+                           capture_output=True, text=True, timeout=timeout + 5,
+                           creationflags=NO_WINDOW)
+    except Exception:
+        return None
+    return r.returncode == 0 and "pong" in r.stdout
+
 
 def http_alive(url, timeout=2):
     """True when something answers - 405 counts, a websocket endpoint says that."""
@@ -492,6 +589,135 @@ def pick_model(loaded, ids, want=None):
         if m in ids:
             return m
     return ids[0] if ids else None
+
+
+# The least a reply needs after the request's fixed prefix: a tool call with a
+# prompt in it is a few hundred tokens, a thinking model's preamble a thousand,
+# and every turn adds a tool result. Under this the tab is cut off before it can
+# act - "Incomplete inference response (length)" on the first message.
+MIN_ROOM = 2048
+
+
+def context_window(base_url, model_id, timeout=5):
+    """(loaded, maximum) context length in tokens of one model the host
+    serves, from LM Studio's REST API; (None, None) from a host that does
+    not say. `loaded` is what the model was loaded with, which is LM
+    Studio's default for it and often far below `maximum`."""
+    try:
+        with urllib.request.urlopen(api_root(base_url) + "/api/v0/models",
+                                    timeout=timeout) as r:
+            data = json.load(r).get("data", [])
+    except Exception:
+        return None, None
+    for m in data:
+        if isinstance(m, dict) and m.get("id") == model_id:
+            loaded, top = m.get("loaded_context_length"), m.get("max_context_length")
+            return (loaded if isinstance(loaded, int) else None,
+                    top if isinstance(top, int) else None)
+    return None, None
+
+
+def headroom_note(model, prompt_tokens, loaded, maximum=None):
+    """What to tell a tab whose prefix leaves the model too little room to
+    answer, or "" when there is room or nothing is known.
+
+    `prompt_tokens` is the warm-up's `usage.prompt_tokens`: the exact cost of
+    the briefing, the tools and one short message on this model's tokenizer.
+    The fix is on the LLM PC, so the note names it in LM Studio's terms and
+    as the `lms` command, with the numbers that justify it.
+    """
+    if not isinstance(prompt_tokens, int) or not isinstance(loaded, int):
+        return ""
+    room = loaded - prompt_tokens
+    if room >= MIN_ROOM:
+        return ""
+    head = ("This tab's briefing and tools take %s of %s's %s-token context window, "
+            "leaving %s for the conversation and each reply - the model will be cut "
+            "off before it can finish (\"Incomplete inference response (length)\"). "
+            % ("{:,}".format(prompt_tokens), model, "{:,}".format(loaded),
+               "about {:,} tokens".format(room) if room > 0 else "nothing"))
+    if isinstance(maximum, int) and maximum <= loaded:
+        return head + ("That is all %s can take; this tab needs a model with a larger "
+                       "context window." % model)
+    want = max(16384, 2 * loaded)
+    if isinstance(maximum, int):
+        want = min(want, maximum)
+    return head + ("On the LLM PC, reload %s with a context length of %s or more: eject it "
+                   "in LM Studio and load it again with Context Length raised, or run "
+                   "`lms load %s --context-length %d`.%s"
+                   % (model, "{:,}".format(want), model, want,
+                      " The model supports up to {:,}.".format(maximum)
+                      if isinstance(maximum, int) else ""))
+
+
+# Draft models for speculative decoding, by the family whose vocabulary they
+# share; smallest first, because a draft earns its keep by being fast and the
+# big model rejects what it gets wrong. A family is the id up to its first
+# size or variant, so "qwen3-coder-30b-a3b-instruct" is qwen3 and "qwen3.6-27b"
+# is not - a mismatched pair is refused by the host, and the LLM client drops
+# it, but that is a retry the first request need not pay. Pin a pair the table
+# does not know with STUDIO_DRAFT_MODEL.
+DRAFT_MODELS = [
+    ("qwen3", ["qwen3-0.6b", "qwen3-1.7b"]),
+    ("qwen2.5-coder", ["qwen2.5-coder-0.5b-instruct", "qwen2.5-coder-1.5b-instruct"]),
+    ("qwen2.5", ["qwen2.5-0.5b-instruct", "qwen2.5-1.5b-instruct"]),
+    ("llama-3.1", ["llama-3.2-1b-instruct", "llama-3.2-3b-instruct"]),
+    ("llama-3.3", ["llama-3.2-1b-instruct", "llama-3.2-3b-instruct"]),
+    ("gemma-3", ["gemma-3-1b-it"]),
+]
+DRAFT_OFF = ("off", "none", "no", "0", "false")
+
+
+def draft_family(model_id):
+    """The DRAFT_MODELS family a model id belongs to, or None.
+
+    The family has to be a whole part of the name - "qwen3" between dashes,
+    the start or the end - not a prefix, or qwen3.6 would draft with qwen3's
+    models. "meta-llama-3.1-8b-instruct" is llama-3.1; a publisher/ prefix
+    is dropped first. The table is ordered, so qwen2.5-coder is found before
+    qwen2.5 claims it."""
+    m = (model_id or "").lower().rsplit("/", 1)[-1]
+    for family, drafts in DRAFT_MODELS:
+        if re.search(r"(^|-)%s(-|$)" % re.escape(family), m):
+            return family
+    return None
+
+
+def pick_draft_model(executing, ids, want=None):
+    """The draft model to run ahead of `executing`, or None for none.
+
+    `want` is the pin: one of DRAFT_OFF turns speculative decoding off, a
+    served id is used as given (the table need not know the pair), and one
+    the host does not serve falls through to the table - a stale pin is not
+    a reason to give the speed up. A model that is itself draft-sized gets
+    no draft: there is nothing smaller worth running ahead of a 1.7B.
+    """
+    if want and want.strip().lower() in DRAFT_OFF:
+        return None
+    if want and want in ids and want != executing:
+        return want
+    drafts = dict(DRAFT_MODELS).get(draft_family(executing), [])
+    if executing in (d for _, ds in DRAFT_MODELS for d in ds):
+        return None
+    for d in drafts:
+        if d in ids and d != executing:
+            return d
+    return None
+
+
+def resolve_draft(executing, ids):
+    """(draft model or None, note to print once or "") for the executing model.
+
+    STUDIO_DRAFT_MODEL is read here so every caller - the window, each tab
+    with its own model, the CLI - resolves the same way."""
+    want = os.environ.get("STUDIO_DRAFT_MODEL")
+    draft = pick_draft_model(executing, ids, want)
+    if want and want.strip().lower() in DRAFT_OFF:
+        return None, ""
+    if want and want not in ids:
+        return draft, ("STUDIO_DRAFT_MODEL names %s, which the host does not serve; %s"
+                       % (want, "drafting with " + draft if draft else "no draft model"))
+    return draft, ""
 
 
 # Vision models that describe a picture well and fit beside the executing model.
@@ -626,7 +852,7 @@ def resolve_vision(base_url, executing, vision_ids, loaded=None):
            if want else "the host has no vision-capable model downloaded")
     return None, ("%s, so the model cannot see: attached pictures reach it as paths "
                   "and previews go unreviewed. Download a vision model in LM Studio "
-                  "(one of %s) and reopen." % (why, ", ".join(PREFERRED_VISION_MODELS[:3])))
+                  "(one of %s) and connect again." % (why, ", ".join(PREFERRED_VISION_MODELS[:3])))
 
 
 # --------------------------------------------------------------- the app registry
@@ -643,6 +869,8 @@ HOW TO WORK
 - After a write, verify it landed if the result is not self-evident - a small
   targeted read, not a full re-listing.
 - Work in small steps and stop when the user's request is satisfied.
+- Describing a call is not making it. "Now I'll generate the image" does nothing;
+  the tool call does. When the next step is a call, make it in this reply.
 - Do not repeat a call that has already failed the same way. Report what happened.
 - Ask first before anything destructive: deleting, overwriting or replacing
   something the user did not ask you to touch.
@@ -2469,13 +2697,21 @@ def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False,
     record = TaskRecord()
     record.briefs.append(task)
     def emit(kind, payload):
-        if kind in ("tool", "tool_result", "sys"):
+        if kind == "tool":
+            log("  %s %s" % (payload["name"], json.dumps(payload["arguments"])[:160]), quiet)
+        elif kind == "tool_result":
+            log("     " + " ".join(payload["text"].split())[:180], quiet)
+        elif kind == "sys":
             log("  " + str(payload), quiet)
     while True:
         executor = Executor(llm, mcp, tools, schemas=schemas, record=record, emit=emit,
                             library=library, vision=vision.review if vision else None,
                             readback=readback, review=review, notebook=notebook)
         result = executor.run(messages, max_steps, streaming=False)
+        note = getattr(llm, "draft_note", None)
+        if note:
+            llm.draft_note = None
+            log("  " + note, quiet)
         if notebook is not None:
             for lesson in learn_from_run(executor, messages, notebook, llm, app_name):
                 log("  lesson kept: " + lesson, quiet)
@@ -2589,6 +2825,10 @@ def main():
     p.add_argument("--model", default=env_default("STUDIO_MODEL", "AE_AGENT_MODEL"),
                    help="model id on the host (default: the app's preferred small model "
                         "if served, else %s)" % DEFAULT_MODEL)
+    p.add_argument("--draft", default=None, metavar="MODEL",
+                   help="draft model for speculative decoding, or 'off' (default: "
+                        "STUDIO_DRAFT_MODEL, else a small model of the same family the "
+                        "host serves, else none)")
     p.add_argument("--groups", default=None,
                    help="tool groups to expose; app-specific, see --list-groups")
     p.add_argument("--all-tools", action="store_true", help="expose every tool the app has")
@@ -2630,6 +2870,13 @@ def main():
             log("  " + note, a.quiet)
     a.vision, note = resolve_vision(a.host, a.model, vision_ids, loaded)
     log("  " + (note or "vision: " + a.vision.model), a.quiet)
+    if a.draft:
+        os.environ["STUDIO_DRAFT_MODEL"] = a.draft
+    a.draft, note = resolve_draft(a.model, ids)
+    if note:
+        log("  " + note, a.quiet)
+    elif a.draft:
+        log("  draft: %s (speculative decoding)" % a.draft, a.quiet)
     if a.vision and a.vision.needs_load:
         log(". loading %s on the host..." % a.vision.model, a.quiet)
         err = load_model(a.host, a.vision.model)
@@ -2643,7 +2890,7 @@ def main():
         if a.list_tools:
             print("%s has no bridge and exposes no tools." % app.name)
             return 0
-        llm = LLM(a.host, a.model, a.temperature)
+        llm = LLM(a.host, a.model, a.temperature, draft=a.draft)
         log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
         return converse(llm, None, [], app, a, schemas=[])
 
@@ -2691,7 +2938,7 @@ def main():
             mcp = Router(mcp, sidecar)
             log("  + %d research tools (files and the web)" % len(extra), a.quiet)
         tools = to_openai_tools(chosen)
-        llm = LLM(a.host, a.model, a.temperature)
+        llm = LLM(a.host, a.model, a.temperature, draft=a.draft)
         log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
 
         return converse(llm, mcp, tools, app, a, schemas=chosen)
