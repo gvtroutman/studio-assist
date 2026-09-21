@@ -104,6 +104,51 @@ class TestModelChoice(unittest.TestCase):
     def test_no_models_is_none(self):
         self.assertIsNone(eng.pick_model(None, []))
 
+    def test_the_apps_own_helpers_in_vram_are_not_the_users_choice(self):
+        """After the LLM PC restarts, the first thing in VRAM is whatever
+        helper got loaded first - the vision model, or a draft. Every tab
+        then ran on qwen2.5-vl-7b-instruct, which answers a tool call with
+        advice to open File Explorer."""
+        ids = ["qwen2.5-vl-7b-instruct", "qwen3-1.7b", eng.DEFAULT_MODEL, "gpt-oss-20b"]
+        self.assertEqual(eng.pick_model(["qwen2.5-vl-7b-instruct"], ids), eng.DEFAULT_MODEL)
+        self.assertEqual(eng.pick_model(["qwen3-1.7b", "qwen2.5-vl-7b-instruct"], ids),
+                         eng.DEFAULT_MODEL)
+        # the default in VRAM wins over a helper listed before it
+        self.assertEqual(eng.pick_model(["qwen2.5-vl-7b-instruct", eng.DEFAULT_MODEL], ids),
+                         eng.DEFAULT_MODEL)
+        # a model loaded by hand is still the one used when the default is not loaded
+        self.assertEqual(eng.pick_model(["qwen2.5-vl-7b-instruct", "gpt-oss-20b"], ids),
+                         "gpt-oss-20b")
+        # and STUDIO_MODEL still beats everything
+        self.assertEqual(eng.pick_model([eng.DEFAULT_MODEL], ids, want="gpt-oss-20b"),
+                         "gpt-oss-20b")
+
+    def test_the_probe_reports_every_loaded_model(self):
+        import urllib.request
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_open(url, timeout=None):
+            return Resp(json.dumps({"data": [
+                {"id": "qwen2.5-vl-7b-instruct", "type": "vlm", "state": "loaded"},
+                {"id": "big-30b", "type": "llm", "state": "loaded"},
+                {"id": "other", "type": "llm", "state": "not-loaded"}]}).encode("utf-8"))
+        real = urllib.request.urlopen
+        urllib.request.urlopen = fake_open
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        ok, loaded, ids, vision, err = eng.probe_models("http://h:1234/v1")
+        self.assertTrue(ok)
+        self.assertEqual(loaded, ["qwen2.5-vl-7b-instruct", "big-30b"])
+        self.assertEqual(vision, ["qwen2.5-vl-7b-instruct"])
+        # the vision picker still prefers one already in VRAM, from the list
+        self.assertEqual(eng.pick_vision_model(["other-vl", "qwen2.5-vl-7b-instruct"], "big-30b",
+                                               loaded=loaded), "qwen2.5-vl-7b-instruct")
+
 
 class TestVisionChoice(unittest.TestCase):
     """Every bridge answers a screenshot with a picture and the executing model
@@ -240,24 +285,27 @@ class TestVisionChoice(unittest.TestCase):
 
 
 class TestPerAppModel(unittest.TestCase):
-    """ComfyUI shares its GPU with the inference box, so its tab prefers a
-    small model. The preference is a preference: it never stops a tab opening."""
+    """An app may prefer a small model over the shared one. The preference
+    is a preference: it never stops a tab opening. No app in the registry
+    uses it today - ComfyUI did, and its 1.7B talked about generating
+    instead of calling comfy_generate - so the tests give one to a spec."""
 
     def setUp(self):
         self.comfy = eng.APPS_BY_ID["comfyui"]
+        self._models = self.comfy.models
+        self.comfy.models = ["small-1.7b", "small-1.5b"]
         self._pin = os.environ.pop("STUDIO_MODEL_COMFYUI", None)
 
     def tearDown(self):
+        self.comfy.models = self._models
         if self._pin is not None:
             os.environ["STUDIO_MODEL_COMFYUI"] = self._pin
         else:
             os.environ.pop("STUDIO_MODEL_COMFYUI", None)
 
-    def test_comfyui_prefers_a_small_model_the_host_serves(self):
-        self.assertTrue(self.comfy.models)
-        small = self.comfy.models[0]
-        model, note = self.comfy.model_for(["big-30b", small], "big-30b")
-        self.assertEqual(model, small)
+    def test_a_preferred_small_model_the_host_serves_is_chosen(self):
+        model, note = self.comfy.model_for(["big-30b", "small-1.7b"], "big-30b")
+        self.assertEqual(model, "small-1.7b")
         self.assertIn("small", note)
 
     def test_the_first_served_preference_wins_in_registry_order(self):
@@ -282,6 +330,17 @@ class TestPerAppModel(unittest.TestCase):
         for app in eng.APPS:
             if not app.models:
                 self.assertEqual(app.model_for(["x", "big"], "big"), ("big", ""))
+
+    def test_comfyui_shares_the_model_the_other_tabs_use(self):
+        """The small-model rule made the tab unusable: qwen3-1.7b under the
+        ComfyUI briefing and nineteen tools described the generation it was
+        about to make and never called it, or was cut off. The shared 30B
+        made the picture. A host that cannot hold both pins one with
+        STUDIO_MODEL_COMFYUI."""
+        self.comfy.models = self._models
+        self.assertEqual(self.comfy.models, [])
+        self.assertEqual(self.comfy.model_for(["big-30b", "qwen3-1.7b"], "big-30b"),
+                         ("big-30b", ""))
 
 
 class TestDraftChoice(unittest.TestCase):
@@ -528,6 +587,160 @@ class TestHeadroom(unittest.TestCase):
         urllib.request.urlopen = gone
         self.addCleanup(setattr, urllib.request, "urlopen", real)
         self.assertEqual(eng.context_window("http://h:1234/v1", "m"), (None, None))
+
+
+class FakeHost:
+    """LM Studio's REST API, as much of it as a fit touches: the v0 list
+    with each model's window, the v1 list with its instances, load and
+    unload. Records every write it is sent."""
+
+    def __init__(self, loaded=8192, maximum=262144, instances=("big-30b",), fail_load=None):
+        self.loaded, self.maximum = loaded, maximum
+        self.instances = list(instances)
+        self.fail_load = fail_load
+        self.calls = []
+
+    def __call__(self, req, timeout=None):
+        import urllib.request
+        url = req.full_url if isinstance(req, urllib.request.Request) else req
+        body = json.loads(req.data) if getattr(req, "data", None) else None
+        if url.endswith("/api/v0/models"):
+            entry = {"id": "big-30b", "max_context_length": self.maximum,
+                     "state": "loaded" if self.instances else "not-loaded"}
+            if self.instances and self.loaded:
+                entry["loaded_context_length"] = self.loaded
+            return self._resp({"data": [entry, {"id": "other", "state": "not-loaded"}]})
+        if url.endswith("/api/v1/models"):
+            return self._resp({"models": [{"key": "big-30b", "loaded_instances": [
+                {"id": i, "config": {"context_length": self.loaded}} for i in self.instances]}]})
+        if url.endswith("/api/v1/models/unload"):
+            self.calls.append(("unload", body))
+            self.instances.remove(body["instance_id"])
+            return self._resp({"instance_id": body["instance_id"]})
+        if url.endswith("/api/v1/models/load"):
+            self.calls.append(("load", body))
+            if self.fail_load:
+                raise urllib.error.HTTPError(url, 400, "bad", {}, io.BytesIO(self.fail_load.encode()))
+            self.instances.append(body["model"])
+            self.loaded = body.get("context_length")
+            return self._resp({"status": "loaded", "instance_id": body["model"]})
+        raise AssertionError("unexpected url " + url)
+
+    @staticmethod
+    def _resp(payload):
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return Resp(json.dumps(payload).encode("utf-8"))
+
+
+class TestFitModel(unittest.TestCase):
+    """The window a model is loaded with is the app's to set. LM Studio loads
+    at its default - 8,192 for the 30B - and every tab's prefix is most or
+    all of that: the ComfyUI tab measured 7,707 tokens before a word was
+    said, After Effects about 20,000. Under that the model lost its own tool
+    results to truncation and called list_folder ten times running. The
+    same call that loads the vision model takes a context_length, so the app
+    loads, or reloads, the model with one that fits."""
+
+    H = "http://h:1234/v1"
+
+    def host(self, **kw):
+        import urllib.request
+        fake = FakeHost(**kw)
+        real = urllib.request.urlopen
+        urllib.request.urlopen = fake
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        return fake
+
+    def test_the_wanted_window_is_a_power_of_two_with_room_after_the_prefix(self):
+        self.assertEqual(eng.wanted_context(7707), 16384)
+        self.assertEqual(eng.wanted_context(20000), 32768)
+        self.assertEqual(eng.wanted_context(31000), 65536)
+        self.assertEqual(eng.wanted_context(None), 16384)
+        self.assertEqual(eng.wanted_context(20000, maximum=24576), 24576)
+        self.assertEqual(eng.wanted_context(1000, maximum=8192), 8192)
+
+    def test_the_estimate_is_on_the_high_side_of_the_measurement(self):
+        # 27,506 characters of ComfyUI briefing and tools cost 7,707 tokens.
+        tools = [{"type": "function", "function": {"name": "t", "parameters": {}}}]
+        chars = 11374 + len(json.dumps(tools))
+        self.assertGreaterEqual(eng.estimate_tokens("x" * 11374, tools), chars // 3)
+        self.assertEqual(eng.estimate_tokens("", []), 0)
+
+    def test_a_window_that_fits_is_left_alone(self):
+        fake = self.host(loaded=32768)
+        self.assertEqual(eng.fit_model(self.H, "big-30b", 7707), (32768, ""))
+        self.assertEqual(fake.calls, [])
+        # and with no count yet there is nothing to fit against
+        fake = self.host(loaded=8192)
+        self.assertEqual(eng.fit_model(self.H, "big-30b", None), (8192, ""))
+        self.assertEqual(fake.calls, [])
+
+    def test_a_short_window_is_unloaded_and_loaded_again_larger(self):
+        fake = self.host(loaded=8192)
+        now, note = eng.fit_model(self.H, "big-30b", 7707)
+        self.assertEqual(now, 16384)
+        self.assertEqual(fake.calls, [("unload", {"instance_id": "big-30b"}),
+                                      ("load", {"model": "big-30b", "context_length": 16384})])
+        for word in ("Reloaded big-30b", "16,384", "7,707", "8,192", "about 485 tokens"):
+            self.assertIn(word, note)
+
+    def test_a_model_not_yet_loaded_is_loaded_with_the_window_not_the_default(self):
+        fake = self.host(loaded=None, instances=())
+        now, note = eng.fit_model(self.H, "big-30b", 20000)
+        self.assertEqual(now, 32768)
+        self.assertEqual(fake.calls, [("load", {"model": "big-30b", "context_length": 32768})])
+        self.assertIn("Loaded big-30b with a 32,768-token context window", note)
+
+    def test_every_instance_goes_before_the_reload(self):
+        # A load of a model already loaded is a second instance, and requests
+        # by model id keep going to the first: both have to go.
+        fake = self.host(loaded=8192, instances=("big-30b", "big-30b:2"))
+        eng.fit_model(self.H, "big-30b", 7707)
+        self.assertEqual([c for c in fake.calls if c[0] == "unload"],
+                         [("unload", {"instance_id": "big-30b"}),
+                          ("unload", {"instance_id": "big-30b:2"})])
+
+    def test_a_model_at_its_maximum_is_not_reloaded_but_named(self):
+        fake = self.host(loaded=8192, maximum=8192)
+        now, note = eng.fit_model(self.H, "big-30b", 7707)
+        self.assertEqual((now, fake.calls), (8192, []))
+        self.assertIn("needs a model with a larger context window", note)
+
+    def test_a_host_that_says_nothing_is_left_alone(self):
+        import urllib.request
+
+        def gone(req, timeout=None):
+            raise urllib.error.URLError("no such endpoint")
+        real = urllib.request.urlopen
+        urllib.request.urlopen = gone
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        self.assertEqual(eng.fit_model(self.H, "big-30b", 7707), (None, ""))
+
+    def test_a_load_that_fails_falls_back_to_the_advice(self):
+        fake = self.host(loaded=8192, fail_load="out of memory")
+        now, note = eng.fit_model(self.H, "big-30b", 7707)
+        self.assertEqual(now, 8192)
+        self.assertIn("Could not load big-30b with a 16,384-token context window", note)
+        self.assertIn("out of memory", note)
+        self.assertIn("lms load big-30b --context-length 16384", note)
+
+    def test_load_model_sends_the_window_when_given_one(self):
+        fake = self.host(loaded=None, instances=())
+        self.assertIsNone(eng.load_model(self.H, "big-30b", context_length=32768))
+        self.assertIsNone(eng.load_model(self.H, "big-30b"))
+        self.assertEqual([c[1] for c in fake.calls],
+                         [{"model": "big-30b", "context_length": 32768}, {"model": "big-30b"}])
+
+    def test_instances_come_from_the_v1_list(self):
+        self.host(loaded=8192, instances=("big-30b", "big-30b:2"))
+        self.assertEqual(eng.loaded_instances(self.H, "big-30b"),
+                         [("big-30b", 8192), ("big-30b:2", 8192)])
+        self.assertEqual(eng.loaded_instances(self.H, "absent"), [])
 
 
 class TestHostUnreachable(unittest.TestCase):
@@ -1353,6 +1566,10 @@ class TestGui(unittest.TestCase):
         studio_chat.Chat._boot_host = lambda self, *a, **k: None
         studio_chat.Chat._ensure = lambda self, s: None
         studio_chat.Chat._read_icons = lambda self: None
+        # A tab's boot fits the model's window on the host: no host here.
+        cls._real_fit = (eng.loaded_instances, eng.fit_model)
+        eng.loaded_instances = lambda *a, **k: [("m", 8192)]
+        eng.fit_model = lambda *a, **k: (8192, "")
         cls.app = studio_chat.Chat()
         for _ in range(15):
             cls.app.update()
@@ -1361,6 +1578,7 @@ class TestGui(unittest.TestCase):
     def tearDownClass(cls):
         cls.app.destroy()
         eng.installed_apps = cls._real_installed
+        eng.loaded_instances, eng.fit_model = cls._real_fit
         if cls._real_settings is None:
             os.environ.pop("STUDIO_SETTINGS", None)
         else:
@@ -1642,6 +1860,71 @@ class TestGui(unittest.TestCase):
         s.close()
         self.assertIsNone(s.mcp)
 
+    def test_a_booting_tab_fits_the_models_window_and_warms_up_again_after_a_reload(self):
+        """Before the warm-up the model is loaded with a window from an
+        estimate; the warm-up's reply carries the exact prefix cost, and a
+        window still short is reloaded on that and the warm-up paid once
+        more - the reload threw the host's prefix cache away."""
+        fits, warmed = [], []
+
+        def fit(host, model, prompt_tokens, timeout=600, exact=True):
+            fits.append((model, prompt_tokens, exact))
+            if len(fits) == 2:
+                return 16384, "Reloaded shared with a 16,384-token context window: test"
+            return 8192, ""
+
+        class Counts:
+            model, base_url = "shared", "http://h:1234/v1"
+
+            def chat(self, messages, tools, max_tokens=None):
+                warmed.append(len(tools))
+                return {"choices": [{"message": {"content": "ready"}}],
+                        "usage": {"prompt_tokens": 7707}}
+
+        real_fit, eng.fit_model = eng.fit_model, fit
+        real_llm, self.app.llm = self.app.llm, Counts()
+        self.app.host_ready.set()
+        try:
+            s = self.app.sessions[eng.CHAT.id]
+            self.app._boot_session(s)
+        finally:
+            eng.fit_model, self.app.llm = real_fit, real_llm
+        self.app._drain()
+        self.app.update()
+        self.assertTrue(s.ready)
+        self.assertEqual([m for m, _, _ in fits], ["shared", "shared"])
+        self.assertIsInstance(fits[0][1], int)          # the estimate, before the warm-up
+        self.assertFalse(fits[0][2])                    # and said to be one
+        self.assertEqual(fits[1][1:], (7707, True))     # the host's count, after it
+        self.assertEqual(len(warmed), 2)
+        self.assertIn("Reloaded shared with a 16,384-token context window",
+                      s.view.get("1.0", "end"))
+
+    def test_no_reload_while_another_tab_is_mid_request(self):
+        """A reload cuts off whatever the host is answering. With another
+        tab busy the tab gets the advice instead, and is fitted on its next
+        boot."""
+        touched = []
+        real_fit, eng.fit_model = eng.fit_model, lambda *a, **k: touched.append(a) or (8192, "")
+        real_window = eng.context_window
+        eng.context_window = lambda host, model, timeout=5: (8192, 32768)
+
+        class Shared:
+            model, base_url = "shared", "http://h:1234/v1"
+        other = self.app.sessions[eng.APPS[0].id]
+        other.busy = True
+        s = self.app.sessions[eng.CHAT.id]
+        real_llm, s.llm = s.llm, Shared()
+        try:
+            reloaded, note = self.app._fit(s, 7707)
+        finally:
+            other.busy = False
+            s.llm = real_llm
+            eng.fit_model, eng.context_window = real_fit, real_window
+        self.assertFalse(reloaded)
+        self.assertEqual(touched, [])
+        self.assertIn("lms load shared --context-length 16384", note)
+
     def test_the_comfyui_tab_gets_its_own_small_model_and_the_rest_share(self):
         """One host, but not one model: the ComfyUI tab drives a small model
         when the host serves one, so the diffusion model has the GPU. Other
@@ -1649,7 +1932,8 @@ class TestGui(unittest.TestCase):
         cached prefix per tab for no reason."""
         real_llm, real_ids = self.app.llm, self.app.model_ids
         self.app.llm = eng.LLM(self.app.host, "big-30b", temperature=0.3, timeout=99)
-        small = eng.APPS_BY_ID["comfyui"].models[0]
+        spec, real_models = eng.APPS_BY_ID["comfyui"], eng.APPS_BY_ID["comfyui"].models
+        spec.models, small = ["small-1.7b"], "small-1.7b"
         try:
             comfy, ae = self.app.sessions["comfyui"], self.app.sessions[eng.APPS[0].id]
             self.app.model_ids = ["big-30b", small]
@@ -1666,6 +1950,7 @@ class TestGui(unittest.TestCase):
             self.assertIs(self.app._llm_for(comfy), self.app.llm)
         finally:
             self.app.llm, self.app.model_ids = real_llm, real_ids
+            spec.models = real_models
 
     def test_a_tab_with_its_own_model_gets_its_own_draft(self):
         """The draft pairs with the executing model, so a tab that departs
@@ -1673,7 +1958,9 @@ class TestGui(unittest.TestCase):
         none unless the pin insists."""
         real_llm, real_ids = self.app.llm, self.app.model_ids
         pin = os.environ.pop("STUDIO_DRAFT_MODEL", None)
-        big, small = "qwen3-coder-30b-a3b-instruct", eng.APPS_BY_ID["comfyui"].models[0]
+        big, small = "qwen3-coder-30b-a3b-instruct", "qwen3-1.7b"
+        spec, real_models = eng.APPS_BY_ID["comfyui"], eng.APPS_BY_ID["comfyui"].models
+        spec.models = [small]
         self.app.llm = eng.LLM(self.app.host, big, draft="qwen3-0.6b")
         self.app.model_ids = [big, small, "qwen3-0.6b"]
         try:
@@ -1690,6 +1977,7 @@ class TestGui(unittest.TestCase):
             self.assertIn("STUDIO_DRAFT_MODEL names ghost", comfy.view.get("1.0", "end"))
         finally:
             self.app.llm, self.app.model_ids = real_llm, real_ids
+            spec.models = real_models
             os.environ.pop("STUDIO_DRAFT_MODEL", None)
             if pin is not None:
                 os.environ["STUDIO_DRAFT_MODEL"] = pin
@@ -1771,6 +2059,18 @@ class TestGui(unittest.TestCase):
         self.assertNotIn("Launching", body)
         self.assertEqual(s.status[0], "ComfyUI is not reachable")
         self.assertTrue(s.status[2], "the button stays, to check again")
+
+    def test_the_error_log_lives_beside_the_settings_not_in_the_source_tree(self):
+        """Every test run that exercised _guard appended its deliberate
+        HostUnreachable tracebacks to the source tree's log, beside the
+        user's real ones. It goes where STUDIO_SETTINGS puts everything."""
+        path = self.mod.error_log_path()
+        self.assertEqual(os.path.dirname(path), self.dir)
+        self.assertEqual(os.path.basename(path), self.mod.ERROR_LOG)
+        self.app._log("Traceback: a test's own")
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("a test's own", f.read())
+        self.assertFalse(os.path.exists(os.path.join(self.mod.HERE, "tests", self.mod.ERROR_LOG)))
 
     def test_a_container_app_is_started_not_checked(self):
         """OpenCode runs here, so its button starts it - and when Docker is

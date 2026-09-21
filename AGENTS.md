@@ -517,17 +517,32 @@ returns in seconds. LM Studio's prefix cache survives across processes, which is
 this works at all. Each tab has its own prefix and so warms up separately, the first
 time it is opened.
 
-**The warm-up's reply is also the tab's token budget; read it.** `usage.prompt_tokens`
-on that 1-token call is the exact cost of the briefing, the tools and one short message
-on the tab's model. `Chat._headroom()` sets it against the window LM Studio loaded the
-model with (`context_window()`, from `/api/v0/models`' `loaded_context_length`) and,
-under `MIN_ROOM` (2,048 tokens), prints `headroom_note()` in the tab: the numbers, the
-`lms load <model> --context-length N` that fixes it, or "needs a bigger model" when the
-model is already at its maximum. The ComfyUI tab found this: its prefix is ~7,200 tokens
-on qwen3-1.7b, which LM Studio loads at 8,192 by default, so a thinking model had ~1,000
-tokens to think and call a tool and the host cut it off with `finish_reason: length` -
-which `LLM.stream` now explains in the same terms instead of reporting the bare word.
-Nothing here reloads the model: that is the user's GPU on another machine.
+**The window the model is loaded with is this app's to set, and it sets it.** LM
+Studio loads a model at its default, 8,192 for most, and every tab's fixed prefix -
+briefing plus tool schemas - is most or all of that: 7,707 tokens measured on the
+ComfyUI tab before a word is said, ~11,000 estimated for Resolve, ~20,000 for After
+Effects (65 tools). Under that the host truncates the request and the model loses its
+own tool results: the 30B called `list_folder` ten times running with the same
+arguments until the step limit, and a thinking model was cut off with
+`finish_reason: length` (which `LLM.stream` explains in these terms). For a while the
+warm-up only *reported* this - `headroom_note()`, with the `lms load --context-length`
+to run on the LLM PC - on the grounds that the GPU is on another machine. That was the
+hurdle: walk to the other PC, eject, reload, and LM Studio's next just-in-time load is
+8,192 again. The app already loads the vision model through `/api/v1/models/load`; the
+same call takes `context_length`, so `fit_model()` loads, or unloads and reloads, the
+executing model with `wanted_context()` - a power of two, 16,384 at least, `ROOM`
+(8,192) past the prefix, never past the model's `max_context_length`. `_boot_session`
+fits twice: before the warm-up from `estimate_tokens()` (chars / 3; tool JSON measures
+~3.5) so the model is not first loaded just in time at the default and thrown away, then
+on the warm-up's exact `usage.prompt_tokens`, and a reload there warms up once more,
+because a reload empties the host's prefix cache. Two facts about LM Studio shape the
+code: loading a model that is loaded makes a *second instance* (`<model>:2`) rather
+than reloading, so `loaded_instances()` (from `/api/v1/models`) is unloaded first,
+every one; and a load beside another tab's request cuts that request off, so `_fit`
+gives the old advice instead while any other session is `busy`, and `fit_lock`
+serialises two tabs booting at once (the second finds the first's load and does
+nothing). A host with no REST API says nothing, and nothing is fitted. `headroom_note()`
+remains the fallback when a load fails or the model is already at its maximum.
 
 **Never test the GUI with synthetic keystrokes.** `SendKeys` types into whatever
 window has focus, not the one you meant. It has already leaked a test sentence into
@@ -657,6 +672,15 @@ composer.
   nudged - the count is per run - and `BASE_RULES` says the same thing in the
   prompt, for the models that read it. `tests/test_tasks.py`
   `TestPromisedWork` replays the transcript that found it.
+- **The same read, with the same arguments, straight after itself, is not
+  dispatched twice.** `_dispatch` counts the trailing journal entries with the call's
+  `signature`: the second time it returns the first answer, marked, and journals a
+  `repeat` entry (status ok, `verifies` false, so the count reaches three); the third
+  raises `RepeatedCall`, which `_run` turns into a stop that names the cause - the
+  model is not taking its results in - and skips the rest of the batch. Only reads:
+  two `comfy_generate` calls with one prompt are two pictures, and a read after a
+  write is a fresh look. The 30B at 8,192 was the case; the window fit above is the
+  fix, and this is what stops the ten-call loop when something else causes it.
 - `readonly()` decides which calls owe a read-back from the tool's name prefix or its
   MCP `readOnlyHint` annotation. A bridge written here must annotate its reads
   (`READ_ONLY` in every bridge here); unannotated, `comfy_status` counted as an
@@ -665,18 +689,42 @@ composer.
   that waited for its files is the observation, not something to inspect afterwards.
 - Stop prevents subsequent dispatches; it cannot undo or guarantee cancellation of
   an in-flight operation. Complete tool-result envelopes when stopping a batch.
-- An `AppSpec` may carry `models`, small models it prefers, best first; ComfyUI does,
+- An `AppSpec` may carry `models`, small models it prefers, best first. ComfyUI did,
   because a 30B model resident beside a diffusion model on the same GPU is VRAM the
-  pictures could have had. `AppSpec.model_for(ids, shared)` resolves it against what
-  the host serves — `STUDIO_MODEL_<APP>` pin, then the list, then the shared model,
-  never a model that is not served — and returns a note the tab prints once. The GUI
-  keeps one `Session.llm` per tab, fixed at boot: the executor, both warm-ups and the
-  host's cached prefix must agree, and tabs with no preference share the window's
-  handle (`Chat._llm_for`). The CLI resolves the same way unless `--model` is given.
-- **Speculative decoding is a request field, not a load.** LM Studio takes
-  `draft_model` in the `/v1/chat/completions` body and loads the draft just in time;
-  its `/api/v1/models/load` has no draft field, so there is nothing to load at boot.
-  `LLM(draft=...)` puts it on every request, streamed or not. `resolve_draft(model,
+  pictures could have had - and that is what made the tab unusable: qwen3-1.7b under
+  the ComfyUI briefing and nineteen tools described the generation it was about to
+  make and never called `comfy_generate`, or called `comfy_upload_image` on a folder
+  with a double-escaped path, then wrote its plan as a code block and asked "would you
+  like me to". The shared 30B, given a window that fits, made the picture. No app in
+  the registry sets `models` now; the mechanism stays, and `STUDIO_MODEL_COMFYUI`
+  pins a smaller model on a host that cannot hold both. `AppSpec.model_for(ids,
+  shared)` resolves it against what the host serves — `STUDIO_MODEL_<APP>` pin, then
+  the list, then the shared model, never a model that is not served — and returns a
+  note the tab prints once. The GUI keeps one `Session.llm` per tab, fixed at boot:
+  the executor, both warm-ups and the host's cached prefix must agree, and tabs with
+  no preference share the window's handle (`Chat._llm_for`). The CLI resolves the
+  same way unless `--model` is given.
+- **What is in VRAM is not what the user chose, once the app loads models of its
+  own.** `pick_model` put "what is loaded" before the known-good list from the start,
+  so a model loaded by hand in LM Studio was the one used. After the window began
+  loading a vision model and LM Studio a draft, the first loaded id after an LLM-PC
+  restart was `qwen2.5-vl-7b-instruct`, and every tab ran on it - a 7B that answers a
+  tool call with advice to open File Explorer. `probe_models` now returns every
+  loaded id, and `pick_model` goes: the pin, the default when it is in VRAM, anything
+  else in VRAM that is not a helper (`helper_models()`: the preferred vision models
+  and every draft in `DRAFT_MODELS`), the known-good list, the first served. A model
+  loaded by hand still wins over a default that is not loaded.
+- **Speculative decoding is a request field on some hosts and a load field on
+  others.** Older LM Studio takes `draft_model` in the `/v1/chat/completions` body and
+  loads the draft just in time; the studio's current one refuses that with "must be
+  configured at load time, not prediction time" and takes it on `/api/v1/models/load`
+  as `speculative_draft_model` with `speculative_draft_simple: true` (the field is
+  named `draft_model` nowhere). It is not wired at load: a 1.7B draft ahead of a
+  30B-A3B MoE, whose active parameters are 3B, is as likely to slow it as speed it,
+  and nothing measured says otherwise. So on this host the first request per `LLM`
+  pays one refused round trip, the note below is printed once, and the tab runs
+  without; `STUDIO_DRAFT_MODEL=off` skips the round trip. `LLM(draft=...)` puts it on
+  every request, streamed or not. `resolve_draft(model,
   ids)` picks it the way the vision model is picked: `STUDIO_DRAFT_MODEL` when served
   (`off` disables), else the smallest served model of the executing model's family
   from `DRAFT_MODELS`, else none — a draft has to share the main model's vocabulary,
@@ -924,6 +972,14 @@ folder are exactly that, and their `serve()` loops are gone.
   check so a misspelling is reported as one. The reader is a 3B model with one more
   try; `is not allowed` on its own sent it guessing again, and the guess landed in
   `failed_calls`. Keep every new refusal in that shape.
+- **A path from the model goes through `studio_mcp.local_path()` before the
+  filesystem sees it.** A small model writes `"C:\\\\Users\\\\x"` in its arguments
+  JSON for a path it was given as `C:\Users\x`; decoded, that is two backslashes and
+  nothing at it, the tool errors, and the notebook learned a platitude from the error.
+  `local_path` collapses runs of backslashes only when that makes something exist, so
+  a path that is right is never touched; the research bridge's `resolve()` and every
+  `open`/`place_file`/`import_files`/`upload_image` here call it. A new tool that
+  takes a path from this PC does too.
 - **Annotations are the spec's defaults unless a tool says otherwise.** A `Tool` is
   assumed to write, to be destructive and to touch the outside world; `read_only=True`
   sets the three hints a read implies, and `HINTS` in each bridge overrides the rest
@@ -1038,4 +1094,7 @@ them rather than guessing.
   badges, and there is an ASCII fallback if the font is ever missing. Write them as
   hex codepoints: pasted into an editor the characters themselves are blanks.
 - Errors must reach the user as prose. `_guard()` catches everything off the UI thread;
-  tracebacks go to `studio_assistant_error.log`, never to the screen.
+  tracebacks go to `studio_assistant_error.log` beside the settings file
+  (`error_log_path()`: `%APPDATA%\StudioAssistant`, or wherever `STUDIO_SETTINGS`
+  points), never to the screen. It sat in the source tree once, and every test run's
+  deliberate `HostUnreachable` tracebacks landed beside the user's real ones.

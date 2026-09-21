@@ -87,7 +87,8 @@ def result(text, error=False):
 def resolve(path):
     if not isinstance(path, str) or not path.strip():
         raise ResearchError("A path is required.")
-    return os.path.abspath(os.path.expandvars(os.path.expanduser(path.strip().strip('"'))))
+    return os.path.abspath(studio_mcp.local_path(
+        os.path.expandvars(os.path.expanduser(path.strip().strip('"')))))
 
 
 def private(path):

@@ -255,7 +255,7 @@ def t_new_document(a):
 
 
 def t_open(a):
-    path = a["path"]
+    path = studio_mcp.local_path(a["path"])
     if not os.path.isfile(path):
         raise ComError("No file at %s" % path)
     info = run("var d = app.open(new File(%s)); var o = __docinfo(d); o.layers = __walk(d, 0, []); return o;"
@@ -299,7 +299,7 @@ def t_add_fill_layer(a):
 
 
 def t_place_file(a):
-    path = a["path"]
+    path = studio_mcp.local_path(a["path"])
     if not os.path.isfile(path):
         raise ComError("No file at %s" % path)
     info = run("""

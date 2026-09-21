@@ -445,7 +445,7 @@ def t_list_presets(a):
 # -------------------------------------------------------------------- create
 
 def t_open_project(a):
-    path = a["path"]
+    path = studio_mcp.local_path(a["path"])
     if not os.path.isfile(path):
         raise CepError("No file at %s" % path)
     info = run("""
@@ -474,7 +474,7 @@ def t_new_project(a):
 
 
 def t_import_files(a):
-    paths = a["paths"]
+    paths = [studio_mcp.local_path(p) for p in a["paths"]]
     missing = [p for p in paths if not os.path.isfile(p)]
     if missing:
         raise CepError("No file at %s" % ", ".join(missing))

@@ -154,6 +154,22 @@ class TestFolders(ResearchCase):
         self.assertEqual(research.resolve("~"), os.path.abspath(home))
         self.assertEqual(research.resolve('"%s"' % self.dir), self.dir)
 
+    def test_a_path_the_model_double_escaped_still_finds_the_folder(self):
+        """qwen3-1.7b wrote "C:\\\\Users\\\\..." in its arguments JSON for a
+        folder it had been given as C:\\Users\\...: the tool saw two
+        backslashes, found nothing, and the model learned a platitude from
+        the error. Collapsed only when that makes something exist."""
+        self.write("sub/a.txt", "a")
+        doubled = self.path("sub").replace("\\", "\\\\")
+        self.assertEqual(research.resolve(doubled), self.path("sub"))
+        out = parsed(self.call("list_folder", path=doubled))
+        self.assertEqual(out["files"], 1)
+        # a path that is right is never touched, nor one that is wrong either way
+        self.assertEqual(studio_mcp.local_path(self.path("sub")), self.path("sub"))
+        missing = self.path("nope").replace("\\", "\\\\")
+        self.assertEqual(studio_mcp.local_path(missing), missing)
+        self.assertEqual(studio_mcp.local_path(None), None)
+
 
 class TestFind(ResearchCase):
     def setUp(self):
