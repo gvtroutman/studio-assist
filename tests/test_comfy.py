@@ -57,6 +57,8 @@ class FakeComfy:
         # is also what keeps a finished run from freeing the GPU under it.
         self.running = [[1, "run-1", {"5": {"class_type": "KSampler"}}]]
         self.free_vram = [20e9]    # /system_stats answers these in turn, the last for good
+        self.faces = {}            # uploaded name -> SAM3's boxes, for PreviewAny to report
+        self.size = (1254, 1254)   # what GetImageSize says of any picture
 
     def __call__(self, req, timeout=None):
         url = req if isinstance(req, str) else req.full_url
@@ -69,6 +71,26 @@ class FakeComfy:
         if isinstance(body, bytes):
             return io.BytesIO(body)
         return io.BytesIO(json.dumps(body).encode("utf-8"))
+
+    def node_outputs(self, graph):
+        """What PreviewAny shows of SAM3's boxes and a picture's size, and a
+        temp file for every other PreviewImage in the graph."""
+        out = {}
+        for nid, node in graph.items():
+            if node["class_type"] == "PreviewImage" and nid != "7":
+                out[nid] = {"images": [{"filename": "edit%s.png" % nid, "subfolder": "",
+                                        "type": "temp"}]}
+            if node["class_type"] != "PreviewAny":
+                continue
+            src, index = node["inputs"]["source"]
+            if graph[src]["class_type"] == "GetImageSize":
+                value = self.size[index]
+            else:
+                image = graph[graph[src]["inputs"]["image"][0]]["inputs"]["image"]
+                value = [[{"x": x, "y": y, "width": w, "height": h, "score": 0.8}
+                          for x, y, w, h in self.faces.get(image, [])]]
+            out[nid] = {"text": [json.dumps(value)]}
+        return out
 
     def fail(self, code, body):
         raise urllib.error.HTTPError("x", code, "err", {}, io.BytesIO(json.dumps(body).encode()))
@@ -118,10 +140,12 @@ class FakeComfy:
             graph = json.loads(data)["prompt"]
             pid = "p%d" % (len(self.prompts) + 1)
             self.prompts[pid] = graph
+            outputs = {"7": {"images": [
+                {"filename": "StudioAssistant_00001_.png", "subfolder": "", "type": "output"},
+                {"filename": "preview.png", "subfolder": "", "type": "temp"}]}}
+            outputs.update(self.node_outputs(graph))
             self.history[pid] = {
-                "prompt": [], "outputs": {"7": {"images": [
-                    {"filename": "StudioAssistant_00001_.png", "subfolder": "", "type": "output"},
-                    {"filename": "preview.png", "subfolder": "", "type": "temp"}]}},
+                "prompt": [], "outputs": outputs,
                 "status": {"status_str": "success", "completed": True, "messages": []}}
             return {"prompt_id": pid, "number": 1, "node_errors": {}}
         if route.startswith("/history/"):
@@ -451,6 +475,59 @@ class ComfyBridgeTest(unittest.TestCase):
         res = comfy.call_tool("comfy_edit_image", {"image": r"C:\nowhere\a.png",
                                                    "instruction": "x"})
         self.assertTrue(res["isError"])
+
+    def test_face_swap_edits_each_face_cropped_and_stitches_it_back(self):
+        """Edited whole, a face in a group photo is a few hundred of the edit
+        model's pixels and came back a stranger. Each face is cropped, edited
+        at full size against its match, and composited back where it was."""
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors"]
+        self.fake.text_encoders = ["qwen_2.5_vl_7b_fp8_scaled.safetensors"]
+        self.fake.loras = ["Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors"]
+        self.fake.running = []
+        # The scene: two people and a small face in the crowd, found right to left.
+        self.fake.faces = {"old.png": [(763, 464, 100, 104), (254, 460, 102, 113),
+                                       (992, 735, 16, 20)],
+                           "us.png": [(292, 407, 130, 156), (730, 432, 128, 147)]}
+        res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png",
+                                                  "seed": 3})
+        self.assertFalse(res["isError"], self.text(res))
+        detect, edit, stitch = (self.fake.prompts[p] for p in ("p1", "p2", "p3"))
+        self.assertEqual(detect["1"]["inputs"]["ckpt_name"], "sam3.1_multiplex_fp16.safetensors")
+        # Left to right, the crowd face dropped: the man gets the left face.
+        man, woman = edit["100"]["inputs"]["crop_region"], edit["120"]["inputs"]["crop_region"]
+        self.assertTrue(man["x"] < 254 + 51 < man["x"] + man["width"])
+        self.assertTrue(woman["x"] < 763 + 50 < woman["x"] + woman["width"])
+        self.assertEqual(man["width"], man["height"])
+        self.assertEqual(edit["102"]["inputs"]["bboxes"]["x"], 292)
+        self.assertEqual(edit["122"]["inputs"]["bboxes"]["x"], 730)
+        self.assertEqual(edit["103"]["inputs"]["image1"], ["101", 0])
+        self.assertEqual(edit["103"]["inputs"]["image2"], ["102", 0])
+        self.assertEqual(edit["106"]["inputs"]["steps"], 4)
+        self.assertNotIn("SaveImage", {n["class_type"] for n in edit.values()})
+        # The stitch loads each edit's preview and pastes it where it was cut.
+        self.assertEqual(stitch["100"]["inputs"]["image"], "edit108.png [temp]")
+        self.assertEqual(stitch["120"]["inputs"]["image"], "edit128.png [temp]")
+        self.assertEqual((stitch["114"]["inputs"]["x"], stitch["114"]["inputs"]["y"]),
+                         (man["x"], man["y"]))
+        self.assertEqual(stitch["134"]["inputs"]["destination"], ["114", 0])
+        self.assertEqual(stitch["9"]["inputs"]["images"], ["134", 0])
+        self.assertIn("faces swapped: 2", self.text(res))
+        # order swaps who gets which face.
+        comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png",
+                                            "order": [2, 1]})
+        self.assertEqual(self.fake.prompts["p5"]["102"]["inputs"]["bboxes"]["x"], 730)
+        res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png",
+                                                  "order": [3]})
+        self.assertTrue(res["isError"])
+        res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "nobody.png"})
+        self.assertTrue(res["isError"])
+        self.assertIn("No face found in nobody.png", self.text(res))
+
+    def test_a_returned_picture_says_where_it_was_saved(self):
+        res = comfy.call_tool("comfy_generate", {"prompt": "a fox"})
+        image = [i for i in res["content"] if i["type"] == "image"][0]
+        self.assertTrue(os.path.isfile(image["_meta"]["path"]))
 
     def test_upscale_redraws_at_the_larger_size(self):
         res = comfy.call_tool("comfy_upscale", {"image": "shot.png", "scale": 2})

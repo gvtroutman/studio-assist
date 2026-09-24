@@ -348,6 +348,8 @@ class TestResearchSidecar(unittest.TestCase):
         self.assertIn("HOW DESIGN WORK IS BUILT", by_id["photoshop"].chat_prompt())
         self.assertIn("HOW IMAGES ARE MADE", by_id["comfyui"].chat_prompt())
         for app in eng.TABS:
+            if app.panel:
+                continue                  # no model, so no prompt
             self.assertIn("CREATIVE WORK", app.chat_prompt())
             self.assertIn("studio_ask", app.chat_prompt())
 
@@ -372,6 +374,8 @@ class TestStudioBrief(unittest.TestCase):
             f.write("# Method & Form\nWe cut brand films at 25 fps.\n")
         text = eng.read_studio_brief(path)
         for app in eng.TABS:
+            if app.panel:
+                continue
             prompt = app.chat_prompt(studio=text, lessons="- Music goes on A3.")
             self.assertTrue(prompt.startswith(app.system_prompt))
             about, kept = prompt.index("ABOUT THIS STUDIO"), prompt.index("LESSONS FROM EARLIER WORK")

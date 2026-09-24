@@ -1771,10 +1771,12 @@ class TestGui(unittest.TestCase):
         prompts = []
         for sid in self.app.order:
             s = self.app.sessions[sid]
+            if s.app.panel:
+                continue                  # a window, not a conversation
             self.assertEqual(s.messages[0]["role"], "system")
             self.assertIn(s.app.name.split()[0], s.messages[0]["content"])
             prompts.append(s.messages[0]["content"])
-        self.assertEqual(len(set(prompts)), len(self.app.order))
+        self.assertEqual(len(set(prompts)), len(prompts))
         histories = [id(self.app.sessions[i].messages) for i in self.app.order]
         self.assertEqual(len(set(histories)), len(self.app.order))
 
@@ -2285,6 +2287,9 @@ class TestGui(unittest.TestCase):
         waking fails it. That used to leave every tab at 'no inference host'
         with no button, and reopening the window as the only way on."""
         state = self._host_state()
+        # A fresh tab: an earlier test may have left this one booted.
+        self.app._close_tab(eng.CHAT.id)
+        self.app._add_tab(eng.CHAT.id)
         s = self.app.sessions[eng.CHAT.id]
         self.app._select(s.id)
         self.app.llm = None

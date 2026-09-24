@@ -688,8 +688,11 @@ def collect(prompt_id, entry):
             continue
         lines.append(path)
         if f["filename"].lower().endswith(".png") and len(content) < MAX_INLINE_IMAGES:
+            # _meta.path is where the picture is on this workstation, so the
+            # chat window can save, open and show the file it previews.
             content.append({"type": "image", "mimeType": "image/png",
-                            "data": base64.b64encode(data).decode("ascii")})
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "_meta": {"path": path}})
     text = "prompt_id: %s\n" % prompt_id
     text += ("Saved %d file(s) on this workstation:\n  " % len(lines) + "\n  ".join(lines)
              if lines else "The prompt finished but wrote no output files.")
@@ -906,6 +909,215 @@ def finish_edit(g, edited, z, instruction, seed, a, header, notes):
     notes = list(notes) + ["photo finish: Z-Image detail pass x%s at denoise %s"
                            % (r["scale"], r["denoise"])]
     return run(g2, dict(a, wait=True), header, notes, started=started)
+
+
+SAM3 = "sam3"                # the checkpoint that finds faces and heads
+FACE_EDIT = 1024             # side each face crop is edited at
+# Name no accessory here: listing "glasses", "facial hair" or "the hat" had the
+# model add them - a hat and a moustache on a woman who had neither.
+SWAP_INSTRUCTION = (
+    "Replace the face and hair of the person in picture 1 with the face and hair of "
+    "the person in picture 2, so that it is unmistakably the person from picture 2. "
+    "Keep the position, angle and tilt of the head and everything else in picture 1 "
+    "unchanged, and add nothing that is not already in picture 1 or picture 2. Match "
+    "picture 1's lighting, colours, softness and film grain.")
+
+
+def find_faces(names, prompt="face:8", threshold=0.3):
+    """SAM3's face boxes and each picture's size, in one quick run: per
+    uploaded name, (width, height, [(x, y, w, h), ...]) with the incidental
+    faces - a crowd behind the subjects - dropped, left to right."""
+    ckpt = pick_first(list_models("checkpoints"), SAM3)
+    if not ckpt or SAM3 not in ckpt.lower():
+        raise ComfyError("Face swap finds faces with SAM3, and ComfyUI has no sam3 "
+                         "checkpoint installed.")
+    g = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+         "2": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["1", 1]}}}
+    for i, name in enumerate(names):
+        n = 10 + 10 * i
+        g[str(n)] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        g[str(n + 1)] = {"class_type": "SAM3_Detect", "inputs": {
+            "model": ["1", 0], "image": [str(n), 0], "conditioning": ["2", 0],
+            "threshold": threshold, "refine_iterations": 0, "individual_masks": True}}
+        g[str(n + 2)] = {"class_type": "PreviewAny", "inputs": {"source": [str(n + 1), 1]}}
+        g[str(n + 3)] = {"class_type": "GetImageSize", "inputs": {"image": [str(n), 0]}}
+        g[str(n + 4)] = {"class_type": "PreviewAny", "inputs": {"source": [str(n + 3), 0]}}
+        g[str(n + 5)] = {"class_type": "PreviewAny", "inputs": {"source": [str(n + 3), 1]}}
+    entry = wait_for(submit(g), 300)
+    out = entry.get("outputs") or {}
+
+    def text(node):
+        t = (out.get(str(node)) or {}).get("text") or []
+        if not t:
+            raise ComfyError("Face detection returned nothing: %s"
+                             % ("; ".join(status_messages(entry)) or "no output"))
+        return json.loads(t[0])
+
+    found = []
+    for i in range(len(names)):
+        n = 10 + 10 * i
+        boxes = text(n + 2)
+        boxes = boxes[0] if boxes and isinstance(boxes[0], list) else boxes
+        boxes = [(b["x"], b["y"], b["width"], b["height"]) for b in boxes or []]
+        if boxes:
+            big = max(w * h for _, _, w, h in boxes)
+            boxes = sorted((b for b in boxes if b[2] * b[3] >= big / 4), key=lambda b: b[0])
+        found.append((int(text(n + 4)), int(text(n + 5)), boxes))
+    return found
+
+
+def head_square(box, width, height, pad):
+    """A square around a face, `pad` times its size and nudged up for the
+    hair, kept inside the picture."""
+    x, y, w, h = box
+    side = int(min(max(w, h) * pad, width, height))
+    cx, cy = x + w / 2.0, y + h / 2.0 - 0.12 * h
+    x0 = int(min(max(cx - side / 2.0, 0), width - side))
+    y0 = int(min(max(cy - side / 2.0, 0), height - side))
+    return {"x": x0, "y": y0, "width": side, "height": side}
+
+
+def t_face_swap(a):
+    """Put the people of one picture into another, face for face, as crop,
+    edit and stitch: each face is cut out of the scene with room for the
+    hair, edited at 1024 px against the matching face from `faces`, and
+    blended back through a soft head mask. Edited whole, a face in a group
+    photo is a few hundred of the edit model's million pixels and comes
+    back as a likeness at best; cropped, it gets all of them, and nothing
+    outside the heads is touched."""
+    started = time.monotonic()
+    scene, people = input_image(a["image"]), input_image(a["faces"])
+    (sw, sh, targets), (_, _, sources) = find_faces([scene, people])
+    if not targets:
+        return result("No face found in %s." % a["image"], error=True)
+    if not sources:
+        return result("No face found in %s." % a["faces"], error=True)
+    order = a.get("order")
+    if order:
+        try:
+            sources = [sources[int(i) - 1] for i in order]
+        except (ValueError, IndexError):
+            return result("order has %s, but %s has %d face(s)."
+                          % (order, a["faces"], len(sources)), error=True)
+    pairs = list(zip(targets, sources))
+    plan = plan_edit(a)
+    seed = new_seed(a)
+    instruction = SWAP_INSTRUCTION
+    if a.get("instruction"):
+        instruction += " " + a["instruction"].strip()
+
+    # 1. The edits, to previews: the 19.5 GB edit model and SAM3 are never
+    # on the card together (see finish_edit).
+    free, total = gpu_memory()
+    g = {}
+    model, clip, vae = load_split(g, plan, lora=plan["lora"])
+    g["13"] = {"class_type": "CFGNorm", "inputs": {"model": model, "strength": 1.0}}
+    model = ["13", 0]
+    g["20"] = {"class_type": "LoadImage", "inputs": {"image": scene}}
+    g["21"] = {"class_type": "LoadImage", "inputs": {"image": people}}
+    fast = bool(plan["lora"])
+    steps = a.get("steps", plan["fast_steps"] if fast else plan["steps"])
+    cfg = a.get("cfg", 1.0 if fast else plan["cfg"])
+    crops = []
+    for i, (t, s) in enumerate(pairs):
+        n = 100 + 20 * i
+        crop = head_square(t, sw, sh, a.get("padding", 2.4))
+        crops.append(crop)
+        g[str(n)] = {"class_type": "ImageCropV2", "inputs": {"image": ["20", 0], "crop_region": crop}}
+        g[str(n + 1)] = {"class_type": "ImageScale", "inputs": {
+            "image": [str(n), 0], "upscale_method": "lanczos", "width": FACE_EDIT,
+            "height": FACE_EDIT, "crop": "disabled"}}
+        # The likeness: the person's head with some room, not the whole picture.
+        g[str(n + 2)] = {"class_type": "CropByBBoxes", "inputs": {
+            "image": ["21", 0], "bboxes": {"x": s[0], "y": s[1], "width": s[2], "height": s[3]},
+            "output_width": FACE_EDIT, "output_height": FACE_EDIT,
+            "padding": int(max(s[2], s[3]) * 0.45), "keep_aspect": "pad"}}
+        images = {"image1": [str(n + 1), 0], "image2": [str(n + 2), 0]}
+        g[str(n + 3)] = {"class_type": "TextEncodeQwenImageEditPlus",
+                         "inputs": dict(images, clip=clip, vae=vae, prompt=instruction)}
+        # At cfg 1 the sampler never reads the negative, and each encode runs
+        # the 7B vision encoder over both pictures on the CPU.
+        g[str(n + 4)] = ({"class_type": "ConditioningZeroOut",
+                          "inputs": {"conditioning": [str(n + 3), 0]}} if cfg == 1 else
+                         {"class_type": "TextEncodeQwenImageEditPlus",
+                          "inputs": dict(images, clip=clip, vae=vae, prompt="")})
+        g[str(n + 5)] = {"class_type": "VAEEncode", "inputs": {"pixels": [str(n + 1), 0], "vae": vae}}
+        g[str(n + 6)] = {"class_type": "KSampler", "inputs": {
+            "seed": seed + i, "steps": steps, "cfg": cfg, "sampler_name": plan["sampler"],
+            "scheduler": plan["scheduler"], "denoise": 1.0, "model": model,
+            "positive": [str(n + 3), 0], "negative": [str(n + 4), 0],
+            "latent_image": [str(n + 5), 0]}}
+        g[str(n + 7)] = {"class_type": "VAEDecode", "inputs": {"samples": [str(n + 6), 0], "vae": vae}}
+        g[str(n + 8)] = {"class_type": "PreviewImage", "inputs": {"images": [str(n + 7), 0]}}
+    entry = wait_for(submit(g), a.get("timeout", DEFAULT_WAIT))
+    release(free)
+    edited = {}
+    for i in range(len(pairs)):
+        imgs = (entry.get("outputs") or {}).get(str(100 + 20 * i + 8), {}).get("images") or []
+        if imgs:
+            f = imgs[0]
+            edited[i] = ("%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder")
+                         else f["filename"]) + " [temp]"
+    if len(edited) < len(pairs):
+        return result("The face edit failed: %s" % ("; ".join(status_messages(entry))
+                                                    or "no picture came back"), error=True)
+
+    # 2. The stitch: each edited head back in its place, through a mask of the
+    # head before and after (so the old hair goes too), grown and blurred, and
+    # faded out towards the crop's edge so no seam can show.
+    g = {"1": {"class_type": "CheckpointLoaderSimple",
+               "inputs": {"ckpt_name": pick_first(list_models("checkpoints"), SAM3)}},
+         "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "head:1", "clip": ["1", 1]}},
+         "20": {"class_type": "LoadImage", "inputs": {"image": scene}}}
+    last = ["20", 0]
+    for i, crop in enumerate(crops):
+        n, side = 100 + 20 * i, crop["width"]
+        g[str(n)] = {"class_type": "LoadImage", "inputs": {"image": edited[i]}}
+        g[str(n + 1)] = {"class_type": "ImageCropV2", "inputs": {"image": ["20", 0], "crop_region": crop}}
+        g[str(n + 2)] = {"class_type": "ImageScale", "inputs": {
+            "image": [str(n + 1), 0], "upscale_method": "lanczos", "width": FACE_EDIT,
+            "height": FACE_EDIT, "crop": "disabled"}}
+        for k, src in ((3, [str(n), 0]), (4, [str(n + 2), 0])):
+            g[str(n + k)] = {"class_type": "SAM3_Detect", "inputs": {
+                "model": ["1", 0], "image": src, "conditioning": ["2", 0], "threshold": 0.3,
+                "refine_iterations": 2, "individual_masks": False}}
+        g[str(n + 5)] = {"class_type": "MaskComposite", "inputs": {
+            "destination": [str(n + 3), 0], "source": [str(n + 4), 0], "x": 0, "y": 0,
+            "operation": "or"}}
+        g[str(n + 6)] = {"class_type": "GrowMask", "inputs": {
+            "mask": [str(n + 5), 0], "expand": 28, "tapered_corners": True}}
+        g[str(n + 7)] = {"class_type": "SolidMask", "inputs": {
+            "value": 1.0, "width": FACE_EDIT, "height": FACE_EDIT}}
+        edge = FACE_EDIT // 8
+        g[str(n + 8)] = {"class_type": "FeatherMask", "inputs": {
+            "mask": [str(n + 7), 0], "left": edge, "top": edge, "right": edge, "bottom": edge}}
+        g[str(n + 9)] = {"class_type": "MaskComposite", "inputs": {
+            "destination": [str(n + 6), 0], "source": [str(n + 8), 0], "x": 0, "y": 0,
+            "operation": "multiply"}}
+        g[str(n + 10)] = {"class_type": "MaskToImage", "inputs": {"mask": [str(n + 9), 0]}}
+        g[str(n + 11)] = {"class_type": "ImageBlur", "inputs": {
+            "image": [str(n + 10), 0], "blur_radius": 31, "sigma": 10.0}}
+        g[str(n + 12)] = {"class_type": "ImageToMask", "inputs": {"image": [str(n + 11), 0], "channel": "red"}}
+        # The edit drifts brighter and warmer than an old print; matched to
+        # the crop it replaces, the new head takes the photograph's colour.
+        g[str(n + 15)] = {"class_type": "ColorTransfer", "inputs": {
+            "image_target": [str(n), 0], "image_ref": [str(n + 2), 0],
+            "method": "reinhard_lab", "source_stats": "per_frame", "strength": 1.0}}
+        g[str(n + 13)] = {"class_type": "ImageScale", "inputs": {
+            "image": [str(n + 15), 0], "upscale_method": "lanczos", "width": side,
+            "height": side, "crop": "disabled"}}
+        g[str(n + 14)] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": last, "source": [str(n + 13), 0], "x": crop["x"], "y": crop["y"],
+            "resize_source": False, "mask": [str(n + 12), 0]}}
+        last = [str(n + 14), 0]
+    g["9"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioFaceSwap"), "images": last}}
+    header = ("model: %s%s\nseed: %d  steps: %s  cfg: %s\nfaces swapped: %d (left to right; "
+              "%d found in the scene, %d in the faces picture)\n" % (
+                  plan["label"], " + " + plan["lora"] if plan["lora"] else "", seed, steps,
+                  cfg, len(pairs), len(targets), len(sources)))
+    notes = [vram_note(free, total)] if vram_note(free, total) else []
+    return run(g, dict(a, wait=True), header, notes, started=started)
 
 
 def t_upscale(a):
@@ -1174,6 +1386,32 @@ TOOLS = [
          "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5,
                        maximum=MAX_WAIT),
      }, ["image", "instruction"])),
+    ("comfy_face_swap", t_face_swap,
+     "Put the faces of the people in one picture onto the people in another, so it "
+     "looks like they were there: 'make this old photo us'. Each face in `image` is cut "
+     "out large, given the matching face from `faces` with Qwen-Image-Edit, and blended "
+     "back; everything but the heads is left as it was. Faces pair left to right. Takes "
+     "a few minutes. Returns the finished picture like comfy_generate.",
+     _obj({
+         "image": _s("The scene whose people get new faces: a path on this workstation "
+                     "or a name from comfy_upload_image."),
+         "faces": _s("The picture of the people whose faces go in, same forms as image."),
+         "order": {"type": "array", "items": {"type": "integer", "minimum": 1},
+                   "description": "Which face in `faces` (1 = leftmost) goes on each "
+                                  "face in `image`, left to right. Default [1, 2, ...]."},
+         "instruction": _s("Anything to add to the swap instruction, such as 'keep her "
+                           "own hair' or 'no glasses'."),
+         "padding": _n("How much of the head around each face is redrawn, as a multiple "
+                       "of the face's size. Default 2.4.", minimum=1.5, maximum=4),
+         "fast": {"type": "boolean", "description": "Default true: 4 Lightning steps. "
+                  "false: 20 full steps, much slower, sometimes a closer likeness."},
+         "steps": _i("Override the step count.", minimum=1, maximum=60),
+         "cfg": _n("Override cfg.", minimum=0, maximum=10),
+         "seed": _i("Fixed seed. Default: random.", minimum=-1),
+         "filename_prefix": _s("Output filename prefix. Default StudioFaceSwap."),
+         "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5,
+                       maximum=MAX_WAIT),
+     }, ["image", "faces"])),
     ("comfy_upscale", t_upscale,
      "Enlarge a picture and redraw its fine detail with the photographic model, so it "
      "is sharp at the new size rather than stretched. The picture is brought to about "
@@ -1252,6 +1490,7 @@ READ_ONLY = {"comfy_status", "comfy_list_models", "comfy_search_nodes", "comfy_n
 HINTS = {
     "comfy_generate": {"destructive": False},
     "comfy_edit_image": {"destructive": False},
+    "comfy_face_swap": {"destructive": False},
     "comfy_upscale": {"destructive": False},
     "comfy_run_workflow": {"destructive": False},
     "comfy_upload_image": {"destructive": False, "idempotent": True},
