@@ -236,6 +236,46 @@ class TaskRecord:
         record.status = "restored — inspect the current project before editing"
         return record, repaired
 
+    @classmethod
+    def summaries(cls, folder):
+        """What is saved under `folder`, newest first - enough to recognise a
+        task without opening it, which a file dialog full of 32-character hex
+        names is not. Each is {path, when, brief, steps, status, problem}.
+
+        A file that will not parse is listed carrying its `problem` rather
+        than dropped: a saved task that can no longer be resumed is worth
+        knowing about, and silently hiding it is how a user comes to believe
+        the app threw their work away.
+        """
+        out = []
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return out                    # no folder yet is no tasks, not an error
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(folder, name)
+            item = {"path": path, "when": 0.0, "brief": "", "steps": 0,
+                    "status": "", "problem": ""}
+            try:
+                item["when"] = os.path.getmtime(path)
+            except OSError:
+                pass
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                record = data["record"]
+                briefs = [b for b in (record.get("briefs") or []) if isinstance(b, str)]
+                item["brief"] = briefs[0] if briefs else ""
+                item["steps"] = len(record.get("journal") or [])
+                item["status"] = record.get("status") or ""
+            except Exception as e:
+                item["problem"] = "%s: %s" % (type(e).__name__, e)
+            out.append(item)
+        out.sort(key=lambda i: i["when"], reverse=True)
+        return out
+
 
 def context_messages(messages, record, tools, max_chars=100000, memory=True, extra=""):
     """Bound the request conservatively by characters, keeping whole exchanges.

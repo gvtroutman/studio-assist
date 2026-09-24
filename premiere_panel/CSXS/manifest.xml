@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- The Studio Assistant bridge panel for Premiere Pro. It runs a loopback HTTP
+<!-- The Studio Assist bridge panel for Premiere Pro. It runs a loopback HTTP
      server inside Premiere that evaluates the ExtendScript sent to it and answers
      with the result; studio_premiere_mcp.py is the other end, and its install-panel
      flag copies this folder into place (with Premiere closed). Note for editors: a
      double hyphen is illegal inside an XML comment and CEP will refuse the manifest. -->
 <ExtensionManifest Version="11.0" ExtensionBundleId="org.methodandform.studio-premiere"
-                   ExtensionBundleVersion="1.0.0" ExtensionBundleName="Studio Assistant Bridge"
+                   ExtensionBundleVersion="1.0.0" ExtensionBundleName="Studio Assist Bridge"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <ExtensionList>
     <Extension Id="org.methodandform.studio-premiere.panel" Version="1.0.0" />
@@ -39,7 +39,7 @@
         </Lifecycle>
         <UI>
           <Type>Panel</Type>
-          <Menu>Studio Assistant Bridge</Menu>
+          <Menu>Studio Assist Bridge</Menu>
           <Geometry>
             <Size><Height>180</Height><Width>300</Width></Size>
             <MinSize><Height>100</Height><Width>220</Width></MinSize>

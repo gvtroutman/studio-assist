@@ -1086,7 +1086,7 @@ def main(argv=None):
             print("CEP will not load an unsigned panel until PlayerDebugMode is set. Run, for each:")
             for v in missing:
                 print(r"    reg add HKCU\Software\Adobe\CSXS.%s /v PlayerDebugMode /t REG_SZ /d 1" % v)
-        print("Start Premiere Pro; the panel is under Window > Extensions > Studio Assistant Bridge "
+        print("Start Premiere Pro; the panel is under Window > Extensions > Studio Assist Bridge "
               "and listens on %s." % PREMIERE_URL)
         return 0
     return studio_mcp.main(SERVER, argv)
