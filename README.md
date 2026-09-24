@@ -194,6 +194,14 @@ After Effects, Resolve or their projects. It uses the same LM Studio host as the
 tabs (`STUDIO_MODEL_OPENCODE` pins its model). The window does not stop the container
 when it closes; `docker stop studio-opencode` does, and the workspace stays.
 
+**Milanote** is a tab with no model and no bridge: Milanote has no API, so the tab
+holds its web app instead. Open it from the **+** on the tab strip. It is a Chrome (or
+Edge) window with its own profile, `%LOCALAPPDATA%\StudioAssistant\milanote-browser`,
+so you sign in there once and it stays signed in. That sign-in is separate from your
+everyday Chrome. **Upload files** drops the files you pick onto the middle of the board
+you have open, the same as dragging them in from Explorer. **Reload** reloads the
+page, and reopens the window if it has gone. The window closes with the tab.
+
 Each tab carries its own system prompt — a briefing on that bridge's ids, units and
 conventions, because the local model knows the app in general but has never seen this
 bridge. It is what keeps After Effects colours in 0..1 and Resolve's track numbering
@@ -361,6 +369,7 @@ out badly.
 | `studio_lessons.py` | What the model learns per app: the notebook, `studio_remember`, the end-of-task reflection |
 | `studio_agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
 | `studio_mcp.py` | The MCP harness: the server our bridges run on, an in-process client, and `check` — holds any bridge to what the executor and the model need |
+| `studio_milanote.py` | The Milanote tab: its web app in a browser window held in the tab, and uploads dropped onto the board |
 | `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
 | `Studio Assist.cmd` | Console-free launcher used by the shortcuts |
 | `make_icon.py` | Regenerates `studio-assistant.ico`, the shortcut and taskbar mark |
