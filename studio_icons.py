@@ -72,6 +72,67 @@ def disc_png(colour, size, over=4):
     return png(bytes(out), size, size)
 
 
+# A remote app has no .exe to read, so its mark is drawn. ComfyUI's is a
+# yellow stepped C on blue: three rounded bars, all leaning the same way.
+# Measured off the published logo on a 1000-unit square, with the lean taken
+# out - x here is x + LEAN * (y - 500) on the logo - so each bar is an upright
+# rounded box, and the lean goes back in per sub-sample below.
+COMFY_BG = (0x14, 0x30, 0xDA)
+COMFY_FG = (0xEE, 0xFF, 0x44)
+COMFY_LEAN = 0.29
+COMFY_BARS = ((372, 187, 718, 400),   # top:    x0, y0, x1, y1
+              (241, 329, 455, 682),   # stem
+              (376, 613, 713, 823))   # bottom
+COMFY_ROUND = 36
+
+
+def _in_box(x, y, box, r):
+    x0, y0, x1, y1 = box
+    if not (x0 <= x <= x1 and y0 <= y <= y1):
+        return False
+    cx = min(max(x, x0 + r), x1 - r)
+    cy = min(max(y, y0 + r), y1 - r)
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
+def comfy_png(size, over=4):
+    """ComfyUI's mark as a size x size PNG: the logo on a rounded blue square,
+    the same corner as a drawn badge's so it sits in the row like the rest."""
+    out = bytearray(size * size * 4)
+    corner = size * 0.22
+    unit = 1000.0 / size
+    step = 1.0 / over
+    for y in range(size):
+        for x in range(size):
+            square = mark = 0
+            for sy in range(over):
+                py = y + (sy + 0.5) * step
+                for sx in range(over):
+                    px = x + (sx + 0.5) * step
+                    if not _in_box(px, py, (0, 0, size, size), corner):
+                        continue
+                    square += 1
+                    ly = py * unit
+                    lx = px * unit + COMFY_LEAN * (ly - 500)
+                    if any(_in_box(lx, ly, b, COMFY_ROUND) for b in COMFY_BARS):
+                        mark += 1
+            i = (y * size + x) * 4
+            share = mark / float(square) if square else 0.0
+            for k in range(3):
+                out[i + k] = int(round(COMFY_BG[k] + (COMFY_FG[k] - COMFY_BG[k]) * share))
+            out[i + 3] = square * 255 // (over * over)
+    return png(bytes(out), size, size)
+
+
+DRAWN = {"comfyui": comfy_png}
+
+
+def drawn_png(key, size):
+    """The drawn mark for an app with no .exe to read, or None."""
+    draw = DRAWN.get(key)
+    return draw(size) if draw else None
+
+
 # ---------------------------------------------------------------- PE structure
 
 class _PE:

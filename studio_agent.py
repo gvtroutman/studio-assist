@@ -37,6 +37,9 @@ import studio_mcp
 import studio_procs
 
 DEFAULT_HOST = "http://100.127.17.38:1234/v1"
+# The longest an MCP call may run while its bridge keeps reporting progress. A
+# silent bridge still times out at the call's own timeout.
+PROGRESS_CAP = 1800
 # ComfyUI shares the inference box: its GPU does the image work so the 5090
 # here stays free for rendering. Same variable the bridge reads.
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://100.127.17.38:8188").rstrip("/")
@@ -147,7 +150,11 @@ class MCPClient:
             # Ask for progress under our own id; a bridge that waits reports on it.
             params.setdefault("_meta", {})["progressToken"] = rid
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        # A bridge that reports progress is working, not hung: each report
+        # restarts the timeout, up to PROGRESS_CAP in all. Without this a
+        # ComfyUI render that took four minutes was abandoned at three.
         deadline = time.monotonic() + timeout
+        cap = time.monotonic() + max(timeout, PROGRESS_CAP)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -164,7 +171,11 @@ class MCPClient:
                     raise RuntimeError("MCP error: " + studio_mcp.error_text(msg["error"]))
                 return msg.get("result", {})
             if msg.get("id") is None and msg.get("method"):
-                self._notification(msg["method"], msg.get("params") or {})
+                note = msg.get("params") or {}
+                self._notification(msg["method"], note)
+                if (msg["method"] == "notifications/progress"
+                        and note.get("progressToken") == rid):
+                    deadline = min(time.monotonic() + timeout, cap)
             # Late replies to timed-out serialized requests must not
             # accumulate forever in the inbox.
         # Tell the bridge we stopped listening; one built on studio_mcp stops
@@ -174,7 +185,10 @@ class MCPClient:
                         "params": {"requestId": rid, "reason": "timeout"}})
         except Exception:
             pass
-        raise TimeoutError("no MCP reply to %s in %ss" % (method, timeout))
+        raise TimeoutError("no MCP reply to %s in %ss" % (method, timeout)
+                           if time.monotonic() < cap else
+                           "no MCP reply to %s in %ss, though it reported progress"
+                           % (method, int(max(timeout, PROGRESS_CAP))))
 
     def _notification(self, method, params):
         if method == "notifications/message":
@@ -912,6 +926,74 @@ def unload_model(base_url, instance_id, timeout=60):
         return str(e)
 
 
+def make_room(base_url, keep, timeout=10):
+    """Unload every language or vision model on the host except those in
+    `keep`. -> ([unloaded instance ids], error text or None).
+
+    ComfyUI shares the LLM PC's one GPU. With the 30B and the vision model
+    resident it saw 0.3 GB free and streamed every diffusion model from system
+    RAM - 200-330 s a picture, 35 s of it sampling. A tab whose tools render
+    clears the host before each render; a tab whose model was unloaded is
+    reloaded, at its own window, before its next turn (`Chat._turn`).
+    Embedding models are left alone: they are small and something may be
+    using them."""
+    try:
+        with urllib.request.urlopen(api_root(base_url) + "/api/v1/models",
+                                    timeout=timeout) as r:
+            models = json.load(r).get("models", [])
+    except Exception as e:
+        return [], str(e)
+    gone, errors = [], []
+    for m in models:
+        if not isinstance(m, dict) or m.get("key") in keep or m.get("type") == "embedding":
+            continue
+        for inst in m.get("loaded_instances") or []:
+            iid = inst.get("id") if isinstance(inst, dict) else None
+            if not isinstance(iid, str) or iid in keep:
+                continue
+            err = unload_model(base_url, iid)
+            if err:
+                errors.append("%s: %s" % (iid, err))
+            else:
+                gone.append(iid)
+    return gone, "; ".join(errors) or None
+
+
+def give_back(base_url, model, context_length):
+    """Reload `model` at `context_length` if a render unloaded it. -> error or None."""
+    if loaded_instances(base_url, model):
+        return None
+    return load_model(base_url, model, context_length=context_length)
+
+
+class YieldGPU:
+    """A bridge whose `heavy` tools want the host's whole GPU: `before()` runs
+    ahead of each of them and returns a token, `after(token)` runs once the
+    tool returns - or raises. Everything else passes straight through.
+
+    The tab's own model is idle while it waits on a render, so it leaves the
+    GPU too: the Qwen edit model is 19.5 GB and does not fit beside even the
+    9B, whose first step took 272 s there. Reloading the 9B from the host's
+    RAM costs seconds."""
+
+    def __init__(self, bridge, heavy, before, after=None):
+        self.bridge, self.heavy = bridge, set(heavy)
+        self.before, self.after = before, after
+
+    def call_tool(self, name, arguments):
+        if name not in self.heavy:
+            return self.bridge.call_tool(name, arguments)
+        token = self.before()
+        try:
+            return self.bridge.call_tool(name, arguments)
+        finally:
+            if self.after:
+                self.after(token)
+
+    def __getattr__(self, attr):
+        return getattr(self.bridge, attr)
+
+
 # What a conversation needs after the fixed prefix, when this app chooses the
 # window: several tool exchanges, a screenshot's description, a reply.
 ROOM = 8192
@@ -1314,40 +1396,66 @@ HOW COMFYUI IS SHAPED
 - Model files are addressed by filename, exactly as comfy_list_models prints them,
   including the extension: "sd_xl_base_1.0.safetensors", not "SDXL".
 
-SETTINGS - the ones that silently produce poor output
-- Call comfy_status before the first generation in a session: it says which
-  model comfy_generate will use. Only name a different model when the user asks
-  for one, and then with the exact filename from comfy_list_models.
-- Sizes: Z-Image, Qwen-Image, Flux and anything named xl, sdxl, pony or
-  illustrious want 1024x1024 or a nearby aspect such as 1152x896, 1344x768 or
-  832x1216; a 1.5-era checkpoint wants 512x512 or 512x768. The wrong size gives
-  doubled figures or mush, not an error.
-- Steps and cfg come from the model's recipe when you leave them out, and that is
-  the right thing to do. Z-Image Turbo is 8 steps at cfg 1, where the negative
-  prompt is ignored - do not "fix" that by raising cfg. Only a checkpoint named
-  turbo, lightning, hyper or lcm wants few steps and low cfg set by hand.
-- width and height are pixels and must be multiples of 16.
-- The seed is what makes a result reproducible. To vary one image slightly keep
-  the seed and change the prompt; to get a different take keep the prompt and
-  change the seed. Every result reports the seed it used - keep it.
-- Prompts are descriptive phrases, not instructions: "a lighthouse at dusk, long
-  exposure, film grain" rather than "please draw a lighthouse". The negative is
-  the same: things to avoid, such as "blurry, text, watermark, extra fingers".
+WHICH TOOL
+- A new picture from words: comfy_generate.
+- Change something in an existing picture - swap, add, remove, recolour, relight,
+  restyle one part, put a person somewhere else - and keep the rest: comfy_edit_image.
+  Describe the change as one instruction ("replace the grey sky with a warm sunset,
+  keep everything else"). Do not use comfy_generate's init_image for this: it
+  repaints the whole picture and follows no instruction.
+- Bigger or sharper: comfy_upscale.
+- All three take a picture as a path on this workstation and send it up
+  themselves. Do not call comfy_upload_image first.
+- Just generate. The default model and settings are the best ones installed for
+  photographs; do not call comfy_status or comfy_list_models first unless the user
+  asks what is installed or a call failed.
 
-MAKING THINGS
-- comfy_generate is the whole ordinary workflow: text to image, or image to image
-  when init_image names a file first sent up with comfy_upload_image. For image to
-  image, denoise is how far to depart from the source: 0.3 keeps its structure,
-  0.75 keeps little but the palette.
-- A LoRA is applied by filename with `lora`; list them with comfy_list_models
-  kind=loras. Most want their trigger word in the prompt, and a LoRA only fits
-  the family it was trained for - a Qwen-Image LoRA does nothing useful on
-  Z-Image.
-- batch_size makes several variations of one prompt in one run. Prefer it to
-  calling generate repeatedly.
-- Generation takes real time - seconds to a few minutes depending on size, steps
-  and batch. If a call reports the run is still going, use comfy_wait with the
-  prompt_id it gave you; do not queue the same prompt again.
+REALISM - the user wants pictures that look like real photographs
+- Leave model, steps, cfg, sampler, realism and hires at their defaults. The
+  default is Z-Image Turbo at 8 steps, cfg 1, followed by a detail pass that
+  redraws skin, fabric and texture at 1.5x the size. Raising steps or cfg makes it
+  worse, not better. hires false is only for a quick draft the user asked for.
+- Write the prompt the way a photographer would describe the shot, in plain
+  sentences: who or what and what they are doing; where; the light (golden hour
+  backlight, overcast daylight, a single window, neon at night); the camera (35mm
+  or 85mm lens, f/1.8, shallow depth of field, eye level); and the real-world
+  imperfections that sell it (visible skin pores, flyaway hair, creased cotton,
+  scuffed paint, dust, wet asphalt). Two to five sentences.
+- Never write "masterpiece, best quality, 8k, ultra HD, hyperrealistic, trending
+  on artstation": those push the model toward a glossy digital-art look.
+- Name the look if it matters: "candid snapshot on a phone", "35mm film, Portra
+  400, soft grain", "editorial studio portrait". A plain description gives a clean
+  modern photograph.
+- For a drawing, painting, logo or cartoon, set realism false and say the medium.
+- Sizes (before the detail pass): 1024x1024 square, 832x1216 or 896x1152
+  portrait, 1216x832 or 1344x768 landscape. Multiples of 16. Bigger base sizes
+  only cost time; the detail pass adds the resolution.
+- The seed makes a result reproducible. To vary a picture slightly keep the seed
+  and change the prompt; for a different take keep the prompt and change the seed.
+  Every result reports its seed - keep it.
+
+EDITING
+- Say what changes and what stays: "change her jacket to red leather, keep her
+  face, pose and the background". One change per call gives the cleanest result;
+  chain calls on the new file for several.
+- references are extra pictures, called picture 2 and picture 3 in the instruction.
+- photo_finish true runs a Z-Image detail pass afterwards: use it when the edited
+  picture is a photograph and the user wants the most realistic result, or the
+  edit looks smooth or waxy. It adds time.
+
+TIME
+- ONE render per request. When the picture comes back, show it: give the path,
+  say in a sentence what it shows, and offer what could change next. Do not render
+  again on your own because a review of the picture found something to improve -
+  every render costs the user a minute or more. Render again only when the picture
+  is plainly not what was asked for (wrong subject, wrong count, text garbled
+  where text was asked for), and then only once.
+- A picture takes one to five minutes on this studio's shared GPU; an edit with
+  photo_finish or an upscale takes longer. The tool waits for you. If a call
+  reports the run is still going, use comfy_wait with its prompt_id; never queue
+  the same prompt again.
+- batch_size makes several variations in one run; prefer it to repeated calls.
+- A LoRA only fits the family it was trained for, and most want a trigger word.
 - Every result lists the file paths on this workstation. Tell the user those
   paths - that is how they open the picture and how another tab imports it.
 - Uploads and outputs are files on this workstation; the model files live with
@@ -1802,7 +1910,7 @@ class AppSpec:
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
                  examples, launch_note="", models=(), readback=(), review=None,
-                 docs=(), craft=""):
+                 docs=(), craft="", gpu_tools=()):
         self.id = id
         self.name = name
         self.tab = tab                    # short label for a tab strip
@@ -1822,6 +1930,9 @@ class AppSpec:
         # beside a diffusion model is VRAM the pictures could have had, and the
         # tab's work - one generate call and a filename - does not need it.
         self.models = list(models)
+        # Tools that render on the LLM PC's GPU: before each, every other model
+        # is unloaded from the host so the render runs in VRAM (YieldGPU).
+        self.gpu_tools = frozenset(gpu_tools)
         # How to check a write landed, for the executor's read-back reminder:
         # (read tool, the id arguments it needs) pairs, most specific first. A
         # write that carried those ids is verified by that read with the same
@@ -2096,7 +2207,8 @@ RESOLVE_GROUPS = {
 
 COMFY_GROUPS = {
     "discover": ["comfy_status", "comfy_list_models", "comfy_queue", "comfy_history"],
-    "generate": ["comfy_generate", "comfy_upload_image", "comfy_wait", "comfy_fetch_output"],
+    "generate": ["comfy_generate", "comfy_edit_image", "comfy_upscale", "comfy_upload_image",
+                 "comfy_wait", "comfy_fetch_output"],
     "control": ["comfy_interrupt", "comfy_clear_queue"],
     # Arbitrary graphs and the node catalogue: powerful, verbose, and easy for a
     # small model to get wrong. Off by default; switch the group on for a session
@@ -2290,7 +2402,7 @@ APPS = [
         id="comfyui",
         name="ComfyUI",
         tab="ComfyUI",
-        code="Cf", fg="#E6E6E6", bg="#1F5F8B",
+        code="Cf", fg="#EEFF44", bg="#1430DA",   # studio_icons.COMFY_*
         exe_globs=[],                        # remote: lives on the LLM PC
         probe="url:%s/system_stats" % COMFYUI_URL,
         command=sys.executable,
@@ -2307,11 +2419,13 @@ APPS = [
         ],
         launch_note="Start ComfyUI on the LLM PC with --listen so it accepts connections "
                     "from this machine, then click Start again to re-check.",
-        # No `models` preference: this tab ran on qwen3-1.7b to leave the GPU
-        # to the pictures, and that model talked about generating instead of
-        # calling comfy_generate. The shared model does the job; ComfyUI and
-        # LM Studio each page what they need. STUDIO_MODEL_COMFYUI pins a
-        # smaller one for a host that cannot hold both.
+        # A 9B that calls tools, so the 30B can leave the GPU to the pictures.
+        # qwen3-1.7b was tried first and talked about generating instead of
+        # calling comfy_generate; the 9B, tested live on this briefing, wrote
+        # a photographer's prompt and called it. Not served -> the shared model.
+        models=["qwen3.5-9b-deepseek-v4-flash"],
+        gpu_tools=["comfy_generate", "comfy_edit_image", "comfy_upscale",
+                   "comfy_run_workflow"],
         docs=[("ComfyUI documentation", "https://docs.comfy.org/"),
               ("ComfyUI workflow examples", "https://comfyanonymous.github.io/ComfyUI_examples/")],
         craft=CRAFT_IMAGES,
@@ -3106,6 +3220,20 @@ def main():
         tools = to_openai_tools(chosen)
         llm = LLM(a.host, a.model, a.temperature, draft=a.draft)
         log("  model: %s @ %s\n" % (a.model, a.host), a.quiet)
+        if app.gpu_tools:
+            # As in the window: the whole GPU to the render, the model back after.
+            def room():
+                ctx = next((c for _, c in loaded_instances(a.host, a.model)), None)
+                gone, err = make_room(a.host, set())
+                if gone or err:
+                    log("  . made room on the GPU: unloaded %s%s" % (
+                        ", ".join(gone) or "nothing", " (%s)" % err if err else ""), a.quiet)
+                return ctx
+            def back(ctx):
+                err = give_back(a.host, a.model, ctx)
+                if err:
+                    log("  . could not reload %s: %s" % (a.model, err), a.quiet)
+            mcp = YieldGPU(mcp, app.gpu_tools, room, back)
 
         return converse(llm, mcp, tools, app, a, schemas=chosen)
     finally:

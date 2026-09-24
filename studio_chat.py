@@ -95,9 +95,12 @@ CALL_TEXT_LIMIT = 12_000                  # chars of one argument or result show
 # is registered, so a window with nothing happening in it costs nothing.
 ANIM_MS = 70                              # one frame
 ELLIPSIS = "…"                       # the marker: a label ending in this is still working
-ELLIPSIS_FRAMES = 5                       # frames per dot, so the count moves about 3x a second
+SEND = "→"                           # the send button's label while idle: an arrow, not a word
 REVEAL_FRAMES = 7                         # a picture wipes in over about half a second
-SWEEP_FRAMES = 26                         # one pass of the shimmer across a placeholder
+SWEEP_FRAMES = 26                         # one pass of the arc across a bridge row
+RIPPLE_FRAMES = 24                        # one pulse out of a placeholder's centre dot: about 1.7s
+RIPPLE_SPEED = 0.55                       # grid steps the ripple travels per frame
+RIPPLE_WIDTH = 1.8                        # grid steps a dot takes to swell and settle as it passes
 SHADES = 12                               # brightness steps a pulse is quantised to, so the disc cache stays small
 
 # Events that put something at the end of a transcript, and so have to take the
@@ -259,6 +262,7 @@ class Session:
         self.window = None
         self.frame = None
         self.view = None
+        self.hero = None                  # the app's mark and name while nothing is said
         self._stream_open = False
         self._stream_buf = []
         self._asst_start = "1.0"
@@ -416,15 +420,28 @@ class Chat(tk.Tk):
         return (eng.installed_apps() or list(eng.APPS)) + [eng.CHAT]
 
     def _fonts(self):
-        self.f_ui = tkfont.Font(family="Segoe UI", size=10)
-        self.f_bold = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-        self.f_title = tkfont.Font(family="Segoe UI Semibold", size=12)
-        self.f_small = tkfont.Font(family="Segoe UI", size=8)
-        self.f_cap = tkfont.Font(family="Segoe UI", size=8, weight="bold")
-        self.f_badge = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        # Inter when it is installed, Segoe UI when it is not - Tk would
+        # otherwise substitute a font of its own choosing without a word. A
+        # static Inter install names its semibold as a family of its own; a
+        # variable one does not, and Tk can only ask it for bold.
+        have = set(tkfont.families())
+        sans = "Inter" if "Inter" in have else "Segoe UI"
+        semi = next((f for f in (sans + " SemiBold", sans + " Semibold")
+                     if f in have), None)
+        self.f_ui = tkfont.Font(family=sans, size=10)
+        self.f_bold = tkfont.Font(family=sans, size=10, weight="bold")
+        self.f_title = (tkfont.Font(family=semi, size=13) if semi else
+                        tkfont.Font(family=sans, size=13, weight="bold"))
+        self.f_small = tkfont.Font(family=sans, size=8)
+        self.f_cap = tkfont.Font(family=sans, size=8, weight="bold")
+        self.f_badge = tkfont.Font(family=sans, size=9, weight="bold")
+        # An empty tab's name and badge, in the middle of the transcript.
+        self.f_hero = (tkfont.Font(family=semi, size=20) if semi else
+                       tkfont.Font(family=sans, size=20, weight="bold"))
+        self.f_hero_badge = tkfont.Font(family=sans, size=22, weight="bold")
         self.f_mono = tkfont.Font(family="Consolas", size=9)
-        self.f_body = tkfont.Font(family="Segoe UI", size=11)
-        self.f_body_b = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+        self.f_body = tkfont.Font(family=sans, size=11)
+        self.f_body_b = tkfont.Font(family=sans, size=11, weight="bold")
         # Segoe MDL2 Assets is Windows' own icon font - a pin drawn by the OS
         # beats anything hand-plotted at 9pt. Fall back to punctuation if it is
         # somehow missing. The bridges' mark is not in here: it is `_arc`,
@@ -453,7 +470,7 @@ class Chat(tk.Tk):
         "2024, 2025, 2026, Beta" - so nothing is clipped at any display scale.
         """
         self.marks_px = {"row": self._px(30), "tab": self._px(22),
-                         "menu": self._px(18)}
+                         "menu": self._px(18), "hero": self._px(72)}
         self.dot_px = self._px(8)
         # A tab chip's inset and corner radius. The frame inside it must clear
         # the curve - a corner of radius r bulges r*(1 - 1/root 2) past the
@@ -553,7 +570,8 @@ class Chat(tk.Tk):
         m_file = menu()
         m_file.add_command(label="New chat", accelerator="Ctrl+N",
                            command=self._on_new)
-        m_file.add_command(label="Saved tasks...", command=self._resume_task)
+        m_file.add_command(label="Chat history...", accelerator="Ctrl+H",
+                           command=self._resume_task)
         m_file.add_command(label="Task progress...", command=self._task_progress)
         m_file.add_command(label="Lessons for this tab...", command=self._lessons_window)
         m_file.add_command(label="About this studio...", command=self._studio_window)
@@ -615,6 +633,7 @@ class Chat(tk.Tk):
         # Bound on the input as well, returning "break", so Tk's own Text
         # bindings (Ctrl+T transposes characters) never also fire.
         for seq, fn in (("<Control-n>", self._on_new),
+                        ("<Control-h>", self._resume_task),
                         ("<Control-t>", lambda: self._tab_menu(self.btn_add)),
                         ("<Control-w>", self._close_tab),
                         ("<Control-o>", self._on_attach),
@@ -638,7 +657,6 @@ class Chat(tk.Tk):
         self._skin(head, bg="head")
         head.pack(side="top", fill="x")
         head.pack_propagate(False)
-        self._skin(tk.Frame(self, height=1), bg="border").pack(side="top", fill="x")
 
         # The window's name is in the title bar, where Windows also puts it on
         # the taskbar and in Alt-Tab. Repeating it here said it twice, one line
@@ -647,8 +665,19 @@ class Chat(tk.Tk):
         self.lbl_status = tk.Label(head, text="starting", font=self.f_title)
         self._skin(self.lbl_status, bg="head", fg="muted")
         self.lbl_status.pack(side="left", padx=(18, 0))
+        # The status's jumping dots, when it describes something still going
+        # on: a canvas beside the label, since a Label's text cannot move. As
+        # tall as the label and plotted on its baseline, so the two line up
+        # without either knowing where the other is.
+        self.status_jump = tk.Canvas(head, highlightthickness=0, bd=0,
+                                     width=ui.jump_width(self.f_title) + 2)
+        self._skin(self.status_jump, bg="head")
         self.btn_new = self._button(head, "New chat", self._on_new, bg="head")
         self.btn_new.pack(side="right", padx=(6, 18))
+        # Every tab keeps its app's past conversations; this is the way back
+        # to them, beside the button that starts the next one.
+        self.btn_hist = self._button(head, "History", self._resume_task, bg="head")
+        self.btn_hist.pack(side="right", padx=(6, 0))
         self.btn_fix = self._button(head, "Start app", self._on_fix, bg="head",
                                     kind="accent")
 
@@ -659,7 +688,6 @@ class Chat(tk.Tk):
         self._skin(side, bg="side")
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
-        self._skin(tk.Frame(main, width=1), bg="border").pack(side="left", fill="y")
         self._build_sidebar(side)
 
         right = self._skin(tk.Frame(main), bg="bg")
@@ -671,13 +699,12 @@ class Chat(tk.Tk):
         # exactly how the composer used to disappear until the window was
         # resized. Composer, then tab strip, then the transcript stack.
         composer = self._skin(tk.Frame(right), bg="bg")
-        composer.pack(side="bottom", fill="x", padx=18, pady=(8, 16))
+        composer.pack(side="bottom", fill="x", padx=24, pady=(8, 20))
         self._build_composer(composer)
 
         strip = self._skin(tk.Frame(right), bg="bg")
-        strip.pack(side="top", fill="x", padx=14, pady=(10, 0))
+        strip.pack(side="top", fill="x", padx=14, pady=(10, 6))
         self._build_tabs(strip)
-        self._skin(tk.Frame(right, height=1), bg="border").pack(side="top", fill="x")
 
         self.stack = self._skin(tk.Frame(right), bg="bg")
         self.stack.pack(side="top", fill="both", expand=True)
@@ -716,7 +743,30 @@ class Chat(tk.Tk):
         s.view.pack(side="left", fill="both", expand=True)
         bar.config(command=s.view.yview)
         self._tags(s.view)
+        self._build_hero(s)
         self._welcome(s)
+
+    def _build_hero(self, s):
+        """What a tab shows before anything is said: the app's mark and name
+        in the middle of the transcript. Placed over the Text rather than
+        written into it, so it sits in the middle at any window height and the
+        boot lines keep their place at the top."""
+        s.hero = self._skin(tk.Frame(s.frame), bg="bg")
+        self._mark(s.hero, self._spec_for(s.app), self.marks_px["hero"],
+                   bg="bg").pack()
+        self._skin(tk.Label(s.hero, text=s.app.name, font=self.f_hero),
+                   bg="bg", fg="text").pack(pady=(self._px(14), 0))
+        if not s.app.drivable:
+            # Say the one thing this tab is not, before the model has to.
+            note = tk.Label(s.hero, font=self.f_ui, justify="center",
+                            wraplength=self._px(380),
+                            text="No app attached - it reads files and folders on "
+                                 "this PC and looks things up on the web.")
+            self._skin(note, bg="bg", fg="muted").pack(pady=(self._px(6), 0))
+
+    def _hide_hero(self, s):
+        if s.hero is not None:
+            s.hero.place_forget()
 
     def _tags(self, v):
         C = self.C
@@ -774,6 +824,7 @@ class Chat(tk.Tk):
         with config()."""
         pill = Pill(parent, text, command, font or self.f_ui,
                     self.PILL_ROLES[kind], **kw)
+        pill.disc = self._disc_colour     # for the jumping dots a "…" label draws
         self._skin(pill, bg=bg)
         self.pills.append(pill)
         pill.paint(self.C)
@@ -813,10 +864,15 @@ class Chat(tk.Tk):
             shell.config(height=h)
             shell.itemconfig(item, width=max(1, w - 2 * INSET))
             shell.delete("box")
-            edge = self.C["accent" if focused["on"] else "border"]
-            rounded(shell, 0, 0, w, h, R, fill=edge, outline=edge, tags="box")
-            rounded(shell, 1, 1, w - 1, h - 1, R - 1, fill=self.C["card"],
-                    outline=self.C["card"], tags="box")
+            # At rest the field is a raised surface, not a box; the accent
+            # ring comes back only to say where typing will go.
+            if focused["on"]:
+                edge = self.C["accent"]
+                rounded(shell, 0, 0, w, h, R, fill=edge, outline=edge, tags="box")
+                rounded(shell, 1, 1, w - 1, h - 1, R - 1, fill=self.C["card"],
+                        outline=self.C["card"], tags="box")
+            else:
+                ui.lifted(shell, w, h, R, self.C["card"], self.C[bg], "box")
             shell.tag_lower("box")
 
         shell.bind("<Configure>", paint)
@@ -848,35 +904,39 @@ class Chat(tk.Tk):
         if photo is not None:
             c.create_image(size / 2, size / 2, image=photo)
             return
-        rounded(c, 1, 1, size - 1, size - 1, 7, fill=spec["bg"], outline=spec["bg"])
+        big = size >= self.marks_px["hero"]
+        rounded(c, 1, 1, size - 1, size - 1, size * 0.22 if big else 7,
+                fill=spec["bg"], outline=spec["bg"])
         c.create_text(size / 2, size / 2 + 1, text=spec["code"], fill=spec["fg"],
-                      font=self.f_badge)
+                      font=self.f_hero_badge if big else self.f_badge)
 
     def _dots(self, parent, bg="bg", role="muted", n=3):
-        """Three dots lighting in turn: something is still running, and this
+        """Three dots jumping in a wave: something is still running, and this
         is where its answer will land. Embedded in the transcript, so it says
         it in the place the user is already looking rather than only in the
-        header.
+        header. The same motion as a status ending in an ellipsis
+        (`ui.jumps`), at the transcript's dot size.
 
         Drawn as the status dot is - `_disc` renders a PNG because a canvas
-        oval this small comes out as an octagon - with each frame's brightness
-        a blend between the role and the background it sits on. Every shade is
-        cached by colour, so a run of these costs a handful of small images and
-        not one per frame. The animation reads `self.C` live, which is what
-        makes a theme switch mid-run correct without a repaint hook."""
+        oval this small comes out as an octagon. A dot is a touch brighter the
+        higher it is, which is what keeps a low one from reading as a stray
+        full stop; every shade is cached by colour, so a run of these costs a
+        handful of small images and not one per frame. The animation reads
+        `self.C` live, which is what makes a theme switch mid-run correct
+        without a repaint hook."""
         size = self.dot_px
         gap = size + self._px(5)
-        c = tk.Canvas(parent, width=gap * n - self._px(5) + 2, height=size + 2,
-                      highlightthickness=0, bd=0)
+        rise = size                       # room above for the hop, and no more
+        c = tk.Canvas(parent, width=gap * (n - 1) + size + 2,
+                      height=size + rise + 2, highlightthickness=0, bd=0)
         self._skin(c, bg=bg)
-        ids = [c.create_image(gap * i + size / 2 + 1, size / 2 + 1)
-               for i in range(n)]
+        ground = rise + size / 2 + 1      # a resting dot's centre
+        ids = [c.create_image(gap * i + size / 2 + 1, ground) for i in range(n)]
 
         def draw(frame):
-            phase = frame * 0.36
-            for i, item in enumerate(ids):
-                lit = 0.5 + 0.5 * math.sin(phase - i * 1.15)
-                c.itemconfig(item, image=self._shade(role, bg, 0.12 + 0.88 * lit,
+            for i, (item, up) in enumerate(zip(ids, ui.jumps(frame, n))):
+                c.coords(item, gap * i + size / 2 + 1, ground - up * rise)
+                c.itemconfig(item, image=self._shade(role, bg, 0.55 + 0.45 * up,
                                                      size))
         self._animate(("dots", str(c)), draw)
         return c
@@ -1340,9 +1400,7 @@ class Chat(tk.Tk):
         # changes. Fixed widget before the expanding one, same rule as the
         # composer.
         conns = self._skin(tk.Frame(side), bg="side")
-        conns.pack(side="bottom", fill="x", pady=(0, 14))
-        self._skin(tk.Frame(side, height=1), bg="border").pack(
-            side="bottom", fill="x", padx=14)
+        conns.pack(side="bottom", fill="x", pady=(14, 14))
 
         listing = self._skin(tk.Frame(side), bg="side")
         listing.pack(side="top", fill="both", expand=True)
@@ -1753,7 +1811,6 @@ class Chat(tk.Tk):
                     % app.bridge_label)
         self._skin(tk.Label(box, text=note, font=self.f_small, anchor="w"),
                    bg="head", fg="faint").pack(fill="x")
-        self._skin(tk.Frame(win, height=1), bg="border").pack(side="top", fill="x")
 
         bar = tk.Scrollbar(win, highlightthickness=0, bd=0, width=11)
         self._skin(bar, bg="bg", troughcolor="bg", activebackground="faint")
@@ -1835,7 +1892,7 @@ class Chat(tk.Tk):
         # inside the curve (INSET against radius R) that its square corners
         # never poke out; the canvas follows the frame's height, so the
         # outline grows with the chip strip and shrinks back with it.
-        INSET, R = 7, 14
+        INSET, R = 7, 16
         shell = tk.Canvas(composer, highlightthickness=0, bd=0)
         self._skin(shell, bg="bg")
         shell.pack(fill="x")
@@ -1848,10 +1905,7 @@ class Chat(tk.Tk):
             shell.config(height=h)
             shell.itemconfig(item, width=max(1, w - 2 * INSET))
             shell.delete("frame")
-            rounded(shell, 0, 0, w, h, R, fill=self.C["border"],
-                    outline=self.C["border"], tags="frame")
-            rounded(shell, 1, 1, w - 1, h - 1, R - 1, fill=self.C["card"],
-                    outline=self.C["card"], tags="frame")
+            ui.lifted(shell, w, h, R, self.C["card"], self.C["bg"], "frame")
             shell.tag_lower("frame")
         shell.bind("<Configure>", paint)
         inner.bind("<Configure>", paint)
@@ -1860,32 +1914,56 @@ class Chat(tk.Tk):
         # Pictures waiting to go with the next message sit above the input,
         # one chip each; the strip is packed only while it has something in it.
         self.chips = self._skin(tk.Frame(inner), bg="card")
+        # The text takes the card's width; the controls sit in a row under it,
+        # attach on the left and send on the right - the layout of every
+        # composer people already know, rather than buttons wedged beside the
+        # text. `self.row` is the text's slot, which the chips go in above.
         self.row = self._skin(tk.Frame(inner), bg="card")
         self.row.pack(fill="x")
-        row = self.row
-        # button first, then the expanding input - same rule as above
-        self.btn_send = self._button(row, "Send", self._on_send, kind="accent",
-                                     bg="card", font=self.f_bold)
-        self.btn_send.pack(side="right", padx=(10, 4), pady=4)
-        self.btn_attach = self._glyph(row, "file", self._on_attach, bg="card",
-                                      tip="Attach files (Ctrl+O)")
-        self.btn_attach.pack(side="left", padx=(12, 0))
-        self.btn_folder = self._glyph(row, "folder", self._on_attach_folder, bg="card",
-                                      tip="Attach a folder (Ctrl+Shift+O)")
-        self.btn_folder.pack(side="left", padx=(4, 0))
-        self.input = tk.Text(row, height=2, font=self.f_body, wrap="word", bd=0,
-                             padx=14, pady=11, highlightthickness=0)
+        self.input = tk.Text(self.row, height=2, font=self.f_body, wrap="word", bd=0,
+                             padx=12, pady=10, highlightthickness=0)
         self._skin(self.input, bg="card", fg="text", insertbackground="accent",
                    selectbackground="sel")
-        self.input.pack(side="left", fill="both", expand=True)
+        self.input.pack(fill="both", expand=True)
         self.input.bind("<Return>", self._on_return)
         self.input.focus_set()
-        hint = tk.Label(composer, text="Enter to send   ·   Shift+Enter for a new line"
-                                       "   ·   Ctrl+O to attach files"
-                                       "   ·   Ctrl+Tab to switch app",
-                        font=self.f_small, anchor="w")
-        self._skin(hint, bg="bg", fg="faint")
-        hint.pack(fill="x", pady=(6, 0))
+        # Tk's Text has no placeholder, so it is a label over the empty text,
+        # shown and hidden on `<<Modified>>` - which fires on any change,
+        # typed or programmatic, once its flag is cleared each time.
+        ghost = tk.Label(self.input, text="Ask %s%s" % (APP_NAME, ELLIPSIS),
+                         font=self.f_body, cursor="xterm", bd=0, padx=0, pady=0)
+        self._skin(ghost, bg="card", fg="faint")
+        ghost.bind("<Button-1>", lambda ev: self.input.focus_set())
+
+        def placeholder(_ev=None):
+            if self.input.compare("end-1c", "==", "1.0"):
+                ghost.place(x=12, y=10)
+            else:
+                ghost.place_forget()
+            self.input.edit_modified(False)
+        self.input.bind("<<Modified>>", placeholder)
+        placeholder()
+
+        bar = self._skin(tk.Frame(inner), bg="card")
+        bar.pack(fill="x", pady=(0, 4))
+        # right-hand side first: fixed widgets before anything that expands
+        self.btn_send = self._button(bar, SEND, self._on_send, kind="accent",
+                                     bg="card", font=self.f_body_b, padx=8,
+                                     pady=5, round=True)
+        self.btn_send.pack(side="right", padx=(8, 4))
+        self._tip(self.btn_send, "Send (Enter)")
+        hint = tk.Label(bar, text="Enter to send  ·  Shift+Enter for a new line",
+                        font=self.f_small)
+        self._skin(hint, bg="card", fg="faint")
+        hint.pack(side="right")
+        self.btn_attach = self._button(bar, "+  Attach", self._on_attach,
+                                       kind="ghost", bg="card", padx=10, pady=4,
+                                       r=self._px(10))
+        self.btn_attach.pack(side="left", padx=(2, 0))
+        self._tip(self.btn_attach, "Attach files (Ctrl+O)")
+        self.btn_folder = self._glyph(bar, "folder", self._on_attach_folder, bg="card",
+                                      tip="Attach a folder (Ctrl+Shift+O)")
+        self.btn_folder.pack(side="left", padx=(4, 0))
 
     # ------------------------------------------------------------- attachments
     def _on_attach(self, _widget=None):
@@ -1942,25 +2020,25 @@ class Chat(tk.Tk):
             shell = tk.Canvas(self.chips, highlightthickness=0, bd=0)
             self._skin(shell, bg="card")
             shell.pack(side="left", padx=(12, 0), pady=(10, 0))
-            chip = self._skin(tk.Frame(shell), bg="side")
+            chip = self._skin(tk.Frame(shell), bg="sel")
             item = shell.create_window(PAD, PAD, window=chip, anchor="nw")
             dims = image_dims(p)
             text = os.path.basename(p) + ("  %d\u00d7%d" % dims if dims else "")
             if os.path.isdir(p):
                 text = self.g["folder"] + "  " + os.path.basename(p)
             lbl = tk.Label(chip, text=clip(text, 44), font=self.f_small, padx=8, pady=3)
-            self._skin(lbl, bg="side", fg="text")
+            self._skin(lbl, bg="sel", fg="text")
             lbl.pack(side="left")
             self._tip(lbl, p)
             self._glyph(chip, "close", lambda _w, p=p: self._drop_attachment(p),
-                        bg="side", tip="Remove").pack(side="left", padx=(0, 4))
+                        bg="sel", tip="Remove").pack(side="left", padx=(0, 4))
 
             def paint(_ev=None, shell=shell, chip=chip):
                 w = chip.winfo_reqwidth() + 2 * PAD
                 h = chip.winfo_reqheight() + 2 * PAD
                 shell.config(width=w, height=h)
                 shell.delete("chip")
-                fill = self.C["side"]
+                fill = self.C["sel"]
                 rounded(shell, 0, 0, w, h, R, fill=fill, outline=fill, tags="chip")
                 shell.tag_lower("chip")
 
@@ -1985,15 +2063,8 @@ class Chat(tk.Tk):
         self._write(s, "[%s]\n" % os.path.basename(path), "hint")
 
     def _welcome(self, s):
-        if not s.app.drivable:
-            # Say the one thing this tab is not, before the model has to.
-            self._write(s, "Chat with the model - no app attached, so nothing here can "
-                           "open or change a project. It can read files and folders on "
-                           "this PC and look things up on the web. Try:\n", "sys")
-        else:
-            self._write(s, "%s. Try:\n" % s.app.name, "sys")
-        for e in s.app.examples:
-            self._write(s, e + "\n", "hint")
+        """An empty tab: its app's mark and name, until the first message."""
+        s.hero.place(relx=0.5, rely=0.42, anchor="center")
 
     # ---------------------------------------------------- bridges entered by hand
     def _bridge_dialog(self, row=None, spec=None):
@@ -2238,6 +2309,8 @@ class Chat(tk.Tk):
 
     # -------------------------------------------------------------- view writes
     def _write(self, s, text, tag):
+        if tag == "err":
+            self._hide_hero(s)            # a paragraph that matters, never under it
         s.view.config(state="normal")
         s.view.insert("end", text, tag)
         s.view.config(state="disabled")
@@ -2448,36 +2521,63 @@ class Chat(tk.Tk):
         w, h = self._px(320), self._px(180)
         c = tk.Canvas(v, width=w, height=h, highlightthickness=0, bd=0)
         self._skin(c, bg="bg")
+        # A grid of dots with one in the middle that pulses, each pulse rippling
+        # out through the rest - after Motion's staggered grid, where every
+        # cell starts a beat later the further it is from the origin. It reads
+        # as "being made" rather than as "broken", and unlike a progress bar it
+        # claims no fraction nobody here knows. Odd counts on both axes, so
+        # there is a dot at the exact centre to start from; the strip under
+        # the grid is the caption's.
+        cols, rows, pitch = 13, 5, self._px(22)
+        top = self._px(16)
+        ox, oy = (w - (cols - 1) * pitch) / 2.0, top + pitch / 2.0
+        mid_c, mid_r = cols // 2, rows // 2
+        dots = [(ox + i * pitch, oy + j * pitch,
+                 math.hypot(i - mid_c, j - mid_r))
+                for j in range(rows) for i in range(cols)]
+        small, big = self._px(4), self._px(10)
+
+        def swell(frame, d):
+            """0 at rest, 1 at the crest: how far the ripple has this dot
+            raised, `d` grid steps from the centre. A raised cosine either
+            side of the ripple's front, so a dot eases in and back out. The
+            front starts a ripple's width short of the centre so the centre
+            dot swells into its pulse rather than popping."""
+            front = (frame % RIPPLE_FRAMES) * RIPPLE_SPEED - RIPPLE_WIDTH
+            off = abs(d - front) / RIPPLE_WIDTH
+            return 0.0 if off >= 1 else 0.5 + 0.5 * math.cos(math.pi * off)
 
         def draw(frame):
             c.delete("all")
             rounded(c, 1, 1, w - 1, h - 1, self._px(10), fill=self.C["card"],
-                    outline=self.C["border"])
-            # A band of light crossing the panel: the one motion that reads as
-            # "being made" rather than as "broken" or as a progress bar telling
-            # a fraction nobody here knows.
-            t = (frame % SWEEP_FRAMES) / float(SWEEP_FRAMES)
-            band = w * 0.42
-            x = -band + t * (w + 2 * band)
-            # `hover` is three values away from `card` in this palette and the
-            # band was invisible against it; `border` is the one that reads as
-            # light moving over a surface. Enough slices that the steps between
-            # them fall below one level of the ramp - at nine it was visibly a
-            # row of rectangles - and each a pixel wider than its stride, so
-            # there are no seams between them.
-            slices = 24
-            step = band / (slices - 1.0)
-            for i in range(slices):
-                k = i / (slices - 1.0)
-                edge = blend(self.C["card"], self.C["border"],
-                             math.sin(math.pi * k) ** 2)
-                c.create_rectangle(x + i * step, 2, x + i * step + step + 1,
-                                   h - 2, fill=edge, outline=edge)
-            rounded(c, 1, 1, w - 1, h - 1, self._px(10), fill="",
-                    outline=self.C["border"])
-            c.create_text(w / 2, h / 2, font=self.f_small, fill=self.C["faint"],
-                          text="making a picture"
-                               + "." * (1 + (frame // ELLIPSIS_FRAMES) % 3))
+                    outline=self.C["card"])
+            # A dot at rest is a step up from the card - `border` alone was
+            # invisible against it, the way the old sheen once was - and one
+            # at the crest is lit toward the text. The centre is the one
+            # coloured dot: the origin, as in Motion's example. Quantised to
+            # SHADES steps, which is what keeps the disc cache to a few dozen
+            # images however long a generation runs.
+            rest = blend(self.C["card"], self.C["faint"], 0.35)
+            lit = blend(self.C["card"], self.C["text"], 0.55)
+            for x, y, d in dots:
+                k = round(swell(frame, d) * (SHADES - 1)) / float(SHADES - 1)
+                if d == 0:
+                    size = int(round(small + 2 + (big + 2 - small - 2) * k))
+                    colour = blend(self.C["accent_dk"], self.C["accent"], k)
+                else:
+                    size = int(round(small + (big - small) * k))
+                    colour = blend(rest, lit, k)
+                c.create_image(x, y, image=self._disc_colour(colour, size))
+            f, caption = self.f_small, "making a picture"
+            tw, gap = f.measure(caption), f.measure(" ")
+            x = (w - tw - gap - ui.jump_width(f)) / 2.0
+            y = (oy + (rows - 1) * pitch + h) / 2.0
+            c.create_text(x, y, font=f, fill=self.C["faint"], text=caption,
+                          anchor="w")
+            ui.draw_jumps(c, x + tw + gap, y - f.metrics("linespace") / 2.0
+                          + f.metrics("ascent"), ui.jumps(frame),
+                          self._disc_colour(self.C["faint"], ui.jump_metrics(f)[0]),
+                          f)
 
         # Tagged, not marked: the whole placeholder - its blank lines with it -
         # has to come out in one piece when the picture lands in its place, and
@@ -2585,6 +2685,23 @@ class Chat(tk.Tk):
                 v.see(shown[-1])
             v.see(at)
 
+    def _show_status(self, text, role, lift):
+        """The header's status, with its jumping dots beside it while `lift`
+        says it is still going on, and without them once it is not."""
+        self.lbl_status.config(text=text, fg=self.C[role])
+        c = self.status_jump
+        if lift is None:
+            c.pack_forget()
+            return
+        if not c.winfo_ismapped():
+            c.pack(side="left", after=self.lbl_status, padx=(3, 0))
+        f = self.f_title
+        h = self.lbl_status.winfo_reqheight()
+        c.config(height=h)
+        c.delete("all")
+        ui.draw_jumps(c, 1, (h - f.metrics("linespace")) / 2.0 + f.metrics("ascent"),
+                      lift, self._disc_colour(self.C[role], ui.jump_metrics(f)[0]), f)
+
     def cur(self):
         """The session the user is looking at, or None with every tab closed."""
         return self.sessions.get(self.active)
@@ -2594,29 +2711,31 @@ class Chat(tk.Tk):
         s = self.cur()
         if s is None:
             self._ellipsis("status", "no app open",
-                           lambda t: self.lbl_status.config(text=t,
-                                                            fg=self.C["muted"]))
+                           lambda t, lift: self._show_status(t, "muted", lift))
             self._show_fix(False)
-            self._ellipsis("send", "Send", lambda t: self.btn_send.set(text=t))
+            self._ellipsis("send", SEND,
+                           lambda t, lift: self.btn_send.set(text=t, lift=lift))
             self.btn_send.set(state="disabled")
             self.btn_new.set(state="disabled")
+            self.btn_hist.set(state="disabled")
             return
         text, role, fixable = s.status
         # A status ending in an ellipsis is one still happening, and the dots
-        # count so the window never sits looking stalled while it works. See
+        # jump so the window never sits looking stalled while it works. See
         # `_ellipsis`; the marker is written at the point the status is made.
         self._ellipsis("status", text,
-                       lambda t, r=role: self.lbl_status.config(text=t, fg=self.C[r]))
+                       lambda t, lift, r=role: self._show_status(t, r, lift))
         if s.host_down:
             self.btn_fix.set(text="Connect")
         else:
             self.btn_fix.set(text=("Check %s" if s.app.remote else "Start %s") % s.app.name)
         self._show_fix(fixable)
         self.btn_new.set(state="normal")
+        self.btn_hist.set(state="disabled" if s.busy else "normal")
         stopping = s.busy and s.cancel.is_set()
         self._ellipsis("send",
-                       "Stopping" + ELLIPSIS if stopping else "Stop" if s.busy else "Send",
-                       lambda t: self.btn_send.set(text=t))
+                       "Stopping" + ELLIPSIS if stopping else "Stop" if s.busy else SEND,
+                       lambda t, lift: self.btn_send.set(text=t, lift=lift))
         self.btn_send.set(state="disabled" if stopping else "normal")
         # A tab still working says so on its own tab, not only in the header:
         # the run you started is often not the tab you are looking at.
@@ -2798,8 +2917,10 @@ class Chat(tk.Tk):
         self._arm_anim()
 
     def _ellipsis(self, key, text, show):
-        """Show `text`, and if it ends in an ellipsis keep showing it with the
-        dots counting 1, 2, 3 and round again.
+        """Call `show(text, lift)`, and if the text ends in an ellipsis keep
+        calling it every frame: the stem without the ellipsis, and `lift` the
+        heights of three jumping dots to draw after it (`ui.jumps`). Text that
+        does not end in one is shown once with `lift` None.
 
         The trailing ellipsis is the whole protocol. A status, a button label
         or a caption that ends in one is one describing something still
@@ -2809,11 +2930,10 @@ class Chat(tk.Tk):
         finished state stops moving without a second call."""
         if not text.endswith(ELLIPSIS):
             self._unanimate(key)
-            show(text)
+            show(text, None)
             return
         stem = text[:-1]
-        self._animate(key, lambda frame: show(
-            stem + "." * (1 + (frame // ELLIPSIS_FRAMES) % 3)))
+        self._animate(key, lambda frame: show(stem, ui.jumps(frame)))
 
     def report_callback_exception(self, exc, val, tb):
         """Tk's own hook for a callback that raised - a menu command, a button,
@@ -2848,14 +2968,15 @@ class Chat(tk.Tk):
         of a 500MB Photoshop binary is not something to do while the window is
         trying to open. Badges are drawn until these land.
         """
-        row, tab, menu = (self.marks_px["row"], self.marks_px["tab"],
-                          self.marks_px["menu"])
+        row, tab, menu, hero = (self.marks_px["row"], self.marks_px["tab"],
+                                self.marks_px["menu"], self.marks_px["hero"])
         jobs = [(a["id"] or a["name"], a["exe"], row) for a in self.detected]
         for app in eng.APPS:
             exe = app.exe()
-            jobs += [(app.id, exe, tab), (app.id, exe, menu)]
+            jobs += [(app.id, exe, tab), (app.id, exe, menu), (app.id, exe, hero)]
         for key, exe, size in jobs:
-            data = icons.icon_png(exe, size)
+            # No .exe (ComfyUI is on the LLM PC): its mark is drawn instead.
+            data = icons.icon_png(exe, size) or icons.drawn_png(key, size)
             if data:
                 self.q.put(("icon", None, (key, size, data)))
 
@@ -3184,6 +3305,54 @@ class Chat(tk.Tk):
         s.window = now
         return (before != now and not note.startswith("Could not")), note
 
+    def _make_room(self, s):
+        """Before a render: every model off the shared GPU - this tab's own
+        too, which only waits while the picture is made - so the render runs
+        in VRAM rather than streaming from system RAM. A model another tab is
+        mid-request on stays. Says what it did once a tab. -> the context
+        length to reload this tab's model with afterwards."""
+        own = getattr(s.llm or self.llm, "model", None)
+        keep = {getattr(o.llm or self.llm, "model", None)
+                for o in self.sessions.values() if o is not s and o.busy}
+        with self.fit_lock:
+            ctx = next((c for _, c in eng.loaded_instances(self.host, own)), None)
+            gone, err = eng.make_room(self.host, keep)
+        if gone and not getattr(s, "room_said", False):
+            s.room_said = True
+            self.q.put(("sys", s.event_id,
+                        "Unloaded %s from the LLM PC while %s renders, so the picture gets "
+                        "the whole GPU; this tab's model comes back after each render, other "
+                        "tabs reload theirs when next used." % (", ".join(gone), s.app.name)))
+        elif err:
+            self.q.put(("sys", s.event_id, "Could not free the GPU for %s (%s); this "
+                                           "render may be slow." % (s.app.name, err)))
+        return ctx or s.window
+
+    def _give_back(self, s, ctx):
+        """After a render: this tab's model back, at the window it had."""
+        own = getattr(s.llm or self.llm, "model", None)
+        with self.fit_lock:
+            err = eng.give_back(self.host, own, ctx)
+        if err:
+            self.q.put(("sys", s.event_id, "Could not reload %s after the render (%s)."
+                        % (own, err)))
+
+    def _reload_if_unloaded(self, s):
+        """A tab whose model was unloaded - by another tab making room, or by
+        hand in LM Studio - gets it back at its own window before its turn.
+        Left to the host, the next request would load it just in time at the
+        8,192 default and truncate this tab's briefing."""
+        llm = s.llm or self.llm
+        if llm is None or s.window is None:
+            return
+        loaded, top = eng.context_window(self.host, llm.model)
+        if loaded is not None or top is None:     # loaded, or a host that does not say
+            return
+        self.q.put(("status", s.event_id, ("loading %s on the LLM PC%s"
+                                           % (llm.model, ELLIPSIS), "muted", True)))
+        prefix = s.prefix_tokens or eng.estimate_tokens(s.messages[0]["content"], s.tools)
+        self._fit(s, prefix, exact=bool(s.prefix_tokens))
+
     def _headroom(self, s, reply):
         """After a warm-up: the prefix's exact token cost, which the host
         reports as `usage.prompt_tokens`, against the window the model was
@@ -3376,6 +3545,9 @@ class Chat(tk.Tk):
             s.sidecar_names = frozenset(t["name"] for t in extra)
             if extra:
                 s.mcp = eng.Router(mcp, s.sidecar)
+        if getattr(s.app, "gpu_tools", None):
+            s.mcp = eng.YieldGPU(s.mcp, s.app.gpu_tools, lambda: self._make_room(s),
+                                 lambda ctx: self._give_back(s, ctx))
         if s.app.custom:
             # Nothing was known about this bridge until it answered: its groups
             # come from its tool names and its briefing from `instructions`, so
@@ -3527,7 +3699,7 @@ class Chat(tk.Tk):
             win.destroy()                 # rebuilt: a resume or a delete changed the list
         win = tk.Toplevel(self)
         self.windows[key] = win
-        win.title("Saved tasks - %s" % s.app.name)
+        win.title("History - %s" % s.app.name)
         win.geometry("%dx%d" % (self._px(660), self._px(520)))
         self._skin(win, bg="bg")
         bar = tk.Scrollbar(win, highlightthickness=0, bd=0, width=11)
@@ -3547,19 +3719,20 @@ class Chat(tk.Tk):
         here = s.record.id + ".json"
         saved = [t for t in saved if os.path.basename(t["path"]) != here]
         if not saved:
-            view.insert("end", "Nothing saved for %s yet.\n\n" % s.app.name, "group")
-            view.insert("end", "Every message checkpoints the tab it was sent in, so a "
-                               "task shows up here as soon as you ask for something.\n",
+            view.insert("end", "No past conversations with %s yet.\n\n" % s.app.name, "group")
+            view.insert("end", "Every message is saved with the tab it was sent in, so a "
+                               "conversation shows up here as soon as you ask for "
+                               "something and start a new one.\n",
                         "desc")
         else:
-            view.insert("end", "%d saved task%s for %s, newest first.\n"
+            view.insert("end", "%d past conversation%s with %s, newest first.\n"
                         % (len(saved), "" if len(saved) == 1 else "s", s.app.name),
                         "group")
             for task in saved:
                 view.insert("end", "\n")
                 if not task["problem"]:
                     view.window_create("end",
-                                       window=self._task_button(view, s, task, "resume"))
+                                       window=self._task_button(view, s, task, "open"))
                 view.window_create("end",
                                    window=self._task_button(view, s, task, "delete"))
                 view.insert("end", "  " + self._task_title(task) + "\n", "name")
@@ -3593,8 +3766,8 @@ class Chat(tk.Tk):
             # removes one on its own - not on a timer, not to keep a folder
             # tidy - and when asked it asks again first.
             if not messagebox.askyesno(
-                    "Delete saved task",
-                    "Delete this saved task?\n\n%s\n\nThis cannot be undone."
+                    "Delete conversation",
+                    "Delete this conversation?\n\n%s\n\nThis cannot be undone."
                     % self._task_title(task), parent=parent):
                 return
             try:
@@ -3602,7 +3775,7 @@ class Chat(tk.Tk):
             except OSError as e:
                 self._write(s, "Could not delete that saved task: %s\n" % e, "err")
             self._resume_task()           # rebuilt without it
-        return self._button(parent, kind, resume if kind == "resume" else delete,
+        return self._button(parent, kind, resume if kind == "open" else delete,
                             kind="ghost", bg="card", font=self.f_small,
                             padx=self._px(9), pady=self._px(1), r=self._px(8))
 
@@ -3617,11 +3790,12 @@ class Chat(tk.Tk):
             s.record, s.messages = record, messages
             s.cancel.clear()
             self._clear_view(s)
+            self._hide_hero(s)
             for msg in messages:
                 if msg.get("role") in ("user", "assistant") and isinstance(msg.get("content"), str):
                     self._role(s, "YOU" if msg["role"] == "user" else s.app.tab.upper(), "role_user" if msg["role"] == "user" else "role_asst")
                     self._write(s, msg["content"] + "\n", "user" if msg["role"] == "user" else "asst")
-            self._write(s, "Task restored. Send a message to continue; the current project must be inspected first.\n", "sys")
+            self._write(s, "Reopened from history. Send a message to carry on; the current project must be inspected first.\n", "sys")
         except Exception as e:
             self._write(s, "Could not restore task: %s\n" % e, "err")
 
@@ -3819,6 +3993,7 @@ class Chat(tk.Tk):
         model's question - and the turn that answers it. An open question form
         is closed either way: a typed reply is an answer too."""
         self._settle_ask(s)
+        self._hide_hero(s)
         self._role(s, "YOU", "role_user")
         self._write(s, task + "\n", "user")
         for p in attached:
@@ -3960,6 +4135,7 @@ class Chat(tk.Tk):
         def checkpoint():
             s.record.save(self._task_path(s), s.messages)
         try:
+            self._reload_if_unloaded(s)
             if pictures and self.vision:
                 # The executing model reads text. Put what the pictures show
                 # into the brief itself, so it survives checkpoints and resume.
