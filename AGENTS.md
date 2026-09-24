@@ -191,7 +191,8 @@ Two things stay derived, never hand-maintained:
 ### The app on another machine: `remote`
 
 An entry with **no `exe_globs`** is remote. ComfyUI is the only one: it lives on the
-LLM PC, so there is no `.exe` here to find, no icon to read (the badge is drawn), and
+LLM PC, so there is no `.exe` here to find, no icon to read (its logo is drawn instead,
+by `studio_icons.comfy_png`, keyed by app id in `DRAWN`), and
 nothing to launch. `installed()` is True for it — the tab is always worth offering —
 `running()` probes its `url:`, and `launch()` raises with the `launch_note`, which for a
 remote app has to say *where* to start it. The GUI asks `app.remote` before it offers
@@ -211,6 +212,84 @@ The URL is `COMFYUI_URL` (default `http://100.127.17.38:8188`), read once in the
 engine for the probe and the bridge label, and again by `studio_comfy_mcp.py` in its
 own process — keep both reading the same variable. ComfyUI must be started with
 `--listen` on that machine or it binds to its own loopback and the probe fails.
+
+### What ComfyUI makes, and why it takes the time it does
+
+The bridge has three making tools. `comfy_generate` is text to image; `comfy_edit_image`
+changes a picture by instruction (Qwen-Image-Edit 2509 with up to two reference
+pictures); `comfy_upscale` enlarges one and redraws its detail. Each takes a local path
+and uploads it (`input_image`), so the model never spends a round trip on
+`comfy_upload_image`. The recipes are ComfyUI's own templates, read from
+`/templates/<name>.json` on the server: `image_z_image_turbo`,
+`image_krea2_turbo_t2i_int8`, `image_qwen_image_edit_2509`,
+`utility_z_image_turbo_2k_upscaler.app`. Check a new model there before guessing its
+recipe; the wrong encoder type or latent gives noise, not an error.
+
+- **`FAMILIES` order is the text-to-image preference, and edit models are never the
+  default.** The LLM PC has Z-Image Turbo, Krea 2 Turbo and Qwen-Image-Edit as split
+  models and only a SAM checkpoint. `plan_model` used to take the first known split
+  model by filename, which was `qwen_image_edit_2509` matching the `qwen_image`
+  family: every "draw a duck" ran a 20B edit model at 20 steps and CFG 2.5 (two
+  passes a step) with no picture to edit. Slow, and soft. Now a known family beats a
+  checkpoint, `FAMILIES` order ranks them (Z-Image, the photographic one, first), and
+  a family marked `edit` is skipped.
+- **Realism is three things, all on by default.** A photographic prompt (one naming
+  no other medium, `NOT_PHOTO`) gets `PHOTO_SUFFIX`; a checkpoint at CFG above 1 with
+  no negative gets `PHOTO_NEGATIVE`; and a family with a `hires` recipe gets the
+  detail pass (`detail_pass`): lanczos ×1.5, VAE encode, resample at denoise 0.33 —
+  the Z-Image upscaler template without ESRGAN, which is not installed. The pass is
+  what turns smeared 1-megapixel micro-detail into pores, fibres and knots; measured
+  on the LLM PC it added 20-55 s to a ~200 s job. It is capped near 4.2 MP and skipped
+  for image-to-image. The prompt tells the model to describe a photograph in
+  sentences and never write "masterpiece, 8k".
+- **At CFG 1 the negative is a `ConditioningZeroOut` of the positive**, as the model's
+  templates do; the sampler never reads it, so encoding a negative wasted time.
+- **The GPU is shared, and that is where the time goes.** ComfyUI and LM Studio share
+  one 24 GB RTX 3090. With the 30B executor and the vision model resident, ComfyUI saw
+  0.3 GB free and staged every model through system RAM ("prepared for dynamic VRAM
+  loading" in its log): a 1024² Z-Image picture took 200-330 s, of which 35 s was
+  sampling, and the first Qwen-edit step took 140 s, and one render sat in "Model
+  Initializing" until it was interrupted. The graph cannot fix that; making room can.
+  An `AppSpec` lists its `gpu_tools`, the GUI (and the CLI) wraps that tab's
+  bridge in `YieldGPU`, and around each of those calls `Chat._make_room` has
+  `eng.make_room` unload every model on the host - the tab's own too, which only
+  waits while the picture is made - and `Chat._give_back` reloads the tab's model
+  at the context length it had (`eng.give_back`), in a `finally`, so a failed
+  render still gives it back. A model another tab is mid-request on stays.
+  Keeping the tab's 9B resident was tried first: the 19.5 GB Qwen edit model then
+  took 272 s for its first of four steps, and a Z-Image render sat six minutes in
+  the VAE at the detail-pass size. Measured on the same 1248x1824 picture: 254 s
+  with everything resident, 64-68 s with the vision model and the 30B gone, 41-49 s
+  with the whole GPU and the text encoder on the CPU (below); an edit went from a
+  272 s first step to 119 s in all. The 9B reloads from the host's RAM in seconds;
+  the vision model comes back just in time for the review of the picture and goes
+  again before the next render.
+- **The text encoder runs on the CPU** (`ENCODER_ON_CPU`, `device: cpu` on the
+  `CLIPLoader`). It runs once a picture; the diffusion model runs every step. On
+  the GPU the 8 GB encoder stayed resident beside the 12 GB Z-Image (or the
+  19.5 GB edit model) and crowded it: with the whole card free, a first picture
+  took 158 s with the encoder on the GPU and 49 s with it on the CPU, from the LLM
+  PC's 128 GB of RAM. `COMFYUI_ENCODER_ON_GPU=1` puts it back, for a bigger card.
+- **The detail pass encodes and decodes in tiles** (`VAEEncodeTiled`,
+  `VAEDecodeTiled`, `TILES`): a whole 2-4 MP frame through the VAE beside
+  resident models ran ComfyUI out of VRAM, and its fallback stalled for minutes.
+- **One render per request.** Handed the vision review of its picture, the 9B
+  rendered the same truck seven times over nitpicks ("does not look old enough"),
+  34 minutes for one request. The briefing now says render once, show it, offer
+  the change, and render again only when the picture is plainly not what was asked. A tab
+  whose model was unloaded - by this, or by hand in LM Studio - is refitted
+  before its next turn (`Chat._reload_if_unloaded`), because the host's own
+  just-in-time load is 8,192 tokens and truncates the briefing. Each result still
+  names a starved GPU (`vram_note`, under `LOW_VRAM`) and says how long it took.
+- **A silent ComfyUI is busy, not gone.** While it stages a model its HTTP server stops
+  answering for 30 s or more. `_open` raises `Unreachable` for no answer at all, and
+  `wait_for` keeps polling through it until its deadline, reporting progress as
+  "busy". Before this, a render in progress failed as "cannot reach ComfyUI".
+- **Progress keeps an MCP call alive.** `MCPClient._request` gave every call 180 s,
+  and a four-minute render was cancelled at three, leaving the model to find
+  `comfy_wait`. A `notifications/progress` on the call's own token now restarts its
+  timeout, up to `PROGRESS_CAP` (30 min); a bridge that says nothing still times out.
+  The bridge's own wait defaults to `DEFAULT_WAIT` (15 min).
 
 ### The app the user connects by hand: `BridgeSpec`
 
@@ -561,7 +640,8 @@ and a tab with under `ROOM` left reads as an error, not a note.
 message checkpoints its tab into `tasks/<app>/<task-id>.json`, so that folder is the
 app's memory of what has been asked of it — and it was reachable only through a file
 dialog pointed at 32-character hex names, which is why nothing was ever resumed from
-it. File > Saved tasks… lists them newest first through `TaskRecord.summaries()`:
+it. The header's **History** button (also File > Chat history…, Ctrl+H) lists the
+active tab's past conversations newest first through `TaskRecord.summaries()`:
 what was asked (the first brief), when, how many steps, the recorded status. A file
 that will not parse is listed carrying its `problem` and offered no resume button
 rather than being hidden — silently dropping it is how someone comes to believe the
@@ -712,12 +792,27 @@ ghost went the colour of the panel, with no error anywhere. A test pins the midp
 animation is the exception that needs no hook: its `draw` reads `self.C` live, so it
 picks the new palette up on its next frame by itself.
 
+**Surfaces are told apart by contrast and spacing, not by 1px rules.** There are no
+hairlines under the header, beside the rail, under the tab strip or above the
+connections; the light theme is a `#f7f7f8` canvas with white surfaces on it. A field
+or the composer sits on the canvas raised by `ui.lifted`'s two-pixel shadow, and a
+field draws the accent ring only while focused. What keeps an edge: the tooltip (it
+floats over anything) and the Preferences theme cards (the ring *is* the choice).
+
+**The composer floats.** A white card 24px in from the sides and 20px off the bottom,
+no footer band behind it: the text on top with a placeholder label (Tk's Text has none;
+it is shown and hidden on `<<Modified>>`), and under it `+ Attach` and the folder
+glyph on the left, the Enter hint and a round accent send button on the right. The
+button's idle label is `SEND` (an arrow); busy it still reads `Stop` / `Stopping…`, and
+`Pill(round=True)` grows from a disc into a lozenge to fit. It draws ovals, not
+`rounded()`: a smoothed polygon asked for half-height corners undershoots badly.
+
 **Nothing in this window is square, and Tk cannot bend a widget.** A Frame, a
 Button and an Entry are rectangles; the only thing that curves is a smoothed polygon
 on a Canvas. So every rounded surface in the app is the same construction — a canvas
 that draws the shape, with the real widgets in a frame placed on top of it through
 `create_window`, and a `paint()` the canvas's or the frame's `<Configure>` calls:
-the composer's outline, a tab chip (`_make_tab`), a rail row's hover (`_app_row`), an
+the composer's surface, a tab chip (`_make_tab`), a rail row's hover (`_app_row`), an
 attachment chip, the question form's card, a text field (`_entry`), a Preferences
 theme card. Three rules come with it:
 
@@ -846,6 +941,11 @@ composer.
   `TestHostUnreachable`, `TestHostAlive`, and the `connect`, `keeps_trying` and
   `which_half` tests in `TestGui`, which keep the real `_boot_host` behind the
   fixture's stub as `real_boot_host` and cancel `host_timer` in `_restore_host`.
+- **An empty tab shows its app, not suggestions.** `_build_hero()` places the app's
+  mark (`marks_px["hero"]`, read from its .exe like the others) and name over the
+  middle of the transcript; `_welcome()` shows it, and the first message, a
+  reopened conversation or any `err` line hides it — an error must never sit
+  under it. The registry's `examples` are no longer shown in the GUI.
 - **Boot is lazy and idempotent.** `_ensure()` fires on first `_select()`; `booting`
   guards re-entry and is cleared in a `finally` so a failed bridge can be retried by
   switching away and back.
@@ -915,6 +1015,18 @@ composer.
   nudged - the count is per run - and `BASE_RULES` says the same thing in the
   prompt, for the models that read it. `tests/test_tasks.py`
   `TestPromisedWork` replays the transcript that found it.
+- **An answer beside nothing but `studio_task_update` is the answer.** The chat
+  tab's model wrote its reply and logged it in one step; asked for another step it
+  wrote the same reply again, once or twice, and the user read it repeated. When
+  every call in a step is the record update, it succeeded, the reply is non-empty,
+  does not `announces_work()` and no read-back is owed, the run ends there with
+  "response complete". A plan plus "I'll make the comp" still continues.
+- **Stop interrupts the reply being streamed.** Cancellation used to be checked
+  only between steps, so the rest of a reply kept arriving after Stop. The
+  executor's token callback raises `Cancelled` once `cancel` is set; it unwinds
+  through `LLM.stream`'s `with resp:`, closing the connection so LM Studio stops
+  generating, and nothing the partial reply asked for runs. It lands on the next
+  token: a Stop during prompt processing still waits for the first one.
 - **The same read, with the same arguments, straight after itself, is not
   dispatched twice.** `_dispatch` counts the trailing journal entries with the call's
   `signature`: the second time it returns the first answer, marked, and journals a
@@ -938,9 +1050,13 @@ composer.
   the ComfyUI briefing and nineteen tools described the generation it was about to
   make and never called `comfy_generate`, or called `comfy_upload_image` on a folder
   with a double-escaped path, then wrote its plan as a code block and asked "would you
-  like me to". The shared 30B, given a window that fits, made the picture. No app in
-  the registry sets `models` now; the mechanism stays, and `STUDIO_MODEL_COMFYUI`
-  pins a smaller model on a host that cannot hold both. `AppSpec.model_for(ids,
+  like me to". The shared 30B, given a window that fits, made the picture. ComfyUI
+  sets `models` again, to `qwen3.5-9b-deepseek-v4-flash`: tested live on the
+  ComfyUI briefing, it wrote a photographer's prompt and called `comfy_generate`
+  on its own. With it, `gpu_tools` makes room for each render (see *What ComfyUI
+  makes, and why it takes the time it does*). Try any smaller model the same way,
+  with a real request through the CLI, before listing it. `STUDIO_MODEL_COMFYUI`
+  still pins one. `AppSpec.model_for(ids,
   shared)` resolves it against what the host serves — `STUDIO_MODEL_<APP>` pin, then
   the list, then the shared model, never a model that is not served — and returns a
   note the tab prints once. The GUI keeps one `Session.llm` per tab, fixed at boot:
@@ -1157,8 +1273,9 @@ click the call as the model made it - every argument whole, so a `run_jsx` /
   `makes_a_picture()` decides, generously and on purpose: guessing wrong costs nothing
   either way, because a placeholder nothing arrives for is taken down by
   `_clear_stages` when the call returns, and a generator not guessed simply appears
-  without one. `_stage` draws it (a sheen sweeping a `card` panel — see `blend()`
-  above for why that was invisible for a while); `_take_stage` removes it and says
+  without one. `_stage` draws it (a grid of dots on a `card` panel whose orange centre
+  dot pulses, each pulse rippling outward, after Motion's staggered grid; sizes and
+  shades are quantised to `SHADES` so the disc cache stays small); `_take_stage` removes it and says
   *where*, so `_show_preview` lands the picture exactly where its space was held.
   A preview is a `_reveal` canvas wiped in from the left, not a bare `image_create`:
   Tk has no alpha to fade, but it can uncover. The session still has to keep the

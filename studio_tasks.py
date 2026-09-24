@@ -329,6 +329,12 @@ class RepeatedCall(ValueError):
     """The same read, with the same arguments, for the third time running."""
 
 
+class Cancelled(Exception):
+    """Stop pressed while a reply was streaming. Raised from the token
+    callback so it unwinds through the open response and closes it - the host
+    stops generating - instead of the rest of the reply arriving after Stop."""
+
+
 def inference_tools(tools, library=None):
     """One exact tool prefix for execution and every GUI warm-up path.
 
@@ -762,8 +768,15 @@ class Executor:
                                        self.max_chars, memory=bool(self.tools),
                                        extra=self._fresh_lessons())
             if streaming:
-                msg = self.llm.stream(context, self.tools,
-                                      lambda piece: self.emit("token", piece))
+                def on_text(piece):
+                    if self.cancel.is_set():
+                        raise Cancelled()
+                    self.emit("token", piece)
+                try:
+                    msg = self.llm.stream(context, self.tools, on_text)
+                except Cancelled:
+                    self.emit("stream_end", None)
+                    return stop("Stopped mid-reply. Completed edits remain; inspect before resuming.")
             else:
                 choice = self.llm.chat(context, self.tools)["choices"][0]
                 if choice.get("finish_reason") not in (None, "stop", "tool_calls"):
@@ -846,6 +859,17 @@ class Executor:
                             "in. Try again with a shorter request, or New chat.")
             if failures >= 3:
                 return stop("Stopped after repeated tool errors. Review the last error and inspect the project before continuing.")
+            # An answer written alongside nothing but a note to the task
+            # record is the answer: asked for another step, a small model
+            # writes the same reply again, once or twice, and the user reads
+            # it repeated. A reply that promises more work still continues.
+            final = (msg.get("content") or "").strip()
+            if (final and not needs_read and not failures and not self.cancel.is_set()
+                    and not announces_work(final)
+                    and all(c["function"]["name"] == TASK_TOOL["function"]["name"] for c in calls)):
+                self.record.status = "response complete; see recorded checks and limitations"
+                self._save()
+                return final
             if self.asked is not None:
                 # The user has a question to answer; the model has nothing to
                 # do until they do. Any unverified edit stays in the journal

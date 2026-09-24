@@ -48,6 +48,9 @@ class FakeComfy:
         self.reject_next = None    # a (code, body) to answer the next /prompt with
         self.models_route = True   # older servers have no /models/<kind>
         self.checkpoints = ["sd_xl_base_1.0.safetensors", "dreamshaper_8.safetensors"]
+        self.diffusion_models = ["z_image_turbo_bf16.safetensors"]
+        self.text_encoders = ["qwen_3_4b.safetensors"]
+        self.loras = ["detail.safetensors"]
         self.finish_after = 0      # history polls before a prompt "completes"
         self._polls = {}
 
@@ -83,9 +86,9 @@ class FakeComfy:
             if not self.models_route:
                 self.fail(404, "not found")
             return {"checkpoints": self.checkpoints,
-                    "loras": ["detail.safetensors"],
-                    "diffusion_models": ["z_image_turbo_bf16.safetensors"],
-                    "text_encoders": ["qwen_3_4b.safetensors"],
+                    "loras": self.loras,
+                    "diffusion_models": self.diffusion_models,
+                    "text_encoders": self.text_encoders,
                     "vae": ["ae.safetensors", "qwen_image_vae.safetensors"]}.get(route[8:], [])
         if route == "/object_info/CheckpointLoaderSimple":
             return {"CheckpointLoaderSimple": {"input": {"required": {
@@ -231,7 +234,7 @@ class ComfyBridgeTest(unittest.TestCase):
     def test_generate_builds_the_canonical_graph_and_brings_the_image_home(self):
         res = comfy.call_tool("comfy_generate", {
             "prompt": "a lighthouse at dusk", "negative": "blurry", "seed": 42,
-            "width": 1152, "height": 896, "steps": 8, "cfg": 1.5,
+            "width": 1152, "height": 896, "steps": 8, "cfg": 1.5, "realism": False,
             "checkpoint": "sd_xl_base_1.0.safetensors"})
         self.assertFalse(res["isError"])
         g = self.fake.prompts["p1"]
@@ -257,10 +260,12 @@ class ComfyBridgeTest(unittest.TestCase):
         self.assertEqual(base64.b64decode(images[0]["data"]), PNG)
         self.assertNotIn("preview.png", text)
 
-    def test_generate_defaults_to_the_first_checkpoint_and_a_random_seed(self):
+    def test_generate_defaults_to_the_photographic_model_and_a_random_seed(self):
+        """Z-Image out-draws an SD-era checkpoint for realism, so with both
+        installed and nothing named, the split model is the default."""
         res = comfy.call_tool("comfy_generate", {"prompt": "x"})
         g = self.fake.prompts["p1"]
-        self.assertEqual(g["1"]["inputs"]["ckpt_name"], "sd_xl_base_1.0.safetensors")
+        self.assertEqual(g["1"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
         self.assertGreaterEqual(g["5"]["inputs"]["seed"], 0)
         self.assertIn("seed: %d" % g["5"]["inputs"]["seed"], self.text(res))
 
@@ -283,13 +288,283 @@ class ComfyBridgeTest(unittest.TestCase):
                                            "checkpoint": "sam3.1_multiplex_fp16.safetensors"})
         self.assertEqual(self.fake.prompts["p2"]["1"]["class_type"], "CheckpointLoaderSimple")
 
-    def test_a_real_checkpoint_still_wins_over_a_split_model(self):
-        """The fallback must not demote a genuine checkpoint: with both present,
-        the all-in-one checkpoint is still the default."""
+    def test_a_real_checkpoint_is_the_default_when_no_known_split_model_is(self):
         self.fake.checkpoints = ["dreamshaper_8.safetensors"]
+        self.fake.diffusion_models = ["mystery_dit.safetensors"]
         comfy.call_tool("comfy_generate", {"prompt": "x"})
         self.assertEqual(self.fake.prompts["p1"]["1"]["inputs"]["ckpt_name"],
                          "dreamshaper_8.safetensors")
+
+    def test_an_edit_model_is_never_the_text_to_image_default(self):
+        """The regression: with Qwen-Image-Edit sorted ahead of Z-Image, every
+        "draw a duck" ran the 20B edit model at 20 steps and cfg 2.5 - slow,
+        soft, and not what it is for."""
+        self.fake.checkpoints = []
+        self.fake.diffusion_models = ["krea2_turbo_int8_convrot.safetensors",
+                                      "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                                      "z_image_turbo_bf16.safetensors"]
+        comfy.call_tool("comfy_generate", {"prompt": "a duck"})
+        self.assertEqual(self.fake.prompts["p1"]["1"]["inputs"]["unet_name"],
+                         "z_image_turbo_bf16.safetensors")
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors"]
+        res = comfy.call_tool("comfy_generate", {"prompt": "a duck"})
+        self.assertTrue(res["isError"])
+
+    def test_krea2_gets_its_own_recipe(self):
+        self.fake.diffusion_models = ["krea2_turbo_int8_convrot.safetensors"]
+        self.fake.text_encoders = ["qwen3vl_4b_fp8_scaled.safetensors", "qwen_3_4b.safetensors"]
+        comfy.call_tool("comfy_generate", {"prompt": "x"})
+        g = self.fake.prompts["p1"]
+        self.assertEqual(g["10"]["inputs"], {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+                                             "type": "krea2", "device": "cpu"})
+        self.assertEqual(g["11"]["inputs"]["vae_name"], "qwen_image_vae.safetensors")
+        self.assertNotIn("12", g)                         # no shift node
+        self.assertEqual(g["4"]["class_type"], "EmptyLatentImage")
+        k = g["5"]["inputs"]
+        self.assertEqual((k["steps"], k["cfg"], k["sampler_name"]), (8, 1.0, "euler"))
+
+    def test_the_detail_pass_resamples_the_upscaled_picture(self):
+        res = comfy.call_tool("comfy_generate", {"prompt": "a fisherman", "seed": 3,
+                                                 "width": 832, "height": 1216})
+        g = self.fake.prompts["p1"]
+        self.assertEqual(g["13"]["class_type"], "ImageScaleBy")
+        self.assertEqual(g["13"]["inputs"]["image"], ["6", 0])
+        self.assertEqual(g["13"]["inputs"]["scale_by"], 1.5)
+        self.assertEqual(g["14"]["inputs"]["pixels"], ["13", 0])
+        # Tiled: a whole 2-4 MP frame through the VAE stalled ComfyUI for minutes.
+        self.assertEqual((g["14"]["class_type"], g["16"]["class_type"]),
+                         ("VAEEncodeTiled", "VAEDecodeTiled"))
+        k = g["15"]["inputs"]
+        self.assertEqual((k["latent_image"], k["denoise"], k["model"]), (["14", 0], 0.33, ["12", 0]))
+        self.assertEqual(g["7"]["inputs"]["images"], ["16", 0])
+        self.assertIn("detail pass: x1.5", self.text(res))
+        self.assertIn("1248x1824", self.text(res))
+        # Off on request, and never on image-to-image.
+        comfy.call_tool("comfy_generate", {"prompt": "x", "hires": False})
+        self.assertEqual(self.fake.prompts["p2"]["7"]["inputs"]["images"], ["6", 0])
+        # Capped so a big base size is not blown past what the card holds.
+        comfy.call_tool("comfy_generate", {"prompt": "x", "width": 2048, "height": 2048})
+        self.assertNotIn("13", self.fake.prompts["p3"])
+
+    def test_the_text_encoder_runs_on_the_cpu_unless_told_otherwise(self):
+        """The encoder runs once a picture, the diffusion model every step: on
+        the shared card, the encoder on the CPU made a picture in 41-49 s and
+        the encoder on the GPU in 158 s."""
+        comfy.call_tool("comfy_generate", {"prompt": "x"})
+        self.assertEqual(self.fake.prompts["p1"]["10"]["inputs"]["device"], "cpu")
+        real = comfy.ENCODER_ON_CPU
+        comfy.ENCODER_ON_CPU = False
+        try:
+            comfy.call_tool("comfy_generate", {"prompt": "x"})
+        finally:
+            comfy.ENCODER_ON_CPU = real
+        self.assertNotIn("device", self.fake.prompts["p2"]["10"]["inputs"])
+
+    def test_realism_is_added_to_photographic_prompts_only(self):
+        comfy.call_tool("comfy_generate", {"prompt": "a fisherman on a dock."})
+        text = self.fake.prompts["p1"]["2"]["inputs"]["text"]
+        self.assertTrue(text.startswith("a fisherman on a dock. Photorealistic photograph"))
+        # cfg 1 never reads a negative: zero it, as the model's template does.
+        self.assertEqual(self.fake.prompts["p1"]["3"], {
+            "class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}})
+        comfy.call_tool("comfy_generate", {"prompt": "a watercolor fox"})
+        self.assertEqual(self.fake.prompts["p2"]["2"]["inputs"]["text"], "a watercolor fox")
+        comfy.call_tool("comfy_generate", {"prompt": "a fox", "realism": False})
+        self.assertEqual(self.fake.prompts["p3"]["2"]["inputs"]["text"], "a fox")
+        # A checkpoint at real cfg gets a negative against the generated look.
+        comfy.call_tool("comfy_generate", {"prompt": "a fox",
+                                           "checkpoint": "sd_xl_base_1.0.safetensors"})
+        self.assertIn("plastic skin", self.fake.prompts["p4"]["3"]["inputs"]["text"])
+
+    def test_edit_builds_the_qwen_edit_graph_with_lightning(self):
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                                      "z_image_turbo_bf16.safetensors"]
+        self.fake.text_encoders = ["qwen_2.5_vl_7b_fp8_scaled.safetensors", "qwen_3_4b.safetensors"]
+        self.fake.loras = ["Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors"]
+        src = os.path.join(self.tmp, "room.png")
+        with open(src, "wb") as fh:
+            fh.write(PNG)
+        res = comfy.call_tool("comfy_edit_image", {
+            "image": src, "instruction": "make the walls green", "references": ["sofa.png"],
+            "seed": 5})
+        self.assertFalse(res["isError"], self.text(res))
+        self.assertEqual(len(self.fake.uploads), 1)          # the local path went up
+        g = self.fake.prompts["p1"]
+        self.assertEqual(g["1"]["inputs"]["unet_name"], "qwen_image_edit_2509_fp8_e4m3fn.safetensors")
+        self.assertEqual(g["10"]["inputs"], {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                                             "type": "qwen_image", "device": "cpu"})
+        self.assertEqual(g["9"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(g["12"]["inputs"]["model"], ["9", 0])
+        self.assertEqual(g["13"]["class_type"], "CFGNorm")
+        self.assertEqual(g["21"]["class_type"], "FluxKontextImageScale")
+        pos = g["2"]["inputs"]
+        self.assertEqual(pos["prompt"], "make the walls green")
+        self.assertEqual((pos["image1"], pos["image2"]), (["21", 0], ["22", 0]))
+        self.assertEqual(g["22"]["inputs"]["image"], "sofa.png")
+        self.assertEqual(g["3"]["inputs"]["prompt"], "")
+        k = g["5"]["inputs"]
+        self.assertEqual((k["steps"], k["cfg"], k["model"], k["latent_image"]),
+                         (4, 1.0, ["13", 0], ["4", 0]))
+        self.assertEqual(g["7"]["inputs"]["images"], ["6", 0])
+        self.assertIn("Lightning", self.text(res))
+        # Full quality drops the LoRA and uses the template's 20 steps at cfg 4.
+        comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x", "fast": False})
+        g = self.fake.prompts["p2"]
+        self.assertNotIn("9", g)
+        self.assertEqual((g["5"]["inputs"]["steps"], g["5"]["inputs"]["cfg"]), (20, 4.0))
+        # photo_finish chains Z-Image's detail pass on its own loaders.
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x",
+                                                   "photo_finish": True})
+        g = self.fake.prompts["p3"]
+        self.assertEqual(g["31"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
+        self.assertEqual(g["42"]["inputs"]["image"], ["6", 0])
+        self.assertEqual(g["44"]["inputs"]["model"], ["34", 0])
+        self.assertEqual(g["44"]["inputs"]["denoise"], 0.25)
+        self.assertEqual(g["7"]["inputs"]["images"], ["45", 0])
+        self.assertIn("photo finish", self.text(res))
+
+    def test_edit_without_an_edit_model_says_so(self):
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x"})
+        self.assertTrue(res["isError"])
+        self.assertIn("no image-edit model", self.text(res))
+        res = comfy.call_tool("comfy_edit_image", {"image": r"C:\nowhere\a.png",
+                                                   "instruction": "x"})
+        self.assertTrue(res["isError"])
+
+    def test_upscale_redraws_at_the_larger_size(self):
+        res = comfy.call_tool("comfy_upscale", {"image": "shot.png", "scale": 2})
+        self.assertFalse(res["isError"], self.text(res))
+        g = self.fake.prompts["p1"]
+        self.assertEqual(g["8"]["inputs"]["image"], "shot.png")
+        self.assertEqual(g["20"]["class_type"], "ImageScaleToTotalPixels")
+        self.assertEqual(g["13"]["inputs"]["image"], ["20", 0])
+        self.assertEqual(g["13"]["inputs"]["scale_by"], 2)
+        self.assertEqual(g["15"]["inputs"]["denoise"], 0.3)
+        self.assertEqual(g["7"]["inputs"]["images"], ["16", 0])
+
+    def test_a_wait_rides_out_a_server_that_stops_answering(self):
+        """ComfyUI stops answering HTTP while it stages a big model; that is a
+        busy server, not a dead one, and the generate must not fail on it."""
+        real = self.fake.route
+        silent = [3]
+        def stalls(method, r, q, data):
+            if r.startswith("/history/") and silent[0]:
+                silent[0] -= 1
+                raise urllib.error.URLError("timed out")
+            return real(method, r, q, data)
+        self.fake.route = stalls
+        real_sleep = comfy.time.sleep
+        comfy.time.sleep = lambda s: None
+        try:
+            res = comfy.call_tool("comfy_generate", {"prompt": "x"})
+        finally:
+            comfy.time.sleep = real_sleep
+        self.assertFalse(res["isError"], self.text(res))
+        self.assertIn("took", self.text(res))
+
+    def test_make_room_unloads_every_model_but_the_tabs_own(self):
+        """The LLM PC's 3090 held the 30B and the vision model - 28 GB of a
+        24 GB card - and ComfyUI saw 0.3 GB free: 254 s a picture. With them
+        unloaded the same picture took 64 s."""
+        listing = {"models": [
+            {"key": "qwen3-coder-30b-a3b-instruct", "type": "llm",
+             "loaded_instances": [{"id": "qwen3-coder-30b-a3b-instruct"},
+                                  {"id": "qwen3-coder-30b-a3b-instruct:2"}]},
+            {"key": "qwen2.5-vl-7b-instruct", "type": "llm",
+             "loaded_instances": [{"id": "qwen2.5-vl-7b-instruct"}]},
+            {"key": "qwen3.5-9b-deepseek-v4-flash", "type": "llm",
+             "loaded_instances": [{"id": "qwen3.5-9b-deepseek-v4-flash"}]},
+            {"key": "nomic-embed", "type": "embedding",
+             "loaded_instances": [{"id": "nomic-embed"}]},
+            {"key": "gemma", "type": "llm", "loaded_instances": []}]}
+        unloaded = []
+        def host(req, timeout=None):
+            url = req if isinstance(req, str) else req.full_url
+            if url.endswith("/api/v1/models"):
+                return io.BytesIO(json.dumps(listing).encode())
+            if url.endswith("/api/v1/models/unload"):
+                unloaded.append(json.loads(req.data)["instance_id"])
+                return io.BytesIO(b"{}")
+            raise AssertionError(url)
+        urllib.request.urlopen = host
+        gone, err = eng.make_room("http://h:1234/v1", {"qwen3.5-9b-deepseek-v4-flash"})
+        self.assertIsNone(err)
+        self.assertEqual(gone, unloaded)
+        self.assertEqual(unloaded, ["qwen3-coder-30b-a3b-instruct",
+                                    "qwen3-coder-30b-a3b-instruct:2", "qwen2.5-vl-7b-instruct"])
+
+    def test_only_rendering_tools_make_room_first(self):
+        calls = []
+        class Bridge:
+            def call_tool(self, name, args):
+                calls.append(name)
+                return {}
+            instructions = "x"
+        app = eng.APPS_BY_ID["comfyui"]
+        def room():
+            calls.append("room")
+            return 32768
+        wrapped = eng.YieldGPU(Bridge(), app.gpu_tools, room,
+                               lambda ctx: calls.append(("back", ctx)))
+        wrapped.call_tool("comfy_status", {})
+        wrapped.call_tool("comfy_generate", {})
+        wrapped.call_tool("comfy_edit_image", {})
+        self.assertEqual(calls, ["comfy_status", "room", "comfy_generate", ("back", 32768),
+                                 "room", "comfy_edit_image", ("back", 32768)])
+        self.assertEqual(wrapped.instructions, "x")
+        # And the tab prefers a small tool-calling model, falling back to the
+        # shared one when the host does not serve it.
+        self.assertEqual(app.model_for(["qwen3.5-9b-deepseek-v4-flash", "big"], "big")[0],
+                         "qwen3.5-9b-deepseek-v4-flash")
+        self.assertEqual(app.model_for(["big"], "big")[0], "big")
+
+    def test_the_tabs_model_comes_back_even_when_the_render_fails(self):
+        calls = []
+        class Broken:
+            def call_tool(self, name, args):
+                raise TimeoutError("bridge gone")
+        wrapped = eng.YieldGPU(Broken(), {"comfy_generate"}, lambda: 16384,
+                               lambda ctx: calls.append(ctx))
+        with self.assertRaises(TimeoutError):
+            wrapped.call_tool("comfy_generate", {})
+        self.assertEqual(calls, [16384])
+
+    def test_give_back_reloads_only_a_model_that_is_gone(self):
+        posted = []
+        state = {"loaded": []}
+        def host(req, timeout=None):
+            url = req if isinstance(req, str) else req.full_url
+            if url.endswith("/api/v1/models"):
+                return io.BytesIO(json.dumps({"models": [{"key": "m", "type": "llm",
+                    "loaded_instances": state["loaded"]}]}).encode())
+            posted.append((url.rsplit("/", 1)[-1], json.loads(req.data)))
+            return io.BytesIO(b"{}")
+        urllib.request.urlopen = host
+        self.assertIsNone(eng.give_back("http://h:1234/v1", "m", 32768))
+        self.assertEqual(posted, [("load", {"model": "m", "context_length": 32768})])
+        state["loaded"] = [{"id": "m"}]
+        eng.give_back("http://h:1234/v1", "m", 32768)
+        self.assertEqual(len(posted), 1)            # already back: no second instance
+
+    def test_an_interrupted_prompt_says_so(self):
+        comfy.call_tool("comfy_generate", {"prompt": "x", "wait": False})
+        self.fake.history["p1"] = {"outputs": {}, "status": {
+            "status_str": "error", "completed": False,
+            "messages": [["execution_interrupted", {"node_id": "5"}]]}}
+        res = comfy.call_tool("comfy_wait", {"prompt_id": "p1"})
+        self.assertTrue(res["isError"])
+        self.assertIn("interrupted", self.text(res))
+
+    def test_a_starved_gpu_is_named_in_the_result(self):
+        real = self.fake.route
+        def full(method, r, q, data):
+            if r == "/system_stats":
+                return {"devices": [{"name": "cuda:0 RTX 3090", "vram_total": 25.7e9,
+                                     "vram_free": 0.3e9}]}
+            return real(method, r, q, data)
+        self.fake.route = full
+        res = comfy.call_tool("comfy_generate", {"prompt": "x"})
+        self.assertIn("0.3 of 26 GB free", self.text(res))
 
     def test_a_split_model_is_used_with_its_family_recipe_when_no_checkpoint_exists(self):
         """The LLM PC has Z-Image Turbo as three files and no checkpoint at all.
@@ -301,7 +576,8 @@ class ComfyBridgeTest(unittest.TestCase):
         g = self.fake.prompts["p1"]
         self.assertEqual(g["1"], {"class_type": "UNETLoader", "inputs": {
             "unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default"}})
-        self.assertEqual(g["10"]["inputs"], {"clip_name": "qwen_3_4b.safetensors", "type": "lumina2"})
+        self.assertEqual(g["10"]["inputs"], {"clip_name": "qwen_3_4b.safetensors", "type": "lumina2",
+                                             "device": "cpu"})
         self.assertEqual(g["11"]["inputs"], {"vae_name": "ae.safetensors"})
         self.assertEqual(g["12"], {"class_type": "ModelSamplingAuraFlow",
                                    "inputs": {"model": ["1", 0], "shift": 3.0}})
@@ -337,7 +613,7 @@ class ComfyBridgeTest(unittest.TestCase):
         self.fake.route = no_split
         res = comfy.call_tool("comfy_generate", {"prompt": "x"})
         self.assertTrue(res["isError"])
-        self.assertIn("no checkpoints and no diffusion models", self.text(res))
+        self.assertIn("no checkpoints and no text-to-image diffusion models", self.text(res))
 
     def test_checkpoints_fall_back_to_the_loader_enum_on_old_servers(self):
         self.fake.models_route = False
@@ -345,6 +621,7 @@ class ComfyBridgeTest(unittest.TestCase):
 
     def test_img2img_and_lora_rewire_the_graph(self):
         comfy.call_tool("comfy_generate", {"prompt": "x", "init_image": "sketch.png",
+                                           "checkpoint": "sd_xl_base_1.0.safetensors",
                                            "denoise": 0.4, "lora": "detail.safetensors",
                                            "lora_strength": 0.7})
         g = self.fake.prompts["p1"]
