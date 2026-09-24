@@ -3144,8 +3144,8 @@ class Chat(tk.Tk):
             self.host_booting = False
             self.host_ready.set()
             self.q.put(("host_probed", None, ok))
-        if ok and self.vision is not None and self.vision.needs_load:
-            self._load_vision()
+        # The vision model is not loaded here: it goes on after a tab's own
+        # model (`_boot_session`, `_load_vision`), never before it.
 
     def _probe_host(self, first, quiet=False):
         """-> True with `self.llm` set. A probe that fails after an earlier
@@ -3188,11 +3188,9 @@ class Chat(tk.Tk):
                         % (pretty_host(self.host), model, len(ids), "" if len(ids) == 1 else "s")))
         if not self.vision:
             self._host_healthy("warn", "no vision model")
-        elif self.vision.needs_load:
-            # The tabs can boot meanwhile: a picture before the load finishes
-            # is loaded just-in-time by the host, only slower.
-            self._host_healthy("muted", "loading " + clip(self.vision.model, 16))
         else:
+            # Loaded or not: it goes on after the first tab's model, and a
+            # picture before then is loaded just in time by the host.
             self._host_healthy("ok", "sees: " + clip(self.vision.model, 18))
         return True
 
@@ -3222,14 +3220,28 @@ class Chat(tk.Tk):
         return "%s\n%s\n(%s)" % (what, retry, err)
 
     def _load_vision(self):
-        """After the probe, off the path the tabs wait on."""
-        err = eng.load_model(self.host, self.vision.model)
+        """The vision model onto the host, after a tab's own model has gone on
+        - never before it. LM Studio gives the card to the model it loads
+        first and the one it loads beside it partly system memory for as
+        long as it stays loaded: loaded at the probe, ahead of every tab,
+        the vision model left the 30B decoding at 26 tokens a second where
+        it does 79. Off the path a tab waits on; one tab asks, the rest find
+        it done."""
+        vision = self.vision
+        # Under the fit lock, like every load: a tab fitting its model now
+        # would find the card half taken, and two tabs asking at once would
+        # load it twice.
+        with self.fit_lock:
+            if vision is None or not vision.needs_load:
+                return
+            vision.needs_load = False
+            self._host_healthy("muted", "loading " + clip(vision.model, 16))
+            err = eng.load_model(self.host, vision.model)
         if err:
             self.q.put(("sys", None, "Could not load the vision model %s on the host (%s); "
                                      "it will be loaded on first use instead."
-                                     % (self.vision.model, err)))
-        self.vision.needs_load = False
-        self._host_healthy("ok", "sees: " + clip(self.vision.model, 18))
+                                     % (vision.model, err)))
+        self._host_healthy("ok", "sees: " + clip(vision.model, 18))
 
     def _host_healthy(self, role, last):
         """The Inference row with the host answering - kept, so that a loss
@@ -3301,9 +3313,17 @@ class Chat(tk.Tk):
             return False, eng.headroom_note(s.llm.model, prompt_tokens, loaded, top)
         with self.fit_lock:
             before, _ = eng.context_window(self.host, s.llm.model)
-            now, note = eng.fit_model(self.host, s.llm.model, prompt_tokens, exact=exact)
+            # A load goes onto an empty card (`fit_model`'s `keep`): the model
+            # loaded first gets the GPU, and the one beside it system memory.
+            now, note = eng.fit_model(self.host, s.llm.model, prompt_tokens, exact=exact,
+                                      keep=())
+            reloaded = before != now and not note.startswith("Could not")
+            vision = self.vision
+            if reloaded and vision is not None and vision.model != s.llm.model:
+                # It went with the rest; `_load_vision` puts it back after.
+                vision.needs_load = not eng.loaded_instances(self.host, vision.model)
         s.window = now
-        return (before != now and not note.startswith("Could not")), note
+        return reloaded, note
 
     def _make_room(self, s):
         """Before a render: every model off the shared GPU - this tab's own
@@ -3329,9 +3349,21 @@ class Chat(tk.Tk):
         return ctx or s.window
 
     def _give_back(self, s, ctx):
-        """After a render: this tab's model back, at the window it had."""
+        """After a render: this tab's model back, at the window it had. Not
+        straight away - `eng.YieldGPU` calls this when the model is next
+        needed, once the picture is on screen and the vision model has
+        looked at it on a GPU with nothing else loading. The vision model
+        goes first: LM Studio loads a model into an empty card in 3 s and
+        beside another in 9 to 16, whichever of the two comes second, so
+        the check, the unload and the reload take 11 s in that order and
+        20 s with both resident."""
         own = getattr(s.llm or self.llm, "model", None)
+        busy = [o for o in self.sessions.values() if o is not s and o.busy]
+        keep = {getattr(o.llm or self.llm, "model", None) for o in busy} | {own}
+        if busy and self.vision is not None:
+            keep.add(self.vision.model)   # another tab may be looking through it
         with self.fit_lock:
+            eng.make_room(self.host, keep)
             err = eng.give_back(self.host, own, ctx)
         if err:
             self.q.put(("sys", s.event_id, "Could not reload %s after the render (%s)."
@@ -3460,16 +3492,16 @@ class Chat(tk.Tk):
                                 exact=False)
             if note:
                 self.q.put(("sys", sid, note))
-            # Prefill dominates the first call - a full tool schema set takes about a
-            # minute cold. Pay it here against the exact prompt prefix a real message
-            # will use, so the first question comes back in seconds. Each tab has its
-            # own prefix, so each warms up the first time it is opened. The reply
-            # carries the prefix's exact cost; a window the estimate got wrong is
-            # fitted on it and the warm-up paid once more.
+            # Prefill dominates the first call - a full tool schema set is 9,000 to
+            # 20,000 tokens, seconds on a model with the card to itself and over a
+            # minute on one loaded beside another (see `_fit`). Pay it here against
+            # the exact prompt prefix a real message will use, so the first question
+            # comes back in seconds. Each tab has its own prefix, so each warms up
+            # the first time it is opened. The reply carries the prefix's exact
+            # cost; a window the estimate got wrong is fitted on it and the warm-up
+            # paid once more.
             for attempt in (1, 2):
-                self.q.put(("status", sid, ("warming up the model%s%s"
-                                            % (", about a minute" if s.tools else "",
-                                               ELLIPSIS),
+                self.q.put(("status", sid, ("warming up the model" + ELLIPSIS,
                                             "warn", False)))
                 try:
                     reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
@@ -3492,6 +3524,11 @@ class Chat(tk.Tk):
                 self.q.put(("status", sid, ("ready", "ok", False)))
                 self.q.put(("bridge", sid, ("ok", "no bridge\nthe model on its own")))
             self.q.put(("ready", sid, None))
+            # Now the vision model, after this tab's own and not before it -
+            # except beside a tab that renders, which clears the card for every
+            # picture and has the vision model look at it on its own.
+            if self.vision is not None and self.vision.needs_load and not s.app.gpu_tools:
+                self._spawn(None, self._load_vision)
         finally:
             s.booting = False
             self.q.put(("idle", sid, None))
@@ -4135,6 +4172,9 @@ class Chat(tk.Tk):
         def checkpoint():
             s.record.save(self._task_path(s), s.messages)
         try:
+            # A run that ended in an error can leave a render's model away;
+            # it comes back at the window it had.
+            eng.settle(s.mcp)
             self._reload_if_unloaded(s)
             if pictures and self.vision:
                 # The executing model reads text. Put what the pictures show
@@ -4149,9 +4189,12 @@ class Chat(tk.Tk):
             elif pictures:
                 emit("sys", "No vision model is served, so the model has only the names "
                             "and paths of the pictures - it cannot see what is in them.")
+            look = None
+            if self.vision:
+                look = self.vision.check if s.app.makes_pictures else self.vision.review
             executor = tasks.Executor(s.llm or self.llm, s.mcp, s.tools, schemas=s.schemas,
                 record=s.record, cancel=s.cancel, emit=emit, checkpoint=checkpoint,
-                vision=self.vision.review if self.vision else None, library=s.library,
+                vision=look, library=s.library,
                 readback=s.app.readback, review=s.app.review, notebook=s.notebook)
             executor.run(s.messages, MAX_STEPS)
             self._learn(s, executor, emit)

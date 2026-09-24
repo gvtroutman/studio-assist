@@ -809,6 +809,19 @@ class Vision:
               "the frame is not what was asked for at all - for instance the original "
               "picture placed unchanged when a remake was wanted. Do not claim to "
               "assess motion or audio from a still. Brief: ")
+    # A picture a tool *made* is looked at differently from a frame of the
+    # user's project. Asked to name defects, the vision model always finds
+    # some - steam from a fox's mouth, fur "not red enough" - and the model
+    # driving ComfyUI redrew the picture for each, at minutes a render and
+    # against its own briefing's one render per request. So a made picture is
+    # described and held to the brief, and nothing more.
+    CHECK = ("This picture was just made for the brief below. Say in one or two "
+             "sentences what it shows. Then, on a line of its own, write either "
+             "\"Matches the brief.\" or \"Not what was asked:\" followed by the one "
+             "thing that is plainly wrong - the wrong subject, the wrong number of "
+             "things, text that was asked for missing or garbled. Do not list small "
+             "flaws or suggest improvements; the user decides what to change next. "
+             "Brief: ")
     MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
             ".webp": "image/webp", ".bmp": "image/bmp"}
 
@@ -845,7 +858,7 @@ class Vision:
         return ("\n\nWhat the pictures show (described by the vision model %s):\n"
                 % self.model + "\n".join(out))
 
-    def review(self, item, brief):
+    def review(self, item, brief, question=None, max_tokens=700):
         """An MCP image content item, judged against the task record."""
         mime = item.get("mimeType", "image/png")
         data = item["data"]
@@ -854,8 +867,13 @@ class Vision:
                 data = self._encode(base64.b64decode(data), mime)
             except (ValueError, TypeError):
                 pass
-        return self._ask(self.REVIEW + json.dumps(brief), mime, data, 700) \
-            or "No assessment returned."
+        return self._ask((question or self.REVIEW) + json.dumps(brief), mime, data,
+                         max_tokens) or "No assessment returned."
+
+    def check(self, item, brief):
+        """A picture a tool made, held to the brief without a list of flaws
+        (see CHECK). Shorter to write, and nothing in it to redraw for."""
+        return self.review(item, brief, self.CHECK, 200)
 
 
 def load_model(base_url, model, timeout=600, context_length=None):
@@ -974,24 +992,52 @@ class YieldGPU:
     The tab's own model is idle while it waits on a render, so it leaves the
     GPU too: the Qwen edit model is 19.5 GB and does not fit beside even the
     9B, whose first step took 272 s there. Reloading the 9B from the host's
-    RAM costs seconds."""
+    RAM costs seconds.
+
+    `after` does not run when the tool returns but when the model is next
+    needed: whatever talks to the model calls `settle()` first (`Executor`
+    before every request, `settle` below). Timed end to end, the picture used
+    to sit finished and unseen for 17 s behind the model's reload; now it
+    goes back the moment the render ends, and the vision model looks at it
+    on a GPU with nothing else loading - LM Studio loading the two at once
+    took 15 s for a check that takes 8 alone. A render straight after a
+    render never brings the model back in between: it is still away."""
 
     def __init__(self, bridge, heavy, before, after=None):
         self.bridge, self.heavy = bridge, set(heavy)
         self.before, self.after = before, after
+        self.away = None                  # (token,) while a render has the model away
 
     def call_tool(self, name, arguments):
         if name not in self.heavy:
             return self.bridge.call_tool(name, arguments)
         token = self.before()
+        if self.away:
+            token = self.away[0]          # still away: what it had before the first
         try:
             return self.bridge.call_tool(name, arguments)
         finally:
             if self.after:
-                self.after(token)
+                self.away = (token,)
+
+    def settle(self):
+        """Bring back what a render sent away, if anything is away. Cheap
+        when nothing is."""
+        away, self.away = self.away, None
+        if away:
+            self.after(away[0])
 
     def __getattr__(self, attr):
         return getattr(self.bridge, attr)
+
+
+def settle(bridge):
+    """Bring back the models a render sent away, before anything talks to
+    the model - a `YieldGPU` bridge gives them back only when asked - and do
+    nothing for any other bridge."""
+    fn = getattr(bridge, "settle", None)
+    if callable(fn):
+        fn()
 
 
 # What a conversation needs after the fixed prefix, when this app chooses the
@@ -1019,7 +1065,7 @@ def estimate_tokens(system_prompt, tools):
     return (len(system_prompt or "") + len(json.dumps(tools or []))) // 3
 
 
-def fit_model(base_url, model, prompt_tokens, timeout=600, exact=True):
+def fit_model(base_url, model, prompt_tokens, timeout=600, exact=True, keep=None):
     """Load `model` on the host with a window that fits a prefix of
     `prompt_tokens` - or reload it if the window it has leaves under MIN_ROOM.
     -> (context length now, note for the tab or "").
@@ -1031,6 +1077,14 @@ def fit_model(base_url, model, prompt_tokens, timeout=600, exact=True):
     model), or when the host has no REST API (the note is the old advice:
     reload it by hand). A reload drops the host's prefix cache; the caller
     warms up again after.
+
+    `keep`, when given, is what may stay on the host while `model` loads;
+    everything else is unloaded first (`make_room`). LM Studio gives a model
+    it loads onto an empty card the card, and one it loads beside another
+    partly system memory, for as long as it stays loaded: on the LLM PC's
+    24 GB, the 30B loaded after the vision model decoded at 20-31 tokens a
+    second - still, after the vision model had gone - and at 75-79 loaded
+    first. The vision model loads after it, and is the slower one for it.
     """
     loaded, maximum = context_window(base_url, model)
     if loaded is None and maximum is None:
@@ -1043,6 +1097,8 @@ def fit_model(base_url, model, prompt_tokens, timeout=600, exact=True):
     want = wanted_context(prompt_tokens, maximum)
     if isinstance(loaded, int) and want <= loaded:
         return loaded, headroom_note(model, prompt_tokens, loaded, maximum)
+    if keep is not None:
+        make_room(base_url, set(keep) | {model})
     for instance, _ in loaded_instances(base_url, model):
         err = unload_model(base_url, instance)
         if err:
@@ -1910,7 +1966,7 @@ class AppSpec:
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
                  examples, launch_note="", models=(), readback=(), review=None,
-                 docs=(), craft="", gpu_tools=()):
+                 docs=(), craft="", gpu_tools=(), makes_pictures=False):
         self.id = id
         self.name = name
         self.tab = tab                    # short label for a tab strip
@@ -1933,6 +1989,11 @@ class AppSpec:
         # Tools that render on the LLM PC's GPU: before each, every other model
         # is unloaded from the host so the render runs in VRAM (YieldGPU).
         self.gpu_tools = frozenset(gpu_tools)
+        # True when the pictures this app's tools return are what they made -
+        # a render, an edit - rather than a view of the user's project. The
+        # vision model then checks one against the brief instead of listing
+        # its flaws (Vision.check), because every flaw listed was a redraw.
+        self.makes_pictures = bool(makes_pictures)
         # How to check a write landed, for the executor's read-back reminder:
         # (read tool, the id arguments it needs) pairs, most specific first. A
         # write that carried those ids is verified by that read with the same
@@ -2426,6 +2487,7 @@ APPS = [
         models=["qwen3.5-9b-deepseek-v4-flash"],
         gpu_tools=["comfy_generate", "comfy_edit_image", "comfy_upscale",
                    "comfy_run_workflow"],
+        makes_pictures=True,
         docs=[("ComfyUI documentation", "https://docs.comfy.org/"),
               ("ComfyUI workflow examples", "https://comfyanonymous.github.io/ComfyUI_examples/")],
         craft=CRAFT_IMAGES,
@@ -2946,12 +3008,13 @@ def answer_text(asked, reply):
 
 def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False,
               schemas=None, library=None, vision=None, readback=(), review=None,
-              notebook=None, app_name="", answer=input):
+              notebook=None, app_name="", answer=input, makes_pictures=False):
     """One task, start to finish. `system_prompt` is final - see AppSpec.cli_prompt.
 
     A studio_ask question is put to the console and its answer continues the
     same task; a troubled run ends with the notebook learning from it, as the
-    GUI's does.
+    GUI's does. `makes_pictures` is the app's (AppSpec.makes_pictures): a
+    picture it returns is checked against the brief, not reviewed for flaws.
     """
     from studio_tasks import Executor, TaskRecord
     import studio_lessons
@@ -2966,9 +3029,12 @@ def run_agent(llm, mcp, tools, task, system_prompt, max_steps=25, quiet=False,
             log("     " + " ".join(payload["text"].split())[:180], quiet)
         elif kind == "sys":
             log("  " + str(payload), quiet)
+    look = None
+    if vision:
+        look = vision.check if makes_pictures else vision.review
     while True:
         executor = Executor(llm, mcp, tools, schemas=schemas, record=record, emit=emit,
-                            library=library, vision=vision.review if vision else None,
+                            library=library, vision=look,
                             readback=readback, review=review, notebook=notebook)
         result = executor.run(messages, max_steps, streaming=False)
         note = getattr(llm, "draft_note", None)
@@ -3039,10 +3105,11 @@ def converse(llm, mcp, tools, app, args, schemas=None):
     # The window the model is loaded with has to hold this briefing, these
     # tools and a conversation; LM Studio's default does not. The GUI fits it
     # after its warm-up, exactly; the CLI has no warm-up, so from an estimate.
+    # A load goes onto an empty card, as the GUI's does (fit_model's `keep`).
     if getattr(llm, "base_url", None):
         _, note = fit_model(llm.base_url, llm.model,
                             estimate_tokens(system_prompt, tasks.inference_tools(tools, library)),
-                            exact=False)
+                            exact=False, keep=())
         if note:
             log("  " + note, args.quiet)
     if args.task:
@@ -3050,7 +3117,8 @@ def converse(llm, mcp, tools, app, args, schemas=None):
                         args.max_steps, args.quiet, schemas=schemas, library=library,
                         vision=getattr(args, "vision", None),
                         readback=app.readback, review=app.review,
-                        notebook=notebook, app_name=app.name))
+                        notebook=notebook, app_name=app.name,
+                        makes_pictures=app.makes_pictures))
         return 0
 
     print("studio_agent [%s] - interactive. Ctrl-C or 'exit' to quit.\n" % app.name)
@@ -3070,7 +3138,8 @@ def converse(llm, mcp, tools, app, args, schemas=None):
                                    args.max_steps, args.quiet, schemas=schemas,
                                    library=library, vision=getattr(args, "vision", None),
                                    readback=app.readback, review=app.review,
-                                   notebook=notebook, app_name=app.name)
+                                   notebook=notebook, app_name=app.name,
+                                   makes_pictures=app.makes_pictures)
                   + "\n")
         except Exception as e:
             print("error: %s\n" % e, file=sys.stderr)
@@ -3157,12 +3226,9 @@ def main():
         log("  " + note, a.quiet)
     elif a.draft:
         log("  draft: %s (speculative decoding)" % a.draft, a.quiet)
-    if a.vision and a.vision.needs_load:
-        log(". loading %s on the host..." % a.vision.model, a.quiet)
-        err = load_model(a.host, a.vision.model)
-        if err:
-            log("  could not load it (%s); the host may still load it on first use" % err,
-                a.quiet)
+    # The vision model is not loaded here, ahead of the executing model: the
+    # host gives the card to whichever loads first. It loads just in time, on
+    # the first picture - after `converse` has fitted the executing model.
     if not app.bridged:
         # No bridge to start and no tools to expose: the model on its own.
         if a.groups or a.all_tools:
@@ -3230,6 +3296,9 @@ def main():
                         ", ".join(gone) or "nothing", " (%s)" % err if err else ""), a.quiet)
                 return ctx
             def back(ctx):
+                # The vision model that looked at the picture goes first: a
+                # model loads into an empty card in 3 s, beside another in 9-16.
+                make_room(a.host, {a.model})
                 err = give_back(a.host, a.model, ctx)
                 if err:
                     log("  . could not reload %s: %s" % (a.model, err), a.quiet)
