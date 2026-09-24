@@ -1,4 +1,4 @@
-# Studio Assistant
+# Studio Assist
 
 A chat window that drives your creative apps with a **local LLM**. One tab per app —
 **After Effects**, **Premiere Pro**, **Photoshop**, **Illustrator**, **DaVinci Resolve**,
@@ -14,7 +14,7 @@ and the GPU in the workstation stays free for rendering.
 
 ## Running it
 
-Double-click **Studio Assistant** on the Desktop or in the Start Menu. No terminal.
+Double-click **Studio Assist** on the Desktop or in the Start Menu. No terminal.
 
 Pick the app you want to talk to from the tab strip. Each tab is a separate
 conversation with its own tools — After Effects never sees Resolve's history, and
@@ -105,7 +105,7 @@ stdio bridge that is not in the registry (`--name` says what to call the app). E
 the same family — `qwen3-0.6b` beside `qwen3-coder-30b-a3b-instruct`,
 `qwen2.5-coder-0.5b-instruct` beside `qwen2.5-coder-14b-instruct` — drafts the next
 few tokens and the big model checks them in one pass, so answers read the same and
-arrive sooner. Studio Assistant asks LM Studio for it on every request
+arrive sooner. Studio Assist asks LM Studio for it on every request
 (`draft_model`), and LM Studio loads the draft the first time it is asked for, so
 download one in LM Studio and it is used from the next window. The
 Inference row names it (`draft: qwen3-0.6b`) and, once LM Studio reports how the
@@ -120,7 +120,7 @@ request, the tab says so once, and runs without — `off` skips the asking.
 take 8,000–20,000 tokens before you have typed anything, and LM Studio loads a model
 with an 8,192-token window unless told otherwise — under that the model loses its own
 tool results and asks the same question again, or is cut off mid-reply. So when a tab
-starts, Studio Assistant loads the model itself (or unloads and reloads it) with a
+starts, Studio Assist loads the model itself (or unloads and reloads it) with a
 window that holds the tab's briefing and a conversation — 16,384 or 32,768, never
 more than the model supports — and the tab says so in one line. Nothing to set on the
 LLM PC. A tab that starts while another is mid-request leaves the model alone and
@@ -139,7 +139,7 @@ on a host that cannot hold the diffusion model and the 30B together.
 | App | Bridge | Needs |
 |---|---|---|
 | After Effects | `@engine-room/after-effects-mcp` over `npx`, talking to the CEP panel on `127.0.0.1:7777` | Node / `npx` on PATH, and the panel installed (`setup_panel`, with AE closed) |
-| Premiere Pro (Beta) | `studio_premiere_mcp.py` (in this folder), posting ExtendScript to the **Studio Assistant Bridge** panel inside Premiere on `127.0.0.1:7787` (`STUDIO_PREMIERE_PORT`) | The panel installed: `python studio_premiere_mcp.py --install-panel` with Premiere closed, then open it once from *Window > Extensions*. CEP's `PlayerDebugMode` must be on (the installer says if it is not) |
+| Premiere Pro (Beta) | `studio_premiere_mcp.py` (in this folder), posting ExtendScript to the **Studio Assist Bridge** panel inside Premiere on `127.0.0.1:7787` (`STUDIO_PREMIERE_PORT`) | The panel installed: `python studio_premiere_mcp.py --install-panel` with Premiere closed, then open it once from *Window > Extensions*. CEP's `PlayerDebugMode` must be on (the installer says if it is not) |
 | Photoshop | `studio_photoshop_mcp.py` (in this folder), running ExtendScript inside Photoshop through its Windows COM automation (`Photoshop.Application`) | Photoshop installed. Nothing to install inside it — no panel, no plugin |
 | Illustrator | `studio_illustrator_mcp.py` (in this folder), the same way through `Illustrator.Application` | Illustrator installed. Nothing to install inside it |
 | DaVinci Resolve | `davinci-resolve-mcp` from `~/davinci-resolve-mcp` | Resolve Studio, with *External scripting using* set to **Local** |
@@ -203,7 +203,7 @@ After Effects exposes shape contents, path and property editing, masks, and text
 animators by default. Try *"Add a centred red circle, 300 pixels across, to my
 comp."* The shape briefing covers geometry plus fill/stroke, grouping, and comp
 coordinates; creating an empty shape layer alone is not a completed drawing.
-Restart Studio Assistant after updating so its tabs load the new tools and prompt.
+Restart Studio Assist after updating so its tabs load the new tools and prompt.
 
 Adding an app for good is a registry entry in `studio_agent.py`, not a code change —
 `AGENTS.md` says what an entry has to supply, the briefing included. Connecting one
@@ -273,11 +273,11 @@ goes into the brief. OpenCode sees only its workspace, so pictures attached ther
 are copied into `attachments/` inside it.
 
 The executing model reads text, and every app answers a screenshot with a picture,
-so a vision model is part of every tab, not an option. At start-up Studio Assistant
+so a vision model is part of every tab, not an option. At start-up Studio Assist
 picks one from what the **same remote inference host** serves: `STUDIO_VISION_MODEL`
 if you pin one and it is served, else the executing model itself when it can see,
 else one already in VRAM, else a known-good vision model (Qwen-VL, Gemma), else any
-the host has downloaded. It need not be loaded: Studio Assistant asks LM Studio to
+the host has downloaded. It need not be loaded: Studio Assist asks LM Studio to
 load it while the tabs start (the Inference row says `loading …`, then `sees: …`),
 and a host that cannot be asked loads it on first use. Returned frames and the task
 brief go to it; it says what the frame actually shows and how it falls short, and
@@ -357,7 +357,7 @@ out badly.
 | `studio_agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
 | `studio_mcp.py` | The MCP harness: the server our bridges run on, an in-process client, and `check` — holds any bridge to what the executor and the model need |
 | `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
-| `Studio Assistant.cmd` | Console-free launcher used by the shortcuts |
+| `Studio Assist.cmd` | Console-free launcher used by the shortcuts |
 | `make_icon.py` | Regenerates `studio-assistant.ico`, the shortcut and taskbar mark |
 | `tests/` | Offline tests — no network, no creative apps. `tests/contracts/` records what the installed bridges expose, so the registry is checked against the real thing |
 | `AGENTS.md` | Notes for anyone changing the code. **Read this first** |

@@ -1505,6 +1505,65 @@ class TestPrefs(unittest.TestCase):
         p.set(theme="light")                 # must not raise
 
 
+class TestErrorLog(unittest.TestCase):
+    """The app's only forensic record: the shortcut starts it with
+    `pythonw.exe`, so there is no console a traceback could reach instead."""
+
+    def setUp(self):
+        import studio_chat
+        self.mod = studio_chat
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self._real = os.environ.get("STUDIO_SETTINGS")
+        os.environ["STUDIO_SETTINGS"] = os.path.join(self.dir, "settings.json")
+        self.addCleanup(self._restore)
+        self.path = studio_chat.error_log_path()
+
+    def _restore(self):
+        if self._real is None:
+            os.environ.pop("STUDIO_SETTINGS", None)
+        else:
+            os.environ["STUDIO_SETTINGS"] = self._real
+
+    def test_it_writes_beside_the_settings_and_says_where(self):
+        self.assertEqual(self.mod.log_error("first entry"), self.path)
+        with open(self.path, encoding="utf-8") as f:
+            self.assertIn("first entry", f.read())
+
+    def test_it_rolls_over_instead_of_growing_without_end(self):
+        """Months of a workstation tool's failures must not become one file
+        nobody can open. One generation back is as far as anyone looks."""
+        self.mod.log_error("x" * (self.mod.LOG_MAX_BYTES + 1))
+        self.mod.log_error("after the rollover")
+        self.assertTrue(os.path.exists(self.path + ".1"))
+        with open(self.path, encoding="utf-8") as f:
+            kept = f.read()
+        self.assertIn("after the rollover", kept)
+        self.assertLess(len(kept), self.mod.LOG_MAX_BYTES)
+
+    def test_an_unwritable_log_costs_the_entry_not_the_app(self):
+        os.environ["STUDIO_SETTINGS"] = os.path.join(
+            self.dir, "settings.json", "no", "settings.json")
+        with open(os.path.join(self.dir, "settings.json"), "w") as f:
+            f.write("")               # a file where the directory would have to be
+        self.assertIsNone(self.mod.log_error("nowhere to put this"))
+
+    def test_a_startup_failure_is_logged_rather_than_silent(self):
+        """Without this, a failure before the window exists looked exactly
+        like double-clicking the shortcut and nothing happening."""
+        shown = []
+        real = self.mod.messagebox.showerror
+        self.mod.messagebox.showerror = lambda *a, **k: shown.append(a)
+        try:
+            self.mod.fail_visibly("starting up", "Traceback...\nTclError: no display")
+        finally:
+            self.mod.messagebox.showerror = real
+        with open(self.path, encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("starting up", body)
+        self.assertIn("TclError: no display", body)
+
+
 class TestThemes(unittest.TestCase):
     def test_both_palettes_carry_every_role(self):
         """A role missing from one palette is a KeyError mid theme switch."""
@@ -1576,7 +1635,10 @@ class TestGui(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.app.destroy()
+        # `_quit`, not `destroy`: the app's own shutdown stands the timers down
+        # first. A bare destroy left them armed, and the run ended with Tk
+        # complaining about "invalid command name ..._drain".
+        cls.app._quit()
         eng.installed_apps = cls._real_installed
         eng.loaded_instances, eng.fit_model = cls._real_fit
         if cls._real_settings is None:
@@ -2164,7 +2226,8 @@ class TestGui(unittest.TestCase):
 
             eng.probe_models = lambda host, timeout=8: (False, None, [], [], "timed out")
             self.app._connect_host()
-            self.assertEqual(a.status[0], "connecting to the inference host")
+            self.assertEqual(a.status[0],
+                             "connecting to the inference host" + self.mod.ELLIPSIS)
             self.assertFalse(self.app.btn_fix.winfo_ismapped(), "no second click meanwhile")
             self.real_boot_host(self.app, False)   # what _connect_host spawned
             self.app._drain()
@@ -2449,19 +2512,32 @@ class TestGui(unittest.TestCase):
             self.app._show_app(n)
 
     def _sidebar_names(self):
-        """The visible app list: each row's title, in the order it is drawn."""
+        """The visible app list: each row's title, in the order it is drawn.
+
+        Searched rather than walked by a fixed depth: a row is a canvas with
+        its content on a frame placed inside it, so the name box is a
+        grandchild now and would be a great-grandchild the next time the row
+        gains a wrapper. The name box is the first frame holding two labels -
+        the pin and hide glyphs each sit in a one-label slot of their own."""
         import tkinter
-        out = []
-        for row in self.app.applist.winfo_children():
-            # the name box is the frame holding title and subtitle; the pin
-            # and hide glyphs each sit in a one-label slot of their own
-            for box in row.winfo_children():
-                if isinstance(box, tkinter.Frame):
-                    labels = [w for w in box.winfo_children()
+
+        def box_of(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, tkinter.Frame):
+                    labels = [w for w in child.winfo_children()
                               if isinstance(w, tkinter.Label)]
                     if len(labels) >= 2:
-                        out.append(labels[0].cget("text"))
-                        break
+                        return labels[0]
+                found = box_of(child)
+                if found is not None:
+                    return found
+            return None
+
+        out = []
+        for row in self.app.applist.winfo_children():
+            title = box_of(row)
+            if title is not None:
+                out.append(title.cget("text"))
         return out
 
     def _labels(self, menu):
@@ -2536,12 +2612,723 @@ class TestGui(unittest.TestCase):
                 self.assertIn(s.status[1], self.mod.DARK)
                 self.assertIn(s.bridge[0], self.mod.DARK)
 
+    # Tk names its one documented override hook like any other method, so the
+    # blanket check cannot tell it from an accident. Overriding it is the
+    # supported way to catch a failing callback; each entry here is a decision,
+    # not an oversight, and anything not listed is still a clash.
+    DELIBERATE_TK_OVERRIDES = {"report_callback_exception"}
+
     def test_no_method_shadows_tkinter_internals(self):
         import tkinter
         clashes = [n for n in vars(self.mod.Chat)
                    if not n.startswith("__")
+                   and n not in self.DELIBERATE_TK_OVERRIDES
                    and (hasattr(tkinter.Misc, n) or hasattr(tkinter.Tk, n))]
         self.assertEqual(clashes, [], "shadowing Tk internals breaks the widget")
+
+    def test_the_deliberate_overrides_are_really_tk_hooks(self):
+        """The allowlist must not become a place to hide a genuine clash: a
+        name in it that Tk does not define is a typo waiting to do nothing."""
+        import tkinter
+        for name in self.DELIBERATE_TK_OVERRIDES:
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(tkinter.Misc, name) or hasattr(tkinter.Tk, name))
+                self.assertIn(name, vars(self.mod.Chat))
+
+    def test_the_pump_stays_a_single_timer_however_it_is_entered(self):
+        """Every hand-called `_drain` in this file used to arm a tick beside
+        the live one; they piled up and Tk named each orphan on the way out
+        ("invalid command name ..._drain"). One in, one armed."""
+        self.app._drain()
+        first = self.app.drain_timer
+        self.app._drain()
+        pending = self.app.tk.splitlist(self.app.tk.call("after", "info"))
+        self.assertIn(self.app.drain_timer, pending)
+        self.assertNotIn(first, pending)
+
+    def test_a_failing_event_leaves_the_pump_running(self):
+        """The queue pump is the only path from the worker threads to the UI.
+        An event whose handling raised used to escape past the reschedule, so
+        the pump stopped for good: every tab went quiet at once - no tokens,
+        no status, no idle - while the threads kept filling a queue nobody
+        read. `pythonw.exe` has no stderr, so nothing said why."""
+        sid, seen, real = self.app.order[0], [], self.app._handle
+
+        def explode(kind, s, payload):
+            if payload == "boom":
+                raise RuntimeError("a widget said no")
+            seen.append(payload)
+            return real(kind, s, payload)
+
+        self.app._handle = explode
+        try:
+            self.app.q.put(("sys", sid, "boom"))
+            self.app.q.put(("sys", sid, "delivered-after-the-failure"))
+            self.app._drain()
+        finally:
+            self.app._handle = real
+        self.assertIn("delivered-after-the-failure", seen)
+        self.assertIsNotNone(self.app.drain_timer)
+
+    def test_a_failing_event_is_logged_and_named_in_the_transcript(self):
+        """Surviving is not enough - a failure nobody can see is the hobby
+        version. It goes to the error log, and the tab says so in words."""
+        sid, logged, real = self.app.order[0], [], self.app._handle
+        real_log, self.app._log = self.app._log, logged.append
+
+        def explode(kind, s, payload):
+            raise RuntimeError("a widget said no")
+
+        self.app._handle = explode
+        try:
+            self.app.q.put(("sys", sid, "boom"))
+            self.app._drain()
+        finally:
+            self.app._handle, self.app._log = real, real_log
+        self.assertTrue(any("a widget said no" in t for t in logged), logged)
+        self.assertIn("a widget said no",
+                      self.app.cur().view.get("1.0", "end"))
+
+    def test_a_failing_callback_reaches_the_same_place(self):
+        """Tk's hook for a menu command or button that raised. Its default
+        prints to a stderr the shortcut does not give the app."""
+        logged, real_log = [], self.app._log
+        self.app._log = logged.append
+        try:
+            self.app.report_callback_exception(
+                RuntimeError, RuntimeError("the button said no"), None)
+        finally:
+            self.app._log = real_log
+        self.assertTrue(any("the button said no" in t for t in logged), logged)
+
+    def _save_a_task(self, s, brief, steps=1, broken=False):
+        import studio_tasks as tasks
+        folder = os.path.dirname(self.app._task_path(s))
+        os.makedirs(folder, exist_ok=True)
+        self.addCleanup(shutil.rmtree, folder, True)
+        if broken:
+            path = os.path.join(folder, "0" * 32 + ".json")
+            with open(path, "w") as f:
+                f.write("{not json")
+            return path
+        record = tasks.TaskRecord()
+        record.app_id = s.id
+        record.briefs = [brief]
+        record.journal = [{"call": "x", "status": "ok"} for _ in range(steps)]
+        path = os.path.join(folder, record.id + ".json")
+        record.save(path, [{"role": "system", "content": "s"},
+                           {"role": "user", "content": brief}])
+        return path
+
+    def test_saved_tasks_lists_what_was_asked_not_hex_names(self):
+        """The old file dialog showed a folder of 32-character names and no
+        way to tell which was which, so in practice nothing was resumed."""
+        s = self.app.cur()
+        self._save_a_task(s, "make a pic of a duck", steps=13)
+        try:
+            self.app._resume_task()
+            body = self.app.tasks_view.get("1.0", "end")
+            self.assertIn("make a pic of a duck", body)
+            self.assertIn("13 steps", body)
+        finally:
+            self.app.windows[("tasks", s.id)].destroy()
+
+    def test_the_conversation_already_on_screen_is_not_offered(self):
+        """Resuming it would replace it with a checkpoint of itself."""
+        s = self.app.cur()
+        s.record.briefs = ["the one already open"]
+        s.record.save(self.app._task_path(s), s.messages)
+        self.addCleanup(shutil.rmtree,
+                        os.path.dirname(self.app._task_path(s)), True)
+        try:
+            self.app._resume_task()
+            self.assertNotIn("the one already open",
+                             self.app.tasks_view.get("1.0", "end"))
+        finally:
+            self.app.windows[("tasks", s.id)].destroy()
+            s.record.briefs = []
+
+    def test_a_task_that_will_not_parse_is_shown_and_cannot_be_resumed(self):
+        """Hiding it is how someone comes to believe the app lost their work."""
+        s = self.app.cur()
+        self._save_a_task(s, "", broken=True)
+        try:
+            self.app._resume_task()
+            view = self.app.tasks_view
+            self.assertIn("nothing asked yet", view.get("1.0", "end"))
+            labels = [w.cget("text") for w in view.winfo_children()
+                      if isinstance(w, (tk.Button, self.mod.Pill))]
+            self.assertEqual(labels, ["delete"])
+        finally:
+            self.app.windows[("tasks", s.id)].destroy()
+
+    def test_diagnostics_opens_saying_so_and_then_paints_the_report(self):
+        """The probe talks to the host, so the window has to open before the
+        answer does - a tailnet timeout must not look like a frozen app."""
+        import studio_doctor
+        fake = [("Inference host", [("Model", "qwen3-coder-30b", "ok"),
+                                    ("Context window", "8,192 loaded", "warn")])]
+        real = studio_doctor.report
+        studio_doctor.report = lambda *a, **k: fake
+        try:
+            self.app._diagnostics_window()
+            self.assertIn("Checking", self.app.diag_view.get("1.0", "end"))
+            for _ in range(15):
+                self.app.update()
+            self.app._paint_diagnostics(fake)     # as the pump would
+            body = self.app.diag_view.get("1.0", "end")
+            self.assertIn("Inference host", body)
+            self.assertIn("qwen3-coder-30b", body)
+            self.app._copy_diagnostics()
+            self.assertIn("8,192 loaded", self.app.clipboard_get())
+        finally:
+            studio_doctor.report = real
+            self.app.windows[("diagnostics", "")].destroy()
+
+    def test_diagnostics_survives_being_painted_after_it_is_closed(self):
+        """The report arrives on the queue; the window it was asked for may
+        have been shut in the meantime, and the pump must not care."""
+        self.app._diagnostics_window()
+        self.app.windows[("diagnostics", "")].destroy()
+        self.app.update()
+        self.app._paint_diagnostics([("Anything", [("x", "y", "ok")])])
+
+    def test_the_pump_does_not_re_arm_while_the_window_is_closing(self):
+        """`_quit` cancels the timers; a tick already in flight must not put
+        one back, or `after` fires against a destroyed widget - which is what
+        printed "invalid command name ..._drain" over a window already gone."""
+        before = self.app.drain_timer
+        self.app.closing = True
+        try:
+            self.app._drain()
+            self.assertIs(self.app.drain_timer, before)
+        finally:
+            self.app.closing = False
+
+    # ------------------------------------------------------------- animation
+    # One `after` tick drives everything that moves, for the reason the queue
+    # pump is one tick: a timer per animation is a timer per orphan on the way
+    # out. These hold the discipline that follows from that.
+
+    def test_the_animator_is_one_timer_armed_only_while_something_moves(self):
+        """A window with nothing happening in it must not wake up fourteen
+        times a second to redraw nothing - and two animations must not mean
+        two timers."""
+        self.app.anim.clear()
+        self.app._stand_down("anim_timer")
+        self.assertIsNone(self.app.anim_timer)
+        self.app._animate("a", lambda frame: None)
+        first = self.app.anim_timer
+        self.assertIsNotNone(first)
+        self.app._animate("b", lambda frame: None)
+        self.assertIs(self.app.anim_timer, first, "a second animation, no second timer")
+        self.app._anim_tick()
+        pending = self.app.tk.splitlist(self.app.tk.call("after", "info"))
+        self.assertIn(self.app.anim_timer, pending)
+        self.assertNotIn(first, pending, "the old tick is stood down, not left behind")
+        self.app._unanimate("a")
+        self.app._unanimate("b")
+        self.app._anim_tick()
+        self.assertIsNone(self.app.anim_timer, "nothing left to draw, no tick armed")
+
+    def test_an_animation_paints_immediately_rather_than_next_frame(self):
+        """Registering is also a paint: a status that changes must not wait
+        ANIM_MS to say so, or every state change reads as lag."""
+        seen = []
+        self.app._animate("probe", lambda frame: seen.append(frame))
+        try:
+            self.assertEqual(seen, [self.app.anim_frame])
+        finally:
+            self.app._unanimate("probe")
+
+    def test_a_one_frame_animation_drops_itself_without_a_tick(self):
+        """A `draw` that returns False on its first paint - the wipe at the
+        end of its run, an arc already where it was going - is over before the
+        timer ever sees it, and must not arm one."""
+        self.app.anim.clear()
+        self.app._stand_down("anim_timer")
+        self.app._animate("once", lambda frame: False)
+        self.assertNotIn("once", self.app.anim)
+        self.assertIsNone(self.app.anim_timer)
+
+    def test_a_failing_animation_is_dropped_and_the_others_keep_drawing(self):
+        """Same rule as the queue pump: one bad frame must not stop the tick.
+        A widget destroyed under its own animation is ordinary and silent; an
+        animation that raises anything else is a bug and is reported."""
+        drawn, logged = [], []
+        real_log, self.app._log = self.app._log, logged.append
+
+        def gone(frame):
+            raise tk.TclError("invalid command name .!canvas")
+
+        try:
+            self.app._animate("gone", gone)
+            self.app._animate("broken", lambda frame: 1 / 0)
+            self.app._animate("fine", drawn.append)
+            self.app._anim_tick()
+            self.assertNotIn("gone", self.app.anim)
+            self.assertNotIn("broken", self.app.anim)
+            self.assertIn("fine", self.app.anim)
+            self.assertTrue(drawn)
+            self.assertIsNotNone(self.app.anim_timer)
+            self.assertTrue(any("ZeroDivisionError" in t for t in logged), logged)
+            self.assertFalse(any("TclError" in t for t in logged),
+                             "a destroyed widget is not worth a log entry")
+        finally:
+            self.app._unanimate("fine")
+            self.app._log = real_log
+
+    def test_the_animator_does_not_re_arm_while_the_window_is_closing(self):
+        before = self.app.anim_timer
+        self.app.closing = True
+        try:
+            self.app._animate("late", lambda frame: None)
+            self.assertIs(self.app.anim_timer, before)
+        finally:
+            self.app.closing = False
+            self.app._unanimate("late")
+
+    def test_a_trailing_ellipsis_is_what_makes_a_label_animate(self):
+        """The whole protocol: text ending in one is text describing something
+        still happening, and the dots count. Anything else is shown once and
+        its animation dropped, which is how a finished state stops moving."""
+        shown = []
+        self.app._ellipsis("probe", "working" + self.mod.ELLIPSIS, shown.append)
+        self.assertIn("probe", self.app.anim)
+        for _ in range(3 * self.mod.ELLIPSIS_FRAMES + 1):
+            self.app._anim_tick()
+        self.assertTrue(all(t.startswith("working.") for t in shown), shown[:4])
+        self.assertEqual({t[len("working"):] for t in shown}, {".", "..", "..."})
+        self.app._ellipsis("probe", "ready", shown.append)
+        self.assertNotIn("probe", self.app.anim)
+        self.assertEqual(shown[-1], "ready")
+
+    def test_every_status_the_window_shows_is_a_role_and_never_a_bare_ellipsis(self):
+        """The header renders the dots itself, so the literal character must
+        never reach the label - and a status still carries a palette role."""
+        for text, role, _fixable in (
+                ("working" + self.mod.ELLIPSIS, "warn", False),
+                ("ready", "muted", False)):
+            with self.subTest(text=text):
+                s = self.app.cur()
+                s.status = (text, role, False)
+                self.app._apply_status()
+                self.assertNotIn(self.mod.ELLIPSIS, self.app.lbl_status.cget("text"))
+                self.assertEqual(self.app.lbl_status.cget("fg"), self.app.C[role])
+
+    def test_blend_walks_between_two_colours(self):
+        """A generator expression per colour closes over the comprehension's
+        loop variable, so both ends come out as the second colour and every
+        pulse in the window goes flat without an error. It did. This is why
+        the channels are built eagerly."""
+        blend = self.mod.blend
+        self.assertEqual(blend("#000000", "#ffffff", 0.0), "#000000")
+        self.assertEqual(blend("#000000", "#ffffff", 1.0), "#ffffff")
+        self.assertEqual(blend("#000000", "#ffffff", 0.25), "#404040")
+        self.assertEqual(blend("#102030", "#302010", 0.5), "#202020")
+        self.assertEqual(blend("#000000", "#ffffff", 4.0), "#ffffff", "clamped")
+        self.assertNotEqual(blend("#232321", "#302f2c", 0.5), "#302f2c")
+
+    def test_the_bridges_row_is_a_drawn_arc_and_not_a_font_glyph(self):
+        """MDL2's chain link says "two things fastened together", which is not
+        what a bridge is; and a glyph cannot show a span going up. The drawn
+        arc can, so the link codepoint is gone from the glyph table."""
+        self.assertNotIn("link", self.app.g)
+        lead, _lbl = self.app.conn["bridges"]
+        self.assertIsInstance(lead, tk.Canvas)
+        self.assertIn(lead, self.app.arcs)
+        self.assertTrue(lead.find_all(), "the arc draws itself")
+
+    def test_the_arc_draws_itself_across_only_when_the_state_changes(self):
+        """One pass on a change, then it settles. There is no state it can sit
+        in spinning: a bridge that never starts would otherwise animate for the
+        life of the window."""
+        lead, _lbl = self.app.conn["bridges"]
+        key = ("arc", str(lead))
+        self.app._arc_state(lead, "faint")
+        self.app._unanimate(key)
+        self.app._arc_state(lead, "ok")
+        self.assertIn(key, self.app.anim, "a new state draws itself across")
+        for _ in range(self.mod.SWEEP_FRAMES + 2):
+            self.app._anim_tick()
+        self.assertNotIn(key, self.app.anim, "and then settles")
+        self.app._arc_state(lead, "ok")
+        self.assertNotIn(key, self.app.anim, "the same state again is not a change")
+
+    def test_a_theme_switch_repaints_the_arc_rather_than_reconfiguring_it(self):
+        """A canvas that plotted its own palette colours cannot be told a new
+        one with config() - same reason the app marks and the dots are
+        repainted. A role missing from a palette would be a KeyError mid-switch."""
+        lead, _lbl = self.app.conn["bridges"]
+        was = self.app.prefs.get("theme")
+        try:
+            for name in ("light", "dark"):
+                self.app._theme(name)
+                # The switch re-syncs the row, so the role is whatever the
+                # bridges are actually doing - but it is always a role both
+                # palettes hold, or the switch is a KeyError halfway through.
+                self.assertIn(self.app.arcs[lead], self.mod.DARK)
+                self.assertIn(self.app.arcs[lead], self.mod.LIGHT)
+                self.assertTrue(lead.find_all(), "repainted, not reconfigured")
+                self.assertNotIn(self.mod.DARK["side"] if name == "light" else
+                                 self.mod.LIGHT["side"],
+                                 [lead.itemcget(i, "fill") for i in lead.find_all()],
+                                 "no colour left over from the other palette")
+        finally:
+            self.app._theme(was)
+
+    def test_a_call_waiting_on_a_result_shows_dots_and_gives_them_up(self):
+        """The ellipsis a row used to wait behind never moved, so a call that
+        took a minute looked the same as one that had hung."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        windows = len(s.view.window_names())
+        self.app._show_call(s, {"name": "get_comp", "arguments": {}, "via": None})
+        self.assertEqual(len(s.view.window_names()), windows + 1)
+        n, = s.open_calls["get_comp"]
+        dots = s.pending[n]
+        self.assertIn(("dots", str(dots)), self.app.anim)
+        self.app._show_result(s, {"name": "get_comp", "text": "ok", "status": "ok"})
+        self.assertNotIn(("dots", str(dots)), self.app.anim)
+        self.assertNotIn(n, s.pending)
+
+    def test_a_call_row_written_while_thinking_survives_the_dots_going(self):
+        """The dots sit at the end, and `_end_thinking` deletes from its mark
+        to the end - so a row written past them would be inside what it
+        deletes. `_show_call` takes them down first, not last."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._begin_thinking(s)
+        self.app._show_call(s, {"name": "get_comp", "arguments": {}, "via": None})
+        self.assertIsNone(s.thinking)
+        self.assertIn("get_comp", s.view.get("1.0", "end"))
+
+    def test_a_failed_call_still_says_so_in_words(self):
+        """The dots go; the word that replaces them is the one the row had
+        before any of this."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._show_call(s, {"name": "set_text", "arguments": {}, "via": None})
+        self.app._show_result(s, {"name": "set_text", "text": "no", "status": "error"})
+        self.assertIn("set_text failed", s.view.get("1.0", "end"))
+
+    def test_a_picture_tool_holds_the_space_its_picture_will_fill(self):
+        """A generation is the longest wait in the app and the one with most to
+        show for it, so the waiting happens where the result will be."""
+        import base64
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._show_call(s, {"name": "comfy_generate", "arguments": {}, "via": None})
+        self.assertEqual(len(s.stages), 1)
+        _tag, stage = s.stages[0]
+        self.assertIn(("stage", str(stage)), self.app.anim)
+        before = s.view.index("end-1c")
+        png = icons.png(bytes([0, 0, 0, 255]) * 4, 2, 2)
+        self.app._handle("preview", s.event_id,
+                         {"type": "image", "mimeType": "image/png",
+                          "data": base64.b64encode(png).decode()})
+        self.assertEqual(s.stages, [], "the picture took the placeholder's place")
+        self.assertNotIn(("stage", str(stage)), self.app.anim)
+        self.assertLessEqual(float(s.view.index("end-1c").split(".")[0]),
+                             float(before.split(".")[0]) + 1,
+                             "the placeholder came out as the picture went in")
+
+    def test_a_placeholder_nothing_arrives_for_is_taken_down_by_the_result(self):
+        """Guessing from a tool's name costs nothing in either direction, and
+        this is the half that makes that true."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._show_call(s, {"name": "ppro_screenshot", "arguments": {}, "via": None})
+        self.assertEqual(len(s.stages), 1)
+        self.app._show_result(s, {"name": "ppro_screenshot", "text": "no display",
+                                  "status": "error"})
+        self.assertEqual(s.stages, [])
+        self.assertFalse([k for k in self.app.anim if k[0] == "stage"])
+
+    def test_which_tool_names_are_taken_to_make_a_picture(self):
+        makes = self.mod.makes_a_picture
+        for name in ("comfy_generate", "comfy_run_workflow", "comfy_wait",
+                     "ppro_screenshot", "screenshot_frame", "screenshot_layer",
+                     "render", "comfy_fetch_output"):
+            self.assertTrue(makes(name), name)
+        for name in ("get_comp", "list_folder", "set_text", "comfy_list_models",
+                     "timeline", "read_file"):
+            self.assertFalse(makes(name), name)
+
+    def test_the_thinking_dots_come_and_go_without_a_trace(self):
+        """They sit at the end of the transcript, so anything written next
+        would land underneath them. Every event that writes takes them down
+        first, and what is left has to be exactly what was there before."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._write(s, "a line\n", "sys")
+        before = s.view.get("1.0", "end")
+        self.app._begin_thinking(s)
+        self.assertIsNotNone(s.thinking)
+        _mark, dots = s.thinking
+        self.assertIn(("dots", str(dots)), self.app.anim)
+        self.app._begin_thinking(s)
+        self.assertIs(s.thinking[1], dots, "idempotent: one set of dots, not two")
+        self.app._end_thinking(s)
+        self.assertIsNone(s.thinking)
+        self.assertNotIn(("dots", str(dots)), self.app.anim)
+        self.assertEqual(s.view.get("1.0", "end"), before)
+        self.assertFalse(s.view.window_names())
+
+    def test_every_transcript_event_takes_the_thinking_dots_down_first(self):
+        """The set is a list, so it can go stale. Anything that reaches
+        `_write`, `_show_call` or the rest belongs in it."""
+        s = self.app.cur()
+        for kind in self.mod.WRITES_TO_TRANSCRIPT:
+            with self.subTest(kind=kind):
+                self.app._clear_view(s)
+                self.app._begin_thinking(s)
+                payload = {"sys": "note", "error": "bad", "token": "x",
+                           "ready": None, "stream_start": None,
+                           "tool": {"name": "t", "arguments": {}, "via": None},
+                           "tool_result": {"name": "t", "text": "r"},
+                           "ask": {"question": "which?", "options": ["a", "b"]},
+                           "preview": {"data": ""}}[kind]
+                try:
+                    self.app._handle(kind, s.id, payload)
+                except Exception:
+                    pass          # a malformed payload is not what is on trial
+                self.assertIsNone(s.thinking, kind)
+        self.app._clear_view(s)
+
+    def test_clearing_a_transcript_stands_its_animations_down(self):
+        """New chat destroys every widget embedded in it; the animations that
+        were drawing them must not be left for the next frame to trip over."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._show_call(s, {"name": "comfy_generate", "arguments": {}, "via": None})
+        self.app._begin_thinking(s)
+        # This session's widgets by name: `anim` is the whole window's, and
+        # another tab's dots are none of this test's business.
+        live = ([("dots", str(w)) for w in s.pending.values()]
+                + [("stage", str(c)) for _tag, c in s.stages]
+                + [("dots", str(s.thinking[1]))])
+        self.assertEqual(len(live), 3)
+        for key in live:
+            self.assertIn(key, self.app.anim)
+        self.app._clear_view(s)
+        self.assertEqual(s.pending, {})
+        self.assertEqual(s.stages, [])
+        self.assertIsNone(s.thinking)
+        self.assertFalse([k for k in self.app.anim if k in live])
+
+    def test_a_busy_tab_pulses_its_own_dot_and_stops_when_it_is_done(self):
+        """The run you started is very often not the tab you are looking at,
+        so a tab says for itself that it is working."""
+        s = self.app.cur()
+        dot = self.app.tab_ui[s.id]["dot"]
+        key = ("dot", str(dot))
+        was = s.busy
+        try:
+            s.busy = True
+            self.app._paint_tab(s.id)
+            self.assertIn(key, self.app.anim)
+            self.assertEqual(self.app.dot_role[dot], s.bridge[0],
+                             "the settled role survives, for a theme switch")
+            s.busy = False
+            self.app._paint_tab(s.id)
+            self.assertNotIn(key, self.app.anim)
+        finally:
+            s.busy = was
+            self.app._paint_tab(s.id)
+
+    def test_a_settled_window_animates_nothing(self):
+        """The rule the rest of this section exists to protect: every
+        animation is tied to something actually in progress, so a window
+        nobody is asking anything of draws nothing and arms no timer. A tab
+        stuck at "not started" because the host went away is settled, not
+        busy - that one was a live animation for the life of the window."""
+        s = self.app.cur()
+        was = (s.busy, s.booting, s.bridge, self.app.host_booting)
+        try:
+            for t in self.app.sessions.values():
+                t.busy = t.booting = False
+                self.app._handle("bridge", t.id, ("faint", "%s\nnot started"
+                                                  % t.app.bridge_label))
+            self.app.host_booting = False
+            self.app._handle("host", None, ("faint", None))
+            self.app._handle("host_probed", None, False)
+            s.status = ("ready", "muted", False)
+            self.app._apply_status()
+            for _ in range(self.mod.SWEEP_FRAMES + 2):
+                self.app._anim_tick()
+            self.assertEqual(self.app.anim, {},
+                             "something is animating that nothing is doing")
+            self.assertIsNone(self.app.anim_timer)
+        finally:
+            s.busy, s.booting, s.bridge, self.app.host_booting = was
+            self.app._stand_down("host_timer")
+
+    # ---------------------------------------------------------------- corners
+    def test_nothing_in_the_window_is_a_tk_button(self):
+        """Tk's Button is a rectangle and nothing on it bends, so one of them
+        among the rounded controls is not a style choice - it is the only
+        shape Tk would give. Every button goes through `_button`, which makes
+        a `Pill`. Read from the source because the dialogs that hold most of
+        them are not open."""
+        import studio_ui
+        for module in (self.mod, studio_ui):
+            with self.subTest(module=module.__name__):
+                with open(module.__file__, encoding="utf-8") as f:
+                    body = f.read()
+                self.assertNotIn("tk.Button(", body,
+                                 "use _button(); see PILL_ROLES for the kinds")
+
+    def test_the_window_says_its_name_once(self):
+        """The title bar has it, and Windows repeats it on the taskbar and in
+        Alt-Tab. The header said it again directly underneath, which bought
+        nothing - the header's job is to say what this tab is doing."""
+        self.assertEqual(self.app.title(), self.mod.APP_NAME)
+        head = self.app.lbl_status.master
+        texts = []
+        for child in head.winfo_children():
+            try:
+                texts.append(str(child.cget("text")))
+            except tk.TclError:
+                pass
+        self.assertNotIn(self.mod.APP_NAME, texts)
+
+    def test_every_pill_is_repainted_on_a_theme_switch(self):
+        """A Pill plotted its palette colours into canvas items; `_theme` can
+        reconfigure a widget but not a shape, so it repaints them instead."""
+        was = self.app.prefs.get("theme")
+        try:
+            for name in ("light", "dark"):
+                self.app._theme(name)
+                self.assertTrue(self.app.pills)
+                for pill in self.app.pills:
+                    self.assertIs(pill.C, self.app.C, pill.cget("text"))
+        finally:
+            self.app._theme(was)
+
+    def test_a_pictures_masked_corners_follow_the_theme(self):
+        """The corners are rounded by painting them in the background they
+        sit on - Tk will not clip an image to a shape. Switch the palette
+        without redrawing them and every picture in the transcript keeps four
+        blots of the old one."""
+        import base64
+        s = self.app.cur()
+        self.app._clear_view(s)
+        was = self.app.prefs.get("theme")
+        self.app._theme("dark")
+        png = icons.png(bytes([255, 255, 255, 255]) * 4, 2, 2)
+        self.app._handle("preview", s.event_id,
+                         {"type": "image", "mimeType": "image/png",
+                          "data": base64.b64encode(png).decode()})
+        canvas = s.view.nametowidget(s.view.window_names()[-1])
+        try:
+            def masks():
+                return {canvas.itemcget(i, "fill")
+                        for i in canvas.find_withtag("mask")}
+            self.assertEqual(masks(), {self.mod.DARK["bg"]})
+            self.app._theme("light")
+            self.assertEqual(masks(), {self.mod.LIGHT["bg"]})
+        finally:
+            self.app._theme(was)
+            self.app._clear_view(s)
+
+    def test_a_dead_widgets_repaint_is_swept_rather_than_raising(self):
+        """Chips are rebuilt on every attach and every send, and each one
+        registers a repaint. Left in the list they would grow with the
+        session and raise in the middle of a theme switch."""
+        gone = tk.Frame(self.app)
+        self.app._repaint_on_theme(gone, lambda: None)
+        self.assertIn(gone, [w for w, _d in self.app.repaints])
+        gone.destroy()
+        self.app._forget()
+        self.assertNotIn(gone, [w for w, _d in self.app.repaints])
+
+    def test_a_left_reading_pill_takes_its_width_and_wraps(self):
+        """An option in the question form is a full-width row that happens to
+        be clickable, so it reads from the left and a long label wraps rather
+        than running off the end."""
+        holder = tk.Frame(self.app, width=self.app._px(260))
+        holder.pack_propagate(False)
+        pill = self.mod.Pill(holder, "a label long enough that it has to wrap "
+                                     "onto a second line to fit in this row",
+                             lambda: None, self.app.f_body,
+                             self.app.PILL_ROLES["option"], anchor="w")
+        pill.pack(fill="x")
+        try:
+            holder.update()
+            pill.paint(self.app.C)
+            holder.update()
+            one_line = self.app.f_body.metrics("linespace") + 2 * pill.pady
+            self.assertGreater(int(pill.cget("height")), one_line, "it wrapped")
+            self.assertLessEqual(pill.winfo_width(), self.app._px(260))
+        finally:
+            holder.destroy()
+
+    def test_a_field_is_an_entry_inside_a_drawn_outline(self):
+        """Tk's own `highlightthickness` can only draw a rectangle, and a
+        square field between rounded buttons is what gives a window away."""
+        holder = tk.Frame(self.app)
+        var = tk.StringVar(value="npx -y some-mcp")
+        entry = self.app._entry(holder, var)
+        try:
+            entry.master.pack(fill="x")
+            holder.update()
+            self.assertIsInstance(entry.master, tk.Canvas)
+            self.assertEqual(entry.get(), "npx -y some-mcp")
+            self.assertEqual(int(entry.cget("highlightthickness")), 0,
+                             "the outline is drawn, not Tk's rectangle")
+            self.assertIn(entry.master, [w for w, _d in self.app.repaints])
+        finally:
+            holder.destroy()
+            self.app._forget()
+
+    def test_quitting_leaves_no_animation_armed(self):
+        """A second window, so the real one survives the test. `after` against
+        a destroyed widget is what printed "invalid command name" over a
+        window that was already gone."""
+        other = self.mod.Chat()
+        try:
+            other._animate("x", lambda frame: None)
+            self.assertIsNotNone(other.anim_timer)
+        finally:
+            other._quit()
+        self.assertIsNone(other.anim_timer)
+        self.assertEqual(other.anim, {})
+
+    def test_the_send_pill_fires_on_release_and_only_inside(self):
+        """Press and release, not one click: a button that reacts only once
+        the work has started reads as one that missed the press, and letting
+        go somewhere else has to mean you changed your mind."""
+        fired = []
+        pill = self.mod.Pill(self.app, "Go", lambda: fired.append(1), self.app.f_bold,
+                             ("accent", "accent_fg", "accent_dk", "border", "faint"))
+        pill.paint(self.app.C)
+        pill.update()
+        w, h = pill.winfo_width(), pill.winfo_height()
+        try:
+            pill._press(None)
+            self.assertTrue(pill.down)
+            self.assertEqual(fired, [], "nothing has happened yet")
+            pill._release(type("Ev", (), {"x": w // 2, "y": h // 2})())
+            self.assertFalse(pill.down)
+            self.assertEqual(fired, [1])
+            pill._press(None)
+            pill._release(type("Ev", (), {"x": w + 40, "y": h // 2})())
+            self.assertEqual(fired, [1], "let go outside: cancelled")
+            # Off and back on with the button still held re-arms it, so a
+            # wobble between press and release is not a click thrown away.
+            pill._press(None)
+            pill._light(False, type("Ev", (), {"state": 0x0100})())
+            self.assertFalse(pill.down)
+            pill._light(True, type("Ev", (), {"state": 0x0100})())
+            self.assertTrue(pill.down, "came back with the button down")
+            pill._release(type("Ev", (), {"x": w // 2, "y": h // 2})())
+            self.assertEqual(fired, [1, 1])
+            # ...and merely hovering, with nothing held, presses nothing.
+            pill._light(True, type("Ev", (), {"state": 0})())
+            self.assertFalse(pill.down)
+        finally:
+            pill.destroy()
 
     def test_stop_button_sets_cancellation_without_touching_composer(self):
         s = self.app.cur()
@@ -2556,7 +3343,11 @@ class TestGui(unittest.TestCase):
             self.app._on_send()
             self.assertTrue(s.cancel.is_set())
             self.assertEqual(self.app.input.get("1.0", "end").strip(), "next request")
-            self.assertEqual(self.app.btn_send.cget("text"), "Stopping…")
+            # The label is animated now: the button says Stopping and counts
+            # dots, so it is the stem that is fixed, not the whole string.
+            self.assertTrue(self.app.btn_send.cget("text").startswith("Stopping"),
+                            self.app.btn_send.cget("text"))
+            self.assertIn("send", self.app.anim)
         finally:
             s.busy = False
             s.cancel.clear()
@@ -2574,14 +3365,17 @@ class TestGui(unittest.TestCase):
         self.assertNotIn("stale-generation-token", replacement.view.get("1.0", "end"))
 
     def test_preview_image_remains_owned_by_session(self):
+        """A picture arrives on a canvas of its own now, not as a bare image:
+        that is what the wipe-in is drawn on. The session still has to hold the
+        PhotoImage, or Tk drops it the moment it is collected."""
         import base64
         s = self.app.cur()
         png = icons.png(bytes([255, 0, 0, 255]) * 4, 2, 2)
-        count = len(s.preview_images)
+        count, windows = len(s.preview_images), len(s.view.window_names())
         self.app._handle("preview", s.event_id, {"type": "image", "mimeType": "image/png",
                                                "data": base64.b64encode(png).decode()})
         self.assertEqual(len(s.preview_images), count + 1)
-        self.assertTrue(s.view.image_names())
+        self.assertEqual(len(s.view.window_names()), windows + 1)
 
     def _picture(self, name, kind="png"):
         """A real PNG Tk wrote itself, or a JPEG that is only a header - the
@@ -2646,7 +3440,9 @@ class TestGui(unittest.TestCase):
                 try:
                     s.reset()
                     s.ready = True
-                    images = len(s.view.image_names())
+                    # Counted by what the session owns, not by what is on the
+                    # transcript: sending also puts the thinking dots there.
+                    pictures = len(s.preview_images)
                     self.app.input.insert("1.0", "Match this")
                     self.app._on_send()
                     self.app.update()
@@ -2659,7 +3455,7 @@ class TestGui(unittest.TestCase):
                     self.assertEqual(self.app.attachments, [])
                     self.assertFalse(self.app.chips.winfo_ismapped())
                     self.assertEqual(self.app.input.get("1.0", "end").strip(), "")
-                    self.assertEqual(len(s.view.image_names()), images + 1)
+                    self.assertEqual(len(s.preview_images), pictures + 1)
                     # a picture alone is a message
                     s.busy = False                      # the mocked turn never ended
                     self.app._add_attachments([jpg])

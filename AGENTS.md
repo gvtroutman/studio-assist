@@ -13,7 +13,7 @@ this PC's files and the web instead. Two moving parts:
   environment probes. Also a working CLI: `python studio_agent.py --app resolve
   "what's on the timeline"`, or bare for a REPL.
 - **`studio_chat.py`** — the Tkinter GUI, and the way the app is actually used.
-  Launched with no console via `Studio Assistant.cmd` and the Desktop / Start Menu
+  Launched with no console via `Studio Assist.cmd` and the Desktop / Start Menu
   shortcuts.
 - **`studio_tasks.py`** — shared GUI/CLI execution, original-schema validation,
   bounded request context, cancellation, execution journals and task recovery.
@@ -55,6 +55,9 @@ this PC's files and the web instead. Two moving parts:
   read-only (`list_folder`, `find_files`, `read_file`, `search_web`, `fetch_page`). The
   one bridge the GUI runs *in process*, through `studio_mcp.Loopback`. See *The tab
   with no app*.
+- **`studio_procs.py`** — every child process the app starts, contained: each in its
+  own kill-on-close Windows job object, so it and everything it starts end with the tab,
+  the app, or the app's crash. See *Processes: nothing outlives the app*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -474,7 +477,107 @@ explicitly if the fixed tool contract and brief cannot fit.
 **Never name a Tk widget method `_w`.** Tkinter's `Misc` uses `self._w` for the
 widget's Tcl pathname. Shadowing it sends `__repr__` into infinite recursion and the
 window never opens. `Misc._bind` and `Misc.quit` are the same kind of trap. Audit new
-method names against `tkinter.Misc` / `tkinter.Tk` — a test does it for you.
+method names against `tkinter.Misc` / `tkinter.Tk` — a test does it for you. The one
+exception is `report_callback_exception`, which Tk *means* to be overridden; the test
+keeps a `DELIBERATE_TK_OVERRIDES` allowlist, and a second test holds every name in it
+to being a real Tk attribute the class really defines, so the list cannot become a
+hiding place for an accident.
+
+**The queue pump must never die, and nothing may fail in silence.** `_drain` is the
+only path from the worker threads to the UI, and `_handle` — which it calls — touches
+widgets, images and transcripts. Anything `_handle` raised used to escape past the
+`self.after(40, self._drain)` at the end, so the pump stopped *permanently*: every tab
+went quiet at once (no tokens, no status, no idle, Stop stuck on) while the threads
+kept filling a queue nobody read. The shortcut starts the app with `pythonw.exe`, which
+has no stderr, so the traceback went nowhere and the app looked hung rather than
+broken. Now the reschedule is in a `finally`, each event is handled in its own
+`try`, and a failure goes to `_report`: the error log, plus a line in the transcript
+naming the log. `report_callback_exception` routes a failing menu command or button to
+the same place, for the same reason. Two rules follow — **nothing in `_report` may
+raise** (it is reached precisely when a widget is already unhappy, so every step is
+wrapped), and **the pump is one timer however it is entered**: `_drain` stands the old
+tick down before arming the next, because the twenty-odd hand-called `_drain()`s in
+`tests/test_agent.py` each used to arm one beside the live one, and Tk named every
+orphan on the way out. `_quit` sets `closing` and cancels `drain_timer` and
+`host_timer` through `_stand_down`; the GUI tests tear down with `_quit()`, not
+`destroy()`.
+
+**The modules pulled out of `studio_chat`, and the rules that keep them out.**
+`studio_doctor` (where things are kept, the error log's one writer, the diagnostics
+report), `studio_files` (attachments: headers, folder listings, the container copy)
+and `studio_ui` (palette roles, `blend`/`rounded`/`clip`/`pretty_host`, `Pill`).
+`studio_chat` re-exports every name it used to define, so the rest of the app reaches
+for them where it always did — but edit them in their own module.
+`tests/test_doctor.py::ModuleBoundaryTest` enforces the two rules worth having: the
+headless pair must import with tkinter entirely unavailable (tested by blocking it on
+`sys.meta_path`, not by reading the source — a *guarded* probe inside a function is
+fine and wanted, since `python_rows` reports a missing tkinter on purpose), and none
+of the three may import `studio_chat` back. `studio_ui` is exempt from the first:
+`Pill` is a Canvas.
+
+**What is left of `studio_chat` is one class, and that is the real shape of it.**
+`Chat` is ~220 methods over ~3,700 lines. A mixin carve-up — `class Chat(SidebarMixin,
+TranscriptMixin, …)` — would scatter the text across files while every piece still
+reached into `self` state defined somewhere else, and would cost the one thing the
+single file currently buys: everything about the window is findable in one place.
+Do not do that. Further splitting should be real collaborator extraction, one at a
+time, each owning its own state and reached through a narrow interface — the
+animation engine (`_animate`/`_arm_anim`/`_anim_tick` over `anim`/`anim_timer`/
+`anim_frame`) is the cleanest candidate and would make an `Animator` that takes a
+widget to schedule on and a `report` callback for failures.
+
+**`studio_doctor.py` must not import tkinter.** It holds the layout of
+`%APPDATA%\StudioAssistant` (`settings_path`, `data_dir`, `error_log_path`,
+`tasks_dir`), the one error-log writer, and the diagnostics report — and the whole
+point of `python studio_chat.py --doctor` is that it answers "I clicked the shortcut
+and nothing happened", which includes a Python whose tkinter is broken or missing.
+Importing the GUI to ask what is wrong would fail for the reason being asked about.
+`studio_chat` re-exports `settings_path`, `error_log_path` and `log_error`, so the
+rest of the app still reaches for them where it always did; edit them in
+`studio_doctor`. `--doctor` is handled before the DPI call and before
+`claim_single_instance`, so it runs beside a copy that is already up, and its exit
+code is `worst()`: 0 fine, 1 worth a look, 2 broken.
+
+**The report is one function, rendered twice.** `doctor.report()` returns
+`[(section, [(label, value, role)])]` where the role is a palette name; `as_text`
+prints it with a mark per role for the console, and `Chat._paint_diagnostics` paints
+it with a tag per role for Help > Diagnostics. Two renderings, one set of facts, so
+the window and the console cannot drift. The probe does network I/O — a tailnet
+timeout is seconds — so the window opens saying "Checking…" and the report arrives on
+the queue as a `diagnostics` event, handled beside `icon` because it belongs to the
+installation rather than to a tab and must still land with every tab closed.
+`_paint_diagnostics` returns quietly when the window has been shut under it. Tag
+colours are copied out of the palette, so `_diag_tags` is called again from `_theme`,
+exactly like `_tool_tags`.
+
+**`Session.prefix_tokens` and `Session.window` are kept, not just used.** The warm-up
+measures the exact prefix (`usage.prompt_tokens`) and `_fit` knows the window the
+model was loaded with; the app acted on both and then forgot them, so the first thing
+anyone needs when a tab talks instead of calling a tool — prefix against window — was
+only ever visible in a note that had scrolled away. Diagnostics reports them per tab,
+and a tab with under `ROOM` left reads as an error, not a note.
+
+**Saved tasks are the user's work; the app never removes one by itself.** Every
+message checkpoints its tab into `tasks/<app>/<task-id>.json`, so that folder is the
+app's memory of what has been asked of it — and it was reachable only through a file
+dialog pointed at 32-character hex names, which is why nothing was ever resumed from
+it. File > Saved tasks… lists them newest first through `TaskRecord.summaries()`:
+what was asked (the first brief), when, how many steps, the recorded status. A file
+that will not parse is listed carrying its `problem` and offered no resume button
+rather than being hidden — silently dropping it is how someone comes to believe the
+app threw their work away. The conversation already on screen is filtered out, since
+resuming it would replace it with a checkpoint of itself. There is **no automatic
+pruning**: not on a timer, not to keep the folder tidy. Deleting is a per-task button
+that asks first. (Nineteen saved tasks were examined when this was written; every one
+held a real request. An age or count based sweep would have deleted work.)
+
+**The launchers must not name a Python by its install path.** `Studio Assist.cmd`
+pointed at `...\Programs\Python\Python312\pythonw.exe`, which is one Python upgrade
+away from a shortcut that does nothing at all when clicked — no window and no error,
+because `pythonw.exe` has no console to complain in. Both `.cmd` files now resolve
+`pyw`/`py` (the Windows Python launcher, in System32, which survives a version change)
+and fall back to `pythonw`/`python` on the PATH, and say what to install when neither
+is there.
 
 **The tab strip folds; it never overflows.** Seven labelled tabs are wider than the
 strip at the window's minimum size, and Tk's packer answers by pushing the last ones
@@ -549,6 +652,146 @@ window has focus, not the one you meant. It has already leaked a test sentence i
 the user's chat window mid-run. Test by constructing `Chat()` in-process and calling
 its handlers, and assert on widget geometry for layout. Screen-capturing the window
 to look at it is fine — that's read-only.
+
+**The app is called Studio Assist; the paths on disk are not, and must not be.**
+`APP_NAME` is the one place the displayed name lives — title bar, About, the "already
+running" box, the crash box. It is deliberately *not* in the header: Windows already
+shows the title on the taskbar and in Alt-Tab, and repeating it a line below bought
+nothing. The header's job is to say what the tab you are looking at is doing, so the
+status starts that row. A test asserts the name appears there no more. Four things deliberately keep the older spelling
+because they are identities rather than labels, and renaming them would orphan what is
+already written under them: `%LOCALAPPDATA%\StudioAssistant\` (settings, lessons, task
+records, the OpenCode workspace), `studio_assistant_error.log`, `studio-assistant.ico`,
+and the CEP panel's `ExtensionBundleId`. The panel's *display* name did change, so
+`python studio_premiere_mcp.py --install-panel` has to be re-run for the entry under
+*Window > Extensions* to read "Studio Assist Bridge"; until then the app's instructions
+name a menu item the installed panel does not have. The launcher is `Studio Assist.cmd`
+now, so a shortcut pointing at the old filename needs re-pointing.
+
+**Everything that moves runs off one tick, and only while something is happening.**
+`ANIM_MS`, `Chat.anim` (key → `draw(frame)`) and `_anim_tick` are the animator; nothing
+else may call `after` to animate. The reasoning is the queue pump's, plus one more:
+
+- *One timer.* A timer per animation is a timer per orphan on the way out, and Tk
+  names every one of them. `_anim_tick` stands the old tick down before arming the
+  next, because a hand-called tick — the tests are full of them — otherwise arms one
+  beside the live one. It respects `closing`, and `_quit` clears `anim` and stands
+  `anim_timer` down with the rest.
+- *Nothing escapes a frame.* `_draw_once` guards every paint, from the tick and from
+  `_animate`'s immediate first paint alike — that one matters more, because `_animate`
+  is called from `_apply_status` and friends, which run on every event, so an animation
+  that raised on registration took the event with it. A `tk.TclError` is a widget
+  destroyed under its own animation: ordinary, silent, dropped. Anything else goes to
+  `_report`.
+- *Nothing animates that is not happening.* The tick is armed only while `anim` has
+  something in it, so a settled window draws nothing — and `draw` returning `False`
+  drops it. Every animation must therefore be tied to a real in-progress state and be
+  able to end. Two were caught being unable to: the arc sweeping while any bridge was
+  unstarted (a bridge that never starts is a permanent animation), and the rail's dot
+  keyed on the bridge role rather than `Session.booting` (the host coming back resets
+  every stuck tab, and the ones you are not looking at wait to be selected — settled,
+  not busy). `test_a_settled_window_animates_nothing` is the guard; keep it passing.
+
+**A trailing ellipsis is the marker for "still happening".** A status, a button label
+or a caption ending in `ELLIPSIS` is one describing work in progress, and `_ellipsis`
+animates the dots; anything else is shown once and its animation dropped. The author
+writes `"working" + ELLIPSIS` at the point where they know that, and nothing else has
+to be told — no fourth element on the status tuple, no list of phrases to keep in sync.
+The literal character never reaches a label. New status for something in flight: end it
+with `ELLIPSIS` and it animates for free.
+
+**`blend()` builds both channel lists eagerly, and the reason is not style.** A
+generator expression per colour reads better and is wrong: it closes over the
+comprehension's loop variable, so by the time `zip` draws from either one both yield
+the *second* colour. Every blend in the window then silently came out as its second
+argument — the dots stopped pulsing, the placeholder's sheen vanished and the arc's
+ghost went the colour of the panel, with no error anywhere. A test pins the midpoints.
+
+**Drawn canvases are repainted on a theme switch, never reconfigured** — `arcs` joins
+`dot_role` and `marks` in `_forget` and `_theme` for exactly the reason those exist. An
+animation is the exception that needs no hook: its `draw` reads `self.C` live, so it
+picks the new palette up on its next frame by itself.
+
+**Nothing in this window is square, and Tk cannot bend a widget.** A Frame, a
+Button and an Entry are rectangles; the only thing that curves is a smoothed polygon
+on a Canvas. So every rounded surface in the app is the same construction — a canvas
+that draws the shape, with the real widgets in a frame placed on top of it through
+`create_window`, and a `paint()` the canvas's or the frame's `<Configure>` calls:
+the composer's outline, a tab chip (`_make_tab`), a rail row's hover (`_app_row`), an
+attachment chip, the question form's card, a text field (`_entry`), a Preferences
+theme card. Three rules come with it:
+
+- *The frame must clear the curve.* A corner of radius `r` bulges `r(1 - 1/√2)` ≈
+  `0.29r` past the corner, so the inset has to beat that or the frame's square corners
+  poke out of the shape and the whole thing looks broken rather than round. Each site
+  names its own `PAD` and `R`; the tab's are `_metrics`' `tab_pad` / `tab_r`, because
+  `_fit_tabs` has to measure against the same number.
+- *The inset is height, and height adds up.* Nine rail rows at four pixels a side
+  pushed the last one off the rail. Three is enough, and the gap it leaves between
+  rows replaced the `pady` they used to be packed with.
+- *It has to be repainted on a theme switch.* `_theme` reconfigures widgets, which
+  does nothing for a colour plotted into a canvas item. Tab chips go through
+  `_paint_tab`, rail rows through `_build_apps`; everything else registers with
+  `_repaint_on_theme`, swept by widget in `_forget` because chips are rebuilt on every
+  attach and every send. A picture's rounded corners are the sharp case: they are the
+  background painted over the image (Tk will not clip a PhotoImage to a shape and it
+  has no alpha to mask with), so a switch without a repaint leaves four blots of the
+  old palette on every picture in the transcript.
+
+**Every button is a `Pill`, through `Chat._button`.** `PILL_ROLES` holds the four
+kinds — `accent`, `quiet`, `option`, `ghost` — as the `(bg, fg, hover, disabled,
+disabled fg)` tuple `Pill.paint` reads. A `Pill` is a canvas, so it is repainted from
+`self.pills` rather than reconfigured, it answers `cget("text")`, `set(text=, state=)`
+and `invoke()` the way the Button it replaced did, and `anchor="w"` makes it a
+full-width row that reads from the left and wraps — that is what the question form's
+options are. A test reads both source files and fails on a literal `tk.Button(`.
+
+**The bridges' mark is drawn, not a glyph.** MDL2's chain link says "two things
+fastened together", which is not what a bridge is or what that row reports, and a font
+glyph cannot show a span going up. `_arc` plots it: shallow on purpose, because at 18×13
+a tall one reads as a chevron, and the piers and abutments that would fix that only
+thicken the middle — both were tried at size. `_arc_state` draws it across once when the
+state changes and then settles.
+
+## Processes: nothing outlives the app
+
+Every subprocess the app keeps — an MCP bridge, a COM bridge's PowerShell worker — is
+started with `studio_procs.spawn()`, never a bare `Popen`. Read the module docstring
+before changing that; the short of it:
+
+- **Windows does not kill a dead parent's children, and `Popen.kill()` ends one process,
+  not a tree.** The After Effects bridge is four deep (`cmd /c npx` → `node npx-cli` →
+  `cmd /c after-effects-mcp` → `node server.js`); killing the top left the `node` at the
+  bottom running with nobody on its pipes. So did a crash, a Task Manager kill, or a test
+  run stopped half way. Leftovers piled up across a day of development.
+- **So each child gets its own job object** with `KILL_ON_JOB_CLOSE`. It is created
+  suspended, put in the job, then resumed, so even a grandchild started in its first
+  instant is inside. `Child.stop(grace)` closes stdin (a bridge's cue to exit), waits,
+  then terminates the job — the whole tree. If this process dies any other way, the
+  kernel closes the job handle and does the same. `tests/test_procs.py` kills a parent
+  outright and checks the grandchild is gone.
+- **Only what we started is touched.** Nothing is found or killed by name. The apps are
+  not our children: `launch()` starts them detached with a plain `Popen`, on purpose,
+  because After Effects must outlive the window; Photoshop and Illustrator are started
+  by COM's own service. Neither is ever in a job of ours. The OpenCode container is left
+  running on quit as documented under *The app in a box*.
+- **Quitting is parallel and off-screen.** `_quit` withdraws the window, closes every
+  tab's bridge at once with `QUIT_GRACE_S` between them, then `procs.stop_all(0)` for
+  anything left. One tab at a time, each allowed seconds, was a frozen window. Ctrl+C,
+  Ctrl+Break and SIGTERM go through the same `_quit` (`procs.on_shutdown`); in the CLI
+  they raise `KeyboardInterrupt` so its `finally: mcp.close()` runs. `atexit` stops what
+  is left on any interpreter exit.
+- **One copy at a time** is `claim_single_instance()`: a loopback port (57733) held for
+  the life of the process, released by the OS however it ends, so there is no stale lock
+  file to clear after a crash.
+- **`ComHost` makes its temp folder on first use and removes it on `close()`** (also run
+  at exit). It used to make it in `__init__`, and each bridge module builds its host at
+  import — every test run and every bridge start left a `studio_com_*` folder in `%TEMP%`.
+- **Idle is cheap.** The event pump polls every `DRAIN_MS` while events flow or a tab is
+  busy and every `DRAIN_IDLE_MS` otherwise; the animator's timer is armed only while
+  something animates. Tk draws with GDI: the window uses no GPU.
+- **The Premiere panel closes its server on `unload`**, so reloading the panel does not
+  find 7787 held by the page it replaced. It has no timers; it costs nothing idle.
 
 ## Tabs and sessions
 
@@ -901,8 +1144,32 @@ click the call as the model made it - every argument whole, so a `run_jsx` /
   present: `view.get` returns it, `bbox` is `None` for it, and a `see("end")`
   after an expand near the fold is what keeps the header on screen.
 - **Per-row tags go with the text.** `_clear_view` deletes `call:`, `body:`,
-  `mark:` and `status:` tags and empties `open_calls`; use it, not a bare
-  `delete("1.0", "end")`, wherever a transcript is emptied.
+  `mark:`, `status:` and `stage:` tags, empties `open_calls`, and stands down the
+  animations of every widget embedded in the transcript before the delete destroys
+  them; use it, not a bare `delete("1.0", "end")`, wherever a transcript is emptied.
+- **What the row is waiting for, it says.** The `status:<n>` range holds an embedded
+  `_dots` canvas rather than a static `…`: a call that takes a minute used to look
+  exactly like one that had hung. `_show_result` stands its animation down and
+  deletes the range, which is also what destroys the widget. Embedded widgets go in
+  through `_embed`, which tags the one character they occupy — a `window_create`
+  takes no tags of its own.
+- **A tool whose name says it makes a picture gets the space that picture will fill.**
+  `makes_a_picture()` decides, generously and on purpose: guessing wrong costs nothing
+  either way, because a placeholder nothing arrives for is taken down by
+  `_clear_stages` when the call returns, and a generator not guessed simply appears
+  without one. `_stage` draws it (a sheen sweeping a `card` panel — see `blend()`
+  above for why that was invisible for a while); `_take_stage` removes it and says
+  *where*, so `_show_preview` lands the picture exactly where its space was held.
+  A preview is a `_reveal` canvas wiped in from the left, not a bare `image_create`:
+  Tk has no alpha to fade, but it can uncover. The session still has to keep the
+  `PhotoImage` in `preview_images` or Tk drops it when it is collected.
+- **The dots between turns are `Session.thinking`.** The longest silence in a run is
+  between a tool result and whatever the model does next, and it used to look most
+  like nothing happening. `_begin_thinking` is idempotent and `_end_thinking` deletes
+  from the mark it laid down, so the transcript is byte-for-byte what it was. They sit
+  at the end, so *every* event that writes takes them down first —
+  `WRITES_TO_TRANSCRIPT` is that list, checked at the top of `_handle`'s dispatch, and
+  a new transcript-writing event kind belongs in it.
 
 ## Tools the model makes for itself
 
@@ -1041,6 +1308,8 @@ python studio_mcp.py check --app after-effects --call   # ...and call its harmle
 python studio_mcp.py check --app resolve --snapshot tests/contracts/resolve.json
 python studio_mcp.py snapshot --app resolve tests/contracts/resolve.json  # re-record
 python studio_chat.py                        # the real app (console attached)
+python studio_chat.py --doctor               # no window, no lock: runs beside a live copy
+python studio_doctor.py                      # the same report, on its own
 ```
 
 `tests/` never touches the network, the creative apps, Docker, or the model — the

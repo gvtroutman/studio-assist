@@ -297,8 +297,8 @@ class TestPromisedWork(unittest.TestCase):
 
     def test_a_promise_is_nudged_once_and_the_call_then_runs(self):
         ex = self.setup_run([answer(text=self.PROMISE), answer(call("get_comp")),
-                             answer(text="Here it is: C:\out\a.png")])
-        self.assertEqual(ex.run(self.messages), "Here it is: C:\out\a.png")
+                             answer(text=r"Here it is: C:\out\a.png")])
+        self.assertEqual(ex.run(self.messages), r"Here it is: C:\out\a.png")
         self.assertEqual(self.messages[3]["role"], "user")
         self.assertIn("called no tool", self.messages[3]["content"])
         self.assertEqual(self.bridge.call_tool.call_count, 1)
@@ -611,3 +611,58 @@ class TestSessionRouting(unittest.TestCase):
         chat.Chat._handle(fake, "token", old.event_id, "old result")
         fake._write.assert_not_called()
         self.assertNotEqual(old.event_id, new.event_id)
+
+
+class TestSavedTaskSummaries(unittest.TestCase):
+    """What the Saved tasks window reads. A folder of 32-character hex names
+    is not a list anyone can choose from; these are the facts that make it one."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def _save(self, brief, steps=0, status="working", name=None):
+        record = tasks.TaskRecord()
+        record.app_id = "after-effects"
+        record.briefs = [brief]
+        record.journal = [{"call": "x", "status": "ok"} for _ in range(steps)]
+        record.status = status
+        path = os.path.join(self.dir, (name or record.id) + ".json")
+        record.save(path, [{"role": "system", "content": "s"}])
+        return path
+
+    def test_it_reads_back_what_was_asked_and_how_far_it_got(self):
+        self._save("make a pic of a duck", steps=13, status="Stopped.")
+        got = tasks.TaskRecord.summaries(self.dir)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["brief"], "make a pic of a duck")
+        self.assertEqual(got[0]["steps"], 13)
+        self.assertEqual(got[0]["status"], "Stopped.")
+        self.assertGreater(got[0]["when"], 0)
+
+    def test_newest_first(self):
+        first = self._save("the older one")
+        second = self._save("the newer one")
+        os.utime(first, (1_000_000, 1_000_000))
+        os.utime(second, (2_000_000, 2_000_000))
+        self.assertEqual([t["brief"] for t in tasks.TaskRecord.summaries(self.dir)],
+                         ["the newer one", "the older one"])
+
+    def test_a_file_that_will_not_parse_is_listed_with_its_problem(self):
+        """Hiding it is how a user comes to believe the app threw their work
+        away; the window shows it and offers no resume."""
+        with open(os.path.join(self.dir, "broken.json"), "w") as f:
+            f.write("{not json")
+        got = tasks.TaskRecord.summaries(self.dir)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0]["problem"])
+        self.assertEqual(got[0]["brief"], "")
+
+    def test_a_missing_folder_is_no_tasks_rather_than_a_failure(self):
+        self.assertEqual(tasks.TaskRecord.summaries(
+            os.path.join(self.dir, "never-made")), [])
+
+    def test_only_json_is_listed(self):
+        self._save("a real one")
+        with open(os.path.join(self.dir, "notes.txt"), "w") as f:
+            f.write("not a task")
+        self.assertEqual(len(tasks.TaskRecord.summaries(self.dir)), 1)

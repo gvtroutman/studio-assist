@@ -442,7 +442,7 @@ class TestGuiForms(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "app", None) is not None:
-            cls.app.destroy()
+            cls.app._quit()               # stands the timers down; destroy does not
         eng.installed_apps = cls._real_installed
         eng.loaded_instances, eng.fit_model = cls._real_fit
         if cls._real_settings is None:
@@ -521,8 +521,10 @@ class TestGuiForms(unittest.TestCase):
         editor.delete("1.0", "end")
         editor.insert("1.0", "# Method & Form\nBrand films, 25 fps, sentence case.")
         win = self.app.windows["studio"]
+        # Every button in this window is a `Pill` now - a drawn canvas, not a
+        # Tk Button - and `invoke` is the interface both answer to.
         for child in win.winfo_children():
-            if isinstance(child, self.mod.tk.Button):
+            if isinstance(child, (self.mod.tk.Button, self.mod.Pill)):
                 child.invoke()
         with open(self.app._studio_path(), encoding="utf-8") as f:
             self.assertIn("sentence case", f.read())
@@ -534,7 +536,7 @@ class TestGuiForms(unittest.TestCase):
         editor.delete("1.0", "end")
         editor.insert("1.0", "# Changed\nNow 24 fps.")
         for child in win.winfo_children():
-            if isinstance(child, self.mod.tk.Button):
+            if isinstance(child, (self.mod.tk.Button, self.mod.Pill)):
                 child.invoke()
         self.assertNotIn("24 fps", self.s.messages[0]["content"])
         self.app._on_new()
@@ -549,7 +551,7 @@ class TestGuiForms(unittest.TestCase):
         self.assertIn("you said so", text)
         win = self.app.windows[("lessons", "after-effects")]
         buttons = [w for w in self.app.lessons_view.winfo_children()
-                   if isinstance(w, self.mod.tk.Button)]
+                   if isinstance(w, (self.mod.tk.Button, self.mod.Pill))]
         self.assertEqual(len(buttons), 1)
         buttons[0].invoke()
         self.assertEqual(self.s.notebook.lessons, [])

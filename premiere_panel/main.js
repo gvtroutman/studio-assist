@@ -94,6 +94,11 @@
     setStatus("cannot listen on 127.0.0.1:" + port + " - " + e.message, "err");
     log("Is another Premiere, or another panel, already using the port? Set STUDIO_PREMIERE_PORT to move both ends.", "err");
   });
+  // Give the port back when the panel goes: a reload, or closing and
+  // reopening the panel, otherwise found 7787 still held by the old page.
+  window.addEventListener("unload", function () {
+    try { server.close(); } catch (e) {}
+  });
   server.listen(port, "127.0.0.1", function () {
     setStatus("ready", "ok");
     $addr.textContent = "127.0.0.1:" + port;
