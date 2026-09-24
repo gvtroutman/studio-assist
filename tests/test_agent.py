@@ -331,16 +331,19 @@ class TestPerAppModel(unittest.TestCase):
             if not app.models:
                 self.assertEqual(app.model_for(["x", "big"], "big"), ("big", ""))
 
-    def test_comfyui_shares_the_model_the_other_tabs_use(self):
-        """The small-model rule made the tab unusable: qwen3-1.7b under the
-        ComfyUI briefing and nineteen tools described the generation it was
-        about to make and never called it, or was cut off. The shared 30B
-        made the picture. A host that cannot hold both pins one with
-        STUDIO_MODEL_COMFYUI."""
+    def test_comfyui_runs_on_a_small_model_that_calls_tools(self):
+        """qwen3-1.7b under the ComfyUI briefing described the generation it
+        was about to make and never called it, so it is never the choice. The
+        9B, tested live, called comfy_generate with a photographer's prompt,
+        and leaves the shared GPU to the pictures. Not served -> the shared
+        model; STUDIO_MODEL_COMFYUI still pins one."""
         self.comfy.models = self._models
-        self.assertEqual(self.comfy.models, [])
-        self.assertEqual(self.comfy.model_for(["big-30b", "qwen3-1.7b"], "big-30b"),
-                         ("big-30b", ""))
+        self.assertNotIn("qwen3-1.7b", self.comfy.models)
+        self.assertEqual(self.comfy.model_for(["big-30b", "qwen3-1.7b"], "big-30b")[0],
+                         "big-30b")
+        self.assertEqual(self.comfy.model_for(
+            ["big-30b", "qwen3.5-9b-deepseek-v4-flash"], "big-30b")[0],
+            "qwen3.5-9b-deepseek-v4-flash")
 
 
 class TestDraftChoice(unittest.TestCase):
@@ -2748,6 +2751,31 @@ class TestGui(unittest.TestCase):
             self.app.windows[("tasks", s.id)].destroy()
             s.record.briefs = []
 
+    def test_an_empty_tab_shows_its_app_until_the_first_message(self):
+        """No suggested prompts: the app's name, centred, until something is said."""
+        s = self.app.cur()
+        self.app._on_new()
+        self.app.update_idletasks()
+        self.assertTrue(s.hero.winfo_manager())
+        names = [w.cget("text") for w in s.hero.winfo_children()
+                 if isinstance(w, tk.Label)]
+        self.assertIn(s.app.name, names)
+        self.assertNotIn("Try:", s.view.get("1.0", "end"))
+        self.app._hide_hero(s)            # as _send does
+        self.assertFalse(s.hero.winfo_manager())
+        self.app._on_new()
+        self.assertTrue(s.hero.winfo_manager())
+
+    def test_history_is_a_header_button_for_every_tab(self):
+        s = self.app.cur()
+        self._save_a_task(s, "an older conversation")
+        try:
+            self.app.btn_hist.invoke()
+            self.assertIn("an older conversation",
+                          self.app.tasks_view.get("1.0", "end"))
+        finally:
+            self.app.windows[("tasks", s.id)].destroy()
+
     def test_a_task_that_will_not_parse_is_shown_and_cannot_be_resumed(self):
         """Hiding it is how someone comes to believe the app lost their work."""
         s = self.app.cur()
@@ -2890,18 +2918,26 @@ class TestGui(unittest.TestCase):
 
     def test_a_trailing_ellipsis_is_what_makes_a_label_animate(self):
         """The whole protocol: text ending in one is text describing something
-        still happening, and the dots count. Anything else is shown once and
+        still happening, and the dots jump. Anything else is shown once and
         its animation dropped, which is how a finished state stops moving."""
         shown = []
-        self.app._ellipsis("probe", "working" + self.mod.ELLIPSIS, shown.append)
+        self.app._ellipsis("probe", "working" + self.mod.ELLIPSIS,
+                           lambda t, lift: shown.append((t, lift)))
         self.assertIn("probe", self.app.anim)
-        for _ in range(3 * self.mod.ELLIPSIS_FRAMES + 1):
+        for _ in range(2 * self.mod.ui.JUMP_FRAMES + 1):
             self.app._anim_tick()
-        self.assertTrue(all(t.startswith("working.") for t in shown), shown[:4])
-        self.assertEqual({t[len("working"):] for t in shown}, {".", "..", "..."})
-        self.app._ellipsis("probe", "ready", shown.append)
+        self.assertEqual({t for t, _lift in shown}, {"working"})
+        lifts = [lift for _t, lift in shown]
+        self.assertTrue(all(len(l) == 3 and all(0 <= y <= 1 for y in l) for l in lifts))
+        # Each dot goes all the way up and back down, and not in step.
+        for i in range(3):
+            heights = [l[i] for l in lifts]
+            self.assertLess(min(heights), 0.05)
+            self.assertGreater(max(heights), 0.95)
+        self.assertTrue(any(l[0] != l[1] for l in lifts))
+        self.app._ellipsis("probe", "ready", lambda t, lift: shown.append((t, lift)))
         self.assertNotIn("probe", self.app.anim)
-        self.assertEqual(shown[-1], "ready")
+        self.assertEqual(shown[-1], ("ready", None))
 
     def test_every_status_the_window_shows_is_a_role_and_never_a_bare_ellipsis(self):
         """The header renders the dots itself, so the literal character must

@@ -6,6 +6,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -101,6 +102,44 @@ class TestExecutor(unittest.TestCase):
         ex = self.setup_run([answer(call("timeline", {"action": "invented"})), answer(text="Unavailable")], specs=[s])
         ex.run(self.messages)
         self.bridge.call_tool.assert_not_called()
+
+    def test_an_answer_beside_only_a_record_update_ends_the_turn(self):
+        """The model answers and notes it in the task record in one step.
+        Asked for another, it writes the same answer again: the user saw it
+        twice. The answer is final; the echo is never requested."""
+        ex = self.setup_run([answer(call("studio_task_update", {"issues": ["none"]}),
+                                    text="I don't have a religion."),
+                             answer(text="I don't have a religion.")])
+        self.assertEqual(ex.run(self.messages), "I don't have a religion.")
+        self.assertEqual(len(self.llm.requests), 1)
+        self.assertTrue(ex.record.status.startswith("response complete"))
+
+    def test_a_promise_beside_a_record_update_still_continues(self):
+        ex = self.setup_run([answer(call("studio_task_update", {"plan": ["make it"]}),
+                                    text="I'll make the comp now."),
+                             answer(call("get_comp")), answer(text="There it is.")])
+        self.assertEqual(ex.run(self.messages), "There it is.")
+        self.assertEqual(len(self.llm.requests), 3)
+
+    def test_stop_while_streaming_ends_the_reply_there(self):
+        """Stop pressed mid-reply: the rest of it never reaches the tab, and
+        nothing it asked for runs."""
+        cancel = threading.Event()
+
+        class Streaming(FakeLLM):
+            def stream(self, messages, tools, on_text):
+                on_text("First half")
+                cancel.set()
+                on_text(" second half")
+                return answer(call("create_comp"), text="First half second half")
+
+        ex = self.setup_run([], cancel=cancel)
+        ex.llm = Streaming([])
+        self.assertIn("Stopped mid-reply", ex.run(self.messages))
+        tokens = [p for k, p in self.events if k == "token"]
+        self.assertEqual(tokens, ["First half"])
+        self.bridge.call_tool.assert_not_called()
+        self.assertEqual(self.messages[-1]["role"], "user")
 
     def test_stop_during_batch_skips_remaining_calls_and_repairs_history(self):
         cancel = threading.Event()
@@ -583,6 +622,36 @@ class TestTransport(unittest.TestCase):
         client._send = Mock()
         with self.assertRaises(EOFError):
             client.request("tools/call", timeout=100)
+
+    def test_progress_keeps_a_long_call_alive_and_silence_does_not(self):
+        """A ComfyUI render that took four minutes was abandoned at the call's
+        three-minute timeout while the bridge was reporting progress every
+        second. Progress on our token restarts the timeout; silence does not."""
+        def client_with(feed):
+            client = eng.MCPClient.__new__(eng.MCPClient)
+            client._lock, client._request_lock = threading.Lock(), threading.Lock()
+            client._id = 0
+            client._inbox = queue.Queue()
+            client.quiet = True
+            client._send = Mock()
+            threading.Thread(target=feed, args=(client._inbox,), daemon=True).start()
+            return client
+
+        def busy(inbox):
+            for _ in range(8):
+                time.sleep(0.05)
+                inbox.put({"jsonrpc": "2.0", "method": "notifications/progress",
+                           "params": {"progressToken": 1, "progress": 1}})
+            inbox.put({"jsonrpc": "2.0", "id": 1, "result": {"content": []}})
+        self.assertEqual(client_with(busy).request("tools/call", timeout=0.2), {"content": []})
+
+        def someone_elses(inbox):
+            for _ in range(8):
+                time.sleep(0.05)
+                inbox.put({"jsonrpc": "2.0", "method": "notifications/progress",
+                           "params": {"progressToken": 99, "progress": 1}})
+        with self.assertRaises(TimeoutError):
+            client_with(someone_elses).request("tools/call", timeout=0.2)
 
 
 class TestSchemaValidation(unittest.TestCase):

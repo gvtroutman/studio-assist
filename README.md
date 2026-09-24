@@ -240,8 +240,9 @@ execution stops with an explanation instead of silently clipping the contract.
   dispatches. The current network request or app operation may need to return or
   time out first; completed edits remain in the creative app.
 - **File → Task progress:** inspect the saved brief, plan, checks and issues.
-- **File → Resume saved task:** reopen an earlier task for the active app, then
-  send a message to continue. The agent must inspect the current project first.
+- **History (header button, Ctrl+H):** every app tab keeps its own past
+  conversations. Open one to read it and send a message to continue; the agent
+  must inspect the current project first.
 - **Bridges → Choose capabilities for current tab:** enable additional groups,
   such as AE asset import or Resolve Fusion. Default groups remain enabled because
   the app's prompt depends on them. Applying changes warms the selected tool set.

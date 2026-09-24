@@ -41,7 +41,18 @@ OUTPUT_DIR = os.environ.get(
     os.path.join(os.path.expanduser("~"), "Pictures", "ComfyUI"))
 
 MAX_INLINE_IMAGES = 4        # image content blocks per result; the rest are paths
-MAX_WAIT = 600               # seconds a generate/wait call will block for
+MAX_WAIT = 1200              # seconds a generate/wait call will block for
+DEFAULT_WAIT = 900           # ...when the caller does not say. A starved GPU takes minutes.
+# Below this much free VRAM, ComfyUI streams model weights from system RAM every
+# step. On the LLM PC that is what LM Studio's resident models leave it, and it
+# is most of the time a picture takes; each result says so rather than hide it.
+LOW_VRAM = 8e9
+# The text encoder runs once per picture; the diffusion model runs every step.
+# On the shared 24 GB card, keeping the 8 GB encoder in VRAM beside the 12 GB
+# model and the tab's LLM is what starved the rest, so it runs on the CPU from
+# the LLM PC's 128 GB of RAM. COMFYUI_ENCODER_ON_GPU=1 puts it back.
+ENCODER_ON_CPU = os.environ.get("COMFYUI_ENCODER_ON_GPU", "") not in ("1", "true", "yes")
+TILES = {"tile_size": 1024, "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}
 CLIENT_ID = uuid.uuid4().hex
 
 # ComfyUI's model folders, as /models/<folder> names them. `kind` on
@@ -56,17 +67,37 @@ SAMPLERS = ["euler", "euler_cfg_pp", "euler_ancestral", "heun", "dpm_2", "dpm_2_
 SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple",
               "ddim_uniform", "beta", "linear_quadratic", "kl_optimal"]
 # CLIPLoader's `type`: which text encoder family a split model's encoder is.
-ENCODER_TYPES = ["lumina2", "qwen_image", "flux2", "chroma", "sd3", "wan", "hidream",
+ENCODER_TYPES = ["lumina2", "krea2", "qwen_image", "flux2", "chroma", "sd3", "wan", "hidream",
                  "pixart", "cosmos", "ltxv", "mochi", "hunyuan_image", "stable_diffusion"]
 
 # Split models - a diffusion model, a text encoder and a VAE as three files
 # rather than one checkpoint - each want their own sampling recipe, and the
 # wrong one gives noise rather than an error. Matched on the diffusion model's
-# filename, first hit wins; anything the caller passes overrides.
+# filename, first hit wins; anything the caller passes overrides. The recipes
+# are ComfyUI's own templates for each model (image_z_image_turbo,
+# image_krea2_turbo_t2i_int8, image_qwen_image_edit_2509).
+#
+# Order is also preference: with nothing named, text-to-image uses the first
+# family installed, so the most photographic model leads. `edit` models take a
+# picture and an instruction; they are never the text-to-image default - the
+# Qwen edit model was, and made every "draw a duck" a slow, soft 20-step
+# double-CFG render. `hires` is the detail pass (see build_graph).
 FAMILIES = [
     ("z_image", {"label": "Z-Image Turbo", "encoder_type": "lumina2", "encoder": "qwen_3",
                  "vae": "ae.safetensors", "shift": 3.0, "steps": 8, "cfg": 1.0,
-                 "sampler": "res_multistep", "scheduler": "simple"}),
+                 "sampler": "res_multistep", "scheduler": "simple",
+                 "latent": "EmptySD3LatentImage", "photo": True,
+                 "hires": {"scale": 1.5, "denoise": 0.33, "steps": 5,
+                           "sampler": "dpmpp_2m_sde", "scheduler": "beta"}}),
+    ("krea2", {"label": "Krea 2 Turbo", "encoder_type": "krea2", "encoder": "qwen3vl",
+               "vae": "qwen_image_vae.safetensors", "shift": None, "steps": 8, "cfg": 1.0,
+               "sampler": "euler", "scheduler": "simple", "latent": "EmptyLatentImage",
+               "hires": {"scale": 1.5, "denoise": 0.3, "steps": 6,
+                         "sampler": "euler", "scheduler": "simple"}}),
+    ("qwen_image_edit", {"label": "Qwen-Image-Edit", "edit": True, "encoder_type": "qwen_image",
+                         "encoder": "qwen_2.5_vl", "vae": "qwen_image_vae.safetensors",
+                         "shift": 3.0, "steps": 20, "cfg": 4.0, "sampler": "euler",
+                         "scheduler": "simple", "lightning": "lightning", "fast_steps": 4}),
     ("qwen_image", {"label": "Qwen-Image", "encoder_type": "qwen_image", "encoder": "qwen_2.5_vl",
                     "vae": "qwen_image_vae.safetensors", "shift": 3.1, "steps": 20,
                     "cfg": 2.5, "sampler": "euler", "scheduler": "simple"}),
@@ -81,9 +112,35 @@ GENERIC_FAMILY = {"label": "split model", "encoder_type": "stable_diffusion", "e
                   "vae": None, "shift": None, "steps": 20, "cfg": 6.0, "sampler": "euler",
                   "scheduler": "normal"}
 
+# Realism. A photographic prompt gets a closing sentence that holds the model to
+# a camera's rendering - the thing every "make it realistic" request is after -
+# unless it already names another medium. And a checkpoint run at real CFG gets
+# a negative against the looks that read as generated, when none is given.
+# Z-Image and Krea at cfg 1 ignore a negative, so for them the sentence is it.
+PHOTO_SUFFIX = ("Photorealistic photograph with true-to-life colour, natural light and "
+                "shadow, real-world textures and fine detail, sharp focus.")
+PHOTO_NEGATIVE = ("illustration, painting, drawing, cartoon, anime, CGI, 3d render, "
+                  "plastic skin, airbrushed, oversaturated, overexposed, blurry, lowres, "
+                  "jpeg artifacts, deformed hands, extra fingers, watermark, text")
+NOT_PHOTO = ("illustration", "painting", "painted", "drawing", "sketch", "cartoon", "anime",
+             "manga", "comic", "watercolor", "watercolour", "oil paint", "vector", "logo",
+             "icon", "pixel art", "3d render", "low poly", "claymation", "line art",
+             "charcoal", "pencil", "ink ", "sticker", "flat design", "isometric")
+
+
+def wants_photo(prompt):
+    low = prompt.lower()
+    return not any(k in low for k in NOT_PHOTO)
+
 
 class ComfyError(Exception):
     """Anything ComfyUI, or the network in front of it, refuses."""
+
+
+class Unreachable(ComfyError):
+    """No answer at all. While ComfyUI stages a 20 GB model through system RAM
+    its HTTP server stops answering for half a minute or more, so a wait
+    treats this as "busy", not "gone"."""
 
 
 # ------------------------------------------------------------------- HTTP
@@ -99,12 +156,12 @@ def _open(req, timeout):
             detail = body
         raise ComfyError("ComfyUI answered HTTP %d: %s" % (e.code, _explain(detail)))
     except urllib.error.URLError as e:
-        raise ComfyError(
+        raise Unreachable(
             "Cannot reach ComfyUI at %s (%s). It has to be running on the LLM PC, "
             "started with --listen so it accepts connections from this machine."
             % (COMFY_URL, e.reason))
     except OSError as e:
-        raise ComfyError("Cannot reach ComfyUI at %s (%s)." % (COMFY_URL, e))
+        raise Unreachable("Cannot reach ComfyUI at %s (%s)." % (COMFY_URL, e))
 
 
 def _explain(detail):
@@ -223,33 +280,48 @@ def is_known_family(name):
     return family_of(name)["label"] != GENERIC_FAMILY["label"]
 
 
+def is_edit_model(name):
+    return bool(family_of(name).get("edit"))
+
+
+def family_rank(name):
+    low = (name or "").lower()
+    for i, (key, _) in enumerate(FAMILIES):
+        if key in low:
+            return i
+    return len(FAMILIES)
+
+
 def plan_model(a):
     """
-    What to load, when the caller names nothing. A real all-in-one checkpoint is
-    preferred; but a checkpoint whose name is a non-generative model (a lone
-    sam3.1, an upscaler) is skipped in favour of a split model that has a known
-    recipe, because such a checkpoint cannot make a picture and picking it fails
-    every request. Explicit `checkpoint`/`diffusion_model` arguments always win.
+    What to load, when the caller names nothing. A split model with a known
+    recipe comes first, the most photographic family first - Z-Image Turbo
+    out-draws any SD-era checkpoint for realism, at 8 steps. Then a real
+    all-in-one checkpoint; one whose name is a non-generative model (a lone
+    sam3.1, an upscaler) is skipped, because it cannot make a picture and
+    picking it fails every request. Edit models are never the default: they
+    need a picture to edit. Explicit `checkpoint`/`diffusion_model` always win.
     """
     if a.get("checkpoint"):
         return {"kind": "checkpoint", "checkpoint": a["checkpoint"], "label": a["checkpoint"]}
     unet = a.get("diffusion_model")
     if not unet:
         ckpts = list_models("checkpoints")
-        unets = list_models("diffusion_models") or list_models("unet")
+        unets = [u for u in (list_models("diffusion_models") or list_models("unet"))
+                 if not is_edit_model(u)]
         good = [c for c in ckpts if is_generative_checkpoint(c)]
-        known = [u for u in unets if is_known_family(u)]
-        if good:                      # a plausible all-in-one checkpoint
-            return {"kind": "checkpoint", "checkpoint": good[0], "label": good[0]}
+        known = sorted((u for u in unets if is_known_family(u)), key=family_rank)
         if known:                     # a split model we have a working recipe for
             unet = known[0]
+        elif good:                    # a plausible all-in-one checkpoint
+            return {"kind": "checkpoint", "checkpoint": good[0], "label": good[0]}
         elif unets:                   # any diffusion model, generic recipe
             unet = unets[0]
         elif ckpts:                   # last resort: a checkpoint that looked unusable
             return {"kind": "checkpoint", "checkpoint": ckpts[0], "label": ckpts[0]}
         else:
-            raise ComfyError("ComfyUI has no checkpoints and no diffusion models installed; "
-                             "nothing can generate.")
+            raise ComfyError("ComfyUI has no checkpoints and no text-to-image diffusion "
+                             "models installed; nothing can generate.")
     fam = family_of(unet)
     encoders = list_models("text_encoders") or list_models("clip")
     vaes = list_models("vae")
@@ -266,15 +338,104 @@ def plan_model(a):
     return plan
 
 
+def new_seed(a):
+    seed = a.get("seed")
+    return random.randint(0, 2**32 - 1) if seed is None or seed < 0 else seed
+
+
+def load_split(g, plan, ids=("1", "10", "11", "12"), lora=None):
+    """UNET (+ LoRA) + text encoder + VAE (+ shift) into g, under `ids`;
+    returns the (model, clip, vae) links."""
+    unet, enc, vae, shift = ids
+    g[unet] = {"class_type": "UNETLoader", "inputs": {
+        "unet_name": plan["diffusion_model"], "weight_dtype": "default"}}
+    g[enc] = {"class_type": "CLIPLoader", "inputs": {
+        "clip_name": plan["text_encoder"], "type": plan["encoder_type"]}}
+    if ENCODER_ON_CPU:
+        g[enc]["inputs"]["device"] = "cpu"
+    g[vae] = {"class_type": "VAELoader", "inputs": {"vae_name": plan["vae"]}}
+    model = [unet, 0]
+    if lora:
+        g["9"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": model, "lora_name": lora, "strength_model": 1.0}}
+        model = ["9", 0]
+    if plan.get("shift") is not None:
+        g[shift] = {"class_type": "ModelSamplingAuraFlow",
+                    "inputs": {"model": model, "shift": plan["shift"]}}
+        model = [shift, 0]
+    return model, [enc, 0], [vae, 0]
+
+
+def detail_pass(g, pixels, model, positive, negative, vae, recipe, seed, first="13"):
+    """
+    The hi-res detail pass: upscale the decoded picture with lanczos, encode it
+    and resample the last third of the schedule at the larger size. The model
+    redraws pores, fabric weave, hair and foliage at the resolution they are
+    seen at, instead of the soft, smeared micro-detail a 1-megapixel sample
+    leaves - the single biggest step from "AI picture" to photograph. This is
+    ComfyUI's own Z-Image upscaler recipe, less its ESRGAN model. Node ids
+    start at `first`; returns the link to the final pixels.
+    """
+    n = int(first)
+    up, enc, samp, dec = (str(n + i) for i in range(4))
+    g[up] = {"class_type": "ImageScaleBy", "inputs": {
+        "image": pixels, "upscale_method": "lanczos", "scale_by": recipe["scale"]}}
+    # Tiled at this size: a whole 2-4 MP frame through the VAE beside a
+    # resident diffusion model and an LLM ran ComfyUI out of VRAM, and its
+    # fallback sat for six minutes on a pass that takes seconds in tiles.
+    g[enc] = {"class_type": "VAEEncodeTiled", "inputs": dict(TILES, pixels=[up, 0], vae=vae)}
+    g[samp] = {"class_type": "KSampler", "inputs": {
+        "seed": seed, "steps": recipe["steps"], "cfg": 1.0,
+        "sampler_name": recipe["sampler"], "scheduler": recipe["scheduler"],
+        "denoise": recipe["denoise"], "model": model, "positive": positive,
+        "negative": negative, "latent_image": [enc, 0]}}
+    g[dec] = {"class_type": "VAEDecodeTiled", "inputs": dict(TILES, samples=[samp, 0], vae=vae)}
+    return [dec, 0]
+
+
+def hires_recipe(a, plan, w, h):
+    """The detail pass to run, or None. On by default for a family that has
+    one; `hires` false turns it off, `hires_scale` sizes it. The scale is
+    capped so the pass never samples more than ~4.2 megapixels, where a
+    24 GB card runs out and the models start to repeat themselves."""
+    base = plan.get("hires")
+    if not base or not a.get("hires", True) or a.get("init_image"):
+        return None
+    r = dict(base)
+    if a.get("hires_scale"):
+        r["scale"] = a["hires_scale"]
+    r["scale"] = round(min(r["scale"], (4.2e6 / float(w * h)) ** 0.5), 3)
+    if r["scale"] <= 1.05:
+        return None
+    if a.get("hires_denoise") is not None:
+        r["denoise"] = a["hires_denoise"]
+    return r
+
+
+def input_image(ref):
+    """
+    A picture for a LoadImage node: a path on this workstation is uploaded
+    first, anything else is taken to be a name already in ComfyUI's input
+    folder. Saves the model a comfy_upload_image round trip per edit.
+    """
+    path = studio_mcp.local_path(ref)
+    if os.path.isfile(path):
+        return upload(path)
+    if os.path.isabs(path) or ("\\" in path and ":" in path):
+        raise ComfyError("No file at %s on this workstation." % path)
+    return ref
+
+
 def build_graph(a):
     """
-    The canonical txt2img graph, with img2img and one LoRA as options. Node ids
-    are strings; a link is [node_id, output_index]. Returns (graph, seed, plan).
+    The canonical txt2img graph, with img2img, one LoRA and the detail pass as
+    options. Node ids are strings; a link is [node_id, output_index].
+    Returns (graph, seed, plan, notes) - notes say what was added on the
+    caller's behalf, so the result can show it.
     """
-    seed = a.get("seed")
-    if seed is None or seed < 0:
-        seed = random.randint(0, 2**32 - 1)
+    seed = new_seed(a)
     plan = plan_model(a)
+    notes = []
     if plan["kind"] == "checkpoint":
         g = {"1": {"class_type": "CheckpointLoaderSimple",
                    "inputs": {"ckpt_name": plan["checkpoint"]}}}
@@ -282,17 +443,9 @@ def build_graph(a):
         latent_node = "EmptyLatentImage"
         defaults = {"steps": 20, "cfg": 6.0, "sampler": "euler", "scheduler": "normal"}
     else:
-        g = {"1": {"class_type": "UNETLoader", "inputs": {
-                 "unet_name": plan["diffusion_model"], "weight_dtype": "default"}},
-             "10": {"class_type": "CLIPLoader", "inputs": {
-                 "clip_name": plan["text_encoder"], "type": plan["encoder_type"]}},
-             "11": {"class_type": "VAELoader", "inputs": {"vae_name": plan["vae"]}}}
-        model, clip, vae = ["1", 0], ["10", 0], ["11", 0]
-        if plan.get("shift") is not None:
-            g["12"] = {"class_type": "ModelSamplingAuraFlow",
-                       "inputs": {"model": model, "shift": plan["shift"]}}
-            model = ["12", 0]
-        latent_node = "EmptySD3LatentImage"
+        g = {}
+        model, clip, vae = load_split(g, plan)
+        latent_node = plan.get("latent", "EmptySD3LatentImage")
         defaults = plan
     if a.get("lora"):
         g["9"] = {"class_type": "LoraLoader", "inputs": {
@@ -301,28 +454,46 @@ def build_graph(a):
             "strength_clip": a.get("lora_strength", 1.0),
             "model": model, "clip": clip}}
         model, clip = ["9", 0], ["9", 1]
-    g["2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": a["prompt"], "clip": clip}}
-    g["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": a.get("negative", ""), "clip": clip}}
+    cfg = a.get("cfg", defaults["cfg"])
+    prompt, negative = a["prompt"].strip(), a.get("negative", "")
+    photo = a.get("realism", True) and wants_photo(prompt)
+    if photo:
+        prompt = prompt.rstrip(" .,;") + ". " + PHOTO_SUFFIX
+        notes.append("realism: on")
+        if not negative and cfg > 1.0:
+            negative = PHOTO_NEGATIVE
+    g["2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": clip}}
+    if cfg <= 1.0:
+        # At cfg 1 the sampler never reads the negative; a zeroed positive is
+        # what the model's own template passes, and saves an encode.
+        g["3"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
+    else:
+        g["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": clip}}
     denoise = 1.0
+    w, h = a.get("width", 1024), a.get("height", 1024)
     if a.get("init_image"):
-        g["8"] = {"class_type": "LoadImage", "inputs": {"image": a["init_image"]}}
+        g["8"] = {"class_type": "LoadImage", "inputs": {"image": input_image(a["init_image"])}}
         g["4"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["8", 0], "vae": vae}}
         denoise = a.get("denoise", 0.6)
     else:
         g["4"] = {"class_type": latent_node, "inputs": {
-            "width": a.get("width", 1024), "height": a.get("height", 1024),
-            "batch_size": a.get("batch_size", 1)}}
+            "width": w, "height": h, "batch_size": a.get("batch_size", 1)}}
     g["5"] = {"class_type": "KSampler", "inputs": {
-        "seed": seed, "steps": a.get("steps", defaults["steps"]),
-        "cfg": a.get("cfg", defaults["cfg"]),
+        "seed": seed, "steps": a.get("steps", defaults["steps"]), "cfg": cfg,
         "sampler_name": a.get("sampler", defaults["sampler"]),
         "scheduler": a.get("scheduler", defaults["scheduler"]),
         "denoise": denoise, "model": model, "positive": ["2", 0], "negative": ["3", 0],
         "latent_image": ["4", 0]}}
     g["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": vae}}
+    out = ["6", 0]
+    hr = hires_recipe(a, plan, w, h)
+    if hr:
+        out = detail_pass(g, out, model, ["2", 0], ["3", 0], vae, hr, seed)
+        notes.append("detail pass: x%s at denoise %s -> %dx%d" % (
+            hr["scale"], hr["denoise"], int(w * hr["scale"]), int(h * hr["scale"])))
     g["7"] = {"class_type": "SaveImage", "inputs": {
-        "filename_prefix": a.get("filename_prefix", "StudioAssistant"), "images": ["6", 0]}}
-    return g, seed, plan
+        "filename_prefix": a.get("filename_prefix", "StudioAssistant"), "images": out}}
+    return g, seed, plan, notes
 
 
 def submit(graph):
@@ -334,15 +505,59 @@ def submit(graph):
 
 
 def history_entry(prompt_id):
-    return get_json("/history/" + prompt_id).get(prompt_id)
+    return get_json("/history/" + prompt_id, timeout=30).get(prompt_id)
+
+
+def vram_note():
+    """A sentence when ComfyUI's GPU is too full to hold a model, else ''."""
+    try:
+        devices = get_json("/system_stats").get("devices", [])
+    except ComfyError:
+        return ""
+    for d in devices:
+        free, total = d.get("vram_free", 0), d.get("vram_total", 0)
+        if total and free < LOW_VRAM:
+            return ("ComfyUI's GPU had %.1f of %.0f GB free when this started - the LLM "
+                    "host's resident models hold the rest - so model weights streamed from "
+                    "system RAM, which is most of the time this took." % (free / 1e9, total / 1e9))
+    return ""
+
+
+def run(graph, a, header, notes=()):
+    """Submit, wait and collect, with the recipe and timing on top."""
+    note = vram_note()
+    started = time.monotonic()
+    pid = submit(graph)
+    if not a.get("wait", True):
+        return result(header + "Queued as prompt_id %s. Call comfy_wait to collect it." % pid)
+    entry = wait_for(pid, a.get("timeout", DEFAULT_WAIT))
+    out = collect(pid, entry)
+    extra = "".join("%s\n" % n for n in notes)
+    extra += "took %ds\n" % (time.monotonic() - started)
+    if note:
+        extra += note + "\n"
+    out["content"][0]["text"] = header + extra + out["content"][0]["text"]
+    return out
 
 
 def wait_for(prompt_id, timeout):
     """Poll history until the prompt finishes. Returns the history entry."""
     started = time.monotonic()
     deadline = started + max(1, min(timeout, MAX_WAIT))
+    silent_since = None
     while True:
-        entry = history_entry(prompt_id)
+        try:
+            entry = history_entry(prompt_id)
+            silent_since = None
+        except Unreachable:
+            # Busy staging a model, most likely: keep waiting, and say so.
+            silent_since = silent_since or time.monotonic()
+            entry = None
+            if time.monotonic() > deadline:
+                raise ComfyError(
+                    "ComfyUI has not answered for %ds while running prompt %s. If it is "
+                    "still up it keeps the prompt; comfy_wait collects it."
+                    % (time.monotonic() - silent_since, prompt_id))
         if entry and (entry.get("status", {}).get("completed") or entry.get("outputs")):
             return entry
         if entry and entry.get("status", {}).get("status_str") == "error":
@@ -350,8 +565,10 @@ def wait_for(prompt_id, timeout):
         if studio_mcp.cancelled():
             raise ComfyError("Stopped waiting for prompt %s; it stays queued on ComfyUI. "
                              "comfy_wait collects it, comfy_interrupt stops it." % prompt_id)
-        studio_mcp.progress("waiting on ComfyUI for %s" % prompt_id,
-                            done=int(time.monotonic() - started), total=int(deadline - started))
+        studio_mcp.progress(
+            ("ComfyUI is busy (loading models?) on %s" if silent_since else
+             "waiting on ComfyUI for %s") % prompt_id,
+            done=int(time.monotonic() - started), total=int(deadline - started))
         if time.monotonic() > deadline:
             raise ComfyError(
                 "Prompt %s is still running after %ds. It stays queued on ComfyUI; call "
@@ -376,6 +593,9 @@ def outputs_of(entry):
 def status_messages(entry):
     msgs = []
     for m in entry.get("status", {}).get("messages", []) or []:
+        if isinstance(m, list) and len(m) == 2 and m[0] == "execution_interrupted":
+            msgs.append("interrupted (comfy_interrupt, or stopped on ComfyUI) before it "
+                        "finished")
         if isinstance(m, list) and len(m) == 2 and m[0] == "execution_error":
             d = m[1] or {}
             msgs.append("%s in %s: %s" % (d.get("exception_type", "error"),
@@ -510,17 +730,134 @@ def t_node_info(a):
 def t_generate(a):
     if not a.get("prompt", "").strip():
         return result("prompt is required.", error=True)
-    graph, seed, plan = build_graph(a)
+    graph, seed, plan, notes = build_graph(a)
     k = graph["5"]["inputs"]
     recipe = "model: %s\nseed: %d  steps: %s  cfg: %s  sampler: %s/%s\n" % (
         plan["label"], seed, k["steps"], k["cfg"], k["sampler_name"], k["scheduler"])
-    pid = submit(graph)
-    if not a.get("wait", True):
-        return result(recipe + "Queued as prompt_id %s. Call comfy_wait to collect it." % pid)
-    entry = wait_for(pid, a.get("timeout", 300))
-    out = collect(pid, entry)
-    out["content"][0]["text"] = recipe + out["content"][0]["text"]
-    return out
+    return run(graph, a, recipe, notes)
+
+
+def plan_edit(a):
+    """The installed edit model, its encoder, VAE and (for fast) Lightning LoRA."""
+    unets = list_models("diffusion_models") or list_models("unet")
+    edits = [u for u in unets if is_edit_model(u)]
+    unet = a.get("edit_model") or (edits[-1] if edits else None)
+    if not unet:
+        raise ComfyError("ComfyUI has no image-edit model installed (such as "
+                         "qwen_image_edit_2509). comfy_generate with init_image restyles a "
+                         "picture instead, but cannot follow an instruction.")
+    fam = family_of(unet)
+    if not fam.get("edit"):
+        fam = dict(FAMILIES[[k for k, _ in FAMILIES].index("qwen_image_edit")][1])
+    encoders = list_models("text_encoders") or list_models("clip")
+    vaes = list_models("vae")
+    plan = dict(fam, kind="split", diffusion_model=unet,
+                text_encoder=pick_first(encoders, fam["encoder"]),
+                vae=fam["vae"] if fam["vae"] in vaes else pick_first(vaes))
+    if not plan["text_encoder"] or not plan["vae"]:
+        raise ComfyError("%s needs a text encoder and a VAE on ComfyUI; found encoders %s "
+                         "and VAEs %s." % (unet, encoders, vaes))
+    plan["lora"] = None
+    if a.get("fast", True):
+        loras = [l for l in list_models("loras")
+                 if fam["lightning"] in l.lower() and "edit" in l.lower()]
+        plan["lora"] = loras[-1] if loras else None
+    return plan
+
+
+def photo_finish():
+    """The Z-Image plan the detail pass borrows to finish an edit, or None."""
+    unets = list_models("diffusion_models") or list_models("unet")
+    photo = [u for u in unets if family_of(u).get("photo")]
+    return plan_model({"diffusion_model": photo[0]}) if photo else None
+
+
+def t_edit_image(a):
+    instruction = a.get("instruction", "").strip()
+    if not instruction:
+        return result("instruction is required.", error=True)
+    refs = [a["image"]] + list(a.get("references") or [])[:2]
+    plan = plan_edit(a)
+    seed = new_seed(a)
+    g = {}
+    model, clip, vae = load_split(g, plan, lora=plan["lora"])
+    g["13"] = {"class_type": "CFGNorm", "inputs": {"model": model, "strength": 1.0}}
+    model = ["13", 0]
+    names = [input_image(r) for r in refs]
+    # The picture being edited is scaled to the ~1 MP the model was trained at;
+    # the latent starts from it, so the untouched parts come back unchanged.
+    g["20"] = {"class_type": "LoadImage", "inputs": {"image": names[0]}}
+    g["21"] = {"class_type": "FluxKontextImageScale", "inputs": {"image": ["20", 0]}}
+    images = {"image1": ["21", 0]}
+    for i, name in enumerate(names[1:], start=2):
+        g[str(20 + i)] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        images["image%d" % i] = [str(20 + i), 0]
+    g["2"] = {"class_type": "TextEncodeQwenImageEditPlus",
+              "inputs": dict(images, clip=clip, vae=vae, prompt=instruction)}
+    g["3"] = {"class_type": "TextEncodeQwenImageEditPlus",
+              "inputs": dict(images, clip=clip, vae=vae, prompt="")}
+    g["4"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["21", 0], "vae": vae}}
+    fast = bool(plan["lora"])
+    steps = a.get("steps", plan["fast_steps"] if fast else plan["steps"])
+    cfg = a.get("cfg", 1.0 if fast else plan["cfg"])
+    g["5"] = {"class_type": "KSampler", "inputs": {
+        "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": plan["sampler"],
+        "scheduler": plan["scheduler"], "denoise": 1.0, "model": model,
+        "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]}}
+    g["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": vae}}
+    out, notes = ["6", 0], []
+    if a.get("photo_finish", False):
+        z = photo_finish()
+        if z:
+            # A second model's detail pass: Z-Image redraws the skin, cloth and
+            # grain the edit model leaves waxy, at 1.5x the size.
+            zmodel, zclip, zvae = load_split(g, z, ids=("31", "32", "33", "34"))
+            g["40"] = {"class_type": "CLIPTextEncode", "inputs": {
+                "text": instruction + ". " + PHOTO_SUFFIX, "clip": zclip}}
+            g["41"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["40", 0]}}
+            r = dict(z["hires"], denoise=a.get("finish_denoise", 0.25))
+            out = detail_pass(g, out, zmodel, ["40", 0], ["41", 0], zvae, r, seed, first="42")
+            notes.append("photo finish: Z-Image detail pass x%s at denoise %s"
+                         % (r["scale"], r["denoise"]))
+        else:
+            notes.append("photo finish skipped: no Z-Image model installed")
+    g["7"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioEdit"), "images": out}}
+    header = "model: %s%s\nseed: %d  steps: %s  cfg: %s\nedited: %s\n" % (
+        plan["label"], " + " + plan["lora"] if plan["lora"] else "", seed, steps, cfg,
+        ", ".join(names))
+    return run(g, a, header, notes)
+
+
+def t_upscale(a):
+    """Enlarge a picture and redraw its fine detail with the photographic model."""
+    unets = list_models("diffusion_models") or list_models("unet")
+    photo = [u for u in unets if family_of(u).get("photo")]
+    if not photo:
+        return result("Upscaling redraws detail with Z-Image, which is not installed on "
+                      "ComfyUI.", error=True)
+    plan = plan_model({"diffusion_model": photo[0]})
+    seed = new_seed(a)
+    g = {}
+    model, clip, vae = load_split(g, plan)
+    g["8"] = {"class_type": "LoadImage", "inputs": {"image": input_image(a["image"])}}
+    # Normalise to ~1 MP first so `scale` means the same thing for any input,
+    # and the pass never samples more than the card holds.
+    g["20"] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
+        "image": ["8", 0], "upscale_method": "lanczos", "megapixels": 1.0,
+        "resolution_steps": 16}}
+    text = (a.get("prompt") or "A sharp, detailed, high-resolution photograph").strip()
+    if a.get("realism", True) and wants_photo(text):
+        text = text.rstrip(" .,;") + ". " + PHOTO_SUFFIX
+    g["2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": text, "clip": clip}}
+    g["3"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
+    r = dict(plan["hires"], scale=a.get("scale", 2.0), denoise=a.get("creativity", 0.3))
+    out = detail_pass(g, ["20", 0], model, ["2", 0], ["3", 0], vae, r, seed)
+    g["7"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioUpscale"), "images": out}}
+    header = "model: %s\nseed: %d  scale: x%s of ~1 MP  creativity (denoise): %s\n" % (
+        plan["label"], seed, r["scale"], r["denoise"])
+    return run(g, a, header)
 
 
 def t_run_workflow(a):
@@ -533,10 +870,7 @@ def t_run_workflow(a):
         return result("Not API format - nodes %s have no class_type. Export the workflow "
                       "with 'Save (API Format)' in ComfyUI, not the ordinary save."
                       % ", ".join(bad), error=True)
-    pid = submit(graph)
-    if not a.get("wait", True):
-        return result("Queued as prompt_id %s. Call comfy_wait to collect it." % pid)
-    return collect(pid, wait_for(pid, a.get("timeout", 300)))
+    return run(graph, a, "")
 
 
 def t_wait(a):
@@ -547,7 +881,7 @@ def t_wait(a):
         queued = {row[1] for row in q.get("queue_running", []) + q.get("queue_pending", []) if len(row) > 1}
         if pid not in queued:
             return result("ComfyUI has no prompt %s - not queued and not in history." % pid, error=True)
-    return collect(pid, wait_for(pid, a.get("timeout", 300)))
+    return collect(pid, wait_for(pid, a.get("timeout", DEFAULT_WAIT)))
 
 
 def t_queue(a):
@@ -590,18 +924,24 @@ def t_fetch_output(a):
     return result("Saved to %s (%d bytes)" % (path, len(data)), images=images)
 
 
-def t_upload_image(a):
-    path = studio_mcp.local_path(a["path"])
-    if not os.path.isfile(path):
-        return result("No file at %s on this workstation." % path, error=True)
+def upload(path):
+    """Send a local file to ComfyUI's input folder; returns the name to load it by."""
     with open(path, "rb") as fh:
         data = fh.read()
     res = post_multipart("/upload/image", {"overwrite": "true"}, os.path.basename(path), data)
     name = res.get("name", os.path.basename(path))
     if res.get("subfolder"):
         name = res["subfolder"] + "/" + name
+    return name
+
+
+def t_upload_image(a):
+    path = studio_mcp.local_path(a["path"])
+    if not os.path.isfile(path):
+        return result("No file at %s on this workstation." % path, error=True)
     return result("Uploaded as %r - pass that as init_image to comfy_generate, or as a "
-                  "LoadImage input." % name)
+                  "LoadImage input. (comfy_generate, comfy_edit_image and comfy_upscale "
+                  "also take the local path directly.)" % upload(path))
 
 
 def t_interrupt(a):
@@ -663,21 +1003,33 @@ TOOLS = [
      "class name such as KSampler or LoadImage.",
      _obj({"node": _s("Exact node class_type.")}, ["node"])),
     ("comfy_generate", t_generate,
-     "Generate images with the standard graph (model -> prompt and negative -> "
-     "KSampler -> VAE decode -> save). With no model named it uses the first "
-     "checkpoint, or - when there are none - the first split model with the right "
-     "recipe for its family (Z-Image Turbo: 8 steps, cfg 1, res_multistep/simple). "
-     "Text-to-image by default; give init_image (a name from comfy_upload_image) for "
-     "image-to-image. Blocks until done, downloads the results to this workstation "
-     "and returns their paths plus the seed and settings used, so a result can be "
-     "reproduced.",
+     "Make pictures from a text prompt. With no model named it uses the most "
+     "photographic one installed (Z-Image Turbo) with its own recipe, adds a realism "
+     "sentence to photographic prompts, and runs a hi-res detail pass that redraws "
+     "skin, fabric and texture at 1.5x the size - leave those defaults alone for the "
+     "most realistic result. init_image (a local path or an uploaded name) restyles a "
+     "picture; to change something specific in a picture use comfy_edit_image. Blocks "
+     "until done, saves the results on this workstation and returns their paths, the "
+     "seed and the settings used.",
      _obj({
-         "prompt": _s("What to draw. Comma-separated descriptive phrases work best."),
-         "negative": _s("What to avoid, e.g. 'blurry, text, watermark'. Default empty."),
+         "prompt": _s("The picture, described as a photograph in plain sentences: subject "
+                      "and action, setting, light, camera and lens, the textures that "
+                      "make it real. Not instructions, not tag lists."),
+         "negative": _s("What to avoid. Only read at cfg above 1; Z-Image ignores it."),
+         "realism": {"type": "boolean", "description": "Default true: photographic prompts "
+                     "get the realism sentence (and, at cfg above 1, a negative against "
+                     "CGI looks). Set false for illustration, logos, paintings, cartoons."},
+         "hires": {"type": "boolean", "description": "Default true where the model has a "
+                   "detail pass. false for a quick draft at the base size."},
+         "hires_scale": _n("Detail pass enlargement. Default 1.5; capped near 4 MP.",
+                           minimum=1, maximum=2.5),
+         "hires_denoise": _n("Detail pass strength. Default 0.33; higher invents more "
+                             "detail, lower keeps the draft.", minimum=0.1, maximum=0.6),
          "checkpoint": _s("All-in-one checkpoint filename from comfy_list_models. Default: "
-                          "the first installed, else a split model."),
+                          "a split model with a known recipe, else the first checkpoint."),
          "diffusion_model": _s("Split model: filename from comfy_list_models "
-                               "kind=diffusion_models. Picks the family's recipe."),
+                               "kind=diffusion_models. Picks the family's recipe. Z-Image "
+                               "is the photographic one, Krea 2 the stylised one."),
          "text_encoder": _s("Split model: text encoder filename from kind=text_encoders. "
                             "Default: chosen for the family."),
          "text_encoder_type": _s("Split model: the encoder family. Default: chosen for the "
@@ -685,27 +1037,80 @@ TOOLS = [
          "vae": _s("Split model: VAE filename from kind=vae. Default: the family's."),
          "shift": _n("Split model: sampling shift. Default: the family's (3.0 for Z-Image).",
                      minimum=0, maximum=100),
-         "width": _i("Pixels, multiple of 16. Default 1024.", minimum=64, maximum=4096),
-         "height": _i("Pixels, multiple of 16. Default 1024.", minimum=64, maximum=4096),
-         "steps": _i("Sampling steps. Default: the model's recipe (20 for a checkpoint, "
-                     "8 for Z-Image Turbo).", minimum=1, maximum=150),
-         "cfg": _n("Prompt adherence. Default: the model's recipe (6 for a checkpoint, 1 "
-                   "for Z-Image Turbo, where the negative is then ignored).", minimum=0, maximum=30),
+         "width": _i("Pixels, multiple of 16, before the detail pass. Default 1024.",
+                     minimum=64, maximum=4096),
+         "height": _i("Pixels, multiple of 16, before the detail pass. Default 1024.",
+                      minimum=64, maximum=4096),
+         "steps": _i("Sampling steps. Default: the model's recipe (8 for Z-Image Turbo, "
+                     "20 for a checkpoint).", minimum=1, maximum=150),
+         "cfg": _n("Prompt adherence. Default: the model's recipe (1 for Z-Image Turbo, "
+                   "6 for a checkpoint).", minimum=0, maximum=30),
          "seed": _i("Fixed seed to reproduce or vary a result. Default: random.", minimum=-1),
          "sampler": _s("Sampler name. Default: the model's recipe.", enum=SAMPLERS),
          "scheduler": _s("Scheduler name. Default: the model's recipe.", enum=SCHEDULERS),
          "batch_size": _i("Images per call. Default 1.", minimum=1, maximum=8),
-         "init_image": _s("Uploaded image name for image-to-image. Omit for text-to-image."),
+         "init_image": _s("Image-to-image: a picture's path on this workstation, or a name "
+                          "from comfy_upload_image. Omit for text-to-image."),
          "denoise": _n("Image-to-image only: how much to change the init image, 0..1. "
                        "Default 0.6.", minimum=0, maximum=1),
-         "lora": _s("LoRA filename from comfy_list_models kind=loras, applied to the checkpoint."),
+         "lora": _s("LoRA filename from comfy_list_models kind=loras, for this model's family."),
          "lora_strength": _n("LoRA strength. Default 1.0.", minimum=-2, maximum=2),
          "filename_prefix": _s("Output filename prefix. Default StudioAssistant."),
          "wait": {"type": "boolean", "description": "Default true. false returns the "
                                                     "prompt_id at once; collect it with comfy_wait."},
-         "timeout": _i("Seconds to wait before giving the prompt_id back. Default 300.",
-                       minimum=5, maximum=MAX_WAIT),
+         "timeout": _i("Seconds to wait before giving the prompt_id back. Default %d."
+                       % DEFAULT_WAIT, minimum=5, maximum=MAX_WAIT),
      }, ["prompt"])),
+    ("comfy_edit_image", t_edit_image,
+     "Change a picture by instruction and keep the rest of it: 'replace the sky with "
+     "a storm', 'put her in a red coat', 'remove the car', 'make it night', 'relight "
+     "from the left'. Up to two more pictures can be references ('put the jacket from "
+     "picture 2 on the man in picture 1'). Uses Qwen-Image-Edit, fast (4 steps) by "
+     "default. photo_finish true adds a Z-Image detail pass for the most photographic "
+     "result, at extra time. Returns the edited picture like comfy_generate.",
+     _obj({
+         "image": _s("The picture to edit: its path on this workstation (sent up for "
+                     "you) or a name from comfy_upload_image."),
+         "instruction": _s("What to change, as one plain instruction; say what must stay "
+                           "the same if it matters ('keep the face and pose')."),
+         "references": {"type": "array", "maxItems": 2, "items": {"type": "string"},
+                        "description": "Up to two more pictures, paths or uploaded "
+                                       "names, called picture 2 and 3 in the instruction."},
+         "photo_finish": {"type": "boolean", "description": "Default false. true runs a "
+                          "Z-Image detail pass at 1.5x afterwards: sharper, more real "
+                          "skin and texture, bigger file, extra time."},
+         "finish_denoise": _n("photo_finish strength. Default 0.25.", minimum=0.1, maximum=0.5),
+         "fast": {"type": "boolean", "description": "Default true: the 4-step Lightning "
+                  "LoRA. false: 20 full steps at cfg 4, several times slower, sometimes "
+                  "more faithful on hard edits."},
+         "steps": _i("Override the step count.", minimum=1, maximum=60),
+         "cfg": _n("Override cfg.", minimum=0, maximum=10),
+         "seed": _i("Fixed seed. Default: random.", minimum=-1),
+         "edit_model": _s("Edit model filename from kind=diffusion_models. Default: the "
+                          "installed one."),
+         "filename_prefix": _s("Output filename prefix. Default StudioEdit."),
+         "wait": {"type": "boolean", "description": "Default true."},
+         "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5,
+                       maximum=MAX_WAIT),
+     }, ["image", "instruction"])),
+    ("comfy_upscale", t_upscale,
+     "Enlarge a picture and redraw its fine detail with the photographic model, so it "
+     "is sharp at the new size rather than stretched. The picture is brought to about "
+     "1 megapixel, then scaled by `scale`.",
+     _obj({
+         "image": _s("The picture: its path on this workstation, or an uploaded name."),
+         "scale": _n("Enlargement of the ~1 MP picture. Default 2 (about 4 MP).",
+                     minimum=1.1, maximum=2.5),
+         "creativity": _n("How much detail may be invented, 0.1..0.6. Default 0.3; above "
+                          "0.4 faces and text start to change.", minimum=0.1, maximum=0.6),
+         "prompt": _s("What the picture shows, one sentence. Helps the redraw. Optional."),
+         "realism": {"type": "boolean", "description": "Default true. false for art."},
+         "seed": _i("Fixed seed. Default: random.", minimum=-1),
+         "filename_prefix": _s("Output filename prefix. Default StudioUpscale."),
+         "wait": {"type": "boolean", "description": "Default true."},
+         "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5,
+                       maximum=MAX_WAIT),
+     }, ["image"])),
     ("comfy_run_workflow", t_run_workflow,
      "Run any ComfyUI workflow in API format: an object of node_id -> {class_type, "
      "inputs}, where a link is [node_id, output_index]. This is what 'Save (API "
@@ -715,12 +1120,12 @@ TOOLS = [
      _obj({"workflow": {"type": "object", "description": "The API-format graph.",
                         "additionalProperties": True},
            "wait": {"type": "boolean", "description": "Default true."},
-           "timeout": _i("Seconds to wait. Default 300.", minimum=5, maximum=MAX_WAIT)},
+           "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5, maximum=MAX_WAIT)},
           ["workflow"])),
     ("comfy_wait", t_wait,
      "Wait for a queued prompt_id to finish and download its outputs to this workstation.",
      _obj({"prompt_id": _s("The prompt_id a generate call returned."),
-           "timeout": _i("Seconds to wait. Default 300.", minimum=5, maximum=MAX_WAIT)},
+           "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5, maximum=MAX_WAIT)},
           ["prompt_id"])),
     ("comfy_queue", t_queue,
      "What ComfyUI is running now and what is waiting, with prompt_ids.",
@@ -765,6 +1170,8 @@ READ_ONLY = {"comfy_status", "comfy_list_models", "comfy_search_nodes", "comfy_n
 # away. The rest are reads (READ_ONLY) or writes with the spec's defaults.
 HINTS = {
     "comfy_generate": {"destructive": False},
+    "comfy_edit_image": {"destructive": False},
+    "comfy_upscale": {"destructive": False},
     "comfy_run_workflow": {"destructive": False},
     "comfy_upload_image": {"destructive": False, "idempotent": True},
     "comfy_interrupt": {"destructive": True, "idempotent": True},
@@ -775,7 +1182,8 @@ SERVER = studio_mcp.Server(
     "studio-comfy-mcp", "1.1",
     studio_mcp.tools_from_table(TOOLS, read_only=READ_ONLY, **HINTS),
     errors=(ComfyError, KeyError, TypeError, ValueError),
-    instructions="ComfyUI on %s. comfy_generate is the ordinary path: it builds the "
+    instructions="ComfyUI on %s. comfy_generate makes a picture, comfy_edit_image "
+                 "changes one by instruction, comfy_upscale enlarges one; each builds the "
                  "graph, waits, and returns the picture. Call comfy_status first if a "
                  "tool reports it cannot reach ComfyUI." % COMFY_URL)
 
