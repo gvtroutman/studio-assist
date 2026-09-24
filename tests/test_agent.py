@@ -597,10 +597,12 @@ class FakeHost:
     with each model's window, the v1 list with its instances, load and
     unload. Records every write it is sent."""
 
-    def __init__(self, loaded=8192, maximum=262144, instances=("big-30b",), fail_load=None):
+    def __init__(self, loaded=8192, maximum=262144, instances=("big-30b",), fail_load=None,
+                 others=None):
         self.loaded, self.maximum = loaded, maximum
         self.instances = list(instances)
         self.fail_load = fail_load
+        self.others = {k: list(v) for k, v in (others or {}).items()}   # key -> instances
         self.calls = []
 
     def __call__(self, req, timeout=None):
@@ -615,10 +617,15 @@ class FakeHost:
             return self._resp({"data": [entry, {"id": "other", "state": "not-loaded"}]})
         if url.endswith("/api/v1/models"):
             return self._resp({"models": [{"key": "big-30b", "loaded_instances": [
-                {"id": i, "config": {"context_length": self.loaded}} for i in self.instances]}]})
+                {"id": i, "config": {"context_length": self.loaded}} for i in self.instances]}]
+                + [{"key": k, "type": "embedding" if "embed" in k else "llm",
+                    "loaded_instances": [{"id": i} for i in v]}
+                   for k, v in self.others.items()]})
         if url.endswith("/api/v1/models/unload"):
             self.calls.append(("unload", body))
-            self.instances.remove(body["instance_id"])
+            for pool in [self.instances] + list(self.others.values()):
+                if body["instance_id"] in pool:
+                    pool.remove(body["instance_id"])
             return self._resp({"instance_id": body["instance_id"]})
         if url.endswith("/api/v1/models/load"):
             self.calls.append(("load", body))
@@ -698,6 +705,29 @@ class TestFitModel(unittest.TestCase):
         self.assertEqual(now, 32768)
         self.assertEqual(fake.calls, [("load", {"model": "big-30b", "context_length": 32768})])
         self.assertIn("Loaded big-30b with a 32,768-token context window", note)
+
+    def test_a_load_goes_onto_an_empty_card(self):
+        """LM Studio gives the card to the model it loads first and the one it
+        loads beside another partly system memory, for as long as it stays
+        loaded: on the LLM PC the 30B loaded after the vision model decoded at
+        20-31 tokens a second - still, once the vision model had gone - and at
+        75-79 loaded first. With `keep` the rest goes before the load; an
+        embedding model stays, and so does whatever `keep` names."""
+        fake = self.host(loaded=None, instances=(),
+                         others={"eyes-vl": ["eyes-vl"], "busy-9b": ["busy-9b"],
+                                 "nomic-embed": ["nomic-embed"]})
+        now, _ = eng.fit_model(self.H, "big-30b", 20000, keep={"busy-9b"})
+        self.assertEqual(now, 32768)
+        self.assertEqual(fake.calls, [("unload", {"instance_id": "eyes-vl"}),
+                                      ("load", {"model": "big-30b", "context_length": 32768})])
+        # A window that fits needs no load, and nothing else is touched.
+        fake = self.host(loaded=32768, others={"eyes-vl": ["eyes-vl"]})
+        self.assertEqual(eng.fit_model(self.H, "big-30b", 20000, keep=()), (32768, ""))
+        self.assertEqual(fake.calls, [])
+        # Without `keep` the card is left as it is - the old behaviour.
+        fake = self.host(loaded=None, instances=(), others={"eyes-vl": ["eyes-vl"]})
+        eng.fit_model(self.H, "big-30b", 20000)
+        self.assertEqual([c[0] for c in fake.calls], ["load"])
 
     def test_every_instance_goes_before_the_reload(self):
         # A load of a model already loaded is a second instance, and requests
@@ -1932,8 +1962,9 @@ class TestGui(unittest.TestCase):
         more - the reload threw the host's prefix cache away."""
         fits, warmed = [], []
 
-        def fit(host, model, prompt_tokens, timeout=600, exact=True):
+        def fit(host, model, prompt_tokens, timeout=600, exact=True, keep=None):
             fits.append((model, prompt_tokens, exact))
+            self.assertEqual(keep, (), "a load goes onto an empty card")
             if len(fits) == 2:
                 return 16384, "Reloaded shared with a 16,384-token context window: test"
             return 8192, ""
@@ -1964,6 +1995,67 @@ class TestGui(unittest.TestCase):
         self.assertEqual(len(warmed), 2)
         self.assertIn("Reloaded shared with a 16,384-token context window",
                       s.view.get("1.0", "end"))
+
+    def test_the_vision_model_goes_on_after_the_tabs_own(self):
+        """LM Studio gives the card to whichever model it loads first. The
+        window used to load the vision model the moment the host answered,
+        ahead of every tab, and the 30B loaded beside it decoded at 26 tokens
+        a second where it does 79. Now the probe loads nothing; the tab's
+        model goes onto an empty card; the vision model follows, off the tab's
+        path - and not at all beside a tab that renders, which clears the
+        card for every picture."""
+        events = []
+
+        def fit(host, model, prompt_tokens, timeout=600, exact=True, keep=None):
+            events.append(("fit", model, keep))
+            return 32768, "Loaded %s with a 32,768-token context window." % model
+
+        class Counts:
+            model, base_url = "shared", "http://h:1234/v1"
+
+            def chat(self, messages, tools, max_tokens=None):
+                return {"choices": [{"message": {"content": "ready"}}],
+                        "usage": {"prompt_tokens": 7707}}
+
+        vision = eng.Vision("http://h:1234/v1", "eyes-vl")
+        vision.needs_load = True
+        real = (eng.fit_model, eng.context_window, eng.loaded_instances, eng.load_model,
+                self.app.llm, self.app.vision)
+        eng.fit_model = fit
+        eng.context_window = lambda host, model, timeout=5: (None, 262144)
+        eng.loaded_instances = lambda host, model, timeout=5: []
+        eng.load_model = lambda host, model, timeout=600, context_length=None: \
+            events.append(("load", model))
+        self.app._spawn = lambda sid, fn, *a: events.append(("spawn", fn.__name__))
+        self.app.llm, self.app.vision = Counts(), vision
+        self.app.host_ready.set()
+        s = self.app.sessions[eng.CHAT.id]
+        try:
+            self.app._boot_session(s)
+            self.assertEqual(events[0], ("fit", "shared", ()))
+            self.assertEqual(events[-1], ("spawn", "_load_vision"))    # after, and off-path
+            self.assertNotIn(("load", "eyes-vl"), events)
+            self.app._load_vision()
+            self.app._load_vision()                                   # a second tab asking
+            self.assertEqual(events.count(("load", "eyes-vl")), 1)
+            self.assertFalse(vision.needs_load)
+            # A tab that renders leaves it be: the card is cleared for every
+            # picture, and the vision model looks at it on its own.
+            events.clear()
+            vision.needs_load = True
+            s.ready, gpu = False, s.app.gpu_tools
+            s.app.gpu_tools = frozenset({"make_a_picture"})
+            try:
+                self.app._boot_session(s)
+            finally:
+                s.app.gpu_tools = gpu
+            self.assertNotIn(("spawn", "_load_vision"), events)
+        finally:
+            (eng.fit_model, eng.context_window, eng.loaded_instances, eng.load_model,
+             self.app.llm, self.app.vision) = real
+            self.app.__dict__.pop("_spawn", None)
+            s.close()
+            self.app._drain()
 
     def test_no_reload_while_another_tab_is_mid_request(self):
         """A reload cuts off whatever the host is answering. With another

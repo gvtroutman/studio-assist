@@ -52,6 +52,18 @@ LOW_VRAM = 8e9
 # model and the tab's LLM is what starved the rest, so it runs on the CPU from
 # the LLM PC's 128 GB of RAM. COMFYUI_ENCODER_ON_GPU=1 puts it back.
 ENCODER_ON_CPU = os.environ.get("COMFYUI_ENCODER_ON_GPU", "") not in ("1", "true", "yes")
+# ComfyUI keeps its last run's models on the GPU until it needs the room for
+# its own next run - and it cannot see LM Studio beside it on the same card.
+# Measured after a Z-Image render: 11.7 GB still held and reported nowhere,
+# the 30B decoding at 25-30 tokens a second instead of 73-81, the tab's 9B
+# taking 17 s to load instead of 3 and the vision model ~30 s instead of 5.
+# So a finished run with nothing queued behind it frees the GPU (`release`).
+# It costs the next render nothing: 24.3 s with the models kept, 23.4 s after
+# a free, and the memory is back in about a second. COMFYUI_KEEP_MODELS=1
+# keeps them, for a ComfyUI with a card of its own.
+KEEP_MODELS = os.environ.get("COMFYUI_KEEP_MODELS", "") in ("1", "true", "yes")
+RELEASE_WAIT = 10            # seconds a finished run waits for the GPU to be let go
+RELEASE_SLACK = 1.5e9        # ...until ComfyUI's free VRAM is this close to where it was
 TILES = {"tile_size": 1024, "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}
 CLIENT_ID = uuid.uuid4().hex
 
@@ -508,36 +520,76 @@ def history_entry(prompt_id):
     return get_json("/history/" + prompt_id, timeout=30).get(prompt_id)
 
 
-def vram_note():
-    """A sentence when ComfyUI's GPU is too full to hold a model, else ''."""
+def gpu_memory():
+    """(free, total) VRAM in bytes as ComfyUI sees it, or (None, None).
+
+    ComfyUI's own view of the card: on the LLM PC it does not see what LM
+    Studio holds - with the 30B loaded it still reported 22 GB free - so a low
+    figure is models ComfyUI itself is holding."""
     try:
         devices = get_json("/system_stats").get("devices", [])
     except ComfyError:
-        return ""
+        return None, None
     for d in devices:
-        free, total = d.get("vram_free", 0), d.get("vram_total", 0)
-        if total and free < LOW_VRAM:
-            return ("ComfyUI's GPU had %.1f of %.0f GB free when this started - the LLM "
-                    "host's resident models hold the rest - so model weights streamed from "
-                    "system RAM, which is most of the time this took." % (free / 1e9, total / 1e9))
+        return d.get("vram_free", 0), d.get("vram_total", 0)
+    return None, None
+
+
+def vram_note(free, total):
+    """A sentence when ComfyUI's GPU is too full to hold a model, else ''."""
+    if total and free is not None and free < LOW_VRAM:
+        return ("ComfyUI's GPU had %.1f of %.0f GB free when this started - models loaded "
+                "before it hold the rest - so model weights streamed from system RAM, "
+                "which is most of the time this took." % (free / 1e9, total / 1e9))
     return ""
 
 
-def run(graph, a, header, notes=()):
-    """Submit, wait and collect, with the recipe and timing on top."""
-    note = vram_note()
-    started = time.monotonic()
+def run(graph, a, header, notes=(), started=None):
+    """Submit, wait and collect, with the recipe and timing on top. `started`
+    is when the work began, for a tool that ran something before this."""
+    free, total = gpu_memory()
+    note = vram_note(free, total)
+    started = started or time.monotonic()
     pid = submit(graph)
     if not a.get("wait", True):
         return result(header + "Queued as prompt_id %s. Call comfy_wait to collect it." % pid)
     entry = wait_for(pid, a.get("timeout", DEFAULT_WAIT))
     out = collect(pid, entry)
+    release(free)
     extra = "".join("%s\n" % n for n in notes)
     extra += "took %ds\n" % (time.monotonic() - started)
     if note:
         extra += note + "\n"
     out["content"][0]["text"] = header + extra + out["content"][0]["text"]
     return out
+
+
+def release(baseline=None):
+    """Unload ComfyUI's models from the GPU once it has nothing left to run,
+    so the LLM host's models get the card back (see KEEP_MODELS). With the
+    free VRAM ComfyUI saw before the run as `baseline`, wait - RELEASE_WAIT
+    at most, about a second in practice - until it is back near that: the
+    tab's model is loaded again the moment this returns, and a load racing
+    the release met the very contention this is here to end. Best effort: a
+    server that will not say, or will not free, costs speed only.
+    -> True when it was asked to."""
+    if KEEP_MODELS:
+        return False
+    try:
+        q = get_json("/queue", timeout=5)
+        if q.get("queue_running") or q.get("queue_pending"):
+            return False                  # the next run wants the models
+        post_json("/free", {"unload_models": True, "free_memory": True}, timeout=10)
+    except ComfyError:
+        return False
+    if baseline:
+        deadline = time.monotonic() + RELEASE_WAIT
+        while time.monotonic() < deadline:
+            free, _ = gpu_memory()
+            if free is None or free >= baseline - RELEASE_SLACK:
+                break
+            time.sleep(0.25)
+    return True
 
 
 def wait_for(prompt_id, timeout):
@@ -805,28 +857,55 @@ def t_edit_image(a):
         "scheduler": plan["scheduler"], "denoise": 1.0, "model": model,
         "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]}}
     g["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": vae}}
-    out, notes = ["6", 0], []
-    if a.get("photo_finish", False):
-        z = photo_finish()
-        if z:
-            # A second model's detail pass: Z-Image redraws the skin, cloth and
-            # grain the edit model leaves waxy, at 1.5x the size.
-            zmodel, zclip, zvae = load_split(g, z, ids=("31", "32", "33", "34"))
-            g["40"] = {"class_type": "CLIPTextEncode", "inputs": {
-                "text": instruction + ". " + PHOTO_SUFFIX, "clip": zclip}}
-            g["41"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["40", 0]}}
-            r = dict(z["hires"], denoise=a.get("finish_denoise", 0.25))
-            out = detail_pass(g, out, zmodel, ["40", 0], ["41", 0], zvae, r, seed, first="42")
-            notes.append("photo finish: Z-Image detail pass x%s at denoise %s"
-                         % (r["scale"], r["denoise"]))
-        else:
-            notes.append("photo finish skipped: no Z-Image model installed")
-    g["7"] = {"class_type": "SaveImage", "inputs": {
-        "filename_prefix": a.get("filename_prefix", "StudioEdit"), "images": out}}
+    notes = []
     header = "model: %s%s\nseed: %d  steps: %s  cfg: %s\nedited: %s\n" % (
         plan["label"], " + " + plan["lora"] if plan["lora"] else "", seed, steps, cfg,
         ", ".join(names))
+    z = photo_finish() if a.get("photo_finish", False) else None
+    if a.get("photo_finish", False) and not z:
+        notes.append("photo finish skipped: no Z-Image model installed")
+    if z:
+        return finish_edit(g, ["6", 0], z, instruction, seed, a, header, notes)
+    g["7"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioEdit"), "images": ["6", 0]}}
     return run(g, a, header, notes)
+
+
+def finish_edit(g, edited, z, instruction, seed, a, header, notes):
+    """An edit and its photo finish - Z-Image redrawing the skin, cloth and
+    grain the edit model leaves waxy, at 1.5x the size - as two runs, not one
+    graph. In one graph ComfyUI kept the 19.5 GB edit model on the 24 GB card
+    while it brought Z-Image's 11.7 GB in beside it: the finish sat in "Model
+    Initializing" for minutes and then sampled at 7 s a step, 410 s for one
+    edit. So the edit runs to a preview, the GPU is freed, and a second run
+    loads that preview for the detail pass. A photo finish always waits."""
+    started = time.monotonic()
+    free, _ = gpu_memory()
+    g["7"] = {"class_type": "PreviewImage", "inputs": {"images": edited}}
+    pid = submit(g)
+    entry = wait_for(pid, a.get("timeout", DEFAULT_WAIT))
+    previews = [f for node in (entry.get("outputs") or {}).values()
+                for f in node.get("images", []) or [] if f.get("type") == "temp"]
+    if not previews:
+        out = collect(pid, entry)         # the edit failed; ComfyUI says why
+        release(free)
+        return out
+    release(free)
+    f = previews[0]
+    name = "%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder") else f["filename"]
+    g2 = {}
+    zmodel, zclip, zvae = load_split(g2, z)
+    g2["8"] = {"class_type": "LoadImage", "inputs": {"image": name + " [temp]"}}
+    g2["2"] = {"class_type": "CLIPTextEncode", "inputs": {
+        "text": instruction + ". " + PHOTO_SUFFIX, "clip": zclip}}
+    g2["3"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
+    r = dict(z["hires"], denoise=a.get("finish_denoise", 0.25))
+    out = detail_pass(g2, ["8", 0], zmodel, ["2", 0], ["3", 0], zvae, r, seed)
+    g2["7"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioEdit"), "images": out}}
+    notes = list(notes) + ["photo finish: Z-Image detail pass x%s at denoise %s"
+                           % (r["scale"], r["denoise"])]
+    return run(g2, dict(a, wait=True), header, notes, started=started)
 
 
 def t_upscale(a):
@@ -881,7 +960,9 @@ def t_wait(a):
         queued = {row[1] for row in q.get("queue_running", []) + q.get("queue_pending", []) if len(row) > 1}
         if pid not in queued:
             return result("ComfyUI has no prompt %s - not queued and not in history." % pid, error=True)
-    return collect(pid, wait_for(pid, a.get("timeout", DEFAULT_WAIT)))
+    out = collect(pid, wait_for(pid, a.get("timeout", DEFAULT_WAIT)))
+    release()
+    return out
 
 
 def t_queue(a):

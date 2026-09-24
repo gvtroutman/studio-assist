@@ -254,16 +254,61 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   bridge in `YieldGPU`, and around each of those calls `Chat._make_room` has
   `eng.make_room` unload every model on the host - the tab's own too, which only
   waits while the picture is made - and `Chat._give_back` reloads the tab's model
-  at the context length it had (`eng.give_back`), in a `finally`, so a failed
-  render still gives it back. A model another tab is mid-request on stays.
+  at the context length it had (`eng.give_back`), even after a failed render. A
+  model another tab is mid-request on stays.
   Keeping the tab's 9B resident was tried first: the 19.5 GB Qwen edit model then
   took 272 s for its first of four steps, and a Z-Image render sat six minutes in
   the VAE at the detail-pass size. Measured on the same 1248x1824 picture: 254 s
   with everything resident, 64-68 s with the vision model and the 30B gone, 41-49 s
   with the whole GPU and the text encoder on the CPU (below); an edit went from a
-  272 s first step to 119 s in all. The 9B reloads from the host's RAM in seconds;
-  the vision model comes back just in time for the review of the picture and goes
-  again before the next render.
+  272 s first step to 119 s in all. ComfyUI cannot see LM Studio's memory on this
+  Windows host (its `vram_free` said 22 GB with the 30B loaded), so it never holds
+  back: one 1024² render with only the vision model left in LM Studio sampled at
+  18 s a step instead of 0.9 and took 165 s instead of 24. Making room is not
+  optional.
+- **ComfyUI lets go of the GPU when a run is done** (`release`, in `run()` and
+  `comfy_wait`). It keeps its last run's models on the card until its own next
+  run needs the room, and LM Studio cannot see them either: after one Z-Image
+  render 11.7 GB were still held, reported nowhere, and every LM Studio model
+  after it paid - the 30B decoded at 25-30 tokens a second instead of 73-81, the
+  9B took 17 s to load instead of 3, the vision model ~30 s instead of 5. A run
+  with nothing queued behind it now posts `/free` (`unload_models` and
+  `free_memory`) and waits, `RELEASE_WAIT` at most, for ComfyUI's free VRAM to
+  come back near where it was before the run - about a second - because the
+  tab's model is loaded the moment the result is back. It costs the next render
+  nothing: 24.3 s with the models kept, 23.6 s after `unload_models`, 23.4 s after
+  both flags. `COMFYUI_KEEP_MODELS=1` keeps them, for a ComfyUI with a card of
+  its own.
+- **The picture comes back before the model does, and the vision model looks
+  at it alone.** `YieldGPU` no longer gives back when the tool returns: it
+  remembers what the render sent away, and `settle()` brings it back when the
+  model is next needed - the executor calls `eng.settle` before every request
+  to the model and when a run ends, and `Chat._turn` before it looks for the
+  tab's model. Timed end to end, the finished picture used to sit unseen for
+  17 s behind the 9B's reload. The order after a render is now: the picture,
+  the vision model's check on an empty card (JIT, 7.5 s), then `_give_back`
+  unloads the vision model and loads the tab's model alone (3 s). LM Studio
+  loads a model onto an empty card in 3-5 s and beside another in 9-16 s -
+  whichever comes second - and loading both at once made the check take 15 s
+  instead of 8; this order took 11 s where both resident took 16-20. A render
+  straight after a render leaves the model away rather than load it only to
+  unload it. One "make a picture" request went from 120 s to 72 s, 55 s to 17 s
+  of it between the finished picture and the answer.
+- **A picture ComfyUI made is checked, not reviewed** (`AppSpec.makes_pictures`,
+  `Vision.check`). Asked to "name concrete visual defects", the vision model
+  always found some - steam from a fox's mouth, fur "not red enough" - and the
+  9B redrew the picture for each, twice in one request, against its own
+  briefing's one-render rule; one of those edits took 410 s. `CHECK` asks what
+  the picture shows and whether it matches the brief or is plainly not what
+  was asked, and forbids a list of small flaws; it writes 16-24 tokens where
+  the review wrote 88-301. Frames of a project (After Effects, Photoshop, …)
+  keep `REVIEW`: there the flaws are the work.
+- **A photo finish is a second run** (`finish_edit`). In the edit's own graph
+  ComfyUI kept the 19.5 GB edit model on the card while it staged Z-Image's
+  11.7 GB beside it: "Model Initializing" for minutes, then 7 s a step, 410 s
+  for one edit. Now the edit ends in a `PreviewImage`, the GPU is freed, and the
+  finish run loads that preview (`LoadImage` with `"<name> [temp]"`): 119 s for
+  the cold edit plus 31 s for the finish.
 - **The text encoder runs on the CPU** (`ENCODER_ON_CPU`, `device: cpu` on the
   `CLIPLoader`). It runs once a picture; the diffusion model runs every step. On
   the GPU the 8 GB encoder stayed resident beside the 12 GB Z-Image (or the
@@ -276,7 +321,8 @@ recipe; the wrong encoder type or latent gives noise, not an error.
 - **One render per request.** Handed the vision review of its picture, the 9B
   rendered the same truck seven times over nitpicks ("does not look old enough"),
   34 minutes for one request. The briefing now says render once, show it, offer
-  the change, and render again only when the picture is plainly not what was asked. A tab
+  the change, and render again only when the picture is plainly not what was
+  asked - and the briefing alone did not hold; the check above is what does. A tab
   whose model was unloaded - by this, or by hand in LM Studio - is refitted
   before its next turn (`Chat._reload_if_unloaded`), because the host's own
   just-in-time load is 8,192 tokens and truncates the briefing. Each result still
@@ -694,7 +740,8 @@ pixels goes through `Chat._px()`, and `_metrics()` sizes the rail against the wi
 row it is actually going to draw. Design at 96dpi, multiply on the way out.
 
 **Do not remove the startup warm-up.** It looks like a redundant throwaway request.
-It is not: a full tool-schema set takes about a minute to prefill cold. The warm-up
+It is not: a full tool-schema set took about a minute to prefill cold - seconds, since
+the model loads onto an empty card (see *A model loads onto an empty card*). The warm-up
 pays that against *the exact prompt prefix a real message uses*, so the first question
 returns in seconds. LM Studio's prefix cache survives across processes, which is why
 this works at all. Each tab has its own prefix and so warms up separately, the first
@@ -726,6 +773,23 @@ gives the old advice instead while any other session is `busy`, and `fit_lock`
 serialises two tabs booting at once (the second finds the first's load and does
 nothing). A host with no REST API says nothing, and nothing is fitted. `headroom_note()`
 remains the fallback when a load fails or the model is already at its maximum.
+
+**A model loads onto an empty card, and the vision model goes on after it.** LM
+Studio gives the GPU to the model it loads first; one it loads beside another is
+placed partly in system memory, and stays there for as long as it is loaded. Measured
+on the LLM PC's 24 GB with the 30B at 32k and the 7B vision model (28 GB between
+them): vision model first, the 30B decoded at 20-31 tokens a second with a 154 tok/s
+cold prefill - and stayed that slow after the vision model was unloaded; the 30B first,
+it decoded at 77-79 (410 tok/s prefill with the vision model beside it, 2,600 alone).
+The window used to load the vision model the moment the probe answered, ahead of every
+tab, so every app tab ran its 30B at a third of its speed. Now `fit_model(keep=...)`
+unloads everything but `keep` before a load (`_fit` passes `()`: the only way it gets
+there is with no other tab busy), `_boot_host` loads nothing, and `_boot_session` spawns
+`_load_vision` once its own model is on - not beside a tab with `gpu_tools`, which
+clears the card for every picture anyway. A load the fit makes takes the vision model
+with it, and `_fit` marks it `needs_load` again. The 30B and a vision model still do
+not fit in 24 GB together; a pair that does (a smaller executing model, or one that
+sees for itself) would get the prefill back too.
 
 **Never test the GUI with synthetic keystrokes.** `SendKeys` types into whatever
 window has focus, not the one you meant. It has already leaked a test sentence into
@@ -1044,6 +1108,10 @@ composer.
   that waited for its files is the observation, not something to inspect afterwards.
 - Stop prevents subsequent dispatches; it cannot undo or guarantee cancellation of
   an in-flight operation. Complete tool-result envelopes when stopping a batch.
+- **The executor settles before it asks the model anything** (`Executor._settle`,
+  `eng.settle`): before every request, and when a run ends, so a reflection or the
+  next turn never finds the model a render sent away still gone and has the host
+  load it just in time at 8,192. Any other bridge has no `settle` and costs nothing.
 - An `AppSpec` may carry `models`, small models it prefers, best first. ComfyUI did,
   because a 30B model resident beside a diffusion model on the same GPU is VRAM the
   pictures could have had - and that is what made the tab unusable: qwen3-1.7b under
@@ -1109,8 +1177,9 @@ composer.
   (no second model in VRAM), then one already loaded (no load), then
   `PREFERRED_VISION_MODELS`, then anything the host has downloaded. Not-loaded is
   fine: `Vision.needs_load` says so and `load_model` posts to LM Studio's
-  `/api/v1/models/load` — the GUI does it on the worker after `host_ready` so the
-  tabs boot meanwhile, the CLI before the task; a host without that endpoint
+  `/api/v1/models/load` — the GUI does it on a worker once the first tab's own
+  model is on (never before it: see *A model loads onto an empty card*), the CLI
+  just in time on the first picture; a host without that endpoint
   loads just-in-time on the first chat call, so a load failure is a line in the
   tab, never a stop. Pictures go through `studio_icons.flatten_png` first: a vision
   model sees alpha as black, so a black glyph on a transparent PNG - most logos,
