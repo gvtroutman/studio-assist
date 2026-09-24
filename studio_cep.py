@@ -124,7 +124,7 @@ class CepHost:
                     "    reg add HKCU\\Software\\Adobe\\CSXS.<n> /v PlayerDebugMode /t REG_SZ /d 1\n"
                     "then restart %s." % (self.name, ", CSXS.".join(missing), self.name))
         return ("%s is running but its bridge panel is not answering at %s (%s). Open it "
-                "once from Window > Extensions > Studio Assistant Bridge; it starts with "
+                "once from Window > Extensions > Studio Assist Bridge; it starts with "
                 "%s after that." % (self.name, self.url, err or "no reply", self.name))
 
     # ------------------------------------------------------------- calls

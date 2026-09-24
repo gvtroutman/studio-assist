@@ -34,6 +34,7 @@ import urllib.parse
 import urllib.request
 
 import studio_mcp
+import studio_procs
 
 DEFAULT_HOST = "http://100.127.17.38:1234/v1"
 # ComfyUI shares the inference box: its GPU does the image work so the 5090
@@ -96,11 +97,14 @@ class MCPClient:
         self.server_info = {}
         self.instructions = ""
         self.capabilities = {}
-        self.proc = subprocess.Popen(
+        # Contained: the bridge and everything it starts (npx's node, a COM
+        # worker) end with close(), or with this process however it ends.
+        self.child = studio_procs.spawn(
             [exe] + list(args),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1, creationflags=NO_WINDOW,
         )
+        self.proc = self.child.proc
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
@@ -210,15 +214,10 @@ class MCPClient:
     def call_tool(self, name, arguments):
         return self.request("tools/call", {"name": name, "arguments": arguments})
 
-    def close(self):
-        try:
-            self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.wait(timeout=5)
-        except Exception:
-            self.proc.kill()
+    def close(self, grace=3.0):
+        """End of input asks the bridge to exit; after `grace` seconds its
+        whole process tree is ended, not just the process we started."""
+        self.child.stop(grace)
 
 
 def mcp_result_to_text(result):
@@ -1612,7 +1611,7 @@ Answer questions directly without calling tools when no tool is needed."""
 # model from claiming otherwise: a confident "done - I added the layer" from a tab
 # that cannot reach After Effects is worse than no answer at all. Its second job
 # is to make the model look things up rather than answer from memory.
-CHAT_PROMPT = """You are the Chat tab of Studio Assistant: a conversation with the local
+CHAT_PROMPT = """You are the Chat tab of Studio Assist: a conversation with the local
 model, with no creative app behind it.
 
 WHAT YOU CAN AND CANNOT DO
@@ -2418,7 +2417,7 @@ APPS = [
             "Cut at the playhead and drop the second half's opacity to 50%",
             "Export the active sequence as H.264 to my Desktop",
         ],
-        launch_note="Premiere Pro also needs the Studio Assistant Bridge panel under Window > "
+        launch_note="Premiere Pro also needs the Studio Assist Bridge panel under Window > "
                     "Extensions; `python studio_premiere_mcp.py --install-panel` installs it.",
         readback=[("ppro_get_clip", ["clip_id"]), ("ppro_get_sequence", [])],
         review=("ppro_screenshot", []),
@@ -2971,6 +2970,10 @@ def env_default(*names, fallback=None):
     return fallback
 
 
+def _interrupt():
+    raise KeyboardInterrupt
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Local LLM agent for creative apps. Inference on the tailnet, "
@@ -3004,6 +3007,9 @@ def main():
                    help="with --mcp, what to call the app the bridge drives")
     p.add_argument("--quiet", action="store_true", help="hide the step trace")
     a = p.parse_args()
+    # Ctrl+Break and SIGTERM end the run the way Ctrl+C does, through the
+    # `finally` that closes the bridge, rather than by killing the process.
+    studio_procs.on_shutdown(_interrupt)
     if a.mcp:
         command, args = split_command(a.mcp)
         add_bridge(BridgeSpec(a.name, command, args, id="mcp"))

@@ -21,13 +21,17 @@ exception folded into `{"__error": ...}` so a bad call is a sentence rather
 than a debugger window inside the user's Photoshop.
 """
 
+import atexit
 import base64
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+
+import studio_procs
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DEFAULT_TIMEOUT = 120                 # seconds one script may hold the app
@@ -152,10 +156,14 @@ class ComHost:
         self.name = name                    # "Photoshop", for messages
         self.process_name = process_name    # "Photoshop.exe", for the running check
         self.proc = None
+        self.child = None
         self.lock = threading.Lock()
-        self.dir = tempfile.mkdtemp(prefix="studio_com_")
-        self.js_path = os.path.join(self.dir, "call.jsx")
-        self.out_path = os.path.join(self.dir, "answer.txt")
+        # Made on the first call and removed by close(). It used to be made
+        # here, and a bridge module builds its host at import - so every test
+        # run, every --list-tools and every bridge start left a folder in
+        # %TEMP% that nothing ever removed.
+        self.dir = self.js_path = self.out_path = None
+        atexit.register(self.close)   # a bridge exits through studio_mcp.main
 
     def running(self):
         return process_running(self.process_name)
@@ -163,13 +171,21 @@ class ComHost:
     # ------------------------------------------------------------ worker
 
     def _start(self):
+        if self.dir is None:
+            self.dir = tempfile.mkdtemp(prefix="studio_com_")
+            self.js_path = os.path.join(self.dir, "call.jsx")
+            self.out_path = os.path.join(self.dir, "answer.txt")
         code = (WORKER % {"progid": self.progid}).encode("utf-16-le")
-        self.proc = subprocess.Popen(
+        # Contained, so a worker cannot outlive the bridge that started it.
+        # The app it drives is started by COM (DcomLaunch), not by us, and is
+        # never in the job.
+        self.child = studio_procs.spawn(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Sta",
              "-ExecutionPolicy", "Bypass",
              "-EncodedCommand", base64.b64encode(code).decode("ascii")],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", bufsize=1, creationflags=NO_WINDOW)
+        self.proc = self.child.proc
         line = self._readline(30)
         if line != "ready":
             self._kill()
@@ -177,20 +193,9 @@ class ComHost:
                            % (self.name, line))
 
     def _kill(self):
-        if self.proc is not None:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
-            self._release()
-
-    def _release(self):
-        for stream in (self.proc.stdin, self.proc.stdout):
-            try:
-                stream.close()
-            except Exception:
-                pass
-        self.proc = None
+        if self.child is not None:
+            self.child.kill()     # the worker, its pipes and its job
+        self.child = self.proc = None
 
     def _readline(self, timeout):
         """One line from the worker, or None when it stays silent past `timeout`."""
@@ -209,14 +214,14 @@ class ComHost:
         return (box[0] or "").rstrip("\r\n") if box else ""
 
     def close(self):
+        """End the worker (end of input, then the job) and remove the folder."""
         with self.lock:
-            if self.proc is not None:
-                try:
-                    self.proc.stdin.close()
-                    self.proc.wait(timeout=3)
-                    self._release()
-                except Exception:
-                    self._kill()
+            if self.child is not None:
+                self.child.stop(3)
+            self.child = self.proc = None
+            if self.dir is not None:
+                shutil.rmtree(self.dir, ignore_errors=True)
+                self.dir = self.js_path = self.out_path = None
 
     # ------------------------------------------------------------- calls
 
@@ -232,7 +237,7 @@ class ComHost:
         js = script(body, setup, teardown)
         with self.lock:
             if self.proc is None or self.proc.poll() is not None:
-                self.proc = None
+                self._kill()
                 self._start()
             with open(self.js_path, "w", encoding="utf-8") as f:
                 f.write(js)
