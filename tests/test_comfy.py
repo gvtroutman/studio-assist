@@ -53,6 +53,10 @@ class FakeComfy:
         self.loras = ["detail.safetensors"]
         self.finish_after = 0      # history polls before a prompt "completes"
         self._polls = {}
+        # What /queue says is running; someone else's run by default, which
+        # is also what keeps a finished run from freeing the GPU under it.
+        self.running = [[1, "run-1", {"5": {"class_type": "KSampler"}}]]
+        self.free_vram = [20e9]    # /system_stats answers these in turn, the last for good
 
     def __call__(self, req, timeout=None):
         url = req if isinstance(req, str) else req.full_url
@@ -71,14 +75,17 @@ class FakeComfy:
 
     def route(self, method, route, q, data):
         if route == "/system_stats":
+            free = self.free_vram.pop(0) if len(self.free_vram) > 1 else self.free_vram[0]
             return {"system": {"comfyui_version": "0.3.0"},
-                    "devices": [{"name": "cuda:0 RTX 4090", "vram_total": 24e9, "vram_free": 20e9}]}
+                    "devices": [{"name": "cuda:0 RTX 4090", "vram_total": 24e9, "vram_free": free}]}
         if route == "/queue" and method == "GET":
-            return {"queue_running": [[1, "run-1", {"5": {"class_type": "KSampler"}}]],
-                    "queue_pending": []}
+            return {"queue_running": self.running, "queue_pending": []}
         if route == "/queue":
             self.posts.append(("queue", json.loads(data)))
             return {}
+        if route == "/free":
+            self.posts.append(("free", json.loads(data)))
+            return b""
         if route == "/interrupt":
             self.posts.append(("interrupt", None))
             return b""
@@ -141,10 +148,13 @@ class ComfyBridgeTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self._real_out = comfy.OUTPUT_DIR
         comfy.OUTPUT_DIR = self.tmp
+        self._real_keep = comfy.KEEP_MODELS
+        comfy.KEEP_MODELS = False         # the default, whatever this shell says
 
     def tearDown(self):
         urllib.request.urlopen = self._real_open
         comfy.OUTPUT_DIR = self._real_out
+        comfy.KEEP_MODELS = self._real_keep
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def text(self, res):
@@ -412,16 +422,27 @@ class ComfyBridgeTest(unittest.TestCase):
         g = self.fake.prompts["p2"]
         self.assertNotIn("9", g)
         self.assertEqual((g["5"]["inputs"]["steps"], g["5"]["inputs"]["cfg"]), (20, 4.0))
-        # photo_finish chains Z-Image's detail pass on its own loaders.
+        # photo_finish is Z-Image's detail pass as a second run. In the edit's
+        # own graph ComfyUI kept the 19.5 GB edit model on the card while it
+        # brought Z-Image in beside it, and one edit took 410 s. So the edit
+        # ends in a preview, the GPU is freed, and the finish loads the preview.
+        self.fake.running = []
         res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x",
                                                    "photo_finish": True})
-        g = self.fake.prompts["p3"]
-        self.assertEqual(g["31"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
-        self.assertEqual(g["42"]["inputs"]["image"], ["6", 0])
-        self.assertEqual(g["44"]["inputs"]["model"], ["34", 0])
-        self.assertEqual(g["44"]["inputs"]["denoise"], 0.25)
-        self.assertEqual(g["7"]["inputs"]["images"], ["45", 0])
+        edit, finish = self.fake.prompts["p3"], self.fake.prompts["p4"]
+        self.assertEqual(edit["7"], {"class_type": "PreviewImage",
+                                     "inputs": {"images": ["6", 0]}})
+        self.assertEqual({n["class_type"] for n in edit.values()} & {"SaveImage"}, set())
+        self.assertEqual(finish["1"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
+        self.assertEqual(finish["8"]["inputs"]["image"], "preview.png [temp]")
+        self.assertEqual(finish["13"]["inputs"]["image"], ["8", 0])
+        self.assertEqual(finish["15"]["inputs"]["model"], ["12", 0])
+        self.assertEqual(finish["15"]["inputs"]["denoise"], 0.25)
+        self.assertEqual(finish["7"]["inputs"]["images"], ["16", 0])
+        self.assertEqual(self.fake.posts.count(("free", {"unload_models": True,
+                                                         "free_memory": True})), 2)
         self.assertIn("photo finish", self.text(res))
+        self.assertFalse(res["isError"], self.text(res))
 
     def test_edit_without_an_edit_model_says_so(self):
         res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x"})
@@ -508,7 +529,9 @@ class ComfyBridgeTest(unittest.TestCase):
                                lambda ctx: calls.append(("back", ctx)))
         wrapped.call_tool("comfy_status", {})
         wrapped.call_tool("comfy_generate", {})
+        wrapped.settle()                  # the model is wanted again
         wrapped.call_tool("comfy_edit_image", {})
+        wrapped.settle()
         self.assertEqual(calls, ["comfy_status", "room", "comfy_generate", ("back", 32768),
                                  "room", "comfy_edit_image", ("back", 32768)])
         self.assertEqual(wrapped.instructions, "x")
@@ -527,7 +550,103 @@ class ComfyBridgeTest(unittest.TestCase):
                                lambda ctx: calls.append(ctx))
         with self.assertRaises(TimeoutError):
             wrapped.call_tool("comfy_generate", {})
-        self.assertEqual(calls, [16384])
+        self.assertEqual(calls, [])       # away until the model is wanted...
+        wrapped.settle()
+        self.assertEqual(calls, [16384])  # ...and then back, failed render or not
+
+    def test_the_picture_comes_back_before_the_model_does(self):
+        """The model's reload after a render took 17 s, and the finished
+        picture waited behind it, unseen; loading it beside the vision model's
+        look at the picture doubled that look. So the result returns at once,
+        the model comes back when it is next wanted - the executor settles
+        before every request - and a render straight after a render leaves it
+        away rather than loading it only to unload it again."""
+        order = []
+        class Bridge:
+            def call_tool(self, name, args):
+                order.append(name)
+                return {"content": [{"type": "image", "data": "x"}]}
+        windows = iter([32768, None])     # what it had; then, away, nothing
+        wrapped = eng.YieldGPU(Bridge(), {"comfy_generate"},
+                               lambda: order.append("room") or next(windows),
+                               lambda ctx: order.append(("back", ctx)))
+        result = wrapped.call_tool("comfy_generate", {})
+        self.assertEqual(result["content"][0]["type"], "image")
+        self.assertEqual(order, ["room", "comfy_generate"])       # not back yet
+        wrapped.call_tool("comfy_generate", {})
+        self.assertEqual(order, ["room", "comfy_generate", "room", "comfy_generate"])
+        eng.settle(wrapped)
+        self.assertEqual(order[-1], ("back", 32768))    # at the window it had first
+        eng.settle(wrapped)                             # nothing away: nothing done
+        eng.settle(object())                            # any other bridge is left alone
+        self.assertEqual(len(order), 5)
+
+    def test_a_made_picture_is_checked_against_the_brief_not_reviewed_for_flaws(self):
+        """Asked to name defects, the vision model always found some - steam
+        from a fox's mouth, fur not red enough - and the ComfyUI tab's model
+        redrew the picture for each, twice in one request, against its own
+        one-render rule. A tab whose pictures are what it made gets the check
+        instead; a tab whose pictures are views of a project keeps the review."""
+        self.assertTrue(eng.APPS_BY_ID["comfyui"].makes_pictures)
+        self.assertFalse(any(a.makes_pictures for a in eng.APPS if a.id != "comfyui"))
+        self.assertNotIn("defects", eng.Vision.CHECK)
+        self.assertIn("Matches the brief.", eng.Vision.CHECK)
+        asked = []
+        class Eyes:
+            def review(self, item, brief):
+                asked.append("review")
+                return "A fox. Defect: steam from its mouth."
+            def check(self, item, brief):
+                asked.append("check")
+                return "A fox in the snow.\nMatches the brief."
+        class Bridge:
+            def call_tool(self, name, args):
+                return {"content": [{"type": "text", "text": "saved fox.png"},
+                                    {"type": "image", "mimeType": "image/png", "data": "x"}]}
+        seen = []
+        class LLM:
+            replies = [{"role": "assistant", "content": "", "tool_calls": [
+                           {"id": "c1", "type": "function", "function": {
+                               "name": "comfy_generate", "arguments": "{\"prompt\": \"fox\"}"}}]},
+                       {"role": "assistant", "content": "Here is your fox."}]
+            def chat(self, messages, tools=None, max_tokens=None):
+                seen.append(messages[-2]["content"] if len(messages) > 3 else "")
+                return {"choices": [{"message": self.replies.pop(0), "finish_reason": "stop"}]}
+        schemas = [t for t in comfy.tool_list() if t["name"] == "comfy_generate"]
+        tools = eng.to_openai_tools(schemas)
+        self.assertEqual(eng.run_agent(LLM(), Bridge(), tools, "a fox in the snow", "s",
+                                       quiet=True, schemas=schemas, vision=Eyes(),
+                                       makes_pictures=True), "Here is your fox.")
+        self.assertEqual(asked, ["check"])
+        self.assertIn("Matches the brief.", seen[-1])
+
+    def test_a_step_waits_for_the_models_a_render_sent_away(self):
+        """The executor asks the bridge to settle before every request to the
+        model, so it never finds the model half-loaded and makes the host load
+        a second copy just in time."""
+        order = []
+        class Bridge:
+            def settle(self):
+                order.append("settle")
+            def call_tool(self, name, args):
+                order.append(name)
+                return {"content": [{"type": "text", "text": "ok"}]}
+        class LLM:
+            replies = [{"role": "assistant", "content": "", "tool_calls": [
+                           {"id": "c1", "type": "function", "function": {
+                               "name": "comfy_status", "arguments": "{}"}}]},
+                       {"role": "assistant", "content": "Done."}]
+            def stream(self, messages, tools, on_text):
+                order.append("model")
+                return self.replies.pop(0)
+        tools = [{"type": "function", "function": {"name": "comfy_status", "parameters": {
+            "type": "object", "properties": {}}}}]
+        schemas = [{"name": "comfy_status", "inputSchema": {"type": "object", "properties": {}},
+                    "annotations": {"readOnlyHint": True}}]
+        ex = tasks.Executor(LLM(), Bridge(), tools, schemas=schemas)
+        self.assertEqual(ex.run([{"role": "system", "content": "s"},
+                                 {"role": "user", "content": "status?"}]), "Done.")
+        self.assertEqual(order, ["settle", "model", "comfy_status", "settle", "model", "settle"])
 
     def test_give_back_reloads_only_a_model_that_is_gone(self):
         posted = []
@@ -554,6 +673,46 @@ class ComfyBridgeTest(unittest.TestCase):
         res = comfy.call_tool("comfy_wait", {"prompt_id": "p1"})
         self.assertTrue(res["isError"])
         self.assertIn("interrupted", self.text(res))
+
+    def test_a_finished_render_hands_the_gpu_back(self):
+        """After a Z-Image render ComfyUI still held 11.7 GB of the card, where
+        LM Studio could not see it: the 30B decoded at a third of its speed and
+        the tab's model took 17 s to load instead of 3. A finished run with
+        nothing queued behind it frees the GPU and waits for the memory to come
+        back before it returns - the tab's model is loaded the moment it does."""
+        self.fake.running = []
+        self.fake.free_vram = [20e9, 4e9, 9e9, 19.5e9]    # before; then letting go
+        slept = []
+        real_sleep = comfy.time.sleep
+        comfy.time.sleep = slept.append
+        try:
+            res = comfy.call_tool("comfy_generate", {"prompt": "x"})
+        finally:
+            comfy.time.sleep = real_sleep
+        self.assertFalse(res["isError"], self.text(res))
+        self.assertEqual(self.fake.posts, [("free", {"unload_models": True,
+                                                     "free_memory": True})])
+        self.assertEqual(self.fake.free_vram, [19.5e9])   # watched until it was back
+        self.assertEqual(slept, [0.25, 0.25])
+        # A run queued behind it wants the models where they are.
+        self.fake.posts.clear()
+        self.fake.running = [[2, "run-2", {}]]
+        comfy.call_tool("comfy_generate", {"prompt": "x"})
+        self.assertEqual(self.fake.posts, [])
+        # And a ComfyUI with a card of its own keeps them (COMFYUI_KEEP_MODELS).
+        self.fake.running = []
+        comfy.KEEP_MODELS = True
+        comfy.call_tool("comfy_generate", {"prompt": "x"})
+        self.assertEqual(self.fake.posts, [])
+        # A server that will not free costs speed, never the picture.
+        comfy.KEEP_MODELS = False
+        real = self.fake.route
+        def refuses(method, r, q, data):
+            if r == "/free":
+                self.fake.fail(500, "no")
+            return real(method, r, q, data)
+        self.fake.route = refuses
+        self.assertFalse(comfy.call_tool("comfy_generate", {"prompt": "x"})["isError"])
 
     def test_a_starved_gpu_is_named_in_the_result(self):
         real = self.fake.route

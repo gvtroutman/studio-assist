@@ -279,10 +279,14 @@ picks one from what the **same remote inference host** serves: `STUDIO_VISION_MO
 if you pin one and it is served, else the executing model itself when it can see,
 else one already in VRAM, else a known-good vision model (Qwen-VL, Gemma), else any
 the host has downloaded. It need not be loaded: Studio Assist asks LM Studio to
-load it while the tabs start (the Inference row says `loading …`, then `sees: …`),
-and a host that cannot be asked loads it on first use. Returned frames and the task
+load it once the first tab's own model is on (the Inference row says `loading …`,
+then `sees: …`), never before - LM Studio gives the GPU to the model it loads first,
+and the 30B loaded after the vision model ran at a third of its speed. A host that
+cannot be asked, or a ComfyUI tab, loads it on first use. Returned frames and the task
 brief go to it; it says what the frame actually shows and how it falls short, and
-that comes back to the executing model for the next step. No model is loaded on the
+that comes back to the executing model for the next step. A picture ComfyUI *made* is
+only held to the brief - it matches, or it plainly does not - because every flaw a
+review listed was a redraw. No model is loaded on the
 workstation. Only if the host has no vision model downloaded at all does the row
 turn amber; every tab says so once, and the model works blind: attached pictures are
 names and paths to it, and previews reach only you — download one in LM Studio and

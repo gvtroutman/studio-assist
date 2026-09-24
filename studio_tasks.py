@@ -460,6 +460,14 @@ class Executor:
             % (write["name"] if write else "your edits", tool, json.dumps(ids), text)})
         return True
 
+    def _settle(self):
+        """A render may have sent the host's models away (`eng.YieldGPU`);
+        they come back here, when the model is next needed - after the user
+        has the picture and the vision model has looked at it. Asked before
+        that, the host would load the model just in time, at its default
+        window."""
+        eng.settle(self.mcp)
+
     def _fresh_lessons(self):
         if self.notebook is None:
             return ""
@@ -726,7 +734,11 @@ class Executor:
 
     def run(self, messages, max_steps=25, streaming=True):
         try:
-            return self._run(messages, max_steps, streaming)
+            result = self._run(messages, max_steps, streaming)
+            # A run can end on a render (a Stop, a question) with the model
+            # still away; the reflection and the next turn talk to it.
+            self._settle()
+            return result
         except BaseException:
             # A persistence/transport failure may interrupt a multi-call batch.
             # Complete its protocol replies so the next user message is valid.
@@ -764,6 +776,7 @@ class Executor:
         for _ in range(max_steps):
             if self.cancel.is_set():
                 return stop("Stopped. Completed edits remain; inspect before resuming.")
+            self._settle()
             context = context_messages(messages, self.record, self.tools,
                                        self.max_chars, memory=bool(self.tools),
                                        extra=self._fresh_lessons())
