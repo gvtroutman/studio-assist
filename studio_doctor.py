@@ -182,6 +182,9 @@ def tab_rows(sessions):
     `prefix_tokens` and `window`; nothing here reaches the network."""
     rows = []
     for s in sessions or []:
+        if getattr(s.app, "panel", False):
+            rows.append((s.app.name, "a window in a tab - no model, no briefing", "muted"))
+            continue
         used, window = getattr(s, "prefix_tokens", None), getattr(s, "window", None)
         if not isinstance(used, int):
             rows.append((s.app.name, "not measured yet - the tab has not warmed up",

@@ -43,6 +43,7 @@ import studio_agent as eng
 import studio_doctor as doctor
 import studio_files as files
 import studio_lessons as lessons
+import studio_milanote as milanote
 import studio_procs as procs
 import studio_ui as ui
 import studio_icons as icons
@@ -96,6 +97,8 @@ CALL_TEXT_LIMIT = 12_000                  # chars of one argument or result show
 ANIM_MS = 70                              # one frame
 ELLIPSIS = "…"                       # the marker: a label ending in this is still working
 SEND = "→"                           # the send button's label while idle: an arrow, not a word
+PANEL_HINT = ("Sign in here once and this tab keeps it. Upload files drops "
+              "them onto the board you have open.")
 REVEAL_FRAMES = 7                         # a picture wipes in over about half a second
 SWEEP_FRAMES = 26                         # one pass of the arc across a bridge row
 RIPPLE_FRAMES = 24                        # one pulse out of a placeholder's centre dot: about 1.7s
@@ -263,6 +266,9 @@ class Session:
         self.frame = None
         self.view = None
         self.hero = None                  # the app's mark and name while nothing is said
+        self.browser = None               # a panel tab's window (studio_milanote.Browser)
+        self.panel_host = None            # ...the frame it is held in
+        self.panel_note = None            # ...and the line above it that speaks
         self._stream_open = False
         self._stream_buf = []
         self._asst_start = "1.0"
@@ -308,6 +314,9 @@ class Session:
 
     def close(self):
         self.cancel.set()
+        browser, self.browser = self.browser, None
+        if browser is not None:
+            browser.close()
         if self.mcp:
             try:
                 self.mcp.close()
@@ -540,7 +549,8 @@ class Chat(tk.Tk):
                 pass
         self.composer_paint()
         for s in self.sessions.values():
-            self._tags(s.view)
+            if s.view is not None:
+                self._tags(s.view)
         for app_id, view in list(self.tool_views.items()):
             if view.winfo_exists():
                 self._tool_tags(view)
@@ -700,10 +710,12 @@ class Chat(tk.Tk):
         # resized. Composer, then tab strip, then the transcript stack.
         composer = self._skin(tk.Frame(right), bg="bg")
         composer.pack(side="bottom", fill="x", padx=24, pady=(8, 20))
+        self.composer = composer          # a panel tab has none; _select hides it
         self._build_composer(composer)
 
         strip = self._skin(tk.Frame(right), bg="bg")
         strip.pack(side="top", fill="x", padx=14, pady=(10, 6))
+        self.strip = strip
         self._build_tabs(strip)
 
         self.stack = self._skin(tk.Frame(right), bg="bg")
@@ -731,6 +743,9 @@ class Chat(tk.Tk):
         self.empty_msg.pack(pady=(4, 0))
 
     def _build_transcript(self, s):
+        if s.app.panel:
+            self._build_panel(s)
+            return
         s.frame = self._skin(tk.Frame(self.stack), bg="bg")
         bar = tk.Scrollbar(s.frame, highlightthickness=0, bd=0, width=11)
         self._skin(bar, bg="bg", troughcolor="bg", activebackground="faint")
@@ -1353,6 +1368,8 @@ class Chat(tk.Tk):
         self.order.remove(sid)
         ui = self.tab_ui.pop(sid)
         ui["tab"].destroy()
+        if s.browser is not None:
+            s.browser.release()           # out of the frame before it goes
         s.frame.destroy()
         self._fit_tabs()
         # Shutting an MCP subprocess down can block for a moment; a turn still
@@ -1377,6 +1394,12 @@ class Chat(tk.Tk):
             self.empty.pack(side="top", fill="both", expand=True)
         else:
             self.sessions[sid].frame.pack(side="top", fill="both", expand=True)
+        panel = sid is not None and self.sessions[sid].app.panel
+        if panel:
+            self.composer.pack_forget()
+        elif not self.composer.winfo_ismapped():
+            self.composer.pack(side="bottom", fill="x", padx=24, pady=(8, 20),
+                               before=self.strip)
         for i in self.order:
             self._paint_tab(i)
         self._fit_tabs()
@@ -1384,7 +1407,10 @@ class Chat(tk.Tk):
         self._sync_bridges()
         if sid is not None:
             self._ensure(self.sessions[sid])
-            self.input.focus_set()
+            if panel:
+                self._focus_panel(self.sessions[sid])
+            else:
+                self.input.focus_set()
 
     def _on_next_tab(self, ev=None):
         if len(self.order) > 1:
@@ -2729,9 +2755,9 @@ class Chat(tk.Tk):
             self.btn_fix.set(text="Connect")
         else:
             self.btn_fix.set(text=("Check %s" if s.app.remote else "Start %s") % s.app.name)
-        self._show_fix(fixable)
-        self.btn_new.set(state="normal")
-        self.btn_hist.set(state="disabled" if s.busy else "normal")
+        self._show_fix(fixable and not s.app.panel)
+        self.btn_new.set(state="disabled" if s.app.panel else "normal")
+        self.btn_hist.set(state="disabled" if s.busy or s.app.panel else "normal")
         stopping = s.busy and s.cancel.is_set()
         self._ellipsis("send",
                        "Stopping" + ELLIPSIS if stopping else "Stop" if s.busy else SEND,
@@ -3022,6 +3048,11 @@ class Chat(tk.Tk):
             # the report is about the whole installation, and it must still
             # arrive when every tab is closed.
             self._paint_diagnostics(payload)
+            return
+
+        if s is not None and s.app.panel and kind not in (
+                "host", "host_probed", "host_retry"):
+            self._panel_event(s, kind, payload)
             return
 
         if s is None:                     # every tab is closed
@@ -3439,6 +3470,11 @@ class Chat(tk.Tk):
         if s.ready or s.booting:
             return
         s.booting = True
+        if s.app.panel:
+            s.status = ("opening %s" % s.app.name + ELLIPSIS, "muted", False)
+            self._apply_status()
+            self._spawn(s.event_id, self._open_panel, s)
+            return
         self._spawn(s.event_id, self._boot_session, s)
 
     def _boot_session(self, s):
@@ -3600,6 +3636,153 @@ class Chat(tk.Tk):
         if missing:
             self.q.put(("sys", sid, "This bridge does not provide: " + ", ".join(sorted(missing))))
 
+    # ------------------------------------------------------------------ panels
+    def _build_panel(self, s):
+        """A panel tab's body: a line of controls over the frame another
+        program's window is held in. No transcript, no hero and no composer -
+        the window is the tab. See studio_milanote.py."""
+        s.frame = self._skin(tk.Frame(self.stack), bg="bg")
+        bar = self._skin(tk.Frame(s.frame), bg="bg")
+        bar.pack(side="top", fill="x", padx=18, pady=(0, 8))
+        self._button(bar, "Upload files", lambda: self._panel_upload(s),
+                     kind="accent").pack(side="left")
+        self._button(bar, "Reload", lambda: self._panel_reload(s)).pack(
+            side="left", padx=(6, 0))
+        s.panel_note = tk.Label(bar, font=self.f_ui, anchor="w", text=PANEL_HINT)
+        self._skin(s.panel_note, bg="bg", fg="muted")
+        s.panel_note.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        s.panel_host = tk.Frame(s.frame, bd=0, highlightthickness=0)
+        self._skin(s.panel_host, bg="card")
+        s.panel_host.pack(side="top", fill="both", expand=True, padx=14, pady=(0, 14))
+        s.panel_host.bind("<Configure>",
+                          lambda ev: self._fit_panel(s, ev.width, ev.height))
+
+    def _fit_panel(self, s, width, height):
+        if s.browser is not None:
+            s.browser.fit(width, height)
+
+    def _focus_panel(self, s):
+        if s.browser is not None:
+            s.browser.focus()
+
+    def _panel_say(self, s, text, role="muted"):
+        if s.panel_note is not None:
+            s.panel_note.config(text=text)
+            self._skin(s.panel_note, bg="bg", fg=role)
+
+    def _open_panel(self, s):
+        """Off the UI thread: start the tab's window. `_panel_event` adopts
+        it into the tab on the UI thread, which owns the frame."""
+        browser = milanote.Browser(url=s.app.url)
+        s.browser = browser
+        try:
+            browser.start()
+        except Exception as e:
+            s.browser = None
+            browser.close(0)
+            self.q.put(("panel", s.event_id, ("failed", str(e))))
+            return
+        if s.closed:                      # the tab went while the window came
+            s.browser = None
+            browser.close()
+            return
+        self.q.put(("panel", s.event_id, ("window", browser)))
+
+    def _measure_panel(self, s, browser):
+        """How much of the window is its own frame, so fitting it can clip
+        that off. Twice: the frame settles a moment after it is adopted."""
+        for wait in (1.0, 3.0):
+            time.sleep(wait)
+            if browser is not s.browser:
+                return
+            try:
+                before = browser.inset
+                if browser.measure() != before:
+                    self.q.put(("panel", s.event_id, ("measured", browser)))
+            except Exception:
+                return                    # it keeps its title bar; nothing else is wrong
+
+    def _panel_event(self, s, kind, payload):
+        """`_handle` for a panel tab. What would be written into a transcript
+        is said on its note line; the rest is about a conversation it has not."""
+        if kind == "panel":
+            what, arg = payload
+            if what == "window" and arg is s.browser:
+                s.panel_host.update_idletasks()
+                arg.embed(s.panel_host.winfo_id(), s.panel_host.winfo_width(),
+                          s.panel_host.winfo_height())
+                s.booting, s.ready = False, True
+                s.status = ("%s is open" % s.app.name, "muted", False)
+                s.bridge = ("ok", "%s\nopen" % s.app.bridge_label)
+                if s.id == self.active:
+                    self._focus_panel(s)
+                self._spawn(s.event_id, self._measure_panel, s, arg)
+            elif what == "measured" and arg is s.browser:
+                arg.fit(*arg.size)
+            elif what == "failed":
+                s.booting = False
+                s.status = ("could not open %s" % s.app.name, "err", False)
+                s.bridge = ("err", "%s\nnot open" % s.app.bridge_label)
+                self._panel_say(s, arg[:1].upper() + arg[1:], "err")
+            elif what == "note":
+                self._panel_say(s, *arg)
+            self._paint_app_dot(s)
+            if s.id in self.tab_ui:
+                self._paint_tab(s.id)
+            if s.id == self.active:
+                self._apply_status()
+        elif kind in ("error", "sys"):
+            self._panel_say(s, payload, "err" if kind == "error" else "muted")
+        elif kind == "trace":
+            self._log(payload)
+        elif kind == "status":
+            s.status = payload
+            if s.id == self.active:
+                self._apply_status()
+        elif kind == "idle":
+            s.busy = False
+            if s.id == self.active:
+                self._apply_status()
+
+    def _panel_upload(self, s):
+        if s.browser is None or not s.ready:
+            self._panel_say(s, "%s is still opening." % s.app.name, "warn")
+            return
+        paths = filedialog.askopenfilenames(parent=self, title="Upload to %s" % s.app.name)
+        if not paths:
+            return
+        self._panel_say(s, "Uploading %d file%s" % (len(paths), "" if len(paths) == 1 else "s")
+                        + ELLIPSIS)
+        self._spawn(s.event_id, self._upload_panel, s, list(paths))
+
+    def _upload_panel(self, s, paths):
+        browser = s.browser
+        try:
+            if browser is None:
+                raise RuntimeError("%s is not open in this tab" % s.app.name)
+            said, role = browser.upload(paths), "ok"
+        except Exception as e:
+            said, role = str(e), "err"
+        self.q.put(("panel", s.event_id, ("note", (said[:1].upper() + said[1:], role))))
+
+    def _panel_reload(self, s):
+        """Reload the page; a window that has gone is opened again."""
+        if s.browser is not None and s.browser.running():
+            self._spawn(s.event_id, self._reload_panel, s)
+        elif not s.booting:
+            s.browser, s.ready = None, False
+            self._panel_say(s, "Opening %s again" % s.app.name + ELLIPSIS)
+            self._ensure(s)
+
+    def _reload_panel(self, s):
+        browser = s.browser
+        try:
+            browser.reload()
+            said, role = PANEL_HINT, "muted"
+        except Exception as e:
+            said, role = str(e), "err"
+        self.q.put(("panel", s.event_id, ("note", (said[:1].upper() + said[1:], role))))
+
     def _load_library(self, s):
         """Read back the tools the model made for this app, against the tools
         this tab is currently offering. A made tool whose steps are no longer
@@ -3658,7 +3841,7 @@ class Chat(tk.Tk):
 
     def _on_fix(self):
         s = self.cur()
-        if s is None or s.busy:
+        if s is None or s.busy or s.app.panel:
             return
         if s.host_down:                   # the button reads Connect
             self._connect_host()
@@ -3728,7 +3911,7 @@ class Chat(tk.Tk):
         it is worth being able to read. Nothing here is deleted on the app's
         own initiative; the button asks first."""
         s = self.cur()
-        if s is None or s.busy:
+        if s is None or s.busy or s.app.panel:
             return
         key = ("tasks", s.id)
         win = self.windows.get(key)
@@ -3870,7 +4053,7 @@ class Chat(tk.Tk):
 
     def _capabilities(self):
         s = self.cur()
-        if s is None or s.busy or s.booting or not s.ready:
+        if s is None or s.busy or s.booting or not s.ready or s.app.panel:
             return
         if not s.app.groups:
             self._write(s, "This tab has no bridge, so there are no capabilities "
@@ -3940,7 +4123,10 @@ class Chat(tk.Tk):
             # of the transcript, the way an attachment goes in.
             at = self._take_stage(s) or s.view.index("end-1c")
             s.view.config(state="normal")
-            self._embed(s.view, self._reveal(s.view, photo), (), at)
+            canvas = self._reveal(s.view, photo)
+            canvas.bind("<Button-3>", lambda ev: self._picture_menu(ev, item), add="+")
+            canvas.bind("<Double-Button-1>", lambda ev: self._open_picture(item), add="+")
+            self._embed(s.view, canvas, (), at)
             s.view.insert("%s+1c" % at, "\n")
             s.view.config(state="disabled")
             s.view.see("end")
@@ -3948,6 +4134,78 @@ class Chat(tk.Tk):
             if item.get("file"):
                 raise
             self._write(s, "Preview could not be displayed: %s\n" % e, "sys")
+
+    @staticmethod
+    def _picture_path(item):
+        """The file a preview shows, when it is on this workstation: the
+        preview's own file, or where the bridge saved it (`_meta.path`)."""
+        for path in (item.get("file"), (item.get("_meta") or {}).get("path")):
+            if path and os.path.isfile(path):
+                return path
+        return None
+
+    @staticmethod
+    def _picture_bytes(item):
+        path = Chat._picture_path(item)
+        if path:
+            with open(path, "rb") as f:
+                return f.read()
+        return base64.b64decode(item.get("data", ""))
+
+    def _picture_menu(self, ev, item):
+        """Right-click on a picture: save it, open it, find it. The preview is
+        shrunk to fit the transcript; each of these is the full picture."""
+        path = self._picture_path(item)
+        m = self._menu()
+        m.add_command(label="Save picture as" + ELLIPSIS, command=lambda: self._save_picture(item))
+        m.add_command(label="Open", command=lambda: self._open_picture(item))
+        if path:
+            m.add_command(label="Show in folder",
+                          command=lambda: self._show_in_folder(path))
+            m.add_command(label="Copy path", command=lambda: (
+                self.clipboard_clear(), self.clipboard_append(path)))
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    @staticmethod
+    def _show_in_folder(path):
+        # Not procs.spawn: the Explorer window is the user's, and must outlive
+        # this app rather than be stopped with its children.
+        import subprocess
+        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+
+    def _save_picture(self, item):
+        path = self._picture_path(item)
+        ext = os.path.splitext(path)[1] if path else ".png"
+        name = os.path.basename(path) if path else "picture" + ext
+        target = filedialog.asksaveasfilename(
+            parent=self, title="Save picture", initialfile=name, defaultextension=ext,
+            initialdir=os.path.join(os.path.expanduser("~"), "Pictures"),
+            filetypes=[("Picture", "*" + ext), ("All files", "*.*")])
+        if not target:
+            return
+        try:
+            with open(target, "wb") as f:
+                f.write(self._picture_bytes(item))
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Save picture", "Could not save it: %s" % e, parent=self)
+
+    def _open_picture(self, item):
+        """In the default viewer. A picture with no file of its own - a
+        screenshot a bridge sent as data - is written to a temporary one."""
+        path = self._picture_path(item)
+        try:
+            if not path:
+                import tempfile
+                fd, path = tempfile.mkstemp(suffix=".png", prefix="studio-picture-")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(self._picture_bytes(item))
+                item["file"] = path
+            os.startfile(path)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Open picture", "Could not open it: %s" % e, parent=self)
 
     def _reveal(self, v, photo):
         """A picture on a canvas, wiped in from the left over about half a
@@ -3991,7 +4249,7 @@ class Chat(tk.Tk):
 
     def _on_new(self):
         s = self.cur()
-        if s is None or s.busy:
+        if s is None or s.busy or s.app.panel:
             return
         s.reset()
         self._clear_view(s)
@@ -3999,7 +4257,7 @@ class Chat(tk.Tk):
 
     def _on_send(self):
         s = self.cur()
-        if s is None:
+        if s is None or s.app.panel:
             return
         if s.busy:
             s.cancel.set()

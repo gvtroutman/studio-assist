@@ -58,6 +58,9 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_procs.py`** — every child process the app starts, contained: each in its
   own kill-on-close Windows job object, so it and everything it starts end with the tab,
   the app, or the app's crash. See *Processes: nothing outlives the app*.
+- **`studio_milanote.py`** — the Milanote tab, which holds a window and has no bridge: a
+  Chrome/Edge `--app` window re-parented into the tab, and uploads dropped onto the board
+  over DevTools. See *The tab that holds a window*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -215,9 +218,10 @@ own process — keep both reading the same variable. ComfyUI must be started wit
 
 ### What ComfyUI makes, and why it takes the time it does
 
-The bridge has three making tools. `comfy_generate` is text to image; `comfy_edit_image`
+The bridge has four making tools. `comfy_generate` is text to image; `comfy_edit_image`
 changes a picture by instruction (Qwen-Image-Edit 2509 with up to two reference
-pictures); `comfy_upscale` enlarges one and redraws its detail. Each takes a local path
+pictures); `comfy_face_swap` puts one picture's people's faces on another's;
+`comfy_upscale` enlarges one and redraws its detail. Each takes a local path
 and uploads it (`input_image`), so the model never spends a round trip on
 `comfy_upload_image`. The recipes are ComfyUI's own templates, read from
 `/templates/<name>.json` on the server: `image_z_image_turbo`,
@@ -309,6 +313,23 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   for one edit. Now the edit ends in a `PreviewImage`, the GPU is freed, and the
   finish run loads that preview (`LoadImage` with `"<name> [temp]"`): 119 s for
   the cold edit plus 31 s for the finish.
+- **A face swap is crop, edit and stitch, in three runs** (`t_face_swap`). There is
+  no face-swap model on the LLM PC (no InsightFace, ReActor or IP-Adapter), and
+  `comfy_edit_image` on the whole picture gave the user strangers: in a 1 MP frame
+  a face is a few hundred pixels of the edit model's attention. So SAM3 finds the
+  faces (`find_faces`, a second or two; `face:8` asks for up to eight, and faces
+  under a quarter of the largest are the crowd), each scene face is cut out as a
+  square 2.4x its size and edited at 1024 px against the matching face (left to
+  right, or `order`), the edits end in previews, the GPU is freed, and a SAM3 run
+  masks the head before and after, grows and blurs the mask, fades it off the
+  crop's edge and composites each head back where it was cut. Nothing outside
+  the heads changes. SAM3's boxes come back through `PreviewAny`, whose text is
+  in `/history` - the one way a graph's non-image values reach the bridge.
+- **Every picture a bridge saved says where** (`_meta.path` on the image block).
+  The transcript's preview is shrunk to fit; right-click on it saves, opens,
+  shows or copies the full-size file, and a double-click opens it
+  (`Chat._picture_menu`). A picture with no file - a screenshot sent as data -
+  is saved from its bytes.
 - **The text encoder runs on the CPU** (`ENCODER_ON_CPU`, `device: cpu` on the
   `CLIPLoader`). It runs once a picture; the diffusion model runs every step. On
   the GPU the 8 GB encoder stayed resident beside the 12 GB Z-Image (or the
@@ -416,6 +437,48 @@ Older servers without `/global/health` are read from `/doc` instead.
 
 The window does not stop the container when it closes, just as it does not close After
 Effects. `docker stop studio-opencode` does; the workspace and the session volume stay.
+
+### The tab that holds a window: `PanelSpec`
+
+Milanote is a web app with no public API and no MCP server, so its tab has no model,
+no bridge, no transcript and no composer. `PanelSpec` (`panel = True`, `drivable`,
+`bridged` and `research` all False) is in `TABS` but, like chat, not in `APPS`.
+`studio_milanote.py` does the work:
+
+- **The window is a browser we start, re-parented into the tab.** `Browser.start()`
+  runs Chrome (else Edge; `STUDIO_MILANOTE_BROWSER` overrides) with `--app=` and a
+  profile of its own (`STUDIO_MILANOTE_PROFILE`, default
+  `%LOCALAPPDATA%\StudioAssistant\milanote-browser`), through `procs.spawn`. It finds
+  the window by the pid, and `adopt()` makes it a `WS_CHILD` of the tab's frame. It
+  must be its own profile. With the user's everyday one, a Chrome that is already
+  running takes the launch over and there is no process of ours to find a window for.
+  Chrome also refuses remote debugging on the default profile.
+- **The window's own title bar is clipped, not removed.** An `--app` window draws its
+  caption itself, so window styles cannot take it off. `measure()` reads the page's
+  `outerWidth - innerWidth` and `outerHeight - innerHeight` over DevTools, and `fit()`
+  places the window that far up and left of the frame, which clips the caption and
+  the resize borders. Measure after `embed`, because the borders change once the
+  window is a child: 0 px before and 10 px after at 150%. `fit()` does nothing before
+  `embed`, because it would move a top-level window to the desktop's corner. The app
+  is `SetProcessDpiAwareness(1)`. A DPI-unaware host put the child at the wrong offset.
+- **Upload is a drop.** `Input.dispatchDragEvent` (`dragEnter`, `dragOver`, `drop`)
+  with the file paths, at the middle of the page. Milanote makes a card of each file.
+  A test page received both files with their full contents. DevTools listens on a port
+  Chrome picks itself (`--remote-debugging-port=0`, loopback only) and writes to
+  `DevToolsActivePort` in the profile. The WebSocket client is a stdlib one in the
+  module. On the sign-in page an upload says to sign in rather than dropping.
+- **Closing detaches first.** `_close_tab` calls `release()` (hide, `SetParent(None)`,
+  `WM_CLOSE`) before it destroys the frame. Destroying a parent destroys its children,
+  and Chrome would lose its window under it and be killed instead of closed.
+  `Session.close()` then waits `CLOSE_GRACE` and ends the job.
+- **In the GUI** `_build_transcript` hands a panel to `_build_panel`. `_select` hides
+  the composer for a panel and puts it back (`before=self.strip`) for a conversation.
+  `_ensure` spawns `_open_panel`, whose `("panel", sid, ...)` events `_panel_event`
+  handles. Every other event for a panel tab, a `sid` of None included, is said on the
+  panel's note line, because there is no transcript to write into. New chat, History,
+  Send, Start and Capabilities do nothing on a panel. `tests/test_milanote.py` holds
+  the DevTools client against a fake on a real socket, and the tab against a stub
+  browser.
 
 ### The COM bridges: Photoshop and Illustrator
 

@@ -1459,8 +1459,13 @@ WHICH TOOL
   Describe the change as one instruction ("replace the grey sky with a warm sunset,
   keep everything else"). Do not use comfy_generate's init_image for this: it
   repaints the whole picture and follows no instruction.
+- Put the faces of the people in one picture onto the people in another - "make
+  it us", "swap our faces into this photo": comfy_face_swap, with the scene as
+  image and the people's picture as faces. It pairs faces left to right; pass
+  order when the user says otherwise. Not comfy_edit_image: edited whole, a face
+  in a group photo comes back as a stranger.
 - Bigger or sharper: comfy_upscale.
-- All three take a picture as a path on this workstation and send it up
+- All four take a picture as a path on this workstation and send it up
   themselves. Do not call comfy_upload_image first.
 - Just generate. The default model and settings are the best ones installed for
   photographs; do not call comfy_status or comfy_list_models first unless the user
@@ -1962,6 +1967,9 @@ class AppSpec:
     # read-only, in process - beside its bridge. False only for ChatSpec, whose
     # bridge *is* the research server.
     research = True
+    # True only for PanelSpec below: the tab holds another program's window,
+    # with no model and no bridge behind it.
+    panel = False
 
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
@@ -2268,7 +2276,8 @@ RESOLVE_GROUPS = {
 
 COMFY_GROUPS = {
     "discover": ["comfy_status", "comfy_list_models", "comfy_queue", "comfy_history"],
-    "generate": ["comfy_generate", "comfy_edit_image", "comfy_upscale", "comfy_upload_image",
+    "generate": ["comfy_generate", "comfy_edit_image", "comfy_face_swap", "comfy_upscale",
+                 "comfy_upload_image",
                  "comfy_wait", "comfy_fetch_output"],
     "control": ["comfy_interrupt", "comfy_clear_queue"],
     # Arbitrary graphs and the node catalogue: powerful, verbose, and easy for a
@@ -2485,7 +2494,7 @@ APPS = [
         # calling comfy_generate; the 9B, tested live on this briefing, wrote
         # a photographer's prompt and called it. Not served -> the shared model.
         models=["qwen3.5-9b-deepseek-v4-flash"],
-        gpu_tools=["comfy_generate", "comfy_edit_image", "comfy_upscale",
+        gpu_tools=["comfy_generate", "comfy_edit_image", "comfy_face_swap", "comfy_upscale",
                    "comfy_run_workflow"],
         makes_pictures=True,
         docs=[("ComfyUI documentation", "https://docs.comfy.org/"),
@@ -2676,9 +2685,64 @@ class ChatSpec(AppSpec):
 
 CHAT = ChatSpec()
 
+
+class PanelSpec(AppSpec):
+    """
+    A tab that holds another program's window instead of a conversation: no
+    model, no bridge, no transcript, no composer. Milanote is the one - a web
+    app with no API to drive, so the tab is a container for it and for files
+    dropped onto it (studio_milanote.py).
+
+    `panel` is the flag the GUI asks. It duck-types AppSpec like ChatSpec does
+    so the tab strip and its menu need no special case, and it is not in APPS
+    for the same reason chat is not: DRIVABLE must not count it.
+    """
+
+    drivable = False
+    bridged = False
+    research = False
+    panel = True
+
+    def __init__(self, id, name, tab, code, fg, bg, url, note):
+        AppSpec.__init__(
+            self, id=id, name=name, tab=tab, code=code, fg=fg, bg=bg,
+            exe_globs=[], probe="", command="", args=[], bridge_label="web app",
+            groups={}, default_groups=[], system_prompt="", examples=[],
+            launch_note=note)
+        self.url = url
+
+    def exe(self):
+        return None
+
+    def installed(self):
+        return True
+
+    def running(self):
+        return True
+
+    def chat_prompt(self, studio="", lessons=""):
+        return ""                         # nothing here talks to a model
+
+    def cli_prompt(self, studio="", lessons=""):
+        return ""
+
+    def connect(self, quiet=True):
+        raise RuntimeError("%s is a window in a tab, with no bridge to connect to."
+                           % self.name)
+
+    def launch(self):
+        raise RuntimeError(self.launch_note)
+
+
+MILANOTE = PanelSpec(
+    id="milanote", name="Milanote", tab="Milanote", code="Mn",
+    fg="#ffffff", bg="#2f3542",
+    url=os.environ.get("MILANOTE_URL", "https://app.milanote.com/"),
+    note="Milanote opens inside its tab, in a Chrome or Edge window of its own.")
+
 # Everything that can be a tab, apps first. APPS stays the registry of drivable
 # apps; TABS is what the tab strip and the new-tab menu offer.
-TABS = APPS + [CHAT]
+TABS = APPS + [MILANOTE, CHAT]
 TABS_BY_ID = {a.id: a for a in TABS}
 
 
@@ -3211,6 +3275,9 @@ def main():
         return 0
 
     app = get_app(a.app)
+    if app.panel:
+        p.error("%s is a window in a tab of the app, with no model and no bridge; "
+                "open it there" % app.name)
     _, loaded, ids, vision_ids, _ = probe_models(a.host)
     if not a.model:
         # The GUI does the same: an app may prefer a small model the host serves.
