@@ -78,6 +78,25 @@ class TestPose(unittest.TestCase):
         x, y = int(wrist[0] * w), int(wrist[1] * h)
         self.assertEqual(rows[y][x * 4:x * 4 + 3], b"\x00\x00\x00")
 
+    def test_a_seen_face_gets_its_landmark_dots(self):
+        # Without them the ControlNet drew every figure from behind.
+        pts = sp.preset("standing", 832, 1216)
+        dots = sp.face_points(pts, 832, 1216)
+        self.assertEqual(len(dots), 68)
+        nose, eye_y = pts[0], pts[14][1]
+        chin = dots[8]
+        self.assertAlmostEqual(chin[0], nose[0], places=3)
+        self.assertGreater(chin[1], nose[1])                  # below the nose, not above
+        self.assertLess(chin[1], pts[1][1])                   # and above the neck
+        self.assertTrue(all(abs(x - nose[0]) < 0.1 for x, _ in dots))
+        w, h, rows = pixels(sp.render(pts, 832, 1216))
+        x, y = int(chin[0] * w), int(chin[1] * h)
+        self.assertEqual(tuple(rows[y][x * 4:x * 4 + 3]), (255, 255, 255))
+        # A face turned away or in profile gets none.
+        self.assertEqual(sp.face_points(sp.preset("profile", 1024, 1024), 1024, 1024), [])
+        pts[15] = None
+        self.assertEqual(sp.face_points(pts, 832, 1216), [])
+
     def test_save_names_the_picture_by_what_it_is(self):
         d = tempfile.mkdtemp()
         pts = sp.preset("waving", 1024, 1024)
