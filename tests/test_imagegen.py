@@ -588,6 +588,25 @@ class TestLibrary(unittest.TestCase):
         self.assertTrue(kept.startswith(lib.root))
         self.assertEqual(kept, lib.keep_reference(src, "Gavin"))
 
+    def test_every_default_style_has_its_example_picture(self):
+        """The form shows styles as pictures; a default without one is a
+        blank tile."""
+        lib = ig.Library(tempfile.mkdtemp())
+        for st in lib.all("styles"):
+            self.assertTrue(ig.style_example(st), st["id"])
+
+    def test_a_styles_own_example_wins_and_a_missing_one_falls_back(self):
+        d = tempfile.mkdtemp()
+        own = os.path.join(d, "mine.png")
+        with open(own, "wb") as f:
+            f.write(PNG)
+        self.assertEqual(ig.style_example(ig.clean_style(
+            {"name": "Cinema", "example": own})), own)
+        self.assertEqual(ig.style_example(ig.clean_style(
+            {"name": "Cinema", "example": os.path.join(d, "gone.png")})),
+            os.path.join(ig.STYLE_EXAMPLES_DIR, "cinema.png"))
+        self.assertIsNone(ig.style_example(ig.clean_style({"name": "Brand new"})))
+
 
 def _headless():
     try:
