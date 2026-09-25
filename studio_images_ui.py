@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 import studio_imagegen as ig
+import studio_scene_ui
 
 THUMB = 72                    # px, before the display's scale
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
@@ -112,6 +113,7 @@ class ImageStudio:
         self.faces = tk.BooleanVar(value=False)
         self.faces_set = False        # likewise for the face pass
         self.adv_open = False
+        self.scene_builder = None     # the Scene Builder window, while it is open
         self._build(session.frame)
         for problem in self.studio.lib.problems:
             self.say(problem, "warn")
@@ -299,6 +301,12 @@ class ImageStudio:
         self.scene.pack(fill="x")
         self.scene.bind("<KeyRelease>", lambda ev: self._recheck())
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
+        srow = self.frame(f)
+        srow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.button(srow, "Scene Builder…", self.build_scene, kind="ghost").pack(side="left")
+        self.label(srow, "Stage a person and props in 3D; the frame becomes the source "
+                   "picture.", "faint", self.host.f_small, wraplength=self.px(250)).pack(
+            side="left", padx=(self.px(6), 0))
 
         self.cap(f, "Person").pack(**pad)
         crow = self.frame(f)
@@ -964,24 +972,39 @@ class ImageStudio:
             self.hints[key].config(text="" if val in (None, "") else "default %s" % val)
 
     # ============================================================== generate
-    def generate(self):
+    def generate(self, extra=None):
         """Refuses, in words, what cannot run where it would go: a missing
         file or node, no backend able to take it. Routing that has not heard
-        from the backends yet is left to submit(), which asks them."""
+        from the backends yet is left to submit(), which asks them. `extra`
+        is laid over the form's settings for this job alone - the Scene
+        Builder's frame size, denoise and scene. True when it was sent on."""
         s = self.collect()
+        s.update(extra or {})
         b, why = self.studio.plan_route(s)
         known = all(bk["id"] in self.studio.health for bk in self.studio.backends()
                     if bk["enabled"])
         if b is None and known:
             self.say(why, "err")
-            return
+            return False
         if b is not None:
             p = self.studio.preview(s, b)
             if p is not None and p.errors:
                 self.say("Not sent. " + " ".join(p.errors), "err")
-                return
+                return False
         self.say("Routing" + ELLIPSIS, "muted")
         self.host._spawn(self.s.event_id, self._submit, s)
+        return True
+
+    def build_scene(self, path=None):
+        """The Scene Builder: one window, raised if it is already open."""
+        sb = self.scene_builder
+        if sb is not None and sb.win.winfo_exists():
+            sb.win.lift()
+            if path:
+                sb.open(path)
+            return sb
+        self.scene_builder = studio_scene_ui.SceneBuilder(self, path)
+        return self.scene_builder
 
     def _submit(self, s):
         """Off the UI thread: routing may check a backend's health."""
@@ -1567,6 +1590,17 @@ class ImageStudio:
             ("example", "Example picture (PNG; the tile on the form)", "path"),
             ("notes", "Notes", "long"),
         ], template={"name": "New style"})
+
+    def release(self):
+        """On the UI thread, before the tab's frame goes (`Chat._close_tab`,
+        `Chat._quit`): the Scene Builder writes into this form, so it cannot
+        outlive it. `close()` runs on a worker thread and must not touch Tk."""
+        sb, self.scene_builder = self.scene_builder, None
+        try:
+            if sb is not None and sb.win.winfo_exists():
+                sb.close(final=True)
+        except tk.TclError:
+            pass
 
     def close(self):
         self.studio.close()
