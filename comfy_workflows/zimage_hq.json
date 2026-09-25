@@ -1,0 +1,68 @@
+{
+  "id": "zimage_hq",
+  "label": "Z-Image Turbo high quality",
+  "about": "Z-Image Turbo text to image (ComfyUI's own recipe) with model-only LoRAs, an optional source picture, and the upscale-and-refine detail pass the chat tab's bridge uses.",
+  "families": ["z-image"],
+  "defaults": {
+    "steps": 8, "guidance": 1.0, "sampler": "res_multistep", "scheduler": "simple",
+    "width": 1024, "height": 1024, "denoise": 1.0, "shift": 3.0,
+    "encoder_device": "default", "refine": false, "upscale": 1.5,
+    "refine_steps": 5, "refine_denoise": 0.33, "refine_sampler": "dpmpp_2m_sde",
+    "refine_scheduler": "beta", "filename_prefix": "ImageStudio/zimage"
+  },
+  "source_denoise": 0.6,
+  "files": {"model": "diffusion_models", "encoder": "text_encoders", "vae": "vae"},
+  "references": {"source": "source_image"},
+  "lora_chain": {"model": ["1", 0]},
+  "switches": {
+    "latent": {"when": "source_image", "then": ["22", 0], "else": ["20", 0]},
+    "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]}
+  },
+  "stages": {"refining": ["42", "43", "44", "45"]},
+  "graph": {
+    "1": {"class_type": "UNETLoader",
+          "inputs": {"unet_name": "{{model}}", "weight_dtype": "default"}},
+    "2": {"class_type": "CLIPLoader",
+          "inputs": {"clip_name": "{{encoder}}", "type": "lumina2",
+                     "device": "{{encoder_device}}"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+    "4": {"class_type": "ModelSamplingAuraFlow",
+          "inputs": {"model": "{{model_out}}", "shift": "{{shift}}"}},
+
+    "10": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["2", 0]}},
+    "12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["10", 0]}},
+
+    "20": {"_unless": "source_image", "class_type": "EmptySD3LatentImage",
+           "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
+    "21": {"_when": "source_image", "class_type": "LoadImage",
+           "inputs": {"image": "{{source_image}}"}},
+    "22": {"_when": "source_image", "class_type": "VAEEncode",
+           "inputs": {"pixels": ["21", 0], "vae": ["3", 0]}},
+
+    "40": {"class_type": "KSampler",
+           "inputs": {"model": ["4", 0], "seed": "{{seed}}", "steps": "{{steps}}",
+                      "cfg": 1.0, "sampler_name": "{{sampler}}", "scheduler": "{{scheduler}}",
+                      "positive": ["10", 0], "negative": ["12", 0],
+                      "latent_image": "{{latent}}", "denoise": "{{denoise}}"}},
+    "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
+
+    "42": {"_when": "refine", "class_type": "ImageScaleBy",
+           "inputs": {"image": ["41", 0], "upscale_method": "lanczos",
+                      "scale_by": "{{upscale}}"}},
+    "43": {"_when": "refine", "class_type": "VAEEncodeTiled",
+           "inputs": {"pixels": ["42", 0], "vae": ["3", 0], "tile_size": 1024,
+                      "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}},
+    "44": {"_when": "refine", "class_type": "KSampler",
+           "inputs": {"model": ["4", 0], "seed": "{{seed}}", "steps": "{{refine_steps}}",
+                      "cfg": 1.0, "sampler_name": "{{refine_sampler}}",
+                      "scheduler": "{{refine_scheduler}}", "positive": ["10", 0],
+                      "negative": ["12", 0], "latent_image": ["43", 0],
+                      "denoise": "{{refine_denoise}}"}},
+    "45": {"_when": "refine", "class_type": "VAEDecodeTiled",
+           "inputs": {"samples": ["44", 0], "vae": ["3", 0], "tile_size": 1024,
+                      "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}},
+
+    "9": {"class_type": "SaveImage",
+          "inputs": {"images": "{{final}}", "filename_prefix": "{{filename_prefix}}"}}
+  }
+}
