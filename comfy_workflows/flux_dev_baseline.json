@@ -1,7 +1,7 @@
 {
   "id": "flux_dev_baseline",
   "label": "FLUX.1 [dev]",
-  "about": "The known-good FLUX.1 [dev] text to image: ComfyUI's own flux_dev_full_text_to_image recipe (split files, KSampler at CFG 1, zeroed negative) plus FluxGuidance, so guidance is a real setting. Layered on it, each off unless asked for, so with none of them on the graph is the baseline node for node: a LoRA stack (identity and style LoRAs), an upscale-and-refine pass at low denoise, a face pass that redraws each face at full size with the same model and LoRAs, and a pose: an OpenPose stick figure through a FLUX ControlNet (Union Pro 2.0), for the first pass only.",
+  "about": "The known-good FLUX.1 [dev] text to image: ComfyUI's own flux_dev_full_text_to_image recipe (split files, KSampler at CFG 1, zeroed negative) plus FluxGuidance, so guidance is a real setting. Layered on it, each off unless asked for, so with none of them on the graph is the baseline node for node: a LoRA stack (identity and style LoRAs), an upscale-and-refine pass at low denoise, a face pass that redraws each face at full size with the same model and LoRAs, a pose: an OpenPose stick figure through a FLUX ControlNet (Union Pro 2.0), for the first pass only; and item pictures (what a character's clothes, hair and accessories look like), which swap the model for FLUX.1 Kontext [dev] and give it the pictures as reference latents.",
   "families": ["flux1"],
   "defaults": {
     "steps": 20, "guidance": 3.5, "sampler": "euler", "scheduler": "simple",
@@ -11,13 +11,14 @@
     "refine_sampler": "euler", "refine_scheduler": "beta",
     "face_denoise": 0.4,
     "controlnet": "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors",
-    "pose_strength": 0.9, "pose_end": 0.65
+    "pose_strength": 0.9, "pose_end": 0.65,
+    "kontext_model": "flux1-dev-kontext_fp8_scaled.safetensors", "item_guidance": 2.5
   },
   "files": {
     "model": "diffusion_models", "clip_l": "text_encoders", "t5": "text_encoders",
-    "vae": "vae", "controlnet": "controlnet"
+    "vae": "vae", "controlnet": "controlnet", "kontext_model": "diffusion_models"
   },
-  "needs": {"pose_image": ["controlnet"]},
+  "needs": {"pose_image": ["controlnet"], "items": ["kontext_model"]},
   "references": {"pose": "pose_image"},
   "lora_chain": {"model": ["1", 0], "clip": ["2", 0]},
   "switches": {
@@ -25,6 +26,8 @@
     "positive": {"when": "pose_image", "then": ["52", 0], "else": ["11", 0]},
     "negative": {"when": "pose_image", "then": ["52", 1], "else": ["12", 0]}
   },
+  "items": {"model": "kontext_model", "guidance": "item_guidance",
+            "conditioning": ["11", "conditioning"], "vae": ["3", 0]},
   "stages": {
     "loading": ["1", "2", "3", "10", "50", "51", "52"],
     "sampling": ["40"],
