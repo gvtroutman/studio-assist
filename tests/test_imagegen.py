@@ -22,7 +22,8 @@ PNG = base64.b64decode(
 
 FLUX_FILES = {"diffusion_models": {"flux1-dev.safetensors", "z_image_turbo_bf16.safetensors"},
               "text_encoders": {"clip_l.safetensors", "t5xxl_fp16.safetensors",
-                                "t5xxl_fp8_e4m3fn.safetensors", "qwen_3_4b.safetensors"},
+                                "t5xxl_fp8_e4m3fn.safetensors",
+                                "t5xxl_fp8_e4m3fn_scaled.safetensors", "qwen_3_4b.safetensors"},
               "vae": {"ae.safetensors"}, "loras": {"gavin.safetensors", "sx70.safetensors",
                                                    "xl_thing.safetensors"},
               "checkpoints": set(), "clip_vision": set(), "style_models": set(),
@@ -65,9 +66,12 @@ class FakeClient:
         return "pid%d" % len(self.graphs)
 
     def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        on_event("queued", 0)
+        on_event("executing", "1")
         on_event("executing", "40")
         for i in range(1, 5):
             on_event("progress", (i, 4, "40"))
+        on_event("executing", "41")
         if FakeClient.hold is not None:
             while not FakeClient.hold.wait(0.02):
                 if stop and stop():
@@ -127,6 +131,20 @@ class TempStudioMixin:
                                        "prompt": "SX-70 instant film.",
                                        "families": ["flux1"]}]
         lib.save("styles", styles)
+        # The layered FLUX workflow (LoRAs, references, refine), kept for when
+        # the baseline is known good; the engine's layering is tested on it.
+        lib.save("models", lib.all("models") + [
+            {"id": "flux-hq", "label": "FLUX.1 [dev] HQ", "family": "flux1",
+             "workflow": "flux_hq",
+             "values": {"model": "flux1-dev.safetensors", "weight_dtype": "default",
+                        "clip_l": "clip_l.safetensors", "t5": "t5xxl_fp16.safetensors",
+                        "vae": "ae.safetensors",
+                        "clip_vision": "sigclip_vision_patch14_384.safetensors",
+                        "style_model": "flux1-redux-dev.safetensors"},
+             "backends": {"3090": {"t5": "t5xxl_fp8_e4m3fn.safetensors",
+                                   "weight_dtype": "fp8_e4m3fn"}},
+             "defaults": {"steps": 28, "guidance": 3.5, "sampler": "euler",
+                          "scheduler": "simple", "width": 1024, "height": 1024}}])
 
     def backend(self, bid):
         return self.studio.backend(bid)
@@ -189,17 +207,52 @@ class TestFill(unittest.TestCase):
         for wf in ig.list_workflows():
             vals = {k: "x.safetensors" for k in (wf.get("files") or {})}
             vals.update(prompt="p", seed=1)
+            loras = [("l.safetensors", 0.5)] if wf.get("lora_chain") else []
             for extra in ({}, {"refine": True, "source_image": "s.png"}):
-                g = ig.fill(wf, dict(vals, **extra), [("l.safetensors", 0.5)])
+                g = ig.fill(wf, dict(vals, **extra), loras)
                 self.assertTrue(any(n["class_type"] == "SaveImage" for n in g.values()),
                                 wf["id"])
 
+    def test_the_flux_baseline_is_plain_text_to_image(self):
+        wf = ig.load_workflow("flux_dev_baseline")
+        g = ig.fill(wf, {"model": "flux1-dev.safetensors", "clip_l": "c", "t5": "t",
+                         "vae": "ae", "prompt": "a fox", "seed": 9, "width": 832,
+                         "height": 1216, "steps": 20, "guidance": 2.5,
+                         "filename_prefix": "ImageStudio/job1"})
+        classes = sorted(n["class_type"] for n in g.values())
+        self.assertEqual(classes, sorted(
+            ["UNETLoader", "DualCLIPLoader", "VAELoader", "CLIPTextEncode", "FluxGuidance",
+             "ConditioningZeroOut", "EmptySD3LatentImage", "KSampler", "VAEDecode",
+             "SaveImage"]))
+        self.assertEqual((g["40"]["inputs"]["seed"], g["40"]["inputs"]["steps"]), (9, 20))
+        self.assertEqual(g["11"]["inputs"]["guidance"], 2.5)
+        self.assertEqual((g["20"]["inputs"]["width"], g["20"]["inputs"]["height"]), (832, 1216))
+        self.assertEqual(g["9"]["inputs"]["filename_prefix"], "ImageStudio/job1")
+        with self.assertRaises(ig.TemplateError):
+            ig.fill(wf, {"model": "m", "clip_l": "c", "t5": "t", "vae": "v", "prompt": "p",
+                         "seed": 1}, [("l.safetensors", 0.5)])
+
 
 class TestCompose(TempStudioMixin, unittest.TestCase):
-    def plan(self, backend="5090", inventory=FLUX_FILES, **kw):
+    def plan(self, backend="5090", inventory=FLUX_FILES, nodes=None, **kw):
         s = ig.default_settings()
+        s["model"] = "flux-hq"
         s.update(kw)
-        return ig.compose(s, self.studio.lib, self.backend(backend), inventory)
+        return ig.compose(s, self.studio.lib, self.backend(backend), inventory, nodes=nodes)
+
+    def test_the_baseline_drops_loras_and_refine_out_loud(self):
+        p = self.plan(model="flux-dev", scene="x", preset="hq_final",
+                      loras=[{"id": "sx70", "strength": 0.5}])
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.loras, [])
+        self.assertFalse(p.values["refine"])
+        self.assertTrue(any("takes no LoRAs: SX-70" in w for w in p.warnings), p.warnings)
+        self.assertTrue(any("no refine pass" in w for w in p.warnings), p.warnings)
+
+    def test_missing_nodes_are_named(self):
+        p = self.plan(model="flux-dev", scene="x", nodes={"UNETLoader"})
+        self.assertTrue(any("FluxGuidance" in e and "KSampler" in e for e in p.errors),
+                        p.errors)
 
     def test_person_style_scene(self):
         p = self.plan(identities=[{"id": "gavin", "strength": 0.9}], style="sx70-authentic",
@@ -237,7 +290,8 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
     def test_missing_model_file_is_an_error_with_the_fix(self):
         inv = dict(FLUX_FILES, diffusion_models=set())
         p = self.plan(inventory=inv, scene="x")
-        self.assertTrue(any("flux1-dev.safetensors" in e and "Models" in e for e in p.errors))
+        self.assertTrue(any("flux1-dev.safetensors" in e and "Models" in e
+                            and "models/diffusion_models" in e for e in p.errors), p.errors)
 
     def test_per_backend_filenames(self):
         p = self.plan(backend="3090", scene="x")
@@ -248,7 +302,8 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
 
     def test_per_backend_family_decides_compatibility(self):
         models = self.studio.lib.all("models")
-        models[0]["backends"]["5090"] = {"model": "flux2-dev.safetensors", "family": "flux2"}
+        next(m for m in models if m["id"] == "flux-hq")["backends"]["5090"] = {
+            "model": "flux2-dev.safetensors", "family": "flux2"}
         self.studio.lib.save("models", models)
         p = self.plan(inventory=None, identities=["gavin"], scene="x")
         self.assertEqual(p.family, "flux2")
@@ -313,6 +368,37 @@ class TestRouting(TempStudioMixin, unittest.TestCase):
             self.studio.submit(dict(ig.default_settings(), scene="x"))
         self.assertIn("5090 Workstation is offline", str(cm.exception))
 
+    def test_auto_prefers_the_5090_and_falls_back_only_to_a_ready_3090(self):
+        s = dict(ig.default_settings(), model="flux-dev", scene="x")
+        self.studio.check_all()
+        b, why = self.studio.plan_route(s)
+        self.assertEqual(b["id"], "5090")
+        self.assertIn("Auto → 5090 Workstation", why)
+        FakeClient.down = {"5090"}
+        self.studio.check_all()
+        b, why = self.studio.plan_route(s)
+        self.assertEqual(b["id"], "3090")
+        self.assertIn("5090 Workstation is offline", why)
+        # The 3090 without FLUX's files: nothing, and the files are named.
+        self.studio.inventories["3090"]["diffusion_models"] = set()
+        b, why = self.studio.plan_route(s)
+        self.assertIsNone(b)
+        self.assertIn("3090 Server is missing flux1-dev.safetensors", why)
+        with self.assertRaises(ig.ComfyError):
+            self.studio.submit(s)
+
+    def test_readiness_names_each_missing_file_and_where(self):
+        self.studio.check_all()
+        self.studio.inventories["3090"]["text_encoders"] = {"clip_l.safetensors"}
+        FakeClient.down = {"5090"}
+        self.studio.check(self.backend("5090"))
+        r = self.studio.readiness(self.studio.lib.get("models", "flux-dev"))
+        self.assertEqual(r["5090"][0], "offline")
+        self.assertEqual(r["3090"][0], "missing")
+        self.assertIn("t5xxl_fp8_e4m3fn_scaled.safetensors (the text encoder, in "
+                      "ComfyUI/models/text_encoders)", r["3090"][1])
+        self.assertNotIn("clip_l", r["3090"][1])
+
 
 class TestJobs(TempStudioMixin, unittest.TestCase):
     def test_a_job_runs_and_lands_in_history(self):
@@ -322,8 +408,8 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         with open(src, "wb") as f:
             f.write(PNG)
         jobs = self.studio.submit(dict(ig.default_settings(), scene="A fox", backend="3090",
-                                       identities=["gavin"], references={"source": src},
-                                       seed=42))
+                                       model="flux-hq", identities=["gavin"],
+                                       references={"source": src}, seed=42))
         settle(jobs)
         job = jobs[0]
         self.assertEqual(job.status, "complete", job.detail)
@@ -347,9 +433,57 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rec["settings"]["seed_mode"], "fixed")
         self.assertEqual(client.freed, 1)                          # queue empty: VRAM back
 
-    def test_generate_again_keeps_a_chosen_seed_and_rerolls_a_random_one(self):
-        self.assertEqual(ig.again({"seed": 5, "seed_mode": "fixed"})["seed"], 5)
-        self.assertEqual(ig.again({"seed": 5, "seed_mode": "random"})["seed"], -1)
+    def test_a_flux_job_records_its_files_and_output_name(self):
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                       backend="5090"))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["workflow"], "flux_dev_baseline")
+        self.assertEqual(rec["model"]["files"], {
+            "model": "flux1-dev.safetensors", "clip_l": "clip_l.safetensors",
+            "t5": "t5xxl_fp16.safetensors", "vae": "ae.safetensors"})
+        self.assertEqual(rec["graph"]["9"]["inputs"]["filename_prefix"],
+                         "ImageStudio/flux_dev_baseline_" + jobs[0].id)
+
+    def test_progress_reads_as_queued_loading_sampling_decoding(self):
+        statuses = []
+        job = ig.Job(ig.default_settings(), self.backend("5090"))
+        job.plan = ig.Plan()
+        job.plan.workflow = ig.load_workflow("flux_dev_baseline")
+        graph = job.plan.workflow["graph"]
+
+        def say(status=None, detail=None, progress=None):
+            if status and (not statuses or statuses[-1][0] != status):
+                statuses.append((status, detail))
+        on = self.studio._progress(job, graph, say)
+        on("queued", 1)
+        on("executing", "1")
+        on("executing", "40")
+        on("progress", (5, 20, "40"))
+        on("executing", "41")
+        self.assertEqual([s for s, _ in statuses],
+                         ["queued", "loading", "sampling", "decoding"])
+        self.assertIn("1 ahead", statuses[0][1])
+        self.assertIn("step 5 of 20 · 25% · node 40 KSampler", statuses[2][1])
+        on("socket", "No live progress: refused")
+        self.assertIn("No live progress: refused", job.notes)
+
+    def test_generate_again_reproduces_and_new_seed_varies(self):
+        rec = {"seed": 5, "steps": 20, "guidance": 3.5, "width": 1024, "height": 768,
+               "sampler": "euler", "scheduler": "simple",
+               "backend": {"id": "5090"},
+               "settings": dict(ig.default_settings(), seed=5, seed_mode="random",
+                                batch=1, batch_of=4)}
+        s = ig.again(rec)
+        self.assertEqual((s["seed"], s["seed_mode"]), (5, "fixed"))
+        self.assertEqual((s["steps"], s["height"], s["prefer_backend"]), (20, 768, "5090"))
+        self.assertNotIn("batch_of", s)
+        self.assertEqual(ig.again(rec, new_seed=True)["seed"], -1)
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        self.assertEqual(jobs[0].settings["seed"], 5)
+        self.assertEqual(jobs[0].backend["id"], "5090")
 
     def test_cancel_while_running(self):
         FakeClient.hold = threading.Event()
@@ -377,6 +511,47 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         settle(jobs)
         self.assertEqual(jobs[0].status, "failed")
         self.assertIn("Describe the scene", jobs[0].detail)
+
+
+class TestErrors(unittest.TestCase):
+    def test_a_refused_workflow_names_the_missing_file_not_the_whole_list(self):
+        detail = {"error": {"type": "prompt_outputs_failed_validation",
+                            "message": "Prompt outputs failed validation"},
+                  "node_errors": {"1": {"class_type": "UNETLoader", "errors": [
+                      {"message": "Value not in list",
+                       "details": "unet_name: 'flux1-dev.safetensors' not in "
+                                  "['a.safetensors', 'b.safetensors']"}]}}}
+        text = ig.explain(detail)
+        self.assertIn("node 1 (UNETLoader): Value not in list - unet_name "
+                      "'flux1-dev.safetensors' is not there (it has 2 others)", text)
+        self.assertNotIn("a.safetensors", text)
+
+    def test_a_failed_run_says_node_exception_and_message(self):
+        entry = {"status": {"status_str": "error", "messages": [
+            ["execution_start", {}],
+            ["execution_error", {"node_id": "40", "node_type": "KSampler",
+                                 "exception_type": "torch.OutOfMemoryError",
+                                 "exception_message": "CUDA out of memory.\nTried 2 GB"}]]}}
+        (text,) = ig.run_errors(entry)
+        self.assertIn("node 40 (KSampler): torch.OutOfMemoryError: CUDA out of memory. "
+                      "Tried 2 GB", text)
+        self.assertIn("ran out of memory", text)
+
+    def test_something_else_on_the_port_is_not_comfyui(self):
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:1"})
+        c.get_json = lambda path, timeout=None: {"ok": True}
+        c.get_queue = lambda: {}
+        h = c.health()
+        self.assertFalse(h["ok"])
+        self.assertIn("not ComfyUI", h["detail"])
+
+    def test_nothing_listening_here_says_so_and_how_to_start_it(self):
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9",
+                              "start": r"D:\ComfyUI\start.cmd"})
+        h = c.health()
+        self.assertFalse(h["ok"])
+        self.assertIn("no ComfyUI is running here", h["detail"])
+        self.assertIn(r"Start it: D:\ComfyUI\start.cmd", h["detail"])
 
 
 class TestLibrary(unittest.TestCase):
@@ -485,8 +660,10 @@ class TestImageStudioTab(unittest.TestCase):
         ui.adv["seed"].set("1234")
         ui.random_seed.set(False)
         ui.settings["model"] = "z-image-turbo"
+        ui.settings["backend"] = "auto"
+        n = len(ui.jobs)
         ui.generate()
-        self.pump(lambda: ui.jobs and ui.jobs[0].status in ig.FINISHED)
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status in ig.FINISHED)
         job = ui.jobs[0]
         self.assertEqual(job.status, "complete", job.detail)
         self.assertEqual(job.settings["seed"], 1234)
@@ -532,6 +709,47 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("lilya", ui.idents)                # the form picked it up
         with open(os.path.join(ui.studio.lib.root, "identities.json")) as f:
             self.assertIn("LILYAPERSON", f.read())
+
+    def test_the_form_says_where_it_goes_and_refuses_what_cannot_run(self):
+        s, ui = self.tab()
+        self.pump(lambda: all(b["id"] in ui.studio.inventories for b in ui.studio.backends()))
+        ui.settings.update(model="flux-dev", backend="auto")
+        ui.scene.delete("1.0", "end")
+        ui.scene.insert("1.0", "A lighthouse")
+        ui._recheck()
+        self.assertIn("Will run on 5090 Workstation", ui.route_note.cget("text"))
+        ed = ui.edit_models()
+        self.app.update()
+        panel = " ".join(w.cget("text") for w in ed.form.winfo_children()[0].winfo_children())
+        self.assertIn("✓  5090 Workstation: every file and node is there", panel)
+        ed.win.destroy()
+        saved = {bid: set(inv["diffusion_models"]) for bid, inv in ui.studio.inventories.items()}
+        try:
+            for inv in ui.studio.inventories.values():
+                inv["diffusion_models"].discard("flux1-dev.safetensors")
+            ui._recheck()
+            self.assertIn("flux1-dev.safetensors", ui.warn.cget("text"))
+            n = len(ui.jobs)
+            ui.generate()
+            self.app.update()
+            self.assertEqual(len(ui.jobs), n)          # nothing was sent
+            self.assertIn("missing flux1-dev.safetensors", ui.note.cget("text"))
+        finally:
+            for bid, files in saved.items():
+                ui.studio.inventories[bid]["diffusion_models"] = files
+            ui._recheck()
+
+    def test_a_job_row_shows_the_stages(self):
+        s, ui = self.tab()
+        ui.settings.update(model="flux-dev", backend="5090")
+        ui.scene.delete("1.0", "end")
+        ui.scene.insert("1.0", "A fox")
+        n = len(ui.jobs)
+        ui.generate()
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status == "complete")
+        w = ui.rows[ui.jobs[0].id]
+        self.assertEqual([l.cget("text") for l in w["stages"]],
+                         ["Queued", "Loading", "Sampling", "Decoding", "Complete"])
 
     def test_a_settled_tab_animates_nothing(self):
         s, ui = self.tab()
