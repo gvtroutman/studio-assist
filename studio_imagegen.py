@@ -1257,7 +1257,7 @@ def default_settings():
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "face_detail": None, "batch": 1,
+            "face_detail": None, "batch": 1, "pose": None,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -1717,6 +1717,12 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if s.get(k) not in (None, ""):
             look[k] = s[k]
     v = dict(mvalues)
+    # A file only an optional input needs (the pose ControlNet) may be named by
+    # the workflow rather than the model, so a model saved before the input
+    # existed still gets it; it is kept below only if that input is used.
+    borrowed = [var for var in (wf.get("files") or {}) if var not in v
+                and (wf.get("defaults") or {}).get(var)]
+    v.update({var: wf["defaults"][var] for var in borrowed})
     v.update(look)
     v["prompt"], v["negative"] = p.prompt, p.negative
     v["seed"] = int(s["seed"]) % (MAX_SEED + 1)
@@ -1808,6 +1814,12 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                               "it" if len(unused) == 1 else "them"))
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
+    pose = s.get("pose") if isinstance(s.get("pose"), dict) else {}
+    if p.references.get("pose") and pose.get("strength") not in (None, ""):
+        v["pose_strength"] = round(float(pose["strength"]), 3)
+    for var in borrowed:
+        if not any(var in fs and img in p.images for img, fs in needs.items()):
+            v.pop(var, None)
 
     if v.get("refine") and not uses(wf, "refine"):
         if s.get("refine") or preset["values"].get("refine"):

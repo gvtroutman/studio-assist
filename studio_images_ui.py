@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 import studio_imagegen as ig
+import studio_pose as sp
 
 THUMB = 72                    # px, before the display's scale
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
@@ -92,6 +93,8 @@ class ImageStudio:
         self.idents = {}              # identity id -> (BooleanVar, DoubleVar, scale row)
         self.loras = []               # [{"id", "var", "row"}]
         self.refs = {}                # kind -> local path
+        self.pose = None              # the drawn stick figure (PoseEditor), or None
+        self.planned_size = (1024, 1024)   # the picture's size, as last composed
         self.adv = {}                 # setting -> StringVar
         self.text = {}                # look slot and camera setting -> StringVar
         self.sliders = {}             # weight, muscle, stature -> IntVar
@@ -706,11 +709,14 @@ class ImageStudio:
             row = self.frame(self.ref_box)
             row.pack(side="top", fill="x", pady=(0, self.px(2)))
             self.label(row, label, "text", width=13).pack(side="left")
-            clear = self.button(row, "×", lambda k=kind: self._set_ref(k, None),
+            clear = self.button(row, "×", lambda k=kind: self._clear_ref(k),
                                 kind="ghost")
             clear.pack(side="right")
             self.button(row, "Choose…", lambda k=kind, a=about: self._pick_ref(k, a),
                         kind="quiet").pack(side="right", padx=(self.px(4), 0))
+            if kind == "pose":
+                self.button(row, "Draw…", self.edit_pose, kind="quiet").pack(
+                    side="right", padx=(self.px(4), 0))
             name = self.label(row, "—", "faint", self.host.f_small)
             name.pack(side="left", fill="x", expand=True)
             self.ref_labels[kind] = name
@@ -720,15 +726,56 @@ class ImageStudio:
             parent=self.host, title=about,
             filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
         if path:
+            if kind == "pose":
+                self.pose = None      # a picture of its own replaces the drawn one
             self._set_ref(kind, path)
+
+    def _clear_ref(self, kind):
+        if kind == "pose":
+            self.pose = None
+        self._set_ref(kind, None)
 
     def _set_ref(self, kind, path):
         if path:
             self.refs[kind] = path
         else:
             self.refs.pop(kind, None)
-        self.ref_labels[kind].config(text=os.path.basename(path) if path else "—")
+        text = os.path.basename(path) if path else "—"
+        if kind == "pose" and path and self.pose:
+            text = "stick figure · strength %.2f" % self.pose.get("strength", 0.9)
+        self.ref_labels[kind].config(text=text)
         self._recheck()
+
+    # ------------------------------------------------------------------ pose
+    def edit_pose(self):
+        return PoseEditor(self)
+
+    def use_pose(self, pose):
+        """From the pose editor: this stick figure is the pose reference."""
+        self.pose = pose
+        self._fit_pose()
+
+    def _fit_pose(self):
+        """The drawn pose's picture at the size the job will be. A size
+        changed since it was drawn refits the figure (the same proportions,
+        scaled and centred) rather than stretching it with the frame."""
+        if not self.pose:
+            return
+        self._recheck()
+        w, h = self.planned_size
+        pw, ph = self.pose.get("width") or w, self.pose.get("height") or h
+        if (pw, ph) != (w, h):
+            self.pose = dict(self.pose, width=w, height=h,
+                             points=sp.refit(self.pose["points"], (pw, ph), (w, h)))
+        hidden = set(self.pose.get("hidden") or ())
+        points = [None if i in hidden else p for i, p in enumerate(self.pose["points"])]
+        folder = os.path.join(self.studio.lib.root, "poses")
+        try:
+            path = sp.save(points, w, h, folder)
+        except OSError as e:
+            self.say("Could not write the pose picture in %s: %s" % (folder, e), "err")
+            return
+        self._set_ref("pose", path)
 
     # ----------------------------------------------------------------- LoRAs
     def _post_lora_menu(self):
@@ -857,6 +904,7 @@ class ImageStudio:
         s["loras"] = [{"id": r["id"], "strength": round(r["var"].get(), 3)}
                       for r in self.loras]
         s["references"] = dict(self.refs)
+        s["pose"] = dict(self.pose) if self.pose and "pose" in self.refs else None
         s["refine"] = bool(self.refine.get())
         s["face_detail"] = bool(self.faces.get())
         for key, _, kind in ADVANCED:
@@ -896,6 +944,8 @@ class ImageStudio:
         self.item_refs = ig.clean_item_refs(s.get("item_refs"))
         self.anatomy.set(s.get("anatomy") is not False)
         self.neg.set(s.get("negative") or "")
+        pose = s.get("pose") if isinstance(s.get("pose"), dict) else None
+        self.pose = dict(pose) if pose and sp.clean(pose.get("points")) else None
         for kind in ig.REFERENCE_NAMES:
             self._set_ref(kind, (s.get("references") or {}).get(kind))
         for key, _, _ in ADVANCED:
@@ -955,6 +1005,10 @@ class ImageStudio:
                                    + ("" if h else " Not checked yet: Check asks it."))
             self.skin(self.route_note, bg="bg", fg="err" if p.errors else "muted")
             v = p.values
+        try:
+            self.planned_size = (int(v.get("width") or 1024), int(v.get("height") or 1024))
+        except (TypeError, ValueError):
+            pass
         for key, _, _ in ADVANCED:
             val = v.get(key)
             if key == "seed":
@@ -968,6 +1022,7 @@ class ImageStudio:
         """Refuses, in words, what cannot run where it would go: a missing
         file or node, no backend able to take it. Routing that has not heard
         from the backends yet is left to submit(), which asks them."""
+        self._fit_pose()
         s = self.collect()
         b, why = self.studio.plan_route(s)
         known = all(bk["id"] in self.studio.health for bk in self.studio.backends()
@@ -2179,3 +2234,209 @@ class CharacterCreator:
         self.owner._rebuild_choices()
         self.owner._set_character(cid)
         self.status("Saved, and on the form.", "ok")
+
+
+class PoseEditor:
+    """The pose, as a stick figure to drag. The figure is OpenPose's 18
+    joints in its own colours, on a frame the shape of the picture. Dragging
+    a joint carries what hangs off it (an elbow brings the wrist), Shift
+    moves the joint alone, dragging the empty frame moves the whole figure
+    and the wheel resizes it. Right-click hides a joint the picture should
+    not show - a hand behind the back, the far ear in profile - or shows it
+    again. Use pose hands it to the form (`use_pose`), which draws the
+    picture the ControlNet reads (studio_pose.render)."""
+
+    VIEW = 520                    # px on the frame's long edge, before the display's scale
+    REACH = 12                    # px from a joint that still picks it up
+
+    def __init__(self, owner):
+        self.owner = o = owner
+        host = owner.host
+        o._recheck()
+        self.size = w, h = owner.planned_size
+        pose = owner.pose
+        self.strength = tk.DoubleVar(value=(pose or {}).get("strength", 0.9))
+        self.hidden = set()
+        if pose and sp.clean(pose.get("points")):
+            pts = sp.refit(pose["points"], (pose.get("width") or w, pose.get("height") or h),
+                           (w, h))
+            self.hidden = set(pose.get("hidden") or ())
+            self.points = self._whole(pts)
+        else:
+            self._preset("standing", draw=False)
+        self.undo = []
+        self.drag = None
+        k = o.px(self.VIEW) / max(w, h)
+        self.vw, self.vh = int(w * k), int(h * k)
+
+        win = self.win = tk.Toplevel(host)
+        win.title("Pose")
+        win.transient(host)
+        host._skin(win, bg="bg")
+        win.resizable(False, False)
+        left = o.frame(win)
+        left.pack(side="left", padx=o.px(12), pady=o.px(12))
+        # Black whatever the theme: the figure is drawn in OpenPose's colours,
+        # which are chosen for black, and this is what the ControlNet sees.
+        self.cv = tk.Canvas(left, width=self.vw, height=self.vh, bd=0,
+                            highlightthickness=1, cursor="hand2", bg="#000000",
+                            highlightbackground="#3a3a3a")
+        self.cv.pack(side="top")
+        self.hover = o.label(left, "%d × %d picture" % (w, h), "faint", host.f_small)
+        self.hover.pack(side="top", fill="x", pady=(o.px(4), 0))
+
+        right = o.frame(win)
+        right.pack(side="left", fill="y", pady=o.px(12), padx=(0, o.px(12)))
+        o.cap(right, "Start from")
+        grid = o.frame(right)
+        grid.pack(side="top", fill="x")
+        for i, (key, label, _) in enumerate(sp.PRESETS):
+            o.button(grid, label, lambda k=key: self._preset(k)).grid(
+                row=i // 2, column=i % 2, sticky="we", padx=(0, o.px(4)), pady=(0, o.px(4)))
+        o.cap(right, "Change")
+        row = o.frame(right)
+        row.pack(side="top", fill="x")
+        o.button(row, "Mirror", self._mirror).pack(side="left")
+        o.button(row, "Undo", self._undo, kind="ghost").pack(side="left", padx=(o.px(4), 0))
+        o.cap(right, "How closely to follow it")
+        o.slider(right, self.strength, 0.3, 1.2).pack(side="top", fill="x")
+        o.label(right, "0.9 follows the figure; lower lets the model move the person "
+                "more freely.", "faint", host.f_small, wraplength=o.px(240)).pack(
+            side="top", fill="x")
+        o.label(right, "Drag a joint to move it and what hangs off it; Shift-drag "
+                "moves it alone. Drag the empty frame to move the figure, scroll to "
+                "resize it. Right-click a joint to hide or show it. Ctrl+Z undoes.",
+                "muted", host.f_small, wraplength=o.px(240)).pack(
+            side="top", fill="x", pady=(o.px(12), 0))
+        foot = o.frame(right)
+        foot.pack(side="bottom", fill="x", pady=(o.px(12), 0))
+        o.button(foot, "Use pose", self._use, kind="accent").pack(side="right")
+        o.button(foot, "Cancel", win.destroy, kind="ghost").pack(side="right",
+                                                                 padx=(0, o.px(6)))
+
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._move)
+        self.cv.bind("<ButtonRelease-1>", lambda ev: setattr(self, "drag", None))
+        self.cv.bind("<Button-3>", self._toggle)
+        self.cv.bind("<Motion>", self._hover)
+        self.cv.bind("<MouseWheel>", self._wheel)
+        win.bind("<Control-z>", lambda ev: self._undo())
+        win.bind("<Escape>", lambda ev: win.destroy())
+        self._draw()
+
+    # ---------------------------------------------------------------- state
+    def _whole(self, pts):
+        """Points with a place for every joint: a joint a preset leaves out
+        is put beside its other side, hidden, so it can be shown again."""
+        out = [list(p) if p else None for p in pts]
+        for i, p in enumerate(out):
+            if p is None:
+                twin = out[sp.MIRROR.get(i, 1)] or [0.5, 0.5]
+                out[i] = [twin[0] + 0.01, twin[1]]
+                self.hidden.add(i)
+        return out
+
+    def _keep(self):
+        self.undo.append(([list(p) for p in self.points], set(self.hidden)))
+        del self.undo[:-50]
+
+    def _preset(self, key, draw=True):
+        if draw:
+            self._keep()
+        self.hidden = set()
+        self.points = self._whole(sp.preset(key, *self.size))
+        if draw:
+            self._draw()
+
+    def _mirror(self):
+        self._keep()
+        self.hidden = {sp.MIRROR.get(i, i) for i in self.hidden}
+        self.points = sp.mirror(self.points)
+        self._draw()
+
+    def _undo(self):
+        if self.undo:
+            self.points, self.hidden = self.undo.pop()
+            self._draw()
+
+    # ---------------------------------------------------------------- mouse
+    def _near(self, ev):
+        return sp.near(self.points, ev.x, ev.y, self.vw, self.vh, self.owner.px(self.REACH))
+
+    def _press(self, ev):
+        self._keep()
+        j = self._near(ev)
+        if j is None:
+            moving = list(range(len(self.points)))
+        elif ev.state & 0x0001:                 # Shift: the joint alone
+            moving = [j]
+        else:
+            moving = sp.carried(j)
+        self.drag = (moving, ev.x, ev.y)
+
+    def _move(self, ev):
+        if not self.drag:
+            return
+        moving, x0, y0 = self.drag
+        dx, dy = (ev.x - x0) / self.vw, (ev.y - y0) / self.vh
+        for i in moving:
+            p = self.points[i]
+            p[0] = min(1.2, max(-0.2, p[0] + dx))
+            p[1] = min(1.2, max(-0.2, p[1] + dy))
+        self.drag = (moving, ev.x, ev.y)
+        self._draw()
+
+    def _wheel(self, ev):
+        self._keep()
+        k = 1.05 ** (ev.delta / 120)
+        seen = [p for i, p in enumerate(self.points) if i not in self.hidden] or self.points
+        cx = sum(p[0] for p in seen) / len(seen)
+        cy = sum(p[1] for p in seen) / len(seen)
+        for p in self.points:
+            p[0], p[1] = cx + (p[0] - cx) * k, cy + (p[1] - cy) * k
+        self._draw()
+
+    def _toggle(self, ev):
+        j = self._near(ev)
+        if j is None:
+            return
+        self._keep()
+        self.hidden ^= {j}
+        if len(self.hidden) == len(self.points):
+            self.hidden.discard(j)
+        self._draw()
+        self._hover(ev)
+
+    def _hover(self, ev):
+        j = self._near(ev)
+        w, h = self.size
+        self.hover.config(text="%d × %d picture" % (w, h) if j is None else
+                          sp.JOINTS[j] + (" (hidden)" if j in self.hidden else ""))
+
+    # ---------------------------------------------------------------- draw
+    def _draw(self):
+        cv, px = self.cv, self.owner.px
+        cv.delete("all")
+        at = [(p[0] * self.vw, p[1] * self.vh) for p in self.points]
+        stick, r = max(3, px(5)), max(4, px(6))
+        for n, (a, b) in enumerate(sp.LIMBS):
+            if a in self.hidden or b in self.hidden:
+                cv.create_line(*at[a], *at[b], width=1, fill="#555555", dash=(3, 3))
+            else:
+                cv.create_line(*at[a], *at[b], width=stick, capstyle="round",
+                               fill="#%02x%02x%02x" % tuple(int(c * 0.6)
+                                                            for c in sp.COLOURS[n]))
+        for i, (x, y) in enumerate(at):
+            if i in self.hidden:
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="#777777", dash=(2, 2))
+            else:
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="#ffffff",
+                               fill="#%02x%02x%02x" % sp.COLOURS[i])
+
+    # ---------------------------------------------------------------- done
+    def _use(self):
+        w, h = self.size
+        self.owner.use_pose({"points": [[round(p[0], 4), round(p[1], 4)] for p in self.points],
+                             "hidden": sorted(self.hidden), "width": w, "height": h,
+                             "strength": round(self.strength.get(), 2)})
+        self.win.destroy()
