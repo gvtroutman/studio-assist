@@ -30,6 +30,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+import studio_imagegen as ig
 import studio_scene as sc
 
 FILETYPES = [("Scenes", "*.scene.json"), ("JSON", "*.json"), ("All files", "*.*")]
@@ -54,6 +55,7 @@ class SceneBuilder:
         self.dirty = False
         self.sel = None               # an object's id; None is the scene and camera
         self.part = "body"
+        self.look_section = ig.LOOKS[0][0]
         self.tool = "move"
         self.drag = None
         self.vars = {}                # key -> (DoubleVar, read) for the inspector's sliders
@@ -172,6 +174,7 @@ class SceneBuilder:
     # ============================================================== objects
     def add(self, asset_id):
         obj = sc.new_object(asset_id, self.scene["objects"])
+        seeded = asset_id == "person" and not sc.people(self.scene) and self._form_look(obj)
         # Put it where the camera is looking, beside anything already there.
         t = self.scene["camera"]["target"]
         taken = len(self.scene["objects"])
@@ -180,9 +183,24 @@ class SceneBuilder:
         self.scene["objects"].append(obj)
         self.select(obj["id"])
         self.changed(rebuild_list=True)
-        self.status("%s added. %s" % (obj["name"], sc.ASSET[asset_id]["about"]), "muted")
+        self.status("%s added%s. %s" % (obj["name"], " with the form's look" if seeded else "",
+                                          sc.ASSET[asset_id]["about"]), "muted")
         self.check()                  # says now, not at Generate, if the frame would go unused
         return obj
+
+    def _form_look(self, obj):
+        """The scene's first person takes the look already on the form, since
+        a scene with people in it sends their looks and not the form's."""
+        o = self.owner
+        look = sc.clean_look(o.collect_looks())
+        cid = o.settings.get("character") or ""
+        if not look and not cid:
+            return False
+        obj["look"], obj["character"] = look, cid
+        rec = o.studio.lib.get("characters", cid) if cid else None
+        if rec is not None and rec["name"] not in {x["name"] for x in self.scene["objects"]}:
+            obj["name"] = rec["name"]
+        return True
 
     def duplicate(self):
         src = self.obj()
@@ -377,6 +395,8 @@ class SceneBuilder:
                     "empty. Sent exactly as written."),
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
                                                                        fill="x")
+        if a["kind"] == "person":
+            self._look_controls(obj)
 
         o.cap(p, "Colour")
         sw = o.frame(p)
@@ -419,6 +439,90 @@ class SceneBuilder:
                 scale[:] = [x, x, x]
             self._slider(p, "size", "Size", lambda: scale[0], uniform, 0.5, 1.3, 0.01)
         self._words_box()
+
+    def _look_controls(self, obj):
+        """Who this person is, as the Image Studio's character creator says
+        it: a character copied on, then the look's sections one at a time -
+        the same slots, picks and sliders as the form, kept on this person."""
+        o, p = self.owner, self.panel
+        o.cap(p, "Look")
+        chars = [("", "No character")] + [(c["id"], c["name"])
+                                          for c in o.studio.lib.all("characters")]
+        if obj["character"] and obj["character"] not in dict(chars):
+            chars.append((obj["character"], "%s (not in the library)" % obj["character"]))
+        row = o.frame(p)
+        row.pack(side="top", fill="x")
+        o.choice(row, chars, obj["character"], self._set_character).pack(side="left")
+        o.button(row, "Clear look", self._clear_look, kind="ghost").pack(side="right")
+        tabs = o.frame(p)
+        tabs.pack(side="top", fill="x", pady=(o.px(6), o.px(2)))
+        for i, (name, _) in enumerate(ig.LOOKS):
+            o.button(tabs, name, lambda n=name: self._look_tab(n),
+                     kind="accent" if name == self.look_section else "quiet",
+                     font=self.host.f_small, padx=o.px(6), pady=o.px(2)).grid(
+                row=i // 3, column=i % 3, sticky="ew", padx=(0, o.px(3)), pady=(0, o.px(3)))
+        for col in range(3):
+            tabs.columnconfigure(col, weight=1)
+        look = obj["look"]
+        section = dict(ig.LOOKS)[self.look_section]
+        text = {k: tk.StringVar(value=look.get(k, "")) for k, *_ in section}
+        steps = {k: tk.IntVar(value=int(look.get(k, 0))) for k in ig.SLIDER_KEYS}
+        relight = [None]
+
+        def changed():
+            for k, var in text.items():
+                v = var.get().strip()
+                if v:
+                    look[k] = v
+                else:
+                    look.pop(k, None)
+            if self.look_section == ig.SLIDER_SECTION:
+                for k, var in steps.items():
+                    if int(var.get()):
+                        look[k] = int(var.get())
+                    else:
+                        look.pop(k, None)
+            if relight[0]:
+                relight[0]()
+            self.dirty = True
+            self._words()
+        if self.look_section == ig.SLIDER_SECTION:
+            o.slider_rows(p, steps, changed)
+        relight[0] = o.look_rows(p, section, text, changed)
+        self.look_vars, self.look_changed = text, changed
+
+    def _look_tab(self, name):
+        self.look_section = name
+        self._inspect()
+
+    def _set_character(self, cid):
+        """Copy a character's look onto the selected person, as the form
+        does: a copy, not a link, so the scene file holds the whole look.
+        A person still under the library's default name takes the
+        character's."""
+        obj = self.obj()
+        if obj is None or obj["asset"] != "person":
+            return
+        rec = self.owner.studio.lib.get("characters", cid) if cid else None
+        obj["character"] = cid if rec is not None else ""
+        if rec is not None:
+            obj["look"] = sc.character_look(rec, obj["look"])
+            default = sc.ASSET["person"]["name"]
+            if obj["name"] == default or obj["name"].startswith(default + " "):
+                taken = {x["name"] for x in self.scene["objects"] if x is not obj}
+                if rec["name"] not in taken:
+                    obj["name"] = rec["name"]
+        self._list()
+        self._inspect()
+        self.changed()
+
+    def _clear_look(self):
+        obj = self.obj()
+        if obj is None or obj["asset"] != "person":
+            return
+        obj["look"], obj["character"] = {}, ""
+        self._inspect()
+        self.changed()
 
     def _pose_controls(self, obj):
         o, p = self.owner, self.panel
@@ -839,8 +943,18 @@ class SceneBuilder:
         except OSError as e:
             self.status("Could not write the frame: %s" % e, "err")
             return False
-        words, ref, extra = sc.generation(self.scene, ref)
         o = self.owner
+        chars = {c["id"]: c for c in o.studio.lib.all("characters")}
+        words, ref, extra = sc.generation(self.scene, ref, chars)
+        # A scene character's face is its identity's LoRA: add it to the
+        # form's ticked identities for this job, at its own strength.
+        idents = o.collect()["identities"]
+        have = {d["id"] for d in idents}
+        for iid in extra.pop("scene_identities", []):
+            ident = o.studio.lib.get("identities", iid)
+            if ident and iid not in have:
+                idents.append({"id": iid, "strength": ident["strength"]})
+        extra["identities"] = idents
         o.scene.delete("1.0", "end")
         o.scene.insert("1.0", words.text)
         o._set_ref("source", ref)
