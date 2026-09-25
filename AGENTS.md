@@ -715,7 +715,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   legs, boots a shaft. The Accessories slot puts a hat (`HATS` names it, `HAT_SHAPES`
   builds it: a cap with its visor, a beanie, a brimmed hat, a top hat, a hard hat -
   site yellow unless a colour is said) and glasses, sunglasses or goggles on the head,
-  as part `head`, so a click on them poses the head. The colour is the first `CLOTH` word in the garment ("black
+  as part `head`, so a click on them poses the head. The Hair section gives hair
+  (`hairdo`): a scalp lofted over the skull from a `hairline` (the head's faces under
+  it are dropped, or a big one sorts in front and shows through), a fall down the back
+  as long as the style says, a bun, ponytail or braids; under a hat only what hangs
+  below it. The colour is the first `CLOTH` word in the garment ("black
   leather jacket" is black), else the slot's default. What is not worn is the object's
   colour. The words are still sent as written; this only draws them. Every look edit
   in the inspector goes through `changed()`, so the viewport follows each keystroke

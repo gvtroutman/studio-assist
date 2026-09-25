@@ -174,6 +174,32 @@ class TestBodyAndClothes(unittest.TestCase):
         self.assertGreater(added, 0)
         self.assertEqual(count(hatted, "head") - count(plain, "head"), added)
 
+    def test_hair_comes_from_the_hair_section(self):
+        self.assertIsNone(sc.hairdo({}))
+        self.assertIsNone(sc.hairdo({"hair": "black", "hair_style": "bald"}))
+        long = sc.hairdo({"hair": "dark brown", "hair_style": "very long wavy"})
+        self.assertEqual(long["rgb"], sc.hex_rgb("#3b2a20"))        # not plain "brown"
+        self.assertEqual(long["fall"], -0.45)                       # not plain "long"
+        self.assertGreater(long["volume"], 1)
+        self.assertIsNone(sc.hairdo({"hair": "blonde", "hair_style": "pixie cut"})["fall"])
+        self.assertEqual(sc.hairdo({"hair": "auburn", "hair_style": "in a bun"})["tie"], "bun")
+        buzz = sc.hairdo({"hair_style": "buzz cut"})
+        self.assertLess(buzz["cap"], sc.hairdo({"hair": "black"})["cap"])
+        self.assertEqual(buzz["rgb"], sc.hex_rgb(sc.HAIR_DEFAULT))
+
+        # Drawn on the head, in its colour; long hair hangs lower.
+        plain, short = self.person(), self.person(hair="red", hair_style="short")
+        low = lambda o: min(p[1] for part, fs, rgb in sc.painted_pieces(o)   # noqa: E731
+                            if rgb == sc.hex_rgb("#9a3b1f") for f in fs for p in f)
+        hair = [part for part, _, rgb in sc.painted_pieces(short) if rgb == sc.hex_rgb("#9a3b1f")]
+        self.assertEqual(set(hair), {"head"})
+        longer = self.person(hair="red", hair_style="long")
+        self.assertLess(low(longer), low(short) - 0.2)
+        self.assertEqual(sc.bounds(short)[0][1], sc.bounds(plain)[0][1])
+        # Under a hat the scalp is the hat's, and the head keeps its crown.
+        hatted = self.person(hair="red", hair_style="short", accessories="beanie")
+        self.assertNotIn(sc.hex_rgb("#9a3b1f"), {rgb for _, _, rgb in sc.painted_pieces(hatted)})
+
     def test_a_garment_is_the_colour_it_names_first(self):
         black = sc.hex_rgb("#27272b")
         self.assertEqual(sc.cloth_colour("black leather jacket", "outerwear"), black)
