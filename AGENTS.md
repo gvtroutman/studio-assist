@@ -65,7 +65,8 @@ this PC's files and the web instead. Two moving parts:
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
 - **`studio_scene.py`**, **`studio_scene_ui.py`** — the Image Studio's Scene Builder: a
-  posable mannequin and simple props on a floor, one camera, and the frame it sees,
+  posable mannequin and simple props on a floor (and walls, each wearing a picture
+  made from words), one camera, and the frame it sees,
   rendered to the PNG the Image Studio makes the picture from. See *The Scene Builder*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
@@ -720,6 +721,27 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   or older files with what it can read and names what it could not (an unknown
   asset); objects are named by asset id, not geometry, so a better mesh from Blender
   later opens old scenes unchanged. Closing with unsaved changes asks first.
+- **The room is the backdrop, and its pictures are made by the Image Studio.**
+  **Floor and walls**, the list's second row, holds the floor and four optional
+  walls around the origin (`scene["room"]`, `new_room`). Each surface takes a
+  few words; Make sends them through `ImageStudio.generate(base=...)` as a text
+  to image job built by `texture_settings` - `base` replaces the form, so the
+  form's person, identities, LoRAs and references stay out of a floor - and
+  `scene_texture` in the job's settings brings the finished job back to
+  `SceneBuilder.texture_done` from `ImageStudio._job_changed`. Picture… puts a
+  PNG from disk there instead. Either way `import_texture` keeps a 256 px copy
+  under `image-studio/scenes/textures/`, named by content, so clearing History
+  does not take the floor with it. It reads the full-size PNG in pure Python
+  (seconds at 1024 px), so it runs off the UI thread. The words also go into
+  the prompt as written ("The floor: ..."). The room is drawn before every
+  object, never sorted among them, so an object outside the walls is not hidden
+  by one; walls face inward, so a camera outside sees in as into a doll's
+  house. `TexMap` lays a picture on a plane perspective-correctly a scanline at
+  a time, with mip levels chosen by how many picture pixels a frame pixel
+  spans (the far floor otherwise shimmers into moire the picture would copy).
+  The viewport cannot texture a canvas polygon, so it draws the room in each
+  picture's mean colour at once and puts a half-size bake (`_bake`, 150 ms
+  after the last change) over the frame: a drag is never held up by one.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
