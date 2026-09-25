@@ -22,6 +22,7 @@ from tkinter import filedialog
 import studio_imagegen as ig
 
 THUMB = 72                    # px, before the display's scale
+STYLE_TILE = 104              # px, before the display's scale; the examples are 208
 HISTORY_PAGE = 40
 ELLIPSIS = "…"          # the window's marker for "still happening": it animates
 ADVANCED = [                  # (setting, label, kind)
@@ -64,6 +65,23 @@ def photo(path, box):
         return None
     k = max(1, -(-max(img.width(), img.height()) // max(1, box)))
     return img.subsample(k) if k > 1 else img
+
+
+def photo_at(path, side, master):
+    """A PhotoImage of `path` at `side` px on its long edge, near enough, or
+    None. Tk scales only by whole factors, so this zooms by a and subsamples
+    by b for the a/b (both at most 8) closest to the ratio it needs. Made in
+    `master`'s interpreter: without one it belongs to the first Tk root."""
+    try:
+        img = tk.PhotoImage(master=master, file=path)
+    except (tk.TclError, OSError):
+        return None
+    want = side / max(1, img.width(), img.height())
+    a, b = min(((a, b) for a in range(1, 9) for b in range(1, 9)),
+               key=lambda ab: (abs(ab[0] / ab[1] - want), ab[0]))
+    if a > 1:
+        img = img.zoom(a)
+    return img.subsample(b) if b > 1 else img
 
 
 class ImageStudio:
@@ -353,16 +371,12 @@ class ImageStudio:
 
         for w in self.style_box.winfo_children():
             w.destroy()
-        styles = [(st["id"], st["name"]) for st in lib.all("styles")]
-        if self.settings["style"] not in dict(styles):
-            self.settings["style"] = styles[0][0] if styles else ""
-        srow = self.frame(self.style_box)
-        srow.pack(side="top", fill="x")
-        self.style_pill = self.choice(srow, styles or [("", "No styles")],
-                                      self.settings["style"], self._set_style)
-        self.style_pill.pack(side="left")
-        self.button(srow, "Styles…", self.edit_styles, kind="ghost").pack(
-            side="left", padx=(self.px(6), 0))
+        styles = lib.all("styles")
+        if self.settings["style"] not in {st["id"] for st in styles}:
+            self.settings["style"] = styles[0]["id"] if styles else ""
+        self._build_style_tiles(styles)
+        self.button(self.style_box, "Styles…", self.edit_styles, kind="ghost").pack(
+            side="top", anchor="w", pady=(self.px(4), 0))
         self.style_strength = tk.DoubleVar(value=0.6)
         self.style_scale_row = self.frame(self.style_box)
         self.style_scale_row.pack(side="top", fill="x")
@@ -420,13 +434,48 @@ class ImageStudio:
             self.faces.set(bool(ig.PRESETS[key]["values"].get("face_detail")))
         self._recheck()
 
+    def _build_style_tiles(self, styles):
+        """The styles as a grid of pictures: each one the same photo in that
+        style (`ig.style_example`), its name under it, a click to choose it.
+        A style with no picture shows its name on a blank tile."""
+        grid = self.frame(self.style_box)
+        grid.pack(side="top", fill="x")
+        self.style_tiles, self.style_photos = {}, []
+        side = self.px(STYLE_TILE)
+        for n, st in enumerate(styles):
+            tile = tk.Frame(grid, bd=0, highlightthickness=self.px(2), cursor="hand2")
+            self.skin(tile, bg="bg", highlightbackground="border")
+            tile.grid(row=n // 3, column=n % 3, padx=(0, self.px(6)), pady=(0, self.px(6)),
+                      sticky="n")
+            path = ig.style_example(st)
+            img = photo_at(path, side, grid) if path else None
+            if img is not None:
+                self.style_photos.append(img)
+                pic = tk.Label(tile, image=img, bd=0)
+            else:
+                pic = self.frame(tile, "card")
+                pic.config(width=side, height=side)
+                pic.pack_propagate(False)
+                self.label(pic, st["name"], "faint", self.host.f_small, bg="card",
+                           wraplength=side - self.px(8)).pack(expand=True)
+            pic.pack(side="top")
+            name = self.label(tile, st["name"], "text", self.host.f_small, wraplength=side)
+            name.config(anchor="center", justify="center")
+            name.pack(side="top", fill="x", pady=(self.px(2), self.px(2)))
+            for w in (tile, pic, name, *pic.winfo_children()):
+                w.bind("<Button-1>", lambda ev, sid=st["id"]: self._set_style(sid))
+            self.style_tiles[st["id"]] = tile
+        if not styles:
+            self.label(grid, "No styles yet.", "faint").pack(side="left")
+
     def _set_style(self, sid, recheck=True):
         self.settings["style"] = sid
         for w in self.style_scale_row.winfo_children():
             w.destroy()
         st = self.studio.lib.get("styles", sid)
-        if st is not None:
-            self.style_pill.set(text=st["name"] + "  \u25be")
+        for tid, tile in self.style_tiles.items():
+            self.skin(tile, bg="bg", highlightbackground="accent" if tid == sid else "border",
+                      highlightcolor="accent" if tid == sid else "border")
         if st and st["lora"]:
             self.style_strength.set(st["strength"])
             self.label(self.style_scale_row, "LoRA strength", "faint",
@@ -1289,6 +1338,7 @@ class ImageStudio:
             ("width", "Width", "number"),
             ("height", "Height", "number"),
             ("families", "Written for", ("multi", list(ig.FAMILIES.items()))),
+            ("example", "Example picture (PNG; the tile on the form)", "path"),
             ("notes", "Notes", "long"),
         ], template={"name": "New style"})
 

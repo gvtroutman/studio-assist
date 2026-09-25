@@ -49,6 +49,7 @@ from studio_comfy_mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS_DIR = os.path.join(HERE, "comfy_workflows")
+STYLE_EXAMPLES_DIR = os.path.join(HERE, "style_examples")
 
 MAX_SEED = 2 ** 32 - 1
 JOB_TIMEOUT = 1800            # seconds a job may run before it is given up on
@@ -328,8 +329,20 @@ def clean_style(d):
         "width": opt_num("width", int, 256, 4096),
         "height": opt_num("height", int, 256, 4096),
         "families": [f for f in _strs(d.get("families"))],
+        "example": _str(d.get("example")),
         "notes": _str(d.get("notes")),
     }
+
+
+def style_example(style):
+    """The picture that shows what `style` looks like: its own `example` when
+    that file is there, else the one shipped for its id (the same cat photo
+    through each default style), else None."""
+    for path in (style.get("example"),
+                 os.path.join(STYLE_EXAMPLES_DIR, (style.get("id") or "") + ".png")):
+        if path and os.path.isfile(path):
+            return path
+    return None
 
 
 CLEAN = {"backends": clean_backend, "models": clean_model, "loras": clean_lora,
