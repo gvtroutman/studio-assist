@@ -527,6 +527,16 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `style`/`composition` (Redux, when its two files are on the backend), and the
   FLUX baseline takes `pose` (below). Nothing does face conditioning yet (no PuLID
   or IP-Adapter in a shipped workflow), so the likeness is the identity LoRA's.
+- **The camera is aimed on a diagram, not typed** (`CameraAim`, the Camera row).
+  From above, the camera is dragged round the person (`turn`, 45° steps toward
+  their left); from the side, up and down (`height`) and in and out (`shot`,
+  face to wide). It is `settings["view"]`, None until touched, so an untouched
+  form prompts as before. `view_text` goes *first* in the prompt, since FLUX
+  weighs the start most, and every shot but the face says the whole head is in
+  the frame with space above it: asked for because FLUX, left alone, cut heads
+  off. With a drawn pose only the height is said (and a warning says why): the
+  figure already frames and faces the person, and words that disagree fight the
+  ControlNet. The free-text Camera field stays, for lens, light and film.
 - **The pose is a stick figure the user drags** (`PoseEditor`, the Pose row's
   Draw…). It is OpenPose's 18 body joints in its colours on black, because that
   is the picture pose ControlNets were trained on; `studio_pose.render` draws it
