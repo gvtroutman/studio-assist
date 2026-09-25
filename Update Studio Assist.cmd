@@ -1,5 +1,5 @@
 @echo off
-rem Double-click once: pull the latest from GitHub now, then register the
+rem Double-click once: pull the latest main from GitHub now, then register the
 rem scheduled task that keeps pulling every 5 minutes (studio_update.py).
 rem Safe to run again - it only fast-forwards, and re-registering the task
 rem replaces the old one.
@@ -13,17 +13,11 @@ if not %errorlevel%==0 (
     exit /b 1
 )
 
-echo Pulling the latest from GitHub...
-git pull --ff-only
-if not %errorlevel%==0 (
-    echo.
-    echo The pull was refused - this folder has its own commits or edits that
-    echo GitHub's version would overwrite. Nothing was changed.
-    pause
-    exit /b 1
-)
-
-echo.
+rem studio_update.py does the pull: it follows main, and moves this folder
+rem off an old, merged branch onto main when that loses nothing. A plain
+rem "git pull" here pulled whatever branch was checked out, and a merged
+rem branch never changes again.
+echo Pulling the latest main from GitHub, then checking every 5 minutes...
 where py.exe >nul 2>&1
 if %errorlevel%==0 (
     py studio_update.py --install

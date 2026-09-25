@@ -86,6 +86,48 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.read("a.txt"), "edited here\n")
         self.assertIn("local edits", self.logged())
 
+    def branch(self):
+        return subprocess.run(["git", "-C", self.pc, "branch", "--show-current"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def merged_branch(self):
+        """The PC on a feature branch that GitHub then merges into main and
+        moves past - the state that stopped updates."""
+        run(self.pc, "checkout", "-q", "-b", "feature")
+        commit(self.pc, "f.txt", "feature\n")
+        run(self.pc, "push", "-q", "-u", "origin", "feature")
+        run(self.dev, "pull", "-q", "origin", "feature")
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q", "origin", "main")
+
+    def test_moves_off_a_merged_branch_onto_main(self):
+        self.merged_branch()
+        self.assertTrue(upd.update())
+        self.assertEqual(self.branch(), "main")
+        self.assertEqual((self.read("a.txt"), self.read("f.txt")), ("two\n", "feature\n"))
+        self.assertIn("Moved from feature to main", self.logged())
+        self.assertFalse(upd.update())              # and stays there quietly after
+        commit(self.dev, "a.txt", "three\n")
+        run(self.dev, "push", "-q", "origin", "main")
+        self.assertTrue(upd.update())
+        self.assertEqual(self.read("a.txt"), "three\n")
+
+    def test_stays_on_a_branch_with_commits_main_lacks(self):
+        self.merged_branch()
+        commit(self.pc, "b.txt", "mine\n")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.branch(), "feature")
+        self.assertIn("1 commit(s) origin/main does not", self.logged())
+
+    def test_stays_on_a_branch_with_local_edits(self):
+        self.merged_branch()
+        with open(os.path.join(self.pc, "f.txt"), "w") as f:
+            f.write("edited here\n")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.branch(), "feature")
+        self.assertEqual(self.read("f.txt"), "edited here\n")
+        self.assertIn("has local edits", self.logged())
+
 
 if __name__ == "__main__":
     unittest.main()
