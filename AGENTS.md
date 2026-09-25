@@ -694,9 +694,24 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   must not be told the floor is tiled.
 - **Descriptions are sent as written.** `scene_text()` adds only what the words cannot
   know - where each object is in the frame, which way a person faces, a non-standing
-  pose - in parentheses before the user's text, and it says "a person" so the anatomy
-  constants apply. An object outside the frame is left out of the words and said so,
+  pose - in parentheses before the user's text (and a person's look between the two),
+  and it says "a person" so the anatomy constants apply. An object outside the frame is left out of the words and said so,
   and so is an object with no description. A test holds punctuation and case verbatim.
+- **Each person carries their own look.** A person object has `look` (the Image
+  Studio's `LOOKS` slots and `SLIDERS`, sparse, cleaned by `clean_look`) and
+  `character`. The inspector's Look section is the form's own `look_rows` /
+  `slider_rows`, one section at a time. Choosing a character copies its look
+  (`character_look`: blank where it has none, the expression and gaze kept) and, if the
+  person still has the default name, its name; it is a copy, like the form's. The look is
+  said in that person's line, `Name (a person, where, facing): look. Description`.
+- **With people in the scene, the form's person is blanked for the job.** `generation()`
+  lays empty slots, zero sliders, no `character` and no `item_refs` over the form, or the
+  picture gets the form's person as well (an extra person, or two blended). The first
+  person added takes the form's look and character so nothing is lost. A scene
+  character's identity is added to the form's ticked ones for the job (`scene_identities`,
+  popped by the window). Item pictures are not sent from a scene: `compose()` matches them
+  to the form's clothes, which are blank, and no workflow takes one yet anyway. A scene
+  of props alone leaves the form's person alone.
 - **Everything stands on its floor.** An object's lowest point is put at its position's
   y (`object_pieces`), so a crouch drops the hips, a kneel puts the knee down and a
   tipped drum lies on the floor; y is the floor it stands on (a platform, a step).
