@@ -518,6 +518,35 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(p.values["denoise"], 0.7)
         self.assertTrue(any(w.startswith("Pose reference") for w in p.warnings), p.warnings)
 
+    def test_a_pose_goes_through_the_controlnet_on_flux(self):
+        src = os.path.join(self.dir, "pose.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        cn = "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors"
+        inv = dict(FLUX_FILES, controlnet={cn})
+        p = self.plan(model="flux-dev", inventory=inv, scene="x", references={"pose": src},
+                      pose={"points": [[0.5, 0.5]] * 18, "strength": 0.75})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.images, {"pose_image": src})
+        self.assertEqual((p.values["controlnet"], p.values["pose_strength"]), (cn, 0.75))
+        g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"))
+        self.assertEqual(g["52"]["class_type"], "ControlNetApplyAdvanced")
+        self.assertEqual(g["40"]["inputs"]["positive"], ["52", 0])
+        self.assertEqual(g["40"]["inputs"]["negative"], ["52", 1])
+        self.assertEqual(g["52"]["inputs"]["strength"], 0.75)
+        # Without the ControlNet on the backend the pose is left out, in words.
+        p = self.plan(model="flux-dev", scene="x", references={"pose": src})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.images, {})
+        self.assertTrue(any("Pose reference" in w and cn in w for w in p.warnings),
+                        p.warnings)
+        # And with no pose, nothing of it is recorded or in the graph.
+        p = self.plan(model="flux-dev", inventory=inv, scene="x")
+        self.assertNotIn("controlnet", p.values)
+        g = ig.fill(p.workflow, p.values)
+        self.assertFalse({"50", "51", "52"} & set(g))
+        self.assertEqual(g["40"]["inputs"]["positive"], ["11", 0])
+
     def test_redux_reference_needs_its_files(self):
         src = os.path.join(self.dir, "style.png")
         with open(src, "wb") as f:
@@ -951,6 +980,52 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("left out", ui.warn.cget("text"))
         ui._drop_lora(ui.loras[0])
         self.assertNotIn("left out", ui.warn.cget("text"))
+
+    def test_a_drawn_pose_becomes_the_pose_reference(self):
+        s, ui = self.tab()
+        ui.settings["model"] = "flux-dev"
+        ui.adv["width"].set("832")
+        ui.adv["height"].set("1216")
+        ed = ui.edit_pose()
+        self.app.update()
+        self.assertEqual(ed.size, (832, 1216))
+
+        class Ev:
+            def __init__(self, x, y, state=0, delta=0):
+                self.x, self.y, self.state, self.delta = x, y, state, delta
+        wrist = list(ed.points[7])
+        at = (int(wrist[0] * ed.vw), int(wrist[1] * ed.vh))
+        ed._press(Ev(*at))
+        ed._move(Ev(at[0] + 20, at[1] - 40))
+        self.assertLess(ed.points[7][1], wrist[1])
+        ed._toggle(Ev(*[int(c) for c in (ed.points[17][0] * ed.vw, ed.points[17][1] * ed.vh)]))
+        self.assertIn(17, ed.hidden)
+        ed._preset("walking")
+        ed._undo()
+        self.assertIn(17, ed.hidden)
+        ed.strength.set(0.8)
+        ed._use()
+        self.app.update()
+        path = ui.refs["pose"]
+        self.assertTrue(os.path.isfile(path))
+        self.assertIn("stick figure", ui.ref_labels["pose"].cget("text"))
+        got = ui.collect()
+        self.assertEqual((got["pose"]["strength"], got["pose"]["hidden"]), (0.8, [17]))
+        # A new size refits the figure at Generate rather than stretching it.
+        ui.adv["width"].set("1024")
+        ui.adv["height"].set("1024")
+        ui._fit_pose()
+        self.assertEqual((ui.pose["width"], ui.pose["height"]), (1024, 1024))
+        self.assertNotEqual(ui.refs["pose"], path)
+        ui._clear_ref("pose")
+        self.assertIsNone(ui.pose)
+        self.assertIsNone(ui.collect()["pose"])
+        ui.apply(got)
+        self.assertEqual(ui.pose["hidden"], [17])
+        self.assertEqual(ui.refs["pose"], path)
+        ui._clear_ref("pose")
+        for k in ("width", "height"):
+            ui.adv[k].set("")
 
     def test_editors_open_and_save(self):
         s, ui = self.tab()

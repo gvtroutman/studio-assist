@@ -1,7 +1,7 @@
 {
   "id": "flux_dev_baseline",
   "label": "FLUX.1 [dev]",
-  "about": "The known-good FLUX.1 [dev] text to image: ComfyUI's own flux_dev_full_text_to_image recipe (split files, KSampler at CFG 1, zeroed negative) plus FluxGuidance, so guidance is a real setting. Layered on it, each off unless asked for, so with none of them on the graph is the baseline node for node: a LoRA stack (identity and style LoRAs), an upscale-and-refine pass at low denoise, and a face pass that redraws each face at full size with the same model and LoRAs.",
+  "about": "The known-good FLUX.1 [dev] text to image: ComfyUI's own flux_dev_full_text_to_image recipe (split files, KSampler at CFG 1, zeroed negative) plus FluxGuidance, so guidance is a real setting. Layered on it, each off unless asked for, so with none of them on the graph is the baseline node for node: a LoRA stack (identity and style LoRAs), an upscale-and-refine pass at low denoise, a face pass that redraws each face at full size with the same model and LoRAs, and a pose: an OpenPose stick figure through a FLUX ControlNet (Union Pro 2.0), for the first pass only.",
   "families": ["flux1"],
   "defaults": {
     "steps": 20, "guidance": 3.5, "sampler": "euler", "scheduler": "simple",
@@ -9,18 +9,24 @@
     "encoder_device": "default", "filename_prefix": "ImageStudio/flux",
     "refine": false, "upscale": 1.5, "refine_steps": 14, "refine_denoise": 0.3,
     "refine_sampler": "euler", "refine_scheduler": "beta",
-    "face_denoise": 0.4
+    "face_denoise": 0.4,
+    "controlnet": "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors",
+    "pose_strength": 0.9, "pose_end": 0.65
   },
   "files": {
     "model": "diffusion_models", "clip_l": "text_encoders", "t5": "text_encoders",
-    "vae": "vae"
+    "vae": "vae", "controlnet": "controlnet"
   },
+  "needs": {"pose_image": ["controlnet"]},
+  "references": {"pose": "pose_image"},
   "lora_chain": {"model": ["1", 0], "clip": ["2", 0]},
   "switches": {
-    "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]}
+    "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]},
+    "positive": {"when": "pose_image", "then": ["52", 0], "else": ["11", 0]},
+    "negative": {"when": "pose_image", "then": ["52", 1], "else": ["12", 0]}
   },
   "stages": {
-    "loading": ["1", "2", "3", "10"],
+    "loading": ["1", "2", "3", "10", "50", "51", "52"],
     "sampling": ["40"],
     "decoding": ["41", "9"],
     "refining": ["42", "43", "44", "45"]
@@ -50,13 +56,22 @@
            "inputs": {"conditioning": ["10", 0], "guidance": "{{guidance}}"}},
     "12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["10", 0]}},
 
+    "50": {"_when": "pose_image", "class_type": "ControlNetLoader",
+           "inputs": {"control_net_name": "{{controlnet}}"}},
+    "51": {"_when": "pose_image", "class_type": "LoadImage",
+           "inputs": {"image": "{{pose_image}}"}},
+    "52": {"_when": "pose_image", "class_type": "ControlNetApplyAdvanced",
+           "inputs": {"positive": ["11", 0], "negative": ["12", 0], "control_net": ["50", 0],
+                      "image": ["51", 0], "strength": "{{pose_strength}}",
+                      "start_percent": 0.0, "end_percent": "{{pose_end}}", "vae": ["3", 0]}},
+
     "20": {"class_type": "EmptySD3LatentImage",
            "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
 
     "40": {"class_type": "KSampler",
            "inputs": {"model": "{{model_out}}", "seed": "{{seed}}", "steps": "{{steps}}",
                       "cfg": 1.0, "sampler_name": "{{sampler}}", "scheduler": "{{scheduler}}",
-                      "positive": ["11", 0], "negative": ["12", 0],
+                      "positive": "{{positive}}", "negative": "{{negative}}",
                       "latent_image": ["20", 0], "denoise": 1.0}},
     "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
 

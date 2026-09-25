@@ -64,6 +64,8 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
+  **`studio_pose.py`** is its pose: OpenPose stick figures and the picture drawn from
+  one, no tkinter (the editor is `PoseEditor` in the tab's module).
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -519,9 +521,34 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 - **A reference is typed** (face, pose, composition, style, source) and used only
   where the workflow declares that kind. Otherwise it is a warning, not a silent
   reuse. As of 2026-09-25 `flux_hq` takes `source` (image to image) and
-  `style`/`composition` (Redux, when its two files are on the backend). Nothing on
-  either machine does face or pose conditioning yet (no PuLID, IP-Adapter or
-  ControlNet), so the likeness is the identity LoRA's.
+  `style`/`composition` (Redux, when its two files are on the backend), and the
+  FLUX baseline takes `pose` (below). Nothing does face conditioning yet (no PuLID
+  or IP-Adapter in a shipped workflow), so the likeness is the identity LoRA's.
+- **The pose is a stick figure the user drags** (`PoseEditor`, the Pose row's
+  Draw…). It is OpenPose's 18 body joints in its colours on black, because that
+  is the picture pose ControlNets were trained on; `studio_pose.render` draws it
+  the way OpenPose's own preprocessor does (limbs at 60%, joints full), with
+  `struct` and `zlib`, in ~30 ms. Dragging a joint carries what hangs off it
+  (`CHILDREN`), Shift moves it alone, the empty frame moves the figure, the wheel
+  resizes it, right-click hides a joint (it stays placed, so it can come back;
+  hidden limbs are not drawn). Points are fractions of the frame, and the frame
+  is the picture's size as last composed (`planned_size`); a size changed since
+  the pose was drawn is `refit` at Generate - scaled and centred, never
+  stretched - and redrawn. The picture is named by a hash of the points and size
+  under `image-studio/poses/`, and the settings keep the points, hidden joints,
+  size and strength (`pose`), so Reuse Settings reopens the figure, not a PNG.
+  A picture chosen with Choose… replaces the drawn pose; it must already be a
+  skeleton, since no preprocessor (DWPose) is installed.
+  `flux_dev_baseline` applies it with `ControlNetApplyAdvanced` (nodes 50-52,
+  `_when: pose_image`) to the first pass only, at `pose_strength` 0.9 to
+  `pose_end` 0.65 of the steps - Shakker's recommendation for pose on Union
+  Pro 2.0, which leaves the last steps to the model's own detail. The refine
+  and face passes keep the plain conditioning. The ControlNet file is named in
+  the workflow's defaults, not the model record (so a `models.json` saved
+  before it still finds it: compose `borrowed`), and is kept in the values -
+  and the record - only when a pose is used. Without the file the pose is a
+  warning and the picture is made without it; with no pose the graph is the
+  baseline node for node.
 - **One lane per backend, one job per picture.** `JobQueue` runs a thread per
   backend, so the two GPUs work at once. A batch of N is N jobs with seeds s..s+N-1,
   spread over every capable backend, so each picture's record states its exact seed.
