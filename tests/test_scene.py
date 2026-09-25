@@ -32,6 +32,24 @@ def png_size(data):
     return struct.unpack(">II", data[16:24])
 
 
+def two_tone(path, a, b, n=64):
+    """A PNG split down the middle: `a` on the left, `b` on the right."""
+    px = bytearray()
+    for _y in range(n):
+        for x in range(n):
+            px += bytes(a if x < n // 2 else b) + b"\xff"
+    with open(path, "wb") as f:
+        f.write(studio_icons.png(bytes(px), n, n))
+    return path
+
+
+def pixel(scene, x, y):
+    w, h = sc.frame_size(scene)
+    rgb = sc.rasterise(sc.render(scene, w, h), w, h)
+    i = (int(y) * w + int(x)) * 3
+    return tuple(rgb[i:i + 3])
+
+
 class TestRig(unittest.TestCase):
     def test_every_pose_stands_on_its_floor(self):
         for key, _, _ in sc.POSES:
@@ -153,6 +171,99 @@ class TestRender(unittest.TestCase):
         self.assertEqual(sc.write_reference(s, d), a)
         s["objects"][0]["position"][0] = 1.0
         self.assertNotEqual(sc.write_reference(s, d), a)
+
+
+class TestRoom(unittest.TestCase):
+    """The floor and walls, and the pictures they wear."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_the_walls_face_into_the_room_and_hide_their_backs(self):
+        room = dict(sc.new_room(), walls=True)
+        for quad, origin, along in sc.walls(room):
+            n = sc.newell(quad)
+            self.assertGreater(sc.dot(n, sc.sub((0, 1, 0), sc.centroid(quad))), 0)
+            self.assertAlmostEqual(origin[1], room["height"])
+        s = staged()
+        s["room"]["walls"] = True
+        s["camera"].update(pitch=85, distance=20, lens=24)      # overhead: every wall
+        self.assertEqual(len([p for p in sc.render(s) if p.part == "wall"]), 4)
+        s["camera"].update(pitch=30, distance=12)               # outside: a doll's house
+        self.assertEqual(len([p for p in sc.render(s) if p.part == "wall"]), 3)
+        s["room"]["walls"] = False
+        self.assertFalse([p for p in sc.render(s) if p.part == "wall"])
+
+    def test_the_room_is_behind_everything_in_it(self):
+        s = staged("box")
+        s["room"].update(walls=True, depth=2.0)            # the back wall 1 m behind a crate
+        polys = sc.render(s)
+        kinds = [p.owner is None for p in polys]
+        self.assertEqual(kinds, sorted(kinds, reverse=True))
+
+    def test_a_picture_is_laid_on_the_floor_and_repeats(self):
+        s = staged()
+        s["camera"].update(pitch=89.0, distance=4.0, target=[0.0, 0.0, 0.0], lens=35)
+        before = pixel(s, 448, 576)
+        self.assertEqual(before, sc.FLOOR)
+        s["room"]["floor"].update(image=sc.import_texture(
+            two_tone(os.path.join(self.dir, "f.png"), (200, 0, 0), (0, 0, 200)), self.dir),
+            size=2.0)
+        # Looking straight down on the origin: x = 0 is the picture's left
+        # edge, so just right of the middle is red and just left, a copy's
+        # right half, is blue.
+        self.assertEqual(pixel(s, 470, 576), (200, 0, 0))
+        self.assertEqual(pixel(s, 426, 576), (0, 0, 200))
+        flat = sc.rasterise(sc.render(s), 896, 1152, flat=True)
+        self.assertEqual(tuple(flat[(576 * 896 + 470) * 3:][:3]), (100, 0, 100))   # the mean
+
+    def test_a_missing_picture_is_drawn_plain_and_said(self):
+        s = staged()
+        s["room"]["floor"]["image"] = os.path.join(self.dir, "gone.png")
+        self.assertEqual(sc.render(s)[0].rgb, sc.FLOOR)
+        _, problems = sc.clean_scene(s)
+        self.assertTrue(any("floor picture gone.png is missing" in p for p in problems))
+
+    def test_a_picture_is_kept_small_and_named_by_content(self):
+        src = two_tone(os.path.join(self.dir, "big.png"), (10, 20, 30), (40, 50, 60), n=600)
+        a = sc.import_texture(src, self.dir)
+        self.assertEqual(a, sc.import_texture(src, self.dir))
+        with open(a, "rb") as f:
+            self.assertEqual(png_size(f.read()), (sc.TEXTURE_SIDE, sc.TEXTURE_SIDE))
+        with open(os.path.join(self.dir, "x.jpg"), "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0 not a png")
+        with self.assertRaises(ValueError):
+            sc.import_texture(os.path.join(self.dir, "x.jpg"), self.dir)
+
+    def test_the_room_saves_and_older_files_open_with_a_plain_floor(self):
+        s = staged()
+        s["room"].update(walls=True, width=5.5, height=99)
+        s["room"]["wall"]["prompt"] = "whitewashed brick"
+        path = os.path.join(self.dir, "r.scene.json")
+        sc.save(s, path)
+        back, problems = sc.load(path)
+        self.assertEqual(problems, [])
+        self.assertEqual((back["room"]["walls"], back["room"]["width"]), (True, 5.5))
+        self.assertEqual(back["room"]["height"], sc.ROOM_LIMITS["height"][1])
+        self.assertEqual(back["room"]["wall"]["prompt"], "whitewashed brick")
+        old = dict(s)
+        del old["room"]
+        self.assertEqual(sc.clean_scene(old)[0]["room"], sc.new_room())
+
+    def test_the_surfaces_words_go_into_the_prompt_as_written(self):
+        s = staged()
+        s["room"]["floor"]["prompt"] = "Polished concrete, worn YELLOW lines"
+        s["room"]["wall"]["prompt"] = "whitewashed brick"
+        text = sc.scene_text(s).text
+        self.assertIn("The floor: Polished concrete, worn YELLOW lines.", text)
+        self.assertNotIn("brick", text)                     # no walls, no wall words
+        s["room"]["walls"] = True
+        self.assertIn("The walls: whitewashed brick.", sc.scene_text(s).text)
+
+    def test_the_grid_stays_inside_the_walls(self):
+        s = staged()
+        s["room"].update(walls=True, width=4.0, depth=4.0)
+        self.assertEqual(len(sc.grid_lines(s, 896, 1152)), 10)
 
 
 class TestSceneFile(unittest.TestCase):
@@ -336,6 +447,24 @@ class TestIntoCompose(TempStudioMixin, unittest.TestCase):
         plan = ig.compose(st, self.studio.lib, self.backend("5090"), FLUX_FILES)
         self.assertNotIn("source", plan.references)
         self.assertTrue(any("Source image" in w for w in plan.warnings), plan.warnings)
+
+    def test_a_floor_is_text_to_image_with_nothing_of_the_person(self):
+        s = staged()
+        s["room"]["floor"]["prompt"] = "oily concrete, drain in the corner."
+        st = sc.texture_settings(s, "floor", "flux-dev")
+        plan = ig.compose(st, self.studio.lib, self.backend("5090"), FLUX_FILES)
+        self.assertEqual(plan.errors, [])
+        self.assertIn("seen from directly above", plan.prompt)
+        self.assertIn(": oily concrete, drain in the corner. Flat", plan.prompt)
+        self.assertNotIn(ig.anatomy_text(), plan.prompt)
+        self.assertEqual(plan.references, {})
+        self.assertEqual((plan.values["width"], plan.values["height"]), (1024, 1024))
+        self.assertEqual(st["scene_texture"], "floor")
+
+
+def sc_room():
+    import studio_scene_ui
+    return studio_scene_ui.ROOM
 
 
 class Ev:
@@ -522,6 +651,38 @@ class TestSceneBuilderWindow(unittest.TestCase):
         d = sb.scene["camera"]["distance"]
         sb._zoom(1)
         self.assertGreater(sb.scene["camera"]["distance"], d)
+
+    def test_make_a_floor_and_walls_from_words(self):
+        """Make sends the words to the Image Studio as text to image, and the
+        finished picture is put on the surface and drawn in the viewport."""
+        ui, sb = self.builder()
+        sb.select(sc_room())
+        self.assertIn("floor_size", sb.vars)
+        self.assertFalse(sb.make_texture("floor"))              # no words yet
+        sb.scene["room"]["floor"]["prompt"] = "polished concrete"
+        n = len(ui.jobs)
+        self.assertTrue(sb.make_texture("floor"))
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status in ig.FINISHED)
+        job = ui.jobs[0]
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(job.settings["scene_texture"], "floor")
+        self.assertEqual(job.settings["references"], {})
+        self.assertIn("polished concrete", job.settings["scene"])
+        self.pump(lambda: sb.scene["room"]["floor"]["image"])
+        self.assertTrue(os.path.isfile(sb.scene["room"]["floor"]["image"]))
+        self.assertNotIn("floor", sb.making)
+        self.assertTrue(sb.dirty)
+        self.pump(lambda: any(sb.canvas.type(i) == "image" for i in sb.canvas.find_all()))
+        sb.texture_done(job)                                    # told twice: used once
+        self.assertNotIn("floor", sb.making)
+
+        sb.scene["room"]["wall"]["prompt"] = "whitewashed brick"
+        self.assertTrue(sb.make_texture("wall"))
+        self.assertTrue(sb.scene["room"]["walls"])              # Make walls puts them up
+        self.pump(lambda: sb.scene["room"]["wall"]["image"])
+        self.assertIn("The walls: whitewashed brick.", sb.words_label.cget("text"))
+        sb._set_model("z-image-turbo")
+        self.assertEqual(sb.check(), "")                        # a room alone is enough
 
     def test_save_reopen_and_generate_through_the_image_studio(self):
         ui, sb = self.builder()
