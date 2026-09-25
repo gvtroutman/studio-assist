@@ -964,6 +964,15 @@ goes to `studio_update.log`, and so does a successful update. A pass with nothin
 to do writes nothing. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
 console hangs forever and nobody sees it.
 
+The window has the same updater on a button. `Chat._update_tick` calls
+`studio_update.check()` (fetch and compare, never a change) 8 s after start and every
+15 minutes; when the branch's upstream is ahead, an **Update (N)** button appears in
+the header. It lists the new commits, runs `pull()` (the same fast-forward, refusals
+and log as the scheduled task) and offers a restart: `main()` releases the
+single-instance lock before `relaunch()` starts the new copy, or the new copy would
+find the old one's lock and say it is already running. *Help → Check for updates...*
+does the same on demand and also says "up to date" or why it could not tell.
+
 **The launchers must not name a Python by its install path.** `Studio Assist.cmd`
 pointed at `...\Programs\Python\Python312\pythonw.exe`, which is one Python upgrade
 away from a shortcut that does nothing at all when clicked — no window and no error,
