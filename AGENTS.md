@@ -496,14 +496,30 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   (`item_refs`, copied under `references/`). Choosing one copies its look onto the
   form (blanking what it does not set) rather than linking to it, so history holds
   the whole look and Generate Again does not change when the character is edited.
-- **Item pictures are put on by Try On, after the picture is made** (below).
-  No generation workflow takes them (Redux in `flux_hq` is taken by
-  style/composition, and nothing does IP-Adapter), so the item's words shape the
-  first picture and `plan_dress` plans the dress run that follows. With the
-  form's "Try On the character's item pictures" off, or a backend without the
-  dress files, the pictures come back as a note or a warning naming them. A
-  picture of something not worn today is skipped without a word. The Hair tab
-  of the creator keeps one picture of its own, under the item name `hair`.
+- **Item pictures go into the picture itself, through FLUX Kontext**
+  (2026-09-25; before, Try On redrew the finished picture, which Gavin did not
+  want). They are chosen on the form's Clothes, Hair and Accessories tabs as in
+  the creator (`item_rows`; the Hair tab keeps one picture, item name `hair`),
+  and copied under `references/`. `plan_items` takes the pictures of what is
+  worn today (`outfit_of`: clothes, hair, accessories; anything else skipped
+  without a word). When the workflow has an `items` section (the FLUX
+  baseline) and the backend has `kontext_model`
+  (`flux1-dev-kontext_fp8_scaled.safetensors`, Comfy-Org's fp8: BFL's full
+  weights are gated), the model file becomes Kontext, guidance
+  `item_guidance` 2.5 unless the form sets one, and `add_item_refs` puts the
+  pictures side by side on white (`ImageStitch`), through
+  `FluxKontextImageScale` and `VAEEncode`, onto the prompt as one
+  `ReferenceLatent`. One picture of them all, since Kontext [dev] was trained on
+  one reference. The prompt gains `ITEM_PROMPT` ("look exactly as in the
+  reference picture ... one person, not the reference picture itself"), which
+  the face pass's prompt leaves out. The LoRA chain, pose ControlNet, refine and
+  face pass all run on Kontext unchanged. Without Kontext, or with a workflow
+  that has no `items` section, a warning names the missing piece and the
+  words alone describe the items. Measured on the 5090 (832x1216): 17-18 s, 21
+  s with a drawn pose (which it follows). A dirndl photographed on a model came
+  out right in every detail (lacing, apron, trim, lace hem) across scenes and
+  poses. But her pendant came along, and without an identity LoRA the face
+  drifted toward hers. Pictures of the item alone, on white, are best.
 - **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
   described, or named in the scene, `PEOPLE`) says outright that every person has
   two hands, each with four fingers and a thumb, two feet, two eyes and a
@@ -657,14 +673,17 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 
 ### Try On: dressing a person from pictures
 
+**Retired from the form on 2026-09-25.** Gavin did not want the finished
+picture redrawn: item pictures now go into the picture itself (*Item pictures
+go into the picture itself*, above). The Try On window, its button, the
+picture menu's entry and Generate's dress pass are gone. The engine is kept
+(`submit_dress`, `run_dress`, `_dress`, the graphs) only so Generate Again
+still remakes a Try On record in history. Reuse on one says it has no form to go back to.
+
 Clothes, hair and accessories from pictures, put on a person who is already
-drawn: any picture, through the Try On window (`TryOnWindow`: the Person row's
-Try On…, the picture's right-click menu, or Reuse on a Try On record), or a
-Generate picture of a character with item pictures (`plan_dress`, then
-`Studio._dress` before the face pass). A Try On job is an ordinary `Job` with
-`settings["mode"] == "dress"` and the outfit in `settings["outfit"]`
-(`settings["dress"]` is Generate's on/off switch); it has a queue row, a
-history record (`dress_record`) and Generate Again like any other.
+drawn. A Try On job is an ordinary `Job` with `settings["mode"] == "dress"` and
+the outfit in `settings["outfit"]`; it has a queue row, a history record
+(`dress_record`) and Generate Again like any other.
 
 - **The recipe is `comfy_workflows/qwen_dress.json` plus code.** The file holds
   the loaders (Qwen-Image-Edit 2509 fp8, its 7B encoder, VAE, the Lightning

@@ -1111,6 +1111,36 @@ def add_face_finder(graph, sam3, pixels=None):
     return graph
 
 
+ITEM_NODES = {"LoadImage", "ImageStitch", "FluxKontextImageScale", "VAEEncode",
+              "ReferenceLatent"}
+
+
+def add_item_refs(graph, section, images):
+    """Into a filled graph: the item pictures (LoadImage names, in order) as
+    one reference for FLUX Kontext - side by side on white, scaled to a size
+    Kontext was trained on, encoded, and set as the reference latent on the
+    conditioning the template's `items` section names. One picture of them
+    all, not a latent each: Kontext [dev] learnt from a single reference."""
+    node, key = section["conditioning"]
+    last = None
+    for n, name in enumerate(images, 1):
+        graph["it%d" % n] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        if last is None:
+            last = ["it%d" % n, 0]
+            continue
+        graph["is%d" % n] = {"class_type": "ImageStitch", "inputs": {
+            "image1": last, "image2": ["it%d" % n, 0], "direction": "right",
+            "match_image_size": True, "spacing_width": 32, "spacing_color": "white"}}
+        last = ["is%d" % n, 0]
+    graph["ik1"] = {"class_type": "FluxKontextImageScale", "inputs": {"image": last}}
+    graph["ik2"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["ik1", 0],
+                                                          "vae": section["vae"]}}
+    graph["ik3"] = {"class_type": "ReferenceLatent", "inputs": {
+        "conditioning": graph[node]["inputs"][key], "latent": ["ik2", 0]}}
+    graph[node]["inputs"][key] = ["ik3", 0]
+    return graph
+
+
 def face_boxes(entry):
     """What add_face_finder's nodes said -> (width, height, [(x, y, w, h)]),
     faces under FACE_MIN px dropped. None when the finder said nothing."""
@@ -1685,7 +1715,7 @@ def default_settings():
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "face_detail": None, "batch": 1, "pose": None, "dress": True,
+            "face_detail": None, "batch": 1, "pose": None,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -2087,39 +2117,61 @@ class Plan:
         self.family = ""
         self.lora_meta = []          # [{"name", "file", "strength", "category"}]
         self.references = {}         # kind -> local path actually used
-        self.dress = None            # the outfit the picture is dressed in after, if any
+        self.items = []              # [(item name, local path)]: Kontext's reference
+        self.item_text = ""          # the prompt's line about them
 
 
-def plan_dress(p, s, backend, inventory, nodes, workflow_loader):
-    """Into `p`: the outfit to dress a Generate picture in afterwards - the
-    character's pictures of what it wears today (outfit_of) - when the
-    setting is on and `backend` can. -> the names it puts on (lower case),
-    which then need no other word."""
+ITEM_PROMPT = ("The %s %s exactly as in the reference picture, worn by the person. "
+               "One person, not the reference picture itself.")
+
+
+def plan_items(p, s, wf, v, backend, short, nodes):
+    """Into `p` and `v`: the character's pictures of what it wears today
+    (outfit_of: clothes, the hair picture, accessories) as references for the
+    picture itself. A workflow with an `items` section makes it with FLUX
+    Kontext, the pictures side by side as its reference (add_item_refs);
+    otherwise, or on a backend without Kontext (`short` names the file), the
+    words alone describe them, said once."""
     outfit = outfit_of(s)
-    items = outfit["clothes"] + outfit["accessories"]
-    if not (items or outfit["hair"]):
-        return set()
-    names = _and([i["name"] for i in items] + (["hair"] if outfit["hair"] else []))
-    if s.get("dress") is False:
-        p.notes.append("Try On is off: the pictures of the %s are not used." % names)
-        return set()
-    missing = [x for x in outfit_pictures(outfit) if not os.path.isfile(x)]
-    if missing:
-        p.warnings.append("Not on this PC any more, so not put on: %s." % ", ".join(missing))
-        return set()
-    try:
-        wf = workflow_loader(DRESS_WORKFLOW)
-    except TemplateError as e:
-        p.warnings.append("The %s are not put on: %s" % (names, e))
-        return set()
-    short = dress_lacks(wf, outfit, inventory, nodes)
-    if short:
-        p.warnings.append("The %s are not put on: %s lacks %s." % (
-            names, backend["name"], "; ".join(m["text"] for m in short)))
-        return set()
-    p.dress = outfit
-    p.notes.append("Then dressed from pictures: %s." % names)
-    return {i["name"].lower() for i in items} | ({HAIR_ITEM} if outfit["hair"] else set())
+    items = outfit["clothes"] + ([{"name": "hair", "path": outfit["hair"]["path"]}]
+                                 if outfit["hair"] else []) + outfit["accessories"]
+    if not items:
+        return
+    names = _and([i["name"] for i in items])
+    gone = [i for i in items if not os.path.isfile(i["path"])]
+    for i in gone:
+        p.warnings.append("The picture of the %s (%s) is not on this PC any more; not "
+                          "used." % (i["name"], i["path"]))
+    items = [i for i in items if i not in gone]
+    section = wf.get("items")
+    why = ""
+    if not section:
+        why = "the %s workflow takes no item pictures" % wf.get("label", wf.get("id"))
+    elif short:
+        why = "%s lacks %s (FLUX.1 Kontext [dev], which draws from pictures)" % (
+            backend["name"], short)
+    elif nodes is not None and ITEM_NODES - set(nodes):
+        why = "%s's ComfyUI lacks %s" % (backend["name"],
+                                         ", ".join(sorted(ITEM_NODES - set(nodes))))
+    if items and why:
+        p.warnings.append("Pictures of the %s: %s, so the words alone describe %s."
+                          % (names, why, "it" if len(items) == 1 else "them"))
+        return
+    if not items:
+        return
+    p.items = [(i["name"], i["path"]) for i in items]
+    for name, path in p.items:
+        p.references["item: " + name] = path
+    v["model"] = v[section["model"]]
+    v["weight_dtype"] = "default"
+    if s.get("guidance") in (None, ""):
+        v["guidance"] = (wf.get("defaults") or {}).get(section["guidance"], v.get("guidance"))
+    p.item_text = ITEM_PROMPT % (_and([i["name"] for i in items]),
+                                 "looks" if len(items) == 1 else "look")
+    p.prompt = (p.prompt + " " + p.item_text).strip()
+    v["prompt"] = p.prompt
+    p.notes.append("Made with FLUX.1 Kontext [dev] from the pictures of the %s." % _and(
+        [i["name"] for i in items]))
 
 
 def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow,
@@ -2338,34 +2390,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             continue
         p.images[var] = path
         p.references[kind] = path
-    # Item pictures: what the character's glasses or necklace look like. Only
-    # a workflow that declares an "item" reference takes one, a picture per
-    # input; the item's name is in the prompt either way.
-    worn = {x.lower() for x in items_worn(s)}
-    dressed = plan_dress(p, s, backend, inventory, nodes, workflow_loader)
-    unused = []
-    for name, path in clean_item_refs(s.get("item_refs")).items():
-        if name.lower() not in worn or name.lower() in dressed:
-            continue                  # not worn today, or put on by the dress pass
-        var = slots.get("item")
-        if not var or var in p.images:
-            unused.append(name)
-        elif not os.path.isfile(path):
-            p.warnings.append("The picture of the %s (%s) is not on this PC any more; "
-                              "not used." % (name, path))
-        elif lacking(var):
-            p.warnings.append("The picture of the %s: %s lacks %s, which it needs; not "
-                              "used." % (name, backend["name"], lacking(var)))
-        else:
-            p.images[var] = path
-            p.references["item: " + name] = path
-    if unused:
-        p.warnings.append("Pictures of the %s: the %s workflow has %s, so the words "
-                          "alone describe %s." % (
-                              _and(unused), wf.get("label", wid),
-                              "no free item reference input" if slots.get("item")
-                              else "no item reference input",
-                              "it" if len(unused) == 1 else "them"))
+    plan_items(p, s, wf, v, backend, lacking("items"), nodes)
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
     pose = s.get("pose") if isinstance(s.get("pose"), dict) else {}
@@ -2422,7 +2447,8 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             v["face_detail"] = False
         else:
             v["sam3"] = sam[0] if sam else None
-            v["face_prompt"] = FACE_PROMPT % p.prompt
+            # The face is redrawn without the item pictures, so without their line.
+            v["face_prompt"] = FACE_PROMPT % p.prompt.replace(p.item_text, "").strip()
             v.setdefault("face_denoise", (wf.get("defaults") or {}).get("face_denoise", 0.4))
 
     # ------------------------------------------- files and nodes it needs
@@ -3018,13 +3044,18 @@ class Studio:
         if plan.errors:
             return self.queue._finish(job, "failed", " ".join(plan.errors))
 
-        say("uploading" if plan.images else None,
-            "uploading references" if plan.images else "")
+        say("uploading" if plan.images or plan.items else None,
+            "uploading references" if plan.images or plan.items else "")
         values = dict(plan.values)
         for var, path in plan.images.items():
             if job.cancel.is_set():
                 return self.queue._finish(job, "cancelled")
             values[var] = client.upload_image(path)
+        items = []
+        for _, path in plan.items:
+            if job.cancel.is_set():
+                return self.queue._finish(job, "cancelled")
+            items.append(client.upload_image(path))
         # One output name per job, so the file on the backend says which job
         # made it (ComfyUI adds _00001_ and the extension).
         values["filename_prefix"] = "ImageStudio/%s_%s" % (plan.workflow.get("id", "job"),
@@ -3033,6 +3064,8 @@ class Studio:
             graph = fill(plan.workflow, values, plan.loras)
         except TemplateError as e:
             return self.queue._finish(job, "failed", str(e))
+        if items:
+            add_item_refs(graph, plan.workflow["items"], items)
         try:
             types = set(client.node_types())
         except ComfyError:
@@ -3048,7 +3081,7 @@ class Studio:
                 plan.warnings.append("%s's ComfyUI lacks %s; the picture is made without the "
                                      "face pass." % (b["name"], ", ".join(sorted(FACE_NODES
                                                                                  - types))))
-            elif not plan.dress:          # else it looks at the dressed picture
+            else:
                 add_face_finder(graph, values["sam3"])
         if lacking:
             return self.queue._finish(job, "failed", "%s's ComfyUI lacks the node(s) %s that "
@@ -3091,23 +3124,6 @@ class Studio:
             return self.queue._finish(job, "failed", "; ".join(errors) or
                                       "The workflow finished on %s without a picture."
                                       % b["name"])
-        if plan.dress and not job.cancel.is_set():
-            f = files[0]
-            try:
-                size = picture_size(client.fetch(f))
-                if size is None:
-                    raise ComfyError("its size could not be read")
-                image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
-                                        f["filename"], f.get("type") or "output")
-                entry, files = self._dress(job, client, plan.dress, image, size, say,
-                                           finder=values.get("sam3") if values.get(
-                                               "face_detail") else None)
-            except (ComfyError, TemplateError, OSError) as e:
-                if job.cancel.is_set():
-                    return self.queue._finish(job, "cancelled")
-                plan.warnings.append("Try On failed (%s); the picture is as made, undressed."
-                                     % e)
-                values["face_detail"] = False     # its finder was in the dress run
         if values.get("face_detail") and not job.cancel.is_set():
             files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
             if graph2 is not None:
