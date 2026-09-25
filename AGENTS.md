@@ -218,8 +218,8 @@ own process — keep both reading the same variable. ComfyUI must be started wit
 
 ### What ComfyUI makes, and why it takes the time it does
 
-The bridge has four making tools. `comfy_generate` is text to image; `comfy_edit_image`
-changes a picture by instruction (Qwen-Image-Edit 2509 with up to two reference
+The bridge has four making tools. `comfy_generate` is text to image, faces redrawn;
+`comfy_edit_image` changes a picture by instruction (Qwen-Image-Edit 2509 with up to two reference
 pictures); `comfy_face_swap` puts one picture's people's faces on another's;
 `comfy_upscale` enlarges one and redraws its detail. Each takes a local path
 and uploads it (`input_image`), so the model never spends a round trip on
@@ -325,6 +325,28 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   crop's edge and composites each head back where it was cut. Nothing outside
   the heads changes. SAM3's boxes come back through `PreviewAny`, whose text is
   in `/history` - the one way a graph's non-image values reach the bridge.
+- **Every face is redrawn at full size** (`face_detail`, `redraw_faces`). A face a
+  tenth of the frame's height is ~60 px of Z-Image's 1024 px sample, and it drew
+  them that small: a wedding party of eight all came back smooth and waxy, eyes and
+  teeth smeared - the detail pass enlarges that, it does not fix it. So with SAM3
+  installed `comfy_generate` runs the picture to a preview with SAM3's face boxes
+  beside it, then a second run crops each face `FACE_PAD` (2x) its size, enlarges it
+  to 1024, resamples it with the same model at `FACE_DENOISE` (0.45) under
+  `FACE_PROMPT` (the scene's prompt inside a face-specific one) and blends it back
+  through a soft oval (`oval_png`, a greyscale PNG the bridge draws and uploads).
+  Two details matter. Each crop is taken from the picture as composited so far, so a
+  neighbour's crop never pastes an old face back. And the blend is the oval, not the
+  crop's square: in a row of faces each square holds the next person's face, and a
+  square blend ghosted it. A crop already 1024 px or larger is left alone, as is a
+  face under `FACE_MIN`. Z-Image stays on the card between the runs. Measured on
+  the LLM PC with the card free: 8 faces added 100 s (7 s sampling and ~5 s of VAE
+  and model staging each) to a 68 s picture; one face adds ~15 s. `comfy_face_swap`
+  ends with the same pass at `SWAP_DENOISE` (0.3) when Z-Image is installed, because
+  the edit model's face read as pasted onto an old photograph; at 0.3 it takes the
+  photograph's grain and light and keeps the likeness. `face_detail` false turns
+  either off. The pass does not fix skin the prompt asked for: "weathered, ruddy,
+  deep lines, visible pores" came back crackled and blotchy at every setting, with
+  the pass and without, so the briefing says to name skin once and plainly.
 - **Every picture a bridge saved says where** (`_meta.path` on the image block).
   The transcript's preview is shrunk to fit; right-click on it saves, opens,
   shows or copies the full-size file, and a double-click opens it

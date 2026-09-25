@@ -1480,8 +1480,8 @@ REALISM - the user wants pictures that look like real photographs
   sentences: who or what and what they are doing; where; the light (golden hour
   backlight, overcast daylight, a single window, neon at night); the camera (35mm
   or 85mm lens, f/1.8, shallow depth of field, eye level); and the real-world
-  imperfections that sell it (visible skin pores, flyaway hair, creased cotton,
-  scuffed paint, dust, wet asphalt). Two to five sentences.
+  imperfections that sell it (flyaway hair, creased cotton, scuffed paint,
+  dust, wet asphalt). Three to six sentences; up to eight with people.
 - Never write "masterpiece, best quality, 8k, ultra HD, hyperrealistic, trending
   on artstation": those push the model toward a glossy digital-art look.
 - Name the look if it matters: "candid snapshot on a phone", "35mm film, Portra
@@ -1494,6 +1494,24 @@ REALISM - the user wants pictures that look like real photographs
 - The seed makes a result reproducible. To vary a picture slightly keep the seed
   and change the prompt; for a different take keep the prompt and change the seed.
   Every result reports its seed - keep it.
+
+PEOPLE AND FACES - a vague person comes back with a generic, doll-like face
+- Describe every person as a casting director would: age, build, skin tone, face
+  shape and features (a strong jaw, a crooked nose, deep-set eyes, freckles), hair
+  (colour, length, texture, how it falls), expression and where they are looking,
+  and what they wear. Two or more people: describe each in turn, left to right,
+  and say how they stand to each other.
+- Name the skin once and plainly: "natural, unretouched skin", plus one true
+  detail if it matters (freckles, a scar, a tan). The model exaggerates every skin
+  word: "weathered", "ruddy", "deep wrinkles" and "visible pores" together came
+  back crackled and blotchy. Makeup only when asked for.
+- Light the face: say where the light falls on it (soft window light from the
+  left, a warm rim of backlight). For one person use an 85mm lens at f/2 and eye
+  level; for a group frame no wider than the scene needs - a face drawn larger is
+  a face drawn better.
+- Say what the hands do: holding a cup, in pockets, resting on a railing.
+- comfy_generate redraws every face in the finished picture at full size (the
+  face detail pass). Leave face_detail on; it adds ten or fifteen seconds a face.
 
 EDITING
 - Say what changes and what stays: "change her jacket to red leather, keep her

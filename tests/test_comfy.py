@@ -86,7 +86,11 @@ class FakeComfy:
             if graph[src]["class_type"] == "GetImageSize":
                 value = self.size[index]
             else:
-                image = graph[graph[src]["inputs"]["image"][0]]["inputs"]["image"]
+                # An uploaded picture by its name; a picture the graph made
+                # (comfy_generate's, for the face pass) as "generated".
+                pic = graph[graph[src]["inputs"]["image"][0]]
+                image = (pic["inputs"]["image"] if pic["class_type"] == "LoadImage"
+                         else "generated")
                 value = [[{"x": x, "y": y, "width": w, "height": h, "score": 0.8}
                           for x, y, w, h in self.faces.get(image, [])]]
             out[nid] = {"text": [json.dumps(value)]}
@@ -320,7 +324,8 @@ class ComfyBridgeTest(unittest.TestCase):
         # But if the user insists on it, it is used verbatim.
         comfy.call_tool("comfy_generate", {"prompt": "x",
                                            "checkpoint": "sam3.1_multiplex_fp16.safetensors"})
-        self.assertEqual(self.fake.prompts["p2"]["1"]["class_type"], "CheckpointLoaderSimple")
+        # (p1 and p2 were the picture and its face detail run.)
+        self.assertEqual(self.fake.prompts["p3"]["1"]["class_type"], "CheckpointLoaderSimple")
 
     def test_a_real_checkpoint_is_the_default_when_no_known_split_model_is(self):
         self.fake.checkpoints = ["dreamshaper_8.safetensors"]
@@ -523,6 +528,82 @@ class ComfyBridgeTest(unittest.TestCase):
         res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "nobody.png"})
         self.assertTrue(res["isError"])
         self.assertIn("No face found in nobody.png", self.text(res))
+
+    def test_generate_redraws_each_face_at_full_size(self):
+        """At 60 px a face is drawn smooth and waxy. With SAM3 installed the
+        picture goes to a preview beside SAM3's face boxes, and a second run
+        crops each face, resamples it at FACE_EDIT and blends it back through
+        the oval - each crop taken from the picture as composited so far."""
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.running = []
+        self.fake.size = (1824, 1248)
+        # Two guests, a face too large to gain anything, and a speck of crowd.
+        self.fake.faces = {"generated": [(300, 400, 60, 70), (700, 410, 58, 66),
+                                         (1200, 100, 560, 600), (40, 40, 8, 9)]}
+        res = comfy.call_tool("comfy_generate", {"prompt": "a wedding party", "seed": 5})
+        self.assertFalse(res["isError"], self.text(res))
+        first, second = self.fake.prompts["p1"], self.fake.prompts["p2"]
+        self.assertEqual(first["7"]["class_type"], "PreviewImage")
+        self.assertEqual(first["32"]["inputs"]["image"], first["7"]["inputs"]["images"])
+        self.assertEqual(second["20"]["inputs"]["image"], "preview.png [temp]")
+        crops = [n["inputs"]["crop_region"] for n in second.values()
+                 if n["class_type"] == "ImageCropV2"]
+        self.assertEqual(len(crops), 2)
+        self.assertTrue(crops[0]["x"] < 330 < crops[0]["x"] + crops[0]["width"])
+        self.assertEqual(second["100"]["inputs"]["image"], ["20", 0])
+        self.assertEqual(second["120"]["inputs"]["image"], ["108", 0])
+        self.assertEqual(second["103"]["inputs"]["denoise"], comfy.FACE_DENOISE)
+        self.assertEqual(second["101"]["inputs"]["width"], comfy.FACE_EDIT)
+        self.assertEqual(second["7"]["inputs"]["images"], ["128", 0])
+        self.assertIn("a wedding party", second["2"]["inputs"]["text"])
+        self.assertIn(b"IHDR", self.fake.uploads[-1])     # the oval went up
+        self.assertIn("face detail: 2 face(s)", self.text(res))
+
+        # No faces: the picture is saved as it was drawn.
+        self.fake.faces = {}
+        res = comfy.call_tool("comfy_generate", {"prompt": "a lighthouse"})
+        save = self.fake.prompts["p4"]
+        self.assertEqual(save["7"]["inputs"]["images"], ["20", 0])
+        self.assertNotIn("face detail", self.text(res))
+        # face_detail false, or no SAM3: one run, as before.
+        comfy.call_tool("comfy_generate", {"prompt": "x", "face_detail": False})
+        self.assertEqual(self.fake.prompts["p5"]["7"]["class_type"], "SaveImage")
+        self.fake.checkpoints = ["dreamshaper_8.safetensors"]
+        comfy.call_tool("comfy_generate", {"prompt": "x"})
+        self.assertEqual(self.fake.prompts["p6"]["7"]["class_type"], "SaveImage")
+
+    def test_face_swap_polishes_the_stitched_faces_with_z_image(self):
+        """The edit model's face read as pasted onto an old photograph. With
+        Z-Image installed the stitch goes to a preview and a fourth run
+        redraws each swapped face lightly, keeping the likeness."""
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                                      "z_image_turbo_bf16.safetensors"]
+        self.fake.text_encoders = ["qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                                   "qwen_3_4b.safetensors"]
+        self.fake.running = []
+        self.fake.faces = {"old.png": [(254, 460, 102, 113)], "us.png": [(292, 407, 130, 156)]}
+        res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png"})
+        self.assertFalse(res["isError"], self.text(res))
+        stitch, polish = self.fake.prompts["p3"], self.fake.prompts["p4"]
+        self.assertEqual(stitch["9"]["class_type"], "PreviewImage")
+        self.assertEqual(polish["20"]["inputs"]["image"], "edit9.png [temp]")
+        self.assertEqual(polish["1"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
+        self.assertEqual(polish["103"]["inputs"]["denoise"], comfy.SWAP_DENOISE)
+        self.assertEqual(polish["9"]["inputs"]["images"], ["108", 0])
+        self.assertIn("face detail: 1 face(s)", self.text(res))
+        # face_detail false: the stitch is the result, as before.
+        comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png",
+                                            "face_detail": False})
+        self.assertEqual(self.fake.prompts["p7"]["9"]["class_type"], "SaveImage")
+
+    def test_the_face_oval_is_a_valid_greyscale_png(self):
+        png = comfy.oval_png(64)
+        self.assertTrue(png.startswith(bytes([0x89]) + b"PNG"))
+        rows = zlib.decompress(png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8])
+        self.assertEqual(len(rows), 64 * 65)
+        centre, corner = rows[34 * 65 + 1 + 32], rows[1]
+        self.assertEqual((centre, corner), (255, 0))
 
     def test_a_returned_picture_says_where_it_was_saved(self):
         res = comfy.call_tool("comfy_generate", {"prompt": "a fox"})
