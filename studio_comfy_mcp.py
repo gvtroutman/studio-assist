@@ -25,12 +25,14 @@ import base64
 import json
 import os
 import random
+import struct
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 
 import studio_mcp
 
@@ -544,10 +546,11 @@ def vram_note(free, total):
     return ""
 
 
-def run(graph, a, header, notes=(), started=None):
+def run(graph, a, header, notes=(), started=None, before=None):
     """Submit, wait and collect, with the recipe and timing on top. `started`
-    is when the work began, for a tool that ran something before this."""
-    free, total = gpu_memory()
+    is when the work began, and `before` the (free, total) VRAM then, for a
+    tool that ran something before this and kept its models on the card."""
+    free, total = before or gpu_memory()
     note = vram_note(free, total)
     started = started or time.monotonic()
     pid = submit(graph)
@@ -789,6 +792,9 @@ def t_generate(a):
     k = graph["5"]["inputs"]
     recipe = "model: %s\nseed: %d  steps: %s  cfg: %s  sampler: %s/%s\n" % (
         plan["label"], seed, k["steps"], k["cfg"], k["sampler_name"], k["scheduler"])
+    if (a.get("face_detail", True) and plan["kind"] == "split" and a.get("wait", True)
+            and a.get("batch_size", 1) == 1 and has_sam3()):
+        return face_detail(graph, plan, seed, a, recipe, notes)
     return run(graph, a, recipe, notes)
 
 
@@ -977,6 +983,169 @@ def head_square(box, width, height, pad):
     return {"x": x0, "y": y0, "width": side, "height": side}
 
 
+def has_sam3():
+    try:
+        return SAM3 in (pick_first(list_models("checkpoints"), SAM3) or "").lower()
+    except ComfyError:
+        return False
+
+
+# The face detail pass (ADetailer's idea, built from stock nodes). A face a
+# tenth of the frame's height is ~60 px of a 1024 px sample, and Z-Image draws
+# it that small: smooth, waxy, eyes and teeth smeared - in a wedding group all
+# eight faces came out so. So SAM3 finds every face in the finished picture,
+# each is cut out FACE_PAD times its size, enlarged to FACE_EDIT and resampled
+# at FACE_DENOISE - the model redraws eyes, lashes, pores and teeth at the size
+# it draws best - then shrunk and feathered back in. Each crop is taken from
+# the picture as composited so far, so a face redrawn earlier is never pasted
+# over by its neighbour's crop. A face whose crop is already FACE_EDIT or more
+# was drawn at full size and is left alone.
+FACE_PAD = 2.0
+FACE_DENOISE = 0.45
+FACE_MIN = 16                 # px: a face smaller than this is texture, not a face
+FACE_PROMPT = (
+    "A close-up of one person's face from this photograph, in the same light, colour and "
+    "focus as the rest of it: %s The face is a real human face with natural proportions: "
+    "clear, detailed eyes looking the same way, with irises, lashes and natural "
+    "catchlights; natural skin texture with fine pores, faint lines and small "
+    "imperfections; individual strands of hair and eyebrow; natural lips and teeth.")
+
+
+SWAP_DENOISE = 0.3           # a swapped face is redrawn lightly: the likeness is the point
+FACE_OVAL = "studio_face_oval.png"
+
+
+def oval_png(size=256):
+    """A soft white oval on black as a greyscale PNG: the face and hair of a
+    head_square crop at full strength, fading out well inside the crop's
+    edge, so a neighbour's face near that edge is never blended over."""
+    rows = []
+    for y in range(size):
+        row = bytearray([0])                       # PNG filter: none
+        for x in range(size):
+            dx, dy = (x + 0.5) / size - 0.5, (y + 0.5) / size - 0.53
+            inner = (dx / 0.30) ** 2 + (dy / 0.36) ** 2
+            outer = (dx / 0.46) ** 2 + (dy / 0.47) ** 2
+            if inner <= 1:
+                v = 1.0
+            elif outer >= 1:
+                v = 0.0
+            else:                                  # 1 -> 0 between the two ovals
+                a, b = inner ** 0.5, outer ** 0.5
+                t = (a - 1) / max(a - b, 1e-6)
+                t = min(max(t, 0.0), 1.0)
+                v = 1 - t * t * (3 - 2 * t)
+            row.append(int(round(v * 255)))
+        rows.append(bytes(row))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+def redraw_faces(g, image, crops, plan, scene, seed, denoise, recipe):
+    """Into g: each crop of `image` enlarged to FACE_EDIT, resampled with
+    `plan`'s model (a split model with cfg 1) at `denoise`, shrunk and
+    blended back through the oval. `scene` describes the picture; `recipe`
+    is (steps, sampler, scheduler). Returns the link to the result."""
+    if not crops:
+        return image
+    res = post_multipart("/upload/image", {"overwrite": "true"}, FACE_OVAL, oval_png())
+    g["21"] = {"class_type": "LoadImage", "inputs": {"image": res.get("name", FACE_OVAL)}}
+    model, clip, vae = load_split(g, plan)
+    scene = scene.strip()
+    scene = scene if scene.endswith(".") else scene + "."
+    g["2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": FACE_PROMPT % scene, "clip": clip}}
+    g["3"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
+    steps, sampler, scheduler = recipe
+    last = image
+    for i, crop in enumerate(crops):
+        n, side = 100 + 20 * i, crop["width"]
+        g[str(n)] = {"class_type": "ImageCropV2", "inputs": {"image": last, "crop_region": crop}}
+        g[str(n + 1)] = {"class_type": "ImageScale", "inputs": {
+            "image": [str(n), 0], "upscale_method": "lanczos", "width": FACE_EDIT,
+            "height": FACE_EDIT, "crop": "disabled"}}
+        g[str(n + 2)] = {"class_type": "VAEEncode", "inputs": {"pixels": [str(n + 1), 0], "vae": vae}}
+        g[str(n + 3)] = {"class_type": "KSampler", "inputs": {
+            "seed": seed + i + 1, "steps": steps, "cfg": 1.0, "sampler_name": sampler,
+            "scheduler": scheduler, "denoise": denoise, "model": model,
+            "positive": ["2", 0], "negative": ["3", 0], "latent_image": [str(n + 2), 0]}}
+        g[str(n + 4)] = {"class_type": "VAEDecode", "inputs": {"samples": [str(n + 3), 0], "vae": vae}}
+        g[str(n + 5)] = {"class_type": "ImageScale", "inputs": {
+            "image": [str(n + 4), 0], "upscale_method": "lanczos", "width": side,
+            "height": side, "crop": "disabled"}}
+        # The redrawn face and hair in full, through the soft oval (oval_png).
+        g[str(n + 6)] = {"class_type": "ImageScale", "inputs": {
+            "image": ["21", 0], "upscale_method": "bilinear", "width": side,
+            "height": side, "crop": "disabled"}}
+        g[str(n + 7)] = {"class_type": "ImageToMask", "inputs": {
+            "image": [str(n + 6), 0], "channel": "red"}}
+        g[str(n + 8)] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": last, "source": [str(n + 5), 0], "x": crop["x"], "y": crop["y"],
+            "resize_source": False, "mask": [str(n + 7), 0]}}
+        last = [str(n + 8), 0]
+    return last
+
+
+def face_detail(g, plan, seed, a, header, notes):
+    """comfy_generate's picture with its faces redrawn (see FACE_PAD), in two
+    runs: the picture to a preview with SAM3's face boxes beside it, then the
+    crops redrawn and composited. Z-Image stays on the card between them."""
+    started = time.monotonic()
+    free, total = gpu_memory()
+    pixels = g["7"]["inputs"]["images"]
+    g["7"] = {"class_type": "PreviewImage", "inputs": {"images": pixels}}
+    g["30"] = {"class_type": "CheckpointLoaderSimple",
+               "inputs": {"ckpt_name": pick_first(list_models("checkpoints"), SAM3)}}
+    g["31"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "face:8", "clip": ["30", 1]}}
+    g["32"] = {"class_type": "SAM3_Detect", "inputs": {
+        "model": ["30", 0], "image": pixels, "conditioning": ["31", 0], "threshold": 0.3,
+        "refine_iterations": 0, "individual_masks": True}}
+    g["33"] = {"class_type": "PreviewAny", "inputs": {"source": ["32", 1]}}
+    g["34"] = {"class_type": "GetImageSize", "inputs": {"image": pixels}}
+    g["35"] = {"class_type": "PreviewAny", "inputs": {"source": ["34", 0]}}
+    g["36"] = {"class_type": "PreviewAny", "inputs": {"source": ["34", 1]}}
+    entry = wait_for(submit(g), a.get("timeout", DEFAULT_WAIT))
+    out = entry.get("outputs") or {}
+    previews = [f for f in (out.get("7") or {}).get("images", []) or []
+                if f.get("type") == "temp"]
+    if not previews:
+        res = collect("", entry)          # the render failed; ComfyUI says why
+        release(free)
+        return res
+
+    def text(node):
+        t = (out.get(node) or {}).get("text") or []
+        return json.loads(t[0]) if t else None
+
+    boxes = text("33") or []
+    boxes = boxes[0] if boxes and isinstance(boxes[0], list) else boxes
+    boxes = [(b["x"], b["y"], b["width"], b["height"]) for b in boxes
+             if max(b["width"], b["height"]) >= FACE_MIN]
+    width, height = int(text("35") or 0), int(text("36") or 0)
+    crops = [c for c in (head_square(b, width, height, a.get("face_pad", FACE_PAD))
+                         for b in boxes) if c["width"] < FACE_EDIT]
+    f = previews[0]
+    name = ("%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder")
+            else f["filename"]) + " [temp]"
+    g2 = {"20": {"class_type": "LoadImage", "inputs": {"image": name}}}
+    denoise = a.get("face_denoise", FACE_DENOISE)
+    k = g["5"]["inputs"]
+    last = redraw_faces(g2, ["20", 0], crops, plan, g["2"]["inputs"]["text"], seed, denoise,
+                        (k["steps"], k["sampler_name"], k["scheduler"]))
+    g2["7"] = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioAssistant"), "images": last}}
+    notes = list(notes)
+    if crops:
+        notes.append("face detail: %d face(s) redrawn at %d px, denoise %s"
+                     % (len(crops), FACE_EDIT, denoise))
+    elif boxes:
+        notes.append("face detail: faces already drawn at full size, left as they were")
+    return run(g2, dict(a, wait=True), header, notes, started=started, before=(free, total))
+
+
 def t_face_swap(a):
     """Put the people of one picture into another, face for face, as crop,
     edit and stitch: each face is cut out of the scene with room for the
@@ -1110,14 +1279,42 @@ def t_face_swap(a):
             "destination": last, "source": [str(n + 13), 0], "x": crop["x"], "y": crop["y"],
             "resize_source": False, "mask": [str(n + 12), 0]}}
         last = [str(n + 14), 0]
-    g["9"] = {"class_type": "SaveImage", "inputs": {
-        "filename_prefix": a.get("filename_prefix", "StudioFaceSwap"), "images": last}}
     header = ("model: %s%s\nseed: %d  steps: %s  cfg: %s\nfaces swapped: %d (left to right; "
               "%d found in the scene, %d in the faces picture)\n" % (
                   plan["label"], " + " + plan["lora"] if plan["lora"] else "", seed, steps,
                   cfg, len(pairs), len(targets), len(sources)))
     notes = [vram_note(free, total)] if vram_note(free, total) else []
-    return run(g, dict(a, wait=True), header, notes, started=started)
+    save = {"class_type": "SaveImage", "inputs": {
+        "filename_prefix": a.get("filename_prefix", "StudioFaceSwap"), "images": last}}
+    z = photo_finish() if a.get("face_detail", True) else None
+    small = [c for c in crops if c["width"] < FACE_EDIT]
+    if not (z and small):
+        g["9"] = save
+        return run(g, dict(a, wait=True), header, notes, started=started)
+
+    # 3. The polish: the edit model draws a face smoother and cleaner than the
+    # photograph around it, and the stitched head read as pasted on. Z-Image
+    # redraws each at SWAP_DENOISE - the photograph's grain and light, the
+    # likeness kept - as the face detail pass does for a new picture.
+    g["9"] = {"class_type": "PreviewImage", "inputs": {"images": last}}
+    entry = wait_for(submit(g), a.get("timeout", DEFAULT_WAIT))
+    previews = [f for f in (entry.get("outputs") or {}).get("9", {}).get("images", []) or []
+                if f.get("type") == "temp"]
+    if not previews:
+        release(free)
+        return result("The stitch failed: %s" % ("; ".join(status_messages(entry))
+                                                or "no picture came back"), error=True)
+    f = previews[0]
+    g3 = {"20": {"class_type": "LoadImage", "inputs": {"image": (
+        "%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder") else f["filename"])
+        + " [temp]"}}}
+    denoise = a.get("face_denoise", SWAP_DENOISE)
+    out = redraw_faces(g3, ["20", 0], small, z, "A photograph of people.", seed, denoise,
+                       (z["steps"], z["sampler"], z["scheduler"]))
+    g3["9"] = dict(save, inputs=dict(save["inputs"], images=out))
+    notes.append("face detail: %d face(s) redrawn with %s at denoise %s"
+                 % (len(small), z["label"].split(" (")[0], denoise))
+    return run(g3, dict(a, wait=True), header, notes, started=started, before=(free, total))
 
 
 def t_upscale(a):
@@ -1298,9 +1495,9 @@ TOOLS = [
     ("comfy_generate", t_generate,
      "Make pictures from a text prompt. With no model named it uses the most "
      "photographic one installed (Z-Image Turbo) with its own recipe, adds a realism "
-     "sentence to photographic prompts, and runs a hi-res detail pass that redraws "
-     "skin, fabric and texture at 1.5x the size - leave those defaults alone for the "
-     "most realistic result. init_image (a local path or an uploaded name) restyles a "
+     "sentence to photographic prompts, runs a hi-res detail pass that redraws "
+     "skin, fabric and texture at 1.5x the size, and redraws every face at full size - "
+     "leave those defaults alone for the most realistic result. init_image (a local path or an uploaded name) restyles a "
      "picture; to change something specific in a picture use comfy_edit_image. Blocks "
      "until done, saves the results on this workstation and returns their paths, the "
      "seed and the settings used.",
@@ -1318,6 +1515,11 @@ TOOLS = [
                            minimum=1, maximum=2.5),
          "hires_denoise": _n("Detail pass strength. Default 0.33; higher invents more "
                              "detail, lower keeps the draft.", minimum=0.1, maximum=0.6),
+         "face_detail": {"type": "boolean", "description": "Default true: every face in "
+                         "the finished picture is found and redrawn at full size, which turns "
+                         "small, waxy faces into real ones. false only for a quick draft."},
+         "face_denoise": _n("Face detail strength. Default %s; lower keeps the face closer "
+                            "to the first draw." % FACE_DENOISE, minimum=0.2, maximum=0.7),
          "checkpoint": _s("All-in-one checkpoint filename from comfy_list_models. Default: "
                           "a split model with a known recipe, else the first checkpoint."),
          "diffusion_model": _s("Split model: filename from comfy_list_models "
@@ -1403,6 +1605,12 @@ TOOLS = [
                            "own hair' or 'no glasses'."),
          "padding": _n("How much of the head around each face is redrawn, as a multiple "
                        "of the face's size. Default 2.4.", minimum=1.5, maximum=4),
+         "face_detail": {"type": "boolean", "description": "Default true: Z-Image redraws "
+                         "each new face lightly so it takes the photograph's grain and light "
+                         "instead of looking pasted on. false keeps the edit model's face."},
+         "face_denoise": _n("Face detail strength. Default %s; higher blends better and "
+                            "strays further from the likeness." % SWAP_DENOISE,
+                            minimum=0.1, maximum=0.5),
          "fast": {"type": "boolean", "description": "Default true: 4 Lightning steps. "
                   "false: 20 full steps, much slower, sometimes a closer likeness."},
          "steps": _i("Override the step count.", minimum=1, maximum=60),
