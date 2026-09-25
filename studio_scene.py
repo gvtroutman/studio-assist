@@ -446,6 +446,20 @@ CLOTH = [
 CLOTH_DEFAULT = {"top": "#8d97a3", "bottom": "#4c5566", "outerwear": "#5e564d",
                  "footwear": "#34302d", "hat": "#4a4540", "glasses": "#2e2a28",
                  "sunglasses": "#1c1c20", "goggles": "#b9c7cf"}
+# What the Shoes slot names, by shape: first match wins, anything else is a
+# plain shoe (loafers, oxfords, brogues) on a thin dark sole.
+SHOES = [
+    ("heels", ("heels", "high heels", "heel", "stilettos", "stiletto", "pumps",
+               "court shoes", "wedges", "wedge heels", "platform heels", "slingbacks")),
+    ("boots", ("boot", "boots", "wellies", "wellingtons", "work boots")),
+    ("sandals", ("sandals", "sandal", "flip-flops", "flip flops", "slides", "espadrilles",
+                 "jandals", "thongs")),
+    ("sneakers", ("sneakers", "sneaker", "trainers", "running shoes", "tennis shoes",
+                  "high-tops", "high tops", "basketball shoes", "kicks")),
+]
+SOLE_LIGHT = "#dedcd6"           # a sneaker's sole, unless the words say otherwise
+HEEL = 0.065                     # m a heel lifts the heel of the foot
+
 # From the Accessories slot, on the head: (kind, the words that name it),
 # first match wins, so "hard hat" is not read as a plain "hat". The kinds
 # are shapes (`HAT_SHAPES`); the words say the rest.
@@ -579,10 +593,14 @@ def outfit(look=None):
             hems.append((_hem(outer, 0.6), rgb, True))
             regions["hips"] = rgb
     feet = said["footwear"]
+    shoes = None
     if feet and not _said(feet, "barefoot", "bare feet", "none"):
         rgb = cloth_colour(feet, "footwear")
-        regions["foot"] = rgb
-        if _said(feet, "boot", "boots", "wellies", "wellingtons"):
+        kind = next((k for k, words in SHOES if _said(feet, *words)), "shoes")
+        shoes = (kind, rgb)
+        if kind != "sandals":             # a sandal shows the foot
+            regions["foot"] = rgb
+        if kind == "boots":
             boots = (0.09 if _said(feet, "ankle") else 0.24, rgb)
     hat = glasses = None
     for item in (str(look.get("accessories") or "").lower().split(",")):
@@ -597,7 +615,7 @@ def outfit(look=None):
         if kind and not glasses:
             glasses = (kind, cloth_colour(item, kind))
     return {"regions": regions, "hems": hems, "boots": boots, "hat": hat,
-            "glasses": glasses, "hair": hairdo(look)}
+            "glasses": glasses, "hair": hairdo(look), "shoes": shoes}
 
 
 # Hair, from the look's Hair section: the colour's words, and the style's
@@ -660,6 +678,32 @@ def hairdo(look=None):
     if _said(style, "locs", "dreadlocks", "dreads") and fall is None:
         fall = -0.25
     return {"rgb": rgb, "cap": cap, "fall": fall, "volume": volume, "tie": tie}
+
+
+def _shoe(shoes, at):
+    """What a shoe adds under and over the foot, in the ankle's frame (the
+    sole of the foot is at y -0.08, heel z -0.1 to toe 0.2): [(rgb, faces)].
+    Everything stands on its floor, so a sole or a heel lifts the person
+    by its height, as it does."""
+    kind, rgb = shoes
+    dark = tuple(int(c * 0.5) for c in rgb)
+    slab = lambda lo, hi: outward([[at(p) for p in f] for f in box(lo, hi)])   # noqa: E731
+    if kind == "heels":
+        # The foot is tipped onto its toes (`toe_drop`): a thin sole under
+        # the ball of the foot, and the heel post to the floor it stands on.
+        toe = -0.08 - HEEL + 0.01          # the underside of the tipped toe
+        floor = toe - 0.012
+        return [(rgb, slab((-0.045, floor, 0.045), (0.045, toe + 0.002, 0.135))),
+                (rgb, slab((-0.013, floor, -0.06), (0.013, -0.075, -0.034)))]
+    if kind == "sandals":
+        return [(rgb, slab((-0.05, -0.095, -0.065), (0.05, -0.078, 0.2))),
+                (rgb, slab((-0.049, -0.085, 0.05), (0.049, -0.02, 0.075)))]   # the strap
+    if kind == "sneakers":
+        sole = hex_rgb(SOLE_LIGHT) if sum(rgb) < 600 else (200, 198, 192)
+        return [(sole, slab((-0.05, -0.105, -0.068), (0.05, -0.076, 0.203)))]
+    if kind == "boots":
+        return [(dark, slab((-0.05, -0.1, -0.066), (0.05, -0.076, 0.2)))]
+    return [(dark, slab((-0.047, -0.094, -0.062), (0.047, -0.076, 0.196)))]
 
 
 def hairline(x, z):
@@ -726,6 +770,8 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     skull = [[at("head", p) for p in f]
              for f in ellipsoid((0, 0.11, 0.01), IDENTITY, (0.085, 0.115, 0.1))
              if not (scalp and centroid(f)[1] > hairline(centroid(f)[0], centroid(f)[2] - 0.01))]
+    shoes = dressed.get("shoes")
+    toe_drop = HEEL if shoes and shoes[0] == "heels" else 0.0     # up on its toes
     # (part, region, faces); a region is what clothes cover, or the rgb of a
     # piece that is only clothes (a hem, a boot shaft).
     out = [
@@ -801,8 +847,15 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
         arms = [((0.082, hi - 0.008, 0.0), (0.09, hi - 0.002, 0.108)),
                 ((-0.09, hi - 0.008, 0.0), (-0.082, hi - 0.002, 0.108))]
         out += [("head", rgb, head_box(a, b)) for a, b in lenses + arms]
+    shaft = dressed.get("boots") if "shin" not in wear else None   # trousers hide it
     for side in ("l", "r"):
         hand, foot = "hand_" + side, "foot_" + side
+        # A boot's shaft is the shin's lower part, not a tube over it: the
+        # shin's long faces sort in front of the shaft's and show through.
+        shin_end = P("ankle_" + side)
+        if shaft:
+            up = norm(sub(P("knee_" + side), P("ankle_" + side)))
+            shin_end = add(P("ankle_" + side), mul(up, shaft[0]))
         out += [
             (hand, "upper_arm", prism(P("shoulder_" + side), P("elbow_" + side),
                                       X("shoulder_" + side), r((0.052, 0.052), upper),
@@ -813,21 +866,21 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                  X("wrist_" + side), (0.045, 0.022), (0.04, 0.018), 6)),
             (foot, "thigh", prism(P("hip_" + side), P("knee_" + side), X("hip_" + side),
                                   r((0.078, 0.078), thigh), r((0.056, 0.056), shin))),
-            (foot, "shin", prism(P("knee_" + side), P("ankle_" + side), X("knee_" + side),
+            (foot, "shin", prism(P("knee_" + side), shin_end, X("knee_" + side),
                                  r((0.052, 0.052), shin), r((0.04, 0.04), shin))),
             (foot, "foot", prism(at("ankle_" + side, (0, -0.045, -0.05)),
-                                 at("ankle_" + side, (0, -0.045, 0.19)), X("ankle_" + side),
+                                 at("ankle_" + side, (0, -0.045 - toe_drop, 0.19 - toe_drop)),
+                                 X("ankle_" + side),
                                  r((0.045, 0.035), k("foot", 1)),
                                  r((0.042, 0.025), k("foot", 1)), 6)),
         ]
-        if dressed.get("boots"):
-            tall, rgb = dressed["boots"]
-            # The shaft: from the ankle up the shin, over it.
-            up = norm(sub(P("knee_" + side), P("ankle_" + side)))
-            out.append((foot, rgb, prism(at("ankle_" + side, (0, -0.02, 0)),
-                                         add(P("ankle_" + side), mul(up, tall)),
-                                         X("knee_" + side), r((0.054, 0.054), shin),
-                                         r((0.056, 0.056), shin))))
+        if shoes:
+            out += [(foot, rgb, faces) for rgb, faces in _shoe(
+                shoes, lambda v, s=side: at("ankle_" + s, v))]
+        if shaft:
+            out.append((foot, shaft[1], prism(at("ankle_" + side, (0, -0.02, 0)), shin_end,
+                                              X("knee_" + side), r((0.05, 0.05), shin),
+                                              r((0.052, 0.052), shin))))
     # Hems: a skirt or a coat below the waist, a flared tube from the hips to
     # a line across both legs `reach` of the way down (1 the knee, 2 the
     # ankle), so it follows a step or a seat.

@@ -174,6 +174,31 @@ class TestBodyAndClothes(unittest.TestCase):
         self.assertGreater(added, 0)
         self.assertEqual(count(hatted, "head") - count(plain, "head"), added)
 
+    def test_each_kind_of_shoe_has_its_shape(self):
+        kind = lambda words: sc.outfit({"footwear": words})["shoes"][0]   # noqa: E731
+        self.assertEqual(kind("black high heels"), "heels")
+        self.assertEqual(kind("white sneakers"), "sneakers")
+        self.assertEqual(kind("running shoes"), "sneakers")
+        self.assertEqual(kind("ankle boots"), "boots")
+        self.assertEqual(kind("sandals"), "sandals")
+        self.assertEqual(kind("loafers"), "shoes")
+        self.assertIsNone(sc.outfit({"footwear": "barefoot"})["shoes"])
+        # A sandal shows the foot; a shoe covers it.
+        self.assertNotIn("foot", sc.outfit({"footwear": "brown sandals"})["regions"])
+        self.assertIn("foot", sc.outfit({"footwear": "loafers"})["regions"])
+        # A sole lifts the person, a heel more; they still stand on the floor.
+        tall = lambda words: sc.bounds(self.person(footwear=words))[1][1]  # noqa: E731
+        self.assertGreater(tall("loafers"), tall(""))
+        self.assertGreater(tall("high heels"), tall("sneakers") + 0.03)
+        self.assertAlmostEqual(sc.bounds(self.person(footwear="heels"))[0][1], 0.0, places=9)
+        # A boot's shaft replaces the shin's lower part, and trousers hide it.
+        count = lambda o: len(sc.painted_pieces(o))                       # noqa: E731
+        booted = self.person(footwear="leather boots", bottom="shorts")
+        shod = self.person(footwear="loafers", bottom="shorts")
+        self.assertEqual(count(booted), count(shod) + 2)
+        self.assertEqual(count(self.person(footwear="leather boots", bottom="jeans")),
+                         count(self.person(footwear="loafers", bottom="jeans")))
+
     def test_hair_comes_from_the_hair_section(self):
         self.assertIsNone(sc.hairdo({}))
         self.assertIsNone(sc.hairdo({"hair": "black", "hair_style": "bald"}))
