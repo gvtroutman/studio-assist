@@ -23,10 +23,22 @@ The mouse, in the viewport:
 - left on empty floor or sky: orbit the camera;
 - right (or middle): pan the camera; the wheel: in and out.
 Keys, with the viewport focused: M, R, S for the tools, Delete.
+
+**Floor and walls**, the second row of the list, dresses the room: a few words
+for the floor or the walls, and Make sends them to the Image Studio as a text
+to image job (`studio_scene.texture_settings`); the finished picture comes
+back onto that surface (`ImageStudio._job_changed` -> `texture_done`).
+Picture… puts a PNG from disk there instead. The viewport draws pictured
+surfaces in their mean colour at once and the pictures a moment later, baked
+at half size off the drag (`_bake`), since a per-pixel fill in Python is too
+slow for every mouse move.
 """
 
+import base64
 import copy
+import json
 import os
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -37,6 +49,9 @@ TOOLS = [("move", "Move", "m"), ("rotate", "Rotate", "r"), ("scale", "Scale", "s
 GRID = "#9c978f"
 GRID_AXIS = "#b1aca4"
 SCENE_ROW = "Scene and camera"
+ROOM_ROW = "Floor and walls"
+ROOM = "\0room"              # the room's row in the list; never an object's id
+BAKE = 2                      # the viewport's pictures are baked at 1/BAKE size
 REACH = 20                    # m either way an object can be placed
 
 
@@ -59,6 +74,10 @@ class SceneBuilder:
         self.vars = {}                # key -> (DoubleVar, read) for the inspector's sliders
         self.tool_pills = {}
         self.frame_rect = (0, 0, 1, 1, 1.0)      # ox, oy, w, h, scale on the canvas
+        self.making = {}              # surface -> words sent, while its picture is made
+        self.taken = set()            # ids of the finished picture jobs already used
+        self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
+        self.bake_after = None
 
         win = self.win = tk.Toplevel(host)
         win.title("Scene Builder")
@@ -217,10 +236,14 @@ class SceneBuilder:
             self._inspect()
         self.draw()
 
+    def rows(self):
+        return [None, ROOM] + [x["id"] for x in self.scene["objects"]]
+
     def _list(self):
         self.lb.delete(0, "end")
         self.lb.insert("end", SCENE_ROW)
-        rows = [None] + [x["id"] for x in self.scene["objects"]]
+        self.lb.insert("end", ROOM_ROW)
+        rows = self.rows()
         for x in self.scene["objects"]:
             self.lb.insert("end", "   " + (x["name"] or sc.ASSET[x["asset"]]["label"]))
         at = rows.index(self.sel) if self.sel in rows else 0
@@ -233,7 +256,7 @@ class SceneBuilder:
         sel = self.lb.curselection()
         if not sel:
             return
-        rows = [None] + [x["id"] for x in self.scene["objects"]]
+        rows = self.rows()
         self.select(rows[sel[0]] if sel[0] < len(rows) else None)
 
     # ============================================================ inspector
@@ -292,7 +315,9 @@ class SceneBuilder:
     def _inspect(self):
         self._clear()
         obj = self.obj()
-        if obj is None:
+        if self.sel == ROOM:
+            self._inspect_room()
+        elif obj is None:
             self._inspect_scene()
         else:
             self._inspect_object(obj)
@@ -346,6 +371,65 @@ class SceneBuilder:
                 "composition.", "faint", self.host.f_small,
                 wraplength=o.px(310)).pack(side="top", fill="x")
         self._words_box()
+
+    def _inspect_room(self):
+        o, p, room = self.owner, self.panel, self.scene["room"]
+
+        def put(key):
+            def write(x):
+                room[key] = x
+            return write
+        for key, label, _ in sc.SURFACES:
+            o.cap(p, label)
+            if key == "wall":
+                o.choice(p, [("off", "No walls"), ("on", "Four walls")],
+                         "on" if room["walls"] else "off", self._set_walls).pack(
+                    side="top", anchor="w", pady=(0, o.px(4)))
+                if not room["walls"]:
+                    continue
+                for dim, what in (("width", "Width (m)"), ("depth", "Depth (m)"),
+                                  ("height", "Height (m)")):
+                    self._slider(p, dim, what, lambda dim=dim: room[dim], put(dim),
+                                 *sc.ROOM_LIMITS[dim], 0.25)
+            self._surface(key)
+        o.label(p, "Write what the surface is - \"polished concrete with worn yellow "
+                "safety lines\", \"whitewashed brick\" - and Make: the Image Studio "
+                "makes a flat, repeating picture of it with the model chosen below, and "
+                "it is laid on the surface. The words also go into the prompt.",
+                "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
+        self._words_box()
+
+    def _surface(self, key):
+        """One surface's words, its Make / Picture… / Plain, what it wears now
+        and how big one copy of the picture is."""
+        o, p = self.owner, self.panel
+        face = self.scene["room"][key]
+
+        def said(v):
+            face["prompt"] = v
+            self.dirty = True
+            self._words()
+        self._text(p, face["prompt"], said, height=2)
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        o.button(row, "Make " + sc.SURFACE_NAMES[key].lower(),
+                 lambda: self.make_texture(key), kind="accent").pack(side="left")
+        o.button(row, "Picture…", lambda: self.choose_texture(key)).pack(
+            side="left", padx=(o.px(4), 0))
+        o.button(row, "Plain", lambda: self.set_texture(key, ""), kind="ghost").pack(
+            side="left", padx=(o.px(4), 0))
+        if key in self.making:
+            now = "Making it in the Image Studio…"
+        elif face["image"]:
+            now = "Wearing %s" % os.path.basename(face["image"])
+            if sc.texture(face["image"]) is None:
+                now += " - missing or unreadable, so drawn plain"
+        else:
+            now = "Plain."
+        o.label(p, now, "muted", self.host.f_small, wraplength=o.px(310)).pack(
+            side="top", fill="x", pady=(o.px(2), o.px(2)))
+        self._slider(p, key + "_size", "Pattern size (m)", lambda: face["size"],
+                     lambda x: face.__setitem__("size", x), 0.25, 10, 0.25)
 
     def _inspect_object(self, obj):
         o, p = self.owner, self.panel
@@ -477,6 +561,10 @@ class SceneBuilder:
             pass
 
     # -------------------------------------------------------------- setters
+    def _set_walls(self, on):
+        self.scene["room"]["walls"] = on == "on"
+        self._inspect()
+        self.changed()
     def _set_frame(self, key):
         self.scene["frame"] = key
         self.changed()
@@ -552,26 +640,68 @@ class SceneBuilder:
         C = self.host.C
         polys = sc.render(self.scene, w, h)
         at = lambda pts: [v for x, y in pts for v in (ox + x * k, oy + y * k)]  # noqa
+        room = [p for p in polys if p.owner is None]
+        # The room flat first, everywhere (outside the frame too); then, in
+        # the frame, its pictures once baked for this view.
+        for poly in room:
+            c.create_polygon(at(poly.pts), fill=rgb_hex(poly.rgb), outline="")
+        if any(p.tex for p in room):
+            img = self._backdrop(w, h, k)
+            if img is not None:
+                c.create_image(ox, oy, image=img, anchor="nw")
+        for a, b, axis in sc.grid_lines(self.scene, w, h):
+            c.create_line(*at((a, b)), fill=GRID_AXIS if axis else GRID)
         for poly in polys:
             if poly.owner is None:
-                c.create_polygon(at(poly.pts), fill=rgb_hex(poly.rgb), outline="")
-                for a, b, axis in sc.grid_lines(self.scene, w, h):
-                    c.create_line(*at((a, b)), fill=GRID_AXIS if axis else GRID)
                 continue
             fill = rgb_hex(poly.rgb)
             chosen = poly.owner == self.sel
             c.create_polygon(at(poly.pts), fill=fill,
                              outline=C["accent"] if chosen else fill,
                              tags=("o:" + poly.owner, "p:" + str(poly.part)))
-        if not any(p.owner is None for p in polys):
-            for a, b, axis in sc.grid_lines(self.scene, w, h):
-                c.create_line(*at((a, b)), fill=GRID_AXIS if axis else GRID)
         x0, y0, x1, y1 = ox, oy, ox + w * k, oy + h * k
         for box in ((0, 0, cw, y0), (0, y1, cw, ch), (0, y0, x0, y1), (x1, y0, cw, y1)):
             c.create_rectangle(*box, fill=C["bg"], outline="", stipple="gray50")
         c.create_rectangle(x0, y0, x1, y1, outline=C["accent"], width=2)
         c.create_text(x0 + 6, y0 - 4, anchor="sw", fill=C["muted"], font=self.host.f_small,
                       text="Frame %d x %d · %dmm" % (w, h, round(self.scene["camera"]["lens"])))
+
+    def _backdrop_key(self, w, h, k):
+        room = self.scene["room"]
+        stamps = []
+        for key, _, _ in sc.SURFACES:
+            try:
+                stamps.append(os.path.getmtime(room[key]["image"]))
+            except OSError:
+                stamps.append(None)
+        return json.dumps([w, h, round(k, 5), self.scene["camera"], room, stamps],
+                          sort_keys=True)
+
+    def _backdrop(self, w, h, k):
+        """The room's pictures for this exact view, or None while they bake
+        (the flat colours stand in). A new view asks for a bake a moment after
+        the last change, so a drag is never held up by one."""
+        key = self._backdrop_key(w, h, k)
+        if self.backdrop[0] == key:
+            return self.backdrop[1]
+        if self.bake_after is not None:
+            self.win.after_cancel(self.bake_after)
+        self.bake_after = self.win.after(150, self._bake)
+        return None
+
+    def _bake(self):
+        self.bake_after = None
+        try:
+            ox, oy, w, h, k = self._fit()
+            bw, bh = max(8, int(round(w * k / BAKE))), max(8, int(round(h * k / BAKE)))
+            data = sc.backdrop_png(self.scene, bw, bh)
+            img = tk.PhotoImage(master=self.win, data=base64.b64encode(data).decode("ascii"))
+            if BAKE > 1:
+                img = img.zoom(BAKE)
+        except tk.TclError:
+            return
+        self.backdrop = (self._backdrop_key(w, h, k), img)
+        self.draw()
 
     def camera(self):
         w, h = sc.frame_size(self.scene)
@@ -697,7 +827,7 @@ class SceneBuilder:
     # ================================================================ files
     def _ask_save(self):
         """True to go on (saved, or thrown away), False to stay."""
-        if not self.dirty or not self.scene["objects"]:
+        if not self.dirty or not self.has_content():
             return True
         answer = messagebox.askyesnocancel(
             "Scene Builder", "Save the changes to this scene first?", parent=self.win)
@@ -709,6 +839,7 @@ class SceneBuilder:
         if not self._ask_save():
             return
         self.scene = sc.new_scene()
+        self.making = {}
         self.path, self.dirty = None, False
         self.select(None)
         self._list()
@@ -733,6 +864,7 @@ class SceneBuilder:
             return False
         self.scene, self.path, self.dirty = scene, path, False
         self.sel = None
+        self.making = {}
         self._list()
         self._inspect()
         self.draw()
@@ -765,7 +897,7 @@ class SceneBuilder:
     def close(self, final=False):
         """Close the window, asking first about unsaved changes. `final` is
         the Image Studio going away: save or not, but the window goes."""
-        if final and self.dirty and self.scene["objects"]:
+        if final and self.dirty and self.has_content():
             if messagebox.askyesno("Scene Builder", "Save the changes to this scene "
                                    "before it closes?", parent=self.win):
                 self.save()
@@ -774,6 +906,99 @@ class SceneBuilder:
         self.win.destroy()
         if self.owner.scene_builder is self:
             self.owner.scene_builder = None
+
+    def has_content(self):
+        """Anything worth saving or generating from: an object, or a room
+        that is more than the plain floor."""
+        return bool(self.scene["objects"]) or self.scene["room"] != sc.new_room()
+
+    # ============================================================ textures
+    def make_texture(self, key):
+        """Send the surface's words to the Image Studio as text to image.
+        The picture comes back through `texture_done`."""
+        face = self.scene["room"][key]
+        name = sc.SURFACE_NAMES[key].lower()
+        if not face["prompt"].strip():
+            self.status("Write what the %s is first, then Make." % name, "err")
+            return False
+        if key == "wall" and not self.scene["room"]["walls"]:
+            self.scene["room"]["walls"] = True
+            self.changed()
+        o = self.owner
+        base = sc.texture_settings(self.scene, key, o.settings["model"],
+                                   o.settings.get("backend") or "auto")
+        if not o.generate(base=base):
+            self.status(o.note.cget("text") or "Not sent.", "err")
+            return False
+        self.making[key] = face["prompt"]
+        self._inspect()
+        self.status("Making the %s in the Image Studio; it goes on the %s when it is done."
+                    % (name, name), "muted")
+        return True
+
+    def texture_done(self, job):
+        """From the Image Studio, on the UI thread: a surface's job finished.
+        The picture is read and shrunk off the UI thread (a full-size PNG takes
+        a few seconds in pure Python), then put on the surface."""
+        key = job.settings.get("scene_texture")
+        if key not in self.making or job.id in self.taken:
+            return                     # a job for a scene no longer open, or seen
+        self.taken.add(job.id)
+        name = sc.SURFACE_NAMES.get(key, key).lower()
+        if job.status != "complete" or not job.outputs:
+            self.making.pop(key, None)
+            self._inspect()
+            self.status("The %s could not be made: %s" % (name, job.detail or job.status),
+                        "err")
+            return
+        self._import(key, job.outputs[0])
+
+    def choose_texture(self, key):
+        path = filedialog.askopenfilename(parent=self.win, title="A picture for the %s"
+                                          % sc.SURFACE_NAMES[key].lower(),
+                                          filetypes=[("PNG pictures", "*.png"),
+                                                     ("All files", "*.*")])
+        if path:
+            if key == "wall":
+                self.scene["room"]["walls"] = True
+            self.making[key] = ""
+            self._import(key, path)
+
+    def _import(self, key, src):
+        box = {}
+
+        def work():
+            try:
+                box["path"] = sc.import_texture(src)
+            except (OSError, ValueError) as e:
+                box["error"] = e
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+
+        def wait():
+            if worker.is_alive():
+                self.win.after(100, wait)
+                return
+            if key not in self.making:
+                return
+            self.making.pop(key, None)
+            if "error" in box:
+                self._inspect()
+                self.status("Could not use %s: %s" % (os.path.basename(src), box["error"]),
+                            "err")
+            else:
+                self.set_texture(key, box["path"])
+        self.win.after(100, wait)
+
+    def set_texture(self, key, path):
+        self.making.pop(key, None)
+        self.scene["room"][key]["image"] = path
+        if self.sel == ROOM:
+            self._inspect()
+        self.changed()
+        name = sc.SURFACE_NAMES[key]
+        self.status("%s now wears %s." % (name, os.path.basename(path)) if path else
+                    "%s is plain again." % name, "ok")
 
     # ============================================================= generate
     def _models(self):
@@ -812,8 +1037,9 @@ class SceneBuilder:
     def check(self):
         """-> the reason Generate would not use the frame, or ''."""
         mid = self.owner.settings["model"]
-        if not self.scene["objects"]:
-            return "Add a person or a prop first: the frame is what the picture is made from."
+        if not self.has_content():
+            return ("Add a person, a prop, walls or a floor first: the frame is what the "
+                    "picture is made from.")
         if not self.takes_source(mid):
             model = self.owner.studio.lib.get("models", mid)
             able = [m["label"] for m in self.owner.studio.lib.all("models")
