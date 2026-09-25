@@ -87,6 +87,154 @@ def photo_at(path, side, master):
     return img.subsample(b) if b > 1 else img
 
 
+class CameraAim:
+    """The Camera row's two diagrams. From above, the camera is dragged round
+    the person: which side of them it sees. From the side, it is dragged up
+    and down (how high it is) and in and out (how much of them is in the
+    frame). Both snap to studio_imagegen's VIEW_* steps. Not set until first
+    touched, since then the model frames the picture itself; `get()` is
+    settings["view"]."""
+    W, H = 380, 170           # before the display's scale
+    SPLIT = 168               # the side view starts here
+    TOP = (84, 92, 60)        # the view from above: centre x, y and the orbit's radius
+    # The view from the side: the person faces right at FIG_X, head at the top
+    # of FIG, feet at the bottom; the camera's row is its height, its
+    # distance from the person its shot.
+    FIG_X = SPLIT + 30
+    FIG = {"top": 48, "eye": 57, "neck": 66, "hip": 106, "knee": 133, "foot": 160}
+    ROWS = {"overhead": 12, "high": 32, "eye": 57, "low": 112, "ground": 156}
+    REACH = {"face": 42, "head": 66, "waist": 90, "knees": 114, "full": 138, "wide": 162}
+    SPAN = {"face": (47, 68), "head": (44, 82), "waist": (42, 110), "knees": (41, 138),
+            "full": (40, 164), "wide": (34, 168)}
+
+    def __init__(self, owner, parent, on_change):
+        self.o, self.on_change = owner, on_change
+        self.view = None
+        self.k = owner.px(100) / 100.0
+        self.cv = tk.Canvas(parent, width=int(self.W * self.k), height=int(self.H * self.k),
+                            highlightthickness=0, bd=0, cursor="hand2")
+        owner.skin(self.cv, bg="card")
+        self.cv.bind("<Button-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._drag)
+        self.dragging = None
+        owner.host._repaint_on_theme(self.cv, self.draw)
+        self.draw()
+
+    def get(self):
+        return dict(self.view) if self.view else None
+
+    def set(self, view):
+        self.view = ig.clean_view(view)
+        self.draw()
+
+    # ---------------------------------------------------------------- input
+    def _press(self, ev):
+        x = ev.x / self.k
+        self.dragging = "top" if x < self.SPLIT else "side"
+        self._drag(ev)
+
+    def _drag(self, ev):
+        x, y = ev.x / self.k, ev.y / self.k
+        v = dict(self.view or ig.VIEW_DEFAULT)
+        if self.dragging == "top":
+            cx, cy, _ = self.TOP
+            if math.hypot(x - cx, y - cy) < 6:
+                return
+            # 0 is in front (below the person), toward their left is toward +x
+            v["turn"] = math.degrees(math.atan2(x - cx, y - cy))
+        elif self.dragging == "side":
+            d = x - self.FIG_X
+            v["shot"] = min(self.REACH, key=lambda s: abs(self.REACH[s] - d))
+            v["height"] = min(self.ROWS, key=lambda h: abs(self.ROWS[h] - y))
+        else:
+            return
+        v = ig.clean_view(v)
+        if v != self.view:
+            self.view = v
+            self.draw()
+            self.on_change()
+
+    # ------------------------------------------------------------- drawing
+    def draw(self):
+        C, k, cv = self.o.host.C, self.k, self.cv
+        cv.delete("all")
+        on = self.view is not None
+        v = self.view or ig.VIEW_DEFAULT
+        ink, cam = C["muted"], C["accent"] if on else C["faint"]
+        font = self.o.host.f_small
+
+        def P(*xy):
+            return [n * k for n in xy]
+
+        cv.create_line(*P(self.SPLIT, 8, self.SPLIT, self.H - 8), fill=C["border"])
+        cv.create_text(*P(8, 8), text="FROM ABOVE", anchor="nw", fill=C["faint"], font=font)
+        cv.create_text(*P(self.SPLIT + 8, 8), text="FROM THE SIDE", anchor="nw",
+                       fill=C["faint"], font=font)
+
+        # From above: the orbit, the person (shoulders, head, nose toward the
+        # front), the camera on the orbit looking in.
+        cx, cy, r = self.TOP
+        cv.create_oval(*P(cx - r, cy - r, cx + r, cy + r), outline=C["border"], dash=(2, 3))
+        cv.create_text(*P(cx + 12, cy + r + 3), text="front", anchor="w", fill=C["faint"],
+                       font=font)
+        cv.create_oval(*P(cx - 22, cy - 7, cx + 22, cy + 7), fill=ink, outline=ink)
+        cv.create_oval(*P(cx - 27, cy - 4, cx - 19, cy + 4), fill=ink, outline=ink)
+        cv.create_oval(*P(cx + 19, cy - 4, cx + 27, cy + 4), fill=ink, outline=ink)
+        cv.create_oval(*P(cx - 7, cy - 7, cx + 7, cy + 7), fill=C["card"], outline=ink,
+                       width=2 * k)
+        cv.create_polygon(*P(cx - 4, cy + 6, cx + 4, cy + 6, cx, cy + 13), fill=ink)
+        a = math.radians(v["turn"])
+        px, py = cx + r * math.sin(a), cy + r * math.cos(a)
+        self._frustum(px, py, cx, cy, 14, cam)
+        self._camera(px, py, cx - px, cy - py, cam)
+
+        # From the side: the person in profile, facing right; what is in the
+        # frame marked beside their back; the camera where it was put.
+        F, fx = self.FIG, self.FIG_X
+        top, bot = self.SPAN[v["shot"]]
+        cv.create_line(*P(fx - 16, top, fx - 16, bot), fill=cam, width=3 * k)
+        cv.create_line(*P(fx - 20, top, fx - 12, top), fill=cam, width=2 * k)
+        cv.create_line(*P(fx - 20, bot, fx - 12, bot), fill=cam, width=2 * k)
+        cv.create_oval(*P(fx - 8, F["top"], fx + 8, F["top"] + 16), outline=ink,
+                       width=2 * k)
+        cv.create_line(*P(fx + 7, F["eye"] - 1, fx + 11, F["eye"] + 2, fx + 7, F["eye"] + 4),
+                       fill=ink, width=2 * k)
+        cv.create_line(*P(fx, F["top"] + 16, fx, F["hip"]), fill=ink, width=2 * k)
+        cv.create_line(*P(fx, F["neck"] + 4, fx + 5, F["hip"] - 14, fx + 3, F["hip"] + 4),
+                       fill=ink, width=2 * k)
+        cv.create_line(*P(fx, F["hip"], fx + 2, F["knee"], fx, F["foot"], fx + 9, F["foot"]),
+                       fill=ink, width=2 * k)
+        cv.create_line(*P(self.SPLIT + 6, F["foot"] + 1, self.W - 6, F["foot"] + 1),
+                       fill=C["border"])
+        sx, sy = fx + self.REACH[v["shot"]], self.ROWS[v["height"]]
+        self._frustum(sx, sy, fx + 6, (top + bot) / 2, (bot - top) / 2, cam, True)
+        self._camera(sx, sy, fx + 6 - sx, (top + bot) / 2 - sy, cam)
+
+    def _frustum(self, x, y, tx, ty, half, colour, upright=False):
+        """Two dashed lines from the lens to either edge of what it sees: `half`
+        either side of (tx, ty), square to the line of sight, or straight up
+        and down when `upright` (the side view frames a stretch of the body)."""
+        d = math.hypot(tx - x, ty - y) or 1
+        nx, ny = (0, 1) if upright else (-(ty - y) / d, (tx - x) / d)
+        for s in (-1, 1):
+            self.cv.create_line(x * self.k, y * self.k, (tx + s * nx * half) * self.k,
+                                (ty + s * ny * half) * self.k, fill=colour, dash=(3, 3))
+
+    def _camera(self, x, y, dx, dy, colour):
+        """A camera at (x, y) whose lens points along (dx, dy)."""
+        k, d = self.k, math.hypot(dx, dy) or 1
+        ux, uy = dx / d, dy / d                      # forward
+        vx, vy = -uy, ux                             # across
+
+        def at(f, s):
+            return [(x + ux * f + vx * s) * k, (y + uy * f + vy * s) * k]
+
+        body = at(-11, -6) + at(-11, 6) + at(1, 6) + at(1, -6)
+        lens = at(1, -3) + at(1, 3) + at(7, 5) + at(7, -5)
+        self.cv.create_polygon(*body, fill=colour, outline=colour)
+        self.cv.create_polygon(*lens, fill=colour, outline=colour)
+
+
 class ImageStudio:
     def __init__(self, host, session):
         self.host, self.s = host, session
@@ -353,11 +501,19 @@ class ImageStudio:
                    wraplength=self.px(380)).pack(side="top", fill="x", **pad)
 
         self.cap(f, "Camera").pack(**pad)
+        self.aim = CameraAim(self, f, self._aimed)
+        self.aim.cv.pack(side="top", anchor="w", **pad)
+        arow = self.frame(f)
+        arow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.aim_note = self.label(arow, "", "muted", self.host.f_small)
+        self.aim_note.pack(side="left", fill="x", expand=True)
+        self.aim_clear = self.button(arow, "Clear", lambda: self._aimed(None), kind="ghost")
+        self._aimed(recheck=False)
         self.text["camera"] = tk.StringVar()
         e = self.host._entry(f, self.text["camera"])
         e.master.pack(side="top", fill="x", **pad)
         e.bind("<KeyRelease>", lambda ev: self._recheck())
-        self.label(f, "Lens, angle, light, film: \u201c85mm, shallow depth of field, "
+        self.label(f, "Lens, light, film:\u201c85mm, shallow depth of field, "
                    "golden hour\u201d.", "faint", self.host.f_small,
                    wraplength=self.px(380)).pack(side="top", fill="x", **pad)
 
@@ -923,6 +1079,7 @@ class ImageStudio:
                       for r in self.loras]
         s["references"] = dict(self.refs)
         s["pose"] = dict(self.pose) if self.pose and "pose" in self.refs else None
+        s["view"] = self.aim.get()
         s["refine"] = bool(self.refine.get())
         s["face_detail"] = bool(self.faces.get())
         for key, _, kind in ADVANCED:
@@ -965,6 +1122,8 @@ class ImageStudio:
         self.neg.set(s.get("negative") or "")
         pose = s.get("pose") if isinstance(s.get("pose"), dict) else None
         self.pose = dict(pose) if pose and sp.clean(pose.get("points")) else None
+        self.aim.set(s.get("view"))
+        self._aimed(recheck=False)
         for kind in ig.REFERENCE_NAMES:
             self._set_ref(kind, (s.get("references") or {}).get(kind))
         for key, _, _ in ADVANCED:
@@ -1000,6 +1159,22 @@ class ImageStudio:
             self._toggle_advanced()
         self._recheck()
         self.say("Settings loaded from history. Change anything, then Generate.", "muted")
+
+    def _aimed(self, view=False, recheck=True):
+        """The Camera diagram changed (or is cleared, with view None): say
+        what it now asks for, and offer Clear while it asks for anything."""
+        if view is None:
+            self.aim.set(None)
+        text = ig.view_label(self.aim.get())
+        self.aim_note.config(text=text or "Not set: the model frames the picture. "
+                             "Drag the camera to aim it.")
+        self.skin(self.aim_note, bg="bg", fg="text" if text else "faint")
+        if text:
+            self.aim_clear.pack(side="right")
+        else:
+            self.aim_clear.pack_forget()
+        if recheck:
+            self._recheck()
 
     def _recheck(self):
         """Compose against the backend the job would go to, for the warnings

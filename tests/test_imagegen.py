@@ -520,6 +520,34 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(p.values["denoise"], 0.7)
         self.assertTrue(any(w.startswith("Pose reference") for w in p.warnings), p.warnings)
 
+    def test_the_camera_leads_the_prompt_and_keeps_the_head_in(self):
+        p = self.plan(model="flux-dev", scene="On a pier.", subject="a woman",
+                      view={"shot": "waist", "turn": 90, "height": "low"})
+        self.assertEqual(p.errors, [])
+        self.assertTrue(p.prompt.startswith("Medium shot from the waist up"), p.prompt)
+        self.assertIn("whole head in the frame", p.prompt)
+        self.assertIn("subject's left", p.prompt)
+        self.assertIn("low angle", p.prompt)
+        self.assertNotIn("eye-level", self.plan(model="flux-dev", scene="x").prompt)
+        # With a drawn pose the figure frames itself: only the height is said.
+        src = os.path.join(self.dir, "pose.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        posed = self.plan(model="flux-dev", scene="x", references={"pose": src},
+                          pose={"points": [[0.5, 0.5]] * 18},
+                          view={"shot": "face", "turn": 180, "height": "high"})
+        self.assertTrue(posed.prompt.startswith("High angle shot"), posed.prompt)
+        self.assertNotIn("behind", posed.prompt)
+        self.assertTrue(any("drawn pose decides the framing" in w for w in posed.warnings))
+
+    def test_a_camera_snaps_to_its_steps(self):
+        self.assertIsNone(ig.clean_view(None))
+        self.assertEqual(ig.clean_view({"turn": -170, "shot": "?", "height": 3}),
+                         {"shot": "full", "turn": 180, "height": "eye"})
+        self.assertEqual(ig.clean_view({"turn": 100})["turn"], 90)
+        self.assertEqual(ig.view_label({"shot": "head", "turn": -45, "height": "overhead"}),
+                         "Head and shoulders, overhead, from their right, three-quarter")
+
     def test_a_pose_goes_through_the_controlnet_on_flux(self):
         src = os.path.join(self.dir, "pose.png")
         with open(src, "wb") as f:
@@ -1236,6 +1264,25 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("left out", ui.warn.cget("text"))
         ui._drop_lora(ui.loras[0])
         self.assertNotIn("left out", ui.warn.cget("text"))
+
+    def test_the_camera_is_aimed_by_dragging_and_comes_back_with_reuse(self):
+        s, ui = self.tab()
+        self.assertIsNone(ui.collect()["view"])
+
+        class Ev:
+            def __init__(self, x, y):
+                self.x, self.y = x, y
+        a, k = ui.aim, ui.aim.k
+        cx, cy, r = a.TOP
+        a._press(Ev(int((cx + r) * k), int(cy * k)))             # round to their left
+        a._press(Ev(int((a.FIG_X + a.REACH["head"]) * k), int(a.ROWS["high"] * k)))
+        view = ui.collect()["view"]
+        self.assertEqual(view, {"shot": "head", "turn": 90, "height": "high"})
+        self.assertIn("Head and shoulders", ui.aim_note.cget("text"))
+        ui._aimed(None)
+        self.assertIsNone(ui.collect()["view"])
+        ui.apply(dict(ig.default_settings(), view=view))
+        self.assertEqual(ui.collect()["view"], view)
 
     def test_a_drawn_pose_becomes_the_pose_reference(self):
         s, ui = self.tab()

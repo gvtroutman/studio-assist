@@ -1963,6 +1963,90 @@ def anatomy_negative():
     return ", ".join(neg for _, _, neg in ANATOMY)
 
 
+# The Camera diagram (`CameraAim` in the tab's module): where the camera is,
+# as three steps - how much of the person is in the frame, which side of
+# them it sees, and how high it is. Stored as settings["view"], {"shot",
+# "turn", "height"}, or None when it is not set and the model frames the
+# picture itself. Every shot but the face says the head is in the frame
+# with room above it: FLUX, left to itself, crops the top of the head.
+VIEW_SHOTS = [
+    ("face", "Face", "Extreme close-up of the face, the whole face in the frame"),
+    ("head", "Head and shoulders", "Close-up portrait of the head and shoulders, the "
+     "top of the head in the frame"),
+    ("waist", "Waist up", "Medium shot from the waist up, the whole head in the frame "
+     "with space above it"),
+    ("knees", "Knees up", "Medium-long shot from the knees up, the whole head in the "
+     "frame with space above it"),
+    ("full", "Full body", "Full body shot, the whole person from head to feet in the "
+     "frame, space above the head and below the feet"),
+    ("wide", "Wide", "Wide shot, the whole person small in the frame with the "
+     "surroundings around them, space above the head"),
+]
+# Degrees the camera has gone round the person from their front, toward
+# their left: 90 sees their left side, 180 their back.
+VIEW_TURNS = {0: "seen from the front, facing the camera",
+              45: "three-quarter view from the subject's left",
+              90: "side profile view from the subject's left",
+              135: "three-quarter back view from behind the subject's left",
+              180: "seen from behind, back to the camera",
+              -45: "three-quarter view from the subject's right",
+              -90: "side profile view from the subject's right",
+              -135: "three-quarter back view from behind the subject's right"}
+VIEW_HEIGHTS = [
+    ("overhead", "Overhead", "bird's-eye view, the camera overhead looking straight down"),
+    ("high", "High", "high angle shot, the camera above eye level looking down"),
+    ("eye", "Eye level", "eye-level camera"),
+    ("low", "Low", "low angle shot, the camera below eye level looking up"),
+    ("ground", "Ground", "worm's-eye view, the camera near the ground looking up"),
+]
+VIEW_DEFAULT = {"shot": "full", "turn": 0, "height": "eye"}
+TURN_LABELS = {0: "front", 45: "their left, three-quarter", 90: "their left side",
+               135: "behind their left", 180: "behind",
+               -45: "their right, three-quarter", -90: "their right side",
+               -135: "behind their right"}
+
+
+def clean_view(view):
+    """Anything -> {"shot", "turn", "height"} or None."""
+    if not isinstance(view, dict):
+        return None
+    shots, heights = dict((k, t) for k, _, t in VIEW_SHOTS), dict(
+        (k, t) for k, _, t in VIEW_HEIGHTS)
+    try:
+        turn = int(round(float(view.get("turn", 0)) / 45.0)) * 45
+    except (TypeError, ValueError):
+        turn = 0
+    turn = (turn + 180) % 360 - 180 or 0
+    turn = 180 if turn == -180 else turn
+    return {"shot": view.get("shot") if view.get("shot") in shots else "full",
+            "turn": turn,
+            "height": view.get("height") if view.get("height") in heights else "eye"}
+
+
+def view_label(view):
+    """One line for the form: "Full body, eye level, from the front"."""
+    v = clean_view(view)
+    if not v:
+        return ""
+    shot = dict((k, lbl) for k, lbl, _ in VIEW_SHOTS)[v["shot"]]
+    height = dict((k, lbl) for k, lbl, _ in VIEW_HEIGHTS)[v["height"]]
+    return "%s, %s, from %s" % (shot, height.lower(), TURN_LABELS[v["turn"]])
+
+
+def view_text(view, posed=False):
+    """The camera's words, for the front of the prompt (FLUX weighs what
+    comes first). A drawn pose already frames the figure and faces it, and
+    words that disagree fight the ControlNet, so then only the height is said."""
+    v = clean_view(view)
+    if not v:
+        return ""
+    height = dict((k, t) for k, _, t in VIEW_HEIGHTS)[v["height"]]
+    if posed:
+        return height[0].upper() + height[1:]
+    shot = dict((k, t) for k, _, t in VIEW_SHOTS)[v["shot"]]
+    return ", ".join((shot, VIEW_TURNS[v["turn"]], height))
+
+
 def has_person(settings, named=False):
     """Whether the picture has a person in it: one chosen or described, or
     the scene names one."""
@@ -2146,8 +2230,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     scene = _field(s, "scene")
     person = person_text(s)
     named = " and ".join(t for t in who if t not in scene)
-    parts = [x for x in (", ".join(x for x in (named, person) if x), scene,
+    posed = bool((s.get("references") or {}).get("pose"))
+    parts = [x for x in (view_text(s.get("view"), posed),
+                         ", ".join(x for x in (named, person) if x), scene,
                          _field(s, "camera")) if x]
+    if posed and clean_view(s.get("view")):
+        p.warnings.append("The drawn pose decides the framing and which way the person "
+                          "faces; the Camera gives only its height. Zoom the figure "
+                          "(mouse wheel in Draw…) to frame closer.")
     anatomy = s.get("anatomy") is not False and has_person(s, bool(idents))
     if anatomy:
         parts.append(anatomy_text())
