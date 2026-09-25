@@ -343,6 +343,60 @@ class TestWords(unittest.TestCase):
         self.assertEqual(sc.camera_words(s),
                          "Shot from a high angle looking down on a 24mm wide-angle lens")
 
+    def test_each_person_says_their_own_look(self):
+        s = staged("person", "person", "box")
+        a, b, box = s["objects"]
+        a.update(name="Welder", description="grinding a seam; face shield DOWN.",
+                 look={"subject": "a man", "age": "in their 40s", "facial_hair": "full beard",
+                       "top": "hi-vis vest", "stature": 2, "expression": "determined"})
+        b.update(name="Apprentice", position=[0.9, 0, 0],
+                 look={"subject": "a young woman", "hair": "auburn",
+                       "hair_style": "in a ponytail"})
+        box["position"] = [-0.9, 0, 0]
+        text = sc.scene_text(s).text
+        self.assertIn("Welder (a person, centre of frame, facing the camera): a man, in their "
+                      "40s, tall, full beard, determined expression, wearing hi-vis vest. "
+                      "grinding a seam; face shield DOWN.", text)
+        self.assertIn("Apprentice (a person, ", text)
+        self.assertIn("): a young woman, auburn hair in a ponytail.", text)
+        self.assertNotIn("Apprentice has no description", " ".join(sc.scene_text(s).notes))
+
+    def test_a_look_is_saved_and_cleaned(self):
+        s = staged("person")
+        s["objects"][0].update(character="ada", look={
+            "hair": " auburn ", "weight": 9, "muscle": "x", "eyes": "", "bogus": "yes",
+            "accessories": "glasses, necklace"})
+        back, problems = sc.clean_scene(json.loads(json.dumps(s)))
+        self.assertEqual(problems, [])
+        self.assertEqual(back["objects"][0]["character"], "ada")
+        self.assertEqual(back["objects"][0]["look"], {"hair": "auburn", "weight": 3,
+                                                      "accessories": "glasses, necklace"})
+        old = staged("person")                               # a scene from before looks
+        del old["objects"][0]["look"], old["objects"][0]["character"]
+        back, _ = sc.clean_scene(old)
+        self.assertEqual((back["objects"][0]["look"], back["objects"][0]["character"]),
+                         ({}, ""))
+        self.assertNotIn("look", sc.new_object("box"))
+
+    def test_a_character_copies_its_look_but_not_the_expression(self):
+        rec = {"looks": {"subject": "a woman", "hair": "black", "weight": -1}}
+        look = sc.character_look(rec, {"facial_hair": "full beard", "expression": "shy",
+                                       "muscle": 2})
+        self.assertEqual(look, {"subject": "a woman", "hair": "black", "weight": -1,
+                                "expression": "shy"})
+
+    def test_people_in_the_scene_blank_the_forms_person(self):
+        s = staged("person")
+        s["objects"][0].update(character="ada", look={"subject": "a woman"})
+        chars = {"ada": {"id": "ada", "identity": "ada-face", "item_refs": {"x": "/y.png"}}}
+        _, _, extra = sc.generation(s, "/x/ref.png", chars)
+        self.assertEqual((extra["subject"], extra["hair"], extra["weight"],
+                          extra["character"], extra["item_refs"]), ("", "", 0, "", {}))
+        self.assertEqual(extra["scene_identities"], ["ada-face"])
+        _, _, props = sc.generation(staged("box"), "/x/ref.png")
+        self.assertNotIn("subject", props)                   # no people: the form's stays
+        self.assertNotIn("scene_identities", props)
+
     def test_generation_carries_size_strength_and_the_scene(self):
         s = staged("person")
         s["frame"], s["redraw"] = "landscape", 0.55
@@ -374,6 +428,19 @@ class TestIntoCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(plan.values["denoise"], sc.REDRAW)
         self.assertIn("checking a gauge, hard hat and hi-vis on", plan.prompt)
         self.assertIn(ig.anatomy_text(), plan.prompt)
+
+    def test_the_forms_person_is_not_said_twice(self):
+        s = staged("person")
+        s["objects"][0]["look"] = {"subject": "an older man", "hair": "grey"}
+        ref = sc.write_reference(s, tempfile.mkdtemp())
+        words, ref, extra = sc.generation(s, ref)
+        st = dict(ig.default_settings(), model="z-image-turbo", scene=words.text,
+                  references={"source": ref}, subject="a woman", hair="auburn")
+        st.update(extra)
+        plan = ig.compose(st, self.studio.lib, self.backend("3090"), FLUX_FILES)
+        self.assertIn("an older man, grey hair", plan.prompt)
+        self.assertNotIn("a woman", plan.prompt)
+        self.assertNotIn("auburn", plan.prompt)
 
     def test_a_workflow_without_one_says_the_frame_goes_unused(self):
         st, _ = self.settings("flux-dev")
@@ -539,6 +606,40 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb.set_tool("move")
         self.assertAlmostEqual(sb.vars["x"][0].get(), person["position"][0], places=2)
 
+    def test_a_person_keeps_their_look_in_the_inspector(self):
+        ui, sb = self.builder()
+        for k, var in ui.text.items():
+            var.set("")
+        for var in ui.sliders.values():
+            var.set(0)
+        ui.settings["character"] = ""
+        ui.text["subject"].set("a woman")
+        ui.text["hair"].set("auburn")
+        first = sb.add("person")                               # takes the form's look
+        self.assertEqual(first["look"], {"subject": "a woman", "hair": "auburn"})
+        second = sb.add("person")                              # the second does not
+        self.assertEqual(second["look"], {})
+
+        sb._look_tab("Hair")
+        self.assertIn("hair_style", sb.look_vars)
+        sb.look_vars["hair_style"].set("buzz cut")
+        sb.look_changed()                                      # as a key in its field
+        self.assertEqual(second["look"], {"hair_style": "buzz cut"})
+        self.assertIn("buzz cut", sb.words_label.cget("text"))
+
+        ui.studio.lib.save("characters", [{"id": "ada", "name": "Ada", "identity": "",
+                                           "looks": {"subject": "a woman", "hair": "black",
+                                                     "weight": -1}}])
+        second["look"]["expression"] = "shy"
+        sb._set_character("ada")
+        self.assertEqual(second["character"], "ada")
+        self.assertEqual(second["name"], "Ada")                # was still "Person 2"
+        self.assertEqual(second["look"], {"subject": "a woman", "hair": "black",
+                                          "weight": -1, "expression": "shy"})
+        sb._clear_look()
+        self.assertEqual((second["look"], second["character"]), ({}, ""))
+        ui.studio.lib.save("characters", [])
+
     def test_empty_space_orbits_and_the_wheel_zooms(self):
         ui, sb = self.builder()
         sb._press(Ev(5, 5))
@@ -619,6 +720,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertIn("welding a beam; helmet down, leather gloves", st["scene"])
         self.assertIn("Workbench (", st["scene"])
         self.assertEqual(st["scene_file"], path)
+        self.assertEqual((st["subject"], st["character"]), ("", ""))   # the scene's people only
         self.assertEqual(len(st["scene_layout"]["objects"]), 2)
         self.assertIn("welding a beam", ui.scene.get("1.0", "end"))   # on the form too
         rec = ui.studio.history.list()[0]

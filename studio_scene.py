@@ -22,6 +22,10 @@ pieces:
   words (`texture_settings`), or a PNG from disk - repeated every `size`
   metres and drawn in perspective (`TexMap`). The room is the backdrop: it is
   drawn before every object, so a person always stands in front of a wall.
+- **A person's look** (`look`, `character`): the Image Studio's character
+  creator slots and sliders, per person - who, body, face, hair, expression,
+  clothes, accessories - or a character's look copied on. It is said in that
+  person's line, so two people in one picture each keep their own.
 - **The camera** orbits a target: yaw, pitch, distance and a lens in mm on a
   full-frame diagonal, so 35mm means what it does on a camera whatever the
   frame's shape (`Camera`).
@@ -30,8 +34,8 @@ pieces:
   the same list at the generation size, which is how the viewport shows the
   exact frame the picture is made from.
 - **The words** (`scene_text`): the scene's details, then each object in the
-  frame as "Name (where it is in the frame, which way a person faces): the
-  description, verbatim", then the camera. An object outside the frame is
+  frame as "Name (where it is in the frame, which way a person faces): a
+  person's look. The description, verbatim", then the camera. An object outside the frame is
   left out and said so (`Words.notes`).
 
 No tkinter here; `studio_scene_ui.py` is the window. Stdlib only.
@@ -502,7 +506,50 @@ def new_object(asset_id, taken=()):
            "rotation": [0.0, 0.0, 0.0], "scale": list(a["scale"])}
     if a["kind"] == "person":
         obj["pose"] = {"preset": "standing", "controls": pose_controls("standing")}
+        obj["character"] = ""
+        obj["look"] = {}
     return obj
+
+
+# ==================================================================== looks
+# A person's look is the Image Studio's: every slot of `studio_imagegen.LOOKS`
+# and every slider, kept sparse (only what is set). Imported lazily, as
+# `scenes_dir` does: the engine is heavy and the renderer needs none of it.
+
+def clean_look(d):
+    """A saved look made safe: known slots as text, sliders as whole steps
+    within their span, nothing unset kept."""
+    import studio_imagegen as ig
+    d = d if isinstance(d, dict) else {}
+    out = {}
+    for k in ig.SLOTS:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    for k in ig.SLIDER_KEYS:
+        step = int(round(_num(d.get(k), 0, -ig.SLIDER_SPAN, ig.SLIDER_SPAN)))
+        if step:
+            out[k] = step
+    return out
+
+
+def character_look(rec, look=None):
+    """A character's look put on a person, as the form does it: every slot
+    and slider the character keeps (blank where it has none, so the last
+    one's beard does not stay); the expression and gaze are the picture's,
+    and stay."""
+    import studio_imagegen as ig
+    look = dict(look or {})
+    for k in ig.CHARACTER_KEYS:
+        look.pop(k, None)
+    look.update((rec or {}).get("looks") or {})
+    return clean_look(look)
+
+
+def look_text(obj):
+    """The person's look in words, as the Image Studio says a person."""
+    import studio_imagegen as ig
+    return ig.person_text(obj.get("look") or {})
 
 
 def _num(v, default, lo=None, hi=None):
@@ -550,6 +597,8 @@ def clean_object(d, taken=()):
         start = pose_controls(preset or "standing")
         o["pose"] = {"preset": preset, "controls": {
             k: _num(given.get(k), start[k], *CONTROL_RANGE[k]) for k in CONTROL_KEYS}}
+        o["character"] = str(d.get("character") or "")
+        o["look"] = clean_look(d.get("look"))
     return o
 
 
@@ -1138,8 +1187,10 @@ def scene_text(scene):
         line = "%s (%s)" % (obj["name"].strip() or ASSET[obj["asset"]]["label"],
                             ", ".join(about))
         desc = obj["description"].strip()
-        parts.append(line + (": " + desc if desc else ""))
-        if not desc:
+        look = look_text(obj) if obj["asset"] == "person" else ""
+        said = ". ".join(x for x in (look, desc) if x)
+        parts.append(line + (": " + said if said else ""))
+        if not said:
             out.notes.append("%s has no description; the picture has only its shape and "
                              "name to go on." % obj["name"])
     parts.append(camera_words(scene))
@@ -1147,13 +1198,39 @@ def scene_text(scene):
     return out
 
 
-def generation(scene, reference):
+def people(scene):
+    return [o for o in scene["objects"] if o["asset"] == "person"]
+
+
+def generation(scene, reference, characters=None):
     """What the Image Studio is handed: the words for its Scene field, and
     the settings Generate adds to the form's (the frame's size, the redraw
-    strength, the reference, and the whole scene for History)."""
+    strength, the reference, and the whole scene for History).
+
+    A scene with people in it says every person's look in their own line,
+    so the form's one person is blanked for this job - said twice, the
+    picture gets an extra person or a blend of two, and so are the form's
+    item pictures (compose matches them to the form's clothes, now blank;
+    no workflow takes one yet, and the words carry the items). The identity
+    whose LoRA carries a scene character's face rides along as
+    `scene_identities`, for the form to add to its own. `characters` is
+    {id: record}."""
+    import studio_imagegen as ig
     w, h = frame_size(scene)
     words = scene_text(scene)
     s, _ = clean_scene(scene)
     extra = {"width": w, "height": h, "denoise": round(scene["redraw"], 3),
              "scene_layout": copy.deepcopy(s)}
+    folks = people(s)
+    if folks:
+        extra.update({k: "" for k in ig.SLOTS})
+        extra.update({k: 0 for k in ig.SLIDER_KEYS})
+        extra["character"] = ""
+        extra["item_refs"] = {}
+        idents = []
+        for o in folks:
+            rec = (characters or {}).get(o["character"]) if o["character"] else None
+            if rec and rec.get("identity") and rec["identity"] not in idents:
+                idents.append(rec["identity"])
+        extra["scene_identities"] = idents
     return words, reference, extra
