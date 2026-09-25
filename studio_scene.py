@@ -27,7 +27,7 @@ pieces:
   clothes, accessories - or a character's look copied on. It is said in that
   person's line, so two people in one picture each keep their own. The
   mannequin is built to it too (`body_shape`: weight, muscle, height) and
-  wears its clothes, hat and glasses (`outfit`), since the frame is what the
+  wears its clothes, hat, glasses and hair (`outfit`), since the frame is what the
   picture copies.
 - **The camera** orbits a target: yaw, pitch, distance and a lens in mm on a
   full-frame diagonal, so 35mm means what it does on a camera whatever the
@@ -597,7 +597,100 @@ def outfit(look=None):
         if kind and not glasses:
             glasses = (kind, cloth_colour(item, kind))
     return {"regions": regions, "hems": hems, "boots": boots, "hat": hat,
-            "glasses": glasses}
+            "glasses": glasses, "hair": hairdo(look)}
+
+
+# Hair, from the look's Hair section: the colour's words, and the style's
+# for what shape to build. (words, rgb), matched as the clothes are: the
+# first said wins, the longer of two at one place ("dark brown" not "brown").
+HAIR_COLOURS = [
+    ("black", "#1f1b19"), ("jet black", "#141212"), ("dark brown", "#3b2a20"),
+    ("brunette", "#4a3325"), ("brown", "#5a3e2b"), ("light brown", "#8a6848"),
+    ("chestnut", "#6b3d24"), ("auburn", "#7a3a22"), ("red", "#9a3b1f"),
+    ("ginger", "#b5582a"), ("copper", "#a8552a"), ("strawberry blonde", "#c8905e"),
+    ("dirty blonde", "#a88a5a"), ("blonde", "#d6b77a"), ("blond", "#d6b77a"),
+    ("golden", "#d2aa5c"), ("platinum blonde", "#e6dcc0"), ("platinum", "#e6dcc0"),
+    ("grey", "#9a9a98"), ("gray", "#9a9a98"), ("salt and pepper", "#6e6c6a"),
+    ("silver", "#c0c0c2"), ("white", "#e8e6e0"), ("pink", "#e38fb0"),
+    ("blue", "#4f7fc0"), ("purple", "#7a4fa0"), ("lilac", "#b49ad0"), ("green", "#4f9a6a"),
+    ("teal", "#2f8f8f"),
+]
+HAIR_DEFAULT = "#3b2a20"
+# How far hair falls, in the head's frame (the jaw is near y 0, the
+# shoulders -0.13): the first length said wins.
+HAIR_LENGTHS = [
+    ("very long", -0.45), ("waist-length", -0.45), ("long", -0.3),
+    ("shoulder-length", -0.12), ("shoulder length", -0.12), ("medium", -0.08),
+    ("chin-length", 0.02), ("chin length", 0.02), ("bob", 0.02), ("lob", -0.06),
+]
+
+
+def hairdo(look=None):
+    """The look's Hair -> {"rgb", "cap" (thickness m over the skull, 0 for
+    none), "fall" (how low it hangs, or None), "volume", "tie" (bun,
+    ponytail, braids or None)}, or None for bald or no hair said."""
+    look = look if isinstance(look, dict) else {}
+    colour = str(look.get("hair") or "").strip().lower()
+    style = str(look.get("hair_style") or "").strip().lower()
+    if not (colour or style) or _said(style, "bald", "shaved head", "clean-shaven head"):
+        return None
+    found = []
+    for word, hexc in HAIR_COLOURS:
+        m = re.search(r"(?<![\w-])%s" % re.escape(word), colour + " | " + style)
+        if m:
+            found.append((m.start(), -len(word), hexc))
+    rgb = hex_rgb(min(found)[2] if found else HAIR_DEFAULT)
+    fall = next((y for words, y in HAIR_LENGTHS if _said(style, words)), None)
+    volume = (1.3 if _said(style, "curly", "coily", "kinky", "big", "voluminous")
+              else 1.15 if _said(style, "wavy", "shaggy", "messy", "tousled") else 1.0)
+    cap = 0.012 * volume
+    if _said(style, "buzz cut", "buzzcut", "crew cut", "shaved", "cropped"):
+        cap, fall = 0.004, None
+    elif _said(style, "very short", "pixie cut", "pixie", "short", "slicked back",
+               "undercut", "crew"):
+        fall = None
+    if _said(style, "afro"):
+        cap, fall = 0.055, None
+    tie = next((t for t, words in (("bun", ("bun", "topknot", "top knot", "updo", "chignon")),
+                                   ("ponytail", ("ponytail", "pony tail")),
+                                   ("braids", ("braids", "braid", "plaits", "pigtails")))
+                if _said(style, *words)), None)
+    if tie == "bun":
+        fall = None
+    if _said(style, "locs", "dreadlocks", "dreads") and fall is None:
+        fall = -0.25
+    return {"rgb": rgb, "cap": cap, "fall": fall, "volume": volume, "tie": tie}
+
+
+def hairline(x, z):
+    """How high hair starts on the head at (x, z) in its frame, z from the
+    head's middle: high on the forehead, at the ears on the sides, low at
+    the nape."""
+    return 0.11 + 0.055 * (z / (math.hypot(x, z) or 1.0))
+
+
+def _scalp(at, th, rings=4, n=14):
+    """Hair over the skull, `th` thick: from a hairline high on the forehead
+    and low at the nape up to the crown, lofted over the head's ellipsoid
+    (centre (0, 0.11, 0.01), radii 0.085, 0.115, 0.1) in its frame."""
+    cy, cz, rx, ry, rz = 0.11, 0.01, 0.085, 0.115, 0.1
+    grid = []
+    for j in range(rings + 1):
+        ring = []
+        for i in range(n):
+            t = 2 * math.pi * i / n                       # 0 is the front
+            low = hairline(math.sin(t), math.cos(t)) - 0.012    # under the head's edge
+            y = low + (0.218 - low) * j / rings
+            c = math.sqrt(max(0.0, 1 - ((y - cy) / ry) ** 2))
+            q = (rx * c * math.sin(t), y - cy, rz * c * math.cos(t))
+            nrm = norm((q[0] / rx ** 2, q[1] / ry ** 2, q[2] / rz ** 2))
+            ring.append(at((q[0] + nrm[0] * th, cy + q[1] + nrm[1] * th,
+                            cz + q[2] + nrm[2] * th)))
+        grid.append(ring)
+    faces = [[grid[j][i], grid[j][(i + 1) % n], grid[j + 1][(i + 1) % n], grid[j + 1][i]]
+             for j in range(rings) for i in range(n)]
+    faces.append(grid[-1])
+    return outward(faces)
 
 
 def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
@@ -626,6 +719,13 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     fore = k("forearm", 1 + 0.5 * fat + 0.8 * mus)
     thigh = k("thigh", 1 + 0.8 * fat + 0.8 * mus)
     shin = k("shin", 1 + 0.45 * fat + 0.6 * mus)
+    # The head, less what a scalp of hair covers: a big face of it sorts in
+    # front of the hair over it and shows through as a pale speck.
+    hair = dressed.get("hair")
+    scalp = bool(hair and hair["cap"] and not dressed.get("hat"))
+    skull = [[at("head", p) for p in f]
+             for f in ellipsoid((0, 0.11, 0.01), IDENTITY, (0.085, 0.115, 0.1))
+             if not (scalp and centroid(f)[1] > hairline(centroid(f)[0], centroid(f)[2] - 0.01))]
     # (part, region, faces); a region is what clothes cover, or the rgb of a
     # piece that is only clothes (a hem, a boot shaft).
     out = [
@@ -640,8 +740,7 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                 r((0.14, 0.085), chest * shape["shoulders"], chest))),
         ("head", "neck", prism(P("neck"), P("head"), X("neck"), r((0.05, 0.05), neck),
                                r((0.048, 0.048), neck), 6)),
-        ("head", "head", ellipsoid(at("head", (0, 0.11, 0.01)), M("head"),
-                                   (0.085, 0.115, 0.1))),
+        ("head", "head", skull),
     ]
     # The nose says which way the head faces: a small wedge on the front.
     nose = [at("head", v) for v in ((-0.016, 0.07, 0.1), (0.016, 0.07, 0.1),
@@ -665,6 +764,30 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                            X("head"), brim, brim, 16)))
         if kind == "cap":                 # the visor, forward over the eyes
             out.append(("head", rgb, head_box((-0.07, 0.14, 0.07), (0.07, 0.152, 0.2))))
+    if hair:
+        rgb, v = hair["rgb"], hair["volume"]
+        hp = lambda v3: at("head", v3)                     # noqa: E731
+        if scalp:                                          # under a hat, the hat
+            out.append(("head", rgb, _scalp(hp, hair["cap"])))
+        if hair["fall"] is not None:
+            # Down the back from behind the ears, clear of the back of the torso.
+            y = hair["fall"]
+            out.append(("head", rgb, prism(
+                hp((0, 0.13, -0.035)), hp((0, y, -0.035 - 0.1 * min(1.0, (0.13 - y) / 0.4))),
+                X("head"), (0.098 * v, 0.08 * v), (0.105 * v, 0.035 * v), 10)))
+        if hair["tie"] == "bun":
+            out.append(("head", rgb, ellipsoid(hp((0, 0.2, -0.09)), M("head"),
+                                               (0.045 * v, 0.04 * v, 0.04 * v), 8, 5)))
+        elif hair["tie"] == "ponytail":
+            y = hair["fall"] if hair["fall"] is not None else 0.0
+            out.append(("head", rgb, prism(hp((0, 0.17, -0.1)), hp((0, y, -0.15)), X("head"),
+                                           (0.03 * v, 0.03 * v), (0.018 * v, 0.018 * v), 6)))
+        elif hair["tie"] == "braids":
+            y = hair["fall"] if hair["fall"] is not None else -0.2
+            for sx in (1, -1):
+                out.append(("head", rgb, prism(hp((sx * 0.06, 0.1, -0.06)),
+                                               hp((sx * 0.075, y, -0.11)), X("head"),
+                                               (0.02, 0.02), (0.015, 0.015), 6)))
     if dressed.get("glasses"):
         kind, rgb = dressed["glasses"]
         lo, hi = {"glasses": (0.11, 0.136), "sunglasses": (0.1, 0.14),
