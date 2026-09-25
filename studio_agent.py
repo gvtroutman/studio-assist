@@ -1518,9 +1518,20 @@ EDITING
   face, pose and the background". One change per call gives the cleanest result;
   chain calls on the new file for several.
 - references are extra pictures, called picture 2 and picture 3 in the instruction.
+- A local edit keeps the original's own pixels everywhere else. Pass region: the
+  thing that changes, as a short noun that can be seen in the picture before or
+  after - "make the jacket blue": region "jacket"; "remove the man": "man";
+  "change her hair": "hair"; "add a hat": "hat".
+- keep is what must stay the original's own pixels inside that region: new
+  clothes, a new build or a new pose for the same person is region "person",
+  keep "head".
+- A change to the whole picture - night for day, relighting, a new style,
+  season or weather - is whole_picture true, with no region. Pasting part of it
+  onto the original would leave the rest in daylight.
 - photo_finish true runs a Z-Image detail pass afterwards: use it when the edited
   picture is a photograph and the user wants the most realistic result, or the
-  edit looks smooth or waxy. It adds time.
+  edit looks smooth or waxy. It adds time, and on a local edit touches only the
+  region.
 
 TIME
 - ONE render per request. When the picture comes back, show it: give the path,

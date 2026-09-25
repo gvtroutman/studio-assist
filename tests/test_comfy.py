@@ -59,6 +59,8 @@ class FakeComfy:
         self.free_vram = [20e9]    # /system_stats answers these in turn, the last for good
         self.faces = {}            # uploaded name -> SAM3's boxes, for PreviewAny to report
         self.size = (1254, 1254)   # what GetImageSize says of any picture
+        self.shares = {}           # PreviewAny node id -> share of the 16x16 mask it prints
+        self.extra = {}            # prompt_id -> the extra_data it was queued with
 
     def __call__(self, req, timeout=None):
         url = req if isinstance(req, str) else req.full_url
@@ -85,6 +87,11 @@ class FakeComfy:
             src, index = node["inputs"]["source"]
             if graph[src]["class_type"] == "GetImageSize":
                 value = self.size[index]
+            elif graph[src]["class_type"] == "ImageToMask":
+                # torch prints a mask as tensor([[[0.1000, ...]]]).
+                v = self.shares.get(nid, 0.1)
+                out[nid] = {"text": ["tensor([[[%s]]])" % ", ".join(["%.4f" % v] * 256)]}
+                continue
             else:
                 # An uploaded picture by its name; a picture the graph made
                 # (comfy_generate's, for the face pass) as "generated".
@@ -144,6 +151,7 @@ class FakeComfy:
             graph = json.loads(data)["prompt"]
             pid = "p%d" % (len(self.prompts) + 1)
             self.prompts[pid] = graph
+            self.extra[pid] = json.loads(data).get("extra_data")
             outputs = {"7": {"images": [
                 {"filename": "StudioAssistant_00001_.png", "subfolder": "", "type": "output"},
                 {"filename": "preview.png", "subfolder": "", "type": "temp"}]}}
@@ -425,7 +433,7 @@ class ComfyBridgeTest(unittest.TestCase):
             fh.write(PNG)
         res = comfy.call_tool("comfy_edit_image", {
             "image": src, "instruction": "make the walls green", "references": ["sofa.png"],
-            "seed": 5})
+            "seed": 5, "whole_picture": True})
         self.assertFalse(res["isError"], self.text(res))
         self.assertEqual(len(self.fake.uploads), 1)          # the local path went up
         g = self.fake.prompts["p1"]
@@ -440,38 +448,143 @@ class ComfyBridgeTest(unittest.TestCase):
         self.assertEqual(pos["prompt"], "make the walls green")
         self.assertEqual((pos["image1"], pos["image2"]), (["21", 0], ["22", 0]))
         self.assertEqual(g["22"]["inputs"]["image"], "sofa.png")
-        self.assertEqual(g["3"]["inputs"]["prompt"], "")
+        # At cfg 1 the negative is never read: zeroed, not encoded a second time.
+        self.assertEqual(g["3"], {"class_type": "ConditioningZeroOut",
+                                  "inputs": {"conditioning": ["2", 0]}})
         k = g["5"]["inputs"]
         self.assertEqual((k["steps"], k["cfg"], k["model"], k["latent_image"]),
                          (4, 1.0, ["13", 0], ["4", 0]))
-        self.assertEqual(g["7"]["inputs"]["images"], ["6", 0])
+        self.assertEqual(g["7"]["inputs"]["images"], ["6", 0])   # a whole picture, saved as drawn
         self.assertIn("Lightning", self.text(res))
         # Full quality drops the LoRA and uses the template's 20 steps at cfg 4.
-        comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x", "fast": False})
+        comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x", "fast": False,
+                                             "whole_picture": True})
         g = self.fake.prompts["p2"]
         self.assertNotIn("9", g)
         self.assertEqual((g["5"]["inputs"]["steps"], g["5"]["inputs"]["cfg"]), (20, 4.0))
+        self.assertEqual(g["3"]["inputs"]["prompt"], "")
         # photo_finish is Z-Image's detail pass as a second run. In the edit's
         # own graph ComfyUI kept the 19.5 GB edit model on the card while it
         # brought Z-Image in beside it, and one edit took 410 s. So the edit
         # ends in a preview, the GPU is freed, and the finish loads the preview.
         self.fake.running = []
         res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x",
-                                                   "photo_finish": True})
+                                                   "photo_finish": True, "whole_picture": True})
         edit, finish = self.fake.prompts["p3"], self.fake.prompts["p4"]
         self.assertEqual(edit["7"], {"class_type": "PreviewImage",
                                      "inputs": {"images": ["6", 0]}})
         self.assertEqual({n["class_type"] for n in edit.values()} & {"SaveImage"}, set())
         self.assertEqual(finish["1"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
-        self.assertEqual(finish["8"]["inputs"]["image"], "preview.png [temp]")
-        self.assertEqual(finish["13"]["inputs"]["image"], ["8", 0])
+        self.assertEqual(finish["31"]["inputs"]["image"], "preview.png [temp]")
+        self.assertEqual(finish["13"]["inputs"]["image"], ["31", 0])
         self.assertEqual(finish["15"]["inputs"]["model"], ["12", 0])
         self.assertEqual(finish["15"]["inputs"]["denoise"], 0.25)
         self.assertEqual(finish["7"]["inputs"]["images"], ["16", 0])
+        self.assertNotIn("42", finish)                   # no mask: all of it is redrawn
         self.assertEqual(self.fake.posts.count(("free", {"unload_models": True,
                                                          "free_memory": True})), 2)
         self.assertIn("photo finish", self.text(res))
         self.assertFalse(res["isError"], self.text(res))
+
+    def local_edit_setup(self):
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                                      "z_image_turbo_bf16.safetensors"]
+        self.fake.text_encoders = ["qwen_2.5_vl_7b_fp8_scaled.safetensors", "qwen_3_4b.safetensors"]
+        self.fake.loras = ["Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors"]
+        self.fake.running = []
+
+    def test_a_local_edit_keeps_the_original_outside_what_changed(self):
+        """The edit model gives back the whole frame at ~1 MP, twice through
+        the VAE: the "untouched" parts drift. So by default only what changed
+        is taken from it, scaled back to the original's size and composited
+        onto the original's own pixels."""
+        self.local_edit_setup()
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x"})
+        self.assertFalse(res["isError"], self.text(res))
+        edit, mask, save = (self.fake.prompts[p] for p in ("p1", "p2", "p3"))
+        self.assertEqual(edit["7"]["class_type"], "PreviewImage")
+        self.assertEqual(mask["30"]["inputs"]["image"], "a.png")
+        self.assertEqual(mask["31"]["inputs"]["image"], "preview.png [temp]")
+        self.assertEqual((mask["33"]["inputs"]["width"], mask["33"]["inputs"]["height"]),
+                         (["32", 0], ["32", 1]))
+        self.assertEqual(mask["50"]["inputs"]["blend_mode"], "difference")
+        self.assertNotIn("40", mask)                     # no region, no SAM3
+        comp = mask["64"]["inputs"]
+        self.assertEqual((comp["destination"], comp["source"], comp["mask"]),
+                         (["30", 0], ["33", 0], ["63", 0]))
+        self.assertEqual(save["31"]["inputs"]["image"], "edit65.png [temp]")
+        self.assertEqual(save["7"]["inputs"]["images"], ["31", 0])
+        self.assertIn("kept the original outside what the edit changed (10%", self.text(res))
+        # The saved picture carries all three runs, not only the last.
+        self.assertIsNone(self.fake.extra["p1"])            # previews carry nothing
+        meta = self.fake.extra["p3"]["extra_pnginfo"]["studio_pipeline"]
+        self.assertEqual((meta["tool"], meta["arguments"]["instruction"]),
+                         ("comfy_edit_image", "x"))
+        self.assertEqual([st["prompt"] for st in meta["stages"]],
+                         [edit, mask, save])
+        self.assertEqual(meta["stages"][0]["server"], comfy.COMFY_URL)
+        # A change over most of the frame is a global edit: kept whole.
+        self.fake.shares = {"69": 0.8}
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x"})
+        self.assertEqual(self.fake.prompts["p6"]["31"]["inputs"]["image"], "preview.png [temp]")
+        self.assertIn("changed 80% of the picture, so it is kept whole", self.text(res))
+
+    def test_a_region_edit_takes_sam3s_mask_and_finishes_only_inside_it(self):
+        self.local_edit_setup()
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.shares = {"69": 0.2, "89": 0.4}
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "make the "
+                                                   "jacket red", "region": "jacket",
+                                                   "photo_finish": True})
+        self.assertFalse(res["isError"], self.text(res))
+        mask, finish = self.fake.prompts["p2"], self.fake.prompts["p3"]
+        self.assertEqual(mask["2"]["inputs"]["text"], "jacket:8")   # "jacket" alone finds one
+        self.assertEqual((mask["40"]["inputs"]["image"], mask["41"]["inputs"]["image"]),
+                         (["30", 0], ["33", 0]))            # before and after the edit
+        self.assertEqual(mask["60"]["inputs"]["mask"], ["42", 0])
+        self.assertEqual(mask["80"]["inputs"]["mask"], ["57", 0])
+        self.assertEqual(finish["31"]["inputs"]["image"], "edit65.png [temp]")
+        self.assertEqual(finish["32"]["inputs"]["image"], "edit66.png [temp]")
+        self.assertEqual(finish["41"]["inputs"]["image"], ["16", 0])
+        comp = finish["42"]["inputs"]
+        self.assertEqual((comp["destination"], comp["source"], comp["mask"]),
+                         (["30", 0], ["41", 0], ["33", 0]))
+        self.assertEqual(finish["7"]["inputs"]["images"], ["42", 0])
+        self.assertIn("outside the jacket (SAM3's mask, 20%", self.text(res))
+        self.assertIn("inside the same mask", self.text(res))
+        # SAM3 finds nothing: what changed is used instead, and said so.
+        self.fake.shares = {"69": 0.0, "89": 0.3}
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x",
+                                                   "region": "unicorn"})
+        self.assertEqual(self.fake.prompts["p6"]["31"]["inputs"]["image"], "edit85.png [temp]")
+        self.assertIn("SAM3 found no 'unicorn'", self.text(res))
+
+    def test_keep_takes_the_head_out_of_what_the_edit_may_change(self):
+        """New clothes or a new body on the same person: the whole person is
+        taken from the edit but the head, which stays the original's pixels."""
+        self.local_edit_setup()
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.shares = {"69": 0.5, "89": 0.6, "36": 0.08}
+        res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x",
+                                                   "region": "person", "keep": "head"})
+        self.assertFalse(res["isError"], self.text(res))
+        mask = self.fake.prompts["p2"]
+        self.assertEqual(mask["3"]["inputs"]["text"], "head:8")
+        self.assertEqual((mask["44"]["inputs"]["image"], mask["45"]["inputs"]["image"]),
+                         (["30", 0], ["33", 0]))
+        cut = mask["70"]["inputs"]
+        self.assertEqual((cut["destination"], cut["source"], cut["operation"]),
+                         (["63", 0], ["49", 0], "subtract"))
+        self.assertEqual(mask["64"]["inputs"]["mask"], ["70", 0])
+        self.assertEqual(mask["90"]["inputs"]["destination"], ["83", 0])   # the fallback too
+        self.assertIn("the head (8% of the picture) is the original's own pixels", self.text(res))
+        # A whole-picture edit with a kept head is the whole frame but the head.
+        comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "make it night",
+                                             "whole_picture": True, "keep": "face"})
+        mask = self.fake.prompts["p5"]
+        self.assertEqual(mask["43"]["class_type"], "SolidMask")
+        self.assertEqual(mask["60"]["inputs"]["mask"], ["43", 0])
+        self.assertEqual(self.fake.prompts["p6"]["31"]["inputs"]["image"], "edit65.png [temp]")
 
     def test_edit_without_an_edit_model_says_so(self):
         res = comfy.call_tool("comfy_edit_image", {"image": "a.png", "instruction": "x"})
