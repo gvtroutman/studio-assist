@@ -64,6 +64,9 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
+- **`studio_scene.py`**, **`studio_scene_ui.py`** — the Image Studio's Scene Builder: a
+  posable mannequin and simple props on a floor, one camera, and the frame it sees,
+  rendered to the PNG the Image Studio makes the picture from. See *The Scene Builder*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -657,6 +660,72 @@ Older servers without `/global/health` are read from `/doc` instead.
 
 The window does not stop the container when it closes, just as it does not close After
 Effects. `docker stop studio-opencode` does; the workspace and the session volume stay.
+
+### The Scene Builder: a stage for the Image Studio
+
+**Scene Builder…**, under the Image Studio's Scene field, opens one window laid out like a
+slicer: library and object list on the left, the viewport with Move / Rotate / Scale in
+the middle, the selected object's controls on the right, Open / Save / Generate along the
+bottom. It blocks out a picture; it is not a 3D package. `studio_scene.py` is the engine
+(no tkinter, tested headless), `studio_scene_ui.SceneBuilder` the window, a collaborator
+of `ImageStudio` exactly as `CharacterCreator` is. The rules:
+
+- **Generate goes through the Image Studio, never beside it.** The builder renders the
+  frame (`write_reference`, under `image-studio/scenes/renders/`, named by content hash),
+  writes the scene's words into the form's Scene field, sets the form's `source`
+  reference, and calls `ImageStudio.generate(extra=...)`. `extra` lays the frame's
+  size, the denoise (`redraw`), `scene_layout` (the whole scene) and `scene_file` over
+  the form's settings for that job alone: History records them, and the next plain
+  Generate from the form carries none of them. Routing, refusals, the queue, the face
+  pass and Generate Again are the Image Studio's, unchanged.
+- **The frame is a `source` reference, because that is what exists.** No backend has
+  pose or depth ControlNet, IP-Adapter or PuLID (see the Image Studio's references), so
+  the blockout is image to image at `redraw` denoise (0.7 by default; lower keeps the
+  layout, higher lets the picture leave the grey shapes behind). A model whose
+  workflow declares no `source` input - the FLUX baseline today - would silently make a
+  picture without the frame, so `SceneBuilder.check()` says so the moment something is
+  added and Generate refuses, naming the models that do take one. When a pose
+  ControlNet lands, it is a new reference kind in a workflow; the builder already has
+  the skeleton to draw a pose map from (`skeleton()`).
+- **The viewport is the frame.** The canvas always looks through the one camera; the lit
+  rectangle is `render()` at the generation size, the same polygon list `png()`
+  rasterises, so what is inside it is exactly the reference. Outside it is dimmed
+  context. The metre grid and the selection outline are the window's only: the picture
+  must not be told the floor is tiled.
+- **Descriptions are sent as written.** `scene_text()` adds only what the words cannot
+  know - where each object is in the frame, which way a person faces, a non-standing
+  pose - in parentheses before the user's text, and it says "a person" so the anatomy
+  constants apply. An object outside the frame is left out of the words and said so,
+  and so is an object with no description. A test holds punctuation and case verbatim.
+- **Everything stands on its floor.** An object's lowest point is put at its position's
+  y (`object_pieces`), so a crouch drops the hips, a kneel puts the knee down and a
+  tipped drum lies on the floor; y is the floor it stands on (a platform, a step).
+- **The rig is forward kinematics over named controls.** `JOINTS` is the skeleton,
+  `CONTROLS` the handful of sliders grouped by part (body, head, each hand and foot),
+  `POSES` presets of them. A click on the mannequin selects the part under it (each
+  face carries its object and part as canvas tags), and the inspector shows that
+  part's sliders. Moving any slider by hand clears the preset name, so the words stop
+  claiming "kneeling" for a pose that no longer is.
+- **A move is on a level plane through the object's middle**, not the floor. A ray
+  through a person's chest meets the floor far behind them nearly edge on, and a 60 px
+  drag moved one 14 m; when even the middle's plane is edge on, the drag falls back to
+  screen-space metres at the object's depth.
+- **It cannot outlive its form, and it goes on the UI thread.** `Session.close` runs on
+  a worker thread, and a Tk call there raises "main thread is not in main loop". So
+  `ImageStudio.release()` closes the builder from `Chat._close_tab` (beside
+  `browser.release()`) and from `_quit`, and `ImageStudio.close()` touches no widget.
+  An unsaved scene asks to be saved on the way out.
+- **A scene file is the user's work.** `*.scene.json` under `image-studio/scenes/` by
+  default, written through a temp file and `os.replace`. `clean_scene` opens damaged
+  or older files with what it can read and names what it could not (an unknown
+  asset); objects are named by asset id, not geometry, so a better mesh from Blender
+  later opens old scenes unchanged. Closing with unsaved changes asks first.
+- **Stdlib, like everything else.** The meshes are built in code, the renderer is a
+  painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
+  cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
+  and is drawn over a person at its far end; a test holds that case), and the PNG is a
+  scanline fill written by `studio_icons.png`. Blender can make better assets offline;
+  nothing here needs it to stage a picture.
 
 ### The tab that holds a window: `PanelSpec`
 
