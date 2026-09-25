@@ -980,10 +980,16 @@ pruning**: not on a timer, not to keep the folder tidy. Deleting is a per-task b
 that asks first. (Nineteen saved tasks were examined when this was written; every one
 held a real request. An age or count based sweep would have deleted work.)
 
-**Auto-update only fast-forwards.** `studio_update.py` (a scheduled task under `pyw`,
-set up with `--install`) polls GitHub and runs `merge --ff-only`. It must never
-merge, stash, reset or check out over local work: the workstation sometimes carries its
-own commits, and an updater that "resolves" them destroys them silently. A refusal
+**Auto-update only fast-forwards, and follows `main`.** `studio_update.py` (a
+scheduled task under `pyw`, set up with `--install`) polls GitHub and runs
+`merge --ff-only` against `origin/main` (`BRANCH`). It used to follow whatever
+branch was checked out, and the workstation sat on a feature branch that had been
+merged: a merged branch never moves again, so updates silently stopped. A folder on
+another branch is now moved onto `main`, but only when its tracked files are clean
+and every commit on it is already in `origin/main`; the old branch is left as it
+is. It must never merge, stash, reset or check out over local work: the workstation
+sometimes carries its own commits, and an updater that "resolves" them destroys them
+silently. A refusal
 goes to `studio_update.log`, and so does a successful update. A pass with nothing
 to do writes nothing. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
 console hangs forever and nobody sees it.
