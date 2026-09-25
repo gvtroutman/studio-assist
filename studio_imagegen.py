@@ -1220,11 +1220,46 @@ def missing_for(model, backend, inventory, nodes=None, workflow_loader=None):
 def default_settings():
     return {"preset": "standard", "model": "flux-dev", "backend": "auto",
             "identities": [], "style": "none", "style_strength": None,
-            "scene": "", "negative": "", "loras": [], "references": {},
+            "scene": "", "subject": "", "hair": "", "eyes": "", "build": "",
+            "traits": "", "camera": "", "negative": "", "loras": [], "references": {},
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
             "face_detail": None, "batch": 1}
+
+
+# The person's attributes on the form: (setting, label, noun). A value that
+# does not already name its noun gets it: "auburn" -> "auburn hair".
+PERSON_FIELDS = [
+    ("hair", "Hair", ("hair",)),
+    ("eyes", "Eyes", ("eye",)),
+    ("build", "Build / weight", ("build", "weight", "figure", "body", "physique",
+                                 "lb", "kg", "pound", "kilo")),
+    ("traits", "Other", ()),
+]
+
+
+def _field(s, key):
+    v = s.get(key)
+    return v.strip().strip(",.").strip() if isinstance(v, str) else ""
+
+
+def person_text(settings):
+    """The person as prompt text: who they are, then their attributes.
+    "a woman in her 30s, auburn hair, green eyes, slim build"."""
+    bits = [_field(settings, "subject")]
+    for key, _, nouns in PERSON_FIELDS:
+        v = _field(settings, key)
+        if v and nouns and not any(n in v.lower() for n in nouns):
+            v += " " + nouns[0] + ("s" if nouns[0] == "eye" else "")
+        bits.append(v)
+    return ", ".join(b for b in bits if b)
+
+
+def summary(settings):
+    """One line for a job row before its prompt is composed."""
+    return ". ".join(x for x in (_field(settings, "scene"), person_text(settings),
+                                 _field(settings, "camera")) if x)
 
 
 def resolve_model(model, backend_id):
@@ -1360,12 +1395,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
 
     # ----------------------------------------------------------- prompt
     who = [i["trigger"] for i, _ in idents if i["trigger"]]
-    scene = s["scene"].strip()
-    parts = []
-    if who and not all(t in scene for t in who):
-        parts.append(" and ".join(t for t in who if t not in scene))
-    if scene:
-        parts.append(scene)
+    scene = _field(s, "scene")
+    person = person_text(s)
+    named = " and ".join(t for t in who if t not in scene)
+    parts = [x for x in (", ".join(x for x in (named, person) if x), scene,
+                         _field(s, "camera")) if x]
     if style:
         extra = " ".join(x for x in (style["trigger"], style["prompt"]) if x)
         if extra:
@@ -1375,7 +1409,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             parts.append(rec["trigger"])
     p.prompt = ". ".join(x.rstrip(" .") for x in parts if x) + ("." if parts else "")
     if not p.prompt:
-        p.errors.append("Describe the scene, or choose a person.")
+        p.errors.append("Describe the scene or the person, or choose a person.")
     p.negative = ", ".join(x for x in (s["negative"].strip(),
                                         style["negative"] if style else "") if x)
     if style and style["families"] and family not in style["families"]:
