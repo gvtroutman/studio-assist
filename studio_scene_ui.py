@@ -482,7 +482,8 @@ class SceneBuilder:
         if a["kind"] == "person":
             self._look_controls(obj)
 
-        o.cap(p, "Colour")
+        o.cap(p, "Colour (skin, and whatever is not worn)" if a["kind"] == "person"
+              else "Colour")
         sw = o.frame(p)
         sw.pack(side="top", fill="x")
         for hexc, cname in sc.COLOURS:
@@ -568,8 +569,8 @@ class SceneBuilder:
                         look.pop(k, None)
             if relight[0]:
                 relight[0]()
-            self.dirty = True
-            self._words()
+            # The body and the clothes are the mannequin's shape and colours.
+            self.changed()
         if self.look_section == ig.SLIDER_SECTION:
             o.slider_rows(p, steps, changed)
         relight[0] = o.look_rows(p, section, text, changed)
