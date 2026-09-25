@@ -364,24 +364,103 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
     def test_person_attributes_and_camera(self):
         p = self.plan(style="none", scene="On a pier at dusk.", subject="a woman in her 30s",
                       hair="auburn", eyes="green", build="slim", traits="freckles",
-                      camera="85mm, shallow depth of field")
+                      camera="85mm, shallow depth of field", anatomy=False)
         self.assertEqual(p.errors, [])
-        self.assertEqual(p.prompt, "a woman in her 30s, auburn hair, green eyes, slim build, "
+        self.assertEqual(p.prompt, "a woman in her 30s, slim build, green eyes, auburn hair, "
                                    "freckles. On a pier at dusk. 85mm, shallow depth of field.")
 
     def test_attributes_keep_their_own_nouns(self):
         self.assertEqual(ig.person_text({"hair": "long black hair", "eyes": "hazel eyes",
                                          "build": "about 70 kg"}),
-                         "long black hair, hazel eyes, about 70 kg")
+                         "about 70 kg, hazel eyes, long black hair")
+
+    def test_the_whole_character(self):
+        self.assertEqual(ig.person_text({
+            "subject": "a woman", "age": "in their 30s", "skin": "olive", "weight": -1,
+            "stature": 2, "eyes": "green", "facial_hair": "", "hair": "auburn",
+            "hair_style": "long wavy", "traits": "freckles", "expression": "neutral",
+            "gaze": "looking at the camera", "top": "knit sweater", "bottom": "blue jeans",
+            "footwear": "ankle boots", "accessories": "glasses, necklace"}),
+            "a woman, in their 30s, olive skin, slim, tall, green eyes, long wavy auburn hair, "
+            "freckles, neutral expression, looking at the camera, wearing knit sweater, "
+            "blue jeans and ankle boots, with glasses and necklace")
+
+    def test_hair_reads_as_one_phrase(self):
+        self.assertEqual(ig.hair_text({"hair": "auburn", "hair_style": "in a bun"}),
+                         "auburn hair in a bun")
+        self.assertEqual(ig.hair_text({"hair": "grey", "hair_style": "buzz cut"}), "grey buzz cut")
+        self.assertEqual(ig.hair_text({"hair": "black", "hair_style": "bald"}), "bald")
+        self.assertEqual(ig.hair_text({"hair_style": "curly"}), "curly hair")
+
+    def test_sliders_say_nothing_in_the_middle(self):
+        self.assertEqual(ig.slider_word("weight", 0), "")
+        self.assertEqual(ig.slider_word("weight", 3), "very heavyset")
+        self.assertEqual(ig.slider_word("muscle", 9), "very muscular")      # clamped
+        self.assertEqual(ig.slider_word("stature", -2), "short")
+
+    def test_picks_toggle(self):
+        self.assertEqual(ig.toggle("", "glasses", True), "glasses")
+        self.assertEqual(ig.toggle("glasses", "necklace", True), "glasses, necklace")
+        self.assertEqual(ig.toggle("Glasses, necklace", "glasses", True), "necklace")
+        self.assertEqual(ig.toggle("sad", "angry", False), "angry")
+        self.assertEqual(ig.toggle("angry", "angry", False), "")
+
+    def test_every_expression_has_its_emoji(self):
+        for pick in ig.SLOTS["expression"][3]:
+            self.assertIn(pick, ig.EMOJI)
+            self.assertTrue(ig.pick_label(pick).endswith(" " + pick))
+        p = self.plan(style="none", subject="a man", expression="laughing")
+        self.assertNotIn(ig.EMOJI["laughing"], p.prompt)
+
+    def test_anatomy_constants_for_every_person(self):
+        p = self.plan(style="none", subject="a woman", scene="Waving hello.")
+        self.assertIn("every person has exactly two hands, each with four fingers and a "
+                      "thumb, two feet, two eyes and a proportionate body", p.prompt)
+        self.assertIn("extra fingers", p.negative)
+        p = self.plan(style="none", scene="Two dancers on a stage.")
+        self.assertIn("four fingers and a thumb", p.prompt)          # the scene names people
+        p = self.plan(style="none", scene="A red bicycle against a white wall.")
+        self.assertNotIn("fingers", p.prompt + p.negative)            # nobody in it
+        p = self.plan(style="none", subject="a woman", anatomy=False)
+        self.assertNotIn("fingers", p.prompt + p.negative)
 
     def test_identity_joins_the_described_person(self):
         p = self.plan(identities=["gavin"], style="none", hair="grey", scene="Reading.")
         self.assertTrue(p.prompt.startswith("GAVINPERSON, grey hair. Reading."), p.prompt)
 
     def test_a_person_alone_is_enough(self):
-        p = self.plan(style="none", subject="an old fisherman")
+        p = self.plan(style="none", subject="an old fisherman", anatomy=False)
         self.assertEqual(p.errors, [])
         self.assertEqual(p.prompt, "an old fisherman.")
+
+    def test_item_pictures_need_a_workflow_that_takes_them(self):
+        pic = os.path.join(self.dir, "glasses.png")
+        open(pic, "wb").close()
+        p = self.plan(style="none", subject="a man", accessories="glasses",
+                      item_refs={"glasses": pic, "hat": pic})
+        self.assertEqual(p.images, {})
+        self.assertTrue(any("Pictures of the glasses" in w and "no item reference input" in w
+                            for w in p.warnings), p.warnings)
+        self.assertFalse(any("hat" in w for w in p.warnings))          # not worn today
+
+    def test_a_character_keeps_its_look_not_its_expression(self):
+        rec = ig.clean_character({"name": "Mara", "identity": "lilya",
+                                  "looks": {"hair": "auburn", "weight": -1, "muscle": 0,
+                                            "expression": "sad", "top": "hoodie",
+                                            "nonsense": "x"},
+                                  "item_refs": {"hoodie": "C:/h.png", "": "x"}})
+        self.assertEqual(rec["id"], "mara")
+        self.assertEqual(rec["looks"], {"hair": "auburn", "weight": -1, "top": "hoodie"})
+        self.assertEqual(rec["item_refs"], {"hoodie": "C:/h.png"})
+
+    def test_random_looks_fill_the_creator(self):
+        import random
+        looks = ig.random_looks(random.Random(4))
+        self.assertTrue(looks["subject"])
+        self.assertNotIn("expression", looks)
+        self.assertTrue(all(k in ig.CHARACTER_KEYS for k in looks))
+        only = ig.random_looks(random.Random(4), sections=["Hair"])
+        self.assertEqual(set(only), {"hair", "hair_style"})
 
     def test_two_people_in_one_picture(self):
         p = self.plan(identities=["gavin", "lilya"], scene="Dancing.")
@@ -893,6 +972,55 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("lilya", ui.idents)                # the form picked it up
         with open(os.path.join(ui.studio.lib.root, "identities.json")) as f:
             self.assertIn("LILYAPERSON", f.read())
+
+    def test_a_character_goes_from_the_creator_to_the_form_and_history(self):
+        s, ui = self.tab()
+        ed = ui.edit_characters()
+        ed._new()
+        ed.name.set("Mara")
+        ed.identity.set("")
+        ed.vars["hair"].set("auburn")
+        ed.vars["accessories"].set("glasses")
+        ed.sl["weight"].set(-1)
+        ed._show("Accessories")
+        self.app.update()
+        pic = os.path.join(tempfile.mkdtemp(), "glasses.png")
+        import tkinter as tk
+        tk.PhotoImage(master=self.app, width=4, height=4).write(pic, format="png")
+        ed._set_item("glasses", pic)
+        ed._changed()
+        self.assertIn("slim", ed.sheet.cget("text"))
+        self.assertIn("with glasses", ed.sheet.cget("text"))
+        for tab in ed.SECTIONS:
+            ed._show(tab)
+            self.app.update()
+        ed._randomize()                               # every look tab, from Constants
+        ed.vars["hair"].set("auburn")
+        ed.vars["accessories"].set("glasses")
+        ed.sl["weight"].set(-1)
+        ed._use()
+        ed.win.destroy()
+        rec = ui.studio.lib.get("characters", "mara")
+        self.assertEqual(rec["looks"]["weight"], -1)
+        self.assertIn("glasses", rec["item_refs"])
+        self.assertEqual(ui.settings["character"], "mara")
+        self.assertEqual(ui.text["hair"].get(), "auburn")
+        ui.text["expression"].set("")
+        ui._show_looks("Expression")
+        faces = [w for w in ui.look_box.winfo_children()]
+        self.assertTrue(faces)
+        s_ = ui.collect()
+        self.assertEqual((s_["character"], s_["weight"], s_["accessories"]),
+                         ("mara", -1, "glasses"))
+        self.assertIn("glasses", s_["item_refs"])
+        ui.text["hair"].set("")
+        ui.sliders["weight"].set(0)
+        ui.apply(s_)                                  # Reuse Settings brings it back
+        self.assertEqual((ui.text["hair"].get(), ui.sliders["weight"].get()), ("auburn", -1))
+        for name, _ in ig.LOOKS:
+            ui._show_looks(name)
+            self.app.update()
+        ui.save_as_character().win.destroy()
 
     def test_the_form_says_where_it_goes_and_refuses_what_cannot_run(self):
         s, ui = self.tab()
