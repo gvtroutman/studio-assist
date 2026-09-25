@@ -477,8 +477,10 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 - **Identity and style are separate records.** An identity is a LoRA, a trigger, a
   strength and reference photos (copied under `image-studio/references/`). A style
   is a LoRA and/or prompt additions plus look defaults. The precedence is model
-  defaults < style < preset < the form. `compose()` builds the prompt as triggers,
-  then the scene, then the style. It is pure and does no I/O, which is how the form
+  defaults < style < preset < the form. `compose()` builds the prompt as the person
+  (identity triggers, then the Who field and its attributes, `person_text`: a bare
+  "auburn" becomes "auburn hair"), then the scene, then the camera line, then the
+  style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
 - **Styles are chosen by picture.** The form shows each style as a tile of one cat
   photo in that style (`style_example`): the style's own `example` (a PNG), else
