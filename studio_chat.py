@@ -1378,6 +1378,8 @@ class Chat(tk.Tk):
         ui["tab"].destroy()
         if s.browser is not None:
             s.browser.release()           # out of the frame before it goes
+        if s.images is not None:
+            s.images.release()            # the Scene Builder goes with its form
         s.frame.destroy()
         self._fit_tabs()
         # Shutting an MCP subprocess down can block for a moment; a turn still
@@ -4763,6 +4765,9 @@ class Chat(tk.Tk):
         # flag and does not re-arm. Leaving them armed is what printed
         # "invalid command name ..._drain" over a window that was already gone.
         self.closing = True
+        for s in self.sessions.values():
+            if s.images is not None:
+                s.images.release()        # on this thread: an unsaved scene asks first
         self.anim.clear()
         for timer in ("drain_timer", "host_timer", "anim_timer"):
             self._stand_down(timer)
