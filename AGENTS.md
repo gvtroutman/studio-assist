@@ -705,6 +705,18 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   (`character_look`: blank where it has none, the expression and gaze kept) and, if the
   person still has the default name, its name; it is a copy, like the form's. The look is
   said in that person's line, `Name (a person, where, facing): look. Description`.
+- **The mannequin wears the look, because the frame is what the picture copies.** At
+  `redraw` denoise a heavyset person drawn as the rest mannequin is pulled thin again,
+  so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
+  Height sliders, plus a Body type word `BUILDS` knows, as steps added to them (clamped,
+  so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
+  Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
+  sweater the forearm too), a dress, skirt or long coat adds a hem that follows the
+  legs, boots a shaft. The colour is the first `CLOTH` word in the garment ("black
+  leather jacket" is black), else the slot's default. What is not worn is the object's
+  colour. The words are still sent as written; this only draws them. Every look edit
+  in the inspector goes through `changed()`, so the viewport follows each keystroke
+  and slider step.
 - **With people in the scene, the form's person is blanked for the job.** `generation()`
   lays empty slots, zero sliders, no `character` and no `item_refs` over the form, or the
   picture gets the form's person as well (an extra person, or two blended). The first

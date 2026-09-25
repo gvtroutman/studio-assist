@@ -25,7 +25,9 @@ pieces:
 - **A person's look** (`look`, `character`): the Image Studio's character
   creator slots and sliders, per person - who, body, face, hair, expression,
   clothes, accessories - or a character's look copied on. It is said in that
-  person's line, so two people in one picture each keep their own.
+  person's line, so two people in one picture each keep their own. The
+  mannequin is built to it too (`body_shape`: weight, muscle, height) and
+  wears its clothes (`outfit`), since the frame is what the picture copies.
 - **The camera** orbits a target: yaw, pitch, distance and a lens in mm on a
   full-frame diagonal, so 35mm means what it does on a camera whatever the
   frame's shape (`Camera`).
@@ -354,13 +356,19 @@ def joint_rotations(c):
     return rot
 
 
-def skeleton(controls, root=IDENTITY):
+def skeleton(controls, root=IDENTITY, shape=None):
     """Forward kinematics: {joint: (position, world rotation)} with the
-    pelvis at the origin and the whole rig turned by `root`."""
+    pelvis at the origin and the whole rig turned by `root`. `shape`
+    (`body_shape`) sets the shoulders and hips apart."""
     rot = joint_rotations(controls)
+    shape = shape or REST_SHAPE
+    wide = {"shoulder": shape["shoulders"], "hip": shape["hips"]}
     out = {}
     for name, parent, offset in JOINTS:
         local = rot.get(name, IDENTITY)
+        k = wide.get(name.split("_")[0])
+        if k:
+            offset = (offset[0] * k, offset[1], offset[2])
         if parent is None:
             out[name] = ((0.0, 0.0, 0.0), mat_mul(root, local))
         else:
@@ -369,22 +377,221 @@ def skeleton(controls, root=IDENTITY):
     return out
 
 
-def person_pieces(controls, root=IDENTITY):
-    """The mannequin: [(part, faces)], pelvis at the origin. Parts are the
-    control groups, so a click on a hand selects the hand's controls."""
-    sk = skeleton(controls, root)
+# ==================================================================== the body
+# A person's look sizes the mannequin: the Weight, Muscle and Height sliders
+# (-3..3, as the Image Studio stores them) and a Body type word this table
+# knows, as slider steps it adds. The picture is image to image from the
+# frame, so a heavyset person drawn as the rest mannequin would be pulled
+# thin again.
+BUILDS = [
+    ("athletic", {"muscle": 1.5, "weight": -0.5}), ("lean", {"weight": -1, "muscle": 0.5}),
+    ("curvy", {"weight": 0.5, "curves": 2}), ("broad-shouldered", {"muscle": 1, "shoulders": 1}),
+    ("stocky", {"weight": 1.5, "muscle": 1, "stature": -0.5}),
+    ("lanky", {"weight": -1.5, "stature": 1}), ("petite", {"weight": -1, "stature": -1.5}),
+    ("skinny", {"weight": -2}), ("slender", {"weight": -1}), ("slim", {"weight": -1}),
+    ("thin", {"weight": -1.5}), ("chubby", {"weight": 1.5}), ("plump", {"weight": 1.5}),
+    ("heavy", {"weight": 2}), ("heavyset", {"weight": 2}), ("overweight", {"weight": 2}),
+    ("plus-size", {"weight": 2, "curves": 1}), ("fat", {"weight": 2.5}),
+    ("obese", {"weight": 3}), ("muscular", {"muscle": 2}), ("bulky", {"muscle": 1.5, "weight": 1}),
+    ("burly", {"muscle": 1.5, "weight": 1}), ("toned", {"muscle": 1}),
+]
+
+
+def body_shape(look=None):
+    """A look -> the factors the mannequin is built with, 1 at rest:
+    `height` (all of it), `fat` (girth everywhere), `belly`, `muscle`
+    (chest, shoulders and limbs), and how far apart the `shoulders` and
+    `hips` are."""
+    look = look if isinstance(look, dict) else {}
+    s = {k: _num(look.get(k), 0, -3, 3) for k in ("weight", "muscle", "stature")}
+    s["curves"] = s["shoulders"] = 0.0
+    build = str(look.get("build") or "").lower()
+    for word, steps in BUILDS:
+        if re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(word), build):
+            for k, v in steps.items():
+                s[k] += v
+    w, m, h = (max(-3.0, min(3.0, s[k])) for k in ("weight", "muscle", "stature"))
+    fat = 1 + (0.17 if w > 0 else 0.08) * w
+    muscle = 1 + 0.06 * m
+    return {"height": 1 + 0.04 * h, "fat": fat, "belly": 1 + 0.1 * max(0.0, w),
+            "muscle": muscle,
+            "shoulders": 1 + 0.35 * (fat - 1) + 0.8 * (muscle - 1) + 0.04 * s["shoulders"],
+            "hips": 1 + 0.55 * (fat - 1) + 0.05 * s["curves"]}
+
+
+REST_SHAPE = {"height": 1.0, "fat": 1.0, "belly": 1.0, "muscle": 1.0, "shoulders": 1.0,
+              "hips": 1.0}           # body_shape({}), which needs _num from below
+
+
+# What a person wears, drawn on the mannequin from the look's Clothes words.
+# Each piece of the body is a region; a garment colours the regions it
+# covers, a skirt or a long coat adds a hem, boots add a shaft. The colour is
+# the first colour word in the garment's words ("black leather jacket" is
+# black, "leather jacket" leather), then `dark` / `light` before it.
+CLOTH = [
+    ("hi-vis", "#c8dc3c"), ("high-vis", "#c8dc3c"), ("hi vis", "#c8dc3c"),
+    ("fluorescent", "#c8dc3c"), ("neon", "#c8dc3c"), ("black", "#27272b"),
+    ("white", "#ecebe6"), ("ivory", "#e9e2cc"), ("cream", "#e9e0c6"), ("grey", "#8b8d91"),
+    ("gray", "#8b8d91"), ("charcoal", "#45474c"), ("silver", "#b9bcc0"), ("navy", "#28324f"),
+    ("denim", "#4d6a8f"), ("jeans", "#4d6a8f"), ("blue", "#3f6fb0"), ("teal", "#2f7f7f"),
+    ("turquoise", "#3aa6a6"), ("green", "#4f7d4a"), ("olive", "#6b6b3a"),
+    ("khaki", "#b3a37a"), ("chinos", "#b3a37a"), ("beige", "#cdbb9a"), ("camel", "#b08a5a"),
+    ("tan", "#b48d64"), ("brown", "#6b4a33"), ("leather", "#3b2a22"), ("red", "#b0342f"),
+    ("burgundy", "#6e2233"), ("maroon", "#6e2233"), ("wine", "#6e2233"), ("pink", "#e39ab0"),
+    ("orange", "#d9772f"), ("yellow", "#e2c23c"), ("mustard", "#c9a032"),
+    ("purple", "#6b4a8f"), ("lavender", "#b4a4d6"), ("gold", "#c9a54a"),
+    ("tuxedo", "#27272b"), ("suit", "#45474c"), ("trench", "#b3a37a"),
+]
+CLOTH_DEFAULT = {"top": "#8d97a3", "bottom": "#4c5566", "outerwear": "#5e564d",
+                 "footwear": "#34302d"}
+TORSO = ("chest", "belly")
+SLEEVES = ("upper_arm", "forearm")
+LEGS = ("hips", "thigh", "shin")
+
+
+def _said(text, *words):
+    return any(re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(w), text) for w in words)
+
+
+def cloth_colour(text, slot):
+    """A garment's words -> its colour, (r, g, b)."""
+    found = []
+    for word, hexc in CLOTH:
+        m = re.search(r"(?<![\w-])%s" % re.escape(word), text)
+        if m:
+            found.append((m.start(), -len(word), hexc))
+    rgb = hex_rgb(min(found)[2] if found else CLOTH_DEFAULT[slot])
+    if found:
+        before = text[:min(found)[0]].split()
+        if before and before[-1] in ("dark", "deep"):
+            rgb = tuple(int(c * 0.6) for c in rgb)
+        elif before and before[-1] in ("light", "pale", "pastel"):
+            rgb = tuple(int(c + (255 - c) * 0.45) for c in rgb)
+    return rgb
+
+
+def _hem(text, default):
+    """How far down the legs a skirt or coat reaches: 1 is the knee, 2 the
+    ankle."""
+    if _said(text, "gown", "maxi", "floor-length", "long"):
+        return 1.95
+    if _said(text, "midi"):
+        return 1.4
+    if _said(text, "mini"):
+        return 0.55
+    return default
+
+
+def outfit(look=None):
+    """The look's Clothes -> {"regions": {region: rgb}, "hems": [(reach, rgb,
+    outer)], "boots": (height m, rgb) or None}. Empty for a person with no
+    clothes said, who stays the plain mannequin."""
+    look = look if isinstance(look, dict) else {}
+    said = {k: str(look.get(k) or "").strip().lower()
+            for k in ("top", "bottom", "outerwear", "footwear")}
+    regions, hems, boots = {}, [], None
+    top = said["top"]
+    dress = False
+    if top:
+        rgb = cloth_colour(top, "top")
+        if _said(top, "dress", "gown", "frock", "sundress"):
+            dress = True
+            cover = TORSO + ("hips",)
+            if _said(top, "long-sleeve", "long-sleeved", "long sleeve", "long sleeves"):
+                cover += SLEEVES
+            elif _said(top, "short-sleeve", "short-sleeved", "short sleeve", "t-shirt"):
+                cover += ("upper_arm",)
+            hems.append((_hem(top, 1.0), rgb, False))
+        elif _said(top, "suit", "tuxedo", "jumpsuit", "overalls", "boilersuit",
+                   "coverall", "coveralls", "onesie"):
+            cover = TORSO + SLEEVES + LEGS
+        elif _said(top, "tank", "vest", "camisole", "cami", "sleeveless", "halter",
+                   "tube top", "bikini", "bra"):
+            cover = TORSO
+        elif _said(top, "t-shirt", "tshirt", "tee", "polo", "short-sleeve",
+                   "short-sleeved", "short sleeve"):
+            cover = TORSO + ("upper_arm",)
+        else:
+            cover = TORSO + SLEEVES
+        if _said(top, "turtleneck", "polo neck", "roll neck"):
+            cover += ("neck",)
+        regions.update(dict.fromkeys(cover, rgb))
+    bottom = said["bottom"]
+    if bottom:
+        rgb = cloth_colour(bottom, "bottom")
+        if _said(bottom, "skirt", "kilt", "sarong"):
+            cover = ("hips",)
+            hems.append((_hem(bottom, 0.9), rgb, False))
+        elif _said(bottom, "shorts", "briefs", "trunks", "boxers", "swimsuit"):
+            cover = ("hips", "thigh")
+        else:
+            cover = LEGS
+        if dress:                         # under a dress, only the legs show
+            cover = tuple(c for c in cover if c != "hips")
+        regions.update(dict.fromkeys(cover, rgb))
+    outer = said["outerwear"]
+    if outer:
+        rgb = cloth_colour(outer, "outerwear")
+        sleeveless = _said(outer, "vest", "gilet", "waistcoat", "tabard", "poncho")
+        regions.update(dict.fromkeys(TORSO + (() if sleeveless else SLEEVES), rgb))
+        if _said(outer, "trench", "overcoat", "raincoat", "parka", "duster", "lab coat",
+                 "long coat", "robe", "cloak"):
+            hems.append((_hem(outer, 1.05), rgb, True))
+            regions["hips"] = rgb
+        elif _said(outer, "coat"):
+            hems.append((_hem(outer, 0.6), rgb, True))
+            regions["hips"] = rgb
+    feet = said["footwear"]
+    if feet and not _said(feet, "barefoot", "bare feet", "none"):
+        rgb = cloth_colour(feet, "footwear")
+        regions["foot"] = rgb
+        if _said(feet, "boot", "boots", "wellies", "wellingtons"):
+            boots = (0.09 if _said(feet, "ankle") else 0.24, rgb)
+    return {"regions": regions, "hems": hems, "boots": boots}
+
+
+def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
+    """The mannequin: [(part, faces, rgb or None)], pelvis at the origin,
+    built to `shape` (`body_shape`) and wearing `dressed` (`outfit`); rgb
+    None is the object's own colour. Parts are the control groups, so a
+    click on a hand selects the hand's controls."""
+    shape = shape or REST_SHAPE
+    dressed = dressed or {"regions": {}, "hems": [], "boots": None}
+    sk = skeleton(controls, root, shape)
     P = lambda j: sk[j][0]                                 # noqa: E731
     M = lambda j: sk[j][1]                                 # noqa: E731
     X = lambda j: column(M(j), 0)                          # noqa: E731
     at = lambda j, v: add(P(j), apply(M(j), v))            # noqa: E731
+    fat, mus = shape["fat"] - 1, shape["muscle"] - 1
+    curve = shape["hips"] - 0.55 * fat               # the hips beyond their girth
+    wear = dressed["regions"]
+    # A covered region is drawn a little fuller, as cloth over it is.
+    k = lambda region, f: f * (1.04 if region in wear else 1.0)    # noqa: E731
+    r = lambda rad, ka, kd=None: (rad[0] * ka, rad[1] * (ka if kd is None else kd))  # noqa
+    hips = k("hips", 1 + 0.9 * fat)
+    belly = k("belly", 1 + 0.9 * fat)
+    chest = k("chest", 1 + 0.7 * fat + mus)
+    neck = k("neck", 1 + 0.5 * fat + 0.6 * mus)
+    upper = k("upper_arm", 1 + 0.7 * fat + 1.3 * mus)
+    fore = k("forearm", 1 + 0.5 * fat + 0.8 * mus)
+    thigh = k("thigh", 1 + 0.8 * fat + 0.8 * mus)
+    shin = k("shin", 1 + 0.45 * fat + 0.6 * mus)
+    # (part, region, faces); a region is what clothes cover, or the rgb of a
+    # piece that is only clothes (a hem, a boot shaft).
     out = [
-        ("body", prism(at("pelvis", (0, -0.07, 0)), P("spine"), X("pelvis"),
-                       (0.16, 0.10), (0.15, 0.10))),
-        ("body", prism(P("spine"), P("chest"), X("spine"), (0.14, 0.095), (0.155, 0.10))),
-        ("body", prism(P("chest"), at("chest", (0, 0.20, 0)), X("chest"),
-                       (0.175, 0.11), (0.14, 0.085))),
-        ("head", prism(P("neck"), P("head"), X("neck"), (0.05, 0.05), (0.048, 0.048), 6)),
-        ("head", ellipsoid(at("head", (0, 0.11, 0.01)), M("head"), (0.085, 0.115, 0.1))),
+        ("body", "hips", prism(at("pelvis", (0, -0.07, 0)), P("spine"), X("pelvis"),
+                               r((0.16, 0.10), hips * curve, hips),
+                               r((0.15, 0.10), belly, belly))),
+        ("body", "belly", prism(P("spine"), P("chest"), X("spine"),
+                                r((0.14, 0.095), belly, belly * shape["belly"]),
+                                r((0.155, 0.10), chest, chest))),
+        ("body", "chest", prism(P("chest"), at("chest", (0, 0.20, 0)), X("chest"),
+                                r((0.175, 0.11), chest * shape["shoulders"] ** 0.5, chest),
+                                r((0.14, 0.085), chest * shape["shoulders"], chest))),
+        ("head", "neck", prism(P("neck"), P("head"), X("neck"), r((0.05, 0.05), neck),
+                               r((0.048, 0.048), neck), 6)),
+        ("head", "head", ellipsoid(at("head", (0, 0.11, 0.01)), M("head"),
+                                   (0.085, 0.115, 0.1))),
     ]
     # The nose says which way the head faces: a small wedge on the front.
     nose = [at("head", v) for v in ((-0.016, 0.07, 0.1), (0.016, 0.07, 0.1),
@@ -392,25 +599,55 @@ def person_pieces(controls, root=IDENTITY):
                                     (-0.01, 0.075, 0.135), (0.01, 0.075, 0.135),
                                     (0.01, 0.1, 0.13), (-0.01, 0.1, 0.13))]
     idx = [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (3, 2, 6, 7), (0, 3, 7, 4), (1, 2, 6, 5)]
-    out.append(("head", outward([[nose[i] for i in f] for f in idx])))
+    out.append(("head", "head", outward([[nose[i] for i in f] for f in idx])))
     for side in ("l", "r"):
         hand, foot = "hand_" + side, "foot_" + side
         out += [
-            (hand, prism(P("shoulder_" + side), P("elbow_" + side), X("shoulder_" + side),
-                         (0.052, 0.052), (0.042, 0.042))),
-            (hand, prism(P("elbow_" + side), P("wrist_" + side), X("elbow_" + side),
-                         (0.042, 0.042), (0.033, 0.03))),
-            (hand, prism(P("wrist_" + side), at("wrist_" + side, (0, -0.18, 0.01)),
-                         X("wrist_" + side), (0.045, 0.022), (0.04, 0.018), 6)),
-            (foot, prism(P("hip_" + side), P("knee_" + side), X("hip_" + side),
-                         (0.078, 0.078), (0.056, 0.056))),
-            (foot, prism(P("knee_" + side), P("ankle_" + side), X("knee_" + side),
-                         (0.052, 0.052), (0.04, 0.04))),
-            (foot, prism(at("ankle_" + side, (0, -0.045, -0.05)),
-                         at("ankle_" + side, (0, -0.045, 0.19)), X("ankle_" + side),
-                         (0.045, 0.035), (0.042, 0.025), 6)),
+            (hand, "upper_arm", prism(P("shoulder_" + side), P("elbow_" + side),
+                                      X("shoulder_" + side), r((0.052, 0.052), upper),
+                                      r((0.042, 0.042), (upper + fore) / 2))),
+            (hand, "forearm", prism(P("elbow_" + side), P("wrist_" + side), X("elbow_" + side),
+                                    r((0.042, 0.042), fore), r((0.033, 0.03), fore))),
+            (hand, "hand", prism(P("wrist_" + side), at("wrist_" + side, (0, -0.18, 0.01)),
+                                 X("wrist_" + side), (0.045, 0.022), (0.04, 0.018), 6)),
+            (foot, "thigh", prism(P("hip_" + side), P("knee_" + side), X("hip_" + side),
+                                  r((0.078, 0.078), thigh), r((0.056, 0.056), shin))),
+            (foot, "shin", prism(P("knee_" + side), P("ankle_" + side), X("knee_" + side),
+                                 r((0.052, 0.052), shin), r((0.04, 0.04), shin))),
+            (foot, "foot", prism(at("ankle_" + side, (0, -0.045, -0.05)),
+                                 at("ankle_" + side, (0, -0.045, 0.19)), X("ankle_" + side),
+                                 r((0.045, 0.035), k("foot", 1)),
+                                 r((0.042, 0.025), k("foot", 1)), 6)),
         ]
-    return out
+        if dressed["boots"]:
+            tall, rgb = dressed["boots"]
+            # The shaft: from the ankle up the shin, over it.
+            up = norm(sub(P("knee_" + side), P("ankle_" + side)))
+            out.append((foot, rgb, prism(at("ankle_" + side, (0, -0.02, 0)),
+                                         add(P("ankle_" + side), mul(up, tall)),
+                                         X("knee_" + side), r((0.054, 0.054), shin),
+                                         r((0.056, 0.056), shin))))
+    # Hems: a skirt or a coat below the waist, a flared tube from the hips to
+    # a line across both legs `reach` of the way down (1 the knee, 2 the
+    # ankle), so it follows a step or a seat.
+    for reach, rgb, outer in dressed["hems"]:
+        line = []
+        for side in ("l", "r"):
+            a, b = (("hip_", "knee_") if reach <= 1 else ("knee_", "ankle_"))
+            t = reach if reach <= 1 else reach - 1
+            line.append(add(P(a + side), mul(sub(P(b + side), P(a + side)), t)))
+        mid = mul(add(line[0], line[1]), 0.5)
+        apart = math.sqrt(dot(sub(line[0], line[1]), sub(line[0], line[1]))) / 2
+        flare = 0.03 + 0.035 * reach + (0.02 if outer else 0)
+        top = at("pelvis", (0, 0.04 if outer else 0.0, 0))
+        out.append(("body", rgb, prism(
+            top, mid, X("pelvis"),
+            (0.165 * hips * curve + (0.015 if outer else 0.005),
+             0.105 * hips + (0.015 if outer else 0.005)),
+            (apart + 0.075 * thigh + flare, 0.08 * thigh + flare), 12)))
+    # Each piece's colour: what it wears, else the object's own.
+    return [(part, faces, region if isinstance(region, tuple) else wear.get(region))
+            for part, region, faces in out]
 
 
 # ==================================================================== assets
@@ -433,22 +670,35 @@ ASSET = {a["id"]: a for a in ASSETS}
 UNIT = {"box": box((-0.5, 0, -0.5), (0.5, 1, 0.5)), "cylinder": cylinder()}
 
 
-def object_pieces(obj):
-    """An object's faces in the world: [(part, faces)], standing on its floor
-    (its lowest point at position y)."""
+def painted_pieces(obj):
+    """An object's faces in the world: [(part, faces, rgb)], standing on its
+    floor (its lowest point at position y). A person is built to their
+    look's body (`body_shape`) and wears its clothes (`outfit`); what is
+    not clothed is the object's colour."""
     rot = euler(*obj["rotation"])
     sx, sy, sz = obj["scale"]
+    own = hex_rgb(obj["colour"])
     if obj["asset"] == "person":
-        pieces = person_pieces(obj["pose"]["controls"], rot)
-        pieces = [(part, [[mul(p, sx) for p in f] for f in faces]) for part, faces in pieces]
+        look = obj.get("look") or {}
+        shape = body_shape(look)
+        k = sx * shape["height"]
+        pieces = [(part, [[mul(p, k) for p in f] for f in faces], rgb or own)
+                  for part, faces, rgb in person_pieces(obj["pose"]["controls"], rot,
+                                                        shape, outfit(look))]
     else:
         faces = [[apply(rot, (p[0] * sx, p[1] * sy, p[2] * sz)) for p in f]
                  for f in UNIT[obj["asset"]]]
-        pieces = [("body", [t for f in faces for t in tiles(f)])]
-    low = min(p[1] for _, faces in pieces for f in faces for p in f)
+        pieces = [("body", [t for f in faces for t in tiles(f)], own)]
+    low = min(p[1] for _, faces, _ in pieces for f in faces for p in f)
     x, y, z = obj["position"]
     shift = (x, y - low, z)
-    return [(part, [[add(p, shift) for p in f] for f in faces]) for part, faces in pieces]
+    return [(part, [[add(p, shift) for p in f] for f in faces], rgb)
+            for part, faces, rgb in pieces]
+
+
+def object_pieces(obj):
+    """An object's faces in the world: [(part, faces)]."""
+    return [(part, faces) for part, faces, _ in painted_pieces(obj)]
 
 
 def bounds(obj):
@@ -943,8 +1193,7 @@ def render(scene, width=None, height=None):
     polys = room_polys(scene, cam)
     faces = []
     for obj in scene["objects"]:
-        rgb = hex_rgb(obj["colour"])
-        for part, fs in object_pieces(obj):
+        for part, fs, rgb in painted_pieces(obj):
             for f in fs:
                 n = newell(f)
                 if dot(n, sub(centroid(f), cam.eye)) >= 0:

@@ -90,6 +90,86 @@ class TestRig(unittest.TestCase):
         self.assertEqual({c[0] for c in sc.CONTROLS}, parts)
 
 
+class TestBodyAndClothes(unittest.TestCase):
+    def person(self, **look):
+        o = sc.new_object("person")
+        o["look"] = look
+        return o
+
+    def width(self, o):
+        lo, hi = sc.bounds(o)
+        return hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
+
+    def test_the_sliders_size_the_mannequin_and_it_still_stands_on_its_floor(self):
+        rest = self.width(self.person())
+        heavy = self.width(self.person(weight=3))
+        thin = self.width(self.person(weight=-3))
+        self.assertGreater(heavy[0], rest[0] * 1.1)
+        self.assertGreater(heavy[2], rest[2] * 1.2)             # the belly
+        self.assertLess(thin[0], rest[0])
+        self.assertGreater(self.width(self.person(muscle=3))[0], rest[0])
+        self.assertAlmostEqual(self.width(self.person(stature=3))[1], rest[1] * 1.12,
+                               places=6)
+        self.assertLess(self.width(self.person(stature=-3))[1], rest[1])
+        for look in ({"weight": 3}, {"stature": -3, "weight": -3}, {"muscle": 3}):
+            self.assertAlmostEqual(sc.bounds(self.person(**look))[0][1], 0.0, places=9)
+
+    def test_a_body_type_word_counts_as_slider_steps(self):
+        self.assertGreater(sc.body_shape({"build": "stocky"})["fat"], 1)
+        self.assertLess(sc.body_shape({"build": "petite"})["height"], 1)
+        self.assertEqual(sc.body_shape({"build": "average"}), sc.body_shape({}))
+        # Words are matched whole: "broad-shouldered" is not "broad", and a
+        # slider already at the end is not pushed past it.
+        self.assertEqual(sc.body_shape({"weight": 3, "build": "obese"})["fat"],
+                         sc.body_shape({"weight": 3})["fat"])
+
+    def test_no_clothes_is_the_plain_mannequin_in_its_colour(self):
+        o = self.person(weight=2)
+        own = sc.hex_rgb(o["colour"])
+        self.assertEqual({rgb for _, _, rgb in sc.painted_pieces(o)}, {own})
+
+    def test_clothes_colour_what_they_cover(self):
+        o = self.person(top="white t-shirt", bottom="blue jeans", footwear="black boots")
+        colours = {rgb for _, _, rgb in sc.painted_pieces(o)}
+        for words, slot in (("white t-shirt", "top"), ("blue jeans", "bottom"),
+                            ("black boots", "footwear")):
+            self.assertIn(sc.cloth_colour(words, slot), colours)
+        self.assertIn(sc.hex_rgb(o["colour"]), colours)         # the forearms, the head
+        dressed = sc.outfit(o["look"])
+        self.assertEqual(dressed["regions"]["upper_arm"], sc.cloth_colour("white", "top"))
+        self.assertNotIn("forearm", dressed["regions"])         # short sleeves
+        self.assertIsNotNone(dressed["boots"])
+        # A dress and a long coat hang below the waist; trousers do not.
+        self.assertEqual(dressed["hems"], [])
+        self.assertEqual(len(sc.outfit({"top": "evening gown"})["hems"]), 1)
+        self.assertEqual(len(sc.outfit({"outerwear": "trench coat"})["hems"]), 1)
+        gown = sc.outfit({"top": "evening gown"})["hems"][0][0]
+        self.assertGreater(gown, sc.outfit({"top": "summer dress"})["hems"][0][0])
+        sleeved = sc.outfit({"top": "long-sleeve summer dress"})    # long sleeves, not long
+        self.assertIn("forearm", sleeved["regions"])
+        self.assertLess(sleeved["hems"][0][0], gown)
+
+    def test_a_garment_is_the_colour_it_names_first(self):
+        black = sc.hex_rgb("#27272b")
+        self.assertEqual(sc.cloth_colour("black leather jacket", "outerwear"), black)
+        self.assertEqual(sc.cloth_colour("leather jacket", "outerwear"),
+                         sc.hex_rgb("#3b2a22"))
+        self.assertEqual(sc.cloth_colour("jeans", "bottom"), sc.hex_rgb("#4d6a8f"))
+        self.assertLess(sum(sc.cloth_colour("dark green hoodie", "top")),
+                        sum(sc.cloth_colour("green hoodie", "top")))
+        self.assertEqual(sc.cloth_colour("hoodie", "top"), sc.hex_rgb(sc.CLOTH_DEFAULT["top"]))
+
+    def test_the_frame_shows_the_clothes(self):
+        s = staged("person")
+        s["objects"][0]["look"] = {"top": "red sweater"}
+        w, h = sc.frame_size(s)
+        polys = [p for p in sc.render(s, w, h) if p.owner]
+        red = lambda rgb: rgb[0] > 2 * rgb[1] and rgb[0] > 2 * rgb[2]   # noqa: E731
+        self.assertTrue(any(red(p.rgb) for p in polys))
+        s["objects"][0]["look"] = {}
+        self.assertFalse(any(red(p.rgb) for p in sc.render(s, w, h) if p.owner))
+
+
 class TestCamera(unittest.TestCase):
     def test_the_target_is_the_middle_of_the_frame(self):
         s = staged()
@@ -626,6 +706,17 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb.look_changed()                                      # as a key in its field
         self.assertEqual(second["look"], {"hair_style": "buzz cut"})
         self.assertIn("buzz cut", sb.words_label.cget("text"))
+
+        # Clothes and the body are drawn at once, not only said.
+        colours = lambda: {sb.canvas.itemcget(i, "fill")             # noqa: E731
+                           for i in sb.canvas.find_withtag("o:" + second["id"])}
+        before = colours()
+        sb._look_tab("Clothes")
+        sb.look_vars["top"].set("red sweater")
+        sb.look_changed()
+        self.assertTrue(colours() - before)
+        self.assertTrue(sb.dirty)
+        del second["look"]["top"]
 
         ui.studio.lib.save("characters", [{"id": "ada", "name": "Ada", "identity": "",
                                            "looks": {"subject": "a woman", "hair": "black",
