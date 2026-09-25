@@ -37,8 +37,14 @@ ADVANCED = [                  # (setting, label, kind)
     ("refine_denoise", "Refine denoise", "float"),
     ("batch", "Batch size", "int"),
 ]
-STATUS_ROLE = {"queued": "muted", "uploading": "accent", "running": "accent",
+STATUS_ROLE = {"queued": "muted", "uploading": "accent", "loading": "accent",
+               "sampling": "accent", "decoding": "accent", "running": "accent",
                "refining": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
+# Where each status sits on the Queued -> ... -> Complete strip.
+STAGE_AT = {"queued": 0, "uploading": 0, "loading": 1, "running": 2, "sampling": 2,
+            "refining": 2, "decoding": 3, "complete": 4}
+READY_MARK = {"ready": "✓", "missing": "✗", "offline": "○", "disabled": "–",
+              "unchecked": "?"}
 
 
 def open_path(path, select=False):
@@ -117,6 +123,9 @@ class ImageStudio:
         elif what == "editor-reload":
             if arg.win.winfo_exists():
                 arg.reload()
+        elif what == "editor-refresh":
+            if arg.win.winfo_exists():
+                arg.refresh()
         elif what == "library":
             self._rebuild_choices()
             self._recheck()
@@ -299,6 +308,10 @@ class ImageStudio:
 
         self.warn = self.label(f, "", "warn", self.host.f_small, wraplength=self.px(380))
         self.warn.pack(side="top", fill="x", pady=(self.px(10), 0), **pad)
+        # Where the job will go, and why, before Generate (plan_route).
+        self.route_note = self.label(f, "", "muted", self.host.f_small,
+                                     wraplength=self.px(380))
+        self.route_note.pack(side="top", fill="x", pady=(self.px(6), 0), **pad)
         grow = self.frame(f)
         grow.pack(side="top", fill="x", pady=(self.px(10), self.px(18)), **pad)
         self.go = self.button(grow, "Generate", self.generate, kind="accent")
@@ -368,14 +381,17 @@ class ImageStudio:
         lib = self.studio.lib
         for w in self.model_row.winfo_children():
             w.destroy()
-        online = [b for b in lib.all("backends")
-                  if (self.studio.health.get(b["id"]) or {}).get("ok")]
         models = []
         for m in lib.all("models"):
             text = "%s  (%s)" % (m["label"], ig.FAMILIES.get(m["family"], m["family"] or "?"))
-            if online and all(b["id"] in self.studio.inventories for b in online):
-                where = [b["name"] for b in online if self.studio.has_model(m["id"])(b)]
-                text += "  — " + (", ".join(where) if where else "not installed")
+            ready = self.studio.readiness(m)
+            if all(state == "unchecked" for state, _ in ready.values()):
+                text += "  — not checked yet"
+            else:
+                where = [self.studio.backend(bid)["name"] for bid, (state, _) in ready.items()
+                         if state == "ready"]
+                text += "  — " + ("ready on " + ", ".join(where) if where else
+                                  "not ready anywhere: Models… says what is missing")
             models.append((m["id"], text))
         if models and self.settings["model"] not in dict(models):
             self.settings["model"] = models[0][0]
@@ -639,15 +655,25 @@ class ImageStudio:
         """Compose against the backend the job would go to, for the warnings
         and the defaults beside the advanced fields. No I/O."""
         s = self.collect()
-        b = self._likely_backend(s)
+        b, why = self.studio.plan_route(s)
         if b is None:
-            self.warn.config(text="No backend is enabled. Backends… adds one.")
-            return
-        p = self.studio.preview(s, b)
-        lines = ["%s: %s" % (b["name"], e) for e in p.errors] + p.warnings
-        self.warn.config(text="\n".join("• " + x for x in lines) if lines else "")
-        self.skin(self.warn, bg="bg", fg="err" if p.errors else "warn")
-        v = p.values
+            self.route_note.config(text="")
+            self.warn.config(text="• " + why)
+            self.skin(self.warn, bg="bg", fg="err")
+            b = next((x for x in self.studio.backends() if x["enabled"]), None)
+            if b is None:
+                return
+            v = self.studio.preview(s, b).values
+        else:
+            p = self.studio.preview(s, b)
+            lines = p.errors + p.warnings
+            self.warn.config(text="\n".join("• " + x for x in lines) if lines else "")
+            self.skin(self.warn, bg="bg", fg="err" if p.errors else "warn")
+            h = self.studio.health.get(b["id"])
+            self.route_note.config(text="Will run on " + why.split("Auto → ", 1)[-1]
+                                   + ("" if h else " Not checked yet: Check asks it."))
+            self.skin(self.route_note, bg="bg", fg="err" if p.errors else "muted")
+            v = p.values
         for key, _, _ in ADVANCED:
             val = v.get(key)
             if key == "seed":
@@ -656,24 +682,22 @@ class ImageStudio:
                 val = 1
             self.hints[key].config(text="" if val in (None, "") else "default %s" % val)
 
-    def _likely_backend(self, s):
-        bid = s.get("backend")
-        if bid and bid != "auto":
-            return self.studio.backend(bid)
-        role = ig.PRESETS.get(s["preset"], ig.PRESETS["standard"])["role"]
-        order = ig.route(role, self.studio.backends(), self.studio.health,
-                         self.studio.has_model(s.get("model")))
-        return order[0] if order else next(
-            (b for b in self.studio.backends() if b["enabled"]), None)
-
     # ============================================================== generate
     def generate(self):
+        """Refuses, in words, what cannot run where it would go: a missing
+        file or node, no backend able to take it. Routing that has not heard
+        from the backends yet is left to submit(), which asks them."""
         s = self.collect()
-        b = self._likely_backend(s)
+        b, why = self.studio.plan_route(s)
+        known = all(bk["id"] in self.studio.health for bk in self.studio.backends()
+                    if bk["enabled"])
+        if b is None and known:
+            self.say(why, "err")
+            return
         if b is not None:
             p = self.studio.preview(s, b)
-            if p is not None and p.errors and s.get("backend") not in (None, "auto"):
-                self.say(" ".join(p.errors), "err")
+            if p is not None and p.errors:
+                self.say("Not sent. " + " ".join(p.errors), "err")
                 return
         self.say("Routing" + ELLIPSIS, "muted")
         self.host._spawn(self.s.event_id, self._submit, s)
@@ -700,13 +724,18 @@ class ImageStudio:
 
     def _check_all(self):
         self.studio.check_all()
-        up = [b["name"] for b in self.studio.backends()
-              if (self.studio.health.get(b["id"]) or {}).get("ok")]
+        up, down = [], []
+        for b in self.studio.backends():
+            h = self.studio.health.get(b["id"]) or {}
+            if h.get("ok"):
+                up.append(b["name"])
+            elif b["enabled"]:
+                down.append("%s: %s" % (b["name"], h.get("detail", "no answer")))
         self._post("health")
-        self._post("said", (("Online: " + ", ".join(up)) if up else
-                            "No backend answered. Check that ComfyUI is running, with "
-                            "--listen on a machine other than this one.",
-                            "muted" if up else "warn"))
+        text = ("Online: " + ", ".join(up)) if up else "No backend answered."
+        if down:
+            text += "  Offline - " + "  ".join(down)
+        self._post("said", (text, "warn" if down else "muted"))
 
     def _paint_health(self):
         for w in self.health_row.winfo_children():
@@ -760,8 +789,10 @@ class ImageStudio:
         acts = self.frame(top, "card")
         acts.pack(side="bottom", fill="x", padx=self.px(10), pady=(self.px(4), self.px(10)))
         self.act_again = self.button(acts, "Generate again", self._again_selected, bg="card")
+        self.act_vary = self.button(acts, "New seed", lambda: self._again_selected(True),
+                                    bg="card")
         self.act_reuse = self.button(acts, "Reuse settings", self._reuse_selected, bg="card")
-        for p in (self.act_again, self.act_reuse):
+        for p in (self.act_again, self.act_vary, self.act_reuse):
             p.pack(side="left", padx=(0, self.px(6)))
             p.set(state="disabled")
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
@@ -885,6 +916,16 @@ class ImageStudio:
         meta = self.label(right, "", "faint", self.host.f_small, bg="card")
         meta.pack(side="top", fill="x")
         self.wrap(meta, right, self.px(12))
+        strip = self.frame(right, "card")
+        strip.pack(side="top", fill="x", pady=(self.px(3), 0))
+        stages = []
+        for i, name in enumerate(ig.STAGES):
+            if i:
+                self.label(strip, "→", "faint", self.host.f_small, bg="card").pack(
+                    side="left", padx=self.px(3))
+            lbl = self.label(strip, name.capitalize(), "faint", self.host.f_small, bg="card")
+            lbl.pack(side="left")
+            stages.append(lbl)
         bar = tk.Canvas(right, height=self.px(4), highlightthickness=0, bd=0)
         self.skin(bar, bg="card")
         bar.pack(side="top", fill="x", pady=(self.px(4), 0), padx=(0, self.px(8)))
@@ -893,6 +934,7 @@ class ImageStudio:
         self.wrap(detail, right, self.px(12))
         widgets = {"row": row, "thumb": thumb, "status": status, "elapsed": elapsed,
                    "bar": bar, "detail": detail, "cancel": cancel, "meta": meta,
+                   "stages": stages, "strip": strip,
                    "base": "%s · %s · %s · seed %s" % (
                        preset, model.get("label", s.get("model")), job.backend["name"],
                        s.get("seed"))}
@@ -912,6 +954,16 @@ class ImageStudio:
         w["meta"].config(text=w["base"] + (" · " + loras if loras else ""))
         w["detail"].config(text=job.detail or "")
         self.skin(w["detail"], bg="card", fg="err" if job.status == "failed" else "faint")
+        at = STAGE_AT.get(job.status)
+        if at is None:                    # failed or cancelled: the strip has said its piece
+            w["strip"].pack_forget()
+        else:
+            for i, lbl in enumerate(w["stages"]):
+                role = "ok" if i < at or job.status == "complete" else (
+                    "accent" if i == at else "faint")
+                self.skin(lbl, bg="card", fg=role)
+                lbl.config(font=self.host.f_bold if i == at and job.status != "complete"
+                           else self.host.f_small)
         w["elapsed"].config(text="%ds" % job.elapsed() if job.started else "")
         bar = w["bar"]
         bar.delete("all")
@@ -950,6 +1002,10 @@ class ImageStudio:
             self._paint_health()
             if job.status == "failed":
                 self.say("A job on %s failed: %s" % (job.backend["name"], job.detail), "err")
+                if self.selected is None or self.selected[0] == "job":
+                    self._select(("job", job))
+                    self.preview.config(image="", text="Failed - the reason is below")
+                    self.skin(self.preview, bg="card", fg="err")
 
     def _tick(self, _frame):
         """The elapsed clocks and bars, on the window's one tick, and only
@@ -1020,7 +1076,8 @@ class ImageStudio:
                 text = self.clip(job.record["prompt"]) + "\n" + self.describe(job.record)
             else:
                 text = (job.plan.prompt if job.plan else job.settings.get("scene", "")) \
-                    + "\n" + job.status
+                    + "\n" + job.status.capitalize() + (": " + job.detail if job.detail
+                                                        else "")
         else:
             rec = item[1]
             path = (rec.get("images") or [None])[0]
@@ -1032,7 +1089,7 @@ class ImageStudio:
         self._repaint_preview()
         self.caption.config(text=text)
         rec = self._selected_record()
-        for p in (self.act_again, self.act_reuse):
+        for p in (self.act_again, self.act_vary, self.act_reuse):
             p.set(state="normal" if rec or item[0] == "job" else "disabled")
 
     @staticmethod
@@ -1068,15 +1125,21 @@ class ImageStudio:
             return self.selected[1].settings
         return None
 
-    def _again(self, rec):
-        s = ig.again(rec["settings"])
-        self.say("Generating again" + ELLIPSIS, "muted")
+    def _again(self, rec, new_seed=False):
+        """The same picture again (its seed, values and backend), or with
+        `new_seed` the same settings on a fresh seed."""
+        s = ig.again(rec, new_seed)
+        self.say(("Same settings, new seed" if new_seed else
+                  "Generating again with seed %s" % s.get("seed")) + ELLIPSIS, "muted")
         self.host._spawn(self.s.event_id, self._submit, s)
 
-    def _again_selected(self):
+    def _again_selected(self, new_seed=False):
+        rec = self._selected_record()
+        if rec:
+            return self._again(rec, new_seed)
         s = self._selected_settings()
         if s:
-            self._again({"settings": s})
+            self._again({"settings": s}, new_seed)
 
     def _reuse_selected(self):
         s = self._selected_settings()
@@ -1125,7 +1188,33 @@ class ImageStudio:
             ("defaults", "Defaults (steps, guidance, sampler, width...)", "kv"),
             ("notes", "Notes", "long"),
         ], template={"id": "new-model", "label": "New model", "family": "flux1",
-                     "workflow": "flux_hq", "values": {"model": "model.safetensors"}})
+                     "workflow": "flux_dev_baseline", "values": {"model": "model.safetensors"}},
+            extra=("Check backends", self._recheck_models), info=self._model_status)
+
+    def _model_status(self, rec):
+        """The Models window's answer to "can I use this, and where": per
+        backend, ready or exactly which files (and folders) or nodes are
+        missing, for the record as it stands in the editor."""
+        model = ig.clean_model(rec)
+        if model is None:
+            return [("Give the model an id to check it.", "faint")]
+        out = []
+        for bid, (state, text) in self.studio.readiness(model).items():
+            b = self.studio.backend(bid)
+            role = {"ready": "ok", "missing": "err", "offline": "warn"}.get(state, "faint")
+            out.append(("%s  %s: %s" % (READY_MARK.get(state, "?"), b["name"], text), role))
+        wf = model.get("workflow")
+        out.append(("Workflow: comfy_workflows/%s.json" % wf, "faint"))
+        return out
+
+    def _recheck_models(self, editor):
+        editor.status("Checking the backends" + ELLIPSIS)
+
+        def work():
+            self.studio.check_all()
+            self._post("health")
+            self.host.q.put(("images", self.s.event_id, ("editor-refresh", editor)))
+        self.host._spawn(self.s.event_id, work)
 
     def edit_loras(self):
         return RecordEditor(self, "loras", "LoRA library", [
@@ -1197,8 +1286,10 @@ class RecordEditor:
     with kind one of text, long, number, bool, path, paths, kv, per_backend,
     per_backend_file, ("choice", pairs) or ("multi", pairs)."""
 
-    def __init__(self, owner, kind, title, fields, template, extra=None, label=None):
+    def __init__(self, owner, kind, title, fields, template, extra=None, label=None,
+                 info=None):
         self.owner, self.kind, self.fields = owner, kind, fields
+        self.info = info              # rec -> [(text, role)], shown above the fields
         self.template, self.label_of = template, label or (
             lambda r: r.get("name") or r.get("label") or r.get("id"))
         host = owner.host
@@ -1248,6 +1339,12 @@ class RecordEditor:
         self._reload_list(0 if self.records else None)
         self.status("Library updated.")
 
+    def refresh(self):
+        """Redraw the form - its status panel above all - keeping edits."""
+        self._store()
+        self._build_form()
+        self.status("Checked.")
+
     def _reload_list(self, select):
         self.lb.delete(0, "end")
         for r in self.records:
@@ -1277,6 +1374,14 @@ class RecordEditor:
             return
         rec = self.records[self.current]
         backends = o.studio.backends()
+        if self.info is not None:
+            box = o.frame(self.form, "card")
+            box.pack(side="top", fill="x", pady=(0, o.px(4)))
+            for text, role in self.info(rec):
+                lbl = o.label(box, text, role, host.f_small, bg="card",
+                              wraplength=o.px(380))
+                lbl.pack(side="top", fill="x", padx=o.px(8), pady=o.px(2))
+                o.wrap(lbl, box, o.px(20))
         for key, label, kind in self.fields:
             o.label(self.form, label, "muted", host.f_small).pack(
                 side="top", fill="x", pady=(o.px(8), o.px(2)))

@@ -409,6 +409,36 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   regardless, so a socket that never opens costs the step counter, nothing else.
   `cancel_job` interrupts only its own prompt (`/interrupt` with `prompt_id`, or
   `/queue delete`): a bare interrupt would stop the chat tab's render.
+- **Progress is ComfyUI's own events, shown as Queued → Loading → Sampling →
+  Decoding → Complete.** The job opens the socket (`watch()`) *before* it posts
+  `/prompt`, or the first `executing` events are gone. A node's stage comes from
+  the template's `stages`, else its class (`stage_of`). A sampler that has sent
+  no step yet shows as Loading, because ComfyUI moves the model onto the card
+  inside the sampler. Steps show as "step 12 of 20 · 60% · node 40 KSampler",
+  and a queued job shows how many prompts are ahead of it. A socket that will not
+  open is said once (`Watch.error`, into the record's notes), and 120 s with no
+  event (`QUIET_AFTER`) says which node it was on. That second one is real: a
+  16384² FLUX job ran out of memory in the VAE, ComfyUI's worker died handling
+  it, and the prompt stayed "running" with the GPU idle until ComfyUI was
+  restarted. `compose` now refuses a size over the backend's `max_megapixels`.
+- **Errors name the thing.** `explain()` turns ComfyUI's 400 into "node 1
+  (UNETLoader): Value not in list - unet_name 'flux1-dev.safetensors' is not
+  there (it has 3 others)" rather than the server's whole file list;
+  `run_errors()` gives the node, class, exception and message of a failed run.
+  Nothing is dropped quietly: an unreachable local URL says no ComfyUI is
+  running on this PC (Studio Assist is not one) and how to start it (the
+  backend's `start` field), and something answering on the port without a
+  `comfyui_version` is reported as not ComfyUI.
+- **What a backend has is read, not assumed.** A full check reads `/models/<kind>`
+  and `/object_info` (refreshed each time). `missing_for()` and `lacks()` list
+  every file the model's workflow needs that is not there, by exact name and
+  `ComfyUI/models/<folder>`, plus every node class it lacks. The model menu
+  ("ready on 5090 Workstation"), the Models window's status panel, routing
+  (`has_model`) and `compose`'s errors all ask that one function.
+  `python studio_imagegen.py --probe` checks `/system_stats`, `/object_info`,
+  `/prompt` (an empty graph, which ComfyUI refuses without running anything),
+  `/history` and the WebSocket on every backend, then prints each model's
+  readiness.
 - **Workflows are files.** `comfy_workflows/<id>.json` is an API-format graph plus:
   `{{placeholders}}` (a whole value keeps its type), `_when`/`_unless` nodes,
   `switches` (a link chosen by a value), `lora_chain` (where LoRAs hang;
@@ -438,19 +468,41 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 - **One lane per backend, one job per picture.** `JobQueue` runs a thread per
   backend, so the two GPUs work at once. A batch of N is N jobs with seeds s..s+N-1,
   spread over every capable backend, so each picture's record states its exact seed.
-  Auto routing (`route`) prefers backends whose roles include the preset's role,
-  falls back to any enabled one that is up and has the model, and says why when
-  nothing can take the job.
+  Auto routing (`plan_route`, over `route`) prefers backends whose roles include
+  the preset's role, so FLUX goes to the 5090 when both could take it. It falls
+  back to any enabled one that is up and has *every* file and node the workflow
+  needs, and says why when nothing can take the job. The form shows the choice
+  and its reason ("Will run on 5090 Workstation: preferred for Standard; …")
+  before Generate, and Generate refuses, in words, what would fail there.
 - **History is the record.** `image-studio/history/<date>/<id>.json` sits beside the
   pictures and holds the settings as submitted, the resolved prompt, model file,
   LoRAs with strengths, identities, style, backend, sampler values, the refine pass,
-  warnings, timing and the submitted graph. Reuse Settings loads `settings` back;
-  Generate Again resubmits it, keeping a seed chosen by hand and rolling a random
-  one.
-- **Measured 2026-09-25 on the 3090:** Z-Image Turbo at 1024² took 18-30 s end to
-  end through the studio. No ComfyUI answered on this PC then, and no FLUX files
-  were on either machine, so `flux_hq` was checked against the 3090's
-  `/object_info` but not rendered.
+  warnings, timing and the submitted graph, plus every model file and the
+  workflow. Each job's output is named `ImageStudio/<workflow>_<job id>`.
+  Reuse Settings loads `settings` back. **Generate Again makes the same
+  picture** (`again(record)`): the recorded seed, the sampler values it resolved
+  to, and the backend it ran on when that can still take it (`prefer_backend`;
+  another GPU may differ slightly, and the route line says so). New Seed is
+  the variation. Measured on the 5090: the pixels match exactly, but the PNG
+  bytes do not, because ComfyUI embeds the graph, and the output name in it
+  differs per job.
+- **FLUX runs the baseline first** (`flux_dev_baseline.json`): ComfyUI's own
+  `flux_dev_full_text_to_image` recipe plus FluxGuidance, taking prompt, seed,
+  size, steps, guidance, sampler, scheduler and output name. It has no LoRAs,
+  references, refine or face pass. `compose` leaves any of those out *with a
+  warning*. `flux_hq.json` (the layered graph) stays on disk for later, and
+  the tests keep its LoRA/reference logic covered through a `flux-hq` model of
+  their own. Layer features back one at a time, against the baseline.
+- **The 5090's ComfyUI (2026-09-25)** is ComfyUI v0.37.2 (the 3090's version),
+  git-cloned into `D:\ComfyUI` with its own Python 3.12 venv and PyTorch
+  cu128 (Blackwell). The models live in `D:\ComfyUI-models`
+  (`extra_model_paths.yaml`), so a reinstall keeps them. It is started by
+  `D:\ComfyUI\Start ComfyUI (Image Studio).cmd` on 127.0.0.1:8188, and the app
+  does not start it. FLUX files: `flux1-dev.safetensors` (Comfy-Org mirror, the
+  same file as BFL's), `clip_l`, `t5xxl_fp16`, `ae`. Measured: 1024², 20 steps,
+  ~2.6 it/s, 11-12 s end to end including the model load. The 3090 has no FLUX
+  files (its entry expects `t5xxl_fp8_e4m3fn_scaled` and fp8 weights), so Auto
+  never sends FLUX there. Z-Image Turbo at 1024² took 18-30 s there.
 
 ### The app the user connects by hand: `BridgeSpec`
 
