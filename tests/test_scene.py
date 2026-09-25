@@ -149,6 +149,31 @@ class TestBodyAndClothes(unittest.TestCase):
         self.assertIn("forearm", sleeved["regions"])
         self.assertLess(sleeved["hems"][0][0], gown)
 
+    def test_hats_and_glasses_come_from_the_accessories(self):
+        dressed = sc.outfit({"accessories": "sunglasses, red baseball cap, wristwatch"})
+        self.assertEqual(dressed["hat"], ("cap", sc.cloth_colour("red", "hat")))
+        self.assertEqual(dressed["glasses"][0], "sunglasses")      # not plain "glasses"
+        self.assertEqual(sc.outfit({"accessories": "hard hat"})["hat"][0], "hard hat")
+        self.assertEqual(sc.outfit({"accessories": "hard hat"})["hat"][1],
+                         sc.hex_rgb("#e2c23c"))                      # site yellow
+        self.assertEqual(sc.outfit({"accessories": "white hard hat"})["hat"][1],
+                         sc.cloth_colour("white", "hat"))
+        self.assertEqual(sc.outfit({"accessories": "round glasses"})["glasses"][0], "glasses")
+        bare = sc.outfit({"accessories": "necklace, headphones, tote bag"})
+        self.assertEqual((bare["hat"], bare["glasses"]), (None, None))
+
+        # They are on the head: taller with a top hat, clicked as the head,
+        # and the person still stands on the floor.
+        plain = self.person()
+        hatted = self.person(accessories="top hat, glasses")
+        self.assertGreater(self.width(hatted)[1], self.width(plain)[1] + 0.1)
+        self.assertAlmostEqual(sc.bounds(hatted)[0][1], 0.0, places=9)
+        count = lambda o, part=None: len([1 for p, _, _ in sc.painted_pieces(o)   # noqa
+                                          if part in (None, p)])
+        added = count(hatted) - count(plain)
+        self.assertGreater(added, 0)
+        self.assertEqual(count(hatted, "head") - count(plain, "head"), added)
+
     def test_a_garment_is_the_colour_it_names_first(self):
         black = sc.hex_rgb("#27272b")
         self.assertEqual(sc.cloth_colour("black leather jacket", "outerwear"), black)

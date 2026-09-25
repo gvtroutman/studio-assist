@@ -712,7 +712,10 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
   Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
   sweater the forearm too), a dress, skirt or long coat adds a hem that follows the
-  legs, boots a shaft. The colour is the first `CLOTH` word in the garment ("black
+  legs, boots a shaft. The Accessories slot puts a hat (`HATS` names it, `HAT_SHAPES`
+  builds it: a cap with its visor, a beanie, a brimmed hat, a top hat, a hard hat -
+  site yellow unless a colour is said) and glasses, sunglasses or goggles on the head,
+  as part `head`, so a click on them poses the head. The colour is the first `CLOTH` word in the garment ("black
   leather jacket" is black), else the slot's default. What is not worn is the object's
   colour. The words are still sent as written; this only draws them. Every look edit
   in the inspector goes through `changed()`, so the viewport follows each keystroke
