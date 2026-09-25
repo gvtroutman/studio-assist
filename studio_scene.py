@@ -22,6 +22,12 @@ pieces:
   words (`texture_settings`), or a PNG from disk - repeated every `size`
   metres and drawn in perspective (`TexMap`). The room is the backdrop: it is
   drawn before every object, so a person always stands in front of a wall.
+- **A prop's picture** (`picture`): instead of its grey shape, a prop can
+  stand in the scene as a picture of what it is - one the Image Studio makes
+  from its name and description (`picture_settings`), cut out of its plain
+  background (`key_background`), or a PNG from disk. It is drawn as an
+  upright card at the prop's place, always turned to the camera (`CutMap`),
+  so the frame shows the thing itself rather than a box standing for it.
 - **A person's look** (`look`, `character`): the Image Studio's character
   creator slots and sliders, per person - who, body, face, hair, expression,
   clothes, accessories - or a character's look copied on. It is said in that
@@ -504,6 +510,8 @@ def new_object(asset_id, taken=()):
     obj = {"id": oid, "asset": asset_id, "name": name, "description": "",
            "colour": a["colour"], "position": [0.0, 0.0, 0.0],
            "rotation": [0.0, 0.0, 0.0], "scale": list(a["scale"])}
+    if a["kind"] == "prop":
+        obj["picture"] = ""           # a cut-out PNG drawn in place of the shape
     if a["kind"] == "person":
         obj["pose"] = {"preset": "standing", "controls": pose_controls("standing")}
         obj["character"] = ""
@@ -590,6 +598,8 @@ def clean_object(d, taken=()):
     o["position"] = _vec(d.get("position"), base["position"], -100, 100)
     o["rotation"] = _vec(d.get("rotation"), base["rotation"], -360, 360)
     o["scale"] = _vec(d.get("scale"), base["scale"], 0.05, 20)
+    if "picture" in base:
+        o["picture"] = str(d.get("picture") or "")
     if "pose" in base:
         pose = d.get("pose") if isinstance(d.get("pose"), dict) else {}
         preset = pose.get("preset") if pose.get("preset") in POSE_VALUES else ""
@@ -639,6 +649,9 @@ def clean_scene(d):
                             % (raw.get("asset") if isinstance(raw, dict) else raw))
         else:
             s["objects"].append(o)
+            if o.get("picture") and not os.path.isfile(o["picture"]):
+                problems.append("%s's picture %s is missing, so it is drawn as its shape."
+                                % (o["name"], os.path.basename(o["picture"])))
     return s, problems
 
 
@@ -674,6 +687,7 @@ class Texture:
     def __init__(self, rgba, w, h):
         self.w, self.h = w, h
         self.px = [bytes(rgba[i:i + 3]) for i in range(0, w * h * 4, 4)]
+        self.alpha = bytes(rgba[3::4])
         n = float(w * h)
         self.mean = tuple(int(sum(rgba[c::4]) / n) for c in range(3))
         self._shaded = {}
@@ -732,13 +746,24 @@ def import_texture(src, folder=None):
     path. The scene keeps that copy, so clearing History does not take the
     floor with it. Raises OSError, or ValueError for what is not a PNG this can
     read (JPEG, 16-bit, interlaced)."""
-    with open(src, "rb") as f:
+    rgba, w, h = shrink(*read_png(src), keep_alpha=False)
+    return _keep(studio_icons.png(rgba, w, h), "texture", folder)
+
+
+def read_png(path):
+    """-> (rgba, w, h). Raises OSError, or ValueError for what is not a PNG
+    this can read (JPEG, 16-bit, interlaced)."""
+    with open(path, "rb") as f:
         data = f.read()
     try:
-        rgba, w, h = studio_icons.png_to_rgba(data)
+        return studio_icons.png_to_rgba(data)
     except (KeyError, IndexError, zlib.error, struct.error) as e:
         raise ValueError("not a PNG this can read (%s)" % e)
-    side = TEXTURE_SIDE
+
+
+def shrink(rgba, w, h, side=TEXTURE_SIDE, keep_alpha=True):
+    """RGBA down to at most `side` on its longer edge, four samples a pixel.
+    Colour is weighted by alpha, so a cut-out's edge does not go dark."""
     tw, th = ((side, max(1, round(side * h / w))) if w >= h else
               (max(1, round(side * w / h)), side))
     tw, th = min(tw, w), min(th, h)
@@ -747,21 +772,110 @@ def import_texture(src, folder=None):
         rows = [min(h - 1, int((y + oy) * h / th)) * w for oy in (0.25, 0.75)]
         for x in range(tw):
             cols = [min(w - 1, int((x + ox) * w / tw)) for ox in (0.25, 0.75)]
-            r = g = b = 0
+            r = g = b = a = 0
             for row in rows:
                 for col in cols:
                     i = (row + col) * 4
-                    r, g, b = r + rgba[i], g + rgba[i + 1], b + rgba[i + 2]
+                    al = rgba[i + 3] if keep_alpha else 255
+                    r, g, b = r + rgba[i] * al, g + rgba[i + 1] * al, b + rgba[i + 2] * al
+                    a += al
             o = (y * tw + x) * 4
-            out[o], out[o + 1], out[o + 2], out[o + 3] = r // 4, g // 4, b // 4, 255
-    small = studio_icons.png(bytes(out), tw, th)
+            if a:
+                out[o], out[o + 1], out[o + 2] = r // a, g // a, b // a
+            out[o + 3] = a // 4
+    return bytes(out), tw, th
+
+
+def _keep(data, kind, folder=None):
+    """Write PNG `data` under `<scenes>/textures/`, named by content."""
     folder = folder or os.path.join(scenes_dir(), "textures")
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, "texture_%s.png" % hashlib.sha1(small).hexdigest()[:16])
+    path = os.path.join(folder, "%s_%s.png" % (kind, hashlib.sha1(data).hexdigest()[:16]))
     if not os.path.isfile(path):
         with open(path, "wb") as f:
-            f.write(small)
+            f.write(data)
     return path
+
+
+KEY_TOLERANCE = 60             # sum of |r|+|g|+|b| from the background still counted as it
+
+
+def key_background(rgba, w, h, tolerance=KEY_TOLERANCE):
+    """A picture of one thing on a plain background -> (rgba, w, h), the
+    background made transparent and the picture cropped to the thing. The
+    background is the border's median colour, flooded in from the edges, so
+    a white mug on a white table-top keeps its inside. A picture whose
+    border is not one colour (a photo, a scene) comes back as it was: better
+    a card with a background than a thing cut to pieces."""
+    border = [y * w + x for x in range(w) for y in (0, h - 1)] + \
+             [y * w + x for y in range(h) for x in (0, w - 1)]
+    bg = [sorted(rgba[i * 4 + c] for i in border)[len(border) // 2] for c in range(3)]
+    br, bgg, bb = bg
+
+    def background(i):
+        o = i * 4
+        return rgba[o + 3] < 128 or (abs(rgba[o] - br) + abs(rgba[o + 1] - bgg)
+                                     + abs(rgba[o + 2] - bb) <= tolerance)
+    if sum(1 for i in border if background(i)) < 0.8 * len(border):
+        return rgba, w, h
+    gone = bytearray(w * h)
+    todo = [i for i in border if background(i)]
+    for i in todo:
+        gone[i] = 1
+    while todo:
+        i = todo.pop()
+        x, y = i % w, i // w
+        for j in ((i - 1) if x else -1, (i + 1) if x < w - 1 else -1,
+                  (i - w) if y else -1, (i + w) if y < h - 1 else -1):
+            if j >= 0 and not gone[j] and background(j):
+                gone[j] = 1
+                todo.append(j)
+    kept = [i for i in range(w * h) if not gone[i]]
+    if len(kept) < 0.01 * w * h:
+        return rgba, w, h
+    xs, ys = [i % w for i in kept], [i // w for i in kept]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    cw, ch = x1 - x0 + 1, y1 - y0 + 1
+    out = bytearray(cw * ch * 4)
+    for y in range(ch):
+        for x in range(cw):
+            i = (y + y0) * w + x + x0
+            o = (y * cw + x) * 4
+            out[o:o + 3] = rgba[i * 4:i * 4 + 3]
+            out[o + 3] = 0 if gone[i] else rgba[i * 4 + 3]
+    return bytes(out), cw, ch
+
+
+def import_cutout(src, folder=None):
+    """A picture of a prop -> (path, width / height): shrunk, its background
+    keyed out and cropped, kept beside the textures. Raises as `read_png`."""
+    rgba, w, h = shrink(*read_png(src))
+    rgba, w, h = key_background(rgba, w, h)
+    return _keep(studio_icons.png(rgba, w, h), "cutout", folder), w / float(h)
+
+
+PICTURE_WORDS = ("%s. The whole thing alone, centred and filling most of the frame, on a "
+                 "plain pure white background; soft even studio light, no shadow on the "
+                 "ground, nothing else in the frame.")
+PICTURE_NEGATIVE = ("background scenery, room, floor, cast shadow, people, person, hands, "
+                    "text, watermark, cropped, cut off")
+
+
+def picture_settings(obj, model, backend="auto"):
+    """The Image Studio settings that paint a prop from its name and
+    description, as written: text to image on plain white, so the background
+    keys out, and none of the form's person. `scene_picture` names the
+    object, so the finished job finds its way back to the builder."""
+    import studio_imagegen as ig
+    name = obj["name"].strip() or ASSET[obj["asset"]]["label"]
+    desc = obj["description"].strip().rstrip(" .")
+    s = ig.default_settings()
+    s.update(model=model, backend=backend,
+             scene=PICTURE_WORDS % ("%s: %s" % (name, desc) if desc else name),
+             negative=PICTURE_NEGATIVE, anatomy=False, width=1024, height=1024,
+             refine=False, face_detail=False, upscale=None, batch=1,
+             scene_picture=obj["id"])
+    return s
 
 
 def texture_settings(scene, surface, model, backend="auto"):
@@ -901,12 +1015,18 @@ class TexMap:
         per_m = tex.w / float(size)               # picture pixels a metre, both ways
         self.levels = [(px, w, h, per_m * w / tex.w) for px, w, h in tex.shaded(k)]
         self.fine = per_m / cam.k                 # picture pixels a frame pixel, x t/|d.n|
+        self.plane(cam, origin, along, down, normal)
+
+    def plane(self, cam, origin, along, down, normal):
         a = add(cam.f, add(mul(cam.r, -cam.w / 2 / cam.k), mul(cam.u, cam.h / 2 / cam.k)))
         lin = lambda v: (dot(a, v), dot(cam.r, v) / cam.k, -dot(cam.u, v) / cam.k)  # noqa
         self.n, self.U, self.V = lin(normal), lin(along), lin(down)
         self.c = dot(sub(origin, cam.eye), normal)
         rel = sub(cam.eye, origin)
         self.eu, self.ev = dot(rel, along), dot(rel, down)
+
+    def paint(self, buf, row, y, xa, xb):
+        buf[row + xa * 3:row + (xb + 1) * 3] = self.span(y, xa, xb)
 
     def span(self, y, xa, xb):
         """Pixels xa..xb of row y, as RGB bytes."""
@@ -932,6 +1052,54 @@ class TexMap:
         return b"".join(out)
 
 
+class CutMap(TexMap):
+    """A cut-out picture on an upright card: once, not repeated, and where
+    it is transparent the frame keeps what is behind it."""
+
+    def __init__(self, cam, origin, along, normal, width, height, tex):
+        self.tex = tex
+        self.ku, self.kv = tex.w / float(width), tex.h / float(height)
+        self.plane(cam, origin, along, (0, -1, 0), normal)
+
+    def paint(self, buf, row, y, xa, xb):
+        yc = y + 0.5
+        n0, nx = self.n[0] + self.n[2] * yc, self.n[1]
+        u0, ux = self.U[0] + self.U[2] * yc, self.U[1]
+        v0, vx = self.V[0] + self.V[2] * yc, self.V[1]
+        c, eu, ev, ku, kv = self.c, self.eu, self.ev, self.ku, self.kv
+        px, alpha, tw, th = self.tex.px, self.tex.alpha, self.tex.w, self.tex.h
+        for x in range(xa, xb + 1):
+            xc = x + 0.5
+            dn = n0 + nx * xc
+            if not dn:
+                continue
+            t = c / dn
+            i = int((eu + t * (u0 + ux * xc)) * ku)
+            j = int((ev + t * (v0 + vx * xc)) * kv)
+            if 0 <= i < tw and 0 <= j < th and alpha[j * tw + i] >= 128:
+                o = row + x * 3
+                buf[o:o + 3] = px[j * tw + i]
+
+
+def card(obj, cam, tex):
+    """A prop's picture as a Poly: an upright card at its place, as wide
+    and tall as the prop, turned square to the camera. None when any corner
+    is behind the camera."""
+    x, y, z = obj["position"]
+    w, h = obj["scale"][0], obj["scale"][1]
+    along = norm((cam.r[0], 0, cam.r[2]))
+    top_left = (x - along[0] * w / 2, y + h, z - along[2] * w / 2)
+    quad = [top_left, add(top_left, mul(along, w)),
+            add(top_left, (along[0] * w, -h, along[2] * w)), add(top_left, (0, -h, 0))]
+    c = [cam.to_camera(p) for p in quad]
+    if any(p[2] < NEAR for p in c):
+        return None
+    normal = cross(along, (0, 1, 0))
+    depth = cam.to_camera((x, y + h / 2, z))[2]
+    return Poly([cam.to_screen(p) for p in c], tex.mean, depth, obj["id"], "body",
+                CutMap(cam, top_left, along, normal, w, h, tex))
+
+
 def render(scene, width=None, height=None):
     """The scene through its camera -> [Poly], far to near. The room is
     first - the floor, then the walls facing into it - clipped to the near
@@ -943,6 +1111,12 @@ def render(scene, width=None, height=None):
     polys = room_polys(scene, cam)
     faces = []
     for obj in scene["objects"]:
+        tex = texture(obj.get("picture"))
+        if tex is not None:
+            poly = card(obj, cam, tex)
+            if poly is not None:
+                faces.append(poly)
+            continue
         rgb = hex_rgb(obj["colour"])
         for part, fs in object_pieces(obj):
             for f in fs:
@@ -1052,8 +1226,10 @@ def rasterise(polys, width, height, sky=SKY, flat=False):
             if xb < xa:
                 continue
             row = y * stride
-            buf[row + xa * 3:row + (xb + 1) * 3] = (tex.span(y, xa, xb) if tex else
-                                                    colour * (xb - xa + 1))
+            if tex:
+                tex.paint(buf, row, y, xa, xb)
+            else:
+                buf[row + xa * 3:row + (xb + 1) * 3] = colour * (xb - xa + 1)
     return bytes(buf)
 
 

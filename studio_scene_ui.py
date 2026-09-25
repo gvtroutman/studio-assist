@@ -78,6 +78,7 @@ class SceneBuilder:
         self.frame_rect = (0, 0, 1, 1, 1.0)      # ox, oy, w, h, scale on the canvas
         self.making = {}              # surface -> words sent, while its picture is made
         self.taken = set()            # ids of the finished picture jobs already used
+        self.cards = {}               # (texture, w, h) -> PhotoImage: props' pictures, drawn
         self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
         self.bake_after = None
 
@@ -481,19 +482,23 @@ class SceneBuilder:
                                                                        fill="x")
         if a["kind"] == "person":
             self._look_controls(obj)
+        else:
+            self._picture_controls(obj)
 
-        o.cap(p, "Colour")
-        sw = o.frame(p)
-        sw.pack(side="top", fill="x")
-        for hexc, cname in sc.COLOURS:
-            chip = tk.Canvas(sw, width=o.px(20), height=o.px(20), highlightthickness=0,
-                             bd=0, cursor="hand2")
-            o.skin(chip, bg="bg")
-            ring = "accent" if hexc.lower() == obj["colour"].lower() else "border"
-            chip.create_oval(1, 1, o.px(19), o.px(19), fill=hexc,
-                             outline=self.host.C[ring], width=2)
-            chip.bind("<Button-1>", lambda ev, h=hexc: self._set_colour(h))
-            chip.pack(side="left", padx=(0, o.px(3)))
+        pictured = bool(sc.texture(obj.get("picture")))     # colour and tip do nothing
+        if not pictured:
+            o.cap(p, "Colour")
+            sw = o.frame(p)
+            sw.pack(side="top", fill="x")
+            for hexc, cname in sc.COLOURS:
+                chip = tk.Canvas(sw, width=o.px(20), height=o.px(20), highlightthickness=0,
+                                 bd=0, cursor="hand2")
+                o.skin(chip, bg="bg")
+                ring = "accent" if hexc.lower() == obj["colour"].lower() else "border"
+                chip.create_oval(1, 1, o.px(19), o.px(19), fill=hexc,
+                                 outline=self.host.C[ring], width=2)
+                chip.bind("<Button-1>", lambda ev, h=hexc: self._set_colour(h))
+                chip.pack(side="left", padx=(0, o.px(3)))
 
         if a["kind"] == "person":
             self._pose_controls(obj)
@@ -510,8 +515,14 @@ class SceneBuilder:
         self._slider(p, "z", "Back / front (m)", lambda: pos[2], at(pos, 2),
                      -REACH, REACH, 0.05)
         self._slider(p, "y", "Floor height (m)", lambda: pos[1], at(pos, 1), 0, 3, 0.05)
-        self._slider(p, "yaw", "Turn", lambda: rot[0], at(rot, 0), -180, 180)
-        if a["kind"] == "prop":
+        if not pictured:
+            self._slider(p, "yaw", "Turn", lambda: rot[0], at(rot, 0), -180, 180)
+        if pictured:
+            def tall(x):                  # the picture keeps its shape
+                scale[0], scale[1] = round(scale[0] * x / scale[1], 3), x
+            o.cap(p, "Size (m)")
+            self._slider(p, "size1", "Height", lambda: scale[1], tall, 0.05, 5, 0.05)
+        elif a["kind"] == "prop":
             self._slider(p, "pitch", "Tip forward", lambda: rot[1], at(rot, 1), -90, 90)
             self._slider(p, "roll", "Tip sideways", lambda: rot[2], at(rot, 2), -90, 90)
             o.cap(p, "Size (m)")
@@ -607,6 +618,34 @@ class SceneBuilder:
         obj["look"], obj["character"] = {}, ""
         self._inspect()
         self.changed()
+
+    def _picture_controls(self, obj):
+        """A prop's picture: Make paints it from its name and description,
+        Picture… takes a PNG, Shape goes back to the grey box."""
+        o, p = self.owner, self.panel
+        o.cap(p, "Looks like")
+        row = o.frame(p)
+        row.pack(side="top", fill="x")
+        o.button(row, "Make picture", lambda: self.make_picture(obj["id"]),
+                 kind="accent").pack(side="left")
+        o.button(row, "Picture…", lambda: self.choose_picture(obj["id"])).pack(
+            side="left", padx=(o.px(4), 0))
+        o.button(row, "Shape", lambda: self.set_picture(obj["id"], ""), kind="ghost").pack(
+            side="left", padx=(o.px(4), 0))
+        if "obj:" + obj["id"] in self.making:
+            now = "Making it in the Image Studio…"
+        elif obj.get("picture"):
+            now = "A picture: %s" % os.path.basename(obj["picture"])
+            if sc.texture(obj["picture"]) is None:
+                now += " - missing or unreadable, so drawn as its shape"
+        else:
+            now = "Its shape, in its colour."
+        o.label(p, now, "muted", self.host.f_small, wraplength=o.px(310)).pack(
+            side="top", fill="x", pady=(o.px(2), 0))
+        o.label(p, "Make paints it from its name and description in the Image Studio, on "
+                "white, cuts it out and stands it here in place of the shape, turned to "
+                "the camera. It keeps its height; its width follows the picture.",
+                "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
 
     def _pose_controls(self, obj):
         o, p = self.owner, self.panel
@@ -755,8 +794,12 @@ class SceneBuilder:
                 c.create_image(ox, oy, image=img, anchor="nw")
         for a, b, axis in sc.grid_lines(self.scene, w, h):
             c.create_line(*at((a, b)), fill=GRID_AXIS if axis else GRID)
+        cards, self.cards = self.cards, {}
         for poly in polys:
             if poly.owner is None:
+                continue
+            if isinstance(poly.tex, sc.CutMap):
+                self._card(poly, at(poly.pts), cards)
                 continue
             fill = rgb_hex(poly.rgb)
             chosen = poly.owner == self.sel
@@ -769,6 +812,36 @@ class SceneBuilder:
         c.create_rectangle(x0, y0, x1, y1, outline=C["accent"], width=2)
         c.create_text(x0 + 6, y0 - 4, anchor="sw", fill=C["muted"], font=self.host.f_small,
                       text="Frame %d x %d · %dmm" % (w, h, round(self.scene["camera"]["lens"])))
+
+    def _card(self, poly, flat, old):
+        """A prop's picture on the canvas: the picture scaled to the card's
+        box on screen (a canvas polygon cannot wear one). Scaled pictures are
+        kept between draws, so a drag rescales only when the size changes."""
+        c = self.canvas
+        xs, ys = flat[0::2], flat[1::2]
+        x0, y0 = min(xs), min(ys)
+        bw = max(1, min(1600, int(round(max(xs) - x0))))
+        bh = max(1, min(1600, int(round(max(ys) - y0))))
+        tex = poly.tex.tex
+        key = (id(tex), bw, bh)
+        img = old.get(key) or self.cards.get(key)
+        if img is None:
+            rgba = bytearray(bw * bh * 4)
+            for y in range(bh):
+                j = min(tex.h - 1, y * tex.h // bh) * tex.w
+                for x in range(bw):
+                    i = j + min(tex.w - 1, x * tex.w // bw)
+                    o = (y * bw + x) * 4
+                    rgba[o:o + 3] = tex.px[i]
+                    rgba[o + 3] = tex.alpha[i]
+            data = sc.studio_icons.png(bytes(rgba), bw, bh)
+            img = tk.PhotoImage(master=self.win, data=base64.b64encode(data).decode("ascii"))
+        self.cards[key] = img
+        tags = ("o:" + poly.owner, "p:body")
+        c.create_image(x0, y0, image=img, anchor="nw", tags=tags)
+        if poly.owner == self.sel:
+            c.create_rectangle(x0, y0, x0 + bw, y0 + bh, outline=self.host.C["accent"],
+                               tags=tags)
 
     def _backdrop_key(self, w, h, k):
         room = self.scene["room"]
@@ -1045,10 +1118,12 @@ class SceneBuilder:
         The picture is read and shrunk off the UI thread (a full-size PNG takes
         a few seconds in pure Python), then put on the surface."""
         key = job.settings.get("scene_texture")
+        if job.settings.get("scene_picture"):
+            key = "obj:" + job.settings["scene_picture"]
         if key not in self.making or job.id in self.taken:
             return                     # a job for a scene no longer open, or seen
         self.taken.add(job.id)
-        name = sc.SURFACE_NAMES.get(key, key).lower()
+        name = self._named(key)
         if job.status != "complete" or not job.outputs:
             self.making.pop(key, None)
             self._inspect()
@@ -1068,12 +1143,21 @@ class SceneBuilder:
             self.making[key] = ""
             self._import(key, path)
 
+    def _named(self, key):
+        if key.startswith("obj:"):
+            obj = self.obj(key[4:])
+            return "picture of %s" % (obj["name"] if obj else "the prop")
+        return sc.SURFACE_NAMES.get(key, key).lower()
+
     def _import(self, key, src):
         box = {}
 
         def work():
             try:
-                box["path"] = sc.import_texture(src)
+                if key.startswith("obj:"):
+                    box["path"], box["aspect"] = sc.import_cutout(src)
+                else:
+                    box["path"] = sc.import_texture(src)
             except (OSError, ValueError) as e:
                 box["error"] = e
         worker = threading.Thread(target=work, daemon=True)
@@ -1090,9 +1174,57 @@ class SceneBuilder:
                 self._inspect()
                 self.status("Could not use %s: %s" % (os.path.basename(src), box["error"]),
                             "err")
+            elif key.startswith("obj:"):
+                self.set_picture(key[4:], box["path"], box["aspect"])
             else:
                 self.set_texture(key, box["path"])
         self.win.after(100, wait)
+
+    def make_picture(self, oid):
+        """Paint the prop from its name and description in the Image Studio;
+        the picture comes back through `texture_done`, cut out."""
+        obj = self.obj(oid)
+        if obj is None or "picture" not in obj:
+            return False
+        o = self.owner
+        base = sc.picture_settings(obj, o.settings["model"],
+                                   o.settings.get("backend") or "auto")
+        if not o.generate(base=base):
+            self.status(o.note.cget("text") or "Not sent.", "err")
+            return False
+        self.making["obj:" + oid] = obj["description"]
+        self._inspect()
+        self.status("Making a picture of %s in the Image Studio; it stands in for the shape "
+                    "when it is done." % obj["name"], "muted")
+        if not obj["description"].strip():
+            self.status("Making a picture of %s from its name alone - a description (what "
+                        "it is, its state) gives the picture more to go on." % obj["name"],
+                        "warn")
+        return True
+
+    def choose_picture(self, oid):
+        path = filedialog.askopenfilename(parent=self.win, title="A picture of it",
+                                          filetypes=[("PNG pictures", "*.png"),
+                                                     ("All files", "*.*")])
+        if path and self.obj(oid) is not None:
+            self.making["obj:" + oid] = ""
+            self._import("obj:" + oid, path)
+
+    def set_picture(self, oid, path, aspect=None):
+        """Stand `path` in for the prop's shape ('' goes back to the shape).
+        The prop keeps its height and takes the picture's width."""
+        self.making.pop("obj:" + oid, None)
+        obj = self.obj(oid)
+        if obj is None:
+            return
+        obj["picture"] = path
+        if path and aspect:
+            obj["scale"][0] = round(max(0.05, min(20.0, obj["scale"][1] * aspect)), 3)
+        if self.sel == oid:
+            self._inspect()
+        self.changed()
+        self.status("%s now looks like %s." % (obj["name"], os.path.basename(path)) if path
+                    else "%s is its shape again." % obj["name"], "ok")
 
     def set_texture(self, key, path):
         self.making.pop(key, None)

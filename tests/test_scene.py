@@ -43,6 +43,23 @@ def two_tone(path, a, b, n=64):
     return path
 
 
+def on_white(path, n=128):
+    """A red disc over a blue block on white: a thing on a plain background."""
+    px = bytearray()
+    for y in range(n):
+        for x in range(n):
+            if (x - n // 2) ** 2 + (y - n // 4) ** 2 < (n // 6) ** 2:
+                c = (200, 30, 30)
+            elif n // 3 < x < 2 * n // 3 and n // 3 < y < n - 8:
+                c = (40, 60, 190)
+            else:
+                c = (252, 252, 250)
+            px += bytes(c) + b"\xff"
+    with open(path, "wb") as f:
+        f.write(studio_icons.png(bytes(px), n, n))
+    return path
+
+
 def pixel(scene, x, y):
     w, h = sc.frame_size(scene)
     rgb = sc.rasterise(sc.render(scene, w, h), w, h)
@@ -266,6 +283,68 @@ class TestRoom(unittest.TestCase):
         self.assertEqual(len(sc.grid_lines(s, 896, 1152)), 10)
 
 
+class TestPropPictures(unittest.TestCase):
+    """A prop drawn as a cut-out picture of what it is."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_the_plain_background_is_keyed_out_and_cropped(self):
+        path, aspect = sc.import_cutout(on_white(os.path.join(self.dir, "o.png")), self.dir)
+        tex = sc.texture(path)
+        self.assertLess(aspect, 0.6)                    # cropped to the thing: tall
+        self.assertEqual(tex.alpha[0], 0)               # a corner beside the disc
+        mid = (tex.h * 2 // 3) * tex.w + tex.w // 2
+        self.assertEqual((tex.alpha[mid], tex.px[mid]), (255, bytes((40, 60, 190))))
+
+    def test_a_picture_with_no_plain_border_is_kept_whole(self):
+        src = two_tone(os.path.join(self.dir, "t.png"), (200, 0, 0), (0, 0, 200))
+        path, aspect = sc.import_cutout(src, self.dir)
+        self.assertEqual(aspect, 1.0)
+        self.assertEqual(min(sc.texture(path).alpha), 255)
+
+    def test_the_picture_stands_in_for_the_shape_and_is_seen_through(self):
+        s = staged("box")
+        box = s["objects"][0]
+        box["colour"] = "#00ff00"
+        w, h = sc.frame_size(s)
+        polys = sc.render(s)
+        self.assertTrue(any(p.rgb[1] > 150 and p.owner for p in polys))   # the green box
+        box["picture"], aspect = sc.import_cutout(
+            on_white(os.path.join(self.dir, "o.png")), self.dir)
+        box["scale"] = [1.2 * aspect, 1.2, 0.6]
+        polys = [p for p in sc.render(s) if p.owner]
+        self.assertEqual(len(polys), 1)                 # one card, no box faces
+        self.assertIsInstance(polys[0].tex, sc.CutMap)
+        rgb = sc.rasterise(sc.render(s), w, h)
+        at = lambda x, y: tuple(rgb[(int(y) * w + int(x)) * 3:][:3])     # noqa: E731
+        xs, ys = [p[0] for p in polys[0].pts], [p[1] for p in polys[0].pts]
+        cx = (min(xs) + max(xs)) / 2
+        self.assertEqual(at(cx, min(ys) + (max(ys) - min(ys)) * 0.75), (40, 60, 190))
+        self.assertNotIn(at(min(xs) + 2, min(ys) + 2), ((252, 252, 250),))  # keyed out
+        self.assertIn(at(min(xs) + 2, min(ys) + 2), (sc.SKY, sc.FLOOR))
+
+    def test_the_card_turns_to_the_camera(self):
+        s = staged("box")
+        s["objects"][0]["picture"], _ = sc.import_cutout(
+            on_white(os.path.join(self.dir, "o.png")), self.dir)
+        for yaw in (0, 70, 200):
+            s["camera"]["yaw"] = yaw
+            card = [p for p in sc.render(s) if p.owner][0]
+            top = card.pts[:2]
+            self.assertAlmostEqual(top[0][1], top[1][1], delta=1.0)   # level: square on
+            self.assertLess(top[0][0], top[1][0])                     # and not mirrored
+
+    def test_the_picture_saves_and_a_missing_one_is_said(self):
+        s = staged("box", "person")
+        s["objects"][0]["picture"] = os.path.join(self.dir, "gone.png")
+        back, problems = sc.clean_scene(s)
+        self.assertEqual(back["objects"][0]["picture"], s["objects"][0]["picture"])
+        self.assertNotIn("picture", back["objects"][1])
+        self.assertTrue(any("picture gone.png is missing" in p for p in problems))
+        self.assertTrue([p for p in sc.render(s) if p.owner == "box"])  # drawn as its shape
+
+
 class TestSceneFile(unittest.TestCase):
     def test_save_and_open_keep_everything(self):
         s = staged("person", "box")
@@ -448,6 +527,18 @@ class TestIntoCompose(TempStudioMixin, unittest.TestCase):
         self.assertNotIn("source", plan.references)
         self.assertTrue(any("Source image" in w for w in plan.warnings), plan.warnings)
 
+    def test_a_props_picture_is_its_words_on_white(self):
+        s = staged("box")
+        s["objects"][0].update(name="Workbench", description="steel bench, vice closed.")
+        st = sc.picture_settings(s["objects"][0], "flux-dev")
+        plan = ig.compose(st, self.studio.lib, self.backend("5090"), FLUX_FILES)
+        self.assertEqual(plan.errors, [])
+        self.assertIn("Workbench: steel bench, vice closed. The whole thing alone", plan.prompt)
+        self.assertIn("plain pure white background", plan.prompt)
+        self.assertNotIn(ig.anatomy_text(), plan.prompt)
+        self.assertEqual(plan.references, {})
+        self.assertEqual(st["scene_picture"], "box")
+
     def test_a_floor_is_text_to_image_with_nothing_of_the_person(self):
         s = staged()
         s["room"]["floor"]["prompt"] = "oily concrete, drain in the corner."
@@ -460,6 +551,11 @@ class TestIntoCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(plan.references, {})
         self.assertEqual((plan.values["width"], plan.values["height"]), (1024, 1024))
         self.assertEqual(st["scene_texture"], "floor")
+
+
+def tk_label():
+    import tkinter as tk
+    return tk.Label
 
 
 def sc_room():
@@ -651,6 +747,35 @@ class TestSceneBuilderWindow(unittest.TestCase):
         d = sb.scene["camera"]["distance"]
         sb._zoom(1)
         self.assertGreater(sb.scene["camera"]["distance"], d)
+
+    def test_make_a_picture_of_a_prop(self):
+        """Make picture paints the prop in the Image Studio and the cut-out
+        stands in the viewport in place of the shape."""
+        ui, sb = self.builder()
+        box = sb.add("box")
+        box.update(name="Workbench", description="steel bench")
+        n = len(ui.jobs)
+        self.assertTrue(sb.make_picture(box["id"]))
+        self.assertIn("Making it", " ".join(
+            w.cget("text") for w in sb.panel.winfo_children() if isinstance(w, tk_label())))
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status in ig.FINISHED)
+        job = ui.jobs[0]
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(job.settings["scene_picture"], box["id"])
+        self.assertIn("Workbench: steel bench", job.settings["scene"])
+        self.pump(lambda: box["picture"])
+        self.assertTrue(os.path.isfile(box["picture"]))
+        sb.select(box["id"])
+        self.assertIn("size1", sb.vars)                           # height; width follows
+        self.assertNotIn("yaw", sb.vars)                          # a card turns by itself
+        self.pump(lambda: any(sb.canvas.type(i) == "image"
+                              for i in sb.canvas.find_withtag("o:" + box["id"])))
+        item = sb.canvas.find_withtag("o:" + box["id"])[0]
+        x0, y0, x1, y1 = sb.canvas.bbox(item)
+        self.assertEqual(sb.hit((x0 + x1) / 2, (y0 + y1) / 2)[0], box["id"])
+        sb.set_picture(box["id"], "")                             # back to its shape
+        self.assertFalse(any(sb.canvas.type(i) == "image"
+                             for i in sb.canvas.find_withtag("o:" + box["id"])))
 
     def test_make_a_floor_and_walls_from_words(self):
         """Make sends the words to the Image Studio as text to image, and the
