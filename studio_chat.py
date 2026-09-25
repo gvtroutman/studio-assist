@@ -24,6 +24,7 @@ import queue
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -49,6 +50,7 @@ import studio_procs as procs
 import studio_ui as ui
 import studio_icons as icons
 import studio_tasks as tasks
+import studio_update as updater
 import studio_toolsmith as toolsmith
 
 APP_NAME = "Studio Assist"
@@ -130,6 +132,8 @@ DRAIN_MS = 40                             # the pump, while events flow
 DRAIN_IDLE_MS = 160                       # ...and while nothing is happening
 QUIT_GRACE_S = 3.0                        # every bridge's time to exit, together
 HOST_RETRY_MS = 30000                     # between probes while the host is down
+UPDATE_FIRST_MS = 8000                    # the first look at GitHub, after start-up settles
+UPDATE_EVERY_MS = 15 * 60 * 1000          # ...and again while the window is open
 LLM_PC = "LLM PC"                         # the sidebar's second group: remote apps
 
 
@@ -402,6 +406,9 @@ class Chat(tk.Tk):
         self._build()
         self._menus()
         self.drain_timer = self.after(40, self._drain)
+        self.restart = False              # set by an update; main() relaunches
+        self.updating = False
+        self.update_timer = self.after(UPDATE_FIRST_MS, self._update_tick)
         self._spawn(None, self._read_icons)
         self._spawn(None, self._boot_host)
         self._select(self.active)
@@ -640,6 +647,8 @@ class Chat(tk.Tk):
 
         m_help = menu()
         m_help.add_command(label="Diagnostics...", command=self._diagnostics_window)
+        m_help.add_command(label="Check for updates...",
+                           command=lambda: self._check_updates(quiet=False))
         m_help.add_separator()
         m_help.add_command(label="About %s" % APP_NAME, command=self._about)
         bar.add_cascade(label="Help", menu=m_help)
@@ -658,6 +667,80 @@ class Chat(tk.Tk):
             self.input.bind(seq, lambda ev, f=fn: (f(), "break")[1])
         self.bind_all("<Control-Tab>", self._on_next_tab)
         self.input.bind("<Control-Tab>", self._on_next_tab)
+
+    # ----------------------------------------------------------------- updates
+    def _update_tick(self):
+        """Look at GitHub now and again while the window is open. The header's
+        Update button appears when there is something to pull."""
+        if self.closing:
+            return
+        self._check_updates(quiet=True)
+        self.update_timer = self.after(UPDATE_EVERY_MS, self._update_tick)
+
+    def _check_updates(self, quiet=True):
+        def work():
+            try:
+                st = updater.check()
+            except Exception as e:        # a git that hangs past its timeout
+                st = {"behind": 0, "ahead": 0, "commits": [], "upstream": "",
+                      "problem": "Could not check GitHub: %s" % e}
+            self.q.put(("update", None, (st, quiet)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update(self, st, quiet):
+        if st["behind"] and not self.updating:
+            self.btn_update.set(text="Update (%d)" % st["behind"])
+            self.btn_update.pack(side="right", padx=(6, 0), after=self.btn_hist)
+        else:
+            self.btn_update.pack_forget()
+        if quiet:
+            return
+        if st["problem"]:
+            messagebox.showwarning(APP_NAME, st["problem"], parent=self)
+        elif st["behind"]:
+            self._on_update(st)
+        else:
+            messagebox.showinfo(APP_NAME, "Up to date with %s." % st["upstream"],
+                                parent=self)
+
+    def _on_update(self, st=None):
+        """Say what is new, then fast-forward. Only ever a fast-forward: work
+        on this PC is never merged over (studio_update.py)."""
+        if self.updating:
+            return
+        if st is None:
+            self._check_updates(quiet=False)
+            return
+        new = st["commits"][:12]
+        more = len(st["commits"]) - len(new)
+        text = ("%d new change%s on GitHub (%s):\n\n%s%s\n\nUpdate now?"
+                % (st["behind"], "" if st["behind"] == 1 else "s", st["upstream"],
+                   "\n".join("\u2022 " + c for c in new),
+                   "\n\u2026and %d more" % more if more > 0 else ""))
+        if not messagebox.askyesno(APP_NAME, text, parent=self):
+            return
+        self.updating = True
+        self.btn_update.set(text="Updating" + ELLIPSIS)
+
+        def work():
+            try:
+                result = updater.pull()
+            except Exception as e:
+                result = (False, "The update failed: %s" % e)
+            self.q.put(("updated", None, result))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _updated(self, changed, msg):
+        self.updating = False
+        if not changed:
+            self.btn_update.set(text="Update")
+            messagebox.showwarning(APP_NAME, msg, parent=self)
+            return
+        self.btn_update.pack_forget()
+        if messagebox.askyesno(APP_NAME, "Updated. This window is still running the "
+                               "old version.\n\nRestart %s now?" % APP_NAME, parent=self):
+            self.restart = True
+            self._quit()
 
     def _about(self):
         messagebox.showinfo(
@@ -695,6 +778,9 @@ class Chat(tk.Tk):
         self.btn_hist.pack(side="right", padx=(6, 0))
         self.btn_fix = self._button(head, "Start app", self._on_fix, bg="head",
                                     kind="accent")
+        # Shown only when GitHub has commits this folder does not (_show_update).
+        self.btn_update = self._button(head, "Update", self._on_update, bg="head",
+                                       kind="accent")
 
         main = self._skin(tk.Frame(self), bg="bg")
         main.pack(side="top", fill="both", expand=True)
@@ -3051,6 +3137,13 @@ class Chat(tk.Tk):
             self.marks[key] = live
             return
 
+        if kind == "update":              # the window's, like "icon" below
+            self._show_update(*payload)
+            return
+        if kind == "updated":
+            self._updated(*payload)
+            return
+
         if kind == "diagnostics":
             # Like "icon", this belongs to the window rather than to a tab:
             # the report is about the whole installation, and it must still
@@ -4764,7 +4857,7 @@ class Chat(tk.Tk):
         # "invalid command name ..._drain" over a window that was already gone.
         self.closing = True
         self.anim.clear()
-        for timer in ("drain_timer", "host_timer", "anim_timer"):
+        for timer in ("drain_timer", "host_timer", "anim_timer", "update_timer"):
             self._stand_down(timer)
         # Off the screen at once; the bridges get their grace behind it, all
         # together. One at a time, each allowed seconds to exit, was a window
@@ -4858,6 +4951,16 @@ def main():
     except Exception:
         fail_visibly("starting up", traceback.format_exc())
         raise SystemExit(1)
+    if app.restart:
+        relaunch()
+
+
+def relaunch():
+    """Start the updated code once this copy has let go of the lock."""
+    if _LOCK is not None:
+        _LOCK.close()
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                     cwd=HERE, close_fds=True)
 
 
 if __name__ == "__main__":
