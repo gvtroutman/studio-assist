@@ -379,6 +379,9 @@ out badly.
 
 ## Staying up to date
 
+Double-click **`Update Studio Assist.cmd`** once: it pulls now and turns on the
+automatic checks. Or from a terminal:
+
 ```bash
 python studio_update.py --install            # check GitHub every 5 minutes
 python studio_update.py --install --every 15 # or less often
