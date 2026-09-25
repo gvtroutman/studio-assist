@@ -705,6 +705,29 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   (`character_look`: blank where it has none, the expression and gaze kept) and, if the
   person still has the default name, its name; it is a copy, like the form's. The look is
   said in that person's line, `Name (a person, where, facing): look. Description`.
+- **The mannequin wears the look, because the frame is what the picture copies.** At
+  `redraw` denoise a heavyset person drawn as the rest mannequin is pulled thin again,
+  so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
+  Height sliders, plus a Body type word `BUILDS` knows, as steps added to them (clamped,
+  so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
+  Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
+  sweater the forearm too), a dress, skirt or long coat adds a hem that follows the
+  legs. The Shoes slot is read for a kind (`SHOES`): heels tip the foot onto its toes
+  over a heel post, sneakers get a thick light sole, sandals a sole and a strap under
+  a bare foot, boots a sole and a shaft that replaces the shin's lower part (a tube over
+  it sorts behind the shin's long faces and vanishes; under trousers it is left out),
+  anything else a thin dark sole. A sole lifts the person, as it does. The Accessories slot puts a hat (`HATS` names it, `HAT_SHAPES`
+  builds it: a cap with its visor, a beanie, a brimmed hat, a top hat, a hard hat -
+  site yellow unless a colour is said) and glasses, sunglasses or goggles on the head,
+  as part `head`, so a click on them poses the head. The Hair section gives hair
+  (`hairdo`): a scalp lofted over the skull from a `hairline` (the head's faces under
+  it are dropped, or a big one sorts in front and shows through), a fall down the back
+  as long as the style says, a bun, ponytail or braids; under a hat only what hangs
+  below it. The colour is the first `CLOTH` word in the garment ("black
+  leather jacket" is black), else the slot's default. What is not worn is the object's
+  colour. The words are still sent as written; this only draws them. Every look edit
+  in the inspector goes through `changed()`, so the viewport follows each keystroke
+  and slider step.
 - **With people in the scene, the form's person is blanked for the job.** `generation()`
   lays empty slots, zero sliders, no `character` and no `item_refs` over the form, or the
   picture gets the form's person as well (an extra person, or two blended). The first
