@@ -62,7 +62,7 @@ this PC's files and the web instead. Two moving parts:
   Chrome/Edge `--app` window re-parented into the tab, and uploads dropped onto the board
   over DevTools. See *The tab that holds a window*.
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
-  Image Studio tab: a form (person, style, scene, references, generate) over any number
+  Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
@@ -478,10 +478,34 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   strength and reference photos (copied under `image-studio/references/`). A style
   is a LoRA and/or prompt additions plus look defaults. The precedence is model
   defaults < style < preset < the form. `compose()` builds the prompt as the person
-  (identity triggers, then the Who field and its attributes, `person_text`: a bare
-  "auburn" becomes "auburn hair"), then the scene, then the camera line, then the
+  (identity triggers, then the look, `person_text`: a bare "auburn" becomes "auburn
+  hair"), then the scene, then the camera line, then the anatomy constants, then the
   style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
+- **The look is a video game's character creator.** `LOOKS` is the sections (Body,
+  Face, Hair, Expression, Clothes, Accessories) of slots, each `(setting, label,
+  nouns, picks, many)`; every slot also takes free text, and a `many` slot
+  (accessories, marks) toggles picks in a comma list (`toggle`). Weight, muscle and
+  height are `SLIDERS`, -3..3, nothing said at 0. Height's setting is `stature`:
+  `height` is the picture's. Expressions show as emoji (`EMOJI`), on the form as
+  faces alone; the emoji never reach the prompt. A **character** (`characters.json`,
+  made in `CharacterCreator`) keeps every slot and slider but `PER_PICTURE`
+  (expression, gaze), an identity for the face, and a picture per item worn
+  (`item_refs`, copied under `references/`). Choosing one copies its look onto the
+  form (blanking what it does not set) rather than linking to it, so history holds
+  the whole look and Generate Again does not change when the character is edited.
+- **Item pictures go only where a workflow declares an `item` reference.** None
+  does yet (Redux in `flux_hq` is taken by style/composition, and nothing does
+  IP-Adapter), so today every item picture comes back as a warning naming the items,
+  and the item's words carry it. A picture of something not worn today is skipped
+  without a word.
+- **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
+  described, or named in the scene, `PEOPLE`) says outright that every person has
+  two hands, each with four fingers and a thumb, two feet, two eyes and a
+  proportionate body; diffusion models lose count otherwise. It is a positive
+  sentence on purpose: every shipped workflow samples at CFG 1, which ignores the
+  negative prompt, so the matching negatives are added only for a model that reads
+  one. On by default; the form has a switch (`anatomy`).
 - **Styles are chosen by picture.** The form shows each style as a tile of one cat
   photo in that style (`style_example`): the style's own `example` (a PNG), else
   `style_examples/<id>.png`, else a blank tile with its name. The shipped ones
