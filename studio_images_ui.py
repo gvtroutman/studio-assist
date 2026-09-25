@@ -93,7 +93,11 @@ class ImageStudio:
         self.loras = []               # [{"id", "var", "row"}]
         self.refs = {}                # kind -> local path
         self.adv = {}                 # setting -> StringVar
-        self.text = {}                # person and camera setting -> StringVar
+        self.text = {}                # look slot and camera setting -> StringVar
+        self.sliders = {}             # weight, muscle, stature -> IntVar
+        self.item_refs = {}           # item -> picture, from the character
+        self.look_section = ig.LOOKS[0][0]
+        self.anatomy = tk.BooleanVar(value=True)
         self.hints = {}               # setting -> Label
         self.rows = {}                # job id -> row widgets
         self.jobs = []                # this session's jobs, newest first
@@ -170,8 +174,8 @@ class ImageStudio:
         c.pack(side="top", fill="x", pady=(self.px(12), self.px(3)))
         return c
 
-    def button(self, parent, text, command, kind="quiet", bg="bg"):
-        return self.host._button(parent, text, command, kind=kind, bg=bg)
+    def button(self, parent, text, command, kind="quiet", bg="bg", **kw):
+        return self.host._button(parent, text, command, kind=kind, bg=bg, **kw)
 
     def say(self, text, role="muted"):
         self.note.config(text=text)
@@ -297,23 +301,38 @@ class ImageStudio:
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
 
         self.cap(f, "Person").pack(**pad)
+        crow = self.frame(f)
+        crow.pack(side="top", fill="x", **pad)
+        self.char_row = self.frame(crow)
+        self.char_row.pack(side="left")
+        self.button(crow, "Creator…", lambda: self.edit_characters(), kind="ghost").pack(
+            side="left", padx=(self.px(6), 0))
+        self.button(crow, "Save as…", self.save_as_character, kind="ghost").pack(
+            side="left", padx=(self.px(4), 0))
         self.person_box = self.frame(f)
-        self.person_box.pack(side="top", fill="x", **pad)
-        self.label(f, "Who, and what they look like. Any of these can stay blank.",
+        self.person_box.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.label(f, "Who, and what they look like. Any of these can stay blank; a "
+                   "character fills all but the expression.", "faint", self.host.f_small,
+                   wraplength=self.px(380)).pack(side="top", fill="x",
+                                                 pady=(self.px(6), 0), **pad)
+        for key in ig.SLOTS:
+            self.text[key] = tk.StringVar()
+        for key in ig.SLIDER_KEYS:
+            self.sliders[key] = tk.IntVar(value=0)
+        self.look_tabs = self.frame(f)
+        self.look_tabs.pack(side="top", fill="x", **pad)
+        self.look_box = self.frame(f)
+        self.look_box.pack(side="top", fill="x", **pad)
+        self._show_looks(self.look_section)
+        b = tk.Checkbutton(f, text="Anatomy constants", variable=self.anatomy, anchor="w",
+                           font=self.host.f_ui, bd=0, highlightthickness=0,
+                           command=self._recheck)
+        self.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(self.px(8), 0), **pad)
+        self.label(f, "Every person: " + ig._and([pos for _, pos, _ in ig.ANATOMY]) + ".",
                    "faint", self.host.f_small, wraplength=self.px(380)).pack(
-            side="top", fill="x", pady=(self.px(6), 0), **pad)
-        grid = self.frame(f)
-        grid.pack(side="top", fill="x", **pad)
-        for i, (key, label) in enumerate([("subject", "Who")]
-                                         + [(k, lab) for k, lab, _ in ig.PERSON_FIELDS]):
-            self.label(grid, label, "muted").grid(row=i, column=0, sticky="w",
-                                                  pady=self.px(1))
-            var = tk.StringVar()
-            entry = self.host._entry(grid, var)
-            entry.master.grid(row=i, column=1, sticky="we", padx=(self.px(8), 0))
-            entry.bind("<KeyRelease>", lambda ev: self._recheck())
-            self.text[key] = var
-        grid.columnconfigure(1, weight=1)
+            side="top", fill="x", **pad)
 
         self.cap(f, "Camera").pack(**pad)
         self.text["camera"] = tk.StringVar()
@@ -370,6 +389,13 @@ class ImageStudio:
         LoRA rows. Called again after any editor saves."""
         lib = self.studio.lib
         self._rebuild_models()
+        for w in self.char_row.winfo_children():
+            w.destroy()
+        chars = [("", "No character")] + [(c["id"], c["name"]) for c in lib.all("characters")]
+        if self.settings["character"] not in dict(chars):
+            self.settings["character"] = ""
+        self.choice(self.char_row, chars, self.settings["character"],
+                    self._set_character).pack(side="left")
         for w in self.person_box.winfo_children():
             w.destroy()
         old = {k: (b.get(), s.get()) for k, (b, s, _) in self.idents.items()}
@@ -519,6 +545,160 @@ class ImageStudio:
             sc.pack_forget()
         self._recheck()
 
+    # ------------------------------------------------------------- the look
+    def _set_character(self, cid):
+        """Put a character's look on the form: every slot and slider it keeps
+        (blank where it has none, so the last one's beard does not stay),
+        its item pictures, and its identity ticked. The expression is the
+        picture's, and stays."""
+        self.settings["character"] = cid
+        rec = self.studio.lib.get("characters", cid) if cid else None
+        if rec is not None:
+            for key in ig.CHARACTER_KEYS:
+                if key in self.sliders:
+                    self.sliders[key].set(int(rec["looks"].get(key, 0)))
+                else:
+                    self.text[key].set(rec["looks"].get(key, ""))
+            self.item_refs = dict(rec["item_refs"])
+            if rec["identity"] in self.idents:
+                bvar = self.idents[rec["identity"]][0]
+                if not bvar.get():
+                    bvar.set(True)
+                    self._toggle_ident(rec["identity"])
+            self._show_looks(self.look_section)
+        self._recheck()
+
+    def look_rows(self, parent, slots, vars_, changed, chips=False, bg="bg"):
+        """Rows for look slots: a label, the field, and the picks - a menu on
+        the ▾ beside the field, or (`chips`) a grid of them under it, the
+        chosen ones lit. -> a function that relights the chips."""
+        lights = []
+        for key, label, _, picks, many in slots:
+            row = self.frame(parent, bg)
+            row.pack(side="top", fill="x", pady=(self.px(2), 0))
+            self.label(row, label, "muted", bg=bg, width=12).pack(side="left", anchor="n")
+            var = vars_[key]
+            box = self.frame(row, bg)
+            box.pack(side="left", fill="x", expand=True)
+            line = self.frame(box, bg)
+            line.pack(side="top", fill="x")
+
+            def pick(p, k=key, m=many):
+                vars_[k].set(ig.toggle(vars_[k].get(), p, m))
+                changed()
+            if not chips:
+                menu_pill = self.button(line, "▾", lambda: None, kind="ghost", bg=bg)
+                menu_pill.pack(side="right", padx=(self.px(4), 0))
+                menu_pill.command = (lambda pl=menu_pill, ps=picks, k=key, m=many, f=pick:
+                                     self._post_picks(pl, ps, vars_[k], m, f))
+            entry = self.host._entry(line, var, bg=bg)
+            entry.master.pack(side="left", fill="x", expand=True)
+            entry.bind("<KeyRelease>", lambda ev: changed())
+            if not chips and key != "expression":
+                continue
+            # The form shows expressions as faces alone, big enough to read;
+            # the creator names every pick. Rows of a fixed count, packed
+            # left, so a long pick does not widen a whole column.
+            faces = not chips
+            cols = 6 if faces else 3
+            font = self.emoji_font() if faces else self.host.f_small
+            pills, line = [], None
+            for i, p in enumerate(picks):
+                if i % cols == 0:
+                    line = self.frame(box, bg)
+                    line.pack(side="top", fill="x", pady=(self.px(3), 0))
+                text = ig.EMOJI.get(p, p) if faces else ig.pick_label(p)
+                pl = self.button(line, text, lambda p=p, f=pick: f(p), bg=bg, font=font,
+                                 padx=self.px(6 if faces else 8), pady=self.px(2))
+                pl.pack(side="left", padx=(0, self.px(3)))
+                pills.append((p, pl))
+            lights.append((var, many, pills))
+
+        def relight():
+            for var, many, pills in lights:
+                now = [x.lower() for x in (ig.split_many(var.get()) if many
+                                           else [var.get().strip()])]
+                for p, pl in pills:
+                    kind = "accent" if p.lower() in now else "quiet"
+                    if pl.roles is not self.host.PILL_ROLES[kind]:
+                        pl.roles = self.host.PILL_ROLES[kind]
+                        if pl.C:
+                            pl.paint(pl.C)
+        relight()
+        return relight
+
+    def emoji_font(self):
+        """The faces' font: Windows draws emoji from Segoe UI Emoji, and Tk
+        falls back to whatever has the glyph elsewhere."""
+        if getattr(self, "_emoji_font", None) is None:
+            import tkinter.font as tkfont
+            self._emoji_font = tkfont.Font(root=self.host, family="Segoe UI Emoji", size=15)
+        return self._emoji_font
+
+    def _post_picks(self, pill, picks, var, many, pick):
+        menu = tk.Menu(pill, tearoff=0)
+        self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
+        now = [x.lower() for x in (ig.split_many(var.get()) if many else [var.get().strip()])]
+        for p in picks:
+            menu.add_command(label=("✓ " if p.lower() in now else "    ") + ig.pick_label(p),
+                             command=lambda p=p: pick(p))
+        menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
+
+    def slider_rows(self, parent, vars_, changed, bg="bg"):
+        """Weight, muscle and height as the game's sliders: -3..3, a word
+        beside each, nothing said at the middle."""
+        for key, label, _ in ig.SLIDERS:
+            row = self.frame(parent, bg)
+            row.pack(side="top", fill="x", pady=(self.px(2), 0))
+            self.label(row, label, "muted", bg=bg, width=12).pack(side="left")
+            word = self.label(row, "", "faint", self.host.f_small, bg=bg, width=14)
+            word.pack(side="right")
+
+            def moved(_v=None, k=key, w=word):
+                w.config(text=ig.slider_word(k, vars_[k].get()) or "average")
+                changed()
+            sc = tk.Scale(row, variable=vars_[key], from_=-ig.SLIDER_SPAN,
+                          to=ig.SLIDER_SPAN, resolution=1, orient="horizontal",
+                          showvalue=False, bd=0, highlightthickness=0, sliderrelief="flat",
+                          sliderlength=self.px(14), width=self.px(8), command=moved)
+            self.skin(sc, bg=bg, fg="muted", troughcolor="border", activebackground="accent")
+            sc.pack(side="left", fill="x", expand=True, padx=(self.px(6), self.px(6)))
+            word.config(text=ig.slider_word(key, vars_[key].get()) or "average")
+
+    def _show_looks(self, section):
+        """One section of the look on the form at a time, as the creator's
+        tabs are."""
+        self.look_section = section
+        for box in (self.look_tabs, self.look_box):
+            for w in box.winfo_children():
+                w.destroy()
+        for name, _ in ig.LOOKS:
+            self.button(self.look_tabs, name, lambda n=name: self._show_looks(n),
+                        kind="accent" if name == section else "quiet",
+                        font=self.host.f_small, padx=self.px(6), pady=self.px(2)).pack(
+                side="left", padx=(0, self.px(2)), pady=(self.px(6), self.px(2)))
+        relight = [None]
+
+        def changed():
+            if relight[0]:
+                relight[0]()
+            self._recheck()
+        if section == ig.SLIDER_SECTION:
+            self.slider_rows(self.look_box, self.sliders, changed)
+        relight[0] = self.look_rows(self.look_box, dict(ig.LOOKS)[section], self.text,
+                                    changed)
+        pics = [x for x in self.item_refs if x.lower() in
+                {w.lower() for w in ig.items_worn(self.collect_looks())}]
+        if section in ("Clothes", "Accessories") and pics:
+            self.label(self.look_box, "Pictures from the character: " + ", ".join(pics),
+                       "faint", self.host.f_small, wraplength=self.px(360)).pack(
+                side="top", fill="x", pady=(self.px(4), 0))
+
+    def collect_looks(self):
+        out = {k: v.get().strip() for k, v in self.text.items() if k in ig.SLOTS}
+        out.update({k: int(v.get()) for k, v in self.sliders.items()})
+        return out
+
     # ------------------------------------------------------------ references
     def _build_refs(self):
         self.ref_labels = {}
@@ -664,6 +844,10 @@ class ImageStudio:
         s["scene"] = self.scene.get("1.0", "end").strip()
         for key, var in self.text.items():
             s[key] = var.get().strip()
+        for key, var in self.sliders.items():
+            s[key] = int(var.get())
+        s["item_refs"] = dict(self.item_refs)
+        s["anatomy"] = bool(self.anatomy.get())
         s["negative"] = self.neg.get().strip()
         s["identities"] = [{"id": iid, "strength": round(sv.get(), 3)}
                            for iid, (bv, sv, _) in self.idents.items() if bv.get()]
@@ -696,6 +880,7 @@ class ImageStudio:
         s.update(settings)
         for key in ("preset", "model", "backend", "style"):
             self.settings[key] = s.get(key) or self.settings[key]
+        self.settings["character"] = s.get("character") or ""
         chosen = {d["id"]: d.get("strength") for d in s.get("identities") or []
                   if isinstance(d, dict)}
         for iid, (bv, sv, _) in self.idents.items():
@@ -706,6 +891,10 @@ class ImageStudio:
         self.scene.insert("1.0", s.get("scene") or "")
         for key, var in self.text.items():
             var.set(s.get(key) or "")
+        for key, var in self.sliders.items():
+            var.set(int(s.get(key) or 0))
+        self.item_refs = ig.clean_item_refs(s.get("item_refs"))
+        self.anatomy.set(s.get("anatomy") is not False)
         self.neg.set(s.get("negative") or "")
         for kind in ig.REFERENCE_NAMES:
             self._set_ref(kind, (s.get("references") or {}).get(kind))
@@ -730,6 +919,7 @@ class ImageStudio:
                 sv.set(chosen[iid])
             if bv.get():
                 sc.pack(side="right", fill="x", expand=True, padx=(self.px(8), 0))
+        self._show_looks(self.look_section)
         if s.get("style_strength") is not None:
             self.style_strength.set(s["style_strength"])
         for d in s.get("loras") or []:
@@ -1350,6 +1540,13 @@ class ImageStudio:
             ("notes", "Notes", "long"),
         ], template={"name": "New person", "strength": 0.85})
 
+    def edit_characters(self, looks=None):
+        """The character creator; `looks` starts a new character from them."""
+        return CharacterCreator(self, looks)
+
+    def save_as_character(self):
+        return self.edit_characters(dict(self.collect_looks(), item_refs=self.item_refs))
+
     def edit_styles(self):
         loras = [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
                                   for r in self.studio.lib.all("loras")]
@@ -1687,3 +1884,298 @@ class RecordEditor:
         self._reload_list(idx if idx is not None and idx < len(self.records) else None)
         self.status("Saved.", "ok")
         self.owner._saved(self.kind)
+
+
+class CharacterCreator:
+    """The character creator, laid out like a video game's: the characters on
+    the left; on the right a name, the identity that carries the face, and
+    tabs - Body (with the sliders), Face, Hair, Clothes, Accessories - of
+    picks to click, each slot also taking free text; a picture per item worn;
+    Randomize; and the character sheet, the prompt text it makes, underneath.
+    The anatomy constants have a tab of their own, locked: every character
+    has them. Expressions are not here - they are the picture's, on the form."""
+
+    SECTIONS = [name for name, _ in ig.LOOKS if name != "Expression"] + ["Constants"]
+
+    def __init__(self, owner, looks=None):
+        self.owner = o = owner
+        host = owner.host
+        self.lib = owner.studio.lib
+        self.records = [dict(r) for r in self.lib.all("characters")]
+        self.current = None
+        self.section = self.SECTIONS[0]
+        self.vars = {k: tk.StringVar() for k in ig.CHARACTER_KEYS if k in ig.SLOTS}
+        self.sl = {k: tk.IntVar(value=0) for k in ig.SLIDER_KEYS}
+        self.name = tk.StringVar()
+        self.identity = tk.StringVar()
+        self.item_refs = {}
+        win = self.win = tk.Toplevel(host)
+        win.title("Character creator")
+        win.transient(host)
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(940), host._px(680)))
+
+        left = o.frame(win)
+        left.pack(side="left", fill="y", padx=o.px(12), pady=o.px(12))
+        self.lb = tk.Listbox(left, width=24, bd=0, highlightthickness=0, activestyle="none",
+                             font=host.f_ui, exportselection=False)
+        host._skin(self.lb, bg="card", fg="text", selectbackground="sel",
+                   selectforeground="text")
+        self.lb.pack(side="top", fill="y", expand=True)
+        self.lb.bind("<<ListboxSelect>>", lambda ev: self._pick())
+        btns = o.frame(left)
+        btns.pack(side="top", fill="x", pady=(o.px(8), 0))
+        o.button(btns, "New", self._new).pack(side="left")
+        o.button(btns, "Duplicate", self._dup).pack(side="left", padx=(o.px(4), 0))
+        o.button(btns, "Delete", self._delete, kind="ghost").pack(side="left",
+                                                                  padx=(o.px(4), 0))
+
+        right = o.frame(win)
+        right.pack(side="left", fill="both", expand=True, pady=o.px(12),
+                   padx=(0, o.px(12)))
+        foot = o.frame(right)
+        foot.pack(side="bottom", fill="x", pady=(o.px(8), 0))
+        o.button(foot, "Use on the form", self._use, kind="accent").pack(side="right")
+        o.button(foot, "Save", self._save).pack(side="right", padx=(0, o.px(6)))
+        self.msg = o.label(foot, "", "muted", host.f_small)
+        self.msg.pack(side="left", fill="x", expand=True)
+        sheet = o.frame(right, "card")
+        sheet.pack(side="bottom", fill="x", pady=(o.px(8), 0))
+        o.label(sheet, "CHARACTER SHEET", "faint", host.f_small, bg="card").pack(
+            side="top", fill="x", padx=o.px(10), pady=(o.px(6), 0))
+        self.sheet = o.label(sheet, "", "text", bg="card", wraplength=o.px(560))
+        self.sheet.pack(side="top", fill="x", padx=o.px(10), pady=(o.px(2), o.px(8)))
+
+        top = o.frame(right)
+        top.pack(side="top", fill="x")
+        o.label(top, "Name", "muted", width=12).pack(side="left")
+        e = host._entry(top, self.name)
+        e.master.pack(side="left", fill="x", expand=True)
+        e.bind("<KeyRelease>", lambda ev: self._changed())
+        self.ident_row = o.frame(right)
+        self.ident_row.pack(side="top", fill="x", pady=(o.px(6), 0))
+        self.tabs = o.frame(right)
+        self.tabs.pack(side="top", fill="x", pady=(o.px(10), o.px(4)))
+        outer, self.panel = o.scrolled(right)
+        outer.pack(side="top", fill="both", expand=True)
+
+        if looks is not None:
+            refs = looks.pop("item_refs", {}) if isinstance(looks, dict) else {}
+            self.records.append({"name": "New character", "looks": looks,
+                                 "item_refs": dict(refs)})
+        self._reload_list(len(self.records) - 1 if self.records else None)
+
+    # ---------------------------------------------------------------- state
+    def status(self, text, role="muted"):
+        self.msg.config(text=text)
+        self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def looks(self):
+        out = {k: v.get().strip() for k, v in self.vars.items()}
+        out.update({k: int(v.get()) for k, v in self.sl.items()})
+        return out
+
+    def _store(self):
+        if self.current is None or self.current >= len(self.records):
+            return
+        rec = self.records[self.current]
+        rec.update(name=self.name.get().strip(), identity=self.identity.get(),
+                   looks=self.looks(), item_refs=dict(self.item_refs))
+
+    def _load(self, rec):
+        looks = rec.get("looks") or {}
+        for k, v in self.vars.items():
+            v.set(looks.get(k, "") or "")
+        for k, v in self.sl.items():
+            v.set(int(looks.get(k, 0) or 0))
+        self.name.set(rec.get("name") or "")
+        self.identity.set(rec.get("identity") or "")
+        self.item_refs = dict(rec.get("item_refs") or {})
+
+    def _reload_list(self, select):
+        self.lb.delete(0, "end")
+        for r in self.records:
+            self.lb.insert("end", r.get("name") or "(no name)")
+        self.current = None
+        if select is not None and self.records:
+            self.lb.selection_clear(0, "end")
+            self.lb.selection_set(select)
+            self.lb.see(select)
+        self._pick(store=False)
+
+    def _pick(self, store=True):
+        if store:
+            self._store()
+        sel = self.lb.curselection()
+        self.current = sel[0] if sel else None
+        if self.current is not None:
+            self._load(self.records[self.current])
+        self._build()
+
+    # ----------------------------------------------------------------- form
+    def _build(self):
+        o, host = self.owner, self.owner.host
+        self.relight = None           # the last tab's chips are about to go
+        for box in (self.ident_row, self.tabs, self.panel):
+            for w in box.winfo_children():
+                w.destroy()
+        if self.current is None:
+            o.label(self.panel, "No characters yet. New makes one.", "faint").pack(
+                side="top", anchor="w")
+            self.sheet.config(text="")
+            return
+        o.label(self.ident_row, "Face (identity)", "muted", width=12).pack(side="left")
+        idents = [("", "none: the words alone")] + [(i["id"], i["name"])
+                                                    for i in self.lib.all("identities")]
+        o.choice(self.ident_row, idents, self.identity.get(), self.identity.set).pack(
+            side="left")
+        for i, name in enumerate(self.SECTIONS):
+            o.button(self.tabs, ("\U0001F512 " if name == "Constants" else "") + name,
+                     lambda n=name: self._show(n),
+                     kind="accent" if name == self.section else "quiet").pack(
+                side="left", padx=(0, o.px(4)))
+        o.button(self.tabs, "\U0001F3B2 Randomize", self._randomize, kind="ghost").pack(
+            side="right")
+        p = self.panel
+        if self.section == "Constants":
+            o.label(p, "Every character has these, and every picture with a person in "
+                    "it says so (the form's Anatomy constants).", "muted",
+                    wraplength=o.px(560)).pack(side="top", fill="x", pady=(0, o.px(6)))
+            for part, pos, _ in ig.ANATOMY:
+                row = o.frame(p, "card")
+                row.pack(side="top", fill="x", pady=(0, o.px(3)))
+                o.label(row, "\U0001F512  " + part, "text", bg="card", width=12).pack(
+                    side="left", padx=o.px(8), pady=o.px(4))
+                o.label(row, pos, "muted", bg="card").pack(side="left", fill="x")
+            self._sheet()
+            return
+        if self.section == ig.SLIDER_SECTION:
+            o.slider_rows(p, self.sl, self._changed)
+        slots = [sl for sl in dict(ig.LOOKS)[self.section] if sl[0] in self.vars]
+        self.relight = o.look_rows(p, slots, self.vars, self._changed, chips=True)
+        if self.section in ("Clothes", "Accessories"):
+            self._item_pictures(p, [sl[0] for sl in slots])
+        self._sheet()
+
+    def _item_pictures(self, p, keys):
+        """A picture for each item this section has the character wearing:
+        what the glasses or the necklace actually look like."""
+        o, host = self.owner, self.owner.host
+        items = ig.items_worn({k: self.vars[k].get() for k in keys})
+        o.label(p, "ITEM PICTURES", "faint", host.f_small).pack(
+            side="top", fill="x", pady=(o.px(12), o.px(2)))
+        if not items:
+            o.label(p, "Choose an item above to give it a picture.", "faint",
+                    host.f_small).pack(side="top", fill="x")
+            return
+        for item in items:
+            row = o.frame(p)
+            row.pack(side="top", fill="x", pady=(0, o.px(3)))
+            path = self.item_refs.get(item)
+            img = photo(path, o.px(40)) if path and os.path.isfile(path) else None
+            if img is not None:
+                o.keep.append(img)
+                tk.Label(row, image=img, bd=0).pack(side="left", padx=(0, o.px(6)))
+            o.label(row, item, "text", width=18).pack(side="left")
+            o.label(row, os.path.basename(path) if path else "no picture", "faint",
+                    host.f_small).pack(side="left", fill="x", expand=True)
+            if path:
+                o.button(row, "×", lambda i=item: self._set_item(i, None),
+                         kind="ghost").pack(side="right")
+            o.button(row, "Picture…", lambda i=item: self._choose_item(i)).pack(
+                side="right", padx=(o.px(4), 0))
+
+    def _choose_item(self, item):
+        path = filedialog.askopenfilename(parent=self.win, title="A picture of the " + item,
+                                          filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"),
+                                                     ("All files", "*.*")])
+        if path:
+            self._set_item(item, path)
+
+    def _set_item(self, item, path):
+        if path:
+            try:
+                path = self.lib.keep_reference(path, (self.name.get() or "character")
+                                               + " items")
+            except OSError as e:
+                self.status("Could not copy %s: %s" % (path, e), "err")
+                return
+            self.item_refs[item] = path
+        else:
+            self.item_refs.pop(item, None)
+        self._build()
+
+    def _show(self, section):
+        self._store()
+        self.section = section
+        self._build()
+
+    def _changed(self):
+        if getattr(self, "relight", None):
+            self.relight()
+        if self.current is not None:
+            name = self.name.get().strip() or "(no name)"
+            if self.lb.get(self.current) != name:
+                self.lb.delete(self.current)
+                self.lb.insert(self.current, name)
+                self.lb.selection_set(self.current)
+        self._sheet()
+
+    def _sheet(self):
+        text = ig.person_text(self.looks())
+        self.sheet.config(text=text or "Pick anything above and the character reads "
+                                       "here, as the prompt will.")
+
+    def _randomize(self):
+        """A roll of the dice for the tab shown (every look tab, from Constants)."""
+        tab = None if self.section == "Constants" else [self.section]
+        for k, v in ig.random_looks(sections=tab).items():
+            (self.sl if k in self.sl else self.vars)[k].set(v)
+        self._build()
+
+    # ---------------------------------------------------------------- list
+    def _new(self):
+        self._store()
+        self.records.append({"name": "New character", "looks": {}})
+        self._reload_list(len(self.records) - 1)
+
+    def _dup(self):
+        if self.current is None:
+            return
+        self._store()
+        rec = dict(self.records[self.current])
+        rec["name"] = (rec.get("name") or "Character") + " copy"
+        rec.pop("id", None)
+        self.records.append(rec)
+        self._reload_list(len(self.records) - 1)
+
+    def _delete(self):
+        if self.current is None:
+            return
+        del self.records[self.current]
+        self._reload_list(0 if self.records else None)
+        self.status("Deleted - Save to keep it deleted.", "warn")
+
+    def _save(self):
+        self._store()
+        try:
+            self.lib.save("characters", self.records)
+        except OSError as e:
+            self.status("Could not save: %s" % e, "err")
+            return False
+        idx = self.current
+        self.records = [dict(r) for r in self.lib.all("characters")]
+        self._reload_list(idx if idx is not None and idx < len(self.records) else None)
+        self.status("Saved.", "ok")
+        self.owner._saved("characters")
+        return True
+
+    def _use(self):
+        """Save, then put this character on the form."""
+        if self.current is None or not self._save():
+            return
+        cid = self.records[self.current]["id"]
+        self.owner.settings["character"] = cid
+        self.owner._rebuild_choices()
+        self.owner._set_character(cid)
+        self.status("Saved, and on the form.", "ok")

@@ -334,6 +334,37 @@ def clean_style(d):
     }
 
 
+def clean_item_refs(v):
+    """{item as the form names it: picture path}, junk dropped."""
+    return {k.strip(): x.strip() for k, x in v.items() if isinstance(k, str) and k.strip()
+            and isinstance(x, str) and x.strip()} if isinstance(v, dict) else {}
+
+
+def clean_character(d):
+    """A character from the creator: the look it keeps from picture to
+    picture (`looks`, every CHARACTER_KEYS slot and slider it sets), the
+    identity whose LoRA carries its face, and a picture per item it wears."""
+    if not isinstance(d, dict) or not _str(d.get("name")):
+        return None
+    looks = d.get("looks") if isinstance(d.get("looks"), dict) else {}
+    kept = {}
+    for k in CHARACTER_KEYS:
+        if k in SLIDER_KEYS:
+            step = _num(looks.get(k, 0), int, 0, -SLIDER_SPAN, SLIDER_SPAN)
+            if step:
+                kept[k] = step
+        elif _str(looks.get(k)):
+            kept[k] = _str(looks.get(k))
+    return {
+        "id": slug(d.get("id") or d["name"]),
+        "name": _str(d["name"]),
+        "identity": _str(d.get("identity")),
+        "looks": kept,
+        "item_refs": clean_item_refs(d.get("item_refs")),
+        "notes": _str(d.get("notes")),
+    }
+
+
 def style_example(style):
     """The picture that shows what `style` looks like: its own `example` when
     that file is there, else the one shipped for its id (the same cat photo
@@ -346,7 +377,8 @@ def style_example(style):
 
 
 CLEAN = {"backends": clean_backend, "models": clean_model, "loras": clean_lora,
-         "identities": clean_identity, "styles": clean_style}
+         "identities": clean_identity, "styles": clean_style,
+         "characters": clean_character}
 
 
 def _default_backends():
@@ -423,11 +455,11 @@ def _default_styles():
 
 
 DEFAULTS = {"backends": _default_backends, "models": _default_models, "loras": list,
-            "identities": list, "styles": _default_styles}
+            "identities": list, "styles": _default_styles, "characters": list}
 
 
 class Library:
-    """The five configuration lists, each `<kind>.json` under `studio_dir()`.
+    """The six configuration lists, each `<kind>.json` under `studio_dir()`.
     A missing file is the defaults; a list the user edits is written whole,
     atomically. Best effort both ways: an unreadable file is the defaults and
     a line in `problems`, an unwritable one raises for the editor to say."""
@@ -1220,23 +1252,138 @@ def missing_for(model, backend, inventory, nodes=None, workflow_loader=None):
 def default_settings():
     return {"preset": "standard", "model": "flux-dev", "backend": "auto",
             "identities": [], "style": "none", "style_strength": None,
-            "scene": "", "subject": "", "hair": "", "eyes": "", "build": "",
-            "traits": "", "camera": "", "negative": "", "loras": [], "references": {},
+            "scene": "", "camera": "", "negative": "", "loras": [], "references": {},
+            "character": "", "item_refs": {}, "anatomy": True,
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "face_detail": None, "batch": 1}
+            "face_detail": None, "batch": 1,
+            **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
-# The person's attributes on the form: (setting, label, noun). A value that
-# does not already name its noun gets it: "auburn" -> "auburn hair".
-PERSON_FIELDS = [
-    ("hair", "Hair", ("hair",)),
-    ("eyes", "Eyes", ("eye",)),
-    ("build", "Build / weight", ("build", "weight", "figure", "body", "physique",
-                                 "lb", "kg", "pound", "kilo")),
-    ("traits", "Other", ()),
+# The person, laid out the way a video game's character creator lays one out:
+# sections of slots, each offering picks, every slot also taking free text.
+# A slot is (setting, label, nouns, picks, many). A value that names none of
+# `nouns` gets the first one: "auburn" -> "auburn hair", "neutral" ->
+# "neutral expression". A `many` slot holds several picks, comma-separated
+# ("glasses, silver necklace"), and a pick toggles in and out of it.
+LOOKS = [
+    ("Body", [
+        ("subject", "Who", (), ["a woman", "a man", "a person", "a young woman",
+                                "a young man", "an older woman", "an older man"], False),
+        ("age", "Age", (), ["in their 20s", "in their 30s", "in their 40s", "in their 50s",
+                            "in their 60s", "in their 70s"], False),
+        ("skin", "Skin", ("skin", "complexion"),
+         ["pale", "fair", "light", "olive", "tan", "light brown", "brown", "dark brown",
+          "deep brown"], False),
+        ("build", "Body type", ("build", "weight", "figure", "body", "physique", "lb", "kg",
+                                "pound", "kilo"),
+         ["athletic", "lean", "average", "curvy", "broad-shouldered", "stocky", "lanky",
+          "petite"], False),
+    ]),
+    ("Face", [
+        ("face", "Face shape", ("face", "jaw", "cheek", "chin"),
+         ["oval", "round", "square", "heart-shaped", "long", "diamond-shaped",
+          "sharp jawline", "high cheekbones"], False),
+        ("eyes", "Eyes", ("eyes", "eye"),
+         ["brown", "dark brown", "hazel", "amber", "green", "blue", "grey",
+          "almond-shaped", "hooded"], False),
+        ("brows", "Eyebrows", ("eyebrows", "brow"),
+         ["thick", "thin", "arched", "straight", "bushy", "defined"], False),
+        ("nose", "Nose", ("nose",), ["small", "straight", "button", "aquiline", "broad",
+                                     "Roman"], False),
+        ("lips", "Lips", ("lips", "lip", "mouth"), ["full", "thin", "wide", "bow-shaped"],
+         False),
+        ("facial_hair", "Facial hair", (),
+         ["clean-shaven", "light stubble", "heavy stubble", "short beard", "full beard",
+          "moustache", "goatee"], False),
+        ("traits", "Marks / other", (),
+         ["freckles", "dimples", "beauty mark", "rosy cheeks", "scar on the cheek",
+          "tattoos", "nose piercing"], True),
+    ]),
+    ("Hair", [
+        ("hair", "Colour", ("hair",),
+         ["black", "dark brown", "brown", "light brown", "auburn", "red", "ginger",
+          "strawberry blonde", "blonde", "platinum blonde", "grey", "silver", "white",
+          "dyed pink", "dyed blue"], False),
+        ("hair_style", "Style", ("hair",),
+         ["very short", "short", "chin-length", "shoulder-length", "long", "very long",
+          "straight", "wavy", "curly", "coily", "in a bun", "in a ponytail", "in braids",
+          "slicked back", "pixie cut", "bob", "buzz cut", "afro", "locs", "bald"], False),
+    ]),
+    ("Expression", [
+        ("expression", "Expression", ("expression", "smil", "laugh", "grin", "smirk",
+                                      "frown", "pout", "scowl", "tear", "cry"),
+         ["neutral", "soft smile", "broad smile", "laughing", "winking", "shy", "calm",
+          "dreamy", "playful", "confident smirk", "serious", "thoughtful", "pensive",
+          "surprised", "worried", "scared", "sad", "tearful", "angry", "determined",
+          "disgusted", "tired"], False),
+        ("gaze", "Looking", (),
+         ["looking at the camera", "looking away", "looking over the shoulder",
+          "looking up", "looking down", "eyes closed"], False),
+    ]),
+    ("Clothes", [
+        ("top", "Top / dress", (),
+         ["white t-shirt", "black t-shirt", "button-down shirt", "linen shirt",
+          "knit sweater", "turtleneck", "hoodie", "blouse", "tank top", "polo shirt",
+          "summer dress", "evening gown", "business suit", "tuxedo"], False),
+        ("bottom", "Bottoms", (),
+         ["blue jeans", "black jeans", "chinos", "tailored trousers", "shorts",
+          "pleated skirt", "denim skirt", "leggings", "cargo pants"], False),
+        ("outerwear", "Outerwear", (),
+         ["denim jacket", "leather jacket", "trench coat", "wool overcoat", "blazer",
+          "puffer jacket", "cardigan", "raincoat"], False),
+        ("footwear", "Shoes", (),
+         ["white sneakers", "leather boots", "ankle boots", "loafers", "heels", "sandals",
+          "running shoes", "combat boots"], False),
+    ]),
+    ("Accessories", [
+        ("accessories", "Accessories", (),
+         ["glasses", "round glasses", "sunglasses", "earrings", "hoop earrings", "necklace",
+          "pendant", "wristwatch", "bracelet", "rings", "baseball cap", "beanie", "fedora",
+          "headscarf", "scarf", "tie", "bow tie", "belt", "backpack", "tote bag",
+          "headphones", "gloves"], True),
+    ]),
 ]
+SLOTS = {s[0]: s for _, slots in LOOKS for s in slots}
+# The face each expression pick shows on its chip. Never in the prompt.
+EMOJI = {"neutral": "\U0001F610", "soft smile": "\U0001F642", "broad smile": "\U0001F601",
+         "laughing": "\U0001F602", "winking": "\U0001F609", "shy": "\U0001F60A",
+         "calm": "\U0001F60C", "dreamy": "\U0001F60D", "playful": "\U0001F61C",
+         "confident smirk": "\U0001F60F", "serious": "\U0001F611",
+         "thoughtful": "\U0001F914", "pensive": "\U0001F614", "surprised": "\U0001F62E",
+         "worried": "\U0001F61F", "scared": "\U0001F628", "sad": "\U0001F641",
+         "tearful": "\U0001F622", "angry": "\U0001F620", "determined": "\U0001F624",
+         "disgusted": "\U0001F922", "tired": "\U0001F629",
+         "looking at the camera": "\U0001F440", "looking up": "\U0001F644",
+         "eyes closed": "\U0001F60C"}
+
+
+def pick_label(pick):
+    """A pick as its chip shows it: "\U0001F642 soft smile"."""
+    return (EMOJI[pick] + " " + pick) if pick in EMOJI else pick
+
+# The creator's sliders: (setting, label, words from lo to hi). The middle
+# is 0 and says nothing; the form stores the step as an int.
+SLIDERS = [
+    ("weight", "Weight", ["very thin", "thin", "slim", "", "slightly heavy", "heavyset",
+                          "very heavyset"]),
+    ("muscle", "Muscle", ["frail", "soft", "untoned", "", "toned", "muscular",
+                          "very muscular"]),
+    # "stature", not "height": that is the picture's.
+    ("stature", "Height", ["very short", "short", "a little short", "",
+                          "a little tall", "tall", "very tall"]),
+]
+SLIDER_SPAN = 3                       # each slider runs -3..3
+SLIDER_KEYS = [k for k, _, _ in SLIDERS]
+SLIDER_SECTION = "Body"
+
+# What changes picture to picture rather than person to person: a character
+# does not keep these, and choosing one leaves them as they are.
+PER_PICTURE = ("expression", "gaze")
+CHARACTER_KEYS = [k for k in SLOTS if k not in PER_PICTURE] + [k for k, _, _ in SLIDERS]
+# The slots a reference picture can show: each item worn or carried.
+ITEM_SLOTS = ("top", "bottom", "outerwear", "footwear", "accessories")
 
 
 def _field(s, key):
@@ -1244,16 +1391,154 @@ def _field(s, key):
     return v.strip().strip(",.").strip() if isinstance(v, str) else ""
 
 
+def split_many(value):
+    return [x.strip() for x in (value or "").split(",") if x.strip()]
+
+
+def toggle(value, pick, many):
+    """A pick clicked in a slot holding `value`: a single slot takes it (or
+    lets go of it, clicked again); a `many` slot adds or drops it."""
+    if not many:
+        return "" if value.strip().lower() == pick.lower() else pick
+    items = split_many(value)
+    low = [x.lower() for x in items]
+    if pick.lower() in low:
+        del items[low.index(pick.lower())]
+    else:
+        items.append(pick)
+    return ", ".join(items)
+
+
+def slider_word(key, step):
+    words = next(w for k, _, w in SLIDERS if k == key)
+    try:
+        step = int(round(float(step)))
+    except (TypeError, ValueError):
+        return ""
+    return words[max(-SLIDER_SPAN, min(SLIDER_SPAN, step)) + SLIDER_SPAN]
+
+
+def _noun(key, v):
+    nouns = SLOTS[key][2]
+    if v and nouns and not any(n in v.lower() for n in nouns):
+        v += " " + nouns[0]
+    return v
+
+
+def _and(items):
+    items = [x for x in items if x]
+    return (", ".join(items[:-1]) + " and " + items[-1]) if len(items) > 1 else \
+        "".join(items)
+
+
+HAIR_NOUNS = ("bald", "buzz cut", "pixie cut", "bob", "afro", "locs", "crew cut", "mohawk",
+              "undercut", "shaved head")
+HAIR_AFTER = ("in ", "with ", "pulled ", "slicked ", "tied ")
+
+
+def hair_text(s):
+    """Colour and style as one phrase: "long wavy auburn hair", "auburn hair
+    in a bun", "grey buzz cut", "bald"."""
+    colour, style = _field(s, "hair"), _field(s, "hair_style")
+    low = style.lower()
+    if "bald" in low:
+        return style
+    if "hair" in colour.lower() or "hair" in low:
+        return ", ".join(x for x in (style, _noun("hair", colour)) if x)
+    if any(n in low for n in HAIR_NOUNS):
+        return " ".join(x for x in (colour, style) if x)
+    if not (colour or style):
+        return ""
+    if low.startswith(HAIR_AFTER):
+        return " ".join(x for x in (colour, "hair", style) if x)
+    return " ".join(x for x in (style, colour, "hair") if x)
+
+
 def person_text(settings):
-    """The person as prompt text: who they are, then their attributes.
-    "a woman in her 30s, auburn hair, green eyes, slim build"."""
-    bits = [_field(settings, "subject")]
-    for key, _, nouns in PERSON_FIELDS:
-        v = _field(settings, key)
-        if v and nouns and not any(n in v.lower() for n in nouns):
-            v += " " + nouns[0] + ("s" if nouns[0] == "eye" else "")
-        bits.append(v)
+    """The person as prompt text, the creator's sections in order: who, body,
+    face, hair, expression, clothes, accessories. "a woman, in their 30s, olive
+    skin, slim, tall, green eyes, long auburn hair, freckles, soft smile,
+    wearing a knit sweater and blue jeans, with glasses and a necklace"."""
+    s = settings
+    bits = [_field(s, k) for k in ("subject", "age")]
+    bits += [_noun(k, _field(s, k)) for k in ("skin", "build")]
+    bits += [slider_word(k, s.get(k)) for k, _, _ in SLIDERS]
+    bits += [_noun(k, _field(s, k)) for k in ("face", "eyes", "brows", "nose", "lips",
+                                              "facial_hair")]
+    bits.append(hair_text(s))
+    bits += [_field(s, "traits"), _noun("expression", _field(s, "expression")),
+             _field(s, "gaze")]
+    worn = _and([_field(s, k) for k in ("top", "bottom", "outerwear", "footwear")])
+    bits.append("wearing " + worn if worn else "")
+    carried = _and(split_many(_field(s, "accessories")))
+    bits.append("with " + carried if carried else "")
     return ", ".join(b for b in bits if b)
+
+
+def items_worn(settings):
+    """Every item the person wears or carries, as the form names it."""
+    out = []
+    for k in ITEM_SLOTS:
+        out += split_many(_field(settings, k)) if SLOTS[k][4] else [_field(settings, k)]
+    return [x for x in out if x]
+
+
+def random_looks(rng=random, sections=None):
+    """A roll of the dice, the creator's Randomize: one pick per slot (a few
+    left empty), every slider somewhere. `sections` limits it to those."""
+    out = {}
+    optional = {"facial_hair": 0.6, "traits": 0.5, "outerwear": 0.5, "brows": 0.5,
+                "nose": 0.6, "lips": 0.5, "face": 0.4}
+    for name, slots in LOOKS:
+        if sections and name not in sections or name == "Expression":
+            continue
+        for key, _, _, picks, many in slots:
+            if rng.random() < optional.get(key, 0.0):
+                out[key] = ""
+            elif key == "accessories":
+                out[key] = ", ".join(rng.sample(picks, rng.randint(0, 2)))
+            else:
+                out[key] = rng.choice(picks)
+    if not sections or SLIDER_SECTION in sections:
+        for key, _, _ in SLIDERS:
+            out[key] = rng.randint(-2, 2)
+    return out
+
+
+# The constants: what every person in every picture has, whoever they are
+# and whatever the creator says about them. Diffusion models lose count of
+# fingers and limbs, so the prompt says it outright. (part, positive,
+# negative). Every shipped workflow samples at CFG 1, which ignores the
+# negative prompt, so the positive sentence is what does the work there; the
+# negative is for a model that reads one.
+ANATOMY = [
+    ("Hands", "two hands, each with four fingers and a thumb",
+     "extra fingers, missing fingers, fused fingers, six fingers, extra hands, "
+     "malformed hands"),
+    ("Feet", "two feet", "extra feet, extra legs, missing feet"),
+    ("Eyes", "two eyes", "extra eyes, third eye, misaligned eyes"),
+    ("Body", "a proportionate body with natural anatomy",
+     "extra limbs, extra arms, disproportionate body, elongated neck, deformed body"),
+]
+# A scene with nobody described still gets the constants when it names a person.
+PEOPLE = re.compile(r"\b(wom[ae]n|m[ae]n|person|people|girls?|boys?|lady|ladies|guys?|"
+                    r"kids?|child(ren)?|he|she|they|his|her|portrait|selfie|couple|"
+                    r"crowd|dancers?|athletes?|workers?|someone|figure)\b", re.I)
+
+
+def anatomy_text():
+    parts = [pos for _, pos, _ in ANATOMY]
+    return "Anatomically correct: every person has exactly " + _and(parts)
+
+
+def anatomy_negative():
+    return ", ".join(neg for _, _, neg in ANATOMY)
+
+
+def has_person(settings, named=False):
+    """Whether the picture has a person in it: one chosen or described, or
+    the scene names one."""
+    return bool(named or person_text(settings) or PEOPLE.search(_field(settings, "scene")))
 
 
 def summary(settings):
@@ -1400,6 +1685,9 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     named = " and ".join(t for t in who if t not in scene)
     parts = [x for x in (", ".join(x for x in (named, person) if x), scene,
                          _field(s, "camera")) if x]
+    anatomy = s.get("anatomy") is not False and has_person(s, bool(idents))
+    if anatomy:
+        parts.append(anatomy_text())
     if style:
         extra = " ".join(x for x in (style["trigger"], style["prompt"]) if x)
         if extra:
@@ -1411,7 +1699,8 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     if not p.prompt:
         p.errors.append("Describe the scene or the person, or choose a person.")
     p.negative = ", ".join(x for x in (s["negative"].strip(),
-                                        style["negative"] if style else "") if x)
+                                        style["negative"] if style else "",
+                                        anatomy_negative() if anatomy else "") if x)
     if style and style["families"] and family not in style["families"]:
         p.warnings.append("The %s style was written for %s; %s may read it differently."
                           % (style["name"], ", ".join(FAMILIES.get(f, f) for f in style["families"]),
@@ -1456,6 +1745,12 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                 break
     slots = wf.get("references") or {}
     needs = wf.get("needs") or {}
+
+    def lacking(var):
+        """The files `var`'s input needs that the backend lacks, named."""
+        return ", ".join(str(v.get(f)) for f in needs.get(var, []) if inventory is not None
+                         and v.get(f) not in inventory.get(wf.get("files", {}).get(f, ""),
+                                                           set()))
     for kind in REFERENCE_NAMES:
         path = refs.get(kind)
         if not path:
@@ -1477,14 +1772,40 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             p.warnings.append("%s reference %s is not on this PC any more; not used."
                               % (label, path))
             continue
-        short = [f for f in needs.get(var, []) if inventory is not None
-                 and v.get(f) not in inventory.get(wf.get("files", {}).get(f, ""), set())]
+        short = lacking(var)
         if short:
             p.warnings.append("%s reference: %s lacks %s, which it needs; not used."
-                              % (label, backend["name"], ", ".join(str(v.get(f)) for f in short)))
+                              % (label, backend["name"], short))
             continue
         p.images[var] = path
         p.references[kind] = path
+    # Item pictures: what the character's glasses or necklace look like. Only
+    # a workflow that declares an "item" reference takes one, a picture per
+    # input; the item's name is in the prompt either way.
+    worn = {x.lower() for x in items_worn(s)}
+    unused = []
+    for name, path in clean_item_refs(s.get("item_refs")).items():
+        if name.lower() not in worn:
+            continue                  # a picture of something not worn today
+        var = slots.get("item")
+        if not var or var in p.images:
+            unused.append(name)
+        elif not os.path.isfile(path):
+            p.warnings.append("The picture of the %s (%s) is not on this PC any more; "
+                              "not used." % (name, path))
+        elif lacking(var):
+            p.warnings.append("The picture of the %s: %s lacks %s, which it needs; not "
+                              "used." % (name, backend["name"], lacking(var)))
+        else:
+            p.images[var] = path
+            p.references["item: " + name] = path
+    if unused:
+        p.warnings.append("Pictures of the %s: the %s workflow has %s, so the words "
+                          "alone describe %s." % (
+                              _and(unused), wf.get("label", wid),
+                              "no free item reference input" if slots.get("item")
+                              else "no item reference input",
+                              "it" if len(unused) == 1 else "them"))
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
 
