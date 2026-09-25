@@ -236,7 +236,10 @@ class TestRegistry(unittest.TestCase):
             m.connect()
 
     def test_no_other_tab_is_a_panel(self):
-        self.assertEqual([a.id for a in eng.TABS if a.panel], ["milanote"])
+        # The Image Studio is a panel tab too, but one whose body is our own
+        # form: it holds no other program's window.
+        self.assertEqual([a.id for a in eng.TABS if a.panel], ["milanote", "image-studio"])
+        self.assertEqual([a.id for a in eng.TABS if a.panel and not a.images], ["milanote"])
 
 
 def _headless():

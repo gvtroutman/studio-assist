@@ -61,6 +61,9 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_milanote.py`** — the Milanote tab, which holds a window and has no bridge: a
   Chrome/Edge `--app` window re-parented into the tab, and uploads dropped onto the board
   over DevTools. See *The tab that holds a window*.
+- **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
+  Image Studio tab: a form (person, style, scene, references, generate) over any number
+  of ComfyUI backends, with no model in the loop. See *The Image Studio*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -379,6 +382,75 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   `comfy_wait`. A `notifications/progress` on the call's own token now restarts its
   timeout, up to `PROGRESS_CAP` (30 min); a bridge that says nothing still times out.
   The bridge's own wait defaults to `DEFAULT_WAIT` (15 min).
+
+### The Image Studio: a form over several ComfyUIs
+
+The ComfyUI tab is a conversation; the Image Studio (`IMAGE_STUDIO`, an `ImagesSpec`,
+a `PanelSpec` with `images = True`) is a form. It holds no other program's window,
+so `_ensure` just marks it ready and calls `ImageStudio.start()`, the first thing in
+it that touches the network (a tab is built before it is looked at, and the GUI
+tests build every tab). `studio_imagegen.py` is the engine, with no tkinter;
+`studio_images_ui.py` is the tab, a collaborator the window lends `_skin`, `_button`,
+`_entry`, `_spawn`, `q` and `_animate`. Worker threads post `("images", sid, ...)`
+events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
+
+- **Backends are independent workers.** Each is a record in
+  `image-studio/backends.json` (beside the settings): URL, WebSocket URL, enabled,
+  roles, notes, and three flags. `shares_llm_gpu` means clear LM Studio off the card
+  first (`Chat._images_make_room`, which is `_make_room`'s rule). `release_vram` means
+  `/free` when that backend's queue empties. `encoder_on_cpu` does what it does in
+  the bridge. VRAM is never pooled and no path is assumed to exist on the other
+  machine: pictures reach a backend by upload (named by content hash, sent once),
+  models by a filename that backend has. The defaults are the 5090 on this PC
+  (`IMAGE_STUDIO_5090_URL`) and the 3090 (`COMFYUI_URL`).
+- **Every ComfyUI call is in `ComfyUIClient`**, one per backend. Progress comes over
+  the WebSocket (`studio_milanote.WebSocket`, read on a thread of its own so a timeout
+  never cuts a frame). The *end* of a job is read from `/history` every two seconds
+  regardless, so a socket that never opens costs the step counter, nothing else.
+  `cancel_job` interrupts only its own prompt (`/interrupt` with `prompt_id`, or
+  `/queue delete`): a bare interrupt would stop the chat tab's render.
+- **Workflows are files.** `comfy_workflows/<id>.json` is an API-format graph plus:
+  `{{placeholders}}` (a whole value keeps its type), `_when`/`_unless` nodes,
+  `switches` (a link chosen by a value), `lora_chain` (where LoRAs hang;
+  `{{model_out}}`/`{{clip_out}}` are its end), `references` (which reference kind
+  feeds which image input), `files` and `needs` (what must be on the backend), and
+  `stages.refining`. `fill()` is the whole adapter and refuses an unfilled value or a
+  dangling link by name. Check a new template against the server's `/object_info`
+  (the tests hold the shipped ones to filling; a live check is by hand).
+- **Logical names.** A model (`models.json`) has `values` for every machine and a
+  `backends` entry per machine that overrides them: other filenames, fp8, even
+  another family or workflow, or `null` for "not installed there". A LoRA has `file`
+  and `files` per backend. Compatibility is decided on the family *resolved for the
+  backend the job lands on*: an incompatible LoRA is left out with a warning, and a
+  LoRA of unknown family is applied with one. Nothing is dropped silently.
+- **Identity and style are separate records.** An identity is a LoRA, a trigger, a
+  strength and reference photos (copied under `image-studio/references/`). A style
+  is a LoRA and/or prompt additions plus look defaults. The precedence is model
+  defaults < style < preset < the form. `compose()` builds the prompt as triggers,
+  then the scene, then the style. It is pure and does no I/O, which is how the form
+  shows warnings before Generate.
+- **A reference is typed** (face, pose, composition, style, source) and used only
+  where the workflow declares that kind. Otherwise it is a warning, not a silent
+  reuse. As of 2026-09-25 `flux_hq` takes `source` (image to image) and
+  `style`/`composition` (Redux, when its two files are on the backend). Nothing on
+  either machine does face or pose conditioning yet (no PuLID, IP-Adapter or
+  ControlNet), so the likeness is the identity LoRA's.
+- **One lane per backend, one job per picture.** `JobQueue` runs a thread per
+  backend, so the two GPUs work at once. A batch of N is N jobs with seeds s..s+N-1,
+  spread over every capable backend, so each picture's record states its exact seed.
+  Auto routing (`route`) prefers backends whose roles include the preset's role,
+  falls back to any enabled one that is up and has the model, and says why when
+  nothing can take the job.
+- **History is the record.** `image-studio/history/<date>/<id>.json` sits beside the
+  pictures and holds the settings as submitted, the resolved prompt, model file,
+  LoRAs with strengths, identities, style, backend, sampler values, the refine pass,
+  warnings, timing and the submitted graph. Reuse Settings loads `settings` back;
+  Generate Again resubmits it, keeping a seed chosen by hand and rolling a random
+  one.
+- **Measured 2026-09-25 on the 3090:** Z-Image Turbo at 1024² took 18-30 s end to
+  end through the studio. No ComfyUI answered on this PC then, and no FLUX files
+  were on either machine, so `flux_hq` was checked against the 3090's
+  `/object_info` but not rendered.
 
 ### The app the user connects by hand: `BridgeSpec`
 

@@ -1,0 +1,90 @@
+{
+  "id": "flux_hq",
+  "label": "FLUX.1 high quality",
+  "about": "FLUX.1 [dev] text to image with a LoRA stack, an optional source picture (image to image), an optional Redux style/composition reference, and an optional upscale-and-refine pass at low denoise.",
+  "families": ["flux1"],
+  "defaults": {
+    "steps": 28, "guidance": 3.5, "sampler": "euler", "scheduler": "simple",
+    "width": 1024, "height": 1024, "denoise": 1.0, "weight_dtype": "default",
+    "encoder_device": "default", "refine": false, "upscale": 1.5,
+    "refine_steps": 14, "refine_denoise": 0.3, "refine_sampler": "euler",
+    "refine_scheduler": "beta", "reference_strength": 0.5,
+    "filename_prefix": "ImageStudio/flux"
+  },
+  "source_denoise": 0.7,
+  "files": {
+    "model": "diffusion_models", "clip_l": "text_encoders", "t5": "text_encoders",
+    "vae": "vae", "clip_vision": "clip_vision", "style_model": "style_models"
+  },
+  "needs": {"reference_image": ["clip_vision", "style_model"]},
+  "references": {"style": "reference_image", "composition": "reference_image",
+                 "source": "source_image"},
+  "lora_chain": {"model": ["1", 0], "clip": ["2", 0]},
+  "switches": {
+    "positive": {"when": "reference_image", "then": ["34", 0], "else": ["11", 0]},
+    "latent": {"when": "source_image", "then": ["22", 0], "else": ["20", 0]},
+    "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]}
+  },
+  "stages": {"refining": ["42", "43", "44", "45"]},
+  "graph": {
+    "1": {"class_type": "UNETLoader",
+          "inputs": {"unet_name": "{{model}}", "weight_dtype": "{{weight_dtype}}"}},
+    "2": {"class_type": "DualCLIPLoader",
+          "inputs": {"clip_name1": "{{clip_l}}", "clip_name2": "{{t5}}", "type": "flux",
+                     "device": "{{encoder_device}}"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+
+    "10": {"class_type": "CLIPTextEncode",
+           "inputs": {"text": "{{prompt}}", "clip": "{{clip_out}}"}},
+    "11": {"class_type": "FluxGuidance",
+           "inputs": {"conditioning": ["10", 0], "guidance": "{{guidance}}"}},
+    "12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["10", 0]}},
+
+    "30": {"_when": "reference_image", "class_type": "LoadImage",
+           "inputs": {"image": "{{reference_image}}"}},
+    "31": {"_when": "reference_image", "class_type": "CLIPVisionLoader",
+           "inputs": {"clip_name": "{{clip_vision}}"}},
+    "32": {"_when": "reference_image", "class_type": "CLIPVisionEncode",
+           "inputs": {"clip_vision": ["31", 0], "image": ["30", 0], "crop": "center"}},
+    "33": {"_when": "reference_image", "class_type": "StyleModelLoader",
+           "inputs": {"style_model_name": "{{style_model}}"}},
+    "34": {"_when": "reference_image", "class_type": "StyleModelApply",
+           "inputs": {"conditioning": ["11", 0], "style_model": ["33", 0],
+                      "clip_vision_output": ["32", 0], "strength": "{{reference_strength}}",
+                      "strength_type": "multiply"}},
+
+    "20": {"_unless": "source_image", "class_type": "EmptySD3LatentImage",
+           "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
+    "21": {"_when": "source_image", "class_type": "LoadImage",
+           "inputs": {"image": "{{source_image}}"}},
+    "22": {"_when": "source_image", "class_type": "VAEEncode",
+           "inputs": {"pixels": ["21", 0], "vae": ["3", 0]}},
+
+    "40": {"class_type": "KSampler",
+           "inputs": {"model": "{{model_out}}", "seed": "{{seed}}", "steps": "{{steps}}",
+                      "cfg": 1.0, "sampler_name": "{{sampler}}", "scheduler": "{{scheduler}}",
+                      "positive": "{{positive}}", "negative": ["12", 0],
+                      "latent_image": "{{latent}}", "denoise": "{{denoise}}"}},
+    "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
+
+    "42": {"_when": "refine", "class_type": "ImageScaleBy",
+           "inputs": {"image": ["41", 0], "upscale_method": "lanczos",
+                      "scale_by": "{{upscale}}"}},
+    "43": {"_when": "refine", "class_type": "VAEEncodeTiled",
+           "inputs": {"pixels": ["42", 0], "vae": ["3", 0], "tile_size": 1024,
+                      "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}},
+    "44": {"_when": "refine", "class_type": "KSampler",
+           "inputs": {"model": "{{model_out}}", "seed": "{{seed}}",
+                      "steps": "{{refine_steps}}", "cfg": 1.0,
+                      "sampler_name": "{{refine_sampler}}",
+                      "scheduler": "{{refine_scheduler}}", "positive": "{{positive}}",
+                      "negative": ["12", 0], "latent_image": ["43", 0],
+                      "denoise": "{{refine_denoise}}"}},
+    "45": {"_when": "refine", "class_type": "VAEDecodeTiled",
+           "inputs": {"samples": ["44", 0], "vae": ["3", 0], "tile_size": 1024,
+                      "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}},
+
+    "9": {"class_type": "SaveImage",
+          "inputs": {"images": "{{final}}", "filename_prefix": "{{filename_prefix}}"}}
+  }
+}

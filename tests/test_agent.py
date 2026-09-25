@@ -1656,6 +1656,7 @@ class TestGui(unittest.TestCase):
         # Connect runs the real one against a stubbed probe; see the tests.
         cls.real_boot_host = staticmethod(studio_chat.Chat._boot_host)
         studio_chat.Chat._boot_host = lambda self, *a, **k: None
+        cls._real_ensure = studio_chat.Chat._ensure
         studio_chat.Chat._ensure = lambda self, s: None
         studio_chat.Chat._read_icons = lambda self: None
         # A tab's boot fits the model's window on the host: no host here.
@@ -1672,6 +1673,7 @@ class TestGui(unittest.TestCase):
         # first. A bare destroy left them armed, and the run ended with Tk
         # complaining about "invalid command name ..._drain".
         cls.app._quit()
+        cls.mod.Chat._ensure = cls._real_ensure
         eng.installed_apps = cls._real_installed
         eng.loaded_instances, eng.fit_model = cls._real_fit
         if cls._real_settings is None:
