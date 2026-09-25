@@ -872,6 +872,37 @@ class TestImageStudioTab(unittest.TestCase):
         with open(os.path.join(ui.studio.lib.root, "identities.json")) as f:
             self.assertIn("LILYAPERSON", f.read())
 
+    def test_a_civitai_link_imports_into_the_lora_library(self):
+        import urllib.request
+        import studio_images_ui
+        sys.path.insert(0, HERE)
+        from test_civitai import FakeCivitAI
+        s, ui = self.tab()
+        fake, real = FakeCivitAI(), urllib.request.urlopen
+        urllib.request.urlopen = fake
+        try:
+            ed = ui.edit_loras()
+            self.app.update()
+            dlg = studio_images_ui.LoraImport(ui, ed)
+            self.app.update()
+            dlg.links.delete("1.0", "end")
+            dlg.links.insert("1.0", "not a link")
+            dlg.start()
+            self.assertIn("Not a CivitAI link", dlg.msg.cget("text"))
+            dlg.links.delete("1.0", "end")
+            dlg.links.insert("1.0", "https://civitai.com/models/12345?modelVersionId=67890")
+            dlg.dest = ""                        # the profile only; no download
+            dlg.start()
+            self.pump(lambda: not dlg.busy)
+            self.assertIn("1 added", dlg.msg.cget("text"))
+            rec = ui.studio.lib.lora_by_file("sx70_flux_v2.safetensors")
+            self.assertEqual(rec["trigger"], "sx70 photo, polaroid frame")
+            self.assertEqual(ed.records[ed.current]["id"], rec["id"])   # shown in the editor
+            dlg.close()
+            ed.win.destroy()
+        finally:
+            urllib.request.urlopen = real
+
     def test_the_form_says_where_it_goes_and_refuses_what_cannot_run(self):
         s, ui = self.tab()
         self.pump(lambda: all(b["id"] in ui.studio.inventories for b in ui.studio.backends()))
