@@ -316,6 +316,27 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   for one edit. Now the edit ends in a `PreviewImage`, the GPU is freed, and the
   finish run loads that preview (`LoadImage` with `"<name> [temp]"`): 119 s for
   the cold edit plus 31 s for the finish.
+- **The original's pixels are the base layer of a local edit** (`local_edit`).
+  Qwen-Image-Edit redraws the whole frame at ~1 MP, and what it "leaves alone"
+  comes back resized and twice through the VAE: grain, detail and colour
+  drift. So unless `whole_picture` is set, the edit ends in a preview and a
+  second run (no diffusion model, SAM3 at most) scales it back to the
+  original's size and composites it onto the original with
+  `ImageCompositeMasked` through a grown, blurred mask. The mask is SAM3's
+  `region` in the picture before OR after (so "remove the man" and "add a
+  hat" both work), or, with no region or none found, what changed: a blurred
+  per-channel difference over `DIFF_LEVEL`. `ImageBlend`'s "difference" is a
+  clamped `image1 - image2`, not an absolute one: navy made red read as no
+  change in red, so both orders are screened together. Pixel difference is
+  the fallback, not the plan: the edit nudges masts and roofs, so a red
+  sweater came back as the sweater plus flecks of harbour. A difference mask
+  covering more than `GLOBAL_SHARE` is taken as a global edit and the frame is
+  kept whole, so "make it night" never comes back as night patches on day.
+  Mask coverage returns to the bridge as `PreviewAny` text of a 16x16 mask (a
+  torch tensor print, `mask_share`); `ImageScale` takes its size as links from
+  `GetImageSize`. A photo finish on a local edit is scaled back and kept inside
+  the same mask (`save_edit`). The agent prompt tells the model to name
+  `region` for local edits and set `whole_picture` for global ones.
 - **A face swap is crop, edit and stitch, in three runs** (`t_face_swap`). There is
   no face-swap model on the LLM PC (no InsightFace, ReActor or IP-Adapter), and
   `comfy_edit_image` on the whole picture gave the user strangers: in a 1 MP frame
@@ -459,6 +480,16 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   defaults < style < preset < the form. `compose()` builds the prompt as triggers,
   then the scene, then the style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
+- **Styles are chosen by picture.** The form shows each style as a tile of one cat
+  photo in that style (`style_example`): the style's own `example` (a PNG), else
+  `style_examples/<id>.png`, else a blank tile with its name. The shipped ones
+  are 208 px squares made on the 5090 by FLUX image to image from that photo,
+  with the style's prompt first (after the subject, it barely registered). Denoise
+  was 0.5 for Modern photograph and ~0.93 for the rest; below that, image to image
+  keeps the photo's colour and "Black and white" comes out in colour. A new
+  default style needs its tile (a test checks). Tk scales pictures only by
+  whole factors, so `photo_at` zooms and subsamples to hit the tile size, and
+  passes a master: a `PhotoImage` without one belongs to the first Tk root.
 - **A reference is typed** (face, pose, composition, style, source) and used only
   where the workflow declares that kind. Otherwise it is a warning, not a silent
   reuse. As of 2026-09-25 `flux_hq` takes `source` (image to image) and
