@@ -1,0 +1,47 @@
+{
+  "id": "flux_dev_baseline",
+  "label": "FLUX.1 [dev] baseline",
+  "about": "The known-good FLUX.1 [dev] text to image: ComfyUI's own flux_dev_full_text_to_image recipe (split files, KSampler at CFG 1, zeroed negative) plus FluxGuidance, so guidance is a real setting. No LoRAs, references, ControlNet, face pass or upscale: the clean baseline everything else is layered on.",
+  "families": ["flux1"],
+  "defaults": {
+    "steps": 20, "guidance": 3.5, "sampler": "euler", "scheduler": "simple",
+    "width": 1024, "height": 1024, "weight_dtype": "default",
+    "encoder_device": "default", "filename_prefix": "ImageStudio/flux"
+  },
+  "files": {
+    "model": "diffusion_models", "clip_l": "text_encoders", "t5": "text_encoders",
+    "vae": "vae"
+  },
+  "stages": {
+    "loading": ["1", "2", "3", "10"],
+    "sampling": ["40"],
+    "decoding": ["41", "9"]
+  },
+  "graph": {
+    "1": {"class_type": "UNETLoader",
+          "inputs": {"unet_name": "{{model}}", "weight_dtype": "{{weight_dtype}}"}},
+    "2": {"class_type": "DualCLIPLoader",
+          "inputs": {"clip_name1": "{{clip_l}}", "clip_name2": "{{t5}}", "type": "flux",
+                     "device": "{{encoder_device}}"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+
+    "10": {"class_type": "CLIPTextEncode",
+           "inputs": {"text": "{{prompt}}", "clip": ["2", 0]}},
+    "11": {"class_type": "FluxGuidance",
+           "inputs": {"conditioning": ["10", 0], "guidance": "{{guidance}}"}},
+    "12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["10", 0]}},
+
+    "20": {"class_type": "EmptySD3LatentImage",
+           "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
+
+    "40": {"class_type": "KSampler",
+           "inputs": {"model": ["1", 0], "seed": "{{seed}}", "steps": "{{steps}}",
+                      "cfg": 1.0, "sampler_name": "{{sampler}}", "scheduler": "{{scheduler}}",
+                      "positive": ["11", 0], "negative": ["12", 0],
+                      "latent_image": ["20", 0], "denoise": 1.0}},
+    "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
+
+    "9": {"class_type": "SaveImage",
+          "inputs": {"images": ["41", 0], "filename_prefix": "{{filename_prefix}}"}}
+  }
+}

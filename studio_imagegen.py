@@ -51,6 +51,7 @@ WORKFLOWS_DIR = os.path.join(HERE, "comfy_workflows")
 MAX_SEED = 2 ** 32 - 1
 JOB_TIMEOUT = 1800            # seconds a job may run before it is given up on
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
+QUIET_AFTER = 120             # seconds without a progress event before a job says so
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
                "clip_vision", "style_models", "controlnet", "upscale_models")
 
@@ -239,6 +240,8 @@ def clean_backend(d):
         "encoder_on_cpu": d.get("encoder_on_cpu") is True,
         "max_megapixels": _num(d.get("max_megapixels", 4.2), float, 4.2, 0.5, 64.0),
         "lora_dir": _str(d.get("lora_dir")),
+        # How to start ComfyUI there, said when it does not answer.
+        "start": _str(d.get("start")),
     }
 
 
@@ -336,6 +339,8 @@ def _default_backends():
          "roles": ["primary", "flux", "hires", "identity", "interactive", "training"],
          "notes": "This PC. Its GPU is also After Effects' and Resolve's, so ComfyUI "
                   "lets go of VRAM when its queue empties.",
+         "start": os.environ.get("IMAGE_STUDIO_5090_START",
+                                 r"D:\ComfyUI\Start ComfyUI (Image Studio).cmd"),
          "max_megapixels": 6.0},
         {"id": "3090", "name": "3090 Server",
          "url": os.environ.get("COMFYUI_URL", "http://100.127.17.38:8188"),
@@ -343,25 +348,28 @@ def _default_backends():
                    "caption", "upscale", "background"],
          "notes": "The LLM PC. Shares its 24 GB card with LM Studio: a job here unloads "
                   "LM Studio's models first, and the text encoder runs on the CPU.",
+         "start": "Start ComfyUI on the LLM PC with --listen.",
          "shares_llm_gpu": True, "encoder_on_cpu": True, "max_megapixels": 4.2},
     ]
 
 
 def _default_models():
-    # Filenames are the ones ComfyUI's own FLUX templates download; a machine
-    # with other names says so in its `backends` entry (the Models editor).
+    # Filenames are the ones ComfyUI's own FLUX template downloads
+    # (flux_dev_full_text_to_image); a machine with other names says so in its
+    # `backends` entry (the Models editor). FLUX runs the baseline workflow -
+    # no LoRAs, references or refine - until that is known good on both GPUs;
+    # flux_hq.json is where those layers come back.
     return [
-        {"id": "flux-dev", "label": "FLUX.1 [dev]", "family": "flux1", "workflow": "flux_hq",
+        {"id": "flux-dev", "label": "FLUX.1 [dev]", "family": "flux1",
+         "workflow": "flux_dev_baseline",
          "values": {"model": "flux1-dev.safetensors", "weight_dtype": "default",
                     "clip_l": "clip_l.safetensors", "t5": "t5xxl_fp16.safetensors",
-                    "vae": "ae.safetensors",
-                    "clip_vision": "sigclip_vision_patch14_384.safetensors",
-                    "style_model": "flux1-redux-dev.safetensors"},
-         "backends": {"3090": {"t5": "t5xxl_fp8_e4m3fn.safetensors",
+                    "vae": "ae.safetensors"},
+         "backends": {"3090": {"t5": "t5xxl_fp8_e4m3fn_scaled.safetensors",
                                "weight_dtype": "fp8_e4m3fn"}},
-         "defaults": {"steps": 28, "guidance": 3.5, "sampler": "euler",
+         "defaults": {"steps": 20, "guidance": 3.5, "sampler": "euler",
                       "scheduler": "simple", "width": 1024, "height": 1024},
-         "notes": "The main FLUX model. Identity and style LoRAs trained on FLUX.1 apply."},
+         "notes": "FLUX.1 [dev], the clean baseline: text to image only."},
         {"id": "z-image-turbo", "label": "Z-Image Turbo", "family": "z-image",
          "workflow": "zimage_hq",
          "values": {"model": "z_image_turbo_bf16.safetensors",
@@ -513,6 +521,33 @@ def find_preview(lora_dir, filename):
 
 # ============================================================ ComfyUI client
 
+NOT_IN_LIST = re.compile(r"^(\w+): '(.*?)' not in \[(.*)\]$", re.S)
+
+
+def explain(detail):
+    """ComfyUI's refusal of a workflow, in words: each node's error with its
+    id and class, and a value missing from a list (a model file, a sampler)
+    named exactly - without the list of everything the server does have."""
+    if not isinstance(detail, dict) or not detail.get("node_errors"):
+        return _explain(detail)
+    parts = []
+    err = detail.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        parts.append(err["message"])
+    for node, info in detail["node_errors"].items():
+        for e in info.get("errors", []):
+            what = " ".join(str(e.get("details") or "").split())
+            m = NOT_IN_LIST.match(what)
+            if m:
+                n = len([x for x in m.group(3).split(",") if x.strip()])
+                what = "%s %r is not there (it has %d other%s)" % (
+                    m.group(1), m.group(2), n, "" if n == 1 else "s")
+            parts.append("node %s (%s): %s%s" % (node, info.get("class_type", "?"),
+                                                e.get("message", ""),
+                                                " - " + what if what else ""))
+    return "; ".join(p for p in parts if p)
+
+
 class ComfyUIClient:
     """Every call the app makes to one ComfyUI server. One instance per
     backend; no shared state between them but the class."""
@@ -538,12 +573,17 @@ class ComfyUIClient:
             except ValueError:
                 detail = body
             raise ComfyError("%s answered HTTP %d: %s"
-                             % (self.backend["name"], e.code, _explain(detail)))
+                             % (self.backend["name"], e.code, explain(detail)))
         except (urllib.error.URLError, OSError) as e:
             reason = getattr(e, "reason", e)
-            raise Unreachable("Cannot reach %s at %s (%s). ComfyUI has to be running there, "
-                              "started with --listen if it is on another machine."
-                              % (self.backend["name"], self.url, reason))
+            local = re.match(r"^https?://(127\.0\.0\.1|localhost)(:|/|$)", self.url)
+            where = ("Nothing is answering at %s on this PC: no ComfyUI is running here "
+                     "(Studio Assist itself is not a ComfyUI)." % self.url if local else
+                     "Cannot reach %s at %s. ComfyUI has to be running there, started "
+                     "with --listen." % (self.backend["name"], self.url))
+            start = self.backend.get("start")
+            raise Unreachable("%s (%s)%s" % (where, reason,
+                                             " Start it: %s" % start if start else ""))
 
     def get_json(self, path, timeout=None):
         with self._open(self.url + path, timeout) as r:
@@ -563,8 +603,12 @@ class ComfyUIClient:
         try:
             stats = self.get_json("/system_stats", timeout=5)
             q = self.get_queue()
-        except ComfyError as e:
+        except (ComfyError, ValueError) as e:
             return {"ok": False, "detail": str(e), "queue": 0}
+        if not isinstance(stats, dict) or "comfyui_version" not in (stats.get("system") or {}):
+            return {"ok": False, "queue": 0,
+                    "detail": "Something answers at %s, but it is not ComfyUI (its "
+                              "/system_stats has no comfyui_version)." % self.url}
         dev = (stats.get("devices") or [{}])[0]
         n = len(q.get("queue_running") or []) + len(q.get("queue_pending") or [])
         return {"ok": True, "detail": "ComfyUI %s" % stats.get("system", {}).get(
@@ -589,10 +633,61 @@ class ComfyUIClient:
                 out[kind] = set()
         return out
 
-    def node_types(self):
-        if self._nodes is None:
-            self._nodes = set(self.get_json("/object_info", timeout=30))
+    def node_types(self, fresh=False):
+        """Every node class the server has. Cached; `fresh` asks again, as a
+        full check does, so a node installed since is seen."""
+        if self._nodes is None or fresh:
+            self._nodes = set(self.get_json("/object_info", timeout=60))
         return self._nodes
+
+    def probe(self):
+        """Every endpoint the studio uses, one by one: -> [(what, ok, detail)].
+        /prompt is sent a graph with no outputs, which ComfyUI refuses before
+        queueing anything - proof it validates, with nothing run."""
+        out = []
+
+        def step(what, fn):
+            try:
+                out.append((what, True, fn()))
+            except Exception as e:
+                out.append((what, False, str(e)))
+
+        def stats():
+            s = self.get_json("/system_stats", timeout=5)
+            dev = (s.get("devices") or [{}])[0]
+            return "ComfyUI %s, %s, %.1f of %.1f GB free" % (
+                s["system"]["comfyui_version"], dev.get("name", "?"),
+                (dev.get("vram_free") or 0) / 1e9, (dev.get("vram_total") or 0) / 1e9)
+
+        def prompt():
+            try:
+                self.post_json("/prompt", {"prompt": {}, "client_id": self.client_id})
+            except ComfyError as e:
+                if "HTTP 400" in str(e):
+                    return "validates (refused an empty graph, as it should)"
+                raise
+            raise ComfyError("accepted an empty graph - is this ComfyUI?")
+
+        def socket():
+            events = queue.Queue()
+            watch = self.watch(events)
+            if watch.error:
+                raise ComfyError(watch.error)
+            try:
+                msg = events.get(timeout=5)   # ComfyUI greets a client with its status
+                return "connected; first message %r" % msg.get("type")
+            except queue.Empty:
+                return "connected, but no greeting in 5 s"
+            finally:
+                watch.close()
+
+        step("/system_stats", stats)
+        step("/object_info", lambda: "%d node types" % len(self.node_types(fresh=True)))
+        step("/prompt", prompt)
+        step("/history", lambda: "%d recent entries" % len(
+            self.get_json("/history?max_items=5")))
+        step("websocket " + self.ws_url, socket)
+        return out
 
     def get_queue(self):
         return self.get_json("/queue", timeout=5)
@@ -675,21 +770,29 @@ class ComfyUIClient:
             return False
 
     # --------------------------------------------------------- progress
-    def listen_for_progress(self, prompt_id, on_event, stop=None, timeout=JOB_TIMEOUT):
+    def listen_for_progress(self, prompt_id, on_event, stop=None, timeout=JOB_TIMEOUT,
+                            watch=None):
         """Wait for a prompt, reporting as it goes; -> its history entry, or
         None when `stop()` said to stop. `on_event(kind, data)` gets
-        ("executing", node_id), ("progress", (value, max, node_id)) and
-        ("busy", seconds silent).
+        ("queued", prompts ahead), ("executing", node_id), ("cached", [node
+        ids]), ("progress", (value, max, node_id)), ("busy", seconds silent)
+        and ("socket", why) once when there is no live progress.
 
-        Progress comes over ComfyUI's WebSocket when it will talk; the end is
-        read from /history either way, every two seconds, so a socket that
-        drops or never opens costs the step counter and nothing else. A
-        ComfyUI staging a model stops answering HTTP for half a minute: that
-        is "busy", not gone."""
-        events = queue.Queue()
-        ws = self._open_socket(events)
+        `watch` is the socket opened *before* the prompt was queued (`watch()`),
+        so its first events are not missed; without one it is opened here.
+        Progress comes over ComfyUI's WebSocket; the end is read from /history
+        either way, every two seconds, so a socket that drops or never opens
+        costs the step counter and nothing else. A ComfyUI staging a model
+        stops answering HTTP for half a minute: that is "busy", not gone."""
+        own = watch is None
+        if own:
+            watch = self.watch()
+        if watch.error:
+            on_event("socket", watch.error)
+        events = watch.events
         deadline = time.monotonic() + timeout
-        next_poll, silent = 0.0, None
+        next_poll, silent, started = 0.0, None, False
+        heard = time.monotonic()      # the last event, for ("quiet", seconds)
         try:
             while True:
                 if stop is not None and stop():
@@ -699,6 +802,12 @@ class ComfyUIClient:
                     next_poll = now + 2.0
                     try:
                         entry = self.get_history(prompt_id)
+                        if not started and not entry:
+                            ahead = self.position(prompt_id)
+                            if ahead is None or ahead < 0:
+                                started = ahead is not None
+                            else:
+                                on_event("queued", ahead)
                         silent = None
                     except Unreachable:
                         entry = None
@@ -708,6 +817,8 @@ class ComfyUIClient:
                                   or entry.get("outputs")
                                   or entry.get("status", {}).get("status_str") == "error"):
                         return entry
+                    if started and not watch.error and now - heard > QUIET_AFTER:
+                        on_event("quiet", int(now - heard))
                 if now > deadline:
                     raise ComfyError("%s has not finished prompt %s after %d s; it stays "
                                      "queued there." % (self.backend["name"], prompt_id, timeout))
@@ -718,29 +829,52 @@ class ComfyUIClient:
                 data = msg.get("data") or {}
                 if data.get("prompt_id") not in (None, prompt_id):
                     continue
-                if msg.get("type") == "executing" and data.get("node") is not None:
+                heard = time.monotonic()
+                kind = msg.get("type")
+                if kind == "executing" and data.get("node") is not None:
+                    started = True
                     on_event("executing", str(data["node"]))
-                elif msg.get("type") == "progress":
+                elif kind == "execution_cached" and data.get("nodes"):
+                    started = True
+                    on_event("cached", [str(n) for n in data["nodes"]])
+                elif kind == "progress":
+                    started = True
                     on_event("progress", (data.get("value", 0), data.get("max", 0),
                                           str(data.get("node", ""))))
-                elif msg.get("type") in ("execution_success", "execution_error",
-                                         "execution_interrupted"):
+                elif kind in ("execution_success", "execution_error",
+                              "execution_interrupted"):
                     next_poll = 0.0       # read the result now
         finally:
-            if ws is not None:
-                ws.close()
+            if own:
+                watch.close()
 
-    def _open_socket(self, events):
-        """A reader thread on ComfyUI's WebSocket feeding `events`; -> the
-        socket to close, or None when it will not open. Blocking reads on a
-        thread of their own, so a frame is never cut by a timeout."""
+    def position(self, prompt_id):
+        """Prompts ahead of this one in the queue; -1 while it runs; None
+        when it is in neither list (finished, or never queued)."""
+        q = self.get_queue()
+        if any(len(i) > 1 and i[1] == prompt_id for i in q.get("queue_running") or []):
+            return -1
+        pending = sorted((i for i in q.get("queue_pending") or [] if len(i) > 1),
+                         key=lambda i: i[0])
+        for n, item in enumerate(pending):
+            if item[1] == prompt_id:
+                return n + len(q.get("queue_running") or [])
+        return None
+
+    def watch(self, events=None):
+        """ComfyUI's WebSocket for this client, read on a thread of its own
+        into `events` (blocking reads, so a frame is never cut by a timeout).
+        -> a Watch; its `error` says why there is no socket, never silently."""
+        events = events if events is not None else queue.Queue()
         try:
             from studio_milanote import WebSocket
             sep = "&" if "?" in self.ws_url else "?"
             ws = WebSocket(self.ws_url + sep + "clientId=" + self.client_id, timeout=5)
             ws.sock.settimeout(None)
-        except Exception:
-            return None
+        except Exception as e:
+            return Watch(None, events, "No live progress: the WebSocket %s would not open "
+                                       "(%s); the job is followed through /history instead."
+                         % (self.ws_url, e))
 
         def read():
             try:
@@ -748,7 +882,7 @@ class ComfyUIClient:
                     text = ws.recv()
                     try:
                         msg = json.loads(text)
-                    except ValueError:
+                    except (ValueError, TypeError):
                         continue          # a binary preview frame
                     if isinstance(msg, dict):
                         events.put(msg)
@@ -756,7 +890,22 @@ class ComfyUIClient:
                 return                    # closed, by us or by the server
 
         threading.Thread(target=read, daemon=True).start()
-        return ws
+        return Watch(ws, events, "")
+
+
+class Watch:
+    """An open (or failed) progress socket; see ComfyUIClient.watch."""
+
+    def __init__(self, ws, events, error):
+        self.ws, self.events, self.error = ws, events, error
+
+    def close(self):
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
 
 
 # ======================================================= workflow templates
@@ -877,6 +1026,61 @@ def missing_nodes(graph, available):
     return sorted({n["class_type"] for n in graph.values()} - set(available))
 
 
+FOLDER_WORDS = {"diffusion_models": "diffusion model", "checkpoints": "checkpoint",
+                "text_encoders": "text encoder", "vae": "VAE", "loras": "LoRA",
+                "clip_vision": "CLIP vision model", "style_models": "style model",
+                "controlnet": "ControlNet", "upscale_models": "upscale model"}
+
+
+def uses(wf, var):
+    """Whether a template does anything with `var` (a node kept or dropped by
+    it, or a switch on it) - so a setting it ignores is not recorded as done."""
+    return (any(n.get("_when") == var or n.get("_unless") == var
+                for n in wf["graph"].values())
+            or any(sw.get("when") == var for sw in (wf.get("switches") or {}).values()))
+
+
+def lacks(wf, values, inventory, nodes, skip=()):
+    """What a backend is missing to run `wf` with `values`: [{"kind": "file" |
+    "node", "name", "folder", "var", "text"}]. Files are checked when the
+    backend's `inventory` is known and nodes when its `nodes` are; unknown
+    is not reported as missing."""
+    out = []
+    if inventory is not None:
+        for var, folder in (wf.get("files") or {}).items():
+            if var in skip or var not in values:
+                continue
+            if values[var] not in inventory.get(folder, set()):
+                out.append({"kind": "file", "name": values[var], "folder": folder, "var": var,
+                            "text": "%s (the %s, in ComfyUI/models/%s)"
+                                    % (values[var], FOLDER_WORDS.get(folder, folder), folder)})
+    if nodes is not None:
+        need = {n["class_type"] for n in wf["graph"].values()
+                if "_when" not in n and "_unless" not in n}
+        for name in sorted(need - set(nodes)):
+            out.append({"kind": "node", "name": name, "folder": "", "var": "",
+                        "text": "the node %s (a custom node pack ComfyUI lacks)" % name})
+    return out
+
+
+def missing_for(model, backend, inventory, nodes=None, workflow_loader=None):
+    """Everything `backend` lacks to run `model` - the Models window, the
+    model menu and routing all ask this. -> (problems, lacking) where
+    `problems` are reasons it cannot run at all there (marked absent, a
+    broken template) and `lacking` is `lacks()`'s list. Both empty: ready,
+    as far as is known."""
+    resolved = resolve_model(model, backend["id"])
+    if resolved is None:
+        return (["%s is marked as not on %s (Models)." % (model["label"], backend["name"])],
+                [])
+    values, _, wid = resolved
+    try:
+        wf = (workflow_loader or load_workflow)(wid)
+    except TemplateError as e:
+        return [str(e)], []
+    return [], lacks(wf, values, inventory, nodes)
+
+
 # ============================================================ composing a job
 
 def default_settings():
@@ -917,11 +1121,13 @@ class Plan:
         self.references = {}         # kind -> local path actually used
 
 
-def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow):
+def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow,
+            nodes=None):
     """The form's settings -> a Plan for `backend`. `inventory` is that
-    backend's {kind: filenames} when known; a file missing from it is an
-    error for what the job cannot run without and a warning for what it can.
-    Never raises for a user mistake: those land in `plan.errors`."""
+    backend's {kind: filenames} and `nodes` its node classes, when known; a
+    file or node missing from them is an error for what the job cannot run
+    without and a warning for what it can. Never raises for a user mistake:
+    those land in `plan.errors`."""
     s = dict(default_settings())
     s.update(settings or {})
     p = Plan()
@@ -980,6 +1186,15 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             continue
         stack.append((rec, sel.get("strength", rec["strength"]), "added"))
 
+    if stack and not wf.get("lora_chain"):
+        names = []
+        for rec, strength, _ in stack:
+            if strength and rec["name"] not in names:
+                names.append(rec["name"])
+        if names:
+            p.warnings.append("The %s workflow takes no LoRAs: %s left out."
+                              % (wf.get("label", wid), ", ".join(names)))
+        stack = []
     seen = set()
     have = (inventory or {}).get("loras")
     for rec, strength, why in stack:
@@ -1052,6 +1267,15 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     for k in ("width", "height"):
         if k in v:
             v[k] = max(256, int(v[k]) // 16 * 16)
+    # A size the card cannot hold is refused here, not sent: a 16384x16384
+    # FLUX job on the 5090 ran out of memory in the VAE and took ComfyUI's
+    # worker down with it (2026-09-25), leaving the prompt "running" for good.
+    cap = backend.get("max_megapixels", 4.2)
+    if "width" in v and "height" in v and v["width"] * v["height"] > cap * 1e6:
+        p.errors.append("%dx%d is %.1f megapixels; %s is set to %.1f at most (Backends). "
+                        "Make the picture smaller." % (v["width"], v["height"],
+                                                      v["width"] * v["height"] / 1e6,
+                                                      backend["name"], cap))
 
     # ------------------------------------------------------- references
     refs = {k: x for k, x in (s["references"] or {}).items() if x}
@@ -1096,6 +1320,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
 
+    if v.get("refine") and not uses(wf, "refine"):
+        if s.get("refine") or preset["values"].get("refine"):
+            p.warnings.append("The %s workflow has no refine pass; the picture is made "
+                              "without one." % wf.get("label", wid))
+        v["refine"] = False
     # A refine pass is sized to what the backend's card holds.
     if v.get("refine") and "upscale" in v and "width" in v:
         cap = backend.get("max_megapixels", 4.2) * 1e6
@@ -1107,16 +1336,21 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if scale <= 1.05:
             v["refine"] = False
 
-    # --------------------------------------------------- files it needs
-    if inventory is not None:
-        for var, kind in (wf.get("files") or {}).items():
-            if any(var in fs for fs in needs.values()):
-                continue                  # checked with the reference it serves
-            if var in v and v[var] not in inventory.get(kind, set()):
-                p.errors.append("%s does not have %s (%s) for %s. Put it in ComfyUI's "
-                                "models/%s folder there, or map %s to that machine's "
-                                "filename in Models." % (backend["name"], v[var], var,
-                                                         model["label"], kind, model["label"]))
+    # ------------------------------------------- files and nodes it needs
+    optional = {var for fs in needs.values() for var in fs}   # checked with their reference
+    missing = lacks(wf, v, inventory, nodes, skip=optional)
+    files = [m["text"] for m in missing if m["kind"] == "file"]
+    if files:
+        p.errors.append("%s is missing %s for %s: %s. Put each file in that folder on %s, "
+                        "or map %s to that machine's filenames in Models."
+                        % (backend["name"], "a file" if len(files) == 1 else
+                           "%d files" % len(files), model["label"], "; ".join(files),
+                           backend["name"], model["label"]))
+    node_names = [m["name"] for m in missing if m["kind"] == "node"]
+    if node_names:
+        p.errors.append("%s's ComfyUI lacks the node%s %s that the %s workflow uses."
+                        % (backend["name"], "" if len(node_names) == 1 else "s",
+                           ", ".join(node_names), wf.get("label", wid)))
     p.values = v
     return p
 
@@ -1148,8 +1382,35 @@ def route(role, backends, health, has_model=None, load=None):
 
 # ================================================================ jobs
 
-STATUSES = ("queued", "uploading", "running", "refining", "complete", "failed", "cancelled")
+STATUSES = ("queued", "uploading", "loading", "sampling", "decoding", "running", "refining",
+            "complete", "failed", "cancelled")
 FINISHED = ("complete", "failed", "cancelled")
+# The stages a job is shown moving through. "running" and "refining" are what
+# a node no stage names reports; "uploading" counts as queued.
+STAGES = ("queued", "loading", "sampling", "decoding", "complete")
+# Node classes by the stage they are, for a template that names none. A
+# sampler node that has sent no step yet is loading: ComfyUI moves the model
+# onto the card inside the sampler, before its first step.
+STAGE_OF_CLASS = {
+    "loading": ("Loader", "CLIPTextEncode", "LoadImage", "FluxGuidance",
+                "ConditioningZeroOut", "EmptySD3LatentImage", "EmptyLatentImage",
+                "ModelSampling"),
+    "sampling": ("KSampler", "SamplerCustom", "SamplerCustomAdvanced"),
+    "decoding": ("VAEDecode", "SaveImage", "PreviewImage"),
+}
+
+
+def stage_of(wf, graph, node_id):
+    """The stage a node belongs to: the template's `stages` first, then its
+    class. -> one of STAGES, or "" for a node neither names."""
+    for stage, ids in (wf.get("stages") or {}).items():
+        if node_id in ids and stage in STAGES:
+            return stage
+    cls = (graph.get(node_id) or {}).get("class_type", "")
+    for stage, marks in STAGE_OF_CLASS.items():
+        if any(m in cls for m in marks):
+            return stage
+    return ""
 
 
 class Job:
@@ -1166,6 +1427,8 @@ class Job:
         self.plan = None
         self.outputs = []             # local paths
         self.record = None            # the history record, once complete
+        self.graph = None             # the graph as submitted
+        self.notes = []               # things said on the way (no live progress, ...)
         self.cancel = threading.Event()
 
     @property
@@ -1275,6 +1538,31 @@ class JobQueue:
 
 # ================================================================ history
 
+def run_errors(entry, graph=None):
+    """Why a finished prompt made nothing, from its /history entry, in words:
+    the node (id and class), the exception and its message, and for a
+    missing file the exact name. [] when the entry says nothing."""
+    out = []
+    for m in (entry.get("status") or {}).get("messages") or []:
+        if not (isinstance(m, list) and len(m) == 2):
+            continue
+        kind, d = m[0], m[1] or {}
+        if kind == "execution_interrupted":
+            out.append("interrupted before it finished")
+        elif kind == "execution_error":
+            nid = str(d.get("node_id", "?"))
+            cls = d.get("node_type") or (graph or {}).get(nid, {}).get("class_type", "?")
+            msg = " ".join(str(d.get("exception_message", "")).split())
+            text = "ComfyUI failed at node %s (%s): %s: %s" % (
+                nid, cls, d.get("exception_type", "error"), msg[:600])
+            if "out of memory" in msg.lower() or "OutOfMemory" in str(d.get("exception_type")):
+                text += " - the GPU ran out of memory; free VRAM or lower the size."
+            out.append(text)
+    if not out:
+        out = [x for x in status_messages(entry)]
+    return out
+
+
 class History:
     """Every finished job: its pictures and a JSON record beside them under
     history/<date>/. The record holds the settings exactly as submitted, so
@@ -1333,12 +1621,29 @@ class History:
         return out[:limit]
 
 
-def again(settings):
-    """Settings for Generate Again: the same, with a new seed unless the seed
-    was chosen by hand."""
-    s = copy.deepcopy(settings)
-    if s.get("seed_mode", "random") == "random":
-        s["seed"] = -1
+AGAIN_PINNED = ("steps", "guidance", "sampler", "scheduler", "width", "height")
+
+
+def again(record, new_seed=False):
+    """Settings for Generate Again from a history record (or {"settings":
+    ...} for a job not finished yet): the same picture - the seed it was made
+    with, the sampler values it resolved to (so a changed model default does
+    not change it), and the backend it ran on, preferred when it can still
+    take it. `new_seed` is the variation: everything the same but the seed."""
+    s = copy.deepcopy(record.get("settings") or {})
+    s["batch"] = 1
+    s.pop("batch_of", None)
+    if new_seed:
+        s["seed"], s["seed_mode"] = -1, "random"
+        return s
+    seed = record.get("seed", s.get("seed"))
+    if seed is not None and int(seed) >= 0:
+        s["seed"], s["seed_mode"] = int(seed), "fixed"
+    for k in AGAIN_PINNED:
+        if s.get(k) in (None, "") and record.get(k) not in (None, ""):
+            s[k] = record[k]
+    if (record.get("backend") or {}).get("id"):
+        s["prefer_backend"] = record["backend"]["id"]
     return s
 
 
@@ -1359,6 +1664,7 @@ class Studio:
         self.clients = {}
         self.health = {}              # backend id -> health dict (+ "at")
         self.inventories = {}         # backend id -> {kind: set}
+        self.nodes = {}               # backend id -> set of node classes
         self.queue = JobQueue(self, notify)
 
     def backends(self):
@@ -1383,7 +1689,14 @@ class Studio:
         h["at"] = time.time()
         self.health[backend["id"]] = h
         if h["ok"] and full:
-            self.inventories[backend["id"]] = self.client(backend).inventory()
+            c = self.client(backend)
+            self.inventories[backend["id"]] = c.inventory()
+            try:
+                self.nodes[backend["id"]] = set(c.node_types(fresh=True))
+            except TypeError:             # a client with no `fresh` (the tests')
+                self.nodes[backend["id"]] = set(c.node_types())
+            except ComfyError as e:
+                h["detail"] += "; its node list would not load (%s)" % e
         return h
 
     def check_all(self, full=True):
@@ -1407,27 +1720,101 @@ class Studio:
         self.lib.save("loras")
         return added
 
+    def missing(self, model, backend):
+        """missing_for() with what is known of `backend`; no I/O."""
+        return missing_for(model, backend, self.inventories.get(backend["id"]),
+                           self.nodes.get(backend["id"]), self.workflow_loader)
+
     def has_model(self, model_id):
-        """backend -> True when the model's main file is known to be there
-        (unknown counts as there: routing must not refuse on a guess)."""
+        """backend -> True when every file and node the model's workflow
+        needs is known to be there. Unknown (not checked yet) counts as
+        there - routing must not refuse on a guess - but a backend that has
+        answered is held to its lists."""
         model = self.lib.get("models", model_id)
 
         def check(b):
             if model is None:
                 return False
-            r = resolve_model(model, b["id"])
-            if r is None:
-                return False
-            inv = self.inventories.get(b["id"])
-            if inv is None:
-                return True
-            return r[0].get("model") in inv.get("diffusion_models", set()) | inv.get(
-                "checkpoints", set())
+            problems, lacking = self.missing(model, b)
+            return not problems and not lacking
         return check
+
+    def readiness(self, model):
+        """{backend id: (state, text)} for the Models window and the model
+        menu: state is "ready", "missing", "offline", "disabled" or
+        "unchecked", and text says exactly what is missing where."""
+        out = {}
+        for b in self.backends():
+            h = self.health.get(b["id"])
+            problems, lacking = self.missing(model, b)
+            if problems:
+                out[b["id"]] = ("missing", " ".join(problems))
+            elif not b["enabled"]:
+                out[b["id"]] = ("disabled", "disabled in Backends")
+            elif h is None:
+                out[b["id"]] = ("unchecked", "not checked yet")
+            elif not h.get("ok"):
+                out[b["id"]] = ("offline", "offline: " + h.get("detail", ""))
+            elif b["id"] not in self.inventories:
+                out[b["id"]] = ("unchecked", "online; its model list has not been read")
+            elif lacking:
+                out[b["id"]] = ("missing", "missing " + "; ".join(m["text"] for m in lacking))
+            else:
+                out[b["id"]] = ("ready", "every file and node is there")
+        return out
+
+    def plan_route(self, settings, load=None):
+        """Where one job of `settings` would go, and why, from what is known -
+        no I/O, so the form can say it before Generate. -> (backend or None,
+        text). A named backend is taken as named (its gaps are compose()'s
+        errors); Auto takes the backend the settings prefer (Generate Again's
+        original), then those whose roles include the preset's, when each is
+        up and has everything the model's workflow needs."""
+        model = self.lib.get("models", settings.get("model"))
+        label = model["label"] if model else settings.get("model")
+        if settings.get("backend") not in (None, "", "auto"):
+            b = self.backend(settings["backend"])
+            if b is None:
+                return None, "No backend called %r." % settings["backend"]
+            return b, "%s (chosen by hand)." % b["name"]
+        role = PRESETS.get(settings.get("preset"), PRESETS["standard"])["role"]
+        if int(settings.get("batch") or 1) > 1 and role == "interactive":
+            role = "batch"
+        order = route(role, self.backends(), self.health,
+                      self.has_model(settings.get("model")), load)
+        if not order:
+            return None, self.why_no_backend(settings)
+        pick = order[0]
+        prefer = settings.get("prefer_backend")
+        why = []
+        if prefer:
+            if any(b["id"] == prefer for b in order):
+                pick = self.backend(prefer)
+                why.append("where this picture was made")
+            else:
+                gone = self.backend(prefer)
+                why.append("%s, where it was made, cannot take it now, so the result "
+                           "may differ slightly" % (gone["name"] if gone else prefer))
+        if not why:
+            why.append("preferred for %s" % PRESETS.get(settings.get("preset"),
+                                                           PRESETS["standard"])["label"]
+                       if role in pick["roles"] else "the only backend able to take it")
+        passed = []                   # preferred for the role, but unable to take it
+        for b in self.backends():
+            if (b["enabled"] and role in b["roles"] and b["id"] != pick["id"]
+                    and not any(o["id"] == b["id"] for o in order)):
+                h = self.health.get(b["id"]) or {}
+                passed.append("%s is offline" % b["name"] if not h.get("ok") else
+                              "%s lacks files %s needs" % (b["name"], label))
+        known = pick["id"] in self.inventories
+        return pick, "Auto → %s: %s%s%s." % (
+            pick["name"], "; ".join(why),
+            "" if not known else "; has every file %s needs" % label,
+            "" if not passed else " (" + "; ".join(passed) + ")")
 
     def pick_backends(self, settings, count=1):
         """The backend for each of `count` jobs. A named backend takes them
-        all; Auto routes by the preset's role (batch when more than one),
+        all; Auto routes as plan_route says (batch when more than one),
         spreading a batch over every capable backend."""
         if settings.get("backend") not in (None, "", "auto"):
             b = self.backend(settings["backend"])
@@ -1436,20 +1823,24 @@ class Studio:
             return [b] * count
         for b in self.backends():
             h = self.health.get(b["id"])
-            if b["enabled"] and (h is None or time.time() - h.get("at", 0) > HEALTH_TTL):
+            if b["enabled"] and (h is None or time.time() - h.get("at", 0) > HEALTH_TTL
+                                 or (h.get("ok") and b["id"] not in self.inventories)):
                 self.check(b)
-        role = PRESETS.get(settings.get("preset"), PRESETS["standard"])["role"]
-        if count > 1:
-            role = "batch" if role == "interactive" else role
         load = self.queue.load()
         picks = []
         for _ in range(count):
+            if count == 1:
+                b, why = self.plan_route(dict(settings, batch=1), load)
+                if b is None:
+                    raise ComfyError(why)
+                return [b]
+            role = PRESETS.get(settings.get("preset"), PRESETS["standard"])["role"]
+            role = "batch" if role == "interactive" else role
             order = route(role, self.backends(), self.health,
                           self.has_model(settings.get("model")), load)
             if not order:
                 raise ComfyError(self.why_no_backend(settings))
-            if count > 1:                 # least loaded among every capable machine
-                order.sort(key=lambda b: load.get(b["id"], 0))
+            order.sort(key=lambda b: load.get(b["id"], 0))  # least loaded capable machine
             picks.append(order[0])
             load[order[0]["id"]] = load.get(order[0]["id"], 0) + 1
         return picks
@@ -1457,14 +1848,20 @@ class Studio:
     def why_no_backend(self, settings):
         lines = []
         model = self.lib.get("models", settings.get("model"))
+        if model is None:
+            return "No model called %r in the library." % settings.get("model")
         for b in self.backends():
             h = self.health.get(b["id"]) or {}
+            problems, lacking = self.missing(model, b)
             if not b["enabled"]:
                 lines.append("%s is disabled" % b["name"])
+            elif problems:
+                lines.append(" ".join(problems).rstrip("."))
             elif not h.get("ok"):
                 lines.append("%s is offline (%s)" % (b["name"], h.get("detail", "not checked")))
-            elif model is not None and not self.has_model(model["id"])(b):
-                lines.append("%s does not have %s" % (b["name"], model["label"]))
+            elif lacking:
+                lines.append("%s is missing %s" % (b["name"], "; ".join(m["text"]
+                                                                       for m in lacking)))
         return "No backend can take this job: " + "; ".join(lines) + "."
 
     # ------------------------------------------------------------ submit
@@ -1474,7 +1871,7 @@ class Studio:
         if b is None:
             return None
         return compose(settings, self.lib, b, self.inventories.get(b["id"]),
-                       self.workflow_loader)
+                       self.workflow_loader, self.nodes.get(b["id"]))
 
     def submit(self, settings):
         """Queue the form's settings: one job per picture in the batch, each
@@ -1525,21 +1922,31 @@ class Studio:
         if plan.errors:
             return self.queue._finish(job, "failed", " ".join(plan.errors))
 
-        say("uploading", "uploading references" if plan.images else "")
+        say("uploading" if plan.images else None,
+            "uploading references" if plan.images else "")
         values = dict(plan.values)
         for var, path in plan.images.items():
             if job.cancel.is_set():
                 return self.queue._finish(job, "cancelled")
             values[var] = client.upload_image(path)
-        graph = fill(plan.workflow, values, plan.loras)
+        # One output name per job, so the file on the backend says which job
+        # made it (ComfyUI adds _00001_ and the extension).
+        values["filename_prefix"] = "ImageStudio/%s_%s" % (plan.workflow.get("id", "job"),
+                                                           job.id)
+        try:
+            graph = fill(plan.workflow, values, plan.loras)
+        except TemplateError as e:
+            return self.queue._finish(job, "failed", str(e))
         try:
             lacking = missing_nodes(graph, client.node_types())
         except ComfyError:
             lacking = []
         if lacking:
-            return self.queue._finish(job, "failed", "%s lacks the node(s) %s that the %s "
-                                      "workflow uses." % (b["name"], ", ".join(lacking),
-                                                          plan.workflow.get("label")))
+            return self.queue._finish(job, "failed", "%s's ComfyUI lacks the node(s) %s that "
+                                      "the %s workflow uses." % (
+                                          b["name"], ", ".join(lacking),
+                                          plan.workflow.get("label")))
+        job.graph = graph
         if b.get("shares_llm_gpu") and self.make_room is not None:
             say(detail="clearing LM Studio off the GPU")
             try:
@@ -1548,41 +1955,97 @@ class Studio:
                 plan.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
         if job.cancel.is_set():
             return self.queue._finish(job, "cancelled")
-        job.prompt_id = client.queue_workflow(graph)
-        say("running", "queued on %s" % b["name"], None)
-        refine = set((plan.workflow.get("stages") or {}).get("refining", ()))
-        state = {"node": None}
-
-        def on_event(kind, data):
-            if kind == "executing":
-                state["node"] = data
-                if data in refine and job.status != "refining":
-                    say("refining", "refining detail", None)
-                elif job.status == "running":
-                    say(detail="running", progress=job.progress)
-            elif kind == "progress":
-                value, total, _ = data
-                if total:
-                    say(detail="step %d of %d" % (value, total), progress=value / float(total))
-            elif kind == "busy":
-                say(detail="%s is busy (loading models?) %ds" % (b["name"], data),
-                    progress=job.progress)
-
-        entry = client.listen_for_progress(job.prompt_id, on_event, stop=job.cancel.is_set)
+        watch = client.watch() if hasattr(client, "watch") else None
+        try:
+            try:
+                job.prompt_id = client.queue_workflow(graph)
+            except Unreachable as e:
+                return self.queue._finish(job, "failed", "The workflow could not be sent: %s"
+                                          % e)
+            except ComfyError as e:
+                return self.queue._finish(job, "failed", "%s's ComfyUI rejected the workflow "
+                                          "before running it. %s" % (b["name"], e))
+            say("queued", "queued on %s" % b["name"], None)
+            entry = client.listen_for_progress(
+                job.prompt_id, self._progress(job, graph, say), stop=job.cancel.is_set,
+                **({"watch": watch} if watch is not None else {}))
+        finally:
+            if watch is not None:
+                watch.close()
         if entry is None:
             return self.queue._finish(job, "cancelled")
-        errors = status_messages(entry)
         files = [f for f in outputs_of(entry)]
         if not files:
+            errors = run_errors(entry, graph)
             if any("interrupted" in e for e in errors) or job.cancel.is_set():
                 return self.queue._finish(job, "cancelled")
             return self.queue._finish(job, "failed", "; ".join(errors) or
-                                      "The workflow finished without a picture.")
-        pictures = [(f["filename"], client.fetch(f)) for f in files]
+                                      "The workflow finished on %s without a picture."
+                                      % b["name"])
+        say("decoding", "fetching the picture from %s" % b["name"], None)
+        try:
+            pictures = [(f["filename"], client.fetch(f)) for f in files]
+        except ComfyError as e:
+            return self.queue._finish(job, "failed", "The picture was made but could not be "
+                                      "fetched from %s: %s" % (b["name"], e))
         job.record = self.history.add(self.record_for(job, graph), pictures)
         job.outputs = list(job.record["images"])
+        job.progress = 1.0
         self.queue._finish(job, "complete",
                            "; ".join(plan.warnings[:1]) if plan.warnings else "")
+
+    def _progress(self, job, graph, say):
+        """The on_event for one job: ComfyUI's events as Queued -> Loading ->
+        Sampling -> Decoding, the node running, its step and percent."""
+        wf, b = job.plan.workflow, job.backend
+        refine = set((wf.get("stages") or {}).get("refining", ()))
+        st = {"node": None, "stepped": set(), "socket": ""}
+
+        def node_name(nid):
+            return "node %s %s" % (nid, (graph.get(nid) or {}).get("class_type", "?"))
+
+        def on_event(kind, data):
+            if kind == "socket":
+                st["socket"] = data
+                job.notes.append(data)
+            elif kind == "queued":
+                if job.status in ("queued", "uploading"):
+                    say("queued", "queued on %s, %s" % (
+                        b["name"], "next" if data == 0 else "%d ahead" % data), None)
+            elif kind == "cached":
+                say(detail="reused from the last run: " + ", ".join(
+                    node_name(n) for n in data[:4]), progress=job.progress)
+            elif kind == "executing":
+                st["node"] = data
+                if data in refine:
+                    say("refining", "refining detail · " + node_name(data), None)
+                    return
+                stage = stage_of(wf, graph, data)
+                if stage == "sampling" and data not in st["stepped"]:
+                    say("loading", "loading the model onto the GPU · " + node_name(data), None)
+                elif stage in ("loading", "decoding"):
+                    say(stage, node_name(data), None if stage == "loading" else 1.0)
+                else:
+                    say("running", node_name(data), job.progress)
+            elif kind == "progress":
+                value, total, nid = data
+                nid = nid or st["node"]
+                st["stepped"].add(nid)
+                if total:
+                    status = "refining" if nid in refine else "sampling"
+                    say(status, "step %d of %d · %d%% · %s" % (
+                        value, total, round(100.0 * value / total), node_name(nid)),
+                        value / float(total))
+            elif kind == "busy":
+                say(detail="%s is not answering while it loads models (%ds)" % (b["name"], data),
+                    progress=job.progress)
+            elif kind == "quiet":
+                say(detail="no word from %s for %ds (last: %s). A big VAE decode can take "
+                           "this long; if it does not move, ComfyUI may be stuck - Cancel, "
+                           "and check its console." % (
+                               b["name"], data, node_name(st["node"]) if st["node"] else "?"),
+                    progress=job.progress)
+        return on_event
 
     def record_for(self, job, graph):
         p, s, b = job.plan, job.settings, job.backend
@@ -1605,13 +2068,17 @@ class Studio:
             "created_ts": now,
             "prompt": p.prompt, "negative": p.negative, "seed": v.get("seed"),
             "model": {"id": model.get("id"), "label": model.get("label"),
-                      "file": v.get("model"), "family": p.family},
+                      "file": v.get("model"), "family": p.family,
+                      "files": {var: v.get(var) for var in (p.workflow.get("files") or {})
+                                if var in v},
+                      "weight_dtype": v.get("weight_dtype")},
             "loras": p.lora_meta,
             "identities": idents,
             "style": ({"id": style["id"], "name": style["name"],
                        "strength": s.get("style_strength")} if style else None),
             "preset": s.get("preset"),
             "workflow": p.workflow.get("id"),
+            "workflow_label": p.workflow.get("label"),
             "backend": {"id": b["id"], "name": b["name"], "url": b["url"]},
             "sampler": v.get("sampler"), "scheduler": v.get("scheduler"),
             "steps": v.get("steps"), "guidance": v.get("guidance"),
@@ -1620,7 +2087,7 @@ class Studio:
             "refine": ({"upscale": v.get("upscale"), "denoise": v.get("refine_denoise"),
                         "steps": v.get("refine_steps")} if v.get("refine") else None),
             "references": p.references,
-            "warnings": p.warnings, "notes": p.notes,
+            "warnings": p.warnings, "notes": p.notes + job.notes,
             "duration": round(time.time() - job.started, 1),
             "prompt_id": job.prompt_id,
             "settings": s,
@@ -1629,3 +2096,32 @@ class Studio:
 
     def close(self):
         self.queue.close()
+
+
+def main(argv=None):
+    """`python studio_imagegen.py --probe`: every endpoint on every backend,
+    then what each model lacks where. Read-only: nothing is queued."""
+    import argparse
+    ap = argparse.ArgumentParser(description=main.__doc__)
+    ap.add_argument("--probe", action="store_true", help="check every backend")
+    args = ap.parse_args(argv)
+    if not args.probe:
+        ap.print_help()
+        return 0
+    studio = Studio()
+    bad = 0
+    for b in studio.backends():
+        print("== %s  %s%s" % (b["name"], b["url"], "" if b["enabled"] else "  (disabled)"))
+        for what, ok, detail in studio.client(b).probe():
+            bad += not ok
+            print("   %-4s %-28s %s" % ("ok" if ok else "FAIL", what, detail))
+    studio.check_all()
+    for m in studio.lib.all("models"):
+        print("== %s" % m["label"])
+        for bid, (state, text) in studio.readiness(m).items():
+            print("   %-10s %-18s %s" % (state, studio.backend(bid)["name"], text))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
