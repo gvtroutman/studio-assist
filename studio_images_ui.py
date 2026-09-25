@@ -251,7 +251,6 @@ class ImageStudio:
         self.item_refs = {}           # item -> picture, from the character
         self.look_section = ig.LOOKS[0][0]
         self.anatomy = tk.BooleanVar(value=True)
-        self.dress = tk.BooleanVar(value=True)   # Try On the character's item pictures
         self.hints = {}               # setting -> Label
         self.rows = {}                # job id -> row widgets
         self.jobs = []                # this session's jobs, newest first
@@ -463,8 +462,6 @@ class ImageStudio:
             side="left", padx=(self.px(6), 0))
         self.button(crow, "Save as…", self.save_as_character, kind="ghost").pack(
             side="left", padx=(self.px(4), 0))
-        self.button(crow, "Try On…", lambda: self.try_on(), kind="ghost").pack(
-            side="left", padx=(self.px(4), 0))
         self.person_box = self.frame(f)
         self.person_box.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
         self.label(f, "Who, and what they look like. Any of these can stay blank; a "
@@ -489,16 +486,11 @@ class ImageStudio:
         self.label(f, "Every person: " + ig._and([pos for _, pos, _ in ig.ANATOMY]) + ".",
                    "faint", self.host.f_small, wraplength=self.px(380)).pack(
             side="top", fill="x", **pad)
-        b = tk.Checkbutton(f, text="Try On the character's item pictures", anchor="w",
-                           variable=self.dress, font=self.host.f_ui, bd=0,
-                           highlightthickness=0, command=self._recheck)
-        self.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
-                  activeforeground="text")
-        b.pack(side="top", fill="x", pady=(self.px(6), 0), **pad)
-        self.label(f, "After the picture is made, the clothes, hair and accessories the "
-                   "character has pictures of are put on it (Qwen-Image-Edit and the "
-                   "Clothes Try On LoRA, ~30-75 s more).", "faint", self.host.f_small,
-                   wraplength=self.px(380)).pack(side="top", fill="x", **pad)
+        self.label(f, "Pictures of the clothes, hair and accessories (Clothes, Hair and "
+                   "Accessories tabs) go into the picture itself: it is then made with "
+                   "FLUX Kontext, which draws from them.", "faint", self.host.f_small,
+                   wraplength=self.px(380)).pack(side="top", fill="x",
+                                                 pady=(self.px(6), 0), **pad)
 
         self.cap(f, "Camera").pack(**pad)
         self.aim = CameraAim(self, f, self._aimed)
@@ -861,14 +853,64 @@ class ImageStudio:
             self.slider_rows(self.look_box, self.sliders, changed)
         relight[0] = self.look_rows(self.look_box, dict(ig.LOOKS)[section], self.text,
                                     changed)
-        pics = [x for x in self.item_refs if x.lower() in
-                {w.lower() for w in ig.items_worn(self.collect_looks())}]
-        if section == "Hair":
-            pics = [x for x in self.item_refs if x.lower() == ig.HAIR_ITEM]
-        if section in ("Clothes", "Accessories", "Hair") and pics:
-            self.label(self.look_box, "Pictures from the character: " + ", ".join(pics),
-                       "faint", self.host.f_small, wraplength=self.px(360)).pack(
-                side="top", fill="x", pady=(self.px(4), 0))
+        if section in ("Clothes", "Accessories", "Hair"):
+            keys = [sl[0] for sl in dict(ig.LOOKS)[section]]
+            items = ([ig.HAIR_ITEM] if section == "Hair" else
+                     ig.items_worn({k: self.text[k].get() for k in keys}))
+            self.item_rows(self.look_box, items, self.item_refs, self._choose_item,
+                           self._set_item)
+
+    def item_rows(self, p, items, refs, choose, drop):
+        """A row per item worn - its picture, name and file, Picture… and ×:
+        what the glasses or the necklace actually look like. The form's look
+        tabs and the creator's both show these; Generate draws from them."""
+        o, host = self, self.host
+        o.label(p, "ITEM PICTURES", "faint", host.f_small).pack(
+            side="top", fill="x", pady=(o.px(12), o.px(2)))
+        if not items:
+            o.label(p, "Choose an item above to give it a picture.", "faint",
+                    host.f_small).pack(side="top", fill="x")
+            return
+        for item in items:
+            row = o.frame(p)
+            row.pack(side="top", fill="x", pady=(0, o.px(3)))
+            path = refs.get(item)
+            img = photo(path, o.px(40)) if path and os.path.isfile(path) else None
+            if img is not None:
+                o.keep.append(img)
+                tk.Label(row, image=img, bd=0).pack(side="left", padx=(0, o.px(6)))
+            o.label(row, item, "text", width=18).pack(side="left")
+            o.label(row, os.path.basename(path) if path else "no picture", "faint",
+                    host.f_small).pack(side="left", fill="x", expand=True)
+            if path:
+                o.button(row, "×", lambda i=item: drop(i, None), kind="ghost").pack(
+                    side="right")
+            o.button(row, "Picture…", lambda i=item: choose(i)).pack(
+                side="right", padx=(o.px(4), 0))
+
+    def _choose_item(self, item):
+        path = filedialog.askopenfilename(parent=self.host, title="A picture of the " + item,
+                                          filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"),
+                                                     ("All files", "*.*")])
+        if path:
+            self._set_item(item, path)
+
+    def _set_item(self, item, path):
+        """A picture for one item, on the form: copied under references/ as
+        the creator's are, so the history record's path stays good. Save as…
+        keeps it in a character."""
+        if path:
+            rec = self.studio.lib.get("characters", self.settings["character"])
+            try:
+                path = self.studio.lib.keep_reference(
+                    path, (rec["name"] if rec else "form") + " items")
+            except OSError as e:
+                return self.say("Could not copy %s: %s" % (path, e), "err")
+            self.item_refs[item] = path
+        else:
+            self.item_refs.pop(item, None)
+        self._show_looks(self.look_section)
+        self._recheck()
 
     def collect_looks(self):
         out = {k: v.get().strip() for k, v in self.text.items() if k in ig.SLOTS}
@@ -1068,7 +1110,6 @@ class ImageStudio:
             s[key] = int(var.get())
         s["item_refs"] = dict(self.item_refs)
         s["anatomy"] = bool(self.anatomy.get())
-        s["dress"] = bool(self.dress.get())
         s["negative"] = self.neg.get().strip()
         s["identities"] = [{"id": iid, "strength": round(sv.get(), 3)}
                            for iid, (bv, sv, _) in self.idents.items() if bv.get()]
@@ -1118,7 +1159,6 @@ class ImageStudio:
             var.set(int(s.get(key) or 0))
         self.item_refs = ig.clean_item_refs(s.get("item_refs"))
         self.anatomy.set(s.get("anatomy") is not False)
-        self.dress.set(s.get("dress") is not False)
         self.neg.set(s.get("negative") or "")
         pose = s.get("pose") if isinstance(s.get("pose"), dict) else None
         self.pose = dict(pose) if pose and sp.clean(pose.get("points")) else None
@@ -1365,8 +1405,6 @@ class ImageStudio:
         menu.add_command(label="Show in folder", command=lambda: self._open_selected(True))
         menu.add_command(label="Copy path", command=lambda: (
             self.host.clipboard_clear(), self.host.clipboard_append(path)))
-        menu.add_separator()
-        menu.add_command(label="Try On…", command=lambda: self.try_on(person=path))
         menu.tk_popup(ev.x_root, ev.y_root)
 
     def _show_list(self, which):
@@ -1683,13 +1721,13 @@ class ImageStudio:
             self.reuse(s)
 
     def reuse(self, settings):
-        """Reuse Settings: a Try On back in its window, anything else on the form."""
+        """Reuse Settings: put them back on the form. A Try On, from before
+        item pictures went into the picture itself, has no form to go back
+        to; Generate Again still remakes it."""
         if settings.get("mode") == "dress":
-            return self.try_on(settings=settings)
+            return self.say("That was a Try On, which the form no longer has; Generate "
+                            "Again remakes it.", "warn")
         self.apply(settings)
-
-    def try_on(self, person=None, settings=None):
-        return TryOnWindow(self, person=person, settings=settings)
 
     def _open_selected(self, select=False):
         path = self.pending_preview
@@ -2322,33 +2360,10 @@ class CharacterCreator:
         self._sheet()
 
     def _item_pictures(self, p, keys, items=None):
-        """A picture for each item this section has the character wearing:
-        what the glasses or the necklace actually look like. Hair has one
-        picture of its own (`items` = ["hair"]). Try On puts them on."""
-        o, host = self.owner, self.owner.host
+        """A picture for each item this section has the character wearing.
+        Hair has one picture of its own (`items` = ["hair"])."""
         items = items or ig.items_worn({k: self.vars[k].get() for k in keys})
-        o.label(p, "ITEM PICTURES", "faint", host.f_small).pack(
-            side="top", fill="x", pady=(o.px(12), o.px(2)))
-        if not items:
-            o.label(p, "Choose an item above to give it a picture.", "faint",
-                    host.f_small).pack(side="top", fill="x")
-            return
-        for item in items:
-            row = o.frame(p)
-            row.pack(side="top", fill="x", pady=(0, o.px(3)))
-            path = self.item_refs.get(item)
-            img = photo(path, o.px(40)) if path and os.path.isfile(path) else None
-            if img is not None:
-                o.keep.append(img)
-                tk.Label(row, image=img, bd=0).pack(side="left", padx=(0, o.px(6)))
-            o.label(row, item, "text", width=18).pack(side="left")
-            o.label(row, os.path.basename(path) if path else "no picture", "faint",
-                    host.f_small).pack(side="left", fill="x", expand=True)
-            if path:
-                o.button(row, "×", lambda i=item: self._set_item(i, None),
-                         kind="ghost").pack(side="right")
-            o.button(row, "Picture…", lambda i=item: self._choose_item(i)).pack(
-                side="right", padx=(o.px(4), 0))
+        self.owner.item_rows(p, items, self.item_refs, self._choose_item, self._set_item)
 
     def _choose_item(self, item):
         path = filedialog.askopenfilename(parent=self.win, title="A picture of the " + item,
@@ -2444,263 +2459,6 @@ class CharacterCreator:
         self.owner._rebuild_choices()
         self.owner._set_character(cid)
         self.status("Saved, and on the form.", "ok")
-
-
-class TryOnWindow:
-    """Try On: one person dressed from pictures - clothes, hair and
-    accessories - on any picture: one from History, the one shown (the
-    picture's right-click menu), or a photo on this PC. A character's item
-    pictures fill it in one pick. Each Try On is a job in the queue with a
-    record in History, like any picture (studio_imagegen "dressing")."""
-
-    PERSON = 260                  # px the person's picture is shown at
-    PICK = 44                     # px an item's thumbnail is shown at
-
-    def __init__(self, owner, person=None, settings=None):
-        self.owner = o = owner
-        host = o.host
-        self.lib = o.studio.lib
-        settings = settings or {}
-        out = ig.clean_outfit(settings.get("outfit"))
-        self.person = person or (settings.get("outfit") or {}).get("person") or ""
-        self.clothes = [dict(x, var=tk.StringVar(value=x["name"])) for x in out["clothes"]]
-        self.accessories = [dict(x, var=tk.StringVar(value=x["name"]))
-                            for x in out["accessories"]]
-        hair = out["hair"] or {}
-        self.hair_path = hair.get("path", "")
-        self.hair_words = tk.StringVar(value=hair.get("words", ""))
-        fixed = settings.get("seed_mode") == "fixed" and settings.get("seed") is not None
-        self.seed = tk.StringVar(value=str(settings["seed"]) if fixed else "")
-        self.keep = []
-        win = self.win = tk.Toplevel(host)
-        win.title("Try On")
-        win.transient(host)
-        host._skin(win, bg="bg")
-        win.geometry("%dx%d" % (host._px(820), host._px(660)))
-
-        foot = o.frame(win)
-        foot.pack(side="bottom", fill="x", padx=o.px(12), pady=(0, o.px(12)))
-        self.go = o.button(foot, "Try On", self._go, kind="accent")
-        self.go.pack(side="right")
-        o.label(foot, "Seed", "muted").pack(side="right", padx=(0, o.px(6)))
-        e = host._entry(foot, self.seed)
-        e.config(width=11)
-        e.master.pack(side="right", padx=(0, o.px(6)))
-        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(440))
-        self.msg.pack(side="left", fill="x", expand=True)
-
-        left = o.frame(win)
-        left.pack(side="left", fill="y", padx=o.px(12), pady=o.px(12))
-        o.cap(left, "Person").pack(side="top", anchor="w")
-        box = tk.Frame(left, width=o.px(self.PERSON), height=o.px(self.PERSON), bd=0,
-                       highlightthickness=0)
-        o.skin(box, bg="card")
-        box.pack_propagate(False)
-        box.pack(side="top", pady=(o.px(4), o.px(6)))
-        self.person_img = tk.Label(box, bd=0, highlightthickness=0, font=host.f_small,
-                                   wraplength=o.px(self.PERSON - 20), justify="center")
-        o.skin(self.person_img, bg="card", fg="faint")
-        self.person_img.pack(expand=True, fill="both")
-        row = o.frame(left)
-        row.pack(side="top", fill="x")
-        o.button(row, "Choose…", self._choose_person).pack(side="left")
-        o.button(row, "The picture shown", self._shown_person, kind="ghost").pack(
-            side="left", padx=(o.px(6), 0))
-        o.label(left, "Best with the whole person in the frame, facing the camera. The "
-                "clothes follow the body; hair and head accessories are drawn on a "
-                "head-and-shoulders crop when SAM3 can find the face.", "faint",
-                host.f_small, wraplength=o.px(self.PERSON)).pack(
-            side="top", fill="x", pady=(o.px(10), 0))
-
-        right = o.frame(win)
-        right.pack(side="left", fill="both", expand=True, pady=o.px(12), padx=(0, o.px(12)))
-        top = o.frame(right)
-        top.pack(side="top", fill="x", pady=(0, o.px(6)))
-        chars = [("", "From a character…")] + [(c["id"], c["name"])
-                                                for c in self.lib.all("characters")]
-        o.choice(top, chars, "", self._from_character).pack(side="left")
-        o.button(top, "Clear", self._clear, kind="ghost").pack(side="right")
-        outer, self.panel = o.scrolled(right)
-        outer.pack(side="top", fill="both", expand=True)
-        self._show_person()
-        self._build()
-
-    # --------------------------------------------------------------- state
-    def status(self, text, role="muted"):
-        self.msg.config(text=text)
-        self.owner.skin(self.msg, bg="bg", fg=role)
-
-    def _kept(self, path, owner):
-        """A copy under the studio folder (Library.keep_reference), so History
-        can dress the same picture again after the original moves."""
-        try:
-            return self.lib.keep_reference(path, owner)
-        except OSError as e:
-            self.status("Could not copy %s: %s" % (path, e), "err")
-            return None
-
-    def _pick_file(self, title, many=False):
-        types = [("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp *.gif"), ("All files", "*.*")]
-        if many:
-            return list(filedialog.askopenfilenames(parent=self.win, title=title,
-                                                    filetypes=types))
-        path = filedialog.askopenfilename(parent=self.win, title=title, filetypes=types)
-        return [path] if path else []
-
-    def _show_person(self):
-        img = photo(self.person, self.owner.px(self.PERSON - 8)) if self.person else None
-        if img is not None:
-            self.keep.append(img)
-            self.person_img.config(image=img, text="")
-        else:
-            self.person_img.config(image="", text=(
-                "No person yet: choose a photo, or right-click a picture in the Image Studio "
-                "and pick Try On." if not self.person else
-                "Cannot show %s" % os.path.basename(self.person)))
-
-    def _choose_person(self):
-        for path in self._pick_file("The person to dress"):
-            self.person = self._kept(path, "try on people") or self.person
-        self._show_person()
-
-    def _shown_person(self):
-        path = self.owner.pending_preview
-        if not path or not os.path.isfile(path):
-            self.status("No picture is shown in the Image Studio.", "warn")
-            return
-        self.person = path
-        self._show_person()
-
-    def _add(self, kind):
-        title = {"clothes": "Pictures of the clothes (a garment each)",
-                 "accessories": "Pictures of the accessories (one each)"}[kind]
-        for path in self._pick_file(title, many=True):
-            kept = self._kept(path, "try on items")
-            if kept:
-                name = os.path.splitext(os.path.basename(path))[0].replace("_", " ")
-                getattr(self, kind).append({"path": kept, "var": tk.StringVar(value=name)})
-        self._build()
-
-    def _choose_hair(self):
-        for path in self._pick_file("A picture of the hair (a person wearing it)"):
-            self.hair_path = self._kept(path, "try on items") or self.hair_path
-        self._build()
-
-    def _drop(self, kind, item):
-        if kind == "hair":
-            self.hair_path = ""
-        else:
-            getattr(self, kind).remove(item)
-        self._build()
-
-    def _clear(self):
-        self.clothes, self.accessories, self.hair_path = [], [], ""
-        self.hair_words.set("")
-        self._build()
-
-    def _from_character(self, cid):
-        """The character's item pictures of what it wears, and its hair."""
-        rec = self.lib.get("characters", cid) if cid else None
-        if rec is None:
-            return
-        out = ig.outfit_of(dict(rec["looks"], item_refs=rec["item_refs"]))
-        self.clothes = [dict(x, var=tk.StringVar(value=x["name"])) for x in out["clothes"]]
-        self.accessories = [dict(x, var=tk.StringVar(value=x["name"]))
-                            for x in out["accessories"]]
-        self.hair_path = (out["hair"] or {}).get("path", "")
-        n = len(self.clothes) + len(self.accessories) + bool(self.hair_path)
-        self.status("%s: %s." % (rec["name"], "%d picture%s" % (n, "" if n == 1 else "s")
-                                 if n else "no item pictures (add them in the Creator)"),
-                    "muted" if n else "warn")
-        self._build()
-
-    # ---------------------------------------------------------------- lists
-    def _build(self):
-        o, host, p = self.owner, self.owner.host, self.panel
-        for w in p.winfo_children():
-            w.destroy()
-        self.keep = self.keep[:1]
-
-        def row_for(kind, item, path, name_var=None):
-            row = o.frame(p, "card")
-            row.pack(side="top", fill="x", pady=(0, o.px(3)))
-            img = photo(path, o.px(self.PICK)) if path and os.path.isfile(path) else None
-            if img is not None:
-                self.keep.append(img)
-                tk.Label(row, image=img, bd=0).pack(side="left", padx=o.px(6), pady=o.px(4))
-            o.button(row, "×", lambda: self._drop(kind, item), kind="ghost",
-                     bg="card").pack(side="right", padx=(0, o.px(4)))
-            if name_var is not None:
-                e = host._entry(row, name_var, bg="card")
-                e.master.pack(side="left", fill="x", expand=True, padx=(0, o.px(6)))
-            else:
-                o.label(row, os.path.basename(path), "muted", host.f_small, bg="card").pack(
-                    side="left", fill="x", expand=True)
-
-        o.cap(p, "Clothes").pack(side="top", anchor="w")
-        for item in self.clothes:
-            row_for("clothes", item, item["path"], item["var"])
-        o.button(p, "Add clothes…", lambda: self._add("clothes")).pack(
-            side="top", anchor="w", pady=(o.px(2), 0))
-        o.label(p, "A picture per garment, laid flat or on a hanger, on a plain background: "
-                "a top, trousers, a jacket, shoes. All of them go on at once.", "faint",
-                host.f_small, wraplength=o.px(470)).pack(side="top", fill="x")
-
-        o.cap(p, "Hair").pack(side="top", anchor="w")
-        if self.hair_path:
-            row_for("hair", None, self.hair_path)
-        hrow = o.frame(p)
-        hrow.pack(side="top", fill="x", pady=(o.px(2), 0))
-        o.button(hrow, "Picture…", self._choose_hair).pack(side="left")
-        o.label(hrow, "and/or words", "faint", host.f_small).pack(side="left",
-                                                                  padx=(o.px(8), o.px(6)))
-        e = host._entry(hrow, self.hair_words)
-        e.master.pack(side="left", fill="x", expand=True)
-        o.label(p, "A picture of someone with the hair, or words alone: “short curly "
-                "auburn hair”.", "faint", host.f_small, wraplength=o.px(470)).pack(
-            side="top", fill="x")
-
-        o.cap(p, "Accessories").pack(side="top", anchor="w")
-        for item in self.accessories:
-            row_for("accessories", item, item["path"], item["var"])
-        o.button(p, "Add accessories…", lambda: self._add("accessories")).pack(
-            side="top", anchor="w", pady=(o.px(2), 0))
-        o.label(p, "Name each one as it is worn - “glasses”, “gold "
-                "necklace”, “wristwatch”: the name is in the instruction, and "
-                "says whether it is drawn on the head crop.", "faint", host.f_small,
-                wraplength=o.px(470)).pack(side="top", fill="x", pady=(0, o.px(8)))
-
-    # ------------------------------------------------------------------ go
-    def settings(self):
-        def items(lst):
-            return [{"name": x["var"].get().strip() or "item", "path": x["path"]} for x in lst]
-        raw = self.seed.get().strip()
-        try:
-            seed = int(raw) if raw else -1
-        except ValueError:
-            seed = -1
-        return {"mode": "dress", "backend": "auto", "seed": seed,
-                "outfit": {"person": self.person, "clothes": items(self.clothes),
-                           "hair": {"path": self.hair_path,
-                                    "words": self.hair_words.get().strip()},
-                           "accessories": items(self.accessories)}}
-
-    def _go(self):
-        s = self.settings()
-        outfit = ig.clean_outfit(s["outfit"])
-        if not self.person:
-            return self.status("Choose the person to dress first.", "err")
-        if not ig.dress_passes(outfit):
-            return self.status("Add something to put on: clothes, hair or an accessory.",
-                               "err")
-        b, why = self.owner.studio.dress_route(s)
-        known = all(bk["id"] in self.owner.studio.health
-                    for bk in self.owner.studio.backends() if bk["enabled"])
-        if b is None and known:
-            return self.status(why, "err")
-        self.status("Queued: %s. It shows in the Image Studio's Queue, then History."
-                    % ig.outfit_text(outfit), "ok")
-        self.owner.host._spawn(self.owner.s.event_id, self.owner._submit, s)
 
 
 class PoseEditor:

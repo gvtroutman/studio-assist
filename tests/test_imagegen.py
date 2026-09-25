@@ -441,7 +441,7 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(style="none", subject="a man", accessories="glasses",
                       item_refs={"glasses": pic, "hat": pic})
         self.assertEqual(p.images, {})
-        self.assertTrue(any("Pictures of the glasses" in w and "no item reference input" in w
+        self.assertTrue(any("Pictures of the glasses" in w and "takes no item pictures" in w
                             for w in p.warnings), p.warnings)
         self.assertFalse(any("hat" in w for w in p.warnings))          # not worn today
 
@@ -1072,25 +1072,53 @@ class TestTryOn(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["h1_ks"]["inputs"]["seed"], 4)
         self.assertEqual(g["h1_out"]["inputs"]["width"], crop["width"])
 
-    def test_generate_dresses_a_character_in_its_pictures(self):
+    def test_generate_draws_a_character_from_its_item_pictures(self):
         refs = {"leather jacket": self.pic("jacket"), "glasses": self.pic("glasses"),
                 "hair": self.pic("hair"), "hat": self.pic("hat")}
         s = dict(ig.default_settings(), model="flux-dev", scene="On a pier.",
-                 outerwear="leather jacket", accessories="glasses", item_refs=refs)
-        inv = dict(FLUX_FILES, **DRESS_FILES)
+                 outerwear="leather jacket", accessories="glasses", item_refs=refs,
+                 face_detail=True)
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"}, **KONTEXT_FILES)
         p = ig.compose(s, self.studio.lib, self.backend("5090"), inv)
-        self.assertEqual([x["name"] for x in p.dress["clothes"]], ["leather jacket"])
-        self.assertEqual([x["name"] for x in p.dress["accessories"]], ["glasses"])
-        self.assertEqual(p.dress["hair"]["path"], refs["hair"])
+        self.assertEqual(p.errors, [])
+        # Clothes, then the hair, then accessories; the hat is not worn today.
+        self.assertEqual([n for n, _ in p.items], ["leather jacket", "hair", "glasses"])
+        self.assertEqual(p.references["item: glasses"], refs["glasses"])
+        self.assertEqual(p.values["model"], "flux1-dev-kontext_fp8_scaled.safetensors")
+        self.assertEqual(p.values["guidance"], 2.5)
+        self.assertIn("The leather jacket, hair and glasses look exactly as in the reference",
+                      p.prompt)
+        self.assertNotIn("reference", p.values["face_prompt"])     # the face has none
         self.assertFalse(any("Pictures of the" in w for w in p.warnings), p.warnings)
-        self.assertTrue(any("Then dressed from pictures" in n for n in p.notes), p.notes)
-        off = ig.compose(dict(s, dress=False), self.studio.lib, self.backend("5090"), inv)
-        self.assertIsNone(off.dress)
-        self.assertTrue(any("Try On is off" in n for n in off.notes), off.notes)
+        self.assertTrue(any("FLUX.1 Kontext" in n for n in p.notes), p.notes)
+        mine = ig.compose(dict(s, guidance=4.0), self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual(mine.values["guidance"], 4.0)             # the form's wins
         short = ig.compose(s, self.studio.lib, self.backend("5090"), FLUX_FILES)
-        self.assertIsNone(short.dress)
-        self.assertTrue(any("not put on" in w and "clothes_tryon" in w for w in short.warnings),
-                        short.warnings)
+        self.assertEqual(short.items, [])
+        self.assertEqual(short.values["model"], "flux1-dev.safetensors")
+        self.assertTrue(any("flux1-dev-kontext_fp8_scaled.safetensors" in w
+                            and "words alone" in w for w in short.warnings), short.warnings)
+        plain = ig.compose(dict(s, item_refs={}), self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual((plain.items, plain.values["model"]), ([], "flux1-dev.safetensors"))
+        self.assertNotIn("kontext_model", plain.values)
+
+    def test_the_item_pictures_are_one_reference_on_the_prompt(self):
+        wf = ig.load_workflow("flux_dev_baseline")
+        g = ig.fill(wf, dict(wf["defaults"], model="m", clip_l="c", t5="t", vae="v",
+                             prompt="p", seed=1))
+        was = g["11"]["inputs"]["conditioning"]
+        ig.add_item_refs(g, wf["items"], ["a.png", "b.png", "c.png"])
+        self.assertEqual(g["11"]["inputs"]["conditioning"], ["ik3", 0])
+        self.assertEqual(g["ik3"]["inputs"]["conditioning"], was)
+        self.assertEqual(g["is3"]["inputs"]["image1"], ["is2", 0])
+        self.assertEqual(g["is3"]["inputs"]["image2"], ["it3", 0])
+        self.assertEqual(g["ik1"]["inputs"]["image"], ["is3", 0])
+        self.assertEqual(g["ik2"]["inputs"]["vae"], ["3", 0])
+        one = ig.fill(wf, dict(wf["defaults"], model="m", clip_l="c", t5="t", vae="v",
+                               prompt="p", seed=1))
+        ig.add_item_refs(one, wf["items"], ["a.png"])
+        self.assertEqual(one["ik1"]["inputs"]["image"], ["it1", 0])
+        self.assertFalse([n for n in one if n.startswith("is")])
 
     def test_a_try_on_job_dresses_the_body_then_the_head_and_lands_in_history(self):
         self.dress_studio()
@@ -1150,19 +1178,38 @@ class TestTryOn(TempStudioMixin, unittest.TestCase):
         self.assertIsNone(jobs)
         self.assertIn("clothes_tryon_qwen-edit-lora.safetensors", str(e.exception))
 
-    def test_a_generated_picture_is_dressed_before_its_face_pass(self):
-        self.dress_studio()
+    def test_a_generated_picture_is_made_from_its_item_pictures(self):
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=KontextClient)
         refs = {"leather jacket": self.pic("jacket")}
         jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
                                        scene="On a pier.", outerwear="leather jacket",
                                        item_refs=refs, backend="5090", seed=5))
         settle(jobs)
         self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
-        made, dressed = ran(DressClient)
-        self.assertEqual(dressed["p0"]["inputs"]["image"], "ImageStudio_00001_.png [output]")
+        graphs = ran(KontextClient)
+        self.assertEqual(len(graphs), 1)                             # one pass, no Try On
+        g = graphs[0]
+        self.assertEqual(g["1"]["inputs"]["unet_name"], "flux1-dev-kontext_fp8_scaled.safetensors")
+        self.assertEqual(g["it1"]["inputs"]["image"], "studio_jacket.png")
+        self.assertEqual(g["11"]["inputs"]["conditioning"], ["ik3", 0])
         rec = self.studio.history.list()[0]
-        self.assertEqual(rec["dress"]["outfit"]["clothes"][0]["name"], "leather jacket")
-        self.assertEqual(os.path.basename(rec["images"][0])[-4:], ".png")
+        self.assertEqual(rec["references"]["item: leather jacket"], refs["leather jacket"])
+        self.assertEqual(rec["model"]["file"], "flux1-dev-kontext_fp8_scaled.safetensors")
+        self.assertIsNone(rec["dress"])
+
+
+KONTEXT_FILES = {"diffusion_models": FLUX_FILES["diffusion_models"]
+                 | {"flux1-dev-kontext_fp8_scaled.safetensors"}}
+
+
+class KontextClient(FakeClient):
+    """A ComfyUI with FLUX Kontext and the nodes that give it a reference."""
+    def inventory(self):
+        return dict(super().inventory(), **KONTEXT_FILES)
+
+    def node_types(self):
+        return FakeClient.node_types(self) | ig.ITEM_NODES
 
 
 def _headless():
@@ -1465,29 +1512,28 @@ class TestImageStudioTab(unittest.TestCase):
         self.app.update()
         self.assertFalse([k for k in self.app.anim if k[0] == "images-clock"])
 
-    def test_try_on_opens_from_the_picture_and_reuse_goes_back_to_it(self):
+    def test_item_pictures_are_chosen_on_the_form(self):
         s, ui = self.tab()
-        pic = os.path.join(self.dir, "someone.png")
+        pic = os.path.join(self.dir, "jacket.png")
         with open(pic, "wb") as f:
             f.write(PNG)
-        win = ui.try_on(person=pic)
+        ui.text["outerwear"].set("leather jacket")
+        ui._show_looks("Clothes")
+        ui._set_item("leather jacket", pic)
         self.app.update()
-        self.assertEqual(win.settings()["outfit"]["person"], pic)
-        win.hair_words.set("short red hair")
-        s1 = win.settings()
-        self.assertEqual(s1["mode"], "dress")
-        self.assertEqual(ig.dress_passes(ig.clean_outfit(s1["outfit"]))[0]["kind"], "hair")
-        win.win.destroy()
-        again = ui.reuse(dict(s1, seed=4, seed_mode="fixed"))
+        kept = ui.collect()["item_refs"]["leather jacket"]
+        self.assertNotEqual(kept, pic)                  # copied, so history keeps it
+        self.assertTrue(os.path.isfile(kept))
+        texts = [w.cget("text") for row in ui.look_box.winfo_children()
+                 for w in row.winfo_children() if type(w).__name__ == "Label"]
+        self.assertIn("leather jacket", texts)
+        ui._set_item("leather jacket", None)
+        self.assertNotIn("leather jacket", ui.collect()["item_refs"])
+        ui._show_looks("Hair")
         self.app.update()
-        self.assertEqual(type(again).__name__, "TryOnWindow")
-        self.assertEqual(again.seed.get(), "4")
-        self.assertEqual(again.hair_words.get(), "short red hair")
-        again.win.destroy()
-        self.assertTrue(ui.collect()["dress"])
-        ui.dress.set(False)
-        self.assertFalse(ui.collect()["dress"])
-        ui.dress.set(True)
+        # A Try On record from before stays out of the form, and says why.
+        ui.reuse({"mode": "dress", "seed": 4})
+        self.assertNotIn("dress", ui.collect())
 
 
 if __name__ == "__main__":
