@@ -372,9 +372,28 @@ out badly.
 | `studio_milanote.py` | The Milanote tab: its web app in a browser window held in the tab, and uploads dropped onto the board |
 | `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
 | `Studio Assist.cmd` | Console-free launcher used by the shortcuts |
+| `studio_update.py` | Keeps this folder in step with GitHub: `--install` checks every 5 minutes and fast-forwards |
 | `make_icon.py` | Regenerates `studio-assistant.ico`, the shortcut and taskbar mark |
 | `tests/` | Offline tests — no network, no creative apps. `tests/contracts/` records what the installed bridges expose, so the registry is checked against the real thing |
 | `AGENTS.md` | Notes for anyone changing the code. **Read this first** |
+
+## Staying up to date
+
+Double-click **`Update Studio Assist.cmd`** once: it pulls now and turns on the
+automatic checks. Or from a terminal:
+
+```bash
+python studio_update.py --install            # check GitHub every 5 minutes
+python studio_update.py --install --every 15 # or less often
+python studio_update.py --uninstall          # stop
+```
+
+This registers a Windows scheduled task, *Studio Assist auto-update*, that runs with no
+console window. It fetches, and when GitHub is ahead it fast-forwards the checked-out
+branch. It never merges, stashes or resets: if this PC has its own commits or edits
+the update would overwrite, it leaves them alone and says so in `studio_update.log`.
+The log also records each update it makes. A window that's already open keeps
+running the old code, so reopen the app to pick up an update.
 
 ## Checking a bridge
 
