@@ -93,6 +93,7 @@ class ImageStudio:
         self.loras = []               # [{"id", "var", "row"}]
         self.refs = {}                # kind -> local path
         self.adv = {}                 # setting -> StringVar
+        self.text = {}                # person and camera setting -> StringVar
         self.hints = {}               # setting -> Label
         self.rows = {}                # job id -> row widgets
         self.jobs = []                # this session's jobs, newest first
@@ -283,14 +284,6 @@ class ImageStudio:
         self.model_row = self.frame(f)
         self.model_row.pack(side="top", fill="x", **pad)
 
-        self.cap(f, "Person").pack(**pad)
-        self.person_box = self.frame(f)
-        self.person_box.pack(side="top", fill="x", **pad)
-
-        self.cap(f, "Style").pack(**pad)
-        self.style_box = self.frame(f)
-        self.style_box.pack(side="top", fill="x", **pad)
-
         self.cap(f, "Scene").pack(**pad)
         shell = self.frame(f, "card")
         shell.pack(side="top", fill="x", **pad)
@@ -302,6 +295,38 @@ class ImageStudio:
         self.scene.pack(fill="x")
         self.scene.bind("<KeyRelease>", lambda ev: self._recheck())
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
+
+        self.cap(f, "Person").pack(**pad)
+        self.person_box = self.frame(f)
+        self.person_box.pack(side="top", fill="x", **pad)
+        self.label(f, "Who, and what they look like. Any of these can stay blank.",
+                   "faint", self.host.f_small, wraplength=self.px(380)).pack(
+            side="top", fill="x", pady=(self.px(6), 0), **pad)
+        grid = self.frame(f)
+        grid.pack(side="top", fill="x", **pad)
+        for i, (key, label) in enumerate([("subject", "Who")]
+                                         + [(k, lab) for k, lab, _ in ig.PERSON_FIELDS]):
+            self.label(grid, label, "muted").grid(row=i, column=0, sticky="w",
+                                                  pady=self.px(1))
+            var = tk.StringVar()
+            entry = self.host._entry(grid, var)
+            entry.master.grid(row=i, column=1, sticky="we", padx=(self.px(8), 0))
+            entry.bind("<KeyRelease>", lambda ev: self._recheck())
+            self.text[key] = var
+        grid.columnconfigure(1, weight=1)
+
+        self.cap(f, "Camera").pack(**pad)
+        self.text["camera"] = tk.StringVar()
+        e = self.host._entry(f, self.text["camera"])
+        e.master.pack(side="top", fill="x", **pad)
+        e.bind("<KeyRelease>", lambda ev: self._recheck())
+        self.label(f, "Lens, angle, light, film: \u201c85mm, shallow depth of field, "
+                   "golden hour\u201d.", "faint", self.host.f_small,
+                   wraplength=self.px(380)).pack(side="top", fill="x", **pad)
+
+        self.cap(f, "Style").pack(**pad)
+        self.style_box = self.frame(f)
+        self.style_box.pack(side="top", fill="x", **pad)
 
         self.cap(f, "References").pack(**pad)
         self.ref_box = self.frame(f)
@@ -637,6 +662,8 @@ class ImageStudio:
         """The form as settings, exactly what history stores."""
         s = dict(self.settings)
         s["scene"] = self.scene.get("1.0", "end").strip()
+        for key, var in self.text.items():
+            s[key] = var.get().strip()
         s["negative"] = self.neg.get().strip()
         s["identities"] = [{"id": iid, "strength": round(sv.get(), 3)}
                            for iid, (bv, sv, _) in self.idents.items() if bv.get()]
@@ -677,6 +704,8 @@ class ImageStudio:
                 sv.set(chosen[iid])
         self.scene.delete("1.0", "end")
         self.scene.insert("1.0", s.get("scene") or "")
+        for key, var in self.text.items():
+            var.set(s.get(key) or "")
         self.neg.set(s.get("negative") or "")
         for kind in ig.REFERENCE_NAMES:
             self._set_ref(kind, (s.get("references") or {}).get(kind))
@@ -970,7 +999,7 @@ class ImageStudio:
         elapsed = self.label(top, "", "faint", self.host.f_small, bg="card")
         elapsed.pack(side="left", padx=(self.px(8), 0))
         s = job.settings
-        prompt = (s.get("scene") or "").replace("\n", " ")
+        prompt = ig.summary(s).replace("\n", " ")
         self.wrap(self.label(right, prompt[:140] + ("\u2026" if len(prompt) > 140 else ""),
                              "text", bg="card"), right, self.px(12))
         model = self.studio.lib.get("models", s.get("model")) or {}
@@ -1140,7 +1169,7 @@ class ImageStudio:
             if job.record:
                 text = self.clip(job.record["prompt"]) + "\n" + self.describe(job.record)
             else:
-                text = (job.plan.prompt if job.plan else job.settings.get("scene", "")) \
+                text = (job.plan.prompt if job.plan else ig.summary(job.settings)) \
                     + "\n" + job.status.capitalize() + (": " + job.detail if job.detail
                                                         else "")
         else:

@@ -361,6 +361,28 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(p.loras, [("gavin.safetensors", 0.9), ("sx70.safetensors", 0.55)])
         self.assertEqual(p.values["seed"], 3)
 
+    def test_person_attributes_and_camera(self):
+        p = self.plan(style="none", scene="On a pier at dusk.", subject="a woman in her 30s",
+                      hair="auburn", eyes="green", build="slim", traits="freckles",
+                      camera="85mm, shallow depth of field")
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.prompt, "a woman in her 30s, auburn hair, green eyes, slim build, "
+                                   "freckles. On a pier at dusk. 85mm, shallow depth of field.")
+
+    def test_attributes_keep_their_own_nouns(self):
+        self.assertEqual(ig.person_text({"hair": "long black hair", "eyes": "hazel eyes",
+                                         "build": "about 70 kg"}),
+                         "long black hair, hazel eyes, about 70 kg")
+
+    def test_identity_joins_the_described_person(self):
+        p = self.plan(identities=["gavin"], style="none", hair="grey", scene="Reading.")
+        self.assertTrue(p.prompt.startswith("GAVINPERSON, grey hair. Reading."), p.prompt)
+
+    def test_a_person_alone_is_enough(self):
+        p = self.plan(style="none", subject="an old fisherman")
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.prompt, "an old fisherman.")
+
     def test_two_people_in_one_picture(self):
         p = self.plan(identities=["gavin", "lilya"], scene="Dancing.")
         self.assertTrue(p.prompt.startswith("GAVINPERSON and LILYAPERSON. Dancing."))
