@@ -712,7 +712,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
   Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
   sweater the forearm too), a dress, skirt or long coat adds a hem that follows the
-  legs, boots a shaft. The Accessories slot puts a hat (`HATS` names it, `HAT_SHAPES`
+  legs. The Shoes slot is read for a kind (`SHOES`): heels tip the foot onto its toes
+  over a heel post, sneakers get a thick light sole, sandals a sole and a strap under
+  a bare foot, boots a sole and a shaft that replaces the shin's lower part (a tube over
+  it sorts behind the shin's long faces and vanishes; under trousers it is left out),
+  anything else a thin dark sole. A sole lifts the person, as it does. The Accessories slot puts a hat (`HATS` names it, `HAT_SHAPES`
   builds it: a cap with its visor, a beanie, a brimmed hat, a top hat, a hard hat -
   site yellow unless a colour is said) and glasses, sunglasses or goggles on the head,
   as part `head`, so a click on them poses the head. The Hair section gives hair
