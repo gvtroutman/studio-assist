@@ -972,13 +972,15 @@ class ImageStudio:
             self.hints[key].config(text="" if val in (None, "") else "default %s" % val)
 
     # ============================================================== generate
-    def generate(self, extra=None):
+    def generate(self, extra=None, base=None):
         """Refuses, in words, what cannot run where it would go: a missing
         file or node, no backend able to take it. Routing that has not heard
         from the backends yet is left to submit(), which asks them. `extra`
         is laid over the form's settings for this job alone - the Scene
-        Builder's frame size, denoise and scene. True when it was sent on."""
-        s = self.collect()
+        Builder's frame size, denoise and scene. `base` replaces the form
+        altogether - the Scene Builder's floor and wall pictures, which want
+        none of its person. True when it was sent on."""
+        s = dict(base) if base is not None else self.collect()
         s.update(extra or {})
         b, why = self.studio.plan_route(s)
         known = all(bk["id"] in self.studio.health for bk in self.studio.backends()
@@ -1302,6 +1304,10 @@ class ImageStudio:
             self.host._apply_status()
         if running:
             self.host._animate(("images-clock", self.s.event_id), self._tick)
+        if job.status in ig.FINISHED and job.settings.get("scene_texture"):
+            sb = self.scene_builder
+            if sb is not None and sb.win.winfo_exists():
+                sb.texture_done(job)
         if job.status in ig.FINISHED:
             self._paint_health()
             if job.status == "failed":
