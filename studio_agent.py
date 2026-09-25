@@ -1988,6 +1988,9 @@ class AppSpec:
     # True only for PanelSpec below: the tab holds another program's window,
     # with no model and no bridge behind it.
     panel = False
+    # True only for IMAGE_STUDIO below: a panel tab whose body is our own
+    # form (studio_images_ui.py) rather than another program's window.
+    images = False
 
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
@@ -2758,9 +2761,24 @@ MILANOTE = PanelSpec(
     url=os.environ.get("MILANOTE_URL", "https://app.milanote.com/"),
     note="Milanote opens inside its tab, in a Chrome or Edge window of its own.")
 
+
+class ImagesSpec(PanelSpec):
+    """The Image Studio: a form over ComfyUI - person, style, scene,
+    references, generate - with the graph built underneath
+    (studio_imagegen.py) and the tab itself in studio_images_ui.py. A panel
+    tab like Milanote (no model, no bridge, no composer), but what it holds
+    is ours, so there is no window to start."""
+    images = True
+
+
+IMAGE_STUDIO = ImagesSpec(
+    id="image-studio", name="Image Studio", tab="Images", code="IS",
+    fg="#ffffff", bg="#5b3cc4", url="",
+    note="The Image Studio sends its work to the ComfyUI backends listed under Backends.")
+
 # Everything that can be a tab, apps first. APPS stays the registry of drivable
 # apps; TABS is what the tab strip and the new-tab menu offer.
-TABS = APPS + [MILANOTE, CHAT]
+TABS = APPS + [MILANOTE, IMAGE_STUDIO, CHAT]
 TABS_BY_ID = {a.id: a for a in TABS}
 
 

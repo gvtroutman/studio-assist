@@ -44,6 +44,7 @@ import studio_doctor as doctor
 import studio_files as files
 import studio_lessons as lessons
 import studio_milanote as milanote
+import studio_images_ui as images_ui
 import studio_procs as procs
 import studio_ui as ui
 import studio_icons as icons
@@ -269,6 +270,7 @@ class Session:
         self.browser = None               # a panel tab's window (studio_milanote.Browser)
         self.panel_host = None            # ...the frame it is held in
         self.panel_note = None            # ...and the line above it that speaks
+        self.images = None                # the Image Studio's form (studio_images_ui)
         self._stream_open = False
         self._stream_buf = []
         self._asst_start = "1.0"
@@ -317,6 +319,9 @@ class Session:
         browser, self.browser = self.browser, None
         if browser is not None:
             browser.close()
+        images, self.images = self.images, None
+        if images is not None:
+            images.close()                # cancels its jobs on the backends
         if self.mcp:
             try:
                 self.mcp.close()
@@ -743,6 +748,9 @@ class Chat(tk.Tk):
         self.empty_msg.pack(pady=(4, 0))
 
     def _build_transcript(self, s):
+        if s.app.images:
+            self._build_images(s)
+            return
         if s.app.panel:
             self._build_panel(s)
             return
@@ -3470,6 +3478,13 @@ class Chat(tk.Tk):
         if s.ready or s.booting:
             return
         s.booting = True
+        if s.app.images:
+            s.booting, s.ready = False, True   # nothing to start: the form is ours
+            s.status = ("Image Studio ready", "muted", False)
+            s.bridge = ("ok", "%s\nready" % s.app.bridge_label)
+            self._apply_status()
+            s.images.start()
+            return
         if s.app.panel:
             s.status = ("opening %s" % s.app.name + ELLIPSIS, "muted", False)
             self._apply_status()
@@ -3657,6 +3672,26 @@ class Chat(tk.Tk):
         s.panel_host.bind("<Configure>",
                           lambda ev: self._fit_panel(s, ev.width, ev.height))
 
+    def _build_images(self, s):
+        """The Image Studio tab: our own form, in the place a panel tab's
+        window goes. Its note line is the panel's, so an error from a worker
+        (`_guard`) is said there like on any panel tab."""
+        s.frame = self._skin(tk.Frame(self.stack), bg="bg")
+        s.images = images_ui.ImageStudio(self, s)
+        s.panel_note = s.images.note
+
+    def _images_make_room(self, backend):
+        """Before an Image Studio job on a ComfyUI that shares the LLM PC's
+        GPU: LM Studio's models off the card, as `_make_room` does for the
+        ComfyUI tab - a model another tab is mid-request on stays, and the
+        rest reload themselves when next used (`_reload_if_unloaded`)."""
+        if not self.host:
+            return
+        keep = {getattr(o.llm or self.llm, "model", None)
+                for o in self.sessions.values() if o.busy}
+        with self.fit_lock:
+            eng.make_room(self.host, keep)
+
     def _fit_panel(self, s, width, height):
         if s.browser is not None:
             s.browser.fit(width, height)
@@ -3731,6 +3766,9 @@ class Chat(tk.Tk):
                 self._paint_tab(s.id)
             if s.id == self.active:
                 self._apply_status()
+        elif kind == "images":
+            if s.images is not None:
+                s.images.handle(payload)
         elif kind in ("error", "sys"):
             self._panel_say(s, payload, "err" if kind == "error" else "muted")
         elif kind == "trace":
