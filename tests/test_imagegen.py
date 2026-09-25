@@ -525,8 +525,11 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         cn = "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors"
         inv = dict(FLUX_FILES, controlnet={cn})
         p = self.plan(model="flux-dev", inventory=inv, scene="x", references={"pose": src},
-                      pose={"points": [[0.5, 0.5]] * 18, "strength": 0.75})
+                      pose={"points": [[0.5, 0.5]] * 18, "strength": 0.75,
+                            "hands": {"right": {"shape": "fist"}}})
         self.assertEqual(p.errors, [])
+        self.assertTrue(p.prompt.endswith("Right hand clenched in a fist."), p.prompt)
+        self.assertEqual(p.values["prompt"], p.prompt)
         self.assertEqual(p.images, {"pose_image": src})
         self.assertEqual((p.values["controlnet"], p.values["pose_strength"]), (cn, 0.75))
         g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"))
@@ -1003,14 +1006,32 @@ class TestImageStudioTab(unittest.TestCase):
         ed._preset("walking")
         ed._undo()
         self.assertIn(17, ed.hidden)
+        # A click on a hand, not a drag, gives it its next shape; the menu agrees.
+        hand = ed._hand_points()["right"]
+        hx = int(sum(p[0] for p in hand) / len(hand) * ed.vw)
+        hy = int(sum(p[1] for p in hand) / len(hand) * ed.vh)
+        ed._press(Ev(hx, hy))
+        ed._release(Ev(hx, hy))
+        self.assertEqual(ed.hands["right"]["shape"], "open")
+        self.assertIn("Open", ed.hand_pills["right"].cget("text"))
+        ed._flip("left")
+        ed._mirror()                                  # hands swap with the sides
+        self.assertTrue(ed.hands["right"]["back"])
+        self.assertEqual(ed.hands["left"]["shape"], "open")
+        ed._undo()
+        self.assertEqual(ed.hands["right"]["shape"], "open")
+        for view in ("model", "figure"):
+            ed._see(view)
+            self.app.update()
         ed.strength.set(0.8)
         ed._use()
         self.app.update()
         path = ui.refs["pose"]
         self.assertTrue(os.path.isfile(path))
-        self.assertIn("stick figure", ui.ref_labels["pose"].cget("text"))
+        self.assertIn("drawn figure", ui.ref_labels["pose"].cget("text"))
         got = ui.collect()
         self.assertEqual((got["pose"]["strength"], got["pose"]["hidden"]), (0.8, [17]))
+        self.assertEqual(got["pose"]["hands"]["right"], {"shape": "open", "back": False})
         # A new size refits the figure at Generate rather than stretching it.
         ui.adv["width"].set("1024")
         ui.adv["height"].set("1024")
