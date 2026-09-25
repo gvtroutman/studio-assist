@@ -64,6 +64,8 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (person, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
+- **`studio_civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
+  for the Image Studio's LoRA library. No tkinter. See *The Image Studio*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -474,6 +476,21 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   and `files` per backend. Compatibility is decided on the family *resolved for the
   backend the job lands on*: an incompatible LoRA is left out with a warning, and a
   LoRA of unknown family is applied with one. Nothing is dropped silently.
+- **LoRAs come in from CivitAI** (`studio_civitai.py`, the LoRA library's *Import
+  from CivitAI…*). Paste links (a model page, `modelVersionId`, a download link, an
+  AIR, a bare version id) and/or pick `.safetensors` files. A link is read from
+  CivitAI's public API: primary file, trained words as the trigger, `baseModel` as
+  the family (`BASE_FAMILIES`), tags as the category, the description as notes, and
+  the tamest still image as the preview (`image-studio/lora-previews/`). A file is
+  read for its own header (`ss_*`, `modelspec.*`), hashed, and looked up by SHA-256
+  (`/model-versions/by-hash/`); offline or unknown, the header is the profile.
+  `Library.import_lora` matches by hash, then filename, and fills only *empty*
+  fields of an existing record, so re-importing never overwrites what the user
+  wrote. The file itself goes only into a backend's `lora_dir` that is on this PC
+  (a download for a link, streamed to `.part` and checked against CivitAI's hash;
+  a copy for a file), or nowhere. The API key (many downloads need one) is
+  `CIVITAI_API_KEY`, else `image-studio/civitai.json`. Tests: `test_civitai.py`,
+  against a table of canned answers.
 - **Identity and style are separate records.** An identity is a LoRA, a trigger, a
   strength and reference photos (copied under `image-studio/references/`). A style
   is a LoRA and/or prompt additions plus look defaults. The precedence is model
