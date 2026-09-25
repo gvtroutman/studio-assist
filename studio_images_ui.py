@@ -1304,7 +1304,8 @@ class ImageStudio:
             self.host._apply_status()
         if running:
             self.host._animate(("images-clock", self.s.event_id), self._tick)
-        if job.status in ig.FINISHED and job.settings.get("scene_texture"):
+        if job.status in ig.FINISHED and (job.settings.get("scene_texture")
+                                          or job.settings.get("scene_picture")):
             sb = self.scene_builder
             if sb is not None and sb.win.winfo_exists():
                 sb.texture_done(job)
