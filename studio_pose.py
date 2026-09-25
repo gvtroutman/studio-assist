@@ -40,11 +40,14 @@ MIRROR.update({b: a for a, b in list(MIRROR.items())})
 CHILDREN = {1: [0, 2, 5, 8, 11], 0: [14, 15, 16, 17], 2: [3], 3: [4], 5: [6], 6: [7],
             8: [9], 9: [10], 11: [12], 12: [13]}
 RENDER_EDGE = 768             # px on the long edge; the ControlNet scales it to the latent
+DRAWING = 3                   # in the saved picture's name: a change to render() redraws
 
 # Presets in body units: x across (0 is the middle, facing the viewer), y down
 # from the top of the head, ankles near 1. `place()` fits them to a frame.
-_HEAD = {0: (0, 0.06), 14: (-0.022, 0.045), 15: (0.022, 0.045), 16: (-0.048, 0.055),
-         17: (0.048, 0.055), 1: (0, 0.16)}
+# The head is a real one's proportions (eyes about 1/27 of the height apart):
+# doubling it, to spread the eyes, gave every picture a caricature's head.
+_HEAD = {0: (0, 0.082), 14: (-0.0185, 0.06), 15: (0.0185, 0.06), 16: (-0.045, 0.068),
+         17: (0.045, 0.068), 1: (0, 0.165)}
 _STAND = {**_HEAD, 2: (-0.11, 0.17), 3: (-0.14, 0.33), 4: (-0.15, 0.47),
           5: (0.11, 0.17), 6: (0.14, 0.33), 7: (0.15, 0.47),
           8: (-0.07, 0.5), 9: (-0.075, 0.73), 10: (-0.08, 0.96),
@@ -80,7 +83,7 @@ PRESETS = [
                                  j13=(0.12, 0.84))),
     ("kneeling", "Kneeling", _pose(j9=(-0.08, 0.72), j10=(-0.08, 0.74),
                                    j12=(0.09, 0.6), j13=(0.1, 0.8))),
-    ("profile", "Side view", {0: (0.06, 0.07), 14: (0.045, 0.05), 16: (-0.01, 0.06),
+    ("profile", "Side view", {0: (0.035, 0.08), 14: (0.022, 0.06), 16: (-0.012, 0.068),
                               1: (0, 0.16), 2: (0.0, 0.17), 3: (0.02, 0.33),
                               4: (0.05, 0.47), 5: None, 6: None, 7: None, 15: None,
                               17: None, 8: (0, 0.5), 9: (0.03, 0.73), 10: (0.0, 0.96),
@@ -146,6 +149,52 @@ def refit(points, old, new):
              round(((p[1] - 0.5) * oh * k) / nh + 0.5, 4)] for p in points]
 
 
+def _face_template():
+    """The 68 face landmarks (the iBUG layout DWPose draws), for a face seen
+    from the front: eyes at (-1, 0) and (1, 0), y down, nose tip near 1.1."""
+    pts = []
+    for i in range(17):                                   # jaw, ear to ear
+        t = math.pi * (1 - i / 16)
+        pts.append((2.1 * math.cos(t), 0.3 + 2.9 * math.sin(t)))
+    for side in (-1, 1):                                  # brows
+        xs = [-1.8, -1.45, -1.1, -0.75, -0.4] if side < 0 else [0.4, 0.75, 1.1, 1.45, 1.8]
+        pts += [(x, -0.55 - 0.25 * math.cos((abs(x) - 1.1) * 2)) for x in xs]
+    pts += [(0, -0.2 + 0.37 * i) for i in range(4)]       # bridge
+    pts += [(x, 1.25 + 0.08 * (1 - abs(x) * 2)) for x in (-0.5, -0.25, 0, 0.25, 0.5)]
+    for cx in (-1, 1):                                    # eyes
+        pts += [(cx + 0.45 * math.cos(math.pi - a * math.pi / 3),
+                 -0.17 * math.sin(math.pi - a * math.pi / 3)) for a in range(6)]
+    pts += [(1.0 * math.cos(math.pi - a * math.pi / 6), 2.0 - 0.4 * math.sin(
+        math.pi - a * math.pi / 6)) for a in range(12)]  # mouth
+    pts += [(0.6 * math.cos(math.pi - a * math.pi / 4), 2.0 - 0.15 * math.sin(
+        math.pi - a * math.pi / 4)) for a in range(8)]
+    return pts
+
+
+FACE = _face_template()
+
+
+def face_points(points, width, height):
+    """The face's landmark dots for a figure whose nose and both eyes are
+    seen, as fractions of the frame, else []. DWPose draws these on every
+    face it finds, and pose ControlNets learnt from its pictures: a body
+    with no face dots came back seen from behind, on every seed tried
+    (2026-09-25). So the figure gets a generic face, turned and sized by
+    its eyes and put on the nose side of them."""
+    nose, r_eye, l_eye = (points[i] if i < len(points) else None for i in (0, 14, 15))
+    if not (nose and r_eye and l_eye):
+        return []
+    rx, ry = r_eye[0] * width, r_eye[1] * height
+    lx, ly = l_eye[0] * width, l_eye[1] * height
+    mx, my = (rx + lx) / 2, (ry + ly) / 2
+    ex, ey = (lx - rx) / 2, (ly - ry) / 2           # template x: half the eye gap
+    dx, dy = -ey, ex                                # template y: square to it
+    if (nose[0] * width - mx) * dx + (nose[1] * height - my) * dy < 0:
+        dx, dy = -dx, -dy                           # down is toward the nose
+    return [((mx + u * ex + v * dx) / width, (my + u * ey + v * dy) / height)
+            for u, v in FACE]
+
+
 def size_for(width, height, edge=RENDER_EDGE):
     k = edge / max(width, height)
     return max(64, int(round(width * k))), max(64, int(round(height * k)))
@@ -188,13 +237,16 @@ def render(points, width, height):
     for i, p in enumerate(pix):
         if p:
             blot(p[0], p[1], p[0], p[1], stick, COLOURS[i], 1.0)
+    dot = max(1.2, stick / 3)
+    for x, y in face_points(points, 1, 1):
+        blot(x * w, y * h, x * w, y * h, dot, (255, 255, 255), 1.0)
     return studio_icons.png(bytes(buf), w, h)
 
 
 def save(points, width, height, folder):
     """The picture of this pose at this size, under `folder`, named by what
     it is, so the same pose is drawn once. -> its path."""
-    key = json.dumps([points, size_for(width, height)], sort_keys=True)
+    key = json.dumps([DRAWING, points, size_for(width, height)], sort_keys=True)
     path = os.path.join(folder, hashlib.sha1(key.encode()).hexdigest()[:16] + ".png")
     if not os.path.exists(path):
         os.makedirs(folder, exist_ok=True)

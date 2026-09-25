@@ -2426,6 +2426,10 @@ class PoseEditor:
                 cv.create_line(*at[a], *at[b], width=stick, capstyle="round",
                                fill="#%02x%02x%02x" % tuple(int(c * 0.6)
                                                             for c in sp.COLOURS[n]))
+        seen = [None if i in self.hidden else p for i, p in enumerate(self.points)]
+        for x, y in sp.face_points(seen, self.vw, self.vh):
+            x, y = x * self.vw, y * self.vh
+            cv.create_oval(x - 1, y - 1, x + 1, y + 1, fill="#ffffff", outline="")
         for i, (x, y) in enumerate(at):
             if i in self.hidden:
                 cv.create_oval(x - r, y - r, x + r, y + r, outline="#777777", dash=(2, 2))

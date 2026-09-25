@@ -549,6 +549,20 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   and the record - only when a pose is used. Without the file the pose is a
   warning and the picture is made without it; with no pose the graph is the
   baseline node for node.
+- **A pose's face needs its 68 dots, or the person turns away.** Measured on the
+  5090 (2026-09-25, seeds 7, 99 and 4242): a body-only skeleton came back seen
+  from behind every time - swapping left and right did not change it, and
+  neither did spreading the eyes. Union Pro 2.0 learnt its poses from DWPose,
+  which draws a face's 68 landmarks whenever it sees one, so a head without them
+  reads as the back of one. `face_points` puts a generic frontal face (`FACE`,
+  iBUG order) on any figure whose nose and both eyes are shown, turned and sized
+  by the eyes; with it all three faced the camera. The head must stay a real
+  one's size (eyes ~1/27 of the height apart): doubled, the dots gave caricature
+  heads. The profile preset, with one eye, gets no face. The picture's name
+  includes `DRAWING`: bump it whenever `render()` changes, or a pose drawn before
+  keeps its old cached picture - which is how the first face-dot test ran
+  against the old drawing. A posed FLUX picture at 832x1216 took 14-15 s on the
+  5090 against 12 s without.
 - **One lane per backend, one job per picture.** `JobQueue` runs a thread per
   backend, so the two GPUs work at once. A batch of N is N jobs with seeds s..s+N-1,
   spread over every capable backend, so each picture's record states its exact seed.
