@@ -1,5 +1,6 @@
 """The pose: OpenPose stick figures, and the picture the pose ControlNet reads."""
 
+import math
 import os
 import struct
 import sys
@@ -116,6 +117,57 @@ class TestPose(unittest.TestCase):
         self.assertIsNone(sp.clean([None] * 18))
         self.assertIsNone(sp.clean(["x"] * 18))
         self.assertEqual(sp.clean([[1, 2]] + [None] * 17)[0], [1.0, 2.0])
+
+    def test_every_hand_shape_has_21_points_and_a_fist_is_closed(self):
+        def reach(shape):                  # the fingertips' mean distance from the wrist
+            pts = sp.hand_shape(shape)
+            return sum(math.hypot(*pts[i]) for i in (8, 12, 16, 20)) / 4
+        for name in sp.HAND_SHAPE_NAMES:
+            self.assertEqual(len(sp.hand_shape(name)), 21, name)
+        self.assertLess(reach("fist"), reach("relaxed"))
+        self.assertLess(reach("relaxed"), reach("open"))
+        point = sp.hand_shape("point")
+        self.assertGreater(math.hypot(*point[8]), math.hypot(*point[12]))   # index out
+
+    def test_hands_follow_the_forearm_and_turn_over(self):
+        pts = sp.preset("standing", 1024, 1024)
+        palm = sp.hand_points(pts, 1024, 1024, {"right": {"shape": "open"}})
+        back = sp.hand_points(pts, 1024, 1024, {"right": {"shape": "open", "back": True}})
+        self.assertEqual(set(palm), {"right", "left"})             # the left is relaxed
+        wrist = pts[4]
+        self.assertAlmostEqual(palm["right"][0][0], wrist[0], places=4)
+        self.assertGreater(palm["right"][12][1], wrist[1])          # the arm hangs: fingers down
+        # Palm to the viewer, a hanging right hand's thumb is on the outside
+        # (the picture's left); turned over, it is on the inside.
+        self.assertLess(palm["right"][4][0], wrist[0])
+        self.assertGreater(back["right"][4][0], wrist[0])
+        pts[3] = None                                               # no elbow, no hand
+        self.assertNotIn("right", sp.hand_points(pts, 1024, 1024, sp.DEFAULT_HANDS))
+
+    def test_hands_are_drawn_and_named_into_the_picture(self):
+        d = tempfile.mkdtemp()
+        pts = sp.preset("t_pose", 1024, 1024)
+        bare = sp.save(pts, 1024, 1024, d)
+        self.assertEqual(sp.save(pts, 1024, 1024, d, None), bare)    # old poses keep their name
+        fist = sp.save(pts, 1024, 1024, d, {"right": {"shape": "fist"}})
+        self.assertNotIn(fist, (bare, sp.save(pts, 1024, 1024, d, {"right": {"shape": "open"}})))
+        w, h, rows = pixels(sp.render(pts, 1024, 1024, sp.DEFAULT_HANDS))
+        tip = sp.hand_points(pts, 1, 1, sp.DEFAULT_HANDS)["right"][12]
+        x, y = int(tip[0] * w), int(tip[1] * h)
+        self.assertEqual(tuple(rows[y][x * 4:x * 4 + 3]), sp.HAND_JOINT)
+
+    def test_the_prompt_names_only_shaped_hands_that_are_seen(self):
+        pts = sp.preset("standing", 1024, 1024)
+        self.assertEqual(sp.hands_text(pts, {"right": {"shape": "peace"}}),
+                         "Right hand making a peace sign with two fingers.")
+        self.assertEqual(sp.hands_text(pts, sp.DEFAULT_HANDS), "")
+        pts[4] = None
+        self.assertEqual(sp.hands_text(pts, {"right": {"shape": "fist"},
+                                             "left": {"shape": "fist"}}),
+                         "Left hand clenched in a fist.")
+        self.assertEqual(sp.mirror_hands({"right": {"shape": "fist", "back": False},
+                                          "left": {"shape": "open", "back": True}})["right"],
+                         {"shape": "open", "back": True})
 
     def test_near_picks_the_closest_joint_within_reach(self):
         pts = sp.preset("standing", 1000, 1000)

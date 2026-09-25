@@ -15,6 +15,7 @@ picture the ControlNet reads; a figure drawn any other way is guessed at.
 the picture's left.
 """
 
+import colorsys
 import hashlib
 import json
 import math
@@ -39,8 +40,8 @@ MIRROR.update({b: a for a, b in list(MIRROR.items())})
 # What hangs off each joint: dragging one carries these with it.
 CHILDREN = {1: [0, 2, 5, 8, 11], 0: [14, 15, 16, 17], 2: [3], 3: [4], 5: [6], 6: [7],
             8: [9], 9: [10], 11: [12], 12: [13]}
-RENDER_EDGE = 768             # px on the long edge; the ControlNet scales it to the latent
-DRAWING = 3                   # in the saved picture's name: a change to render() redraws
+RENDER_EDGE = 1024            # px on the long edge; the ControlNet scales it to the latent
+DRAWING = 4                   # in the saved picture's name: a change to render() redraws
 
 # Presets in body units: x across (0 is the middle, facing the viewer), y down
 # from the top of the head, ankles near 1. `place()` fits them to a frame.
@@ -195,13 +196,147 @@ def face_points(points, width, height):
             for u, v in FACE]
 
 
+# ------------------------------------------------------------------- hands
+# 21 points a hand, in DWPose's order: the wrist, then thumb, index, middle,
+# ring and little finger, four points each from the knuckle out.
+HAND_EDGES = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+              (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
+              (0, 17), (17, 18), (18, 19), (19, 20)]
+HAND_JOINT = (0, 0, 255)      # DWPose draws every hand point blue
+HAND_OF = {"right": (4, 3), "left": (7, 6)}   # wrist, elbow
+# Each finger in the hand's own frame - y out along the forearm, x toward the
+# thumb, the wrist at the origin, wrist to middle fingertip about 1: its
+# knuckle, the angle it points (degrees toward the thumb) and its three bones.
+FINGERS = [((0.09, 0.44), 8, (0.21, 0.12, 0.10)),      # index
+           ((0.0, 0.46), 0, (0.23, 0.14, 0.11)),       # middle
+           ((-0.085, 0.44), -7, (0.21, 0.13, 0.10)),   # ring
+           ((-0.16, 0.39), -15, (0.16, 0.10, 0.09))]   # little
+THUMB = ((0.1, 0.08), (0.16, 0.13, 0.11))
+HAND_LENGTH = 0.72            # of the forearm, wrist to middle fingertip
+_FIST = (90, 100, 60)
+# A shape: how far each finger's three joints bend (degrees; a bend folds
+# the finger toward the viewer, so its bones foreshorten and a fist's tips
+# come back down onto the palm), how far the fingers fan (x their angles),
+# and the thumb's angle and the two bends that carry it across the palm.
+HAND_SHAPES = [
+    ("relaxed", "Relaxed", {"curl": [(10, 20, 10), (15, 25, 15), (20, 30, 15), (25, 30, 15)],
+                            "spread": 1.0, "thumb": (35, 10, 10)}),
+    ("open", "Open", {"curl": [(0, 0, 0)] * 4, "spread": 1.9, "thumb": (58, 0, 0)}),
+    ("fist", "Fist", {"curl": [_FIST] * 4, "spread": 0.6, "thumb": (18, 45, 35)}),
+    ("grab", "Grabbing", {"curl": [(45, 55, 35)] * 4, "spread": 1.1, "thumb": (45, 15, 10)}),
+    ("point", "Pointing", {"curl": [(0, 0, 0), _FIST, _FIST, _FIST], "spread": 0.8,
+                           "thumb": (18, 45, 35)}),
+    ("peace", "Peace", {"curl": [(0, 0, 0), (0, 0, 0), _FIST, _FIST], "spread": 3.2,
+                        "thumb": (18, 45, 35)}),
+    ("thumbs_up", "Thumbs up", {"curl": [_FIST] * 4, "spread": 0.6, "thumb": (80, -10, 0)}),
+    ("ok", "OK", {"curl": [(40, 70, 50), (5, 5, 5), (8, 8, 5), (10, 10, 5)], "spread": 1.4,
+                  "thumb": (22, 30, 25)}),
+]
+HAND_SHAPE_NAMES = [k for k, _, _ in HAND_SHAPES]
+# What the prompt says of each shape. Fingers are ~70 px of a full-length
+# picture, and the skeleton alone lost a peace sign and a thumbs up on the
+# 5090 (2026-09-25); FLUX reads the words. A relaxed hand is not mentioned.
+HAND_WORDS = {"open": "open with the fingers spread", "fist": "clenched in a fist",
+              "grab": "curled as if gripping something", "point": "pointing with the index "
+              "finger", "peace": "making a peace sign with two fingers",
+              "thumbs_up": "giving a thumbs up", "ok": "making an OK sign"}
+
+
+def hands_text(points, hands):
+    """A sentence for the prompt about the hands that are seen and shaped:
+    "Right hand making a peace sign, left hand clenched in a fist." or ""."""
+    hands = clean_hands(hands)
+    if not hands or not points:
+        return ""
+    parts = []
+    for side in ("right", "left"):
+        wrist, elbow = HAND_OF[side]
+        words = HAND_WORDS.get(hands[side]["shape"])
+        if words and wrist < len(points) and points[wrist] and points[elbow]:
+            parts.append("%s hand %s" % (side, words))
+    if not parts:
+        return ""
+    text = ", ".join(parts)
+    return text[0].upper() + text[1:] + "."
+DEFAULT_HANDS = {"right": {"shape": "relaxed", "back": False},
+                 "left": {"shape": "relaxed", "back": False}}
+
+
+def hand_shape(name):
+    """A shape's 21 points in the hand's own frame."""
+    spec = dict((k, s) for k, _, s in HAND_SHAPES).get(name) or HAND_SHAPES[0][2]
+    pts = [(0.0, 0.0)]
+    (tx, ty), bones = THUMB
+    angle, bends = spec["thumb"][0], (0,) + tuple(spec["thumb"][1:])
+    x, y = tx, ty
+    pts.append((x, y))
+    for bone, bend in zip(bones, bends):
+        angle -= bend                        # a thumb curls across the palm
+        a = math.radians(angle)
+        x, y = x + bone * math.sin(a), y + bone * math.cos(a)
+        pts.append((x, y))
+    for ((kx, ky), aim, bones), curl in zip(FINGERS, spec["curl"]):
+        a = math.radians(aim * spec["spread"])
+        ux, uy = math.sin(a), math.cos(a)
+        x, y, bend = kx, ky, 0
+        pts.append((x, y))
+        for bone, c in zip(bones, curl):
+            bend += c                        # a finger curls toward the viewer
+            k = bone * math.cos(math.radians(bend))
+            x, y = x + ux * k, y + uy * k
+            pts.append((x, y))
+    return pts
+
+
+def clean_hands(hands):
+    """Anything -> {"right": {"shape", "back"}, "left": ...}, or None."""
+    if not isinstance(hands, dict):
+        return None
+    out = {}
+    for side in HAND_OF:
+        h = hands.get(side) if isinstance(hands.get(side), dict) else {}
+        out[side] = {"shape": h.get("shape") if h.get("shape") in HAND_SHAPE_NAMES
+                     else "relaxed", "back": bool(h.get("back"))}
+    return out
+
+
+def mirror_hands(hands):
+    return None if not hands else {"right": dict(hands["left"]), "left": dict(hands["right"])}
+
+
+def hand_points(points, width, height, hands):
+    """{side: 21 points as fractions of the frame} for each hand whose wrist
+    and elbow are seen. The hand carries on from the forearm, HAND_LENGTH of
+    it long; its palm faces the viewer unless `back`, with the thumb on the
+    outside, as a person facing the viewer holds an open hand."""
+    out = {}
+    for side, spec in (clean_hands(hands) or {}).items():
+        wi, ei = HAND_OF[side]
+        w, e = points[wi], points[ei]
+        if not (w and e):
+            continue
+        wx, wy, ex, ey = w[0] * width, w[1] * height, e[0] * width, e[1] * height
+        length = math.hypot(wx - ex, wy - ey)
+        if length < 1e-6:
+            continue
+        dx, dy = (wx - ex) / length, (wy - ey) / length
+        px, py = (-dy, dx) if side == "right" else (dy, -dx)
+        if spec["back"]:
+            px, py = -px, -py
+        s = length * HAND_LENGTH
+        out[side] = [((wx + (u * px + v * dx) * s) / width, (wy + (u * py + v * dy) * s) / height)
+                     for u, v in hand_shape(spec["shape"])]
+    return out
+
+
 def size_for(width, height, edge=RENDER_EDGE):
     k = edge / max(width, height)
     return max(64, int(round(width * k))), max(64, int(round(height * k)))
 
 
-def render(points, width, height):
-    """The OpenPose picture of `points` at width x height -> PNG bytes."""
+def render(points, width, height, hands=None):
+    """The OpenPose picture of `points` at width x height -> PNG bytes, with
+    DWPose's hands when `hands` says what shape they are in."""
     w, h = size_for(width, height)
     buf = bytearray(w * h * 4)
     buf[3::4] = b"\xff" * (w * h)
@@ -240,19 +375,35 @@ def render(points, width, height):
     dot = max(1.2, stick / 3)
     for x, y in face_points(points, 1, 1):
         blot(x * w, y * h, x * w, y * h, dot, (255, 255, 255), 1.0)
+    # DWPose's hand: each bone its own hue round the colour wheel, the points
+    # blue - sized to the hand as DWPose's are (radius 4 on a ~150 px hand).
+    # Twice that made a fist or a thumb a blue blob the model could not read.
+    for hand in hand_points(points, 1, 1, hands).values():
+        at = [(x * w, y * h) for x, y in hand]
+        span = math.hypot(at[12][0] - at[0][0], at[12][1] - at[0][1])
+        span = max(span, math.hypot(at[9][0] - at[0][0], at[9][1] - at[0][1]) * 2)
+        thin, knot = max(1.0, span * 0.018), max(1.5, span * 0.034)
+        for n, (a, b) in enumerate(HAND_EDGES):
+            rgb = tuple(int(c * 255) for c in colorsys.hsv_to_rgb(n / len(HAND_EDGES), 1, 1))
+            blot(at[a][0], at[a][1], at[b][0], at[b][1], thin, rgb, 1.0)
+        for x, y in at:
+            blot(x, y, x, y, knot, HAND_JOINT, 1.0)
     return studio_icons.png(bytes(buf), w, h)
 
 
-def save(points, width, height, folder):
+def save(points, width, height, folder, hands=None):
     """The picture of this pose at this size, under `folder`, named by what
-    it is, so the same pose is drawn once. -> its path."""
-    key = json.dumps([DRAWING, points, size_for(width, height)], sort_keys=True)
+    it is, so the same pose is drawn once. -> its path. A pose without hands
+    keeps the name it had before hands existed, so Generate Again finds it."""
+    hands = clean_hands(hands)
+    key = json.dumps([DRAWING, points, size_for(width, height)] + ([hands] if hands else []),
+                     sort_keys=True)
     path = os.path.join(folder, hashlib.sha1(key.encode()).hexdigest()[:16] + ".png")
     if not os.path.exists(path):
         os.makedirs(folder, exist_ok=True)
         tmp = path + ".part"
         with open(tmp, "wb") as f:
-            f.write(render(points, width, height))
+            f.write(render(points, width, height, hands))
         os.replace(tmp, path)
     return path
 

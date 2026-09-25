@@ -1817,6 +1817,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     pose = s.get("pose") if isinstance(s.get("pose"), dict) else {}
     if p.references.get("pose") and pose.get("strength") not in (None, ""):
         v["pose_strength"] = round(float(pose["strength"]), 3)
+    if p.references.get("pose") and pose.get("hands"):
+        import studio_pose
+        hidden = set(pose.get("hidden") or ())
+        seen = [None if i in hidden else x for i, x in enumerate(pose.get("points") or [])]
+        words = studio_pose.hands_text(seen, pose["hands"])
+        if words:
+            p.prompt = (p.prompt + " " + words).strip()
+            v["prompt"] = p.prompt
     for var in borrowed:
         if not any(var in fs and img in p.images for img, fs in needs.items()):
             v.pop(var, None)
