@@ -17,6 +17,11 @@ pieces:
 - **Props** (`ASSETS`): a box and a cylinder, sized by scale in metres. What a
   prop *is* - a crate, a workbench, a gas cylinder - is its name and its
   description; the shape only holds its place in the frame.
+- **The room** (`new_room`): the floor, and optionally four walls around the
+  origin. Either can wear a picture - one the Image Studio makes from a few
+  words (`texture_settings`), or a PNG from disk - repeated every `size`
+  metres and drawn in perspective (`TexMap`). The room is the backdrop: it is
+  drawn before every object, so a person always stands in front of a wall.
 - **A person's look** (`look`, `character`): the Image Studio's character
   creator slots and sliders, per person - who, body, face, hair, expression,
   clothes, accessories - or a character's look copied on. It is said in that
@@ -42,6 +47,8 @@ import json
 import math
 import os
 import re
+import struct
+import zlib
 
 import studio_icons
 
@@ -52,6 +59,7 @@ FLOOR_REACH = 30.0             # m from the origin the floor is drawn to
 TILE = 0.3                     # m; a prop's faces are cut to about this, for sorting
 SKY = (201, 204, 209)
 FLOOR = (143, 138, 132)
+WALL = (184, 178, 170)
 LIGHT = (-0.45, 0.8, 0.55)     # the one light, from above, front left
 AMBIENT = 0.55
 
@@ -451,12 +459,36 @@ def bounds(obj):
 
 
 # ==================================================================== scene
+# The room's surfaces: (key, label, what the picture is asked to be). The
+# words the user writes go in the middle, as written.
+SURFACES = [
+    ("floor", "Floor",
+     "A seamless, tileable floor texture seen from directly above, filling the whole "
+     "frame: %s. Flat and evenly lit, no perspective, no horizon, no objects, no people."),
+    ("wall", "Walls",
+     "A seamless, tileable wall texture seen straight on, filling the whole frame: %s. "
+     "Flat and evenly lit, no perspective, no floor or ceiling, no furniture, no people."),
+]
+SURFACE_NAMES = {k: label for k, label, _ in SURFACES}
+TEXTURE_NEGATIVE = "people, person, furniture, perspective, horizon, text, watermark"
+TEXTURE_SIDE = 256             # px; a picture is kept this size for the renderer
+ROOM_LIMITS = {"width": (1.0, 40.0), "depth": (1.0, 40.0), "height": (1.5, 12.0)}
+
+
+def new_room():
+    """The floor, and walls around the origin (off until asked for). Each
+    surface: the words its picture was asked for, the picture (a PNG path, ''
+    for plain) and `size`, the metres one copy of the picture covers."""
+    return {"walls": False, "width": 8.0, "depth": 8.0, "height": 3.0,
+            "floor": {"prompt": "", "image": "", "size": 2.0},
+            "wall": {"prompt": "", "image": "", "size": 3.0}}
+
 
 def new_scene(details=""):
     return {"version": VERSION, "details": details, "frame": "portrait", "redraw": REDRAW,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
-            "objects": []}
+            "room": new_room(), "objects": []}
 
 
 def new_object(asset_id, taken=()):
@@ -587,6 +619,19 @@ def clean_scene(d):
     c["pitch"] = _num(cam.get("pitch"), c["pitch"], -80, 85)
     c["distance"] = _num(cam.get("distance"), c["distance"], 0.3, 80)
     c["lens"] = _num(cam.get("lens"), c["lens"], 10, 300)
+    room = d.get("room") if isinstance(d.get("room"), dict) else {}
+    r = s["room"]
+    r["walls"] = room.get("walls") is True
+    for key, (lo, hi) in ROOM_LIMITS.items():
+        r[key] = _num(room.get(key), r[key], lo, hi)
+    for key, label, _ in SURFACES:
+        given = room.get(key) if isinstance(room.get(key), dict) else {}
+        r[key]["prompt"] = str(given.get("prompt") or "")
+        r[key]["image"] = str(given.get("image") or "")
+        r[key]["size"] = _num(given.get("size"), r[key]["size"], 0.25, 20)
+        if r[key]["image"] and not os.path.isfile(r[key]["image"]):
+            problems.append("The %s picture %s is missing, so it is drawn plain."
+                            % (label.lower(), os.path.basename(r[key]["image"])))
     for raw in d.get("objects") or []:
         o = clean_object(raw, s["objects"])
         if o is None:
@@ -618,6 +663,138 @@ def load(path):
 def scenes_dir():
     import studio_imagegen as ig        # lazily: the engine is heavy, this is a path
     return os.path.join(ig.studio_dir(), "scenes")
+
+
+# ================================================================= textures
+
+class Texture:
+    """A picture for a surface: its pixels as 3-byte strings, row by row, so
+    a scanline is a join; `mean` is the flat colour drawn while it bakes."""
+
+    def __init__(self, rgba, w, h):
+        self.w, self.h = w, h
+        self.px = [bytes(rgba[i:i + 3]) for i in range(0, w * h * 4, 4)]
+        n = float(w * h)
+        self.mean = tuple(int(sum(rgba[c::4]) / n) for c in range(3))
+        self._shaded = {}
+
+    def shaded(self, k):
+        """Mip levels at brightness `k`: [(pixels, w, h)], each a quarter the
+        width of the one before, down to one pixel. Far floor drawn from the
+        full picture shimmers into moire, which the picture would copy."""
+        k = round(k, 3)
+        if k not in self._shaded:
+            px = self.px if k == 1.0 else [bytes(min(255, int(v * k)) for v in p)
+                                           for p in self.px]
+            levels = [(px, self.w, self.h)]
+            while levels[-1][1] > 1 or levels[-1][2] > 1:
+                src, w, h = levels[-1]
+                nw, nh = max(1, w // 4), max(1, h // 4)
+                out = []
+                for y in range(nh):
+                    rows = range(y * h // nh, max(y * h // nh + 1, (y + 1) * h // nh))
+                    for x in range(nw):
+                        cols = range(x * w // nw, max(x * w // nw + 1, (x + 1) * w // nw))
+                        cell = [src[r * w + c] for r in rows for c in cols]
+                        n = len(cell)
+                        out.append(bytes(sum(p[i] for p in cell) // n for i in range(3)))
+                levels.append((out, nw, nh))
+            self._shaded[k] = levels
+        return self._shaded[k]
+
+
+_TEXTURES = {}
+
+
+def texture(path):
+    """The picture at `path` as a Texture, or None when there is none or it
+    cannot be read (the surface is drawn plain). Cached by path and mtime."""
+    if not path:
+        return None
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return None
+    t = _TEXTURES.get(key)
+    if t is None:
+        try:
+            with open(path, "rb") as f:
+                rgba, w, h = studio_icons.png_to_rgba(f.read())
+        except (OSError, ValueError, KeyError, IndexError, zlib.error, struct.error):
+            return None
+        t = _TEXTURES[key] = Texture(rgba, w, h)
+    return t
+
+
+def import_texture(src, folder=None):
+    """A picture (the Image Studio's output, or a PNG the user chose) ->
+    a `TEXTURE_SIDE` copy under `<scenes>/textures/`, named by content, and its
+    path. The scene keeps that copy, so clearing History does not take the
+    floor with it. Raises OSError, or ValueError for what is not a PNG this can
+    read (JPEG, 16-bit, interlaced)."""
+    with open(src, "rb") as f:
+        data = f.read()
+    try:
+        rgba, w, h = studio_icons.png_to_rgba(data)
+    except (KeyError, IndexError, zlib.error, struct.error) as e:
+        raise ValueError("not a PNG this can read (%s)" % e)
+    side = TEXTURE_SIDE
+    tw, th = ((side, max(1, round(side * h / w))) if w >= h else
+              (max(1, round(side * w / h)), side))
+    tw, th = min(tw, w), min(th, h)
+    out = bytearray(tw * th * 4)
+    for y in range(th):
+        rows = [min(h - 1, int((y + oy) * h / th)) * w for oy in (0.25, 0.75)]
+        for x in range(tw):
+            cols = [min(w - 1, int((x + ox) * w / tw)) for ox in (0.25, 0.75)]
+            r = g = b = 0
+            for row in rows:
+                for col in cols:
+                    i = (row + col) * 4
+                    r, g, b = r + rgba[i], g + rgba[i + 1], b + rgba[i + 2]
+            o = (y * tw + x) * 4
+            out[o], out[o + 1], out[o + 2], out[o + 3] = r // 4, g // 4, b // 4, 255
+    small = studio_icons.png(bytes(out), tw, th)
+    folder = folder or os.path.join(scenes_dir(), "textures")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "texture_%s.png" % hashlib.sha1(small).hexdigest()[:16])
+    if not os.path.isfile(path):
+        with open(path, "wb") as f:
+            f.write(small)
+    return path
+
+
+def texture_settings(scene, surface, model, backend="auto"):
+    """The Image Studio settings that make `surface`'s picture from its
+    words: text to image, square, and none of the form's person, identities,
+    LoRAs or references - a floor has no face to redraw. `scene_texture` names
+    the surface, so the finished job finds its way back to the builder."""
+    import studio_imagegen as ig
+    words = scene["room"][surface]["prompt"].strip().rstrip(" .")
+    s = ig.default_settings()
+    s.update(model=model, backend=backend, scene=dict(
+        (k, w) for k, _, w in SURFACES)[surface] % words, negative=TEXTURE_NEGATIVE,
+        anatomy=False, width=1024, height=1024, refine=False, face_detail=False,
+        upscale=None, batch=1, scene_texture=surface)
+    return s
+
+
+def walls(room):
+    """The four walls, each (quad, origin, along): a quad facing into the
+    room, its top-left corner as seen from inside, and the direction along
+    it. A picture's top row runs along the wall's top."""
+    hw, hd, h = room["width"] / 2, room["depth"] / 2, room["height"]
+    out = []
+    for origin, along, length in (((-hw, h, -hd), (1, 0, 0), 2 * hw),     # back
+                                  ((hw, h, -hd), (0, 0, 1), 2 * hd),      # right
+                                  ((hw, h, hd), (-1, 0, 0), 2 * hw),      # front
+                                  ((-hw, h, hd), (0, 0, -1), 2 * hd)):    # left
+        end = add(origin, mul(along, length))
+        quad = [origin, end, (end[0], 0.0, end[2]), (origin[0], 0.0, origin[2])]
+        if dot(newell(quad), (-origin[0], 0, -origin[2])) < 0:
+            quad = quad[::-1]
+        out.append((quad, origin, along))
+    return out
 
 
 # ==================================================================== camera
@@ -703,27 +880,67 @@ def frame_size(scene):
 
 class Poly:
     """One face on screen: points in frame pixels, a colour, its depth, and
-    the object and part it belongs to (None for the floor)."""
-    __slots__ = ("pts", "rgb", "depth", "owner", "part")
+    the object and part it belongs to (None for the room). `tex` is a
+    `TexMap` when the face wears a picture; `rgb` is then its mean colour."""
+    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex")
 
-    def __init__(self, pts, rgb, depth, owner, part):
+    def __init__(self, pts, rgb, depth, owner, part, tex=None):
         self.pts, self.rgb, self.depth, self.owner, self.part = pts, rgb, depth, owner, part
+        self.tex = tex
+
+
+class TexMap:
+    """A picture laid on a plane, as the frame sees it. For pixel (x, y) the
+    ray is d = a + b x + c y (unnormalised, frame pixels); it meets the plane
+    at t = `c` / (d . n), and the point's place in the picture is
+    (e + t d) . axis, for the along and down axes. Each dot product is linear
+    in x and y, so a scanline costs a division and two products a pixel -
+    perspective-correct without leaving the stdlib."""
+
+    def __init__(self, cam, origin, along, down, normal, size, tex, k=1.0):
+        per_m = tex.w / float(size)               # picture pixels a metre, both ways
+        self.levels = [(px, w, h, per_m * w / tex.w) for px, w, h in tex.shaded(k)]
+        self.fine = per_m / cam.k                 # picture pixels a frame pixel, x t/|d.n|
+        a = add(cam.f, add(mul(cam.r, -cam.w / 2 / cam.k), mul(cam.u, cam.h / 2 / cam.k)))
+        lin = lambda v: (dot(a, v), dot(cam.r, v) / cam.k, -dot(cam.u, v) / cam.k)  # noqa
+        self.n, self.U, self.V = lin(normal), lin(along), lin(down)
+        self.c = dot(sub(origin, cam.eye), normal)
+        rel = sub(cam.eye, origin)
+        self.eu, self.ev = dot(rel, along), dot(rel, down)
+
+    def span(self, y, xa, xb):
+        """Pixels xa..xb of row y, as RGB bytes."""
+        yc = y + 0.5
+        n0, nx = self.n[0] + self.n[2] * yc, self.n[1]
+        u0, ux = self.U[0] + self.U[2] * yc, self.U[1]
+        v0, vx = self.V[0] + self.V[2] * yc, self.V[1]
+        c, eu, ev, fine, levels = self.c, self.eu, self.ev, self.fine, self.levels
+        top = len(levels) - 1
+        out = []
+        for x in range(xa, xb + 1):
+            xc = x + 0.5
+            dn = n0 + nx * xc
+            t = c / dn if dn else 0.0
+            # How many picture pixels this one frame pixel spans, roughly
+            # (further and more edge-on is more): each level is 4x fewer.
+            spread = abs(t / dn) * fine if dn else 1e9
+            lv = 0 if spread < 1 else 1 if spread < 4 else 2 if spread < 16 else 3
+            px, tw, th, k = levels[min(lv, top)]
+            i = int((eu + t * (u0 + ux * xc)) * k + 1e6) % tw
+            j = int((ev + t * (v0 + vx * xc)) * k + 1e6) % th
+            out.append(px[j * tw + i])
+        return b"".join(out)
 
 
 def render(scene, width=None, height=None):
-    """The scene through its camera -> [Poly], far to near. The floor is
-    first, clipped to the near plane; every object face that faces the camera
-    follows, sorted by depth. The same list is drawn on the canvas and
-    rasterised by `png`."""
+    """The scene through its camera -> [Poly], far to near. The room is
+    first - the floor, then the walls facing into it - clipped to the near
+    plane; every object face that faces the camera follows, sorted by depth.
+    The same list is drawn on the canvas and rasterised by `png`."""
     if width is None:
         width, height = frame_size(scene)
     cam = Camera(scene["camera"], width, height)
-    polys = []
-    r = FLOOR_REACH
-    floor = [cam.to_camera(p) for p in ((-r, 0, -r), (r, 0, -r), (r, 0, r), (-r, 0, r))]
-    floor = clip_near(floor)
-    if len(floor) >= 3 and cam.eye[1] > 0:
-        polys.append(Poly([cam.to_screen(c) for c in floor], FLOOR, float("inf"), None, None))
+    polys = room_polys(scene, cam)
     faces = []
     for obj in scene["objects"]:
         rgb = hex_rgb(obj["colour"])
@@ -742,30 +959,75 @@ def render(scene, width=None, height=None):
     return polys + faces
 
 
+def room_polys(scene, cam):
+    """The floor, then each wall whose face looks into the room from where
+    the camera is. A camera outside the room sees through the near wall, as
+    into a doll's house. The room is the backdrop, never sorted in among the
+    objects: everything in the scene stands in front of it."""
+    room = scene.get("room") or new_room()
+    out = []
+    r = FLOOR_REACH
+    floor = clip_near([cam.to_camera(p) for p in ((-r, 0, -r), (r, 0, -r), (r, 0, r),
+                                                  (-r, 0, r))])
+    if len(floor) >= 3 and cam.eye[1] > 0:
+        tex = texture(room["floor"]["image"])
+        m = (TexMap(cam, (0, 0, 0), (1, 0, 0), (0, 0, 1), (0, 1, 0),
+                    room["floor"]["size"], tex) if tex else None)
+        out.append(Poly([cam.to_screen(c) for c in floor], tex.mean if tex else FLOOR,
+                        float("inf"), None, None, m))
+    if not room["walls"]:
+        return out
+    tex = texture(room["wall"]["image"])
+    for quad, origin, along in walls(room):
+        n = newell(quad)
+        if dot(n, sub(origin, cam.eye)) >= 0:
+            continue                             # its back is to the camera
+        c = clip_near([cam.to_camera(p) for p in quad])
+        if len(c) < 3:
+            continue
+        k = AMBIENT + (1 - AMBIENT) * max(0.0, dot(n, LIGHT_DIR))
+        m = (TexMap(cam, origin, along, (0, -1, 0), n, room["wall"]["size"], tex, k)
+             if tex else None)
+        rgb = tuple(min(255, int(v * k)) for v in (tex.mean if tex else WALL))
+        out.append(Poly([cam.to_screen(p) for p in c], rgb, float("inf"), None, "wall", m))
+    return out
+
+
 def grid_lines(scene, width, height, spacing=1.0, reach=10):
     """The floor's metre grid as screen segments, for the window only: the
-    picture must not be told the floor is tiled."""
+    picture must not be told the floor is tiled. Inside the walls when there
+    are walls, since the grid is drawn over the whole room."""
     cam = Camera(scene["camera"], width, height)
+    room = scene.get("room") or new_room()
+    if room["walls"]:
+        hw, hd = room["width"] / 2, room["depth"] / 2
+        lines = [((x, 0, -hd), (x, 0, hd), x == 0)
+                 for x in range(int(math.ceil(-hw)), int(math.floor(hw)) + 1)]
+        lines += [((-hw, 0, z), (hw, 0, z), z == 0)
+                  for z in range(int(math.ceil(-hd)), int(math.floor(hd)) + 1)]
+    else:
+        lines = [(a, b, i == 0) for i in range(-reach, reach + 1)
+                 for a, b in (((i * spacing, 0, -reach), (i * spacing, 0, reach)),
+                              ((-reach, 0, i * spacing), (reach, 0, i * spacing)))]
     out = []
-    for i in range(-reach, reach + 1):
-        for a, b in (((i * spacing, 0, -reach), (i * spacing, 0, reach)),
-                     ((-reach, 0, i * spacing), (reach, 0, i * spacing))):
-            ca, cb = cam.to_camera(a), cam.to_camera(b)
-            if ca[2] < NEAR and cb[2] < NEAR:
-                continue
-            if ca[2] < NEAR or cb[2] < NEAR:
-                t = (NEAR - ca[2]) / (cb[2] - ca[2])
-                cut = add(ca, mul(sub(cb, ca), t))
-                ca, cb = (cut, cb) if ca[2] < NEAR else (ca, cut)
-            out.append((cam.to_screen(ca), cam.to_screen(cb), i == 0))
+    for a, b, axis in lines:
+        ca, cb = cam.to_camera(a), cam.to_camera(b)
+        if ca[2] < NEAR and cb[2] < NEAR:
+            continue
+        if ca[2] < NEAR or cb[2] < NEAR:
+            t = (NEAR - ca[2]) / (cb[2] - ca[2])
+            cut = add(ca, mul(sub(cb, ca), t))
+            ca, cb = (cut, cb) if ca[2] < NEAR else (ca, cut)
+        out.append((cam.to_screen(ca), cam.to_screen(cb), axis))
     return out
 
 
 # ==================================================================== raster
 
-def rasterise(polys, width, height, sky=SKY):
+def rasterise(polys, width, height, sky=SKY, flat=False):
     """Painter's-order polygons -> RGB bytes. A scanline fill of convex
-    polygons; every face the renderer makes is convex."""
+    polygons; every face the renderer makes is convex. A face with a picture
+    is filled from it, unless `flat` (its mean colour: quick)."""
     buf = bytearray(bytes(sky) * (width * height))
     stride = width * 3
     for poly in polys:
@@ -776,6 +1038,7 @@ def rasterise(polys, width, height, sky=SKY):
         if y1 < y0:
             continue
         colour = bytes(poly.rgb)
+        tex = None if flat else poly.tex
         edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
         edges = [(a, b) if a[1] <= b[1] else (b, a) for a, b in edges if a[1] != b[1]]
         for y in range(y0, y1 + 1):
@@ -789,20 +1052,31 @@ def rasterise(polys, width, height, sky=SKY):
             if xb < xa:
                 continue
             row = y * stride
-            buf[row + xa * 3:row + (xb + 1) * 3] = colour * (xb - xa + 1)
+            buf[row + xa * 3:row + (xb + 1) * 3] = (tex.span(y, xa, xb) if tex else
+                                                    colour * (xb - xa + 1))
     return bytes(buf)
+
+
+def rgb_png(rgb, width, height):
+    rgba = bytearray(width * height * 4)
+    for i in range(3):
+        rgba[i::4] = rgb[i::3]
+    rgba[3::4] = b"\xff" * (width * height)
+    return studio_icons.png(bytes(rgba), width, height)
+
+
+def backdrop_png(scene, width, height):
+    """The room alone at `width` x `height` - sky, floor and walls, with
+    their pictures - for the window to put its object faces over."""
+    polys = [p for p in render(scene, width, height) if p.owner is None]
+    return rgb_png(rasterise(polys, width, height), width, height)
 
 
 def png(scene):
     """The camera's frame at the generation size, as PNG bytes: exactly what
     the viewport shows inside its frame, less the grid and the selection."""
     w, h = frame_size(scene)
-    rgb = rasterise(render(scene, w, h), w, h)
-    rgba = bytearray(w * h * 4)
-    for i in range(3):
-        rgba[i::4] = rgb[i::3]
-    rgba[3::4] = b"\xff" * (w * h)
-    return studio_icons.png(bytes(rgba), w, h)
+    return rgb_png(rasterise(render(scene, w, h), w, h), w, h)
 
 
 def write_reference(scene, folder=None):
@@ -890,6 +1164,11 @@ def scene_text(scene):
     details = scene["details"].strip()
     if details:
         parts.append(details.rstrip())
+    room = scene.get("room") or new_room()
+    for key, label, _ in SURFACES:
+        words = room[key]["prompt"].strip()
+        if words and (key == "floor" or room["walls"]):
+            parts.append("The %s: %s" % (label.lower(), words))
     for obj in scene["objects"]:
         where = placement(scene, obj)
         if where is None:
