@@ -22,11 +22,15 @@ hand to see the tool list, or to check its own contract:
 """
 
 import base64
+import contextlib
+import functools
 import json
 import os
 import random
+import re
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -38,6 +42,9 @@ import studio_mcp
 
 DEFAULT_URL = "http://100.127.17.38:8188"
 COMFY_URL = os.environ.get("COMFYUI_URL", DEFAULT_URL).rstrip("/")
+# The 5090's own ComfyUI on this PC (the Image Studio's, see studio_imagegen),
+# which comfy_restage gives the background while the LLM PC does the people.
+LOCAL_URL = os.environ.get("IMAGE_STUDIO_5090_URL", "http://127.0.0.1:8188").rstrip("/")
 OUTPUT_DIR = os.environ.get(
     "COMFYUI_OUTPUT_DIR",
     os.path.join(os.path.expanduser("~"), "Pictures", "ComfyUI"))
@@ -159,6 +166,32 @@ class Unreachable(ComfyError):
 
 # ------------------------------------------------------------------- HTTP
 
+_where = threading.local()
+
+
+def comfy_url():
+    """The ComfyUI this thread talks to: COMFY_URL unless inside `on`."""
+    return getattr(_where, "url", None) or COMFY_URL
+
+
+def dedicated():
+    """True on the 5090's ComfyUI, whose 32 GB card no LLM shares: the text
+    encoder goes on the GPU and models stay loaded between runs. On it the
+    7B edit encoder on the CPU was 48 of an edit's 52 s; sampling was 3.5."""
+    return comfy_url() == LOCAL_URL and LOCAL_URL != COMFY_URL
+
+
+@contextlib.contextmanager
+def on(url):
+    """Every request this thread makes inside goes to the ComfyUI at `url`,
+    so two threads can drive two machines at once."""
+    old = getattr(_where, "url", None)
+    _where.url = url.rstrip("/")
+    try:
+        yield
+    finally:
+        _where.url = old
+
 def _open(req, timeout):
     try:
         return urllib.request.urlopen(req, timeout=timeout)
@@ -170,12 +203,14 @@ def _open(req, timeout):
             detail = body
         raise ComfyError("ComfyUI answered HTTP %d: %s" % (e.code, _explain(detail)))
     except urllib.error.URLError as e:
+        where = comfy_url()
         raise Unreachable(
-            "Cannot reach ComfyUI at %s (%s). It has to be running on the LLM PC, "
-            "started with --listen so it accepts connections from this machine."
-            % (COMFY_URL, e.reason))
+            "Cannot reach ComfyUI at %s (%s). %s" % (where, e.reason, (
+                "It has to be running on the LLM PC, started with --listen so it accepts "
+                "connections from this machine." if where == COMFY_URL else
+                "It is started by hand on this PC (D:\\ComfyUI).")))
     except OSError as e:
-        raise Unreachable("Cannot reach ComfyUI at %s (%s)." % (COMFY_URL, e))
+        raise Unreachable("Cannot reach ComfyUI at %s (%s)." % (comfy_url(), e))
 
 
 def _explain(detail):
@@ -196,13 +231,13 @@ def _explain(detail):
 
 
 def get_json(path, timeout=15):
-    with _open(COMFY_URL + path, timeout) as r:
+    with _open(comfy_url() + path, timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def post_json(path, payload, timeout=30):
     req = urllib.request.Request(
-        COMFY_URL + path, data=json.dumps(payload).encode("utf-8"),
+        comfy_url() + path, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"}, method="POST")
     with _open(req, timeout) as r:
         body = r.read().decode("utf-8")
@@ -210,7 +245,7 @@ def post_json(path, payload, timeout=30):
 
 
 def get_bytes(path, timeout=60):
-    with _open(COMFY_URL + path, timeout) as r:
+    with _open(comfy_url() + path, timeout) as r:
         return r.read()
 
 
@@ -225,7 +260,7 @@ def post_multipart(path, fields, filename, data, timeout=120):
              % (boundary, filename)).encode("utf-8")
     body += data + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
     req = urllib.request.Request(
-        COMFY_URL + path, data=body, method="POST",
+        comfy_url() + path, data=body, method="POST",
         headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
     with _open(req, timeout) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -365,7 +400,7 @@ def load_split(g, plan, ids=("1", "10", "11", "12"), lora=None):
         "unet_name": plan["diffusion_model"], "weight_dtype": "default"}}
     g[enc] = {"class_type": "CLIPLoader", "inputs": {
         "clip_name": plan["text_encoder"], "type": plan["encoder_type"]}}
-    if ENCODER_ON_CPU:
+    if ENCODER_ON_CPU and not dedicated():
         g[enc]["inputs"]["device"] = "cpu"
     g[vae] = {"class_type": "VAELoader", "inputs": {"vae_name": plan["vae"]}}
     model = [unet, 0]
@@ -511,7 +546,16 @@ def build_graph(a):
 
 
 def submit(graph):
-    res = post_json("/prompt", {"prompt": graph, "client_id": CLIENT_ID})
+    payload = {"prompt": graph, "client_id": CLIENT_ID}
+    pipeline = getattr(_where, "pipeline", None)
+    if pipeline is not None:
+        pipeline["stages"].append({"server": comfy_url(), "prompt": graph})
+        # SaveImage writes each extra_pnginfo key as a PNG text chunk, beside
+        # its own "prompt" (this graph alone): the saved picture carries every
+        # run that made it, on whichever machine, not just the last.
+        if any(n.get("class_type") == "SaveImage" for n in graph.values()):
+            payload["extra_data"] = {"extra_pnginfo": {"studio_pipeline": pipeline}}
+    res = post_json("/prompt", payload)
     pid = res.get("prompt_id")
     if not pid:
         raise ComfyError("ComfyUI did not queue the prompt: " + _explain(res))
@@ -538,8 +582,9 @@ def gpu_memory():
 
 
 def vram_note(free, total):
-    """A sentence when ComfyUI's GPU is too full to hold a model, else ''."""
-    if total and free is not None and free < LOW_VRAM:
+    """A sentence when ComfyUI's GPU is too full to hold a model, else ''.
+    Not on the 5090: what fills its card is our own models, kept warm."""
+    if total and free is not None and free < LOW_VRAM and not dedicated():
         return ("ComfyUI's GPU had %.1f of %.0f GB free when this started - models loaded "
                 "before it hold the rest - so model weights streamed from system RAM, "
                 "which is most of the time this took." % (free / 1e9, total / 1e9))
@@ -576,7 +621,7 @@ def release(baseline=None):
     the release met the very contention this is here to end. Best effort: a
     server that will not say, or will not free, costs speed only.
     -> True when it was asked to."""
-    if KEEP_MODELS:
+    if KEEP_MODELS or dedicated():
         return False
     try:
         q = get_json("/queue", timeout=5)
@@ -845,8 +890,11 @@ def t_edit_image(a):
     g["13"] = {"class_type": "CFGNorm", "inputs": {"model": model, "strength": 1.0}}
     model = ["13", 0]
     names = [input_image(r) for r in refs]
-    # The picture being edited is scaled to the ~1 MP the model was trained at;
-    # the latent starts from it, so the untouched parts come back unchanged.
+    # The picture being edited is scaled to the ~1 MP the model was trained at
+    # and the latent starts from it. The untouched parts come back looking the
+    # same but not the same: resized, twice through the VAE, grain and colour
+    # drifted. So unless the edit is of the whole picture, local_edit keeps
+    # the original's own pixels everywhere but the region that was changed.
     g["20"] = {"class_type": "LoadImage", "inputs": {"image": names[0]}}
     g["21"] = {"class_type": "FluxKontextImageScale", "inputs": {"image": ["20", 0]}}
     images = {"image1": ["21", 0]}
@@ -855,12 +903,16 @@ def t_edit_image(a):
         images["image%d" % i] = [str(20 + i), 0]
     g["2"] = {"class_type": "TextEncodeQwenImageEditPlus",
               "inputs": dict(images, clip=clip, vae=vae, prompt=instruction)}
-    g["3"] = {"class_type": "TextEncodeQwenImageEditPlus",
-              "inputs": dict(images, clip=clip, vae=vae, prompt="")}
     g["4"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["21", 0], "vae": vae}}
     fast = bool(plan["lora"])
     steps = a.get("steps", plan["fast_steps"] if fast else plan["steps"])
     cfg = a.get("cfg", 1.0 if fast else plan["cfg"])
+    # At cfg 1 the sampler never reads the negative, and encoding it ran the
+    # 7B vision encoder over every picture a second time.
+    g["3"] = ({"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
+              if cfg == 1 else
+              {"class_type": "TextEncodeQwenImageEditPlus",
+               "inputs": dict(images, clip=clip, vae=vae, prompt="")})
     g["5"] = {"class_type": "KSampler", "inputs": {
         "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": plan["sampler"],
         "scheduler": plan["scheduler"], "denoise": 1.0, "model": model,
@@ -873,6 +925,8 @@ def t_edit_image(a):
     z = photo_finish() if a.get("photo_finish", False) else None
     if a.get("photo_finish", False) and not z:
         notes.append("photo finish skipped: no Z-Image model installed")
+    if not a.get("whole_picture") or (a.get("keep") or "").strip():
+        return local_edit(g, ["6", 0], names[0], z, instruction, seed, a, header, notes)
     if z:
         return finish_edit(g, ["6", 0], z, instruction, seed, a, header, notes)
     g["7"] = {"class_type": "SaveImage", "inputs": {
@@ -880,41 +934,265 @@ def t_edit_image(a):
     return run(g, a, header, notes)
 
 
-def finish_edit(g, edited, z, instruction, seed, a, header, notes):
-    """An edit and its photo finish - Z-Image redrawing the skin, cloth and
-    grain the edit model leaves waxy, at 1.5x the size - as two runs, not one
-    graph. In one graph ComfyUI kept the 19.5 GB edit model on the 24 GB card
-    while it brought Z-Image's 11.7 GB in beside it: the finish sat in "Model
-    Initializing" for minutes and then sampled at 7 s a step, 410 s for one
-    edit. So the edit runs to a preview, the GPU is freed, and a second run
-    loads that preview for the detail pass. A photo finish always waits."""
-    started = time.monotonic()
-    free, _ = gpu_memory()
+def preview_of(entry, node):
+    """The name LoadImage reads node's first PreviewImage file by, or None."""
+    imgs = ((entry.get("outputs") or {}).get(str(node)) or {}).get("images") or []
+    for f in imgs:
+        if f.get("type") == "temp":
+            name = "%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder") else f["filename"]
+            return name + " [temp]"
+    return None
+
+
+def edit_to_preview(g, edited, a, free):
+    """Run the edit graph to a PreviewImage and free the GPU. -> (the
+    preview's LoadImage name, None), or (None, ComfyUI's error as a result)."""
     g["7"] = {"class_type": "PreviewImage", "inputs": {"images": edited}}
     pid = submit(g)
     entry = wait_for(pid, a.get("timeout", DEFAULT_WAIT))
-    previews = [f for node in (entry.get("outputs") or {}).values()
-                for f in node.get("images", []) or [] if f.get("type") == "temp"]
-    if not previews:
+    name = preview_of(entry, "7")
+    if not name:
         out = collect(pid, entry)         # the edit failed; ComfyUI says why
         release(free)
-        return out
+        return None, out
     release(free)
-    f = previews[0]
-    name = "%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder") else f["filename"]
-    g2 = {}
-    zmodel, zclip, zvae = load_split(g2, z)
-    g2["8"] = {"class_type": "LoadImage", "inputs": {"image": name + " [temp]"}}
-    g2["2"] = {"class_type": "CLIPTextEncode", "inputs": {
-        "text": instruction + ". " + PHOTO_SUFFIX, "clip": zclip}}
-    g2["3"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
-    r = dict(z["hires"], denoise=a.get("finish_denoise", 0.25))
-    out = detail_pass(g2, ["8", 0], zmodel, ["2", 0], ["3", 0], zvae, r, seed)
-    g2["7"] = {"class_type": "SaveImage", "inputs": {
+    return name, None
+
+
+def finish_edit(g, edited, z, instruction, seed, a, header, notes):
+    """A whole-picture edit and its photo finish - Z-Image redrawing the
+    skin, cloth and grain the edit model leaves waxy, at 1.5x the size - as
+    two runs, not one graph. In one graph ComfyUI kept the 19.5 GB edit model
+    on the 24 GB card while it brought Z-Image's 11.7 GB in beside it: the
+    finish sat in "Model Initializing" for minutes and then sampled at 7 s a
+    step, 410 s for one edit. So the edit runs to a preview, the GPU is
+    freed, and a second run loads that preview for the detail pass. A photo
+    finish always waits."""
+    started = time.monotonic()
+    free, _ = gpu_memory()
+    name, failed = edit_to_preview(g, edited, a, free)
+    if failed:
+        return failed
+    return save_edit(name, None, None, z, instruction, seed, a, header, notes, started)
+
+
+# A local edit: the edit model redraws the whole frame, and only the region it
+# was asked to change is taken from it (local_edit). The region is SAM3's mask
+# of `region` in the picture before and after (so "remove the man" and "add a
+# hat" both find it), or else what changed: the difference between the two,
+# blurred so grain and VAE drift fall under DIFF_LEVEL. Either is grown by
+# EDIT_GROW px and blurred so no seam shows. A difference covering more than
+# GLOBAL_SHARE of the frame is a global change - relit, restyled, night for
+# day - and the edit is kept whole rather than pasted over the original in
+# patches.
+EDIT_GROW = 16
+EDIT_SOFT = (25, 8.0)          # ImageBlur radius and sigma of the mask's edge
+DIFF_BLUR = (5, 2.5)
+# Measured on a navy sweater made red (2026-09-25): at 0.12 the drift took
+# 67% of the frame, sky and harbour included; at 0.4 the sweater (SAM3 said
+# 42% grown) plus flecks where the edit nudged masts and roofs.
+DIFF_LEVEL = 0.4               # |r|+|g|+|b| difference, 0..1, after DIFF_BLUR
+GLOBAL_SHARE = 0.7             # a sweater can be half the frame; night is all of it
+KEEP_SOFT = (15, 5.0)          # a kept head's edge: soft, not grown, so no old collar shows
+
+
+def sam_prompt(text):
+    """SAM3's text prompt with a count: "head" alone finds ONE head (the
+    couple's second went unmasked); "head:8" finds up to eight."""
+    return text if re.search(r":[0-9]+$", text) else text + ":8"
+
+
+def mask_share(entry, node):
+    """The mean of the 16x16 mask PreviewAny `node` printed (a torch tensor),
+    which is the share of the picture the mask covers; None if it did not."""
+    text = ((entry.get("outputs") or {}).get(str(node)) or {}).get("text") or []
+    vals = [float(v) for v in re.findall(r"\d+(?:\.\d*)?(?:e[-+]?\d+)?",
+                                         text[0].replace("tensor", ""))] if text else []
+    return sum(vals) / len(vals) if vals else None
+
+
+def local_edit(g, edited, original, z, instruction, seed, a, header, notes):
+    """An edit that keeps the original's pixels outside what it changed, in
+    three runs: the edit to a preview (the GPU freed after); the masks and
+    composites (SAM3 only, a few seconds); the save, or the photo finish
+    confined to the same mask. Always waits."""
+    started = time.monotonic()
+    free, total = gpu_memory()
+    edit, failed = edit_to_preview(g, edited, a, free)
+    if failed:
+        return failed
+    region = (a.get("region") or "").strip()
+    keep = (a.get("keep") or "").strip()
+    whole = bool(a.get("whole_picture"))
+    sam = bool(region or keep) and has_sam3()
+    if (region or keep) and not sam:
+        notes.append("%s not used: ComfyUI has no SAM3 checkpoint"
+                     % " and ".join(repr(t) for t in (region, keep) if t))
+        region = keep = ""
+    g2 = {"30": {"class_type": "LoadImage", "inputs": {"image": original}},
+          "31": {"class_type": "LoadImage", "inputs": {"image": edit}},
+          "32": {"class_type": "GetImageSize", "inputs": {"image": ["30", 0]}},
+          # Back at the original's size, whatever size the edit model drew at.
+          "33": {"class_type": "ImageScale", "inputs": {
+              "image": ["31", 0], "upscale_method": "lanczos", "width": ["32", 0],
+              "height": ["32", 1], "crop": "disabled"}}}
+    masks = []
+    if sam:
+        g2["1"] = {"class_type": "CheckpointLoaderSimple",
+                   "inputs": {"ckpt_name": pick_first(list_models("checkpoints"), SAM3)}}
+    if keep:
+        # What must stay the original's own pixels - the head of a person given
+        # new clothes or a new body - wherever it is before or after the edit.
+        g2["3"] = {"class_type": "CLIPTextEncode",
+                   "inputs": {"text": sam_prompt(keep), "clip": ["1", 1]}}
+        for n, src in ((44, "30"), (45, "33")):
+            g2[str(n)] = {"class_type": "SAM3_Detect", "inputs": {
+                "model": ["1", 0], "image": [src, 0], "conditioning": ["3", 0],
+                "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+        g2["46"] = {"class_type": "MaskComposite", "inputs": {
+            "destination": ["44", 0], "source": ["45", 0], "x": 0, "y": 0, "operation": "or"}}
+        g2["47"] = {"class_type": "MaskToImage", "inputs": {"mask": ["46", 0]}}
+        g2["48"] = {"class_type": "ImageBlur", "inputs": {
+            "image": ["47", 0], "blur_radius": KEEP_SOFT[0], "sigma": KEEP_SOFT[1]}}
+        g2["49"] = {"class_type": "ImageToMask", "inputs": {"image": ["48", 0], "channel": "red"}}
+        g2["34"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["48", 0], "upscale_method": "area", "width": 16, "height": 16,
+            "crop": "disabled"}}
+        g2["35"] = {"class_type": "ImageToMask", "inputs": {"image": ["34", 0], "channel": "red"}}
+        g2["36"] = {"class_type": "PreviewAny", "inputs": {"source": ["35", 0]}}
+    if whole:
+        g2["43"] = {"class_type": "SolidMask", "inputs": {
+            "value": 1.0, "width": ["32", 0], "height": ["32", 1]}}
+        masks.append(("whole", ["43", 0]))
+    if region:
+        g2["2"] = {"class_type": "CLIPTextEncode",
+                   "inputs": {"text": sam_prompt(region), "clip": ["1", 1]}}
+        for n, src in ((40, "30"), (41, "33")):
+            g2[str(n)] = {"class_type": "SAM3_Detect", "inputs": {
+                "model": ["1", 0], "image": [src, 0], "conditioning": ["2", 0],
+                "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+        g2["42"] = {"class_type": "MaskComposite", "inputs": {
+            "destination": ["40", 0], "source": ["41", 0], "x": 0, "y": 0, "operation": "or"}}
+        masks.append(("region", ["42", 0]))
+    g2["50"] = {"class_type": "ImageBlend", "inputs": {
+        "image1": ["30", 0], "image2": ["33", 0], "blend_factor": 1.0,
+        "blend_mode": "difference"}}
+    # "difference" is a clamped image1 - image2, so navy to red read as no
+    # change in red: each way round, screened together, is the absolute one.
+    g2["58"] = {"class_type": "ImageBlend", "inputs": {
+        "image1": ["33", 0], "image2": ["30", 0], "blend_factor": 1.0,
+        "blend_mode": "difference"}}
+    g2["59"] = {"class_type": "ImageBlend", "inputs": {
+        "image1": ["50", 0], "image2": ["58", 0], "blend_factor": 1.0, "blend_mode": "screen"}}
+    g2["51"] = {"class_type": "ImageBlur", "inputs": {
+        "image": ["59", 0], "blur_radius": DIFF_BLUR[0], "sigma": DIFF_BLUR[1]}}
+    for n, channel in ((52, "red"), (53, "green"), (54, "blue")):
+        g2[str(n)] = {"class_type": "ImageToMask", "inputs": {"image": ["51", 0], "channel": channel}}
+    g2["55"] = {"class_type": "MaskComposite", "inputs": {
+        "destination": ["52", 0], "source": ["53", 0], "x": 0, "y": 0, "operation": "add"}}
+    g2["56"] = {"class_type": "MaskComposite", "inputs": {
+        "destination": ["55", 0], "source": ["54", 0], "x": 0, "y": 0, "operation": "add"}}
+    g2["57"] = {"class_type": "ThresholdMask", "inputs": {"mask": ["56", 0], "value": DIFF_LEVEL}}
+    masks.append(("changed", ["57", 0]))
+    for i, (_, hard) in enumerate(masks):
+        n = 60 + 20 * i
+        g2[str(n)] = {"class_type": "GrowMask", "inputs": {
+            "mask": hard, "expand": EDIT_GROW, "tapered_corners": True}}
+        g2[str(n + 1)] = {"class_type": "MaskToImage", "inputs": {"mask": [str(n), 0]}}
+        g2[str(n + 2)] = {"class_type": "ImageBlur", "inputs": {
+            "image": [str(n + 1), 0], "blur_radius": EDIT_SOFT[0], "sigma": EDIT_SOFT[1]}}
+        g2[str(n + 3)] = {"class_type": "ImageToMask", "inputs": {
+            "image": [str(n + 2), 0], "channel": "red"}}
+        final = [str(n + 3), 0]
+        if keep:
+            g2[str(n + 10)] = {"class_type": "MaskComposite", "inputs": {
+                "destination": final, "source": ["49", 0], "x": 0, "y": 0,
+                "operation": "subtract"}}
+            final = [str(n + 10), 0]
+        g2[str(n + 11)] = {"class_type": "MaskToImage", "inputs": {"mask": final}}
+        g2[str(n + 4)] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": ["30", 0], "source": ["33", 0], "x": 0, "y": 0,
+            "resize_source": False, "mask": final}}
+        g2[str(n + 5)] = {"class_type": "PreviewImage", "inputs": {"images": [str(n + 4), 0]}}
+        g2[str(n + 6)] = {"class_type": "PreviewImage", "inputs": {"images": [str(n + 11), 0]}}
+        # How much of the frame the mask covers, read back as 256 numbers.
+        g2[str(n + 7)] = {"class_type": "ImageScale", "inputs": {
+            "image": [str(n + 11), 0], "upscale_method": "area", "width": 16, "height": 16,
+            "crop": "disabled"}}
+        g2[str(n + 8)] = {"class_type": "ImageToMask", "inputs": {
+            "image": [str(n + 7), 0], "channel": "red"}}
+        g2[str(n + 9)] = {"class_type": "PreviewAny", "inputs": {"source": [str(n + 8), 0]}}
+    entry = wait_for(submit(g2), a.get("timeout", DEFAULT_WAIT))
+    found = {}
+    for i, (kind, _) in enumerate(masks):
+        n = 60 + 20 * i
+        found[kind] = (preview_of(entry, n + 5), preview_of(entry, n + 6), mask_share(entry, n + 9))
+    if not all(f[0] and f[1] and f[2] is not None for f in found.values()):
+        return result("The edit ran, but keeping the original around it failed: %s"
+                      % ("; ".join(status_messages(entry)) or "no mask came back"), error=True)
+
+    kept = mask_share(entry, 36) if keep else None
+    if keep and not kept:
+        notes.append("SAM3 found no %r to keep, before or after the edit" % keep)
+    elif keep:
+        notes.append("the %s (%d%% of the picture) is the original's own pixels"
+                     % (keep, max(1, round(kept * 100))))
+    chosen = found.get("whole")
+    if chosen:
+        notes.append("the edit is kept whole but for the %s" % keep)
+        return save_edit(chosen[0], chosen[1], original, z, instruction, seed, a, header,
+                         notes, started, (free, total))
+    chosen = found.get("region")
+    if chosen and chosen[2] > 0.001:
+        notes.append("kept the original outside the %s (SAM3's mask, %d%% of the picture)"
+                     % (region, round(chosen[2] * 100)))
+    else:
+        if chosen:
+            notes.append("SAM3 found no %r before or after the edit; used what changed" % region)
+        chosen = found["changed"]
+        if chosen[2] > GLOBAL_SHARE and not kept:
+            notes.append("the edit changed %d%% of the picture, so it is kept whole"
+                         % round(chosen[2] * 100))
+            return save_edit(edit, None, None, z, instruction, seed, a, header, notes,
+                             started, (free, total))
+        notes.append("kept the original outside what the edit changed (%d%% of the picture)"
+                     % round(chosen[2] * 100))
+    return save_edit(chosen[0], chosen[1], original, z, instruction, seed, a, header,
+                     notes, started, (free, total))
+
+
+def save_edit(image, mask, original, z, instruction, seed, a, header, notes, started,
+              before=None):
+    """The last run of an edit: save `image` (a preview's LoadImage name), or,
+    with a Z-Image plan `z`, give it the photo finish first. With `mask` (a
+    preview of the soft mask) the finish is scaled back to `original`'s size
+    and kept only inside the mask, as the edit was."""
+    g = {"31": {"class_type": "LoadImage", "inputs": {"image": image}}}
+    out = ["31", 0]
+    if z:
+        zmodel, zclip, zvae = load_split(g, z)
+        g["2"] = {"class_type": "CLIPTextEncode", "inputs": {
+            "text": instruction + ". " + PHOTO_SUFFIX, "clip": zclip}}
+        g["3"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["2", 0]}}
+        r = dict(z["hires"], denoise=a.get("finish_denoise", 0.25))
+        out = detail_pass(g, out, zmodel, ["2", 0], ["3", 0], zvae, r, seed)
+        notes = list(notes) + ["photo finish: Z-Image detail pass x%s at denoise %s%s"
+                               % (r["scale"], r["denoise"], ", inside the same mask" if mask else "")]
+        if mask:
+            g["30"] = {"class_type": "LoadImage", "inputs": {"image": original}}
+            g["32"] = {"class_type": "LoadImage", "inputs": {"image": mask}}
+            g["33"] = {"class_type": "ImageToMask", "inputs": {"image": ["32", 0], "channel": "red"}}
+            g["40"] = {"class_type": "GetImageSize", "inputs": {"image": ["30", 0]}}
+            g["41"] = {"class_type": "ImageScale", "inputs": {
+                "image": out, "upscale_method": "lanczos", "width": ["40", 0],
+                "height": ["40", 1], "crop": "disabled"}}
+            g["42"] = {"class_type": "ImageCompositeMasked", "inputs": {
+                "destination": ["30", 0], "source": ["41", 0], "x": 0, "y": 0,
+                "resize_source": False, "mask": ["33", 0]}}
+            out = ["42", 0]
+    g["7"] = {"class_type": "SaveImage", "inputs": {
         "filename_prefix": a.get("filename_prefix", "StudioEdit"), "images": out}}
-    notes = list(notes) + ["photo finish: Z-Image detail pass x%s at denoise %s"
-                           % (r["scale"], r["denoise"])]
-    return run(g2, dict(a, wait=True), header, notes, started=started)
+    return run(g, dict(a, wait=True), header, notes, started=started, before=before)
 
 
 SAM3 = "sam3"                # the checkpoint that finds faces and heads
@@ -1561,8 +1839,11 @@ TOOLS = [
      "a storm', 'put her in a red coat', 'remove the car', 'make it night', 'relight "
      "from the left'. Up to two more pictures can be references ('put the jacket from "
      "picture 2 on the man in picture 1'). Uses Qwen-Image-Edit, fast (4 steps) by "
-     "default. photo_finish true adds a Z-Image detail pass for the most photographic "
-     "result, at extra time. Returns the edited picture like comfy_generate.",
+     "default. A local edit keeps the original's own pixels outside the changed "
+     "region: name that region in `region` ('jacket', 'sky', 'the man'). A change to "
+     "the whole picture (night, relighting, a new style) needs whole_picture true. "
+     "photo_finish true adds a Z-Image detail pass for the most photographic result, "
+     "at extra time. Waits for the result and returns it like comfy_generate.",
      _obj({
          "image": _s("The picture to edit: its path on this workstation (sent up for "
                      "you) or a name from comfy_upload_image."),
@@ -1571,9 +1852,24 @@ TOOLS = [
          "references": {"type": "array", "maxItems": 2, "items": {"type": "string"},
                         "description": "Up to two more pictures, paths or uploaded "
                                        "names, called picture 2 and 3 in the instruction."},
+         "region": _s("What the instruction changes, as a short noun SAM3 can find in "
+                      "the picture before or after the edit: 'jacket', 'sky', 'hair', "
+                      "'man', 'car'. Only that region is taken from the edit; the rest "
+                      "stays the original's own pixels. Left out, the region is what "
+                      "changed between the two, which is less exact."),
+         "keep": _s("What must stay exactly the original's pixels even inside the "
+                    "changed region, as a short noun SAM3 can find: 'head' for new "
+                    "clothes or a new body on the same person, 'face', 'the dog'. "
+                    "Taken out of region (or of what changed) with a soft edge."),
+         "whole_picture": {"type": "boolean", "description": "Default false. true for "
+                           "a change to the whole picture - night for day, relighting, "
+                           "a new style or season: the edit is returned whole, at the "
+                           "edit model's ~1 MP. Leave region out then."},
          "photo_finish": {"type": "boolean", "description": "Default false. true runs a "
-                          "Z-Image detail pass at 1.5x afterwards: sharper, more real "
-                          "skin and texture, bigger file, extra time."},
+                          "Z-Image detail pass afterwards: sharper, more real skin and "
+                          "texture, extra time. On a local edit it touches only the "
+                          "changed region; on a whole picture it redraws all of it at "
+                          "1.5x."},
          "finish_denoise": _n("photo_finish strength. Default 0.25.", minimum=0.1, maximum=0.5),
          "fast": {"type": "boolean", "description": "Default true: the 4-step Lightning "
                   "LoRA. false: 20 full steps at cfg 4, several times slower, sometimes "
@@ -1584,7 +1880,8 @@ TOOLS = [
          "edit_model": _s("Edit model filename from kind=diffusion_models. Default: the "
                           "installed one."),
          "filename_prefix": _s("Output filename prefix. Default StudioEdit."),
-         "wait": {"type": "boolean", "description": "Default true."},
+         "wait": {"type": "boolean", "description": "Default true. false is honoured only "
+                  "by a whole_picture edit without photo_finish."},
          "timeout": _i("Seconds to wait. Default %d." % DEFAULT_WAIT, minimum=5,
                        maximum=MAX_WAIT),
      }, ["image", "instruction"])),
@@ -1681,6 +1978,25 @@ TOOLS = [
                           "description": "prompt_ids to remove. Omit to clear all pending."}})),
 ]
 
+def recorded(name, fn):
+    """fn, recording every graph it submits (see submit) as the recipe its
+    pictures carry in their PNG metadata."""
+    @functools.wraps(fn)
+    def call(a):
+        args = {k: (os.path.basename(v) if isinstance(v, str) and os.path.isabs(v) else v)
+                for k, v in (a or {}).items()}
+        old = getattr(_where, "pipeline", None)
+        if old is not None:               # part of a bigger recipe: add to it
+            return fn(a)
+        _where.pipeline = {"tool": name, "arguments": args, "stages": []}
+        try:
+            return fn(a)
+        finally:
+            _where.pipeline = old
+    return call
+
+
+TOOLS = [(name, recorded(name, fn), desc, schema) for name, fn, desc, schema in TOOLS]
 TOOLS_BY_NAME = {name: (fn, desc, schema) for name, fn, desc, schema in TOOLS}
 
 # Tools that change nothing on ComfyUI. The executor reads this hint to decide
