@@ -86,6 +86,8 @@ class ImageStudio:
         self.random_seed = tk.BooleanVar(value=True)
         self.refine = tk.BooleanVar(value=False)
         self.refine_set = False       # the user touched it; the preset no longer decides
+        self.faces = tk.BooleanVar(value=False)
+        self.faces_set = False        # likewise for the face pass
         self.adv_open = False
         self._build(session.frame)
         for problem in self.studio.lib.problems:
@@ -414,6 +416,8 @@ class ImageStudio:
         self.preset_about.config(text=ig.PRESETS[key]["about"])
         if not self.refine_set:
             self.refine.set(bool(ig.PRESETS[key]["values"].get("refine")))
+        if not self.faces_set:
+            self.faces.set(bool(ig.PRESETS[key]["values"].get("face_detail")))
         self._recheck()
 
     def _set_style(self, sid, recheck=True):
@@ -538,7 +542,9 @@ class ImageStudio:
         srow.pack(side="top", fill="x", pady=(self.px(4), 0))
         for text, var, cmd in (("New seed each time", self.random_seed, self._recheck),
                                ("Refine pass (upscale + low-denoise redraw)", self.refine,
-                                self._touch_refine)):
+                                self._touch_refine),
+                               ("Face pass (redraw each face at full size; needs SAM3)",
+                                self.faces, self._touch_faces)):
             b = tk.Checkbutton(srow, text=text, variable=var, command=cmd, anchor="w",
                                font=self.host.f_ui, bd=0, highlightthickness=0)
             self.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
@@ -557,6 +563,10 @@ class ImageStudio:
 
     def _touch_refine(self):
         self.refine_set = True
+        self._recheck()
+
+    def _touch_faces(self):
+        self.faces_set = True
         self._recheck()
 
     def _roll_seed(self):
@@ -588,6 +598,7 @@ class ImageStudio:
                       for r in self.loras]
         s["references"] = dict(self.refs)
         s["refine"] = bool(self.refine.get())
+        s["face_detail"] = bool(self.faces.get())
         for key, _, kind in ADVANCED:
             raw = self.adv[key].get().strip()
             if not raw:
@@ -629,6 +640,8 @@ class ImageStudio:
             self.adv["seed"].set(str(s.get("seed")))
         self.refine.set(bool(s.get("refine")))
         self.refine_set = True
+        self.faces.set(bool(s.get("face_detail")))
+        self.faces_set = True
         for r in list(self.loras):
             r["row"].destroy()
         self.loras = []
@@ -1053,6 +1066,9 @@ class ImageStudio:
         if rec.get("refine"):
             bits.append("refined x%s at %s" % (rec["refine"].get("upscale"),
                                                rec["refine"].get("denoise")))
+        if (rec.get("face_detail") or {}).get("redrawn"):
+            bits.append("%d face(s) redrawn at %s" % (rec["face_detail"]["redrawn"],
+                                                     rec["face_detail"].get("denoise")))
         if rec.get("identities"):
             bits.append("people: " + ", ".join("%s %.2f" % (i["name"], i["strength"] or 0)
                                                for i in rec["identities"]))

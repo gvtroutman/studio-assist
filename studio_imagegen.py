@@ -43,7 +43,9 @@ import urllib.request
 import uuid
 
 import studio_doctor as doctor
-from studio_comfy_mcp import ComfyError, Unreachable, _explain, outputs_of, status_messages
+from studio_comfy_mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, ComfyError,
+                              Unreachable, _explain, head_square, outputs_of, oval_png,
+                              status_messages)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS_DIR = os.path.join(HERE, "comfy_workflows")
@@ -131,10 +133,12 @@ PRESETS = {
                  "values": {"refine": False}},
     "identity": {"label": "Identity Portrait", "role": "identity",
                  "about": "A person from an identity profile, portrait framing, refined.",
-                 "values": {"refine": True, "width": 896, "height": 1152}},
+                 "values": {"refine": True, "face_detail": True, "width": 896,
+                            "height": 1152}},
     "hq_final": {"label": "High Quality Final", "role": "hires",
-                 "about": "Generate, upscale, then redraw detail at low denoise.",
-                 "values": {"refine": True, "upscale": 2.0}},
+                 "about": "Generate, upscale, redraw detail at low denoise, then redraw "
+                          "each face at full size.",
+                 "values": {"refine": True, "upscale": 2.0, "face_detail": True}},
 }
 PRESET_ORDER = ["standard", "identity", "hq_final"]
 
@@ -356,9 +360,9 @@ def _default_backends():
 def _default_models():
     # Filenames are the ones ComfyUI's own FLUX template downloads
     # (flux_dev_full_text_to_image); a machine with other names says so in its
-    # `backends` entry (the Models editor). FLUX runs the baseline workflow -
-    # no LoRAs, references or refine - until that is known good on both GPUs;
-    # flux_hq.json is where those layers come back.
+    # `backends` entry (the Models editor). FLUX runs the baseline workflow
+    # with LoRAs, refine and the face pass layered on, each off unless asked
+    # for; references (Redux, image to image) are still flux_hq.json's.
     return [
         {"id": "flux-dev", "label": "FLUX.1 [dev]", "family": "flux1",
          "workflow": "flux_dev_baseline",
@@ -369,7 +373,7 @@ def _default_models():
                                "weight_dtype": "fp8_e4m3fn"}},
          "defaults": {"steps": 20, "guidance": 3.5, "sampler": "euler",
                       "scheduler": "simple", "width": 1024, "height": 1024},
-         "notes": "FLUX.1 [dev], the clean baseline: text to image only."},
+         "notes": "FLUX.1 [dev]: text to image with LoRAs, refine and the face pass."},
         {"id": "z-image-turbo", "label": "Z-Image Turbo", "family": "z-image",
          "workflow": "zimage_hq",
          "values": {"model": "z_image_turbo_bf16.safetensors",
@@ -1026,6 +1030,123 @@ def missing_nodes(graph, available):
     return sorted({n["class_type"] for n in graph.values()} - set(available))
 
 
+# ============================================================ the face pass
+# The chat bridge's face detail pass (studio_comfy_mcp.face_detail), for a
+# template that declares `face_detail`: SAM3 finds every face in the finished
+# picture in the same run that makes it (`add_face_finder`), then a second run
+# (`face_graph`) crops each face FACE_PAD times its size, redraws it at
+# FACE_EDIT px with the job's own model, LoRAs and guidance at `face_denoise`,
+# and blends it back through a soft oval. The identity LoRA is on the model
+# that redraws the face, so the pass is where most of the likeness is drawn.
+FACE_NODES = {"CheckpointLoaderSimple", "SAM3_Detect", "PreviewAny", "GetImageSize",
+              "ImageCropV2", "ImageScale", "ImageToMask", "ImageCompositeMasked", "LoadImage"}
+
+
+def _is_link(x):
+    return isinstance(x, list) and len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], int)
+
+
+def add_face_finder(graph, sam3):
+    """Into a filled graph: SAM3's face boxes and the picture's size for its
+    SaveImage's picture, as PreviewAny text (read by `face_boxes`)."""
+    save = next(nid for nid, n in graph.items() if n["class_type"] == "SaveImage")
+    pixels = graph[save]["inputs"]["images"]
+    graph["fd1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}}
+    graph["fd2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "face:8",
+                                                               "clip": ["fd1", 1]}}
+    graph["fd3"] = {"class_type": "SAM3_Detect", "inputs": {
+        "model": ["fd1", 0], "image": pixels, "conditioning": ["fd2", 0], "threshold": 0.3,
+        "refine_iterations": 0, "individual_masks": True}}
+    graph["fd4"] = {"class_type": "PreviewAny", "inputs": {"source": ["fd3", 1]}}
+    graph["fd5"] = {"class_type": "GetImageSize", "inputs": {"image": pixels}}
+    graph["fd6"] = {"class_type": "PreviewAny", "inputs": {"source": ["fd5", 0]}}
+    graph["fd7"] = {"class_type": "PreviewAny", "inputs": {"source": ["fd5", 1]}}
+    return graph
+
+
+def face_boxes(entry):
+    """What add_face_finder's nodes said -> (width, height, [(x, y, w, h)]),
+    faces under FACE_MIN px dropped. None when the finder said nothing."""
+    out = entry.get("outputs") or {}
+
+    def text(node):
+        t = (out.get(node) or {}).get("text") or []
+        return json.loads(t[0]) if t else None
+    try:
+        boxes, width, height = text("fd4"), text("fd6"), text("fd7")
+    except ValueError:
+        return None
+    if boxes is None or width is None or height is None:
+        return None
+    boxes = boxes[0] if boxes and isinstance(boxes[0], list) else boxes
+    return int(width), int(height), [(b["x"], b["y"], b["width"], b["height"])
+                                     for b in boxes or []
+                                     if max(b["width"], b["height"]) >= FACE_MIN]
+
+
+def face_crops(width, height, boxes, pad=FACE_PAD):
+    """The squares to redraw: every face whose padded square is smaller than
+    FACE_EDIT (one already that big was drawn at full size)."""
+    return [c for c in (head_square(b, width, height, pad) for b in boxes)
+            if c["width"] < FACE_EDIT]
+
+
+def face_graph(wf, values, loras, image, crops, oval, prefix):
+    """The second run: `image` (a LoadImage name) with each crop redrawn and
+    blended back through `oval`, saved under `prefix`. The model, VAE and
+    conditioning come from the template's `face_detail` section, filled like
+    the rest (so the LoRA chain is the job's), keeping only the nodes they
+    need."""
+    fd = wf["face_detail"]
+    values = dict(wf.get("defaults") or {}, **{k: x for k, x in values.items() if x is not None})
+    extra = dict(fd.get("nodes") or {})
+    extra["fd_links"] = {"class_type": "_links", "inputs": {
+        k: fd[k] for k in ("model", "vae", "positive", "negative")}}
+    g = fill(dict(wf, graph=dict(wf["graph"], **extra)), values, loras)
+    links = g.pop("fd_links")["inputs"]
+    keep, todo = set(), [x[0] for x in links.values()]
+    while todo:
+        nid = todo.pop()
+        if nid in keep:
+            continue
+        keep.add(nid)
+        todo.extend(x[0] for x in g[nid]["inputs"].values() if _is_link(x))
+    g = {k: g[k] for k in keep}
+    g["fi"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+    g["fo"] = {"class_type": "LoadImage", "inputs": {"image": oval}}
+    seed, last = int(values["seed"]), ["fi", 0]
+    for i, crop in enumerate(crops):
+        n, side = "fc%d_" % (i + 1), crop["width"]
+        g[n + "1"] = {"class_type": "ImageCropV2", "inputs": {"image": last, "crop_region": crop}}
+        g[n + "2"] = {"class_type": "ImageScale", "inputs": {
+            "image": [n + "1", 0], "upscale_method": "lanczos", "width": FACE_EDIT,
+            "height": FACE_EDIT, "crop": "disabled"}}
+        g[n + "3"] = {"class_type": "VAEEncode", "inputs": {"pixels": [n + "2", 0],
+                                                            "vae": links["vae"]}}
+        g[n + "4"] = {"class_type": "KSampler", "inputs": {
+            "seed": (seed + i + 1) % (MAX_SEED + 1), "steps": values["steps"], "cfg": 1.0,
+            "sampler_name": values["sampler"], "scheduler": values["scheduler"],
+            "denoise": values["face_denoise"], "model": links["model"],
+            "positive": links["positive"], "negative": links["negative"],
+            "latent_image": [n + "3", 0]}}
+        g[n + "5"] = {"class_type": "VAEDecode", "inputs": {"samples": [n + "4", 0],
+                                                            "vae": links["vae"]}}
+        g[n + "6"] = {"class_type": "ImageScale", "inputs": {
+            "image": [n + "5", 0], "upscale_method": "lanczos", "width": side,
+            "height": side, "crop": "disabled"}}
+        g[n + "7"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["fo", 0], "upscale_method": "bilinear", "width": side,
+            "height": side, "crop": "disabled"}}
+        g[n + "8"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "7", 0],
+                                                              "channel": "red"}}
+        g[n + "9"] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": last, "source": [n + "6", 0], "x": crop["x"], "y": crop["y"],
+            "resize_source": False, "mask": [n + "8", 0]}}
+        last = [n + "9", 0]
+    g["fs"] = {"class_type": "SaveImage", "inputs": {"images": last, "filename_prefix": prefix}}
+    return g
+
+
 FOLDER_WORDS = {"diffusion_models": "diffusion model", "checkpoints": "checkpoint",
                 "text_encoders": "text encoder", "vae": "VAE", "loras": "LoRA",
                 "clip_vision": "CLIP vision model", "style_models": "style model",
@@ -1090,7 +1211,7 @@ def default_settings():
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "batch": 1}
+            "face_detail": None, "batch": 1}
 
 
 def resolve_model(model, backend_id):
@@ -1256,7 +1377,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             look[k] = style[k]
     look.update({k: x for k, x in preset["values"].items()})
     for k in ("steps", "guidance", "sampler", "scheduler", "width", "height", "denoise",
-              "refine", "upscale", "refine_denoise"):
+              "refine", "upscale", "refine_denoise", "face_detail"):
         if s.get(k) not in (None, ""):
             look[k] = s[k]
     v = dict(mvalues)
@@ -1335,6 +1456,32 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         v["upscale"] = round(scale, 3)
         if scale <= 1.05:
             v["refine"] = False
+
+    # The face pass needs the template's face_detail section, a SAM3
+    # checkpoint to find the faces and the stock nodes it is built from. It
+    # is a finish, not the picture: without them the picture is made and the
+    # pass is left out, said once.
+    if v.get("face_detail"):
+        asked = s.get("face_detail") or preset["values"].get("face_detail")
+        ckpts = (inventory or {}).get("checkpoints") if inventory is not None else None
+        sam = sorted(c for c in ckpts or () if SAM3 in c.lower())
+        why = ""
+        if not wf.get("face_detail"):
+            why = "The %s workflow has no face pass" % wf.get("label", wid)
+        elif ckpts is not None and not sam:
+            why = ("%s has no SAM3 checkpoint (a file with sam3 in its name, in "
+                   "ComfyUI/models/checkpoints), which finds the faces" % backend["name"])
+        elif nodes is not None and FACE_NODES - set(nodes):
+            why = "%s's ComfyUI lacks the node(s) %s" % (
+                backend["name"], ", ".join(sorted(FACE_NODES - set(nodes))))
+        if why:
+            if asked:
+                p.warnings.append(why + "; the picture is made without the face pass.")
+            v["face_detail"] = False
+        else:
+            v["sam3"] = sam[0] if sam else None
+            v["face_prompt"] = FACE_PROMPT % p.prompt
+            v.setdefault("face_denoise", (wf.get("defaults") or {}).get("face_denoise", 0.4))
 
     # ------------------------------------------- files and nodes it needs
     optional = {var for fs in needs.values() for var in fs}   # checked with their reference
@@ -1428,6 +1575,8 @@ class Job:
         self.outputs = []             # local paths
         self.record = None            # the history record, once complete
         self.graph = None             # the graph as submitted
+        self.face_graph = None        # the face pass's graph, when it ran
+        self.face = None              # {"found", "redrawn", "denoise"} when it ran
         self.notes = []               # things said on the way (no live progress, ...)
         self.cancel = threading.Event()
 
@@ -1917,7 +2066,7 @@ class Studio:
         if not h["ok"]:
             return self.queue._finish(job, "failed", h["detail"])
         plan = compose(job.settings, self.lib, b, self.inventories.get(b["id"]),
-                       self.workflow_loader)
+                       self.workflow_loader, self.nodes.get(b["id"]))
         job.plan = plan
         if plan.errors:
             return self.queue._finish(job, "failed", " ".join(plan.errors))
@@ -1938,9 +2087,22 @@ class Studio:
         except TemplateError as e:
             return self.queue._finish(job, "failed", str(e))
         try:
-            lacking = missing_nodes(graph, client.node_types())
+            types = set(client.node_types())
         except ComfyError:
-            lacking = []
+            types = None
+        lacking = missing_nodes(graph, types) if types is not None else []
+        if values.get("face_detail"):
+            if not values.get("sam3"):
+                values["face_detail"] = False
+                plan.warnings.append("%s's SAM3 checkpoint is not known; the picture is made "
+                                     "without the face pass." % b["name"])
+            elif types is not None and FACE_NODES - types:
+                values["face_detail"] = False
+                plan.warnings.append("%s's ComfyUI lacks %s; the picture is made without the "
+                                     "face pass." % (b["name"], ", ".join(sorted(FACE_NODES
+                                                                                 - types))))
+            else:
+                add_face_finder(graph, values["sam3"])
         if lacking:
             return self.queue._finish(job, "failed", "%s's ComfyUI lacks the node(s) %s that "
                                       "the %s workflow uses." % (
@@ -1982,6 +2144,12 @@ class Studio:
             return self.queue._finish(job, "failed", "; ".join(errors) or
                                       "The workflow finished on %s without a picture."
                                       % b["name"])
+        if values.get("face_detail") and not job.cancel.is_set():
+            files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
+            if graph2 is not None:
+                job.face_graph = graph2
+        if job.cancel.is_set():
+            return self.queue._finish(job, "cancelled")
         say("decoding", "fetching the picture from %s" % b["name"], None)
         try:
             pictures = [(f["filename"], client.fetch(f)) for f in files]
@@ -1993,6 +2161,72 @@ class Studio:
         job.progress = 1.0
         self.queue._finish(job, "complete",
                            "; ".join(plan.warnings[:1]) if plan.warnings else "")
+
+    def _face_pass(self, job, client, plan, values, entry, files, say):
+        """The second run of the face pass, on the lane's thread. -> (files,
+        graph): the redrawn picture's files and the graph that made them, or
+        the first run's files and None when there was nothing to redraw or
+        the pass failed - the picture is never lost to its finish."""
+        b = job.backend
+        found = face_boxes(entry)
+        if found is None:
+            plan.warnings.append("The face finder said nothing; the picture is as made.")
+            return files, None
+        width, height, boxes = found
+        crops = face_crops(width, height, boxes)
+        job.face = {"found": len(boxes), "redrawn": len(crops),
+                    "denoise": values.get("face_denoise")}
+        if not crops:
+            plan.notes.append("Face pass: %s" % ("no face found" if not boxes else
+                                                 "every face was already drawn at full size"))
+            return files, None
+        f = files[0]
+        image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                f["filename"], f.get("type") or "output")
+        oval = os.path.join(self.lib.root, "face_oval.png")
+        try:
+            if not os.path.isfile(oval):
+                os.makedirs(self.lib.root, exist_ok=True)
+                with open(oval, "wb") as fh:
+                    fh.write(oval_png())
+            graph = face_graph(plan.workflow, values, plan.loras, image, crops,
+                               client.upload_image(oval), values["filename_prefix"] + "_faces")
+            say("refining", "redrawing %d face%s at %d px" % (
+                len(crops), "" if len(crops) == 1 else "s", FACE_EDIT), None)
+            pid = client.queue_workflow(graph)
+        except (ComfyError, TemplateError, OSError) as e:
+            plan.warnings.append("The face pass could not start (%s); the picture is as made."
+                                 % e)
+            return files, None
+        job.prompt_id = pid
+        n = len(crops)
+
+        def on_event(kind, data):
+            if kind != "progress" or not data[1]:
+                return
+            value, total, nid = data
+            face = (nid or "").split("_")[0][2:] if (nid or "").startswith("fc") else "?"
+            say("refining", "redrawing face %s of %d · step %d of %d" % (face, n, value, total),
+                value / float(total))
+        watch = client.watch() if hasattr(client, "watch") else None
+        try:
+            entry2 = client.listen_for_progress(
+                pid, on_event, stop=job.cancel.is_set,
+                **({"watch": watch} if watch is not None else {}))
+        finally:
+            if watch is not None:
+                watch.close()
+        if entry2 is None:
+            return files, None                # cancelled; run_job says so
+        files2 = outputs_of(entry2)
+        if not files2:
+            errors = run_errors(entry2, graph)
+            plan.warnings.append("The face pass failed (%s); the picture is as made."
+                                 % ("; ".join(errors) or "no picture"))
+            return files, None
+        plan.notes.append("Face pass: %d face%s redrawn at %d px, denoise %s" % (
+            n, "" if n == 1 else "s", FACE_EDIT, values.get("face_denoise")))
+        return files2, graph
 
     def _progress(self, job, graph, say):
         """The on_event for one job: ComfyUI's events as Queued -> Loading ->
@@ -2017,6 +2251,9 @@ class Studio:
                     node_name(n) for n in data[:4]), progress=job.progress)
             elif kind == "executing":
                 st["node"] = data
+                if data and data.startswith("fd") and data in graph:
+                    say("refining", "finding faces · " + node_name(data), None)
+                    return
                 if data in refine:
                     say("refining", "refining detail · " + node_name(data), None)
                     return
@@ -2086,12 +2323,14 @@ class Studio:
             "denoise": v.get("denoise"),
             "refine": ({"upscale": v.get("upscale"), "denoise": v.get("refine_denoise"),
                         "steps": v.get("refine_steps")} if v.get("refine") else None),
+            "face_detail": job.face,
             "references": p.references,
             "warnings": p.warnings, "notes": p.notes + job.notes,
             "duration": round(time.time() - job.started, 1),
             "prompt_id": job.prompt_id,
             "settings": s,
             "graph": graph,
+            "face_graph": job.face_graph,
         }
 
     def close(self):

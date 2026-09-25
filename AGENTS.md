@@ -486,13 +486,30 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   the variation. Measured on the 5090: the pixels match exactly, but the PNG
   bytes do not, because ComfyUI embeds the graph, and the output name in it
   differs per job.
-- **FLUX runs the baseline first** (`flux_dev_baseline.json`): ComfyUI's own
-  `flux_dev_full_text_to_image` recipe plus FluxGuidance, taking prompt, seed,
-  size, steps, guidance, sampler, scheduler and output name. It has no LoRAs,
-  references, refine or face pass. `compose` leaves any of those out *with a
-  warning*. `flux_hq.json` (the layered graph) stays on disk for later, and
-  the tests keep its LoRA/reference logic covered through a `flux-hq` model of
-  their own. Layer features back one at a time, against the baseline.
+- **FLUX runs the baseline, with layers that leave it alone when off**
+  (`flux_dev_baseline.json`): ComfyUI's own `flux_dev_full_text_to_image`
+  recipe plus FluxGuidance. Layered on it, one at a time (2026-09-25): a
+  `lora_chain` (identity, style and added LoRAs, `LoraLoader` on model and
+  clip), a `refine` pass (flux_hq's upscale and tiled low-denoise redraw), and
+  the face pass (below). With no LoRA, refine or face pass the filled graph is
+  the baseline node for node; a test holds it to that. References (Redux,
+  image to image) are still only in `flux_hq.json`, which the tests keep
+  covered through a `flux-hq` model of their own; they are the next layer.
+- **The face pass** is the chat bridge's face detail (`studio_comfy_mcp.
+  face_detail`) for a template with a `face_detail` section. The run that
+  makes the picture also runs SAM3 on it (`add_face_finder`, nodes `fd*`);
+  a second run (`face_graph`) loads the saved picture, crops each face
+  `FACE_PAD` times its size, redraws it at `FACE_EDIT` px with the job's own
+  model, LoRA chain and guidance at `face_denoise` (0.4 for FLUX), and blends
+  it back through a soft oval. The identity LoRA is on the model that redraws
+  the face, which is where the likeness sharpens. `face_graph` fills the
+  template with the section's nodes and keeps only the nodes the redraw links
+  need, so the picture is not made twice. It is a finish, never a reason to
+  lose the picture: no SAM3 checkpoint (`sam3` in its name, under
+  `checkpoints`) or a missing node turns it off with a warning, and a failed
+  second run keeps the first run's picture with the error in the record.
+  Identity Portrait and High Quality Final turn it on; the form has a toggle.
+  Faces get seeds s+1, s+2, ... so Generate Again redraws them the same.
 - **The 5090's ComfyUI (2026-09-25)** is ComfyUI v0.37.2 (the 3090's version),
   git-cloned into `D:\ComfyUI` with its own Python 3.12 venv and PyTorch
   cu128 (Blackwell). The models live in `D:\ComfyUI-models`

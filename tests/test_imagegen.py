@@ -96,6 +96,36 @@ class FakeClient:
         return {"queue_running": [], "queue_pending": []}
 
 
+class FaceClient(FakeClient):
+    """A ComfyUI with SAM3: the first run reports one small face, the second
+    run is the face pass."""
+    NODES = FakeClient.node_types(None) | ig.FACE_NODES
+    fail_pass = False
+
+    def inventory(self):
+        return dict(super().inventory(), checkpoints={"sam3.pt"})
+
+    def node_types(self):
+        return set(FaceClient.NODES)
+
+    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        graph = self.graphs[int(pid[3:]) - 1]
+        if "fs" in graph:
+            on_event("progress", (1, 8, "fc1_4"))
+            if FaceClient.fail_pass:
+                return {"status": {"messages": [["execution_error", {
+                    "node_id": "fc1_4", "node_type": "KSampler",
+                    "exception_type": "RuntimeError", "exception_message": "boom"}]]},
+                    "outputs": {}}
+            return {"status": {"completed": True}, "outputs": {"fs": {"images": [
+                {"filename": "faces_00001_.png", "subfolder": "ImageStudio", "type": "output"}]}}}
+        entry = super().listen_for_progress(pid, on_event, stop, timeout)
+        entry["outputs"].update({
+            "fd4": {"text": [json.dumps([[{"x": 400, "y": 300, "width": 90, "height": 110}]])]},
+            "fd6": {"text": ["1024"]}, "fd7": {"text": ["1024"]}})
+        return entry
+
+
 def settle(jobs, seconds=5):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -228,9 +258,54 @@ class TestFill(unittest.TestCase):
         self.assertEqual(g["11"]["inputs"]["guidance"], 2.5)
         self.assertEqual((g["20"]["inputs"]["width"], g["20"]["inputs"]["height"]), (832, 1216))
         self.assertEqual(g["9"]["inputs"]["filename_prefix"], "ImageStudio/job1")
-        with self.assertRaises(ig.TemplateError):
-            ig.fill(wf, {"model": "m", "clip_l": "c", "t5": "t", "vae": "v", "prompt": "p",
-                         "seed": 1}, [("l.safetensors", 0.5)])
+        # With no LoRA and no refine, the layers leave the known-good graph as it was.
+        self.assertEqual(g["40"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(g["10"]["inputs"]["clip"], ["2", 0])
+        self.assertEqual(g["9"]["inputs"]["images"], ["41", 0])
+
+    def test_face_boxes_and_crops(self):
+        entry = {"outputs": {"fd4": {"text": [json.dumps([[
+            {"x": 100, "y": 100, "width": 80, "height": 100},
+            {"x": 600, "y": 50, "width": 8, "height": 9},            # texture, not a face
+            {"x": 0, "y": 0, "width": 700, "height": 800}]])]},    # already full size
+            "fd6": {"text": ["1024"]}, "fd7": {"text": ["1024"]}}}
+        w, h, boxes = ig.face_boxes(entry)
+        self.assertEqual((w, h, len(boxes)), (1024, 1024, 2))
+        crops = ig.face_crops(w, h, boxes)
+        self.assertEqual(len(crops), 1)
+        self.assertEqual(crops[0]["width"], 200)
+        self.assertIsNone(ig.face_boxes({"outputs": {}}))
+
+    def test_the_face_graph_keeps_only_what_the_redraw_needs(self):
+        wf = ig.load_workflow("flux_dev_baseline")
+        crops = [{"x": 10, "y": 20, "width": 200, "height": 200},
+                 {"x": 500, "y": 20, "width": 300, "height": 300}]
+        g = ig.face_graph(wf, {"model": "m", "clip_l": "c", "t5": "t", "vae": "v",
+                               "prompt": "p", "seed": 1, "face_prompt": "a face",
+                               "refine": True},
+                          [("gavin.safetensors", 0.8)], "pic.png [output]", crops, "oval.png",
+                          "ImageStudio/x_faces")
+        classes = {n["class_type"] for n in g.values()}
+        self.assertFalse(classes & {"EmptySD3LatentImage", "VAEEncodeTiled"})
+        for nid in ("20", "40", "41", "44", "9", "10", "11", "12"):
+            self.assertNotIn(nid, g)
+        self.assertEqual(g["fc1_4"]["inputs"]["model"], ["lora1", 0])
+        self.assertEqual(g["f10"]["inputs"]["clip"], ["lora1", 1])
+        self.assertEqual(g["fc2_4"]["inputs"]["positive"], ["f11", 0])
+        self.assertEqual(g["fc2_1"]["inputs"]["image"], ["fc1_9", 0])   # composited so far
+        self.assertEqual(g["fs"]["inputs"]["images"], ["fc2_9", 0])
+        self.assertEqual((g["fc1_4"]["inputs"]["steps"], g["fc1_4"]["inputs"]["denoise"]),
+                         (20, 0.4))
+
+    def test_the_flux_baseline_takes_loras_and_a_refine_pass(self):
+        wf = ig.load_workflow("flux_dev_baseline")
+        g = ig.fill(wf, {"model": "m", "clip_l": "c", "t5": "t", "vae": "v", "prompt": "p",
+                         "seed": 1, "refine": True}, [("gavin.safetensors", 0.85)])
+        self.assertEqual(g["lora1"]["class_type"], "LoraLoader")
+        self.assertEqual(g["40"]["inputs"]["model"], ["lora1", 0])
+        self.assertEqual(g["44"]["inputs"]["model"], ["lora1", 0])
+        self.assertEqual(g["10"]["inputs"]["clip"], ["lora1", 1])
+        self.assertEqual(g["9"]["inputs"]["images"], ["45", 0])
 
 
 class TestCompose(TempStudioMixin, unittest.TestCase):
@@ -240,14 +315,37 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         s.update(kw)
         return ig.compose(s, self.studio.lib, self.backend(backend), inventory, nodes=nodes)
 
-    def test_the_baseline_drops_loras_and_refine_out_loud(self):
-        p = self.plan(model="flux-dev", scene="x", preset="hq_final",
+    def test_flux_applies_identity_and_style_loras_and_refines(self):
+        p = self.plan(model="flux-dev", scene="On a pier.", preset="hq_final",
+                      identities=[{"id": "gavin", "strength": 0.9}],
                       loras=[{"id": "sx70", "strength": 0.5}])
         self.assertEqual(p.errors, [])
-        self.assertEqual(p.loras, [])
-        self.assertFalse(p.values["refine"])
-        self.assertTrue(any("takes no LoRAs: SX-70" in w for w in p.warnings), p.warnings)
-        self.assertTrue(any("no refine pass" in w for w in p.warnings), p.warnings)
+        self.assertEqual(p.loras, [("gavin.safetensors", 0.9), ("sx70.safetensors", 0.5)])
+        self.assertTrue(p.values["refine"])
+        self.assertTrue(p.prompt.startswith("GAVINPERSON"), p.prompt)
+
+    def test_the_face_pass_needs_sam3_and_says_so(self):
+        p = self.plan(model="flux-dev", scene="x", preset="hq_final")
+        self.assertFalse(p.values["face_detail"])
+        self.assertTrue(any("no SAM3 checkpoint" in w for w in p.warnings), p.warnings)
+        p = self.plan(model="flux-dev", scene="x")              # not asked: not said
+        self.assertFalse(any("SAM3" in w for w in p.warnings), p.warnings)
+
+    def test_the_face_pass_is_planned_with_the_person_in_its_prompt(self):
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"})
+        p = self.plan(model="flux-dev", scene="On a pier.", preset="identity",
+                      identities=["gavin"], inventory=inv, nodes=FaceClient.NODES)
+        self.assertEqual(p.errors, [])
+        self.assertTrue(p.values["face_detail"])
+        self.assertEqual(p.values["sam3"], "sam3.pt")
+        self.assertIn("GAVINPERSON", p.values["face_prompt"])
+        p = self.plan(model="flux-dev", scene="x", preset="identity", identities=["gavin"],
+                      inventory=inv, nodes=FaceClient.NODES - {"SAM3_Detect"})
+        self.assertFalse(p.values["face_detail"])
+        self.assertTrue(any("SAM3_Detect" in w for w in p.warnings), p.warnings)
+        p = self.plan(model="flux-dev", scene="x", preset="identity", identities=["gavin"],
+                      inventory=inv, face_detail=False)
+        self.assertFalse(p.values["face_detail"])
 
     def test_missing_nodes_are_named(self):
         p = self.plan(model="flux-dev", scene="x", nodes={"UNETLoader"})
@@ -445,6 +543,51 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             "t5": "t5xxl_fp16.safetensors", "vae": "ae.safetensors"})
         self.assertEqual(rec["graph"]["9"]["inputs"]["filename_prefix"],
                          "ImageStudio/flux_dev_baseline_" + jobs[0].id)
+
+    def face_studio(self):
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=FaceClient)
+        FaceClient.fail_pass = False
+
+    def test_the_face_pass_redraws_each_face_with_the_identity_lora(self):
+        self.face_studio()
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+                                       preset="identity", identities=["gavin"],
+                                       scene="On a pier.", backend="5090", seed=5))
+        settle(jobs)
+        job = jobs[0]
+        self.assertEqual(job.status, "complete", job.detail)
+        client = FaceClient.instances[-1]
+        first, second = client.graphs
+        self.assertEqual(first["fd3"]["inputs"]["image"], first["9"]["inputs"]["images"])
+        self.assertEqual(second["fi"]["inputs"]["image"],
+                         "ImageStudio_00001_.png [output]")
+        self.assertEqual(second["fc1_4"]["inputs"]["model"], ["lora1", 0])
+        self.assertEqual(second["fc1_4"]["inputs"]["seed"], 6)
+        self.assertEqual(second["fc1_4"]["inputs"]["denoise"], 0.4)
+        self.assertEqual(second["fc1_2"]["inputs"]["width"], ig.FACE_EDIT)
+        self.assertIn("GAVINPERSON", second["f10"]["inputs"]["text"])
+        self.assertNotIn("40", second)            # the picture is loaded, not made again
+        self.assertNotIn("fc2_1", second)
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["face_detail"]["redrawn"], 1)
+        self.assertEqual(rec["face_graph"]["fs"]["inputs"]["filename_prefix"],
+                         "ImageStudio/flux_dev_baseline_%s_faces" % job.id)
+        self.assertTrue(any("Face pass: 1 face" in n for n in rec["notes"]), rec["notes"])
+
+    def test_a_failed_face_pass_keeps_the_picture(self):
+        self.face_studio()
+        FaceClient.fail_pass = True
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+                                       preset="identity", identities=["gavin"],
+                                       scene="x", backend="5090"))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        rec = self.studio.history.list()[0]
+        self.assertIsNone(rec["face_graph"])
+        self.assertEqual(len(rec["images"]), 1)
+        self.assertTrue(any("face pass failed" in w and "boom" in w for w in rec["warnings"]),
+                        rec["warnings"])
 
     def test_progress_reads_as_queued_loading_sampling_decoding(self):
         statuses = []
