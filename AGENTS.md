@@ -954,6 +954,14 @@ pruning**: not on a timer, not to keep the folder tidy. Deleting is a per-task b
 that asks first. (Nineteen saved tasks were examined when this was written; every one
 held a real request. An age or count based sweep would have deleted work.)
 
+**Auto-update only fast-forwards.** `studio_update.py` (a scheduled task under `pyw`,
+set up with `--install`) polls GitHub and runs `merge --ff-only`. It must never
+merge, stash, reset or check out over local work: the workstation sometimes carries its
+own commits, and an updater that "resolves" them destroys them silently. A refusal
+goes to `studio_update.log`, and so does a successful update. A pass with nothing
+to do writes nothing. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
+console hangs forever and nobody sees it.
+
 **The launchers must not name a Python by its install path.** `Studio Assist.cmd`
 pointed at `...\Programs\Python\Python312\pythonw.exe`, which is one Python upgrade
 away from a shortcut that does nothing at all when clicked — no window and no error,
