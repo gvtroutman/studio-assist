@@ -496,11 +496,14 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   (`item_refs`, copied under `references/`). Choosing one copies its look onto the
   form (blanking what it does not set) rather than linking to it, so history holds
   the whole look and Generate Again does not change when the character is edited.
-- **Item pictures go only where a workflow declares an `item` reference.** None
-  does yet (Redux in `flux_hq` is taken by style/composition, and nothing does
-  IP-Adapter), so today every item picture comes back as a warning naming the items,
-  and the item's words carry it. A picture of something not worn today is skipped
-  without a word.
+- **Item pictures are put on by Try On, after the picture is made** (below).
+  No generation workflow takes them (Redux in `flux_hq` is taken by
+  style/composition, and nothing does IP-Adapter), so the item's words shape the
+  first picture and `plan_dress` plans the dress run that follows. With the
+  form's "Try On the character's item pictures" off, or a backend without the
+  dress files, the pictures come back as a note or a warning naming them. A
+  picture of something not worn today is skipped without a word. The Hair tab
+  of the creator keeps one picture of its own, under the item name `hair`.
 - **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
   described, or named in the scene, `PEOPLE`) says outright that every person has
   two hands, each with four fingers and a thumb, two feet, two eyes and a
@@ -641,6 +644,74 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   ~2.6 it/s, 11-12 s end to end including the model load. The 3090 has no FLUX
   files (its entry expects `t5xxl_fp8_e4m3fn_scaled` and fp8 weights), so Auto
   never sends FLUX there. Z-Image Turbo at 1024² took 18-30 s there.
+
+### Try On: dressing a person from pictures
+
+Clothes, hair and accessories from pictures, put on a person who is already
+drawn: any picture, through the Try On window (`TryOnWindow`: the Person row's
+Try On…, the picture's right-click menu, or Reuse on a Try On record), or a
+Generate picture of a character with item pictures (`plan_dress`, then
+`Studio._dress` before the face pass). A Try On job is an ordinary `Job` with
+`settings["mode"] == "dress"` and the outfit in `settings["outfit"]`
+(`settings["dress"]` is Generate's on/off switch); it has a queue row, a
+history record (`dress_record`) and Generate Again like any other.
+
+- **The recipe is `comfy_workflows/qwen_dress.json` plus code.** The file holds
+  the loaders (Qwen-Image-Edit 2509 fp8, its 7B encoder, VAE, the Lightning
+  4-step LoRA) and two model chains: plain (node 6) and with kingroka's Clothes
+  Try On LoRA (node 9, `clothes_tryon_qwen-edit-lora.safetensors`, strength 1.5
+  as its page says; CivitAI 1940532, SHA-256 `741606…528f`). `built_by` marks
+  it as finished in code (`dress_graph`, `dress_head_graph`), so it is not
+  offered as a model's workflow and the fill test skips it. 6 steps at CFG 1
+  (the author uses 6-8 on 4-step Lightning).
+- **The clothes go on as the LoRA was trained**: one picture, every garment in
+  a column on white on the left (`ResizeAndPadImage`, `ImageStitch`), the person
+  on the right, the whole canvas 1 MP, and its own prompt, word for word ("put
+  the clothes on the left onto the person on the right."). The person's half
+  is cut back out with `ImageCrop` at exactly the size it went in: **the
+  canvas is sampled at the size it is built at, never resampled**. Scaled to
+  1 MP in between, the cut landed a few pixels off and left a white edge. At
+  2 MP (`tryon_megapixels`) the person drifted left and went soft; 1 is right.
+  The LoRA follows the body well: long sleeves over a t-shirt, ripped jeans,
+  a trucker jacket's pockets and buttons (5090, 2026-09-25).
+- **The LoRA does not do shoes, hats or accessories** (its author says so, and a
+  column of glasses and a necklace was ignored). Hair and accessories are
+  Qwen's own multi-picture edit: the person as picture 1, what to put on as
+  pictures 2 and 3, two accessories to a pass. **The wording decides whether
+  anything happens.** Any "keep the face, pose and background the same" or
+  "same framing" clause, and the edit was not made, seed after seed. "The
+  person in picture 1 now has the hair of the person in picture 2" and "The
+  person in picture 1 wears the glasses from picture 2 and the gold necklace
+  from picture 3" were made. Say "picture", as `TextEncodeQwenImageEditPlus`
+  labels them. Hair as words alone is "Change the person's hair to …".
+- **Hair and head accessories are drawn on a head crop.** On a full-length
+  picture the accessory pass was a coin toss: no change, the right edit, or a
+  head-and-shoulders portrait with a new face, by seed. So the first run
+  (`dress_graph` with `find_head`) draws the clothes and the body's
+  accessories (a watch, a belt, a bag: anything `HEAD_WORDS` does not name),
+  ends in a preview, and SAM3 finds the faces. The second run
+  (`dress_head_graph`) crops `head_region` around the largest one, enlarges it
+  to 1 MP, draws the hair and head accessories there, and blends back only
+  the person (SAM3's "person" before and after, grown `PERSON_GROW`, softened,
+  times a soft rectangle). Through the rectangle alone the crop's redrawn
+  background showed as a pale box behind the head. A head crop over
+  `HEAD_SHARE` of the picture (a portrait) is the whole picture. Without SAM3
+  on the backend it is one run on the whole picture, and the record says so.
+  The 5090 has had `sam3.1_multiplex_fp16.safetensors` (Comfy-Org, 1.75 GB,
+  in `D:\ComfyUI-models\checkpoints`) since 2026-09-25, which the face pass
+  there needs too.
+- **Measured on the 5090 (832x1216)**: the clothes alone 15 s; clothes, hair,
+  glasses and a necklace 72-74 s (a SAM3 load is ~20 s of it); a FLUX picture
+  dressed the same way 60 s end to end. Dressing redraws the person at ~1 MP
+  and scales back, so a refined picture loses some of its refine; the face
+  pass runs after dressing, on the dressed picture. Fidelity is best on a
+  picture of a person in plain clothes. On a FLUX picture whose words already
+  named the clothes, the result was looser (a tartan for a buffalo check,
+  black frames for tortoiseshell).
+- The try-on LoRA and SAM3 are on the 5090; the 3090 has the edit model, the
+  Lightning LoRA and SAM3 but not the try-on LoRA, so `dress_route` sends a Try
+  On with clothes to the 5090 (the primary first either way) and names the
+  missing file when nothing can take it.
 
 ### The app the user connects by hand: `BridgeSpec`
 

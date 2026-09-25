@@ -45,7 +45,7 @@ import uuid
 import studio_doctor as doctor
 from studio_comfy_mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, ComfyError,
                               Unreachable, _explain, head_square, outputs_of, oval_png,
-                              status_messages)
+                              preview_of, status_messages)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS_DIR = os.path.join(HERE, "comfy_workflows")
@@ -1091,11 +1091,13 @@ def _is_link(x):
     return isinstance(x, list) and len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], int)
 
 
-def add_face_finder(graph, sam3):
-    """Into a filled graph: SAM3's face boxes and the picture's size for its
-    SaveImage's picture, as PreviewAny text (read by `face_boxes`)."""
-    save = next(nid for nid, n in graph.items() if n["class_type"] == "SaveImage")
-    pixels = graph[save]["inputs"]["images"]
+def add_face_finder(graph, sam3, pixels=None):
+    """Into a filled graph: SAM3's face boxes and the picture's size for
+    `pixels` (by default its SaveImage's picture), as PreviewAny text (read
+    by `face_boxes`)."""
+    if pixels is None:
+        save = next(nid for nid, n in graph.items() if n["class_type"] == "SaveImage")
+        pixels = graph[save]["inputs"]["images"]
     graph["fd1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}}
     graph["fd2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "face:8",
                                                                "clip": ["fd1", 1]}}
@@ -1192,6 +1194,432 @@ def face_graph(wf, values, loras, image, crops, oval, prefix):
     return g
 
 
+# ================================================================ dressing
+# Try On: a person dressed from pictures - the clothes, the hair, the
+# accessories. Each is a Qwen-Image-Edit 2509 pass, one after another in one
+# run (`dress_graph`), on the loaders and model chains of qwen_dress.json.
+# The clothes pass is kingroka's Clothes Try On LoRA as it was trained: one
+# picture with the clothes on the left and the person on the right, and its
+# own sentence as the prompt; the person's half is cut back out after. The
+# LoRA does not do shoes, hats or accessories reliably (its author says so),
+# so hair and accessories are Qwen's own multi-picture edit instead: the
+# person as picture 1, what to put on them as pictures 2 and 3 (the words
+# TextEncodeQwenImageEditPlus labels them with; "image 1" changed nothing).
+DRESS_WORKFLOW = "qwen_dress"
+TRYON_PROMPT = "put the clothes on the left onto the person on the right."
+DRESS_KEEP = ("Keep the person's face, expression, pose, body and the background exactly "
+              "as they are in picture 1")
+CLOTHES_SLOTS = ("top", "bottom", "outerwear", "footwear")
+HAIR_ITEM = "hair"                    # the item_refs key of a character's hair picture
+ACCESSORIES_PER_PASS = 2              # pictures 2 and 3; picture 1 is the person
+HEAD_SHARE = 0.6                      # a head crop bigger than this share is the whole picture
+PERSON_GROW = 6                       # px the person's mask grows before its edge is softened
+PERSON_SOFT = (15, 5.0)               # ImageBlur radius and sigma of that edge
+DRESS_NODES = {"UNETLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly",
+               "ModelSamplingAuraFlow", "CFGNorm", "LoadImage", "ImageScale",
+               "ResizeAndPadImage", "ImageStitch", "ImageCrop", "ImageCropV2",
+               "ImageToMask", "ImageCompositeMasked", "PreviewImage",
+               # the head crop's finder and person mask (only with a SAM3 checkpoint)
+               "CheckpointLoaderSimple", "CLIPTextEncode", "SAM3_Detect", "PreviewAny",
+               "GetImageSize", "MaskComposite", "GrowMask", "MaskToImage", "ImageBlur",
+               "TextEncodeQwenImageEditPlus", "ConditioningZeroOut", "VAEEncode", "KSampler",
+               "VAEDecode", "SaveImage"}
+
+
+def picture_size(data):
+    """(width, height) of PNG, JPEG, WebP, GIF or BMP bytes, from the header
+    alone; None for anything else. The dress pass lays the person out at
+    their own shape, and stdlib has no image library to ask."""
+    import struct
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return struct.unpack("<HH", data[6:10])
+    if data[:2] == b"BM" and len(data) >= 26:
+        w, h = struct.unpack("<ii", data[18:26])
+        return w, abs(h)
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        kind = data[12:16]
+        if kind == b"VP8 " and len(data) >= 30:
+            w, h = struct.unpack("<HH", data[26:30])
+            return w & 0x3FFF, h & 0x3FFF
+        if kind == b"VP8L" and len(data) >= 25:
+            b = data[21:25]
+            return (1 + (((b[1] & 0x3F) << 8) | b[0]),
+                    1 + (((b[3] & 0xF) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6)))
+        if kind == b"VP8X" and len(data) >= 30:
+            return (1 + int.from_bytes(data[24:27], "little"),
+                    1 + int.from_bytes(data[27:30], "little"))
+        return None
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7 or marker == 0xFF:
+                i += 1 if marker == 0xFF else 2
+                continue
+            length = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            i += 2 + length
+    return None
+
+
+def file_size_of(path):
+    """picture_size of a file on this PC, reading at most its first 256 KB
+    (a JPEG's frame header can sit behind a large EXIF block)."""
+    try:
+        with open(path, "rb") as f:
+            return picture_size(f.read(262144))
+    except OSError:
+        return None
+
+
+def _item(d):
+    if isinstance(d, dict) and _str(d.get("path")):
+        return {"name": _str(d.get("name")) or os.path.splitext(
+            os.path.basename(d["path"]))[0].replace("_", " "), "path": _str(d["path"])}
+    return None
+
+
+def clean_outfit(d):
+    """What to dress a person in: {"clothes": [{"name", "path"}], "hair":
+    {"path", "words"} | None, "accessories": [{"name", "path"}]}, junk
+    dropped. Hair may be words alone; clothes and accessories are pictures."""
+    d = d if isinstance(d, dict) else {}
+    hair = d.get("hair") if isinstance(d.get("hair"), dict) else {}
+    hair = {"path": _str(hair.get("path")), "words": _str(hair.get("words"))}
+    return {"clothes": [x for x in map(_item, d.get("clothes") or []) if x],
+            "hair": hair if hair["path"] or hair["words"] else None,
+            "accessories": [x for x in map(_item, d.get("accessories") or []) if x]}
+
+
+def outfit_of(settings):
+    """The outfit a Generate job is dressed in: the character's pictures of
+    what the form has them wearing today - garments in the Clothes slots,
+    the rest as accessories - and the hair picture, when it has one."""
+    refs = {k.lower(): (k, x) for k, x in clean_item_refs(settings.get("item_refs")).items()}
+    out = {"clothes": [], "hair": None, "accessories": []}
+    for k in ITEM_SLOTS:
+        items = split_many(_field(settings, k)) if SLOTS[k][4] else [_field(settings, k)]
+        for name in items:
+            if name and name.lower() in refs:
+                out["clothes" if k in CLOTHES_SLOTS else "accessories"].append(
+                    {"name": refs[name.lower()][0], "path": refs[name.lower()][1]})
+    if HAIR_ITEM in refs:
+        out["hair"] = {"path": refs[HAIR_ITEM][1], "words": ""}
+    return out
+
+
+def outfit_pictures(outfit):
+    """Every picture an outfit uses, in pass order."""
+    return ([c["path"] for c in outfit["clothes"]]
+            + ([outfit["hair"]["path"]] if outfit["hair"] and outfit["hair"]["path"] else [])
+            + [a["path"] for a in outfit["accessories"]])
+
+
+def outfit_text(outfit):
+    """The outfit in words, for a job row and the record."""
+    bits = [c["name"] for c in outfit["clothes"]]
+    if outfit["hair"]:
+        bits.append(outfit["hair"]["words"] or "the hair in the picture")
+    bits += [a["name"] for a in outfit["accessories"]]
+    return _and(bits)
+
+
+# Accessories worn on the head, neck or face: drawn in the head crop. Any
+# other (a watch, a belt, a bag) is drawn on the whole picture.
+HEAD_WORDS = re.compile(
+    r"\b(glasses|sunglasses|spectacles|goggles|earrings?|necklace|pendant|chain|choker|"
+    r"caps?|hats?|beanie|fedora|beret|helmet|hood|headscarf|scarf|bandana|headband|"
+    r"tiara|crown|ties?|bow tie|headphones|earbuds|mask|collar|piercing)\b", re.I)
+
+
+def on_head(name):
+    return bool(HEAD_WORDS.search(name or ""))
+
+
+def _accessory_passes(items, where):
+    out = []
+    for i in range(0, len(items), ACCESSORIES_PER_PASS):
+        group = items[i:i + ACCESSORIES_PER_PASS]
+        out.append({"kind": "accessories", "where": where, "items": group,
+                    "prompt": "The person in picture 1 wears %s." % _and(
+                        ["the %s from picture %d" % (a["name"], n + 2)
+                         for n, a in enumerate(group)])})
+    return out
+
+
+def dress_passes(outfit):
+    """The edits, in order: every garment at once (the try-on LoRA), the
+    accessories worn below the head, then the hair and the head's
+    accessories, two to a pass. Each is marked `where` it is drawn: "body"
+    (the whole picture) or "head" (the head crop, when there is one).
+
+    The wording was found live (2026-09-25): "Give the person in picture 1
+    the hairstyle shown in picture 2. Keep the face, pose, ... exactly as
+    they are" changed nothing, seed after seed - any "keep it the same" or
+    "same framing" clause and the edit was not made. "The person in picture
+    1 now has the hair of the person in picture 2" and "...wears the glasses
+    from picture 2" were made."""
+    passes = []
+    if outfit["clothes"]:
+        passes.append({"kind": "clothes", "where": "body", "items": list(outfit["clothes"]),
+                       "prompt": TRYON_PROMPT})
+    acc = outfit["accessories"]
+    passes += _accessory_passes([a for a in acc if not on_head(a["name"])], "body")
+    hair = outfit["hair"]
+    if hair and hair["path"]:
+        passes.append({"kind": "hair", "where": "head",
+                       "items": [{"name": "hair", "path": hair["path"]}],
+                       "prompt": "The person in picture 1 now has the hair of the person in "
+                                 "picture 2%s." % (": " + hair["words"] if hair["words"]
+                                                   else "")})
+    elif hair and hair["words"]:
+        passes.append({"kind": "hair", "where": "head", "items": [],
+                       "prompt": "Change the person's hair to %s." % hair["words"]})
+    passes += _accessory_passes([a for a in acc if on_head(a["name"])], "head")
+    return passes
+
+
+def panel_size(width, height, megapixels):
+    """The person's shape at `megapixels`, each side a multiple of 16."""
+    scale = (megapixels * 1e6 / float(width * height)) ** 0.5
+    return (max(256, int(round(width * scale / 16.0)) * 16),
+            max(256, int(round(height * scale / 16.0)) * 16))
+
+
+def head_region(box, width, height, share=None):
+    """The head-and-shoulders box around a face (x, y, w, h) in a picture of
+    width x height: hair and a hat above it, earrings beside it, a necklace
+    or a tie below it. None when that is most of the picture already (a
+    portrait): then the whole picture is the head's."""
+    x, y, w, h = box
+    side = max(w, h)
+    x0, x1 = x + w / 2.0 - 1.7 * side, x + w / 2.0 + 1.7 * side
+    y0, y1 = y - 1.1 * side, y + h + 2.6 * side
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(width, int(x1)), min(height, int(y1))
+    cw, ch = (x1 - x0) // 16 * 16, (y1 - y0) // 16 * 16
+    if cw < 64 or ch < 64 or cw * ch > (share or HEAD_SHARE) * width * height:
+        return None
+    return {"x": x0, "y": y0, "width": cw, "height": ch}
+
+
+def soft_rect_png(size=256, feather=0.14):
+    """A white rectangle on black fading to black over `feather` of each
+    side, as a greyscale PNG: the head crop is blended back through it, so
+    its edge never shows as a seam."""
+    rows = []
+    for yy in range(size):
+        row = bytearray([0])
+        for xx in range(size):
+            e = min(xx + 0.5, size - xx - 0.5, yy + 0.5, size - yy - 0.5) / (feather * size)
+            t = min(max(e, 0.0), 1.0)
+            row.append(int(round(t * t * (3 - 2 * t) * 255)))
+        rows.append(bytes(row))
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
+
+
+def _dress_start(wf, values, passes):
+    """The loaders and model chains, filled; the try-on chain only when a
+    pass puts clothes on. -> (graph, values with the defaults)."""
+    clothes = any(p["kind"] == "clothes" for p in passes)
+    g = fill(wf, dict(values, clothes=clothes))
+    return g, dict(wf.get("defaults") or {}, **{k: x for k, x in values.items()
+                                                  if x is not None})
+
+
+def _dress_pass(g, d, ps, last, size, v, pictures, seed):
+    """One pass into `g` under ids `d`*, on `last` (pixels of `size`).
+    Sampled at the size it is drawn at, ~1 MP (what TextEncodeQwenImageEdit-
+    Plus scales its reference to), each side a multiple of 16, so nothing is
+    resampled between the canvas and the latent and the person's half is cut
+    back out exactly; resampled, the cut landed a few pixels off and left a
+    white edge (2026-09-25). -> the link to the result, at `size`."""
+    clip, vae = ["2", 0], ["3", 0]
+    mp = float(v["panel_megapixels"])
+    loads = []
+    for i, item in enumerate(ps["items"]):
+        g[d + "i%d" % i] = {"class_type": "LoadImage", "inputs": {"image": pictures[item["path"]]}}
+        loads.append([d + "i%d" % i, 0])
+    if ps["kind"] == "clothes":
+        # The garments in a column as tall as the person, each fitted into
+        # its share on white, and the column left of the person: the
+        # picture the try-on LoRA was trained on, at 1 MP in all.
+        cw, ch = panel_size(size[0], size[1], float(v["tryon_megapixels"]) / 2)
+        g[d + "p"] = {"class_type": "ImageScale", "inputs": {
+            "image": last, "upscale_method": "lanczos", "width": cw, "height": ch,
+            "crop": "disabled"}}
+        k, column = len(loads), None
+        for i, link in enumerate(loads):
+            share = ch // k if i < k - 1 else ch - (ch // k) * (k - 1)
+            g[d + "f%d" % i] = {"class_type": "ResizeAndPadImage", "inputs": {
+                "image": link, "target_width": cw, "target_height": share,
+                "padding_color": "white", "interpolation": "lanczos"}}
+            if column is None:
+                column = [d + "f%d" % i, 0]
+            else:
+                g[d + "s%d" % i] = {"class_type": "ImageStitch", "inputs": {
+                    "image1": column, "image2": [d + "f%d" % i, 0], "direction": "down",
+                    "match_image_size": False, "spacing_width": 0, "spacing_color": "white"}}
+                column = [d + "s%d" % i, 0]
+        g[d + "in"] = {"class_type": "ImageStitch", "inputs": {
+            "image1": column, "image2": [d + "p", 0], "direction": "right",
+            "match_image_size": False, "spacing_width": 0, "spacing_color": "white"}}
+        model, images = ["9", 0], {"image1": [d + "in", 0]}
+    else:
+        pw, ph = panel_size(size[0], size[1], mp)
+        g[d + "in"] = {"class_type": "ImageScale", "inputs": {
+            "image": last, "upscale_method": "lanczos", "width": pw, "height": ph,
+            "crop": "disabled"}}
+        model = ["6", 0]
+        images = {"image%d" % (i + 1): link for i, link in enumerate([[d + "in", 0]] + loads)}
+    g[d + "pos"] = {"class_type": "TextEncodeQwenImageEditPlus", "inputs": dict(
+        images, clip=clip, vae=vae, prompt=ps["prompt"])}
+    g[d + "neg"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": [d + "pos", 0]}}
+    g[d + "enc"] = {"class_type": "VAEEncode", "inputs": {"pixels": [d + "in", 0], "vae": vae}}
+    g[d + "ks"] = {"class_type": "KSampler", "inputs": {
+        "seed": seed % (MAX_SEED + 1), "steps": v["steps"], "cfg": 1.0,
+        "sampler_name": v["sampler"], "scheduler": v["scheduler"], "denoise": 1.0,
+        "model": model, "positive": [d + "pos", 0], "negative": [d + "neg", 0],
+        "latent_image": [d + "enc", 0]}}
+    g[d + "dec"] = {"class_type": "VAEDecode", "inputs": {"samples": [d + "ks", 0], "vae": vae}}
+    out = [d + "dec", 0]
+    if ps["kind"] == "clothes":
+        g[d + "cut"] = {"class_type": "ImageCrop", "inputs": {
+            "image": out, "width": cw, "height": ch, "x": cw, "y": 0}}
+        out = [d + "cut", 0]
+    g[d + "out"] = {"class_type": "ImageScale", "inputs": {
+        "image": out, "upscale_method": "lanczos", "width": int(size[0]),
+        "height": int(size[1]), "crop": "disabled"}}
+    return [d + "out", 0]
+
+
+def _dress_save(g, last, size, prefix):
+    g["dz"] = {"class_type": "ImageScale", "inputs": {
+        "image": last, "upscale_method": "lanczos", "width": int(size[0]),
+        "height": int(size[1]), "crop": "disabled"}}
+    g["ds"] = {"class_type": "SaveImage", "inputs": {"images": ["dz", 0],
+                                                     "filename_prefix": prefix}}
+    return g
+
+
+def dress_graph(wf, values, passes, person, size, pictures, prefix, find_head=None):
+    """The first run: `person` (a LoadImage name) of `size` (w, h), scaled
+    to the working size (`panel_megapixels`), with each of `passes` drawn in
+    order on the whole picture. With `find_head` (a SAM3 checkpoint) it
+    ends in a preview of the working picture plus SAM3's face boxes, for
+    dress_head_graph to crop from; else in the result scaled back to `size`
+    and saved under `prefix`. `pictures` maps each item's path to its
+    LoadImage name; pass n is seeded seed+n."""
+    g, v = _dress_start(wf, values, passes)
+    work = panel_size(size[0], size[1], float(v["panel_megapixels"]))
+    g["p0"] = {"class_type": "LoadImage", "inputs": {"image": person}}
+    g["p1"] = {"class_type": "ImageScale", "inputs": {
+        "image": ["p0", 0], "upscale_method": "lanczos", "width": work[0], "height": work[1],
+        "crop": "center"}}
+    last = ["p1", 0]
+    for n, ps in enumerate(passes):
+        last = _dress_pass(g, "d%d_" % (n + 1), ps, last, work, v, pictures, int(v["seed"]) + n)
+    if not find_head:
+        return _dress_save(g, last, size, prefix)
+    g["dp"] = {"class_type": "PreviewImage", "inputs": {"images": last}}
+    return add_face_finder(g, find_head, pixels=last)
+
+
+def dress_head_graph(wf, values, passes, image, work, crop, mask, size, pictures, prefix,
+                     first=0, sam3=None):
+    """The second run: `image` (the first run's preview, `work` sized) with
+    `passes` drawn on `crop` of it - enlarged to the working size, dressed,
+    shrunk back and blended in through `mask` (a LoadImage name of a soft
+    rectangle) - or on the whole of it when `crop` is None; then scaled to
+    `size` and saved. Pass n is seeded seed+first+n, after the first run's.
+
+    With `sam3`, only the person is blended back: SAM3's "person" in the
+    crop before and after the edit, grown and softened, times the soft
+    rectangle. The edit redraws the crop's background a shade off (lighter,
+    on the first live run), and through the rectangle alone that showed as
+    a pale box behind the head; the background now keeps its own pixels."""
+    g, v = _dress_start(wf, values, passes)
+    g["hi"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+    if crop is None:
+        last = ["hi", 0]
+        for n, ps in enumerate(passes):
+            last = _dress_pass(g, "h%d_" % (n + 1), ps, last, work, v, pictures,
+                               int(v["seed"]) + first + n)
+        return _dress_save(g, last, size, prefix)
+    side = (crop["width"], crop["height"])
+    g["hc"] = {"class_type": "ImageCropV2", "inputs": {"image": ["hi", 0], "crop_region": crop}}
+    last = ["hc", 0]
+    for n, ps in enumerate(passes):
+        last = _dress_pass(g, "h%d_" % (n + 1), ps, last, side, v, pictures,
+                           int(v["seed"]) + first + n)
+    g["hm"] = {"class_type": "LoadImage", "inputs": {"image": mask}}
+    g["hs"] = {"class_type": "ImageScale", "inputs": {
+        "image": ["hm", 0], "upscale_method": "bilinear", "width": side[0], "height": side[1],
+        "crop": "disabled"}}
+    g["hk"] = {"class_type": "ImageToMask", "inputs": {"image": ["hs", 0], "channel": "red"}}
+    blend = ["hk", 0]
+    if sam3:
+        g["hl"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}}
+        g["ht"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "person:4",
+                                                              "clip": ["hl", 1]}}
+        for nid, src in (("hp1", ["hc", 0]), ("hp2", last)):
+            g[nid] = {"class_type": "SAM3_Detect", "inputs": {
+                "model": ["hl", 0], "image": src, "conditioning": ["ht", 0],
+                "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+        g["hp3"] = {"class_type": "MaskComposite", "inputs": {
+            "destination": ["hp1", 0], "source": ["hp2", 0], "x": 0, "y": 0, "operation": "or"}}
+        g["hp4"] = {"class_type": "GrowMask", "inputs": {
+            "mask": ["hp3", 0], "expand": PERSON_GROW, "tapered_corners": True}}
+        g["hp5"] = {"class_type": "MaskToImage", "inputs": {"mask": ["hp4", 0]}}
+        g["hp6"] = {"class_type": "ImageBlur", "inputs": {
+            "image": ["hp5", 0], "blur_radius": PERSON_SOFT[0], "sigma": PERSON_SOFT[1]}}
+        g["hp7"] = {"class_type": "ImageToMask", "inputs": {"image": ["hp6", 0],
+                                                             "channel": "red"}}
+        g["hp8"] = {"class_type": "MaskComposite", "inputs": {
+            "destination": ["hp7", 0], "source": ["hk", 0], "x": 0, "y": 0,
+            "operation": "multiply"}}
+        blend = ["hp8", 0]
+    g["hb"] = {"class_type": "ImageCompositeMasked", "inputs": {
+        "destination": ["hi", 0], "source": last, "x": crop["x"], "y": crop["y"],
+        "resize_source": False, "mask": blend}}
+    return _dress_save(g, ["hb", 0], size, prefix)
+
+
+def dress_values(wf, backend, steps=None):
+    """The dress workflow's values on `backend` (its encoder device)."""
+    v = dict(wf.get("defaults") or {})
+    v["encoder_device"] = "cpu" if backend.get("encoder_on_cpu") else "default"
+    if steps:
+        v["steps"] = int(steps)
+    return v
+
+
+def dress_lacks(wf, outfit, inventory, nodes):
+    """What a backend lacks to dress in `outfit`: lacks() without the try-on
+    LoRA when there are no clothes to put on, and DRESS_NODES."""
+    skip = set() if outfit["clothes"] else {"tryon"}
+    out = lacks(wf, wf.get("defaults") or {}, inventory, None, skip=skip)
+    if nodes is not None:
+        out += [{"kind": "node", "name": n, "folder": "", "var": "",
+                 "text": "the node %s (a newer ComfyUI has it)" % n}
+                for n in sorted(DRESS_NODES - set(nodes))]
+    return out
+
+
 FOLDER_WORDS = {"diffusion_models": "diffusion model", "checkpoints": "checkpoint",
                 "text_encoders": "text encoder", "vae": "VAE", "loras": "LoRA",
                 "clip_vision": "CLIP vision model", "style_models": "style model",
@@ -1257,7 +1685,7 @@ def default_settings():
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "face_detail": None, "batch": 1, "pose": None,
+            "face_detail": None, "batch": 1, "pose": None, "dress": True,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -1543,6 +1971,8 @@ def has_person(settings, named=False):
 
 def summary(settings):
     """One line for a job row before its prompt is composed."""
+    if settings.get("mode") == "dress":
+        return "Try On: " + outfit_text(clean_outfit(settings.get("outfit")))
     return ". ".join(x for x in (_field(settings, "scene"), person_text(settings),
                                  _field(settings, "camera")) if x)
 
@@ -1573,6 +2003,39 @@ class Plan:
         self.family = ""
         self.lora_meta = []          # [{"name", "file", "strength", "category"}]
         self.references = {}         # kind -> local path actually used
+        self.dress = None            # the outfit the picture is dressed in after, if any
+
+
+def plan_dress(p, s, backend, inventory, nodes, workflow_loader):
+    """Into `p`: the outfit to dress a Generate picture in afterwards - the
+    character's pictures of what it wears today (outfit_of) - when the
+    setting is on and `backend` can. -> the names it puts on (lower case),
+    which then need no other word."""
+    outfit = outfit_of(s)
+    items = outfit["clothes"] + outfit["accessories"]
+    if not (items or outfit["hair"]):
+        return set()
+    names = _and([i["name"] for i in items] + (["hair"] if outfit["hair"] else []))
+    if s.get("dress") is False:
+        p.notes.append("Try On is off: the pictures of the %s are not used." % names)
+        return set()
+    missing = [x for x in outfit_pictures(outfit) if not os.path.isfile(x)]
+    if missing:
+        p.warnings.append("Not on this PC any more, so not put on: %s." % ", ".join(missing))
+        return set()
+    try:
+        wf = workflow_loader(DRESS_WORKFLOW)
+    except TemplateError as e:
+        p.warnings.append("The %s are not put on: %s" % (names, e))
+        return set()
+    short = dress_lacks(wf, outfit, inventory, nodes)
+    if short:
+        p.warnings.append("The %s are not put on: %s lacks %s." % (
+            names, backend["name"], "; ".join(m["text"] for m in short)))
+        return set()
+    p.dress = outfit
+    p.notes.append("Then dressed from pictures: %s." % names)
+    return {i["name"].lower() for i in items} | ({HAIR_ITEM} if outfit["hair"] else set())
 
 
 def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow,
@@ -1789,10 +2252,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     # a workflow that declares an "item" reference takes one, a picture per
     # input; the item's name is in the prompt either way.
     worn = {x.lower() for x in items_worn(s)}
+    dressed = plan_dress(p, s, backend, inventory, nodes, workflow_loader)
     unused = []
     for name, path in clean_item_refs(s.get("item_refs")).items():
-        if name.lower() not in worn:
-            continue                  # a picture of something not worn today
+        if name.lower() not in worn or name.lower() in dressed:
+            continue                  # not worn today, or put on by the dress pass
         var = slots.get("item")
         if not var or var in p.images:
             unused.append(name)
@@ -1965,6 +2429,7 @@ class Job:
         self.graph = None             # the graph as submitted
         self.face_graph = None        # the face pass's graph, when it ran
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
+        self.dress = None             # {"outfit", "passes", "head_crop", ...} when dressed
         self.notes = []               # things said on the way (no live progress, ...)
         self.cancel = threading.Event()
 
@@ -2414,6 +2879,8 @@ class Studio:
         """Queue the form's settings: one job per picture in the batch, each
         with its own seed so each picture's record says exactly how it was
         made. Routing does network I/O: call off the UI thread. -> [Job]."""
+        if settings.get("mode") == "dress":
+            return self.submit_dress(settings)
         s = copy.deepcopy(settings)
         count = max(1, min(int(s.get("batch") or 1), 64))
         seed = int(s.get("seed", -1))
@@ -2453,6 +2920,8 @@ class Studio:
         h = self.check(b, full=b["id"] not in self.inventories)
         if not h["ok"]:
             return self.queue._finish(job, "failed", h["detail"])
+        if job.settings.get("mode") == "dress":
+            return self.run_dress(job, client, say)
         plan = compose(job.settings, self.lib, b, self.inventories.get(b["id"]),
                        self.workflow_loader, self.nodes.get(b["id"]))
         job.plan = plan
@@ -2489,7 +2958,7 @@ class Studio:
                 plan.warnings.append("%s's ComfyUI lacks %s; the picture is made without the "
                                      "face pass." % (b["name"], ", ".join(sorted(FACE_NODES
                                                                                  - types))))
-            else:
+            elif not plan.dress:          # else it looks at the dressed picture
                 add_face_finder(graph, values["sam3"])
         if lacking:
             return self.queue._finish(job, "failed", "%s's ComfyUI lacks the node(s) %s that "
@@ -2532,6 +3001,23 @@ class Studio:
             return self.queue._finish(job, "failed", "; ".join(errors) or
                                       "The workflow finished on %s without a picture."
                                       % b["name"])
+        if plan.dress and not job.cancel.is_set():
+            f = files[0]
+            try:
+                size = picture_size(client.fetch(f))
+                if size is None:
+                    raise ComfyError("its size could not be read")
+                image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                        f["filename"], f.get("type") or "output")
+                entry, files = self._dress(job, client, plan.dress, image, size, say,
+                                           finder=values.get("sam3") if values.get(
+                                               "face_detail") else None)
+            except (ComfyError, TemplateError, OSError) as e:
+                if job.cancel.is_set():
+                    return self.queue._finish(job, "cancelled")
+                plan.warnings.append("Try On failed (%s); the picture is as made, undressed."
+                                     % e)
+                values["face_detail"] = False     # its finder was in the dress run
         if values.get("face_detail") and not job.cancel.is_set():
             files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
             if graph2 is not None:
@@ -2549,6 +3035,262 @@ class Studio:
         job.progress = 1.0
         self.queue._finish(job, "complete",
                            "; ".join(plan.warnings[:1]) if plan.warnings else "")
+
+    # ------------------------------------------------------------ try on
+    def sam3_on(self, backend):
+        """The SAM3 checkpoint on `backend`, from its last full check, or None."""
+        inv = self.inventories.get(backend["id"]) or {}
+        return next((c for c in sorted(inv.get("checkpoints") or ()) if SAM3 in c.lower()),
+                    None)
+
+    def _dress(self, job, client, outfit, person, size, say, finder=None):
+        """Dress `person` (a LoadImage name on the job's backend) of `size`
+        in `outfit`, on the lane's thread: the body run, then - when there is
+        hair or a head accessory and SAM3 to find the head - the head run on
+        a head-and-shoulders crop. `finder` (a SAM3 checkpoint) puts the
+        face finder on the last run, for the face pass after. Sets job.dress.
+        -> (entry, files) of the last run. Raises ComfyError."""
+        b = job.backend
+        wf = self.workflow_loader(DRESS_WORKFLOW)
+        values = dress_values(wf, b)
+        values["seed"] = int(job.settings.get("seed") or 0)
+        passes = dress_passes(outfit)
+        body = [x for x in passes if x["where"] == "body"]
+        head = [x for x in passes if x["where"] == "head"]
+        sam = self.sam3_on(b) if head else None
+        prefix = "ImageStudio/dress_%s" % job.id
+        job.dress = {"outfit": outfit, "passes": [dict(x, items=[i["name"] for i in x["items"]])
+                                                  for x in passes],
+                     "size": list(size), "head_crop": None, "graphs": []}
+        if head and not sam:
+            job.notes.append("%s has no SAM3 checkpoint to find the head, so the hair and "
+                             "head accessories were drawn on the whole picture; in a "
+                             "full-length picture they may not take." % b["name"])
+        say("uploading", "uploading the outfit's pictures", None)
+        pictures = {}
+        for path in outfit_pictures(outfit):
+            if job.cancel.is_set():
+                raise ComfyError("cancelled")
+            pictures[path] = client.upload_image(path)
+        work = panel_size(size[0], size[1], float(values["panel_megapixels"]))
+        first = body if sam else passes
+        g1 = dress_graph(wf, values, first, person, size, pictures, prefix, find_head=sam)
+        if not sam and finder:
+            add_face_finder(g1, finder)
+        entry = self._dress_run(job, client, g1, first, 0, say)
+        if not sam:
+            return entry, outputs_of(entry)
+        found = face_boxes(entry)
+        image = preview_of(entry, "dp")
+        if image is None:
+            raise ComfyError("the dress run gave no picture to dress the head on")
+        crop = None
+        if found and found[2]:
+            box = max(found[2], key=lambda bx: bx[2] * bx[3])
+            crop = head_region(box, work[0], work[1])
+            job.dress["head_crop"] = crop
+            if crop is None:
+                job.notes.append("Try On: the head fills the picture, so the hair and "
+                                 "head accessories were drawn on all of it.")
+        else:
+            job.notes.append("Try On: no face found, so the hair and head accessories were "
+                             "drawn on the whole picture.")
+        mask = os.path.join(self.lib.root, "dress_mask.png")
+        if not os.path.isfile(mask):
+            os.makedirs(self.lib.root, exist_ok=True)
+            with open(mask, "wb") as fh:
+                fh.write(soft_rect_png())
+        g2 = dress_head_graph(wf, values, head, image, work, crop, client.upload_image(mask),
+                              size, pictures, prefix, first=len(body), sam3=sam)
+        if finder:
+            add_face_finder(g2, finder)
+        entry = self._dress_run(job, client, g2, head, len(body), say)
+        return entry, outputs_of(entry)
+
+    def _dress_run(self, job, client, graph, passes, first, say):
+        """One Try On run, its progress said per pass. -> the /history
+        entry. Raises ComfyError on a failed or cancelled run."""
+        job.dress["graphs"].append(graph)
+        names = {}
+        for n, ps in enumerate(passes):
+            words = {"clothes": "putting on the clothes", "hair": "doing the hair"}.get(
+                ps["kind"]) or "putting on the " + _and([i["name"] for i in ps["items"]])
+            for d in ("d%d_ks" % (n + 1), "h%d_ks" % (n + 1)):
+                names[d] = words
+        status = "sampling" if job.settings.get("mode") == "dress" else "refining"
+
+        def on_event(kind, data):
+            if kind == "executing" and data in names:
+                say(status, "Try On · %s" % names[data], None)
+            elif kind == "progress" and data[1]:
+                value, total, nid = data
+                say(status, "Try On · %s · step %d of %d" % (
+                    names.get(nid, "dressing"), value, total), value / float(total))
+            elif kind == "queued" and job.status in ("queued", "uploading"):
+                say("queued", "queued on %s" % job.backend["name"], None)
+        job.prompt_id = client.queue_workflow(graph)
+        watch = client.watch() if hasattr(client, "watch") else None
+        try:
+            entry = client.listen_for_progress(
+                job.prompt_id, on_event, stop=job.cancel.is_set,
+                **({"watch": watch} if watch is not None else {}))
+        finally:
+            if watch is not None:
+                watch.close()
+        if entry is None:
+            raise ComfyError("cancelled")
+        if not outputs_of(entry) and preview_of(entry, "dp") is None:
+            raise ComfyError("; ".join(run_errors(entry, graph)) or "the run made no picture")
+        return entry
+
+    def dress_route(self, settings):
+        """The backend a Try On job goes to: the one named, else the one it
+        was made on (Generate Again), else the first enabled, up, with
+        everything the outfit needs - the primary (5090) first. No I/O. ->
+        (backend or None, why)."""
+        outfit = clean_outfit(settings.get("outfit"))
+        try:
+            wf = self.workflow_loader(DRESS_WORKFLOW)
+        except TemplateError as e:
+            return None, str(e)
+        if settings.get("backend") not in (None, "", "auto"):
+            order = [self.backend(settings["backend"])]
+        else:
+            order = sorted(self.backends(), key=lambda b: (
+                b["id"] != settings.get("prefer_backend"), "primary" not in b["roles"]))
+        why = []
+        for b in order:
+            if b is None or not b["enabled"]:
+                continue
+            h = self.health.get(b["id"]) or {}
+            if not h.get("ok"):
+                why.append("%s is offline" % b["name"])
+                continue
+            short = dress_lacks(wf, outfit, self.inventories.get(b["id"]),
+                                self.nodes.get(b["id"]))
+            if short:
+                why.append("%s lacks %s" % (b["name"], "; ".join(m["text"] for m in short)))
+                continue
+            return b, "Try On will run on %s." % b["name"]
+        return None, "No backend can dress this: " + ("; ".join(why) or "none is enabled") + "."
+
+    def submit_dress(self, settings):
+        """Queue a Try On job (network I/O: off the UI thread). -> [Job]."""
+        s = copy.deepcopy(settings)
+        s["mode"] = "dress"
+        s["batch"] = 1
+        if int(s.get("seed", -1)) < 0:
+            s["seed"], s["seed_mode"] = random.randint(0, MAX_SEED), "random"
+        else:
+            s["seed_mode"] = "fixed"
+        for b in self.backends():
+            if b["enabled"] and (b["id"] not in self.health or b["id"] not in self.inventories):
+                self.check(b)
+        b, why = self.dress_route(s)
+        if b is None:
+            raise ComfyError(why)
+        job = Job(s, b)
+        self.queue.add(job)
+        return [job]
+
+    def run_dress(self, job, client, say):
+        """A Try On job, start to finish, on its lane's thread."""
+        b, s = job.backend, job.settings
+        d = s.get("outfit") or {}
+        outfit = clean_outfit(d)
+        person = _str(d.get("person"))
+        if not person:
+            problem = "Choose the person to dress."
+        elif not os.path.isfile(person):
+            problem = "The picture of the person (%s) is not on this PC." % person
+        elif not dress_passes(outfit):
+            problem = "Add something to put on: clothes, hair or an accessory."
+        else:
+            gone = [x for x in outfit_pictures(outfit) if not os.path.isfile(x)]
+            problem = "Not on this PC any more: %s." % ", ".join(gone) if gone else ""
+        try:
+            wf = self.workflow_loader(DRESS_WORKFLOW)
+        except TemplateError as e:
+            return self.queue._finish(job, "failed", str(e))
+        short = dress_lacks(wf, outfit, self.inventories.get(b["id"]), self.nodes.get(b["id"]))
+        if short and not problem:
+            problem = "%s lacks %s." % (b["name"], "; ".join(m["text"] for m in short))
+        size = file_size_of(person) if not problem else None
+        if size is None and not problem:
+            problem = "Could not read the size of %s (PNG, JPEG, WebP, GIF or BMP)." % person
+        if problem:
+            return self.queue._finish(job, "failed", problem)
+        cap = b.get("max_megapixels", 4.2) * 1e6
+        if size[0] * size[1] > cap:
+            k = (cap / float(size[0] * size[1])) ** 0.5
+            size = (int(size[0] * k) // 16 * 16, int(size[1] * k) // 16 * 16)
+            job.notes.append("Saved at %dx%d: %s is set to %.1f megapixels at most."
+                             % (size[0], size[1], b["name"], cap / 1e6))
+        if b.get("shares_llm_gpu") and self.make_room is not None:
+            say(detail="clearing LM Studio off the GPU")
+            try:
+                self.make_room(b)
+            except Exception as e:
+                job.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
+        try:
+            say("uploading", "uploading the person", None)
+            entry, files = self._dress(job, client, outfit, client.upload_image(person), size,
+                                       say)
+        except (ComfyError, TemplateError, OSError) as e:
+            if job.cancel.is_set():
+                return self.queue._finish(job, "cancelled")
+            return self.queue._finish(job, "failed", "Try On failed on %s: %s"
+                                      % (b["name"], e))
+        if job.cancel.is_set():
+            return self.queue._finish(job, "cancelled")
+        say("decoding", "fetching the picture from %s" % b["name"], None)
+        try:
+            pictures = [(f["filename"], client.fetch(f)) for f in files]
+        except ComfyError as e:
+            return self.queue._finish(job, "failed", "The picture was made but could not be "
+                                      "fetched from %s: %s" % (b["name"], e))
+        job.record = self.history.add(self.dress_record(job, wf, size), pictures)
+        job.outputs = list(job.record["images"])
+        job.progress = 1.0
+        self.queue._finish(job, "complete")
+
+    def dress_record(self, job, wf, size):
+        """A Try On job's history record, in the fields a Generate record has."""
+        s, b, v = job.settings, job.backend, dress_values(wf, job.backend)
+        now = time.time()
+        loras = [{"id": "", "name": "Lightning 4-step", "file": v["lightning"],
+                  "strength": 1.0, "category": "Detail / Enhancement", "why": "speed"}]
+        if any(x["kind"] == "clothes" for x in job.dress["passes"]):
+            rec = self.lib.lora_by_file(v["tryon"]) or {}
+            loras.append({"id": rec.get("id", ""), "name": rec.get("name") or "Clothes Try On",
+                          "file": v["tryon"], "strength": v["tryon_strength"],
+                          "category": "Clothing", "why": "try on"})
+        outfit = job.dress["outfit"]
+        refs = {"person": (s.get("outfit") or {}).get("person")}
+        refs.update({"item: " + i["name"]: i["path"]
+                     for i in outfit["clothes"] + outfit["accessories"]})
+        if outfit["hair"] and outfit["hair"]["path"]:
+            refs["hair"] = outfit["hair"]["path"]
+        return {
+            "id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + job.id[:6],
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+            "created_ts": now,
+            "prompt": "Try On: " + outfit_text(outfit), "negative": "",
+            "seed": s.get("seed"),
+            "model": {"id": "try-on", "label": wf.get("label", "Try On"), "file": v["model"],
+                      "family": "qwen-image",
+                      "files": {var: v.get(var) for var in (wf.get("files") or {})}},
+            "loras": loras, "identities": [], "style": None, "preset": "dress",
+            "workflow": wf.get("id"), "workflow_label": wf.get("label"),
+            "backend": {"id": b["id"], "name": b["name"], "url": b["url"]},
+            "sampler": v["sampler"], "scheduler": v["scheduler"], "steps": v["steps"],
+            "guidance": None, "width": size[0], "height": size[1], "denoise": 1.0,
+            "refine": None, "face_detail": None, "references": refs,
+            "warnings": [], "notes": list(job.notes),
+            "duration": round(time.time() - job.started, 1),
+            "prompt_id": job.prompt_id, "settings": s,
+            "graph": job.dress["graphs"][-1], "face_graph": None, "dress": job.dress,
+        }
 
     def _face_pass(self, job, client, plan, values, entry, files, say):
         """The second run of the face pass, on the lane's thread. -> (files,
@@ -2719,6 +3461,7 @@ class Studio:
             "settings": s,
             "graph": graph,
             "face_graph": job.face_graph,
+            "dress": job.dress,
         }
 
     def close(self):

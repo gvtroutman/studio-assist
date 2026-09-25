@@ -1,0 +1,50 @@
+{
+  "id": "qwen_dress",
+  "label": "Try On (Qwen-Image-Edit)",
+  "about": "Dresses a person from pictures: clothes, hair and accessories, each a Qwen-Image-Edit 2509 pass at 4-step Lightning speed. The clothes pass puts every garment in a column on the left of the person and runs kingroka's Clothes Try On LoRA with its own prompt; hair and accessories are Qwen's own multi-picture edit, since the LoRA does not do shoes, hats or accessories reliably. This file holds the loaders and both model chains; studio_imagegen.dress_graph adds the passes, one after another (dress_graph, and dress_head_graph for the head crop).",
+  "families": ["qwen-image"],
+  "built_by": "dress_graph",
+  "defaults": {
+    "model": "qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+    "encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "vae": "qwen_image_vae.safetensors",
+    "lightning": "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
+    "tryon": "clothes_tryon_qwen-edit-lora.safetensors",
+    "tryon_strength": 1.5,
+    "shift": 3.0,
+    "steps": 6,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "panel_megapixels": 1.0,
+    "tryon_megapixels": 1.0,
+    "encoder_device": "default",
+    "filename_prefix": "ImageStudio/dress"
+  },
+  "files": {
+    "model": "diffusion_models",
+    "encoder": "text_encoders",
+    "vae": "vae",
+    "lightning": "loras",
+    "tryon": "loras"
+  },
+  "needs": {"clothes": ["tryon"]},
+  "stages": {"loading": ["1", "2", "3", "4", "5", "6", "7", "8", "9"]},
+  "graph": {
+    "1": {"class_type": "UNETLoader",
+          "inputs": {"unet_name": "{{model}}", "weight_dtype": "default"}},
+    "2": {"class_type": "CLIPLoader",
+          "inputs": {"clip_name": "{{encoder}}", "type": "qwen_image",
+                     "device": "{{encoder_device}}"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+    "4": {"class_type": "LoraLoaderModelOnly",
+          "inputs": {"model": ["1", 0], "lora_name": "{{lightning}}", "strength_model": 1.0}},
+    "5": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["4", 0], "shift": "{{shift}}"}},
+    "6": {"class_type": "CFGNorm", "inputs": {"model": ["5", 0], "strength": 1.0}},
+    "7": {"class_type": "LoraLoaderModelOnly", "_when": "clothes",
+          "inputs": {"model": ["4", 0], "lora_name": "{{tryon}}",
+                     "strength_model": "{{tryon_strength}}"}},
+    "8": {"class_type": "ModelSamplingAuraFlow", "_when": "clothes",
+          "inputs": {"model": ["7", 0], "shift": "{{shift}}"}},
+    "9": {"class_type": "CFGNorm", "_when": "clothes", "inputs": {"model": ["8", 0], "strength": 1.0}}
+  }
+}
