@@ -12,6 +12,8 @@ Worker threads never touch a widget: a job's changes arrive as ("images", sid,
 payload) events through the window's pump and land in `handle()`.
 """
 
+import colorsys
+import math
 import os
 import subprocess
 import sys
@@ -742,7 +744,7 @@ class ImageStudio:
             self.refs.pop(kind, None)
         text = os.path.basename(path) if path else "—"
         if kind == "pose" and path and self.pose:
-            text = "stick figure · strength %.2f" % self.pose.get("strength", 0.9)
+            text = "drawn figure · strength %.2f" % self.pose.get("strength", 0.9)
         self.ref_labels[kind].config(text=text)
         self._recheck()
 
@@ -771,7 +773,7 @@ class ImageStudio:
         points = [None if i in hidden else p for i, p in enumerate(self.pose["points"])]
         folder = os.path.join(self.studio.lib.root, "poses")
         try:
-            path = sp.save(points, w, h, folder)
+            path = sp.save(points, w, h, folder, self.pose.get("hands"))
         except OSError as e:
             self.say("Could not write the pose picture in %s: %s" % (folder, e), "err")
             return
@@ -2237,17 +2239,31 @@ class CharacterCreator:
 
 
 class PoseEditor:
-    """The pose, as a stick figure to drag. The figure is OpenPose's 18
-    joints in its own colours, on a frame the shape of the picture. Dragging
-    a joint carries what hangs off it (an elbow brings the wrist), Shift
-    moves the joint alone, dragging the empty frame moves the whole figure
-    and the wheel resizes it. Right-click hides a joint the picture should
-    not show - a hand behind the back, the far ear in profile - or shows it
-    again. Use pose hands it to the form (`use_pose`), which draws the
-    picture the ControlNet reads (studio_pose.render)."""
+    """The pose, as a wooden artist's mannequin to drag: a torso, tapered
+    limbs on ball joints, a head that shows which way it faces, and hands
+    with fingers. Dragging a joint carries what hangs off it (an elbow
+    brings the forearm and hand), Shift moves the joint alone, dragging the
+    empty frame moves the whole figure and the wheel resizes it. A click on
+    a hand gives it its next shape (Relaxed, Open, Fist, ...), as do the menus
+    beside the frame, which also turn a hand palm or back to the viewer.
+    Right-click hides a joint the picture should not show - an arm behind
+    the back, the far ear in profile - or shows it again. The person's right
+    is drawn darker; facing the viewer, it is on the frame's left.
+
+    The mannequin is for the eye. What the ControlNet reads is the skeleton
+    `studio_pose.render` draws from the same points - OpenPose's body, DWPose's
+    face and hands - and "What the model sees" shows it. Use pose hands the
+    pose to the form (`use_pose`)."""
 
     VIEW = 520                    # px on the frame's long edge, before the display's scale
     REACH = 12                    # px from a joint that still picks it up
+    BG = "#1d1f23"
+    WOOD = {"right": "#a8784c", "left": "#d0a271", "torso": "#bf8f60", "head": "#c99a69"}
+    LINE = "#5c3d22"
+    # Limb radii as fractions of the torso's length (neck to hips): (start, end).
+    LIMB_R = {(2, 3): (0.11, 0.085), (3, 4): (0.085, 0.062), (5, 6): (0.11, 0.085),
+              (6, 7): (0.085, 0.062), (8, 9): (0.15, 0.11), (9, 10): (0.11, 0.075),
+              (11, 12): (0.15, 0.11), (12, 13): (0.11, 0.075)}
 
     def __init__(self, owner):
         self.owner = o = owner
@@ -2257,6 +2273,8 @@ class PoseEditor:
         pose = owner.pose
         self.strength = tk.DoubleVar(value=(pose or {}).get("strength", 0.9))
         self.hidden = set()
+        self.hands = sp.clean_hands((pose or {}).get("hands")) or \
+            sp.clean_hands(sp.DEFAULT_HANDS)
         if pose and sp.clean(pose.get("points")):
             pts = sp.refit(pose["points"], (pose.get("width") or w, pose.get("height") or h),
                            (w, h))
@@ -2266,6 +2284,7 @@ class PoseEditor:
             self._preset("standing", draw=False)
         self.undo = []
         self.drag = None
+        self.seeing = tk.StringVar(value="figure")
         k = o.px(self.VIEW) / max(w, h)
         self.vw, self.vh = int(w * k), int(h * k)
 
@@ -2276,10 +2295,16 @@ class PoseEditor:
         win.resizable(False, False)
         left = o.frame(win)
         left.pack(side="left", padx=o.px(12), pady=o.px(12))
-        # Black whatever the theme: the figure is drawn in OpenPose's colours,
-        # which are chosen for black, and this is what the ControlNet sees.
+        tabs = o.frame(left)
+        tabs.pack(side="top", fill="x", pady=(0, o.px(6)))
+        self.view_pills = {}
+        for key, label in (("figure", "Figure"), ("model", "What the model sees")):
+            pill = o.button(tabs, label, lambda k=key: self._see(k),
+                            kind="accent" if key == "figure" else "quiet")
+            pill.pack(side="left", padx=(0, o.px(4)))
+            self.view_pills[key] = pill
         self.cv = tk.Canvas(left, width=self.vw, height=self.vh, bd=0,
-                            highlightthickness=1, cursor="hand2", bg="#000000",
+                            highlightthickness=1, cursor="hand2", bg=self.BG,
                             highlightbackground="#3a3a3a")
         self.cv.pack(side="top")
         self.hover = o.label(left, "%d × %d picture" % (w, h), "faint", host.f_small)
@@ -2293,6 +2318,21 @@ class PoseEditor:
         for i, (key, label, _) in enumerate(sp.PRESETS):
             o.button(grid, label, lambda k=key: self._preset(k)).grid(
                 row=i // 2, column=i % 2, sticky="we", padx=(0, o.px(4)), pady=(0, o.px(4)))
+        o.cap(right, "Hands")
+        self.hand_pills, self.back_pills = {}, {}
+        shapes = [(k, label) for k, label, _ in sp.HAND_SHAPES]
+        for side in ("right", "left"):
+            row = o.frame(right)
+            row.pack(side="top", fill="x", pady=(0, o.px(4)))
+            o.label(row, side.capitalize(), "muted", width=6).pack(side="left")
+            pill = o.choice(row, shapes, self.hands[side]["shape"],
+                            lambda v, s=side: self._shape(s, v))
+            pill.pack(side="left")
+            self.hand_pills[side] = pill
+            back = o.button(row, "", lambda s=side: self._flip(s), kind="ghost")
+            back.pack(side="left", padx=(o.px(4), 0))
+            self.back_pills[side] = back
+        self._label_hands()
         o.cap(right, "Change")
         row = o.frame(right)
         row.pack(side="top", fill="x")
@@ -2304,8 +2344,9 @@ class PoseEditor:
                 "more freely.", "faint", host.f_small, wraplength=o.px(240)).pack(
             side="top", fill="x")
         o.label(right, "Drag a joint to move it and what hangs off it; Shift-drag "
-                "moves it alone. Drag the empty frame to move the figure, scroll to "
-                "resize it. Right-click a joint to hide or show it. Ctrl+Z undoes.",
+                "moves it alone. Click a hand for its next shape. Drag the empty frame "
+                "to move the figure, scroll to resize it. Right-click a joint to hide "
+                "or show it. Ctrl+Z undoes. Right and left are the person's own.",
                 "muted", host.f_small, wraplength=o.px(240)).pack(
             side="top", fill="x", pady=(o.px(12), 0))
         foot = o.frame(right)
@@ -2316,7 +2357,7 @@ class PoseEditor:
 
         self.cv.bind("<ButtonPress-1>", self._press)
         self.cv.bind("<B1-Motion>", self._move)
-        self.cv.bind("<ButtonRelease-1>", lambda ev: setattr(self, "drag", None))
+        self.cv.bind("<ButtonRelease-1>", self._release)
         self.cv.bind("<Button-3>", self._toggle)
         self.cv.bind("<Motion>", self._hover)
         self.cv.bind("<MouseWheel>", self._wheel)
@@ -2337,7 +2378,8 @@ class PoseEditor:
         return out
 
     def _keep(self):
-        self.undo.append(([list(p) for p in self.points], set(self.hidden)))
+        self.undo.append(([list(p) for p in self.points], set(self.hidden),
+                          {s: dict(h) for s, h in self.hands.items()}))
         del self.undo[:-50]
 
     def _preset(self, key, draw=True):
@@ -2352,27 +2394,89 @@ class PoseEditor:
         self._keep()
         self.hidden = {sp.MIRROR.get(i, i) for i in self.hidden}
         self.points = sp.mirror(self.points)
+        self.hands = sp.mirror_hands(self.hands)
+        self._label_hands()
         self._draw()
 
     def _undo(self):
         if self.undo:
-            self.points, self.hidden = self.undo.pop()
+            self.points, self.hidden, self.hands = self.undo.pop()
+            self._label_hands()
             self._draw()
+
+    def _shape(self, side, shape, keep=True):
+        if keep:
+            self._keep()
+        self.hands[side]["shape"] = shape
+        self._label_hands()
+        self._draw()
+
+    def _cycle(self, side):
+        names = sp.HAND_SHAPE_NAMES
+        now = self.hands[side]["shape"]
+        self._shape(side, names[(names.index(now) + 1) % len(names)], keep=False)
+
+    def _flip(self, side):
+        self._keep()
+        self.hands[side]["back"] = not self.hands[side]["back"]
+        self._label_hands()
+        self._draw()
+
+    def _label_hands(self):
+        names = dict((k, label) for k, label, _ in sp.HAND_SHAPES)
+        for side, pill in self.hand_pills.items():
+            pill.set(text=names[self.hands[side]["shape"]] + "  ▾")
+            self.back_pills[side].set(text="Back" if self.hands[side]["back"] else "Palm")
+
+    def _see(self, which):
+        self.seeing.set(which)
+        host = self.owner.host
+        for key, pill in self.view_pills.items():
+            pill.roles = host.PILL_ROLES["accent" if key == which else "quiet"]
+            pill.paint(host.C)
+        self._draw()
 
     # ---------------------------------------------------------------- mouse
     def _near(self, ev):
         return sp.near(self.points, ev.x, ev.y, self.vw, self.vh, self.owner.px(self.REACH))
 
+    def _hand_at(self, ev):
+        """The side whose hand (fingers and palm) is under the pointer."""
+        best, dist = None, None
+        for side, pts in self._hand_points().items():
+            cx = sum(p[0] for p in pts) / len(pts) * self.vw
+            cy = sum(p[1] for p in pts) / len(pts) * self.vh
+            reach = max(math.hypot(p[0] * self.vw - cx, p[1] * self.vh - cy) for p in pts)
+            d = math.hypot(ev.x - cx, ev.y - cy)
+            if d <= reach * 0.9 + self.owner.px(4) and (dist is None or d < dist):
+                best, dist = side, d
+        return best
+
+    def _hand_points(self):
+        return sp.hand_points(self._seen(), self.vw, self.vh, self.hands)
+
+    def _seen(self):
+        return [None if i in self.hidden else p for i, p in enumerate(self.points)]
+
     def _press(self, ev):
         self._keep()
         j = self._near(ev)
+        side = None
         if j is None:
+            side = self._hand_at(ev)
+        if side:
+            moving = sp.carried(sp.HAND_OF[side][0])
+        elif j in (4, 7) and not ev.state & 0x0001:
+            side = "right" if j == 4 else "left"
+            moving = [j]
+        elif j is None:
             moving = list(range(len(self.points)))
         elif ev.state & 0x0001:                 # Shift: the joint alone
             moving = [j]
         else:
             moving = sp.carried(j)
         self.drag = (moving, ev.x, ev.y)
+        self.click = (side, ev.x, ev.y)
 
     def _move(self, ev):
         if not self.drag:
@@ -2385,6 +2489,14 @@ class PoseEditor:
             p[1] = min(1.2, max(-0.2, p[1] + dy))
         self.drag = (moving, ev.x, ev.y)
         self._draw()
+
+    def _release(self, ev):
+        """A click on a hand that did not move it: its next shape."""
+        side, x0, y0 = getattr(self, "click", (None, 0, 0))
+        self.drag, self.click = None, (None, 0, 0)
+        if side and math.hypot(ev.x - x0, ev.y - y0) < self.owner.px(3):
+            self._cycle(side)
+            self._hover(ev)
 
     def _wheel(self, ev):
         self._keep()
@@ -2409,38 +2521,186 @@ class PoseEditor:
 
     def _hover(self, ev):
         j = self._near(ev)
+        side = self._hand_at(ev) if j is None else ("right" if j == 4 else
+                                                    "left" if j == 7 else None)
         w, h = self.size
-        self.hover.config(text="%d × %d picture" % (w, h) if j is None else
-                          sp.JOINTS[j] + (" (hidden)" if j in self.hidden else ""))
+        if side:
+            names = dict((k, label) for k, label, _ in sp.HAND_SHAPES)
+            text = "%s hand: %s - click for the next shape" % (
+                side.capitalize(), names[self.hands[side]["shape"]])
+        elif j is not None:
+            text = sp.JOINTS[j] + (" (hidden)" if j in self.hidden else "")
+        else:
+            text = "%d × %d picture" % (w, h)
+        self.hover.config(text=text)
 
     # ---------------------------------------------------------------- draw
     def _draw(self):
+        self.cv.delete("all")
+        if self.seeing.get() == "model":
+            self.cv.config(bg="#000000")
+            self._draw_skeleton()
+        else:
+            self.cv.config(bg=self.BG)
+            self._draw_figure()
+        self._draw_handles()
+
+    def _limb(self, a, b, ra, rb, fill):
+        """A tapered limb from a to b (view px) with a ball at each end."""
+        cv = self.cv
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        n = math.hypot(dx, dy) or 1e-6
+        nx, ny = -dy / n, dx / n
+        cv.create_polygon(a[0] + nx * ra, a[1] + ny * ra, b[0] + nx * rb, b[1] + ny * rb,
+                          b[0] - nx * rb, b[1] - ny * rb, a[0] - nx * ra, a[1] - ny * ra,
+                          fill=fill, outline=self.LINE)
+        for (x, y), r in ((a, ra), (b, rb)):
+            cv.create_oval(x - r, y - r, x + r, y + r, fill=fill, outline=self.LINE)
+
+    def _draw_figure(self):
+        cv = self.cv
+        seen = self._seen()
+        at = [None if p is None else (p[0] * self.vw, p[1] * self.vh) for p in seen]
+        hips = [at[i] for i in (8, 11) if at[i]]
+        neck = at[1]
+        if neck and hips:
+            mid = (sum(p[0] for p in hips) / len(hips), sum(p[1] for p in hips) / len(hips))
+            torso = math.hypot(mid[0] - neck[0], mid[1] - neck[1])
+        else:
+            mid, torso = None, self.vh * 0.28
+        s = max(torso, self.owner.px(20))
+        wood = self.WOOD
+
+        def limb(a, b, side):
+            if at[a] and at[b]:
+                ra, rb = self.LIMB_R[(a, b)]
+                self._limb(at[a], at[b], ra * s, rb * s, wood[side])
+
+        limb(11, 12, "left")
+        limb(12, 13, "left")
+        limb(8, 9, "right")
+        limb(9, 10, "right")
+        # The torso: shoulders to hips, a little wider than the joints.
+        shoulders = [at[i] for i in (2, 5)]
+        if neck and all(shoulders) and len(hips) == 2:
+            (rx, ry), (lx, ly) = shoulders
+            cx = (rx + lx) / 2
+            out = 0.08 * s
+            pts = [rx - out if rx < cx else rx + out, ry, cx, (ry + ly) / 2 - 0.04 * s,
+                   lx + out if lx > cx else lx - out, ly, at[11][0], at[11][1] - 0.05 * s,
+                   at[11][0], at[11][1] + 0.1 * s, at[8][0], at[8][1] + 0.1 * s,
+                   at[8][0], at[8][1] - 0.05 * s]
+            cv.create_polygon(*pts, smooth=True, fill=wood["torso"], outline=self.LINE)
+        elif neck and mid:
+            self._limb(neck, mid, 0.24 * s, 0.2 * s, wood["torso"])
+        self._draw_head(at, s)
+        limb(5, 6, "left")
+        limb(6, 7, "left")
+        limb(2, 3, "right")
+        limb(3, 4, "right")
+        for side, pts in self._hand_points().items():
+            self._draw_hand([(x * self.vw, y * self.vh) for x, y in pts], s,
+                            wood[side], self.hands[side]["back"])
+
+    def _draw_head(self, at, s):
+        cv = self.cv
+        nose, neck = at[0], at[1]
+        eyes = [at[i] for i in (14, 15) if at[i]]
+        ears = [at[i] for i in (16, 17) if at[i]]
+        if not (nose or eyes):
+            return
+        centre = (eyes if eyes else [nose])
+        cx = sum(p[0] for p in centre) / len(centre)
+        cy = sum(p[1] for p in centre) / len(centre)
+        if len(ears) == 2:
+            rx = math.hypot(ears[0][0] - ears[1][0], ears[0][1] - ears[1][1]) / 2 * 1.15
+        else:
+            rx = 0.2 * s
+        rx = max(rx, 0.12 * s)
+        ry = rx * 1.3
+        # "Up" for the head is away from the neck.
+        ux, uy = (0.0, -1.0)
+        if neck:
+            d = math.hypot(cx - neck[0], cy - neck[1]) or 1e-6
+            ux, uy = (cx - neck[0]) / d, (cy - neck[1]) / d
+            self._limb(neck, (cx - ux * ry * 0.6, cy - uy * ry * 0.6), 0.08 * s, 0.08 * s,
+                       self.WOOD["torso"])
+        px_, py_ = -uy, ux
+        # The eye line sits a little under the middle of the head.
+        hx, hy = cx + ux * ry * 0.12, cy + uy * ry * 0.12
+        pts = []
+        for i in range(28):
+            t = 2 * math.pi * i / 28
+            pts += [hx + px_ * rx * math.cos(t) + ux * ry * math.sin(t),
+                    hy + py_ * rx * math.cos(t) + uy * ry * math.sin(t)]
+        cv.create_polygon(*pts, smooth=True, fill=self.WOOD["head"], outline=self.LINE)
+        dot = max(2, s * 0.025)
+        for x, y in eyes:
+            cv.create_oval(x - dot, y - dot, x + dot, y + dot, fill=self.LINE, outline="")
+        if nose:
+            cv.create_oval(nose[0] - dot * 1.3, nose[1] - dot * 1.3, nose[0] + dot * 1.3,
+                           nose[1] + dot * 1.3, fill="#8a5a33", outline=self.LINE)
+
+    def _draw_hand(self, pts, s, fill, back):
+        cv = self.cv
+        palm = [pts[i] for i in (0, 1, 5, 9, 13, 17)]
+        cv.create_polygon(*[c for p in palm for c in p], smooth=True, fill=fill,
+                          outline=self.LINE)
+        r = max(1.5, 0.028 * s)
+        for base in (1, 5, 9, 13, 17):
+            chain = [pts[0] if base == 1 else pts[base]] + [pts[base + k] for k in range(1, 4)]
+            if base == 1:
+                chain = [pts[1], pts[2], pts[3], pts[4]]
+            for (a, b) in zip(chain, chain[1:]):
+                self._limb(a, b, r * (1.15 if base == 1 else 1), r * 0.85, fill)
+        if back:                                  # knuckles, to tell the back from the palm
+            for i in (5, 9, 13, 17):
+                x, y = pts[i]
+                cv.create_line(x - r, y, x + r, y, fill=self.LINE)
+
+    def _draw_skeleton(self):
+        """What the ControlNet reads, drawn as studio_pose.render draws it."""
         cv, px = self.cv, self.owner.px
-        cv.delete("all")
-        at = [(p[0] * self.vw, p[1] * self.vh) for p in self.points]
-        stick, r = max(3, px(5)), max(4, px(6))
+        seen = self._seen()
+        stick = max(3, px(5))
         for n, (a, b) in enumerate(sp.LIMBS):
-            if a in self.hidden or b in self.hidden:
-                cv.create_line(*at[a], *at[b], width=1, fill="#555555", dash=(3, 3))
-            else:
-                cv.create_line(*at[a], *at[b], width=stick, capstyle="round",
-                               fill="#%02x%02x%02x" % tuple(int(c * 0.6)
-                                                            for c in sp.COLOURS[n]))
-        seen = [None if i in self.hidden else p for i, p in enumerate(self.points)]
+            if seen[a] and seen[b]:
+                cv.create_line(seen[a][0] * self.vw, seen[a][1] * self.vh,
+                               seen[b][0] * self.vw, seen[b][1] * self.vh, width=stick,
+                               capstyle="round", fill="#%02x%02x%02x" % tuple(
+                                   int(c * 0.6) for c in sp.COLOURS[n]))
+        for i, p in enumerate(seen):
+            if p:
+                x, y, r = p[0] * self.vw, p[1] * self.vh, stick / 2 + 1
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="",
+                               fill="#%02x%02x%02x" % sp.COLOURS[i])
         for x, y in sp.face_points(seen, self.vw, self.vh):
             x, y = x * self.vw, y * self.vh
             cv.create_oval(x - 1, y - 1, x + 1, y + 1, fill="#ffffff", outline="")
-        for i, (x, y) in enumerate(at):
+        for pts in self._hand_points().values():
+            at = [(x * self.vw, y * self.vh) for x, y in pts]
+            for n, (a, b) in enumerate(sp.HAND_EDGES):
+                rgb = colorsys.hsv_to_rgb(n / len(sp.HAND_EDGES), 1, 1)
+                cv.create_line(*at[a], *at[b], width=2, fill="#%02x%02x%02x" % tuple(
+                    int(c * 255) for c in rgb))
+            for x, y in at:
+                cv.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#0000ff", outline="")
+
+    def _draw_handles(self):
+        """The joints you can grab, drawn over either view."""
+        cv, r = self.cv, max(3, self.owner.px(4))
+        for i, p in enumerate(self.points):
+            x, y = p[0] * self.vw, p[1] * self.vh
             if i in self.hidden:
-                cv.create_oval(x - r, y - r, x + r, y + r, outline="#777777", dash=(2, 2))
-            else:
-                cv.create_oval(x - r, y - r, x + r, y + r, outline="#ffffff",
-                               fill="#%02x%02x%02x" % sp.COLOURS[i])
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="#8a8a8a", dash=(2, 2))
+            elif i not in (14, 15, 16, 17) or self.seeing.get() == "model":
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="#f2f2f2")
 
     # ---------------------------------------------------------------- done
     def _use(self):
         w, h = self.size
         self.owner.use_pose({"points": [[round(p[0], 4), round(p[1], 4)] for p in self.points],
                              "hidden": sorted(self.hidden), "width": w, "height": h,
+                             "hands": {s: dict(v) for s, v in self.hands.items()},
                              "strength": round(self.strength.get(), 2)})
         self.win.destroy()

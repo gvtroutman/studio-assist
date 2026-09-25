@@ -563,6 +563,29 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   keeps its old cached picture - which is how the first face-dot test ran
   against the old drawing. A posed FLUX picture at 832x1216 took 14-15 s on the
   5090 against 12 s without.
+- **The editor draws a mannequin; the model gets a skeleton.** Since 2026-09-25
+  `PoseEditor` draws a wooden artist's mannequin (tapered limbs on ball joints,
+  a torso, a head that shows its facing, hands with fingers; the person's right
+  darker) from the same 18 points, and "What the model sees" shows the skeleton
+  `render` makes. Hands are DWPose's 21 points (`hand_points`), carried on from
+  the forearm at `HAND_LENGTH` of it, palm to the viewer unless `back`. A shape
+  (`HAND_SHAPES`: relaxed, open, fist, grab, point, peace, thumbs up, OK) is
+  bends per finger joint, foreshortened as a bend toward the viewer would be,
+  so a fist's tips come back onto the palm. A click on a hand (not a drag)
+  gives it the next shape; the menus beside the frame do too, and turn it over.
+  `pose["hands"]` holds each side's shape and `back`; a pose saved before hands
+  existed has none and keeps its picture's name. What held on the 5090 (seed
+  4242 and others, a full-length man, hands ~70 px): the skeleton alone gave
+  open, pointing and a fist on an outstretched arm, but not peace, thumbs up or
+  a fist on a hanging arm; holding the ControlNet to 85% of the steps changed
+  nothing, and thinner hand lines lost the fists (the dots are now ~0.034 of the
+  hand's span). So compose also writes the shapes into the prompt (`HAND_WORDS`,
+  `hands_text`): one shaped hand then comes out right (peace, thumbs up), but
+  two different shapes bleed - the stronger gesture lands on both hands - and
+  FLUX does not keep the person's right and left apart in words. The next step,
+  if hands must be exact, is a hand pass like the face pass: the hands' places
+  are known from the pose, so each can be cropped, redrawn at 1024 px with its
+  own skeleton crop and its own one-hand prompt, and blended back.
 - **One lane per backend, one job per picture.** `JobQueue` runs a thread per
   backend, so the two GPUs work at once. A batch of N is N jobs with seeds s..s+N-1,
   spread over every capable backend, so each picture's record states its exact seed.
