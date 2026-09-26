@@ -337,11 +337,19 @@ def size_for(width, height, edge=RENDER_EDGE):
 def render(points, width, height, hands=None):
     """The OpenPose picture of `points` at width x height -> PNG bytes, with
     DWPose's hands when `hands` says what shape they are in."""
+    return render_figures([{"points": points, "hands": hands}], width, height)
+
+
+def render_figures(figures, width, height):
+    """Several people in one OpenPose picture, drawn in the order given (far
+    to near, so the nearer one's limbs are on top). Each figure is
+    {"points", "hands"?, "face"?}: `face` is its 68 dots as fractions of the
+    frame when the caller knows better than `face_points` (the Scene Builder
+    turns a real head in 3D), None to work them out, [] for none. -> PNG."""
     w, h = size_for(width, height)
     buf = bytearray(w * h * 4)
     buf[3::4] = b"\xff" * (w * h)
     stick = max(3, round(max(w, h) / 170))
-    pix = [None if p is None else (p[0] * w, p[1] * h) for p in points]
 
     def blot(x0, y0, x1, y1, r, colour, alpha):
         """A capsule from (x0, y0) to (x1, y1), radius r, over what is there."""
@@ -366,28 +374,35 @@ def render(points, width, height, hands=None):
                     buf[i + 1] = int(buf[i + 1] * keep + cg)
                     buf[i + 2] = int(buf[i + 2] * keep + cb)
 
-    for n, (a, b) in enumerate(LIMBS):
-        if pix[a] and pix[b]:
-            blot(pix[a][0], pix[a][1], pix[b][0], pix[b][1], stick, COLOURS[n], 0.6)
-    for i, p in enumerate(pix):
-        if p:
-            blot(p[0], p[1], p[0], p[1], stick, COLOURS[i], 1.0)
-    dot = max(1.2, stick / 3)
-    for x, y in face_points(points, 1, 1):
-        blot(x * w, y * h, x * w, y * h, dot, (255, 255, 255), 1.0)
-    # DWPose's hand: each bone its own hue round the colour wheel, the points
-    # blue - sized to the hand as DWPose's are (radius 4 on a ~150 px hand).
-    # Twice that made a fist or a thumb a blue blob the model could not read.
-    for hand in hand_points(points, 1, 1, hands).values():
-        at = [(x * w, y * h) for x, y in hand]
-        span = math.hypot(at[12][0] - at[0][0], at[12][1] - at[0][1])
-        span = max(span, math.hypot(at[9][0] - at[0][0], at[9][1] - at[0][1]) * 2)
-        thin, knot = max(1.0, span * 0.018), max(1.5, span * 0.034)
-        for n, (a, b) in enumerate(HAND_EDGES):
-            rgb = tuple(int(c * 255) for c in colorsys.hsv_to_rgb(n / len(HAND_EDGES), 1, 1))
-            blot(at[a][0], at[a][1], at[b][0], at[b][1], thin, rgb, 1.0)
-        for x, y in at:
-            blot(x, y, x, y, knot, HAND_JOINT, 1.0)
+    def draw(points, hands, face):
+        pix = [None if p is None else (p[0] * w, p[1] * h) for p in points]
+        for n, (a, b) in enumerate(LIMBS):
+            if pix[a] and pix[b]:
+                blot(pix[a][0], pix[a][1], pix[b][0], pix[b][1], stick, COLOURS[n], 0.6)
+        for i, p in enumerate(pix):
+            if p:
+                blot(p[0], p[1], p[0], p[1], stick, COLOURS[i], 1.0)
+        dot = max(1.2, stick / 3)
+        for x, y in face_points(points, 1, 1) if face is None else face:
+            blot(x * w, y * h, x * w, y * h, dot, (255, 255, 255), 1.0)
+        # DWPose's hand: each bone its own hue round the colour wheel, the
+        # points blue - sized to the hand as DWPose's are (radius 4 on a ~150
+        # px hand). Twice that made a fist or a thumb a blue blob the model
+        # could not read.
+        for hand in hand_points(points, 1, 1, hands).values():
+            at = [(x * w, y * h) for x, y in hand]
+            span = math.hypot(at[12][0] - at[0][0], at[12][1] - at[0][1])
+            span = max(span, math.hypot(at[9][0] - at[0][0], at[9][1] - at[0][1]) * 2)
+            thin, knot = max(1.0, span * 0.018), max(1.5, span * 0.034)
+            for n, (a, b) in enumerate(HAND_EDGES):
+                rgb = tuple(int(c * 255) for c in
+                            colorsys.hsv_to_rgb(n / len(HAND_EDGES), 1, 1))
+                blot(at[a][0], at[a][1], at[b][0], at[b][1], thin, rgb, 1.0)
+            for x, y in at:
+                blot(x, y, x, y, knot, HAND_JOINT, 1.0)
+
+    for fig in figures:
+        draw(fig["points"], fig.get("hands"), fig.get("face"))
     return studio_icons.png(bytes(buf), w, h)
 
 
