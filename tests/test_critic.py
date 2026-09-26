@@ -292,6 +292,33 @@ class LoopTest(TempStudioMixin, unittest.TestCase):
         self.assertEqual(len(client.graphs), 1)
         self.assertEqual(job.record["refinement"]["stopped"], "critic failed")
 
+    def test_a_kept_scene_detail_goes_into_the_next_picture(self):
+        jacket = ob("stage backdrop", "NEW_USEFUL_DETAIL", "scene", subject="scene",
+                    value="red velvet curtain behind him")
+        self.run_with([{"needs_refinement": False, "observations": [jacket]}])
+        with open(os.path.join(self.dir, ig.CRITIC_MEMORY), encoding="utf-8") as f:
+            self.assertIn("red velvet curtain", f.read())
+        job, client = self.run_with([{"needs_refinement": False, "observations": []}])
+        self.assertIn("red velvet curtain behind him", client.graphs[0]["10"]["inputs"]["text"])
+        self.assertIn("red velvet curtain", str(self.vision.asked[0]))   # checked, not reinvented
+
+
+class MemoryTest(unittest.TestCase):
+    def test_a_person_is_remembered_by_identity_and_a_scene_by_its_words(self):
+        state = {"characters": {"character_a": {"jacket": "green wool jacket"}},
+                 "scene": {"backdrop": "brick wall"}, "camera": {}}
+        mem = critic.remember({}, state, ["characters.character_a.jacket", "scene.backdrop"],
+                              ["gavin"], "A man in Munich.")
+        self.assertEqual(critic.recall(mem, ["gavin"]), [("jacket", "green wool jacket")])
+        self.assertEqual(critic.recall(mem, (), "a man in munich"), [("backdrop", "brick wall")])
+        self.assertEqual(critic.recall(mem, ["gavin"], set_keys=["Jacket"]), [])
+        self.assertEqual(critic.recall(mem, ["gavin", "lilya"]), [])   # whose? not said
+
+    def test_with_two_people_a_character_detail_is_not_filed(self):
+        state = {"characters": {"character_a": {"jacket": "x"}}, "scene": {}, "camera": {}}
+        self.assertEqual(critic.remember({}, state, ["characters.character_a.jacket"],
+                                         ["a", "b"]), {})
+
 
 if __name__ == "__main__":
     unittest.main()

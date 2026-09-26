@@ -2596,6 +2596,33 @@ def plan_items(p, s, wf, v, backend, short, nodes):
         [i["name"] for i in items]))
 
 
+CRITIC_MEMORY = "critic_memory.json"
+
+
+def load_critic_memory(lib):
+    """The Visual Critic's kept details (studio_critic.remember), or {}."""
+    root = getattr(lib, "root", None)
+    if not root:
+        return {}
+    try:
+        with open(os.path.join(root, CRITIC_MEMORY), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_critic_memory(lib, memory):
+    path = os.path.join(lib.root, CRITIC_MEMORY)
+    try:
+        os.makedirs(lib.root, exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(memory, f, indent=1, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow,
             nodes=None):
     """The form's settings -> a Plan for `backend`. `inventory` is that
@@ -2720,6 +2747,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         p.warnings.append("The drawn pose decides the framing and which way the person "
                           "faces; the Camera gives only its height. Zoom the figure "
                           "(mouse wheel in Draw…) to frame closer.")
+    # What the Visual Critic kept from earlier pictures of this person and
+    # scene (critic_memory.json): every picture starts from it, so they agree.
+    learned = critic.recall(load_critic_memory(lib), [i["id"] for i, _ in idents],
+                            scene, [k for k in SLOTS if _field(s, k)] + ["scene", "camera"])
+    if learned:
+        parts.append(", ".join(v for _, v in learned))
+        p.notes.append("Kept from earlier pictures: %s." % "; ".join(
+            "%s %s" % (k.replace("_", " "), v) for k, v in learned))
     anatomy = s.get("anatomy") is not False and has_person(s, bool(idents))
     if anatomy:
         parts.append(anatomy_text())
@@ -4192,7 +4227,15 @@ class Studio:
         intent = critic.intent_from(s, plan.prompt)
         canonical = critic.initial_canonical(s, SLOTS, [i["name"] for i in idents],
                                              style["name"] if style else None)
-        refs = [plan.references["face"]] if plan.references.get("face") else []
+        # Details kept from earlier pictures are known too, so the critic
+        # checks them rather than inventing again (not locked: a better look
+        # may replace them).
+        memory = load_critic_memory(self.lib)
+        for k, v in critic.recall(memory, [i["id"] for i in idents]):
+            canonical["characters"].setdefault("character_a", {}).setdefault(k, v)
+        for k, v in critic.recall(memory, (), s.get("scene") or ""):
+            canonical["scene"].setdefault(k, v)
+        refs =[plan.references["face"]] if plan.references.get("face") else []
         refs += [i["references"][0] for i in idents if i.get("references")
                  and i["references"][0] not in refs]
         passes = max(0, min(int(s.get("refine_passes") or critic.MAX_PASSES), 6))
@@ -4213,6 +4256,10 @@ class Studio:
                 break
             nxt = critic.plan_next_refinement(result, canonical)
             canonical, promoted = critic.merge_canonical(canonical, nxt["promote"])
+            if promoted:
+                save_critic_memory(self.lib, critic.remember(
+                    load_critic_memory(self.lib), canonical, promoted,
+                    [i["id"] for i in idents], s.get("scene") or ""))
             text = critic.log_text(n, result, nxt)
             log.append(text)
             self._critic_log(job, text)
