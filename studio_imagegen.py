@@ -149,6 +149,29 @@ PRESETS = {
 PRESET_ORDER = ["standard", "identity", "hq_final"]
 
 
+def preset_info(lib, key):
+    """A built-in preset, or a saved LoRA mix (the `presets` library) on top
+    of its `base` built-in -> {label, role, about, values, base, loras,
+    custom}. Unknown is Standard. A mix's LoRAs are what the form loads
+    into its LoRA rows when it is picked; the rows, not the preset, are
+    what a picture is made with."""
+    if key in PRESETS:
+        return dict(PRESETS[key], base=key, loras=[], custom=False)
+    rec = lib.get("presets", key) if lib is not None and key else None
+    if rec is None:
+        return dict(PRESETS["standard"], base="standard", loras=[], custom=False)
+    base = PRESETS[rec["base"]]
+    names = []
+    for sel in rec["loras"]:
+        lora = lib.get("loras", sel["id"])
+        names.append("%s %.2g" % (lora["name"] if lora else sel["id"] + " (missing)",
+                                  sel["strength"]))
+    about = rec["about"] or "%s, plus LoRAs: %s." % (
+        base["label"], ", ".join(names) if names else "none")
+    return dict(base, label=rec["name"], about=about, base=rec["base"],
+                loras=[dict(sel) for sel in rec["loras"]], custom=True)
+
+
 def guess_family(filename):
     n = filename.lower()
     if "kontext" in n:
@@ -393,6 +416,29 @@ def clean_outfit(d):
     }
 
 
+def clean_preset(d):
+    """A saved LoRA mix shown in the form's Preset row: a name, the built-in
+    preset it rides on (`base`: refine, face pass, size, routing) and the
+    LoRAs with strengths it loads into the form."""
+    if not isinstance(d, dict) or not _str(d.get("name")):
+        return None
+    loras, seen = [], set()
+    for sel in d.get("loras") if isinstance(d.get("loras"), list) else ():
+        if isinstance(sel, dict) and _str(sel.get("id")) and sel["id"] not in seen:
+            seen.add(sel["id"])
+            loras.append({"id": _str(sel["id"]),
+                          "strength": _num(sel.get("strength", 0.8), float, 0.8, -2.0, 2.0)})
+    base = _str(d.get("base"))
+    rid = slug(d.get("id") or d["name"])
+    return {
+        "id": "mix-" + rid if rid in PRESETS else rid,     # never a built-in's key
+        "name": _str(d["name"]),
+        "base": base if base in PRESETS else "standard",
+        "loras": loras,
+        "about": _str(d.get("about")),
+    }
+
+
 def style_example(style):
     """The picture that shows what `style` looks like: its own `example` when
     that file is there, else the one shipped for its id (the same cat photo
@@ -406,7 +452,7 @@ def style_example(style):
 
 CLEAN = {"backends": clean_backend, "models": clean_model, "loras": clean_lora,
          "identities": clean_identity, "styles": clean_style,
-         "characters": clean_character, "outfits": clean_outfit}
+         "characters": clean_character, "outfits": clean_outfit, "presets": clean_preset}
 
 
 def _default_backends():
@@ -527,7 +573,7 @@ def _default_styles():
 
 DEFAULTS = {"backends": _default_backends, "models": _default_models, "loras": list,
             "identities": list, "styles": _default_styles, "characters": list,
-            "outfits": _default_outfits}
+            "outfits": _default_outfits, "presets": list}
 
 
 class Library:
@@ -3356,7 +3402,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     s.update(settings or {})
     p = Plan()
     bid = backend["id"]
-    preset = PRESETS.get(s["preset"], PRESETS["standard"])
+    preset = preset_info(lib, s["preset"])
     model = lib.get("models", s["model"])
     if model is None:
         p.errors.append("No model called %r in the library." % s["model"])
@@ -3383,7 +3429,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             continue
         strength = sel.get("strength") if isinstance(sel, dict) else None
         idents.append((ident, ident["strength"] if strength is None else strength))
-    if s["preset"] == "identity" and not idents:
+    if preset["base"] == "identity" and not idents:
         p.errors.append("Identity Portrait needs a person: choose one under Person.")
 
     # ------------------------------------------------------------ LoRAs
@@ -4405,7 +4451,7 @@ class Studio:
             if b is None:
                 return None, "No backend called %r." % settings["backend"]
             return b, "%s (chosen by hand)." % b["name"]
-        role = PRESETS.get(settings.get("preset"), PRESETS["standard"])["role"]
+        role = preset_info(self.lib, settings.get("preset"))["role"]
         if int(settings.get("batch") or 1) > 1 and role == "interactive":
             role = "batch"
         order = route(role, self.backends(), self.health,
@@ -4424,8 +4470,8 @@ class Studio:
                 why.append("%s, where it was made, cannot take it now, so the result "
                            "may differ slightly" % (gone["name"] if gone else prefer))
         if not why:
-            why.append("preferred for %s" % PRESETS.get(settings.get("preset"),
-                                                           PRESETS["standard"])["label"]
+            why.append("preferred for %s" % preset_info(self.lib, settings.get("preset"))[
+                "label"]
                        if role in pick["roles"] else "the only backend able to take it")
         passed = []                   # preferred for the role, but unable to take it
         for b in self.backends():
@@ -4464,7 +4510,7 @@ class Studio:
                 if b is None:
                     raise ComfyError(why)
                 return [b]
-            role = PRESETS.get(settings.get("preset"), PRESETS["standard"])["role"]
+            role = preset_info(self.lib, settings.get("preset"))["role"]
             role = "batch" if role == "interactive" else role
             order = route(role, self.backends(), self.health,
                           self.has_model(settings.get("model")), load)

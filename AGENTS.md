@@ -492,6 +492,17 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   **"Always on"** LoRA (`always` in the library): it joins every picture whose model it
   suits, at its library strength, and is skipped quietly for other families, because
   "suits" is the rule the user set. One added by hand keeps the form's strength.
+- **A LoRA mix is a preset.** "Save as preset…" under the form's LoRAs stores the
+  rows and strengths (`presets.json`, `clean_preset`) on the built-in preset then
+  chosen (`base`: refine, face pass, size, routing role). It is listed in the Preset
+  row after the built-ins; picking it loads its LoRAs *into the rows*, replacing the
+  last mix's rows (hand-added rows stay), and a built-in takes them away. The rows,
+  not the preset, are what `compose` uses, so the strengths can be nudged before
+  Generate. Everything that looked a preset up goes through `preset_info(lib, key)`;
+  an unknown key is Standard, and a mix can never take a built-in's key (`mix-`).
+  Stacked LoRAs add up: on Z-Image Turbo (8 steps) keep the total near 1.0-1.5.
+  An added row's whole `trigger` goes into the prompt, so a CivitAI "trained words"
+  list of alternatives (an expressions LoRA's) must be cleared, not kept.
 - **LoRAs come in from CivitAI** (`studio_civitai.py`, the LoRA library's *Import
   from CivitAI…*). Paste links (a model page, `modelVersionId`, a download link, an
   AIR, a bare version id) and/or pick `.safetensors` files. A link is read from
