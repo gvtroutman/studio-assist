@@ -2187,6 +2187,40 @@ class TestHeadShape(unittest.TestCase):
                               faces=[{"words": "a man"}])
         self.assertNotIn("fcn", plain)
 
+    def test_the_shot_sets_how_hard_pose_and_layout_hold(self):
+        s = sc.new_scene("")
+        p = sc.new_object("person")
+        p["head"] = {"jaw_width": 0.7}
+        s["objects"].append(p)
+        maps = {"pose": "p.png", "composition": "d.png"}
+        shots = []
+        for d, y, lens in ((4.2, 1.0, 35.0), (2.6, 1.3, 50.0), (1.1, 1.55, 70.0)):
+            s["camera"].update(distance=d, target=[0.0, y, 0.0], lens=lens)
+            words, extra = sc.generation(s, maps)
+            shots.append((sc.framing(s)[0], extra["pose"]["strength"],
+                          extra["composition"]["strength"]))
+        self.assertEqual(shots, [("wide shot", 0.85, 0.55),
+                                 ("medium shot", round(0.85 * 0.75, 3), round(0.55 * 0.75, 3)),
+                                 ("close-up", round(0.85 * 0.45, 3), round(0.55 * 0.45, 3))])
+        self.assertTrue(any("close-up" in n for n in words.notes), words.notes)
+        faces = extra["scene_faces"]
+        self.assertEqual(faces["head_depth"], sc.HEAD_DEPTH)
+        who = faces["people"][0]
+        self.assertEqual(who["head"], {"jaw_width": 0.7})
+        self.assertAlmostEqual(who["facing"], 0.5, places=2)        # facing the camera
+        s["camera"]["yaw"] = 20.0                                    # the camera goes round
+        turned = sc.face_targets(s)[0]["facing"]
+        self.assertNotAlmostEqual(turned, 0.5, places=1)
+        self.assertAlmostEqual(abs(ig.facing_yaw(turned)), 20, delta=4)
+        s["head_depth"] = 0.2
+        self.assertEqual(sc.clean_scene(json.loads(json.dumps(s)))[0]["head_depth"], 0.2)
+        # The head's own depth fills the crop's grey: its nearest is white.
+        x, y, w, h = sc.head_box(s, p)
+        region = (x - w / 2, y, 2 * w, 2 * w)
+        plain = sc.depth_crop_png(s, region, (64, 64))
+        anchored = sc.depth_crop_png(s, region, (64, 64), p["id"])
+        self.assertNotEqual(plain, anchored)
+
     def test_a_person_keeps_their_head_and_an_identity_keeps_one(self):
         obj = sc.new_object("person")
         obj["head"] = {"jaw_width": 0.8, "chin_length": 0.3}
