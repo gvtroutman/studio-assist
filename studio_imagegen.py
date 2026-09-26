@@ -4227,9 +4227,9 @@ class Studio:
         pairs = indexed_crops(width, height, boxes, keep=likeness | shaped)
         crops = [c for _, c in pairs]
         f = files[0]
-        image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
-                                f["filename"], f.get("type") or "output")
-        heads = self._head_depths(client, plan, layout, image, width, height,
+        picture = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                  f["filename"], f.get("type") or "output")
+        heads = self._head_depths(client, plan, layout, picture, width, height,
                                   [(i, c) for i, c in pairs if i in shaped], boxes, known,
                                   head_k) if shaped & {i for i, _ in pairs} else {}
         faces = []
@@ -4272,7 +4272,7 @@ class Studio:
                 os.makedirs(self.lib.root, exist_ok=True)
                 with open(oval, "wb") as fh:
                     fh.write(oval_png())
-            graph = face_graph(plan.workflow, values, plan.loras, image, crops,
+            graph = face_graph(plan.workflow, values, plan.loras, picture, crops,
                                client.upload_image(oval), values["filename_prefix"] + "_faces",
                                faces=faces, pulid_file=pulid,
                                boxes=[boxes[i] for i, _ in pairs])
