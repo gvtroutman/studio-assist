@@ -898,6 +898,26 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   pose - in parentheses before the user's text (and a person's look between the two),
   and it says "a person" so the anatomy constants apply. An object outside the frame is left out of the words and said so,
   and so is an object with no description. A test holds punctuation and case verbatim.
+  "Outside" is none of its box on screen: its middle alone dropped a person framed head
+  and shoulders, whose middle is below the frame; left / centre / right is the seen part's.
+- **A person is said from their controls, as the pose map draws them.** Each person's
+  line is `Name (a person, where, facing, [gaze], framing, [named pose]): look.
+  Posture. Description`. `posture_words` reads the posed skeleton, not the sliders, so
+  a combination says what it looks like: the torso's bend, lean and turn; each arm
+  from where its wrist ends up against the crown (`HEAD_TOP` above the head joint),
+  shoulder and hips ("raised above the head", "reaching forward at shoulder height",
+  "bent, the hand in front of the chest", "swinging forward"...), both arms in one
+  phrase when they match (`BOTH_ARMS`); the legs (stride, weight on one leg, wide
+  stance) unless a named pose in `LEG_POSES` says them; the head's nod and tilt.
+  Left and right are theirs, as captions say them. `gaze_words` says where the head
+  looks when that is not the body's way ("head turned towards the camera"), and
+  `framing_words` how much of them the frame shows ("seen from the knees up"). A
+  look with a Gaze keeps it: the head words are left out rather than contradict it.
+  Heights, degrees and body words are not added: the look's sliders already say
+  build and height, the anatomy constants say natural proportions, and numbers do
+  little in a prompt. Live (2026-09-25, same seed): an arm raised in both the map and
+  the words was drawn raised; a front-on carrying pose (forearms towards the
+  camera, so short in the map) was not, in one seed of two.
 - **Each person carries their own look.** A person object has `look` (the Image
   Studio's `LOOKS` slots and `SLIDERS`, sparse, cleaned by `clean_look`) and
   `character`. The inspector's Look section is the form's own `look_rows` /

@@ -720,7 +720,7 @@ class TestWords(unittest.TestCase):
         c["position"] = [-1.0, 0, 0]
         words = sc.scene_text(s)
         self.assertIn("A steel workshop, overcast light.", words.text)
-        self.assertIn(": Kneeling to weld; face shield DOWN, hi-vis vest, gloves.", words.text)
+        self.assertIn(". Kneeling to weld; face shield DOWN, hi-vis vest, gloves.", words.text)
         self.assertIn("Gas cylinder (left of frame): acetylene, valve open  (hose attached).",
                       words.text)
         self.assertIn("a person, centre of frame, facing the camera", words.text)
@@ -746,6 +746,64 @@ class TestWords(unittest.TestCase):
             p["rotation"][0] = yaw
             self.assertEqual(sc.facing(s, p), words, yaw)
 
+    def posed(self, preset="standing", **controls):
+        s = staged("person")
+        p = s["objects"][0]
+        p["pose"] = {"preset": preset, "controls": dict(sc.pose_controls(preset), **controls)}
+        return s, p
+
+    def test_the_posture_is_read_off_the_posed_body(self):
+        for preset, words in (
+                ("standing", ["arms relaxed at the sides"]),
+                ("reaching", ["right arm raised above the head",
+                              "left arm hanging relaxed at the side", "looking up"]),
+                ("pointing", ["right arm reaching forward at shoulder height",
+                              "left arm hanging relaxed at the side"]),
+                ("carrying", ["both arms bent, hands in front of the chest"]),
+                ("working", ["leaning forward", "both arms bent, hands in front of the waist",
+                             "looking down"])):
+            _, p = self.posed(preset)
+            self.assertEqual(sc.posture_words(p), words, preset)
+
+    def test_the_legs_are_said_unless_a_named_pose_says_them(self):
+        _, p = self.posed(leg_l_bend=25)
+        self.assertIn("weight on the right leg, the other knee relaxed", sc.posture_words(p))
+        _, p = self.posed(leg_r_step=30, leg_l_step=-10)
+        self.assertIn("mid-stride, right foot forward", sc.posture_words(p))
+        _, p = self.posed("kneeling")
+        self.assertFalse([w for w in sc.posture_words(p) if "leg" in w or "foot" in w])
+        _, p = self.posed(twist=30, lean=-15, arm_l_out=90)
+        words = sc.posture_words(p)
+        self.assertIn("shoulders turned to their left", words)
+        self.assertIn("leaning to their right", words)
+        self.assertIn("left arm stretched out to the side", words)
+
+    def test_the_looks_gaze_outranks_the_heads_words(self):
+        s, p = self.posed(head_nod=30)
+        self.assertIn("looking down", sc.posture_words(p))
+        p["rotation"][0] = 90
+        p["pose"]["controls"]["head_turn"] = -80        # over the shoulder, to the camera
+        self.assertEqual(sc.gaze_words(s, p), "head turned towards the camera")
+        p["look"] = {"gaze": "looking at the camera"}
+        self.assertNotIn("looking down", sc.posture_words(p))
+        self.assertEqual(sc.gaze_words(s, p), "")
+        p["look"] = {}
+        p["pose"]["controls"]["head_turn"] = 0
+        self.assertEqual(sc.gaze_words(s, p), "")        # the head goes the body's way
+
+    def test_how_much_of_the_person_the_frame_shows(self):
+        s, p = self.posed()
+        self.assertEqual(sc.framing_words(s, p), "whole figure in view")
+        for distance, aim, words in ((1.8, 1.2, "seen from the knees up"),
+                                     (1.0, 1.35, "seen from the waist up"),
+                                     (0.6, 1.6, "head and shoulders")):
+            s["camera"].update(distance=distance, target=[0, aim, 0])
+            self.assertEqual(sc.framing_words(s, p), words, distance)
+        # Framed this close the person's middle is below the frame; they are
+        # still in the words.
+        self.assertIn("Person (a person, centre of frame, facing the camera, "
+                      "head and shoulders)", sc.scene_text(s).text)
+
     def test_the_camera_in_words(self):
         s = staged()
         s["camera"].update(pitch=45, lens=24)
@@ -763,11 +821,12 @@ class TestWords(unittest.TestCase):
                        "hair_style": "in a ponytail"})
         box["position"] = [-0.9, 0, 0]
         text = sc.scene_text(s).text
-        self.assertIn("Welder (a person, centre of frame, facing the camera): a man, in their "
-                      "40s, tall, full beard, determined expression, wearing hi-vis vest. "
-                      "grinding a seam; face shield DOWN.", text)
+        self.assertIn("Welder (a person, centre of frame, facing the camera, whole figure in "
+                      "view): a man, in their 40s, tall, full beard, determined expression, "
+                      "wearing hi-vis vest. Arms relaxed at the sides. grinding a seam; face "
+                      "shield DOWN.", text)
         self.assertIn("Apprentice (a person, ", text)
-        self.assertIn("): a young woman, auburn hair in a ponytail.", text)
+        self.assertIn("): a young woman, auburn hair in a ponytail. Arms relaxed", text)
         self.assertNotIn("Apprentice has no description", " ".join(sc.scene_text(s).notes))
 
     def test_a_look_is_saved_and_cleaned(self):
