@@ -93,6 +93,9 @@ DEPTH_STRENGTH = 0.55
 FRAME_KEEP = 0.0
 FRAME_KEEP_MAX = 0.7
 FALLBACK_KEEP = 0.3            # the frame kept for a model with no ControlNet (denoise 0.7)
+FACE_LIKENESS = 0.6            # how far a face given a picture is redrawn at the end
+REAL_FACES = True              # then their own face pasted over it, where a photo's angle fits
+FACE_LIKENESS_RANGE = (0.3, 0.95)
 DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet scales it
 
 COLOURS = [                    # (hex, name) offered for any object
@@ -1431,7 +1434,8 @@ def new_room():
 def new_scene(details=""):
     return {"version": VERSION, "details": details, "frame": "portrait",
             "pose_strength": POSE_STRENGTH, "depth_strength": DEPTH_STRENGTH,
-            "frame_keep": FRAME_KEEP,
+            "frame_keep": FRAME_KEEP, "face_likeness": FACE_LIKENESS,
+            "real_faces": REAL_FACES,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
             "room": new_room(), "objects": []}
@@ -1454,6 +1458,7 @@ def new_object(asset_id, taken=()):
         obj["pose"] = {"preset": "standing", "controls": pose_controls("standing")}
         obj["character"] = ""
         obj["look"] = {}
+        obj["face"] = ""
     elif a["kind"] == "crowd":
         obj["crowd"] = new_crowd()
     return obj
@@ -1564,6 +1569,7 @@ def clean_object(d, taken=()):
             k: _num(given.get(k), start[k], *CONTROL_RANGE[k]) for k in CONTROL_KEYS}}
         o["character"] = str(d.get("character") or "")
         o["look"] = clean_look(d.get("look"))
+        o["face"] = str(d.get("face") or "")
     if "crowd" in base:
         o["crowd"] = clean_crowd(d.get("crowd"))
     return o
@@ -1583,6 +1589,8 @@ def clean_scene(d):
     s["pose_strength"] = _num(d.get("pose_strength"), POSE_STRENGTH, 0.0, 1.0)
     s["depth_strength"] = _num(d.get("depth_strength"), DEPTH_STRENGTH, 0.0, 1.0)
     s["frame_keep"] = _num(d.get("frame_keep"), FRAME_KEEP, 0.0, FRAME_KEEP_MAX)
+    s["face_likeness"] = _num(d.get("face_likeness"), FACE_LIKENESS, *FACE_LIKENESS_RANGE)
+    s["real_faces"] = bool(d.get("real_faces", REAL_FACES))
     cam = d.get("camera") if isinstance(d.get("camera"), dict) else {}
     c = s["camera"]
     c["target"] = _vec(cam.get("target"), c["target"], -100, 100)
@@ -1610,6 +1618,9 @@ def clean_scene(d):
                             % (raw.get("asset") if isinstance(raw, dict) else raw))
         else:
             s["objects"].append(o)
+            if o.get("face") and not os.path.isfile(o["face"]):
+                problems.append("%s's face picture %s is missing, so their face is drawn "
+                                "from the words." % (o["name"], os.path.basename(o["face"])))
     return s, problems
 
 
@@ -2776,7 +2787,89 @@ def people(scene):
     return [o for o in scene["objects"] if o["asset"] == "person"]
 
 
-def generation(scene, maps, characters=None):
+# ==================================================================== faces
+# The face pass (studio_imagegen) redraws every face in the finished picture
+# close up. A scene knows who each face is: where each person's face falls in
+# the frame, and their own words, so a face is redrawn as that person rather
+# than as the whole prompt's blend of everyone - and, when the person has a
+# face picture (their own, or their character's identity's), redrawn to be
+# that face (PuLID), at the scene's `face_likeness`.
+FACE_UP = 0.1                  # m from the head joint (the top of the neck) to the face's middle
+# The part of the frame a person's face picture is drawn into in the picture
+# itself (PuLID's attention mask), in head heights (head joint to crown)
+# around the face: wide enough for the hair, short of the next person's head.
+FACE_REGION = {"side": 1.1, "above": 0.5, "below": 0.6}
+
+
+def face_picture(obj, characters=None, identities=None):
+    """-> (path, where it came from) of the face a person is drawn with, or
+    ('', ''): the person's own, else their character's identity's first
+    reference picture."""
+    if obj.get("face") and os.path.isfile(obj["face"]):
+        return obj["face"], "their own face picture"
+    rec = (characters or {}).get(obj.get("character")) if obj.get("character") else None
+    ident = (identities or {}).get(rec.get("identity")) if rec and rec.get("identity") else None
+    if ident and ident.get("use_references", True):
+        for path in ident.get("references") or []:
+            if os.path.isfile(path):
+                return path, "%s's profile" % ident["name"]
+    return "", ""
+
+
+def face_photos(obj, characters=None, identities=None):
+    """Every photo of a person's face there is, their own face picture
+    first, then their character's identity's references: the real-face
+    paste picks the one whose head is turned most like the drawn one's."""
+    out = []
+    if obj.get("face") and os.path.isfile(obj["face"]):
+        out.append(obj["face"])
+    rec = (characters or {}).get(obj.get("character")) if obj.get("character") else None
+    ident = (identities or {}).get(rec.get("identity")) if rec and rec.get("identity") else None
+    if ident and ident.get("use_references", True):
+        out += [p for p in ident.get("references") or [] if os.path.isfile(p) and p not in out]
+    return out
+
+
+def face_targets(scene, characters=None, identities=None):
+    """Every person whose face is in the frame: {"id", "name", "at": [x, y]
+    (the face's middle, as fractions of the frame), "region": [x0, y0, x1,
+    y1] (their head and hair, the same way), "words" (what they look
+    like, their own description, the scene's details), "face" (a picture's
+    path or ''), "from", "photos" (every photo of their face, `face_photos`)}. Crowds are left out: their faces are background."""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    details = scene["details"].strip().rstrip(".")
+    out = []
+    for obj in people(scene):
+        sk, k, shift = rigs(obj)[0]
+        hp, hm = sk["head"]
+        up = column(hm, 1)
+        p = cam.project(add(mul(add(hp, mul(up, FACE_UP)), k), shift))
+        if p is None or not (0 <= p[0] <= w and 0 <= p[1] <= h):
+            continue
+        neck = cam.project(add(mul(hp, k), shift))
+        crown = cam.project(add(mul(add(hp, mul(up, HEAD_TOP)), k), shift))
+        head = (math.hypot(crown[0] - neck[0], crown[1] - neck[1])
+                if neck and crown else 0.05 * h)
+        top, bottom = min(neck[1], crown[1]) if neck and crown else p[1], (
+            max(neck[1], crown[1]) if neck and crown else p[1])
+        region = [max(0.0, (p[0] - FACE_REGION["side"] * head) / w),
+                  max(0.0, (top - FACE_REGION["above"] * head) / h),
+                  min(1.0, (p[0] + FACE_REGION["side"] * head) / w),
+                  min(1.0, (bottom + FACE_REGION["below"] * head) / h)]
+        said = [x.strip().rstrip(".") for x in (look_text(obj), obj["description"], details)
+                if x and x.strip()]
+        face, source = face_picture(obj, characters, identities)
+        out.append({"id": obj["id"], "name": obj["name"],
+                    "at": [round(p[0] / w, 4), round(p[1] / h, 4)],
+                    "region": [round(x, 4) for x in region],
+                    "words": ". ".join(said) + ("." if said else ""),
+                    "face": face, "from": source,
+                    "photos": face_photos(obj, characters, identities)})
+    return out
+
+
+def generation(scene, maps, characters=None, identities=None):
     """What the Image Studio is handed: the words for its Scene field, and
     the settings Generate adds to the form's (the frame's size, the maps
     from `scene_maps` as references with their strengths, the denoise when
@@ -2792,8 +2885,12 @@ def generation(scene, maps, characters=None):
     item pictures (compose matches them to the form's clothes, now blank;
     no workflow takes one yet, and the words carry the items). The identity
     whose LoRA carries a scene character's face rides along as
-    `scene_identities`, for the form to add to its own. `characters` is
-    {id: record}."""
+    `scene_identities`, for the form to add to its own. `characters` and
+    `identities` are {id: record}.
+
+    A scene with people always gets the face pass, told who each face is
+    (`scene_faces`, from `face_targets`): each redrawn in their own words,
+    and to their face picture's likeness where they have one."""
     import studio_imagegen as ig
     w, h = frame_size(scene)
     words = scene_text(scene)
@@ -2821,6 +2918,10 @@ def generation(scene, maps, characters=None):
             if rec and rec.get("identity") and rec["identity"] not in idents:
                 idents.append(rec["identity"])
         extra["scene_identities"] = idents
+        extra["face_detail"] = True
+        extra["scene_faces"] = {"likeness": round(s["face_likeness"], 3),
+                                "real": s["real_faces"],
+                                "people": face_targets(s, characters, identities)}
     return words, extra
 
 
