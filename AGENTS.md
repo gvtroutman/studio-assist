@@ -838,6 +838,32 @@ its colours are deliberately not tone-matched. Photo spots run first; the
 other spots are then redrawn on that picture (loaded by its output name).
 The Change strength does not apply to a swap (Qwen draws at denoise 1).
 
+**A fix can end with a face swap** (the window's Face swap row: an
+identity, `fix["face_swap"]` its id). After the spots are done (photo
+swaps, then redraws), `_face_swap_graph` runs one SAM3 finder
+(`faces_graph`, `face:8`) over that result and **every** reference picture
+of the identity. The picture's biggest face is the one swapped (the
+subject; one identity is one person). Each reference is cut to its own
+biggest face (`head_square` at `FACE_SWAP_REF_PAD` 1.8, with the hair):
+Lilya's references are half-body cut-outs whose face is a tenth of the
+picture. Qwen 2509 takes three pictures, the crop and two more, so two
+references get a slot each ("pictures 2 and 3") and three or more go in
+side by side as one picture 2 (`SWAP_SLOTS`, `ps["sheet"]`). The swap is
+colour-matched to the crop it replaces with core `ColorTransfer`
+(reinhard_lab, strength `fix["tone"]`), then blended back through SAM3's
+"face" before and after, and locks are laid back last. A face swap with no
+spots marked is a fix on its own. If SAM3 finds no face, a face-only fix
+fails and a fix with spots keeps their result with a note. It needs SAM3
+and the Qwen files on the backend, like a photo spot.
+
+Live on 2026-09-26 (Lilya, dancing in a meadow, a ~50 px face, 19 s). The
+first version used only the first reference, which was her in profile. It
+came back as a pale stranger with a white halo round the head. All three
+references cut to the face gave her glasses, face shape and mouth, in the
+picture's own pose. `StudioMatchTone` on a swapped face posterized it
+into cyan and green blotches: its per-channel curves are too steep on
+smooth skin. Use `ColorTransfer` there, not the curves.
+
 ### Try On: dressing a person from pictures
 
 **Retired from the form on 2026-09-25.** Gavin did not want the finished
