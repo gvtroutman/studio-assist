@@ -847,10 +847,14 @@ class Vision:
 
     def describe(self, path):
         """What one picture file shows, in a sentence or a few."""
+        return self.ask(path, self.DESCRIBE, 400) or "No description returned."
+
+    def ask(self, path, question, max_tokens=400):
+        """The model's answer to `question` about the picture file at `path`."""
         mime = self.MIME.get(os.path.splitext(path)[1].lower(), "image/png")
         with open(path, "rb") as f:
             data = self._encode(f.read(), mime)
-        return self._ask(self.DESCRIBE, mime, data, 400) or "No description returned."
+        return self._ask(question, mime, data, max_tokens)
 
     def describe_all(self, paths):
         """The block `_turn` appends to a brief: one line per picture."""

@@ -82,6 +82,7 @@ class SceneBuilder:
         self.frame_rect = (0, 0, 1, 1, 1.0)      # ox, oy, w, h, scale on the canvas
         self.making = {}              # surface -> words sent, while its picture is made
         self.posing = set()           # ids of the people a photo's pose is being found for
+        self.picturing = False        # a scene is being made from a picture
         self.taken = set()            # ids of the finished picture jobs already used
         self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
         self.bake_after = None
@@ -102,6 +103,8 @@ class SceneBuilder:
         o.button(foot, "Save as…", self.save_as).pack(side="right", padx=(0, o.px(6)))
         o.button(foot, "Save", self.save).pack(side="right", padx=(0, o.px(6)))
         o.button(foot, "Open…", self.open).pack(side="right", padx=(0, o.px(6)))
+        self.picture_pill = o.button(foot, "From a picture…", self.from_picture)
+        self.picture_pill.pack(side="right", padx=(0, o.px(6)))
         o.button(foot, "New", self.new, kind="ghost").pack(side="right", padx=(0, o.px(6)))
         self.model_row = o.frame(foot)
         self.model_row.pack(side="right", padx=(0, o.px(14)))
@@ -1494,6 +1497,83 @@ class SceneBuilder:
         self._inspect()
         self.draw()
         self.status("New scene.", "muted")
+
+    def from_picture(self, path=None):
+        """A new scene made from a photo (`studio_scene.picture_scene`): the
+        pose finder's people, each posed and stood where they are, and the
+        vision model's words for the setting and each person when it can
+        look. Both run off the UI thread; the scene lands through `_pictured`."""
+        if self.picturing:
+            return False
+        if path is None:
+            if not self._ask_save():
+                return False
+            path = filedialog.askopenfilename(
+                parent=self.win, title="A picture to make the scene from",
+                filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                           ("All files", "*.*")])
+        if not path:
+            return False
+        vision = getattr(self.host, "vision", None)
+        box = {}
+
+        def work():
+            try:
+                data, _ = self.owner.studio.find_poses(path)
+                if vision is not None:
+                    folk = sc.photo_people(data)[:sc.PICTURE_PEOPLE]
+                    try:
+                        w, h = data.get("width") or 0, data.get("height") or 0
+                        box["read"] = sc.picture_answer(vision.ask(
+                            path, sc.picture_question(folk, w, h), 2000), w, h)
+                    except Exception as e:          # the words are extra; the scene is not
+                        box["unread"] = "the vision model could not read it (%s)" % e
+                else:
+                    box["unread"] = "no vision model is connected"
+                box["scene"], box["notes"] = sc.picture_scene(data, box.get("read"))
+            except (ig.ComfyError, OSError, ValueError) as e:
+                box["error"] = e
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        self.picturing = True
+        self.picture_pill.set(state="disabled")
+        self.status("Making a scene from %s: finding the people%s…" % (
+            os.path.basename(path), " and reading the picture" if vision else ""), "muted")
+
+        def wait():
+            if not self.win.winfo_exists():
+                return
+            if worker.is_alive():
+                self.win.after(100, wait)
+                return
+            self.picturing = False
+            self.picture_pill.set(state="normal")
+            self._pictured(path, box)
+        self.win.after(100, wait)
+        return True
+
+    def _pictured(self, path, box):
+        name = os.path.basename(path)
+        if "error" in box:
+            self.status("Could not make a scene from %s: %s" % (name, box["error"]), "err")
+            return
+        self.scene, self.path = box["scene"], None
+        self.making = {}
+        self.sel = None
+        self._forget("From %s" % name)
+        self.dirty = True
+        self._title()
+        self._list()
+        self._inspect()
+        self.draw()
+        n = len(sc.people(self.scene))
+        said = ["Made a scene from %s: %d %s posed and placed as in it"
+                % (name, n, "person" if n == 1 else "people")]
+        if "unread" in box:
+            said.append("the words are left to you, as %s" % box["unread"])
+        self.status("; ".join(said) + ". " + " ".join(box["notes"]) + (
+            " The lens and camera tilt are guessed; a flat picture cannot say them."),
+            "warn" if box["notes"] or "unread" in box else "ok")
 
     def open(self, path=None):
         if path is None:

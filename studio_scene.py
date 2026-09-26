@@ -2965,10 +2965,13 @@ class PoseFit:
     person is turned from facing the camera; + is to frame right), `error`
     (the joints' root-mean-square distance from the photo's points, as a
     fraction of the person's height) and `unseen` (the parts the photo did
-    not show, left at rest)."""
+    not show, left at rest); `scale`, the photo's pixels a metre at the
+    person, and `pelvis`, where in the photo their pelvis falls (x, y px) -
+    how big and where they stand, for `picture_scene`."""
 
-    def __init__(self, controls, yaw, error, unseen):
+    def __init__(self, controls, yaw, error, unseen, scale=0.0, pelvis=(0.0, 0.0)):
         self.controls, self.yaw, self.error, self.unseen = controls, yaw, error, unseen
+        self.scale, self.pelvis = scale, pelvis
 
     @property
     def rough(self):
@@ -3006,6 +3009,14 @@ def _misfit(model, target):
     """Mean squared distance of the model's points, seen from the front and
     scaled and moved to fit best, from `target` [(index, x, y, weight)] (y
     down). None when no positive scale fits."""
+    placed = _laid_over(model, target)
+    return placed and placed[0]
+
+
+def _laid_over(model, target):
+    """-> (the misfit, the scale, where the pelvis falls) for the model laid
+    best over `target`: the scale in target units a metre, the pelvis (the
+    model's origin) as a target (x, y). None when no positive scale fits."""
     sw = sum(t[3] for t in target)
     mx = sum(model[i][0] * w for i, _, _, w in target) / sw
     my = sum(-model[i][1] * w for i, _, _, w in target) / sw
@@ -3024,7 +3035,7 @@ def _misfit(model, target):
         ex = s * (model[i][0] - mx) - (x - dx)
         ey = s * (-model[i][1] - my) - (y - dy)
         err += w * (ex * ex + ey * ey)
-    return err / sw
+    return err / sw, s, (dx - s * mx, dy - s * my)
 
 
 def fit_pose(points, shape=None, box=None):
@@ -3112,6 +3123,215 @@ def fit_pose(points, shape=None, box=None):
             state = descend(limbs(state), keys, steps)[0]
         results.append((state, cost(state)))
     state, _ = min(results, key=lambda r: r[1])
-    err = _misfit(pose_points(state, state["_yaw"], shape), target) or 0.0
+    err, scale, (px, py) = (_laid_over(pose_points(state, state["_yaw"], shape), target)
+                            or (0.0, 0.0, (0.0, 0.0)))
     controls = {k: float(round(state[k])) for k in CONTROL_KEYS}
-    return PoseFit(controls, float(round(state["_yaw"])), math.sqrt(err), unseen)
+    return PoseFit(controls, float(round(state["_yaw"])), math.sqrt(err), unseen,
+                   scale * tall, (px * tall, py * tall))
+
+
+# ==================================================== a scene from a picture
+# **From a picture…** makes a whole scene from one photo: every person the
+# pose finder sees (the most prominent `PICTURE_PEOPLE`), each posed by
+# `fit_pose` and stood where they are in it, and - when the vision model can
+# look - the setting, the floor and each person's clothes and doing in words.
+# Where a person stands comes from how big they are in the photo: the fit's
+# scale (pixels a metre, which a bent or turned pose does not fool the way a
+# box's height would) is how far they are from a lens of `PICTURE_LENS`, and
+# the camera is level at the height that puts every pelvis at its own pose's
+# height above the floor. A flat photo cannot say its lens or its tilt, so
+# both are a start to adjust, as each pose is.
+PICTURE_PEOPLE = 10
+PICTURE_LENS = 35.0
+PICTURE_SLOTS = ("subject", "age", "hair", "hair_style", "facial_hair", "top", "bottom",
+                 "outerwear", "footwear", "accessories", "expression")
+PICTURE_QUESTION = (
+    "This photo, %d x %d pixels, is to be rebuilt as a 3D scene and photographed again. "
+    "It shows %d people. Answer with JSON only, no other words, in this shape:\n"
+    '{"setting": "one or two sentences for the picture: the place, the light, the time '
+    'of day, what is around - not the people", "floor": "what the ground is, in a few '
+    'words", "people": [{"box": [left, top, right, bottom], "name": "a short name for '
+    'them, like Accordion player", "doing": "what they are doing and holding, in a few '
+    'words", "subject": "a man, a woman, a young woman, an older man...", "age": "in '
+    'their 30s...", "hair": "its colour", "hair_style": "", "facial_hair": "", "top": "", '
+    '"bottom": "", "outerwear": "", "footwear": "", "accessories": "", "expression": ""}]}\n'
+    "One entry for every person, including anyone seen from behind or cut off at an "
+    "edge; the box is where they are in the photo, in its pixels. Leave a field empty "
+    "when the photo does not show it.")
+# How far apart (in photo widths) a described person's middle may be from a
+# found one's and still be them. The vision model places a person across
+# the frame well and up and down loosely, so across counts for more.
+PICTURE_MATCH = 0.12
+
+
+def picture_question(folk, width, height):
+    """What the vision model is asked about a photo with `folk` in it. It
+    is not given our boxes to number: a 7B model numbered them in its own
+    order and put the band's clothes on the audience. It gives its own
+    boxes, and `match_people` pairs them."""
+    return PICTURE_QUESTION % (int(width or 0), int(height or 0), len(folk))
+
+
+def picture_answer(text, width=0, height=0):
+    """The vision model's reply -> {"setting", "floor", "people": [{...,
+    "box": [x0, y0, x1, y1] as fractions of the photo, or absent}]}, every
+    other value a string; what cannot be read is left out, never raised: a
+    scene without the words is still a scene. A box of numbers no bigger
+    than 100 in a bigger photo is read as percentages."""
+    out = {"setting": "", "floor": "", "people": []}
+    m = re.search(r"\{.*\}", text or "", re.S)
+    try:
+        data = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        return out
+    for k in ("setting", "floor"):
+        if isinstance(data.get(k), str):
+            out[k] = data[k].strip()
+    for p in data.get("people") or []:
+        if not isinstance(p, dict):
+            continue
+        said = {k: _said_word(k, v) for k, v in p.items() if isinstance(v, str)}
+        said = {k: v for k, v in said.items() if v}
+        box = p.get("box") or p.get("bbox_2d") or p.get("bbox")
+        try:
+            box = [float(v) for v in box][:4] if len(box) >= 4 else None
+        except (TypeError, ValueError):
+            box = None
+        if box and box[2] > box[0] and box[3] > box[1]:
+            pct = max(box) <= 100 and max(width, height) > 100
+            w, h = (100.0, 100.0) if pct else (float(width or 1), float(height or 1))
+            said["box"] = [box[0] / w, box[1] / h, box[2] / w, box[3] / h]
+        out["people"].append(said)
+    return out
+
+
+UNSAID = ("", "none", "n/a", "na", "unknown", "not visible", "not shown", "unclear", "-")
+
+
+def _said_word(key, value):
+    """One field of the reply, cleaned: the example's trailing "..." (a 7B
+    model copies "in their 30s..." back), nothing for "none" and the like,
+    and a person as "a man", not "man", as the look's Who slot says it."""
+    v = value.strip().rstrip(".…").strip()
+    if v.lower() in UNSAID:
+        return ""
+    if key == "subject" and not re.match(r"(?i)(a|an|the)\s", v):
+        v = ("an " if v[:1].lower() in "aeiou" else "a ") + v
+    return v
+
+
+def match_people(folk, said, width, height):
+    """{n: what was said of the found person n (1 is folk[0])}: each
+    described person paired with the found one whose middle is nearest,
+    nearest pairs first, one each; too far apart is no one."""
+    w, h = float(width or 1), float(height or 1)
+
+    def mid(b):
+        return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+
+    pairs = []
+    for n, p in enumerate(folk, 1):
+        fx, fy = mid(p["box"])
+        for i, s in enumerate(said):
+            if "box" not in s:
+                continue
+            sx, sy = mid(s["box"])
+            d = abs(fx / w - sx) + 0.35 * abs(fy / h - sy)
+            if d <= PICTURE_MATCH:
+                pairs.append((d, n, i))
+    out, used = {}, set()
+    for _, n, i in sorted(pairs):
+        if n not in out and i not in used:
+            out[n] = said[i]
+            used.add(i)
+    return out
+
+
+def picture_frame(width, height):
+    """The frame whose shape is nearest the photo's."""
+    aspect = float(width) / max(1.0, float(height))
+    return min(FRAMES, key=lambda f: abs(math.log(f[2] / float(f[3]) / aspect)))[0]
+
+
+def pelvis_height(controls, yaw=0.0, shape=None):
+    """How far the pelvis is above the floor in this pose (m)."""
+    shape = shape or REST_SHAPE
+    low = min(p[1] for _, faces, _ in person_pieces(controls, euler(yaw), shape)
+              for f in faces for p in f)
+    return -low * shape["height"]
+
+
+def picture_scene(data, read=None, lens=PICTURE_LENS):
+    """The pose finder's JSON for a photo (and `picture_answer` of it, or
+    None) -> (scene, notes). Raises ValueError when no one in it can be
+    posed: a scene of nobody is not what was asked for."""
+    pw, ph = float(data.get("width") or 0), float(data.get("height") or 0)
+    folk = photo_people(data)
+    if not folk or pw <= 0 or ph <= 0:
+        raise ValueError("The pose finder found no one in the picture.")
+    read = read or {"setting": "", "floor": "", "people": []}
+    words = match_people(folk[:PICTURE_PEOPLE], read["people"], pw, ph)
+    notes = []
+    if len(folk) > PICTURE_PEOPLE:
+        notes.append("%d smaller people were left out; add a background crowd for them."
+                     % (len(folk) - PICTURE_PEOPLE))
+    scene = new_scene(read["setting"])
+    scene["frame"] = picture_frame(pw, ph)
+    fw, fh = FRAME_SIZES[scene["frame"]]
+    g = max(fw / pw, fh / ph)                     # the frame covers the photo, centred
+    ox, oy = (fw - pw * g) / 2, (fh - ph * g) / 2
+    cam = Camera({"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": 1,
+                  "lens": lens}, fw, fh)
+    placed = []
+    for n, p in enumerate(folk[:PICTURE_PEOPLE], 1):
+        try:
+            fit = fit_pose(p["points"], None, p["box"])
+        except ValueError:
+            notes.append("Person %d shows too little of themselves to pose, so is left "
+                         "out." % n)
+            continue
+        if fit.scale <= 0:
+            continue
+        sx, sy = fit.pelvis[0] * g + ox, fit.pelvis[1] * g + oy
+        depth = cam.k / (fit.scale * g)
+        ray = add(cam.f, add(mul(cam.r, (sx - fw / 2) / cam.k),
+                             mul(cam.u, -(sy - fh / 2) / cam.k)))
+        rel = mul(ray, depth)                         # from the eye, the eye at 0
+        placed.append((n, fit, rel, depth, pelvis_height(fit.controls, fit.yaw)))
+    if not placed:
+        raise ValueError("No one in the picture shows enough of themselves to pose from.")
+    # Near people count for more: a far one's height is a few pixels, and
+    # the photo's tilt (taken as level) moves it the most.
+    weight = [fit.scale ** 2 for _, fit, *_ in placed]
+    eye_y = sum(w * (ph_ - rel[1]) for w, (_, _, rel, _, ph_) in zip(weight, placed))         / sum(weight)
+    eye_y = min(30.0, max(0.2, eye_y))
+    dist = placed[0][3]                   # the camera turns about the most prominent
+    scene["camera"] = {"target": [0.0, round(eye_y, 3), 0.0], "yaw": 0.0, "pitch": 0.0,
+                       "distance": round(dist, 3), "lens": lens}
+    if read["floor"]:
+        scene["room"]["floor"]["prompt"] = read["floor"]
+    rough = []
+    for n, fit, rel, _, _ in sorted(placed, key=lambda t: t[3], reverse=True):
+        obj = new_object("person", scene["objects"])
+        said = words.get(n) or {}
+        if said.get("name"):
+            obj["name"], k = said["name"][:40], 2
+            while any(o["name"] == obj["name"] for o in scene["objects"]):
+                obj["name"], k = "%s %d" % (said["name"][:40], k), k + 1
+        elif len(placed) > 1:
+            obj["name"] = "Person %d" % n
+        obj["description"] = said.get("doing", "")
+        obj["look"] = clean_look({k: said[k] for k in PICTURE_SLOTS if k in said})
+        x, z = rel[0], dist + rel[2]
+        obj["position"] = [round(x, 3), 0.0, round(z, 3)]
+        toward = math.degrees(math.atan2(0.0 - x, dist - z))
+        obj["rotation"][0] = round((toward + fit.yaw + 180) % 360 - 180, 1)
+        obj["pose"] = {"preset": "", "controls": fit.controls}
+        scene["objects"].append(obj)
+        if fit.rough:
+            rough.append(obj["name"])
+    if rough:
+        notes.append("The pose is rough for %s: adjust by hand." % ", ".join(rough))
+    return scene, notes
