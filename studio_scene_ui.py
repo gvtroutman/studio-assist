@@ -111,9 +111,25 @@ class SceneBuilder:
         left.pack_propagate(False)
         left.pack(side="left", fill="y", padx=o.px(12), pady=o.px(12))
         o.cap(left, "Library")
-        for a in sc.ASSETS:
-            o.button(left, "+  " + a["label"], lambda a=a["id"]: self.add(a),
-                     anchor="w").pack(side="top", fill="x", pady=(0, o.px(3)))
+        o.button(left, "+  Person", lambda: self.add("person"),
+                 anchor="w").pack(side="top", fill="x", pady=(0, o.px(3)))
+        # Shapes are stand-ins: they hold a place in the frame, and the name
+        # and description say what the thing is. Props are several shapes.
+        for title, ids in (("Shapes (stand-ins)", [a["id"] for a in sc.ASSETS
+                                                   if a["kind"] == "prop" and "parts" not in a]),
+                           ("Props", [a["id"] for a in sc.ASSETS if "parts" in a])):
+            o.label(left, title, "faint", host.f_small).pack(side="top", anchor="w",
+                                                              pady=(o.px(4), o.px(2)))
+            grid = o.frame(left)
+            grid.pack(side="top", fill="x")
+            grid.columnconfigure((0, 1), weight=1, uniform="lib")
+            for i, aid in enumerate(ids):
+                o.button(grid, sc.ASSET[aid]["label"], lambda a=aid: self.add(a),
+                         kind="ghost").grid(row=i // 2, column=i % 2, sticky="ew",
+                                            padx=(0, o.px(3)) if i % 2 == 0 else 0,
+                                            pady=(0, o.px(3)))
+        self.stand_in_btn = o.button(left, "+  Stand-in…", self._stand_in_menu, anchor="w")
+        self.stand_in_btn.pack(side="top", fill="x", pady=(o.px(2), o.px(3)))
         o.cap(left, "In the scene")
         self.lb = tk.Listbox(left, width=1, bd=0, highlightthickness=0, activestyle="none",
                              font=host.f_ui, exportselection=False)
@@ -194,8 +210,17 @@ class SceneBuilder:
         self.win.title("Scene Builder - %s%s" % (name, " *" if self.dirty else ""))
 
     # ============================================================== objects
-    def add(self, asset_id):
-        obj = sc.new_object(asset_id, self.scene["objects"])
+    def _stand_in_menu(self):
+        """A shape already named and sized as a common thing."""
+        m = self.host._menu()
+        for label, aid, _, scale, _ in sc.STAND_INS:
+            m.add_command(label="%s  (%s, %s m)" % (
+                label, sc.ASSET[aid]["label"].lower(), " × ".join("%g" % v for v in scale)),
+                command=lambda a=aid, s=label: self.add(a, s))
+        self.host._popup(m, self.stand_in_btn)
+
+    def add(self, asset_id, stand_in=None):
+        obj = sc.new_object(asset_id, self.scene["objects"], stand_in)
         seeded = asset_id == "person" and not sc.people(self.scene) and self._form_look(obj)
         # Put it where the camera is looking, beside anything already there.
         t = self.scene["camera"]["target"]
@@ -580,7 +605,7 @@ class SceneBuilder:
     def _inspect_object(self, obj):
         o, p = self.owner, self.panel
         a = sc.ASSET[obj["asset"]]
-        o.cap(p, a["label"])
+        o.cap(p, a["label"] if a["kind"] == "person" else "%s - a stand-in" % a["label"])
         name = tk.StringVar(value=obj["name"])
         e = self.host._entry(p, name)
         e.master.pack(side="top", fill="x")
@@ -603,8 +628,9 @@ class SceneBuilder:
         o.label(p, ("Their action, and what matters about them: PPE (hard hat, "
                     "hi-vis, gloves, face shield up or down), what they hold. "
                     "Sent exactly as written." if a["kind"] == "person" else
-                    "What it is and its state: open or closed, on or off, full or "
-                    "empty. Sent exactly as written."),
+                    "The shape only holds its place in the frame: the name and "
+                    "this say what it really is, and its state - open or closed, on "
+                    "or off, full or empty. Sent exactly as written."),
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
                                                                        fill="x")
         if a["kind"] == "person":
