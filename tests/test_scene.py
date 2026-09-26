@@ -321,6 +321,40 @@ class TestRender(unittest.TestCase):
         s["objects"][0]["scale"] = [20, 3, 20]                # the camera is inside it
         self.assertEqual(png_size(sc.png(s)), sc.frame_size(s))
 
+    def test_a_shadow_plants_what_stands_on_the_floor(self):
+        """Without a contact shadow the picture made from the frame draws
+        the person hovering over the ground."""
+        s = staged("person")
+        w, h = sc.frame_size(s)
+        cam = sc.Camera(s["camera"], w, h)
+        x, y, _ = cam.project((0.3, 0, 0.05))               # beside the right foot
+        shadows = [p for p in sc.render(s, w, h) if p.dim]
+        self.assertTrue(shadows)
+        self.assertTrue(all(p.owner is None and p.part == "shadow" for p in shadows))
+        under = pixel(s, x, y)
+        self.assertLess(sum(under), sum(sc.FLOOR))
+        self.assertEqual(pixel(s, 2, h - 3), sc.FLOOR)        # far from it, no shadow
+
+    def test_a_lifted_foot_casts_no_contact_shadow(self):
+        s = staged("person")
+        pieces = sc.painted_pieces(s["objects"][0])
+        cam = sc.Camera(s["camera"], *sc.frame_size(s))
+        both = len(sc.shadow_polys(pieces, cam))
+        s["objects"][0]["pose"]["controls"]["leg_l_step"] = 40
+        one = len(sc.shadow_polys(sc.painted_pieces(s["objects"][0]), cam))
+        self.assertEqual(both - one, len(sc.CONTACT))
+
+    def test_an_object_up_on_a_platform_leaves_no_shadow_on_the_floor(self):
+        s = staged("box")
+        s["objects"][0]["position"][1] = 0.8
+        self.assertFalse([p for p in sc.render(s) if p.dim])
+
+    def test_the_window_draws_a_shadow_as_its_flat_stand_in(self):
+        s = staged("person")
+        shadows = [p for p in sc.render(s) if p.dim]
+        inner = shadows[-1]
+        self.assertLess(sum(inner.rgb), sum(shadows[0].rgb))  # darker inwards
+
     def test_the_reference_is_named_by_its_content(self):
         s = staged("person")
         d = tempfile.mkdtemp()
@@ -541,6 +575,45 @@ class TestWords(unittest.TestCase):
                                        "muscle": 2})
         self.assertEqual(look, {"subject": "a woman", "hair": "black", "weight": -1,
                                 "expression": "shy"})
+
+    def test_a_costume_is_drawn_not_only_said(self):
+        d = sc.outfit({"top": "green dirndl with a pink apron", "bottom": "lederhosen"})
+        self.assertEqual(d["regions"]["chest"], sc.hex_rgb("#4f7d4a"))     # the dirndl's
+        self.assertEqual(d["apron"], sc.hex_rgb("#e39ab0"))                # the apron's
+        self.assertEqual(d["regions"]["upper_arm"], sc.hex_rgb("#ecebe6"))  # the blouse
+        self.assertIsNone(d["braces"])                   # lederhosen under a dress: hidden
+        lh = sc.outfit({"bottom": "lederhosen"})
+        self.assertEqual(lh["braces"], sc.hex_rgb("#5b4030"))
+        self.assertNotIn("shin", lh["regions"])                            # knee length
+        acc = sc.outfit({"accessories": "flower crown, red accordion, two beer steins"})
+        self.assertEqual(acc["hat"], ("crown", None))                      # every colour
+        self.assertEqual(acc["held"]["accordion"], (("r",), sc.hex_rgb("#b0342f")))
+        self.assertEqual(acc["held"]["stein"][0], ("l", "r"))
+        self.assertEqual(sc.outfit({"accessories": "beer stein"})["held"]["stein"][0],
+                         ("r",))
+        self.assertEqual(sc.outfit({"accessories": "german hat"})["hat"][0], "alpine")
+        self.assertEqual(sc.outfit({"accessories": "hat"})["hat"][0], "hat")
+
+    def test_costume_pieces_are_on_the_mannequin(self):
+        plain = staged("person")["objects"][0]
+        dressed = staged("person")["objects"][0]
+        dressed["look"] = {"top": "dirndl", "accessories": "flower crown, accordion, steins"}
+        count = lambda o, part: sum(len(f) for p, f, _ in sc.painted_pieces(o)   # noqa: E731
+                                    if p == part)
+        for part in ("head", "body", "hand_l", "hand_r"):
+            self.assertGreater(count(dressed, part), count(plain, part), part)
+        dressed["look"]["accessories"] = "flower crown"
+        self.assertEqual(sc.bounds(dressed)[0][1], 0.0)          # still on the floor
+
+    def test_an_outfit_replaces_the_clothes_and_keeps_the_person(self):
+        look = {"subject": "a man", "hair": "grey", "top": "hoodie",
+                "outerwear": "raincoat", "accessories": "glasses", "weight": 2}
+        rec = {"looks": {"top": "white t-shirt", "bottom": "blue jeans"}}
+        self.assertEqual(sc.wear_outfit(rec, look),
+                         {"subject": "a man", "hair": "grey", "weight": 2,
+                          "top": "white t-shirt", "bottom": "blue jeans"})
+        self.assertEqual(sc.outfit_looks(look), {"top": "hoodie", "outerwear": "raincoat",
+                                                 "accessories": "glasses"})
 
     def test_people_in_the_scene_blank_the_forms_person(self):
         s = staged("person")
@@ -936,6 +1009,29 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb._clear_look()
         self.assertEqual((second["look"], second["character"]), ({}, ""))
         ui.studio.lib.save("characters", [])
+
+    def test_save_and_put_on_an_outfit_preset(self):
+        ui, sb = self.builder()
+        ui.studio.lib.save("outfits", [])
+        self.addCleanup(ui.studio.lib.save, "outfits", ig._default_outfits())
+        a, b = sb.add("person"), sb.add("person")
+        a["look"] = {"subject": "a woman", "top": "red sweater", "footwear": "heels"}
+        sb.select(a["id"])
+        sb._save_outfit("Red night")
+        self.assertEqual([(r["id"], r["looks"]) for r in ui.studio.lib.all("outfits")],
+                         [("red-night", {"top": "red sweater", "footwear": "heels"})])
+        b["look"] = {"subject": "a man", "top": "hoodie", "bottom": "shorts"}
+        sb.select(b["id"])
+        sb._put_on_outfit("red-night")
+        self.assertEqual(b["look"], {"subject": "a man", "top": "red sweater",
+                                     "footwear": "heels"})
+        self.assertTrue(sb.dirty)
+        self.assertEqual(sb.outfit_name, "Red night")
+        from unittest import mock
+        with mock.patch("studio_scene_ui.messagebox.askyesno", return_value=True):
+            sb._delete_outfit("red NIGHT")
+        self.assertEqual(ui.studio.lib.all("outfits"), [])
+        self.assertEqual(b["look"]["top"], "red sweater")    # wearers keep their clothes
 
     def test_empty_space_orbits_and_the_wheel_zooms(self):
         ui, sb = self.builder()

@@ -366,6 +366,20 @@ def clean_character(d):
     }
 
 
+def clean_outfit(d):
+    """A clothes preset: a name and what it puts in each OUTFIT_KEYS slot.
+    Putting it on replaces all of those slots, so a slot it leaves empty
+    is taken off (a summer outfit has no coat)."""
+    if not isinstance(d, dict) or not _str(d.get("name")):
+        return None
+    looks = d.get("looks") if isinstance(d.get("looks"), dict) else {}
+    return {
+        "id": slug(d.get("id") or d["name"]),
+        "name": _str(d["name"]),
+        "looks": {k: _str(looks[k]) for k in OUTFIT_KEYS if _str(looks.get(k))},
+    }
+
+
 def style_example(style):
     """The picture that shows what `style` looks like: its own `example` when
     that file is there, else the one shipped for its id (the same cat photo
@@ -379,7 +393,7 @@ def style_example(style):
 
 CLEAN = {"backends": clean_backend, "models": clean_model, "loras": clean_lora,
          "identities": clean_identity, "styles": clean_style,
-         "characters": clean_character}
+         "characters": clean_character, "outfits": clean_outfit}
 
 
 def _default_backends():
@@ -400,6 +414,38 @@ def _default_backends():
                   "LM Studio's models first, and the text encoder runs on the CPU.",
          "start": "Start ComfyUI on the LLM PC with --listen.",
          "shares_llm_gpu": True, "encoder_on_cpu": True, "max_megapixels": 4.2},
+    ]
+
+
+def _default_outfits():
+    # Starters, worded so the Scene Builder's mannequin can draw them: its
+    # colour words, shoe kinds and hats (studio_scene CLOTH, SHOES, HATS).
+    return [
+        {"id": "casual", "name": "Casual",
+         "looks": {"top": "white t-shirt", "bottom": "blue jeans",
+                   "footwear": "white sneakers"}},
+        {"id": "smart", "name": "Smart",
+         "looks": {"top": "white button-down shirt", "bottom": "charcoal tailored trousers",
+                   "outerwear": "navy blazer", "footwear": "brown leather loafers",
+                   "accessories": "wristwatch"}},
+        {"id": "winter", "name": "Winter",
+         "looks": {"top": "grey knit sweater", "bottom": "black jeans",
+                   "outerwear": "camel wool overcoat", "footwear": "brown leather boots",
+                   "accessories": "beanie, scarf"}},
+        {"id": "summer", "name": "Summer",
+         "looks": {"top": "white summer dress", "footwear": "tan sandals",
+                   "accessories": "sunglasses"}},
+        {"id": "site-ppe", "name": "Site PPE",
+         "looks": {"top": "grey t-shirt", "bottom": "khaki cargo pants",
+                   "outerwear": "hi-vis vest", "footwear": "brown work boots",
+                   "accessories": "hard hat, safety glasses, gloves"}},
+        {"id": "oktoberfest-dirndl", "name": "Oktoberfest dirndl",
+         "looks": {"top": "green dirndl with a white blouse and a white apron",
+                   "footwear": "black shoes", "accessories": "flower crown, beer steins"}},
+        {"id": "oktoberfest-lederhosen", "name": "Oktoberfest lederhosen",
+         "looks": {"top": "white linen shirt", "bottom": "lederhosen",
+                   "footwear": "brown leather boots",
+                   "accessories": "german hat, accordion"}},
     ]
 
 
@@ -456,11 +502,12 @@ def _default_styles():
 
 
 DEFAULTS = {"backends": _default_backends, "models": _default_models, "loras": list,
-            "identities": list, "styles": _default_styles, "characters": list}
+            "identities": list, "styles": _default_styles, "characters": list,
+            "outfits": _default_outfits}
 
 
 class Library:
-    """The six configuration lists, each `<kind>.json` under `studio_dir()`.
+    """The configuration lists (`CLEAN`), each `<kind>.json` under `studio_dir()`.
     A missing file is the defaults; a list the user edits is written whole,
     atomically. Best effort both ways: an unreadable file is the defaults and
     a line in `problems`, an unwritable one raises for the editor to say."""
@@ -1383,6 +1430,10 @@ SLIDER_SECTION = "Body"
 # does not keep these, and choosing one leaves them as they are.
 PER_PICTURE = ("expression", "gaze")
 CHARACTER_KEYS = [k for k in SLOTS if k not in PER_PICTURE] + [k for k, _, _ in SLIDERS]
+# What a clothes preset (the `outfits` library) holds: the Clothes and
+# Accessories sections' slots.
+OUTFIT_KEYS = [k for name, slots in LOOKS if name in ("Clothes", "Accessories")
+               for k, *_ in slots]
 # The slots a reference picture can show: each item worn or carried.
 ITEM_SLOTS = ("top", "bottom", "outerwear", "footwear", "accessories")
 
