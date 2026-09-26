@@ -3,6 +3,7 @@ a PNG, scene files, the words sent with the frame, and the window driven in
 process through the Image Studio against a fake ComfyUI. No network, no GPU."""
 
 import json
+import math
 import os
 import struct
 import sys
@@ -618,6 +619,103 @@ class TestIntoCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(st["scene_texture"], "floor")
 
 
+def photo_of(controls, yaw, scale=300, drop=()):
+    """A pose finder's 133 points for the mannequin in `controls`, turned
+    `yaw`, seen from the front in picture pixels; `drop` points unseen."""
+    pts = [[0.0, 0.0, 0.0] for _ in range(133)]
+    for i, p in sc.pose_points(controls, yaw).items():
+        if i not in drop:
+            pts[i] = [600 + scale * p[0], 500 - scale * p[1], 0.9]
+    return pts
+
+
+def joints_apart(a, b):
+    """The farthest any joint of pose `a` is from its place in pose `b`, in
+    metres, as a front view shows them (x and y): what a photo can show."""
+    pa, pb = sc.pose_points(*a), sc.pose_points(*b)
+    return max(math.hypot(pa[i][0] - pb[i][0], pa[i][1] - pb[i][1]) for i in pa)
+
+
+class TestPoseFromPhoto(unittest.TestCase):
+    def test_a_pose_comes_back_from_its_own_picture(self):
+        for preset, yaw in (("walking", 0), ("pointing", 40), ("sitting", -70),
+                            ("carrying", 160)):
+            with self.subTest(pose=preset, yaw=yaw):
+                c = sc.pose_controls(preset)
+                fit = sc.fit_pose(photo_of(c, yaw))
+                self.assertLess(abs((fit.yaw - yaw + 180) % 360 - 180), 15)
+                self.assertLess(joints_apart((fit.controls, fit.yaw), (c, yaw)), 0.07)
+                self.assertFalse(fit.rough)
+                self.assertEqual(fit.unseen, [])
+                self.assertEqual(set(fit.controls), set(sc.CONTROL_KEYS))
+
+    def test_the_fit_does_not_care_where_or_how_big_the_person_is(self):
+        c = sc.pose_controls("working")
+        small = sc.fit_pose(photo_of(c, 30, scale=80))
+        big = sc.fit_pose(photo_of(c, 30, scale=900))
+        self.assertLess(joints_apart((small.controls, small.yaw), (big.controls, big.yaw)),
+                        0.05)
+
+    def test_a_part_the_photo_does_not_show_stays_at_rest_and_is_said(self):
+        c = sc.pose_controls("walking")
+        fit = sc.fit_pose(photo_of(c, 0, drop=(13, 15)))        # the left knee and ankle
+        self.assertEqual(fit.unseen, ["the left leg"])
+        rest = sc.pose_controls("standing")
+        for k in ("leg_l_step", "leg_l_out", "leg_l_bend"):
+            self.assertEqual(fit.controls[k], rest[k])
+
+    def test_too_little_of_a_person_is_refused_in_words(self):
+        pts = photo_of(sc.pose_controls("standing"), 0, drop=range(3, 17))
+        with self.assertRaisesRegex(ValueError, "does not show enough"):
+            sc.fit_pose(pts)
+
+    def test_the_most_prominent_person_comes_first(self):
+        pts = [[0, 0, 0]] * 133
+        data = json.dumps({"people": [
+            {"box": [0, 0, 50, 100], "score": 0.9, "points": pts},
+            {"box": [0, 0, 300, 600], "score": 0.8, "points": pts},
+            {"box": [0, 0, 1], "score": 0.99, "points": pts},          # malformed
+            {"box": [0, 0, 400, 800], "score": 0.9, "points": pts[:5]}]})  # too few
+        folk = sc.photo_people(data)
+        self.assertEqual([p["box"][2] for p in folk], [300, 50])
+        self.assertEqual(sc.photo_people({"people": []}), [])
+
+
+class PoseClient(FakeClient):
+    """A ComfyUI with the pose finder, answering with one person."""
+    answer = None
+
+    def node_types(self):
+        return FakeClient.node_types(self) | {"LoadImage", ig.POSE_NODE}
+
+    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        return {"status": {"completed": True},
+                "outputs": {"2": {"text": [json.dumps(PoseClient.answer)]}}}
+
+
+class TestFindPoses(TempStudioMixin, unittest.TestCase):
+    def photo(self):
+        path = os.path.join(self.dir, "pose.png")
+        with open(path, "wb") as f:
+            f.write(b"not really a png")
+        return path
+
+    def test_a_backend_without_the_finder_is_named_with_how_to_add_it(self):
+        with self.assertRaisesRegex(ig.ComfyError, "custom_nodes.*restart ComfyUI"):
+            self.studio.find_poses(self.photo())
+
+    def test_the_finder_is_one_load_and_one_node_and_its_json_comes_back(self):
+        self.studio.client_factory = PoseClient
+        PoseClient.answer = {"width": 10, "height": 20, "people": []}
+        data, b = self.studio.find_poses(self.photo())
+        self.assertEqual(data["height"], 20)
+        graph = PoseClient.instances[-1].graphs[-1]
+        self.assertEqual(graph["2"], {"class_type": ig.POSE_NODE,
+                                      "inputs": {"image": ["1", 0]}})
+        self.assertEqual(graph["1"]["class_type"], "LoadImage")
+        self.assertTrue(b["enabled"])
+
+
 def sc_room():
     import studio_scene_ui
     return studio_scene_ui.ROOM
@@ -716,6 +814,38 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertIsNone(ui.scene_builder)
         self.assertFalse(sb.win.winfo_exists())
         self.assertIsNot(ui.build_scene(), sb)
+
+    def test_a_photo_poses_the_person_and_turns_them_as_in_it(self):
+        ui, sb = self.builder()
+        person = sb.add("person")
+        person["position"] = [1.5, 0.0, 0.0]            # off the camera's axis
+        c = sc.pose_controls("pointing")
+        other = photo_of(sc.pose_controls("standing"), 0, scale=60)
+        answer = {"people": [{"box": [0, 0, 60, 100], "score": 0.9, "points": other},
+                             {"box": [300, 0, 900, 900], "score": 0.9,
+                              "points": photo_of(c, 40)}]}
+        real = ui.studio.find_poses
+        ui.studio.find_poses = lambda path, stop=None: (answer, {"name": "5090"})
+        self.addCleanup(setattr, ui.studio, "find_poses", real)
+        self.assertTrue(sb.pose_from_photo(person["id"], path="C:/photos/point.jpg"))
+        self.assertIn(person["id"], sb.posing)
+        self.assertFalse(sb.pose_from_photo(person["id"], path="C:/again.jpg"))  # one at a time
+        self.pump(lambda: person["id"] not in sb.posing, 30)
+        self.assertEqual(person["pose"]["preset"], "")
+        got = (person["pose"]["controls"], 40)
+        self.assertLess(joints_apart(got, (c, 40)), 0.07)       # the big one, not the small
+        eye = sc.Camera(sb.scene["camera"], *sc.frame_size(sb.scene)).eye
+        toward = math.degrees(math.atan2(eye[0] - 1.5, eye[2]))
+        turned = (person["rotation"][0] - toward + 180) % 360 - 180
+        self.assertLess(abs(turned - 40), 15)               # + is to frame right
+        text = sb.msg.cget("text")
+        self.assertIn("Posed Person from point.jpg", text.replace(person["name"], "Person"))
+        self.assertIn("most prominent of 2 people", text)
+
+        ui.studio.find_poses = lambda path, stop=None: ({"people": []}, {"name": "5090"})
+        sb.pose_from_photo(person["id"], path="C:/photos/empty.jpg")
+        self.pump(lambda: person["id"] not in sb.posing, 10)
+        self.assertIn("found no one in empty.jpg", sb.msg.cget("text"))
 
     def test_click_a_hand_to_pose_it_and_drag_to_move(self):
         ui, sb = self.builder()

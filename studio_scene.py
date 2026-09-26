@@ -1737,3 +1737,195 @@ def generation(scene, reference, characters=None):
                 idents.append(rec["identity"])
         extra["scene_identities"] = idents
     return words, reference, extra
+
+
+# ==================================================================== pose from a photo
+# A photo's pose, as the mannequin's controls. ComfyUI's `StudioDWPoseKeypoints`
+# node (comfy_nodes/studio_dwpose) finds each person's COCO-WholeBody points in
+# the picture; `fit_pose` searches the controls and the way the person faces
+# for the pose whose joints, seen from the front with no perspective, fall on
+# them. A flat picture cannot say how far a limb reaches towards the camera,
+# so the search leans a little towards the rest pose and away from arms thrown
+# back: the fit is a start to adjust, not a measurement.
+SEEN = 0.3                    # a point DWPose is less sure of than this is not used
+KP_JOINTS = {5: "shoulder_l", 6: "shoulder_r", 7: "elbow_l", 8: "elbow_r",
+             9: "wrist_l", 10: "wrist_r", 11: "hip_l", 12: "hip_r",
+             13: "knee_l", 14: "knee_r", 15: "ankle_l", 16: "ankle_r"}
+KP_HEAD = {0: (0, 0.09, 0.135),                                 # the nose's tip
+           1: (0.032, 0.125, 0.095), 2: (-0.032, 0.125, 0.095),  # the eyes
+           3: (0.085, 0.10, 0.0), 4: (-0.085, 0.10, 0.0)}        # the ears
+# Which points show each group of controls; a group none of them shows is
+# left at rest and said so.
+KP_GROUPS = [("head", "the head", (0, 1, 2, 3, 4), ("head_turn", "head_nod", "head_tilt")),
+             ("body", "the body", (5, 6, 11, 12), ("bend", "twist", "lean"))]
+for _side, _name, _o in (("l", "left", 0), ("r", "right", 1)):
+    KP_GROUPS += [
+        ("hand_" + _side, "the %s arm" % _name, (7 + _o, 9 + _o),
+         ("arm_%s_raise" % _side, "arm_%s_out" % _side, "arm_%s_bend" % _side)),
+        ("foot_" + _side, "the %s leg" % _name, (13 + _o, 15 + _o),
+         ("leg_%s_step" % _side, "leg_%s_out" % _side, "leg_%s_bend" % _side))]
+PRIOR = 1.5e-4                 # per (90 degrees from rest)^2, against a misfit in heights^2
+BACKWARDS = 4e-4               # per (45 degrees)^2 an arm is swung back, or the body leans back
+LIMB_TRIES = {
+    "arm": [(r, o, b) for r in (-30, 20, 60, 100, 140, 175) for o in (0, 45, 90)
+            for b in (0, 60, 120)],
+    "leg": [(s, o, b) for s in (-30, 0, 30, 60, 90, 115) for o in (0, 25, 45)
+            for b in (0, 45, 90, 135)],
+}
+
+
+class PoseFit:
+    """What `fit_pose` found: `controls` (every CONTROL_KEYS), `yaw` (deg the
+    person is turned from facing the camera; + is to frame right), `error`
+    (the joints' root-mean-square distance from the photo's points, as a
+    fraction of the person's height) and `unseen` (the parts the photo did
+    not show, left at rest)."""
+
+    def __init__(self, controls, yaw, error, unseen):
+        self.controls, self.yaw, self.error, self.unseen = controls, yaw, error, unseen
+
+    @property
+    def rough(self):
+        return self.error > 0.05
+
+
+def photo_people(data):
+    """The node's JSON (text or parsed) -> its people, most prominent first
+    (the biggest box, weighed by how sure the finder was), each
+    {"box": [x0, y0, x1, y1], "score", "points": [[x, y, score] * 133]}."""
+    if isinstance(data, (str, bytes)):
+        data = json.loads(data)
+    folk = [p for p in (data or {}).get("people") or []
+            if isinstance(p, dict) and len(p.get("points") or ()) >= 17
+            and len(p.get("box") or ()) == 4]
+
+    def size(p):
+        b = p["box"]
+        return (b[2] - b[0]) * (b[3] - b[1]) * p.get("score", 1)
+    return sorted(folk, key=size, reverse=True)
+
+
+def pose_points(controls, yaw=0.0, shape=None):
+    """{COCO point index: world position} of the mannequin, pelvis at the
+    origin, turned `yaw` degrees."""
+    sk = skeleton(controls, euler(yaw), shape)
+    out = {i: sk[j][0] for i, j in KP_JOINTS.items()}
+    hp, hm = sk["head"]
+    for i, v in KP_HEAD.items():
+        out[i] = add(hp, apply(hm, v))
+    return out
+
+
+def _misfit(model, target):
+    """Mean squared distance of the model's points, seen from the front and
+    scaled and moved to fit best, from `target` [(index, x, y, weight)] (y
+    down). None when no positive scale fits."""
+    sw = sum(t[3] for t in target)
+    mx = sum(model[i][0] * w for i, _, _, w in target) / sw
+    my = sum(-model[i][1] * w for i, _, _, w in target) / sw
+    dx = sum(x * w for _, x, _, w in target) / sw
+    dy = sum(y * w for _, _, y, w in target) / sw
+    num = den = 0.0
+    for i, x, y, w in target:
+        ax, ay = model[i][0] - mx, -model[i][1] - my
+        num += w * (ax * (x - dx) + ay * (y - dy))
+        den += w * (ax * ax + ay * ay)
+    if den <= 0 or num <= 0:
+        return None
+    s = num / den
+    err = 0.0
+    for i, x, y, w in target:
+        ex = s * (model[i][0] - mx) - (x - dx)
+        ey = s * (-model[i][1] - my) - (y - dy)
+        err += w * (ex * ex + ey * ey)
+    return err / sw
+
+
+def fit_pose(points, shape=None, box=None):
+    """A person's 133 [x, y, score] (DWPose's order) -> PoseFit. `box` is
+    their [x0, y0, x1, y1]; its height is the unit the fit is judged in.
+    Raises ValueError when too little of the body is seen to fit anything."""
+    seen = {i: (float(p[0]), float(p[1]), float(p[2])) for i, p in enumerate(points[:17])
+            if len(p) >= 3 and p[2] >= SEEN}
+    if sum(i in seen for i in (5, 6, 11, 12)) < 2 or len(seen) < 5:
+        raise ValueError("The photo does not show enough of the person to pose from "
+                         "(it needs the shoulders or hips and a few more joints).")
+    ys = [p[1] for p in seen.values()]
+    tall = max((box[3] - box[1]) if box else 0, max(ys) - min(ys), 1.0)
+    target = [(i, x / tall, y / tall, s) for i, (x, y, s) in seen.items()]
+    rest = pose_controls("standing")
+    free, unseen = [], []
+    for _part, name, idx, keys in KP_GROUPS:
+        if any(i in seen for i in idx):
+            free += keys
+        else:
+            unseen.append(name)
+
+    core = [t for t in target if t[0] in (0, 1, 2, 3, 4, 5, 6, 11, 12)]
+
+    def cost(state, target=target):
+        m = _misfit(pose_points(state, state["_yaw"], shape), target)
+        if m is None:
+            return float("inf")
+        prior = sum(((state[k] - rest[k]) / 90.0) ** 2 for k in free) * PRIOR
+        back = [state["bend"]] + [state["arm_%s_raise" % s] for s in ("l", "r")]
+        prior += sum(min(0.0, v) ** 2 for v in back) / 45.0 ** 2 * BACKWARDS
+        return m + prior
+
+    def move(state, k, d):
+        trial = dict(state)
+        if k == "_yaw":
+            trial[k] = (state[k] + d + 180) % 360 - 180
+        else:
+            lo, hi = CONTROL_RANGE[k]
+            trial[k] = min(hi, max(lo, state[k] + d))
+        return trial
+
+    def descend(state, keys, steps, target=target):
+        """Coordinate descent: each key a step either way while that helps,
+        then smaller steps."""
+        best = cost(state, target)
+        for step in steps:
+            for _ in range(8):
+                better = False
+                for k in keys:
+                    for d in (step, -step):
+                        trial = move(state, k, d)
+                        c = cost(trial, target)
+                        if c < best - 1e-12:
+                            state, best, better = trial, c, True
+                            break
+                if not better:
+                    break
+        return state, best
+
+    def limbs(state):
+        """Each limb from a spread of starts, the rest held: a limb towards
+        or away from the camera looks alike from the front."""
+        for _part, _name, _idx, limb in KP_GROUPS[2:]:
+            if limb[0] not in free:
+                continue
+            kind = "arm" if limb[0].startswith("arm") else "leg"
+            tries = LIMB_TRIES[kind] + [tuple(state[k] for k in limb)]
+            ranked = sorted(tries, key=lambda v: cost(dict(state, **dict(zip(limb, v)))))
+            state = min((descend(dict(state, **dict(zip(limb, v))), limb, (12, 6, 3))
+                         for v in ranked[:2]), key=lambda r: r[1])[0]
+        return state
+
+    # Every way the person might face, on the head, shoulders and hips alone
+    # (a limb still at rest would pull the torso to make up for it); then,
+    # from the best three, the limbs, and all of it together, twice.
+    keys = ["_yaw"] + free
+    trunk = ["_yaw"] + [k for k in ("bend", "twist", "lean", "head_turn", "head_nod",
+                                    "head_tilt") if k in free]
+    starts = sorted((descend(dict(rest, _yaw=float(yaw)), trunk, (24, 12, 6), core)
+                     for yaw in range(-180, 180, 30)), key=lambda r: r[1])
+    results = []
+    for state, _ in starts[:3]:
+        for steps in ((12, 6, 3), (8, 4, 2, 1)):
+            state = descend(limbs(state), keys, steps)[0]
+        results.append((state, cost(state)))
+    state, _ = min(results, key=lambda r: r[1])
+    err = _misfit(pose_points(state, state["_yaw"], shape), target) or 0.0
+    controls = {k: float(round(state[k])) for k in CONTROL_KEYS}
+    return PoseFit(controls, float(round(state["_yaw"])), math.sqrt(err), unseen)
