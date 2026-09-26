@@ -486,6 +486,13 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   hair"), then the scene, then the camera line, then the anatomy constants, then the
   style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
+- **Pick person cuts one person out of a reference photo.** In the Identities editor,
+  `Studio.find_people` runs SAM3 (`person:8`) on the selected photo on the first online
+  backend with a sam3 checkpoint; with more than one person a window shows numbered
+  boxes and a click picks (`pick_box`). `cut_person` crops round that box, masks the
+  main person (`person:1`) and lays them on white, so a neighbour's shoulder goes too.
+  The cut-out takes the photo's place in the list (first = face reference); the photo
+  stays after it. The runs are polled on `/history`, not the job queue: seconds long.
 - **The look is a video game's character creator.** `LOOKS` is the sections (Body,
   Face, Hair, Expression, Clothes, Accessories) of slots, each `(setting, label,
   nouns, picks, many)`; every slot also takes free text, and a `many` slot

@@ -1072,3 +1072,73 @@ class TestImageStudioTab(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PersonCutoutTest(unittest.TestCase):
+    """The Identities editor's Pick person: find everyone, pick one, cut out."""
+
+    def test_people_found_orders_largest_first_and_drops_slivers(self):
+        entry = {"outputs": {
+            "5": {"text": [json.dumps([[{"x": 0, "y": 0, "width": 10, "height": 10},
+                                        {"x": 50, "y": 0, "width": 100, "height": 200},
+                                        {"x": 200, "y": 0, "width": 80, "height": 190}]])]},
+            "7": {"text": ["400"]}, "8": {"text": ["300"]},
+            "9": {"images": [{"filename": "p.png", "type": "temp"}]}}}
+        w, h, boxes, pv = ig.people_found(entry)
+        self.assertEqual((w, h), (400, 300))
+        self.assertEqual(boxes, [(50, 0, 100, 200), (200, 0, 80, 190)])
+        self.assertEqual(pv["filename"], "p.png")
+        self.assertIsNone(ig.people_found({"outputs": {}}))
+
+    def test_pick_box_prefers_smallest_containing_then_nearest(self):
+        boxes = [(0, 0, 100, 100), (10, 10, 20, 20), (300, 300, 10, 10)]
+        self.assertEqual(ig.pick_box(boxes, 15, 15), (10, 10, 20, 20))
+        self.assertEqual(ig.pick_box(boxes, 50, 50), (0, 0, 100, 100))
+        self.assertEqual(ig.pick_box(boxes, 290, 290), (300, 300, 10, 10))
+
+    def test_cutout_region_pads_and_stays_inside(self):
+        r = ig.cutout_region((0, 10, 100, 200), 150, 205)
+        self.assertEqual(r, {"x": 0, "y": 2, "width": 108, "height": 203})
+
+    def test_cutout_graph_crops_masks_and_saves(self):
+        g = ig.cutout_graph("a.png", "sam3.pt", {"x": 1, "y": 2, "width": 3, "height": 4})
+        self.assertEqual(g["6"]["inputs"]["width"], 3)
+        self.assertEqual(g["7"]["inputs"]["mask"], ["5", 0])
+        self.assertEqual(g["8"]["class_type"], "SaveImage")
+
+    def test_find_then_cut_through_a_fake_backend(self):
+        class Fake:
+            def __init__(self, backend):
+                self.backend, self.graphs = backend, []
+                self.url = backend["url"].rstrip("/")
+
+            def upload_image(self, path):
+                return "up.png"
+
+            def queue_workflow(self, graph):
+                self.graphs.append(graph)
+                return str(len(self.graphs))
+
+            def get_history(self, pid):
+                if pid == "1":
+                    return {"outputs": {
+                        "5": {"text": [json.dumps([{"x": 5, "y": 5, "width": 50,
+                                                     "height": 90}])]},
+                        "7": {"text": ["100"]}, "8": {"text": ["100"]},
+                        "9": {"images": [{"filename": "pv.png", "type": "temp"}]}}}
+                return {"outputs": {"8": {"images": [{"filename": "cut.png"}]}}}
+
+            def fetch(self, f):
+                return f["filename"].encode()
+
+        with tempfile.TemporaryDirectory() as d:
+            s = ig.Studio(root=d, client_factory=Fake)
+            b = s.backends()[0]
+            s.health[b["id"]] = {"ok": True}
+            s.inventories[b["id"]] = {"checkpoints": {"sam3.pt", "flux.safetensors"}}
+            found = s.find_people(__file__)
+            self.assertEqual(found["boxes"], [(5, 5, 50, 90)])
+            self.assertEqual(found["preview"], b"pv.png")
+            self.assertEqual(s.cut_person(found, found["boxes"][0]), b"cut.png")
+            region = s.client(b).graphs[1]["2"]["inputs"]["crop_region"]
+            self.assertEqual(region, {"x": 2, "y": 2, "width": 56, "height": 96})

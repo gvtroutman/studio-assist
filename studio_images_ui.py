@@ -153,6 +153,8 @@ class ImageStudio:
         elif what == "editor-refresh":
             if arg.win.winfo_exists():
                 arg.refresh()
+        elif what == "call":
+            arg()
         elif what == "library":
             self._rebuild_choices()
             self._recheck()
@@ -308,8 +310,16 @@ class ImageStudio:
                    "picture.", "faint", self.host.f_small, wraplength=self.px(250)).pack(
             side="left", padx=(self.px(6), 0))
 
-        self.cap(f, "Person").pack(**pad)
-        crow = self.frame(f)
+        prow = self.frame(f)
+        prow.pack(side="top", fill="x", pady=(self.px(12), 0), **pad)
+        self.pc_pill = self.button(prow, "Person and camera  ▸",
+                                   self._toggle_person, kind="ghost")
+        self.pc_pill.pack(side="left")
+        # Hidden until asked for; what is in it still goes into the prompt.
+        self.pc_open = False
+        self.pc_box = pb = self.frame(f)
+        self.cap(pb, "Person").pack(**pad)
+        crow = self.frame(pb)
         crow.pack(side="top", fill="x", **pad)
         self.char_row = self.frame(crow)
         self.char_row.pack(side="left")
@@ -317,9 +327,9 @@ class ImageStudio:
             side="left", padx=(self.px(6), 0))
         self.button(crow, "Save as…", self.save_as_character, kind="ghost").pack(
             side="left", padx=(self.px(4), 0))
-        self.person_box = self.frame(f)
+        self.person_box = self.frame(pb)
         self.person_box.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
-        self.label(f, "Who, and what they look like. Any of these can stay blank; a "
+        self.label(pb, "Who, and what they look like. Any of these can stay blank; a "
                    "character fills all but the expression.", "faint", self.host.f_small,
                    wraplength=self.px(380)).pack(side="top", fill="x",
                                                  pady=(self.px(6), 0), **pad)
@@ -327,27 +337,27 @@ class ImageStudio:
             self.text[key] = tk.StringVar()
         for key in ig.SLIDER_KEYS:
             self.sliders[key] = tk.IntVar(value=0)
-        self.look_tabs = self.frame(f)
+        self.look_tabs = self.frame(pb)
         self.look_tabs.pack(side="top", fill="x", **pad)
-        self.look_box = self.frame(f)
+        self.look_box = self.frame(pb)
         self.look_box.pack(side="top", fill="x", **pad)
         self._show_looks(self.look_section)
-        b = tk.Checkbutton(f, text="Anatomy constants", variable=self.anatomy, anchor="w",
+        b = tk.Checkbutton(pb, text="Anatomy constants", variable=self.anatomy, anchor="w",
                            font=self.host.f_ui, bd=0, highlightthickness=0,
                            command=self._recheck)
         self.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
                   activeforeground="text")
         b.pack(side="top", fill="x", pady=(self.px(8), 0), **pad)
-        self.label(f, "Every person: " + ig._and([pos for _, pos, _ in ig.ANATOMY]) + ".",
+        self.label(pb, "Every person: " + ig._and([pos for _, pos, _ in ig.ANATOMY]) + ".",
                    "faint", self.host.f_small, wraplength=self.px(380)).pack(
             side="top", fill="x", **pad)
 
-        self.cap(f, "Camera").pack(**pad)
+        self.cap(pb, "Camera").pack(**pad)
         self.text["camera"] = tk.StringVar()
-        e = self.host._entry(f, self.text["camera"])
+        e = self.host._entry(pb, self.text["camera"])
         e.master.pack(side="top", fill="x", **pad)
         e.bind("<KeyRelease>", lambda ev: self._recheck())
-        self.label(f, "Lens, angle, light, film: \u201c85mm, shallow depth of field, "
+        self.label(pb, "Lens, angle, light, film: \u201c85mm, shallow depth of field, "
                    "golden hour\u201d.", "faint", self.host.f_small,
                    wraplength=self.px(380)).pack(side="top", fill="x", **pad)
 
@@ -835,6 +845,14 @@ class ImageStudio:
         self.adv["seed"].set(str(ig.random.randint(0, ig.MAX_SEED)))
         self.random_seed.set(False)
         self._recheck()
+
+    def _toggle_person(self):
+        self.pc_open = not self.pc_open
+        self.pc_pill.set(text="Person and camera  " + ("▾" if self.pc_open else "▸"))
+        if self.pc_open:
+            self.pc_box.pack(side="top", fill="x", after=self.pc_pill.master)
+        else:
+            self.pc_box.pack_forget()
 
     def _toggle_advanced(self):
         self.adv_open = not self.adv_open
@@ -1567,7 +1585,109 @@ class ImageStudio:
             ("use_references", "Use the first photo as the face reference", "bool"),
             ("reference_strength", "Face reference strength", "number"),
             ("notes", "Notes", "long"),
-        ], template={"name": "New person", "strength": 0.85})
+        ], template={"name": "New person", "strength": 0.85},
+            extra=("Pick person…", self._pick_person))
+
+    # ------------------------------------------------------- person cut-out
+    def _pick_person(self, editor):
+        """The selected reference photo (else the first) cut down to one
+        person on white: SAM3 finds everyone; with more than one, a click
+        says who. The cut-out takes the photo's place in the list, so it is
+        the face reference when the photo was; the photo stays after it."""
+        w = editor.widgets.get("references")
+        pics = w[1] if w else None
+        if not pics or not pics["paths"]:
+            editor.status("Add a reference photo first.", "warn")
+            return
+        i = min(pics["sel"]) if pics["sel"] else 0
+        path = pics["paths"][i]
+        rec = editor.records[editor.current]
+        editor.status("Finding the people in the photo" + ELLIPSIS)
+
+        def later(fn):
+            self._post("call", lambda: editor.win.winfo_exists() and fn())
+
+        def cut(found, box):
+            try:
+                data = self.studio.cut_person(found, box)
+                tmp = os.path.join(self.studio.lib.root, "references", "_cutout.png")
+                os.makedirs(os.path.dirname(tmp), exist_ok=True)
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                kept = self.studio.lib.keep_reference(tmp, rec.get("name") or "person")
+                os.remove(tmp)
+            except (ig.ComfyError, OSError) as e:
+                later(lambda: editor.status("The cut-out failed: %s" % e, "err"))
+                return
+
+            def done():
+                if kept in pics["paths"]:
+                    pics["paths"].remove(kept)
+                at = pics["paths"].index(path) if path in pics["paths"] else 0
+                pics["paths"].insert(at, kept)
+                pics["sel"] = set()
+                editor._draw_paths(pics)
+                editor.status("Cut out. Save keeps it.")
+            later(done)
+
+        def find():
+            try:
+                found = self.studio.find_people(path)
+            except (ig.ComfyError, OSError) as e:
+                later(lambda: editor.status(str(e), "err"))
+                return
+            boxes = found["boxes"]
+            if not boxes:
+                later(lambda: editor.status("SAM3 found nobody in that photo.", "warn"))
+            elif len(boxes) == 1:
+                later(lambda: editor.status("One person; cutting them out" + ELLIPSIS))
+                cut(found, boxes[0])
+            else:
+                later(lambda: self._choose_person(editor, found, lambda b: (
+                    editor.status("Cutting them out" + ELLIPSIS),
+                    self.host._spawn(self.s.event_id, cut, found, b))))
+        self.host._spawn(self.s.event_id, find)
+
+    def _choose_person(self, editor, found, then):
+        """A window with the photo and a numbered box round each person; a
+        click picks the one under it."""
+        top = tk.Toplevel(editor.win)
+        top.title("Who is it?")
+        top.transient(editor.win)
+        self.skin(top, bg="bg")
+        self.label(top, "%d people. Click the one this identity is." % len(found["boxes"]),
+                   "text").pack(side="top", fill="x", padx=self.px(12), pady=(self.px(10), 0))
+        img = None
+        if found["preview"]:
+            tmp = os.path.join(self.studio.lib.root, "references", "_people.png")
+            try:
+                os.makedirs(os.path.dirname(tmp), exist_ok=True)
+                with open(tmp, "wb") as f:
+                    f.write(found["preview"])
+                img = photo_at(tmp, self.px(640), top)
+            except OSError:
+                img = None
+        k = img.width() / float(found["width"]) if img else self.px(640) / float(
+            max(found["width"], found["height"]))
+        cw, ch = int(found["width"] * k), int(found["height"] * k)
+        cv = tk.Canvas(top, width=cw, height=ch, bd=0, highlightthickness=0, cursor="hand2")
+        self.skin(cv, bg="card")
+        cv.pack(side="top", padx=self.px(12), pady=self.px(10))
+        if img:
+            top._img = img
+            cv.create_image(0, 0, image=img, anchor="nw")
+        accent = self.host.C["accent"]
+        for n, (x, y, w, h) in enumerate(found["boxes"], 1):
+            cv.create_rectangle(x * k, y * k, (x + w) * k, (y + h) * k, outline=accent,
+                                width=self.px(2))
+            cv.create_text(x * k + self.px(6), y * k + self.px(4), text=str(n), anchor="nw",
+                           fill=accent, font=self.host.f_ui)
+
+        def click(ev):
+            box = ig.pick_box(found["boxes"], ev.x / k, ev.y / k)
+            top.destroy()
+            then(box)
+        cv.bind("<Button-1>", click)
 
     def edit_characters(self, looks=None):
         """The character creator; `looks` starts a new character from them."""
@@ -1767,20 +1887,17 @@ class RecordEditor:
                     vars_[name] = var
                 self.widgets[key] = ("multi", vars_)
             elif kind == "paths":
-                lb = tk.Listbox(self.form, height=4, bd=0, highlightthickness=0,
-                                font=host.f_small)
-                o.skin(lb, bg="card", fg="text", selectbackground="sel")
-                for p in val or []:
-                    lb.insert("end", p)
-                lb.pack(side="top", fill="x")
+                # A grid of thumbnails; a click selects one for Remove.
+                pics = {"paths": list(val or []), "sel": set(), "grid": o.frame(self.form)}
+                pics["grid"].pack(side="top", fill="x")
+                self._draw_paths(pics)
                 row = o.frame(self.form)
                 row.pack(side="top", fill="x", pady=(o.px(4), 0))
-                o.button(row, "Add photos…", lambda l=lb: self._add_paths(l)).pack(
+                o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
                     side="left")
-                o.button(row, "Remove", lambda l=lb: [l.delete(i) for i in
-                                                      reversed(l.curselection())],
+                o.button(row, "Remove", lambda p=pics: self._remove_paths(p),
                          kind="ghost").pack(side="left", padx=(o.px(4), 0))
-                self.widgets[key] = ("paths", lb)
+                self.widgets[key] = ("paths", pics)
             elif kind == "kv":
                 t = tk.Text(self.form, height=5, wrap="none", bd=0, highlightthickness=0,
                             font=host.f_mono, padx=o.px(6), pady=o.px(4))
@@ -1821,7 +1938,46 @@ class RecordEditor:
         if path:
             var.set(path)
 
-    def _add_paths(self, lb):
+    def _draw_paths(self, pics, cols=4):
+        """The photos of a `paths` field as a grid of tiles; the selected ones
+        framed in the accent colour. Tk previews PNG and GIF only, so any
+        other file shows as its name on a blank tile."""
+        o, host = self.owner, self.owner.host
+        grid, side = pics["grid"], o.px(110)
+        for w in grid.winfo_children():
+            w.destroy()
+        if not pics["paths"]:
+            o.label(grid, "No photos yet.", "faint", host.f_small).grid(row=0, column=0,
+                                                                        sticky="w")
+            return
+        for i, p in enumerate(pics["paths"]):
+            tile = tk.Frame(grid, bd=0, highlightthickness=o.px(3))
+            ring = "accent" if i in pics["sel"] else "bg"
+            o.skin(tile, bg="card", highlightbackground=ring, highlightcolor=ring)
+            tile.grid(row=i // cols, column=i % cols, padx=o.px(2), pady=o.px(2))
+            img = photo(p, side) if os.path.isfile(p) else None
+            if img is not None:
+                o.keep.append(img)
+                lbl = tk.Label(tile, image=img, bd=0, width=side, height=side)
+            else:
+                name = os.path.basename(p) + ("" if os.path.isfile(p) else "\n(missing)")
+                lbl = tk.Label(tile, text=name, bd=0, font=host.f_small,
+                               wraplength=side - o.px(8), width=12, height=6)
+            o.skin(lbl, bg="card", fg="muted")
+            lbl.pack()
+            for w in (tile, lbl):
+                w.bind("<Button-1>", lambda ev, i=i: self._toggle_path(pics, i))
+
+    def _toggle_path(self, pics, i):
+        pics["sel"] ^= {i}
+        self._draw_paths(pics)
+
+    def _remove_paths(self, pics):
+        pics["paths"] = [p for i, p in enumerate(pics["paths"]) if i not in pics["sel"]]
+        pics["sel"] = set()
+        self._draw_paths(pics)
+
+    def _add_paths(self, pics):
         paths = filedialog.askopenfilenames(parent=self.win, filetypes=[
             ("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
         rec = self.records[self.current]
@@ -1831,7 +1987,8 @@ class RecordEditor:
             except OSError as e:
                 self.status("Could not copy %s: %s" % (p, e), "err")
                 continue
-            lb.insert("end", kept)
+            pics["paths"].append(kept)
+        self._draw_paths(pics)
 
     @staticmethod
     def _parse_kv(text):
@@ -1874,7 +2031,7 @@ class RecordEditor:
             elif kind == "multi":
                 rec[key] = [n for n, v in w.items() if v.get()]
             elif kind == "paths":
-                rec[key] = list(w.get(0, "end"))
+                rec[key] = list(w["paths"])
             elif kind == "kv":
                 rec[key] = self._parse_kv(w.get("1.0", "end"))
             elif kind == "per_backend_file":
