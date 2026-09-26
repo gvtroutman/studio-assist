@@ -3766,29 +3766,53 @@ def again(record, new_seed=False):
 # The Identities editor's "Pick person": SAM3 finds everyone in a reference
 # photo (`people_graph`), the user clicks one when there is more than one,
 # and a second run (`cutout_graph`) crops that person and puts them on white,
-# so the face reference is them and nobody beside them.
+# so the face reference is them and nobody beside them. The photo can be
+# cropped first (`crop_region`): SAM3 then looks only there, and the boxes,
+# the preview and the cut-out are all of the crop.
 PEOPLE_PROMPT = "person:8"
 CUTOUT_PAD = 0.04             # of the box's larger side, added around the person
 CUTOUT_BG = 0xFFFFFF
+CROP_MIN = 32                 # px a side: a smaller drag is a slip, not a crop
 
 
-def people_graph(image, sam3):
+def people_graph(image, sam3, region=None):
     """Everyone SAM3 finds in `image` (a LoadImage name), the picture's size,
-    and a PNG of it for Tk to show (it reads no JPEG)."""
-    return {
-        "1": {"class_type": "LoadImage", "inputs": {"image": image}},
-        "2": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
-        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": PEOPLE_PROMPT,
-                                                         "clip": ["2", 1]}},
-        "4": {"class_type": "SAM3_Detect", "inputs": {
-            "model": ["2", 0], "image": ["1", 0], "conditioning": ["3", 0],
-            "threshold": 0.3, "refine_iterations": 0, "individual_masks": True}},
-        "5": {"class_type": "PreviewAny", "inputs": {"source": ["4", 1]}},
-        "6": {"class_type": "GetImageSize", "inputs": {"image": ["1", 0]}},
+    and a PNG of it for Tk to show (it reads no JPEG). With `region` (x, y,
+    width, height) all three are of that crop of it; with no `sam3` it
+    finds nobody, only says the size and sends the PNG."""
+    g = {"1": {"class_type": "LoadImage", "inputs": {"image": image}}}
+    pic = ["1", 0]
+    if region:
+        g["c"] = {"class_type": "ImageCropV2", "inputs": {"image": pic, "crop_region": region}}
+        pic = ["c", 0]
+    if sam3:
+        g.update({
+            "2": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": PEOPLE_PROMPT,
+                                                             "clip": ["2", 1]}},
+            "4": {"class_type": "SAM3_Detect", "inputs": {
+                "model": ["2", 0], "image": pic, "conditioning": ["3", 0],
+                "threshold": 0.3, "refine_iterations": 0, "individual_masks": True}},
+            "5": {"class_type": "PreviewAny", "inputs": {"source": ["4", 1]}}})
+    g.update({
+        "6": {"class_type": "GetImageSize", "inputs": {"image": pic}},
         "7": {"class_type": "PreviewAny", "inputs": {"source": ["6", 0]}},
         "8": {"class_type": "PreviewAny", "inputs": {"source": ["6", 1]}},
-        "9": {"class_type": "PreviewImage", "inputs": {"images": ["1", 0]}},
-    }
+        "9": {"class_type": "PreviewImage", "inputs": {"images": pic}}})
+    return g
+
+
+def crop_region(x0, y0, x1, y1, width, height):
+    """A dragged rectangle (corners in any order, the picture's pixels) as a
+    crop_region inside a width x height picture; None when it is too small
+    to be meant (under CROP_MIN px a side) or covers the whole picture."""
+    x0, x1 = sorted((max(0, min(width, int(x0))), max(0, min(width, int(x1)))))
+    y0, y1 = sorted((max(0, min(height, int(y0))), max(0, min(height, int(y1)))))
+    if x1 - x0 < CROP_MIN or y1 - y0 < CROP_MIN:
+        return None
+    if (x0, y0, x1, y1) == (0, 0, width, height):
+        return None
+    return {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
 
 
 def people_found(entry):
@@ -3832,11 +3856,15 @@ def cutout_region(box, width, height, pad=CUTOUT_PAD):
     return {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
 
 
-def cutout_graph(image, sam3, region, prefix="studio_person"):
+def cutout_graph(image, sam3, region, prefix="studio_person", box=None):
     """`image` cropped to `region`, the main person in it masked by SAM3 and
     laid on white, saved under `prefix`. A neighbour's shoulder inside the
-    crop is not the main person, so it goes white with the background."""
-    return {
+    crop is not the main person, so it goes white with the background.
+    `box` (x, y, w, h in the crop's pixels) is the person picked: without it
+    SAM3's "person:1" is whoever it scores highest, which in a tight crop
+    was once a neighbour's hand at the edge rather than the woman filling
+    it (2026-09-26)."""
+    g = {
         "1": {"class_type": "LoadImage", "inputs": {"image": image}},
         "2": {"class_type": "ImageCropV2", "inputs": {"image": ["1", 0], "crop_region": region}},
         "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
@@ -3853,6 +3881,11 @@ def cutout_graph(image, sam3, region, prefix="studio_person"):
         "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0],
                                                     "filename_prefix": prefix}},
     }
+    if box:
+        x, y, w, h = box
+        g["5"]["inputs"]["bboxes"] = {"x": int(x), "y": int(y), "width": int(w),
+                                      "height": int(h)}
+    return g
 
 
 # ================================================================ the studio
@@ -3961,23 +3994,44 @@ class Studio:
             time.sleep(0.5)
         raise ComfyError("%s took over %d s" % (client.backend["name"], timeout))
 
-    def find_people(self, path):
-        """Everyone in the picture at `path`. -> dict with backend, sam3, the
-        uploaded name, width, height, boxes (largest first) and preview (the
-        picture as PNG bytes). Network I/O: off the UI thread."""
+    def look_at(self, path):
+        """The picture at `path` as the crop window needs it: dict with
+        backend, sam3, the uploaded name, width, height and preview (PNG
+        bytes, since Tk reads no JPEG). No SAM3 run. Network I/O: off the
+        UI thread."""
+        backend, sam3 = self._sam3()
+        c = self.client(backend)
+        name = c.upload_image(path)
+        said = people_found(self._run_quick(c, people_graph(name, None)))
+        if said is None:
+            raise ComfyError("ComfyUI could not read the picture.")
+        width, height, _, pv = said
+        return {"backend": backend, "sam3": sam3, "image": name, "width": width,
+                "height": height, "preview": c.fetch(pv) if pv else None}
+
+    def find_people(self, path, region=None):
+        """Everyone in the picture at `path`, or in its `region` (a
+        crop_region). -> dict with backend, sam3, the uploaded name, region,
+        width, height, boxes (largest first) and preview (PNG bytes), the
+        last four of the crop when there is one. Network I/O: off the UI
+        thread."""
+        backend, sam3 = self._sam3()
+        c = self.client(backend)
+        name = c.upload_image(path)
+        said = people_found(self._run_quick(c, people_graph(name, sam3, region)))
+        if said is None:
+            raise ComfyError("SAM3 said nothing about the picture.")
+        width, height, boxes, pv = said
+        return {"backend": backend, "sam3": sam3, "image": name, "region": region,
+                "width": width, "height": height, "boxes": boxes,
+                "preview": c.fetch(pv) if pv else None}
+
+    def _sam3(self):
         found = self.sam3_backend()
         if found is None:
             raise ComfyError("No online ComfyUI has a SAM3 checkpoint (a file with sam3 "
                              "in its name under checkpoints).")
-        backend, sam3 = found
-        c = self.client(backend)
-        name = c.upload_image(path)
-        said = people_found(self._run_quick(c, people_graph(name, sam3)))
-        if said is None:
-            raise ComfyError("SAM3 said nothing about the picture.")
-        width, height, boxes, pv = said
-        return {"backend": backend, "sam3": sam3, "image": name, "width": width,
-                "height": height, "boxes": boxes, "preview": c.fetch(pv) if pv else None}
+        return found
 
     def find_parts(self, path, kind):
         """Fix a spot's one-click Find: the hands, faces or accessories
@@ -4002,7 +4056,12 @@ class Studio:
         """The person in `box` of what find_people found, on white: PNG bytes."""
         c = self.client(found["backend"])
         region = cutout_region(box, found["width"], found["height"])
-        entry = self._run_quick(c, cutout_graph(found["image"], found["sam3"], region))
+        inner = (box[0] - region["x"], box[1] - region["y"], box[2], box[3])
+        crop = found.get("region")
+        if crop:                  # the box is of the crop; the cut is of the photo
+            region = dict(region, x=region["x"] + crop["x"], y=region["y"] + crop["y"])
+        entry = self._run_quick(c, cutout_graph(found["image"], found["sam3"], region,
+                                                box=inner))
         imgs = ((entry.get("outputs") or {}).get("8") or {}).get("images") or []
         if not imgs:
             raise ComfyError("The cut-out came back empty.")

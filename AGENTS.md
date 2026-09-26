@@ -516,12 +516,19 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
 - **Pick person cuts one person out of a reference photo.** In the Identities editor,
-  `Studio.find_people` runs SAM3 (`person:8`) on the selected photo on the first online
-  backend with a sam3 checkpoint; with more than one person a window shows numbered
-  boxes and a click picks (`pick_box`). `cut_person` crops round that box, masks the
-  main person (`person:1`) and lays them on white, so a neighbour's shoulder goes too.
-  The cut-out takes the photo's place in the list (first = face reference); the photo
-  stays after it. The runs are polled on `/history`, not the job queue: seconds long.
+  the photo is the selected reference, else one chosen from disk. `Studio.look_at`
+  sends it through ComfyUI for its size and a PNG (Tk reads no JPEG; no SAM3), and a
+  crop window (`_crop_photo`) takes a drag round the person (`crop_region`; a slip
+  under `CROP_MIN` px is ignored) or "Whole photo". `Studio.find_people(path, region)`
+  then runs SAM3 (`person:8`) on that crop only, on the first online backend with a
+  sam3 checkpoint; with more than one person a window shows numbered boxes and a
+  click picks (`pick_box`). `cut_person` crops round that box (offset back into the
+  photo), masks the person with SAM3 **aimed at the picked box** (`bboxes`) and lays
+  them on white, so a neighbour's shoulder goes too. Without the box, "person:1" in a
+  tight crop once masked a neighbour's hand at the edge instead of the woman filling
+  it. The cut-out takes the photo's place in the list (the front for a photo from
+  disk; first = face reference); a listed photo stays after it. The runs are polled
+  on `/history`, not the job queue: about a second each.
 - **The look is a video game's character creator.** `LOOKS` is the sections (Body,
   Face, Hair, Expression, Clothes, Accessories) of slots, each `(setting, label,
   nouns, picks, many)`; every slot also takes free text, and a `many` slot
