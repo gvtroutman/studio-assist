@@ -2146,6 +2146,37 @@ class TestHeadShape(unittest.TestCase):
         self.assertLess(back(self.head_points({"skull_depth": 1.0})), back(base) - 0.01)
         self.assertNotEqual(self.head_points({"neck_width": 1.0}), base)
 
+    def test_a_face_crop_gets_its_own_head_depth(self):
+        s = sc.new_scene("")
+        p = sc.new_object("person")
+        s["objects"].append(p)
+        s["camera"].update(target=[0.0, 1.3, 0.0], distance=2.6, lens=50.0)
+        x, y, w, h = sc.head_box(s, p)
+        fw, fh = sc.frame_size(s)
+        self.assertTrue(0 < x < fw and 0 < y < fh / 2 and w < h)
+        region = (x - w, y - h / 2, 2 * w + 2, 2 * h)
+        data = sc.depth_crop_png(s, region, (64, 64))
+        self.assertEqual(png_size(data), (64, 64))
+        self.assertIsNone(sc.depth_crop_png(s, (0, 0, 4, 4), (8, 8)))   # only sky there
+        # The face pass takes it as the crop's ControlNet, over its first steps.
+        wf = ig.load_workflow("flux_dev_baseline")
+        vals = {"model": "m", "clip_l": "c", "t5": "t", "vae": "v", "prompt": "p", "seed": 1,
+                "face_prompt": "a face"}
+        crop = {"x": 10, "y": 10, "width": 200, "height": 200}
+        g = ig.face_graph(wf, vals,
+                          [], "in.png", [crop], "oval.png",
+                          "t_faces", faces=[{"words": "a man", "depth": "d.png"}])
+        apply = g["fc1_dc"]["inputs"]
+        self.assertEqual(g["fc1_d"]["inputs"]["image"], "d.png")
+        self.assertEqual(g["fcn"]["inputs"]["control_net_name"], wf["defaults"]["controlnet"])
+        self.assertEqual((apply["strength"], apply["end_percent"]),
+                         (ig.FACE_DEPTH_STRENGTH, ig.FACE_DEPTH_END))
+        self.assertEqual(g["fc1_4"]["inputs"]["positive"], ["fc1_dc", 0])
+        plain = ig.face_graph(wf, vals,
+                              [], "in.png", [crop], "oval.png", "t_faces",
+                              faces=[{"words": "a man"}])
+        self.assertNotIn("fcn", plain)
+
     def test_a_person_keeps_their_head_and_an_identity_keeps_one(self):
         obj = sc.new_object("person")
         obj["head"] = {"jaw_width": 0.8, "chin_length": 0.3}

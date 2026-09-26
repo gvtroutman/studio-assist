@@ -2935,11 +2935,22 @@ def _fill_depth(zb, width, height, pts):
             q += b
 
 
-def depth_values(scene, width, height):
+def depth_values(scene, width, height, window=None):
     """1/z (1/m) of the nearest surface at each pixel, row by row, 0 where
     the camera sees only sky: the floor, the walls that face into the room,
-    and every object, as `render` draws them but without the shadows."""
-    cam = Camera(scene["camera"], width, height)
+    and every object, as `render` draws them but without the shadows.
+    `window` (x, y, w, h), a part of the frame in its own pixels, is drawn
+    alone at `width` x `height` instead of the whole frame."""
+    if window:
+        fw, fh = frame_size(scene)
+        wx, wy, ww, wh = window
+        full = Camera(scene["camera"], fw, fh)
+        cam = Camera(scene["camera"], width, height)
+        kx, ky = width / float(ww), height / float(wh)
+        cam.to_screen = lambda c: ((full.to_screen(c)[0] - wx) * kx,     # noqa: E731
+                                   (full.to_screen(c)[1] - wy) * ky)
+    else:
+        cam = Camera(scene["camera"], width, height)
     room = scene.get("room") or new_room()
     faces = []
     if cam.eye[1] > 0:
@@ -2976,6 +2987,44 @@ def depth_png(scene, edge=DEPTH_EDGE):
     for i in range(3):
         rgb[i::3] = grey
     return rgb_png(bytes(rgb), dw, dh)
+
+
+HEAD_REACH = 0.35              # m behind the nearest point a face crop's depth map spans
+
+
+def depth_crop_png(scene, region, size):
+    """The depth map of one part of the frame, `region` (x, y, w, h) in the
+    frame's pixels, drawn at `size` (w, h): a face crop for the face pass.
+    Its grey spans only HEAD_REACH behind the nearest point, so the face's
+    own relief - jaw, cheek, chin - fills it, as Depth Anything would make
+    of a close-up; what is further is black."""
+    dw, dh = size
+    zb = depth_values(scene, dw, dh, region)
+    seen = [q for q in zb if q > 0]
+    if not seen:
+        return None
+    hi = max(seen)
+    lo = 1.0 / (1.0 / hi + HEAD_REACH)
+    span = (hi - lo) or 1.0
+    grey = bytes(0 if q <= lo else int(round(255 * (q - lo) / span)) for q in zb)
+    rgb = bytearray(dw * dh * 3)
+    for i in range(3):
+        rgb[i::3] = grey
+    return rgb_png(bytes(rgb), dw, dh)
+
+
+def head_box(scene, obj):
+    """Where a person's head is in the frame, (x, y, w, h) in its pixels, or
+    None when it is not in front of the camera."""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    pts = [cam.project(p) for part, faces, _ in painted_pieces(obj) if part == "head"
+           for f in faces for p in f]
+    pts = [p for p in pts if p]
+    if not pts:
+        return None
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
 
 
 MAP_KINDS = ("pose", "composition", "source")
