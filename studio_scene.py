@@ -1070,12 +1070,11 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             (hand, "forearm", loft(P("elbow_" + side), P("wrist_" + side), X("elbow_" + side), [
                 (0, r((0.044, 0.044), fore), 0.0), (0.25, r((0.05, 0.047), fore), 0.0),
                 (0.7, r((0.04, 0.036), fore), 0.0), (1, r((0.032, 0.025), fore), 0.0)])),
-            # A mitten of a hand, the fingers as one, curled a little at the end.
-            (hand, "hand", loft(P("wrist_" + side), at("wrist_" + side, (0, -0.19, 0.02)),
+            # The palm; the four fingers and the thumb come after.
+            (hand, "hand", loft(P("wrist_" + side), at("wrist_" + side, (0, -0.1, 0.012)),
                                 X("wrist_" + side), [
-                (0, (0.028, 0.02), 0.0, mq.MITTEN), (0.3, (0.042, 0.02), 0.0, mq.MITTEN),
-                (0.6, (0.044, 0.016), 0.0, mq.MITTEN), (0.88, (0.038, 0.012), 0.004, mq.MITTEN),
-                (1, (0.022, 0.008), 0.008, mq.MITTEN)], 14)),
+                (0, (0.028, 0.02), 0.0, mq.MITTEN), (0.45, (0.042, 0.02), 0.0, mq.MITTEN),
+                (1, (0.044, 0.016), 0.0, mq.MITTEN)], 14)),
             (foot, "thigh", loft(P("hip_" + side), P("knee_" + side), X("hip_" + side), [
                 (0, r((0.084, 0.084), thigh), 0.0), (0.3, r((0.084, 0.086), thigh), 0.004),
                 (0.8, r((0.06, 0.062), (thigh + shin) / 2), 0.004),
@@ -1108,6 +1107,18 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             (foot, "shin", ellipsoid(P("knee_" + side), M("knee_" + side),
                                      (0.056 * shin, 0.058 * shin, 0.058 * shin), 12, 8)),
         ]
+        # Four fingers off the palm's end, index by the thumb to little
+        # finger, each in two joints curled a little forward.
+        for x, length, w in ((0.03, 0.078, 0.0095), (0.01, 0.086, 0.01),
+                             (-0.01, 0.08, 0.0095), (-0.029, 0.064, 0.0085)):
+            x *= -sign
+            base = at("wrist_" + side, (x, -0.098, 0.012))
+            knuckle = at("wrist_" + side, (x, -0.098 - length * 0.55, 0.018))
+            tip = at("wrist_" + side, (x, -0.098 - length, 0.03))
+            out += [(hand, "hand", prism(base, knuckle, X("wrist_" + side),
+                                         (w, w * 0.9), (w * 0.9, w * 0.85), 6)),
+                    (hand, "hand", prism(knuckle, tip, X("wrist_" + side),
+                                         (w * 0.9, w * 0.85), (w * 0.7, w * 0.65), 6))]
         if shoes:
             out += [(foot, rgb, faces) for rgb, faces in _shoe(
                 shoes, lambda v, s=side: at("ankle_" + s, v))]
