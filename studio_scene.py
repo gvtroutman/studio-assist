@@ -65,6 +65,7 @@ import struct
 import zlib
 
 import studio_icons
+import studio_mannequin as mq
 import studio_pose
 
 VERSION = 1
@@ -226,10 +227,12 @@ def prism(p0, p1, side, r0, r1, n=8):
 
 def loft(p0, p1, side, profile, n=12):
     """A tube from p0 to p1 through rings of `profile`: [(t, (across, deep),
-    shift)], t 0..1 along the way and `shift` how far the ring's middle sits
-    off the axis in the `deep` direction - a calf behind the shin, a chest
-    in front of the spine. `side` is the direction `across` runs, as for
-    `prism`, whose two rings are a loft's simplest."""
+    shift[, shape])], t 0..1 along the way and `shift` how far the ring's
+    middle sits off the axis in the `deep` direction - a calf behind the
+    shin, a chest in front of the spine. `shape`, if given, is the ring's
+    section (`studio_mannequin`): the angle round -> how far out, 1 on the
+    ellipse. `side` is the direction `across` runs, as for `prism`, whose
+    two rings are a loft's simplest."""
     d = norm(sub(p1, p0))
     a = sub(side, mul(d, dot(side, d)))
     if dot(a, a) < 1e-8:
@@ -237,11 +240,14 @@ def loft(p0, p1, side, profile, n=12):
     a = norm(a)
     b = cross(d, a)
     rings = []
-    for t, (ra, rb), shift in profile:
+    for t, (ra, rb), shift, *shape in profile:
         c = add(add(p0, mul(sub(p1, p0), t)), mul(b, shift))
-        rings.append([add(c, add(mul(a, ra * math.cos(2 * math.pi * (i + 0.5) / n)),
-                                 mul(b, rb * math.sin(2 * math.pi * (i + 0.5) / n))))
-                      for i in range(n)])
+        ring = []
+        for i in range(n):
+            th = 2 * math.pi * (i + 0.5) / n
+            k = shape[0](th) if shape else 1.0
+            ring.append(add(c, add(mul(a, ra * k * math.cos(th)), mul(b, rb * k * math.sin(th)))))
+        rings.append(ring)
     faces = [[lo[i], lo[(i + 1) % n], hi[(i + 1) % n], hi[i]]
              for lo, hi in zip(rings, rings[1:]) for i in range(n)]
     faces += [rings[0][::-1], rings[-1]]
@@ -945,26 +951,29 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     wide = shape["shoulders"]
     lf = lambda rows, ka, kd: [(t, (ra * ka, rb * kd), sh * kd)     # noqa: E731
                                for t, ra, rb, sh in rows]
+    seat = mq.pelvis(0.06 + 0.04 * max(0.0, curve - 1))
+    waist = mq.abdomen(0.02)
     out = [
-        ("body", "hips", loft(at("pelvis", (0, -0.1, 0)), at("spine", (0, 0.01, 0)),
-                              X("pelvis"), lf(
-            [(0, 0.09, 0.065, 0.0), (0.15, 0.14, 0.092, 0.004), (0.55, 0.162, 0.104, 0.008),
-             (0.88, 0.155, 0.1, 0.004), (1, 0.13, 0.085, 0.0)], hips * curve, hips), 16)),
+        ("body", "hips", loft(at("pelvis", (0, -0.1, 0)), at("spine", (0, 0.015, 0)),
+                              X("pelvis"), [row + (seat,) for row in lf(
+            [(0, 0.09, 0.065, 0.0), (0.15, 0.14, 0.092, 0.004), (0.55, 0.16, 0.1, 0.006),
+             (0.88, 0.152, 0.096, 0.004), (1, 0.13, 0.085, 0.0)], hips * curve, hips)], 20)),
         ("body", "belly", loft(at("spine", (0, 0.015, 0)), at("chest", (0, 0.0, 0)),
                                X("spine"), [
-            (0, (0.12 * belly, 0.082 * belly), 0.0),
-            (0.2, (0.14 * belly, 0.094 * belly), 0.0),
-            (0.55, (0.142 * belly, 0.096 * belly * shape["belly"]),
-             -0.006 * shape["belly"] - 0.04 * fat),
-            (1, (0.13 * belly, 0.088 * belly), 0.0)], 16)),
-        ("body", "chest", loft(at("chest", (0, 0.005, 0)), at("chest", (0, 0.23, 0)),
+            (0, (0.12 * belly, 0.082 * belly), 0.0, waist),
+            (0.2, (0.138 * belly, 0.092 * belly), 0.0, waist),
+            (0.55, (0.14 * belly, 0.094 * belly * shape["belly"]),
+             -0.006 * shape["belly"] - 0.04 * fat, waist),
+            (1, (0.128 * belly, 0.086 * belly), 0.0, waist)], 20)),
+        ("body", "chest", loft(at("chest", (0, 0.0, 0)), at("chest", (0, 0.23, 0)),
                                X("chest"), [
-            (0, (0.125 * chest, 0.085 * chest), 0.0),
-            (0.12, (0.155 * chest, 0.1 * chest), -0.004),
-            (0.45, (0.172 * chest * wide ** 0.5, 0.112 * chest), -0.014),
-            (0.78, (0.185 * chest * wide, 0.102 * chest), -0.006),
-            (0.94, (0.16 * chest * wide, 0.078 * chest), 0.004),
-            (1, (0.08 * neck, 0.055 * neck), 0.006)], 16)),
+            (0, (0.122 * chest, 0.083 * chest), 0.0, mq.chest(0)),
+            (0.12, (0.15 * chest, 0.096 * chest), -0.002, mq.chest(0.02)),
+            (0.35, (0.162 * chest * wide ** 0.5, 0.1 * chest), -0.008, mq.chest(0.08)),
+            (0.55, (0.172 * chest * wide ** 0.75, 0.102 * chest), -0.01, mq.chest(0.07)),
+            (0.8, (0.18 * chest * wide, 0.094 * chest), -0.004, mq.chest(0.01)),
+            (0.94, (0.158 * chest * wide, 0.074 * chest), 0.004, mq.chest(0)),
+            (1, (0.08 * neck, 0.055 * neck), 0.006)], 24)),
         ("head", "neck", loft(at("neck", (0, -0.02, 0)), at("head", (0, 0.04, 0)), X("neck"), [
             (0, r((0.056, 0.054), neck), 0.0), (0.5, r((0.052, 0.05), neck), 0.0),
             (1, r((0.05, 0.048), neck), 0.0)], 12)),
@@ -1064,9 +1073,9 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             # A mitten of a hand, the fingers as one, curled a little at the end.
             (hand, "hand", loft(P("wrist_" + side), at("wrist_" + side, (0, -0.19, 0.02)),
                                 X("wrist_" + side), [
-                (0, (0.028, 0.02), 0.0), (0.3, (0.044, 0.021), 0.0),
-                (0.6, (0.046, 0.017), 0.0), (0.88, (0.04, 0.013), 0.004),
-                (1, (0.022, 0.008), 0.008)], 12)),
+                (0, (0.028, 0.02), 0.0, mq.MITTEN), (0.3, (0.042, 0.02), 0.0, mq.MITTEN),
+                (0.6, (0.044, 0.016), 0.0, mq.MITTEN), (0.88, (0.038, 0.012), 0.004, mq.MITTEN),
+                (1, (0.022, 0.008), 0.008, mq.MITTEN)], 14)),
             (foot, "thigh", loft(P("hip_" + side), P("knee_" + side), X("hip_" + side), [
                 (0, r((0.084, 0.084), thigh), 0.0), (0.3, r((0.084, 0.086), thigh), 0.004),
                 (0.8, r((0.06, 0.062), (thigh + shin) / 2), 0.004),
