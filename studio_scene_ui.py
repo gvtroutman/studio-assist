@@ -1088,6 +1088,11 @@ class SceneBuilder:
         obj["character"] = cid if rec is not None else ""
         if rec is not None:
             obj["look"] = sc.character_look(rec, obj["look"])
+            # Their identity's head shape comes with them, when it has one.
+            ident = self._identity_of(obj)
+            head = sc.mq.clean_head((ident or {}).get("head"))
+            if head:
+                obj["head"] = head
             default = sc.ASSET["person"]["name"]
             if obj["name"] == default or obj["name"].startswith(default + " "):
                 taken = {x["name"] for x in self.scene["objects"] if x is not obj}
@@ -1252,9 +1257,84 @@ class SceneBuilder:
             o.label(p, "Or press L and click where they should look.",
                     "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
                                                                            fill="x")
+            self._head_shape(obj)
         o.label(p, "Click a hand, foot or the head in the viewport to pose that part.",
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
                                                                        fill="x")
+
+    def _head_shape(self, obj):
+        """The head's proportions (`mq.HEAD_SHAPE`), the middle of each its
+        own; and, when their character has an identity, its head to load
+        or this one to save to it, so every scene of theirs inherits it."""
+        o, p = self.owner, self.panel
+        o.cap(p, "Head shape")
+        for key, label, _, _ in sc.mq.HEAD_SHAPE:
+            def read(key=key):
+                return (obj.get("head") or {}).get(key, 0.5)
+
+            def write(x, key=key):
+                head = dict(obj.get("head") or {}, **{key: x})
+                head = sc.mq.clean_head(head)
+                if head:
+                    obj["head"] = head
+                else:
+                    obj.pop("head", None)
+            self._slider(p, key, label, read, write, 0.0, 1.0, 0.01)
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        o.button(row, "Reset shape", self._reset_head, kind="ghost").pack(side="left")
+        ident = self._identity_of(obj)
+        if ident is not None:
+            if ident.get("head"):
+                o.button(row, "Load %s's" % ident["name"], self._load_head,
+                         kind="ghost").pack(side="left", padx=(o.px(6), 0))
+            o.button(row, "Save to %s" % ident["name"], self._save_head,
+                     kind="ghost").pack(side="left", padx=(o.px(6), 0))
+
+    def _identity_of(self, obj):
+        """The identity record behind a person's character, else None."""
+        lib = self.owner.studio.lib
+        rec = lib.get("characters", obj.get("character")) if obj.get("character") else None
+        iid = (rec or {}).get("identity")
+        return lib.get("identities", iid) if iid else None
+
+    def _reset_head(self):
+        obj = self.obj()
+        if obj is not None and obj.pop("head", None) is not None:
+            self.sync()
+            self.changed()
+
+    def _load_head(self):
+        obj = self.obj()
+        ident = self._identity_of(obj) if obj else None
+        if ident is None:
+            return
+        head = sc.mq.clean_head(ident.get("head"))
+        if head:
+            obj["head"] = head
+        else:
+            obj.pop("head", None)
+        self.sync()
+        self.changed()
+        self.status("%s has %s's head shape." % (obj["name"], ident["name"]))
+
+    def _save_head(self):
+        """This person's head shape onto their identity, in the library."""
+        obj = self.obj()
+        ident = self._identity_of(obj) if obj else None
+        if ident is None:
+            return
+        lib = self.owner.studio.lib
+        records = [dict(r, head=obj.get("head") or {}) if r["id"] == ident["id"] else r
+                   for r in lib.all("identities")]
+        try:
+            lib.save("identities", records)
+        except OSError as e:
+            self.status("Could not save: %s" % e, "err")
+            return
+        self.status("Saved the head shape to %s; every scene of theirs can load it."
+                    % ident["name"], "ok")
+        self._inspect()
 
     def _words_box(self):
         o = self.owner

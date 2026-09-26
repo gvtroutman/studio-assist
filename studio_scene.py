@@ -929,6 +929,13 @@ def _scalp(at, th, rings=4, n=14):
     return outward(faces)
 
 
+def _reshape(warp, p):
+    """A point in the head's frame moved as `warp` moves the skull's, which
+    works in the skull ellipsoid's frame (centre (0, 0.11, 0.01))."""
+    x, y, z = warp((p[0], p[1] - 0.11, p[2] - 0.01))
+    return (x, y + 0.11, z + 0.01)
+
+
 def _jaw(p):
     """The skull's ellipsoid made a head: narrower at the jaw and the chin,
     the back of the neck in under the skull, the face a little flatter."""
@@ -999,9 +1006,10 @@ def _fingers(part, side, sign, grip, at, side_x, side_z):
     return out
 
 
-def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
+def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
     """The mannequin: [(part, faces, rgb or None)], pelvis at the origin,
-    built to `shape` (`body_shape`) and wearing `dressed` (`outfit`); rgb
+    built to `shape` (`body_shape`), its head to `head` (`mq.HEAD_SHAPE`)
+    and wearing `dressed` (`outfit`); rgb
     None is the object's own colour. Parts are the control groups, so a
     click on a hand selects the hand's controls."""
     shape = shape or REST_SHAPE
@@ -1024,7 +1032,7 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     hips = k("hips", 1 + 0.9 * fat)
     belly = k("belly", 1 + 0.9 * fat)
     chest = k("chest", 1 + 0.7 * fat + mus)
-    neck = k("neck", 1 + 0.5 * fat + 0.6 * mus)
+    neck = k("neck", 1 + 0.5 * fat + 0.6 * mus) * mq.neck_scale(head)
     upper = k("upper_arm", 1 + 0.7 * fat + 1.3 * mus)
     fore = k("forearm", 1 + 0.5 * fat + 0.8 * mus)
     thigh = k("thigh", 1 + 0.8 * fat + 0.8 * mus)
@@ -1034,8 +1042,10 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     hair = dressed.get("hair")
     hat = dressed.get("hat")
     scalp = bool(hair and hair["cap"] and not (hat and hat[0] != "crown"))
+    warp = mq.head_warp(head)
+    shaped = (lambda p: warp(_jaw(p))) if warp else _jaw          # noqa: E731
     skull = [[at("head", p) for p in f]
-             for f in ellipsoid((0, 0.11, 0.01), IDENTITY, (0.085, 0.115, 0.1), 16, 12, _jaw)
+             for f in ellipsoid((0, 0.11, 0.01), IDENTITY, (0.085, 0.115, 0.1), 16, 12, shaped)
              if not (scalp and centroid(f)[1] > hairline(centroid(f)[0], centroid(f)[2] - 0.01))]
     shoes = dressed.get("shoes")
     toe_drop = HEEL if shoes and shoes[0] == "heels" else 0.0     # up on its toes
@@ -1111,7 +1121,9 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                 X("head"), (0.01, 0.025), (0.004, 0.012), 4)))
     if hair:
         rgb, v = hair["rgb"], hair["volume"]
-        hp = lambda v3: at("head", v3)                     # noqa: E731
+        # Hair follows the skull's shape: the point moved as the skull's is.
+        def hp(v3):
+            return at("head", _reshape(warp, v3) if warp else v3)
         if scalp:                                          # under a hat, the hat
             out.append(("head", rgb, _scalp(hp, hair["cap"])))
         if hair["fall"] is not None:
@@ -1578,7 +1590,7 @@ def painted_pieces(obj):
         k = sx * shape["height"]
         pieces = [(part, [[mul(p, k) for p in f] for f in faces], rgb or own)
                   for part, faces, rgb in person_pieces(obj["pose"]["controls"], rot,
-                                                        shape, outfit(look))]
+                                                        shape, outfit(look), obj.get("head"))]
     elif obj["asset"] == "crowd":
         pieces = crowd_pieces(obj)
         if not pieces:
@@ -1941,6 +1953,9 @@ def clean_object(d, taken=()):
         o["character"] = str(d.get("character") or "")
         o["look"] = clean_look(d.get("look"))
         o["face"] = str(d.get("face") or "")
+        head = mq.clean_head(d.get("head"))
+        if head:
+            o["head"] = head
         at = d.get("look_at")
         if isinstance(at, (list, tuple)) and len(at) == 3:
             o["look_at"] = _vec(at, [0.0, 1.6, 0.0], -100, 100)

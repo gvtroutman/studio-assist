@@ -1910,6 +1910,39 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual((second["look"], second["character"]), ({}, ""))
         ui.studio.lib.save("characters", [])
 
+    def test_head_shape_sliders_save_to_the_identity_and_come_back(self):
+        ui, sb = self.builder()
+        lib = ui.studio.lib
+        lib.save("identities", [{"name": "Gavin", "id": "gavin"}])
+        lib.save("characters", [{"id": "gav", "name": "Gav", "identity": "gavin"}])
+        self.addCleanup(lib.save, "characters", [])
+        self.addCleanup(lib.save, "identities", [])
+        a = sb.add("person")
+        sb._set_character("gav")
+        self.assertNotIn("head", a)                        # the identity has no head yet
+        sb.select(a["id"], "head")
+        self.app.update()
+        for k in sc.mq.HEAD_KEYS:
+            self.assertAlmostEqual(sb.vars[k][0].get(), 0.5)
+        import tkinter as tk
+        want = str(sb.vars["jaw_width"][0])
+        scale = next(w for row in sb.panel.winfo_children() for w in row.winfo_children()
+                     if isinstance(w, tk.Scale) and str(w.cget("variable")) == want)
+        scale.set(0.8)                                     # as a drag of the slider
+        self.app.update()
+        self.assertEqual(a["head"], {"jaw_width": 0.8})
+        sb._save_head()
+        self.assertEqual(lib.get("identities", "gavin")["head"], {"jaw_width": 0.8})
+        sb._reset_head()
+        self.assertNotIn("head", a)
+        self.assertAlmostEqual(sb.vars["jaw_width"][0].get(), 0.5)
+        b = sb.add("person")                               # a second of them: it comes along
+        sb._set_character("gav")
+        self.assertEqual(b["head"], {"jaw_width": 0.8})
+        sb.select(a["id"], "head")
+        sb._load_head()
+        self.assertEqual(a["head"], {"jaw_width": 0.8})
+
     def test_save_and_put_on_an_outfit_preset(self):
         ui, sb = self.builder()
         ui.studio.lib.save("outfits", [])
@@ -2070,6 +2103,58 @@ class FakeLLM:
     def chat(self, messages, max_tokens=None):
         self.sent.append(messages)
         return {"choices": [{"message": {"content": self.replies.pop(0)}}]}
+
+
+class TestHeadShape(unittest.TestCase):
+    """The head's proportions (`mq.HEAD_SHAPE`): 0.5 the mannequin's own,
+    each moving the skull where it says, kept with the person and with an
+    identity."""
+
+    def head_points(self, head=None, part="head"):
+        obj = sc.new_object("person")
+        if head:
+            obj["head"] = head
+        return [p for pt, faces, _ in sc.painted_pieces(obj) if pt == part
+                for f in faces for p in f]
+
+    def test_a_neutral_head_is_the_mannequins_own(self):
+        self.assertEqual(sc.mq.clean_head({k: 0.5 for k in sc.mq.HEAD_KEYS}), {})
+        self.assertEqual(sc.mq.clean_head({"jaw_width": "0.734", "x": 1, "chin_width": 9,
+                                           "neck_width": "no"}),
+                         {"jaw_width": 0.73, "chin_width": 1.0})
+        self.assertIsNone(sc.mq.head_warp({"head_width": 0.5}))
+        self.assertEqual(self.head_points(), self.head_points({"head_width": 0.5}))
+
+    def test_each_slider_moves_the_head_where_it_says(self):
+        base = self.head_points()
+
+        def width(pts, lo, hi):
+            xs = [p[0] for p in pts if lo <= p[1] <= hi]
+            return max(xs) - min(xs)
+        top = max(p[1] for p in base)
+        crown, jaw = (top - 0.08, top), (top - 0.21, top - 0.17)
+        wide = self.head_points({"head_width": 1.0})
+        self.assertGreater(width(wide, *crown), width(base, *crown) * 1.1)
+        jawy = self.head_points({"jaw_width": 1.0})
+        self.assertGreater(width(jawy, *jaw), width(base, *jaw) * 1.05)
+        self.assertAlmostEqual(width(jawy, *crown), width(base, *crown), places=3)
+        # The mannequin faces +z: the face longer reaches lower, the skull deeper
+        # reaches further back.
+        chin = lambda pts: min(p[1] for p in pts if p[2] > 0.06)   # noqa: E731  not the neck
+        self.assertLess(chin(self.head_points({"face_length": 1.0})), chin(base) - 0.01)
+        back = lambda pts: min(p[2] for p in pts)                  # noqa: E731
+        self.assertLess(back(self.head_points({"skull_depth": 1.0})), back(base) - 0.01)
+        self.assertNotEqual(self.head_points({"neck_width": 1.0}), base)
+
+    def test_a_person_keeps_their_head_and_an_identity_keeps_one(self):
+        obj = sc.new_object("person")
+        obj["head"] = {"jaw_width": 0.8, "chin_length": 0.3}
+        back = sc.clean_object(json.loads(json.dumps(obj)))
+        self.assertEqual(back["head"], {"jaw_width": 0.8, "chin_length": 0.3})
+        self.assertNotIn("head", sc.clean_object(sc.new_object("person")))
+        ident = ig.clean_identity({"name": "Gavin", "head": {"jaw_width": 0.8, "bad": 1}})
+        self.assertEqual(ident["head"], {"jaw_width": 0.8})
+        self.assertEqual(ig.clean_identity({"name": "Lilya"})["head"], {})
 
 
 class TestShapesAndProps(unittest.TestCase):
