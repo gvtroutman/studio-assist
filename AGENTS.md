@@ -958,7 +958,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
     z-buffer of 1/z over every face, the floor and the inward walls (`_fill_depth`:
     1/z is linear across a flat face on screen), grey from farthest (black) to
     nearest (white), sky black - Depth Anything's convention, which Union Pro 2.0
-    learnt. 512 px on the long edge; the ControlNet scales it.
+    learnt. 512 px on the long edge; the ControlNet scales it. Each body (person,
+    crowd member, prop) has its own depth stretched `DEPTH_RELIEF` (3x) about its
+    middle, where it is on screen unchanged, and the grey spans `DEPTH_CLIP`'s
+    percentiles, not min to max: in true 1/z a person at 5 m is a flat cut-out,
+    where Depth Anything's maps give bodies rounded relief.
   - **Grey frame kept** (`frame_keep`, kind `source`, default 0 = not sent): 1 -
     denoise. 0.1-0.25 pins props and exact framing on top of the maps.
   A model with neither ControlNet input (Z-Image) gets the frame alone, at
