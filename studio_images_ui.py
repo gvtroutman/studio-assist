@@ -2545,7 +2545,9 @@ class FixWindow:
 
     Find hands / face / accessories asks SAM3 to mark them in one click. In
     Lock mode a click (or Find) marks a square the fix may not change: the
-    original is laid back over it last."""
+    original is laid back over it last. An identity's face (the Face swap
+    row) is swapped onto the picture's biggest face after everything else,
+    and needs no spots."""
 
     TARGETS = [("hand", "Hand"), ("face", "Face"), ("other", "Accessory / other")]
     STRENGTHS = [("light", "Light"), ("medium", "Medium"), ("strong", "Strong")]
@@ -2611,6 +2613,16 @@ class FixWindow:
         self.words = tk.StringVar()
         e = host._entry(row, self.words)
         e.master.pack(side="left", fill="x", expand=True)
+        row = o.frame(opts)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        o.label(row, "Face swap", "muted", width=10).pack(side="left")
+        self.face = ""                    # the identity whose face is swapped in last
+        idents = [(i["id"], i["name"]) for i in o.studio.lib.all("identities")]
+        self.face_pill = o.choice(row, [("", "None")] + idents, "", self._face_identity)
+        self.face_pill.pack(side="left")
+        if not idents:
+            o.label(row, "  No identities yet (Library > Identities).", "faint",
+                    host.f_small).pack(side="left")
 
         self.canvas = tk.Canvas(win, bd=0, highlightthickness=0, cursor="crosshair")
         host._skin(self.canvas, bg="card")
@@ -2867,6 +2879,18 @@ class FixWindow:
             p.roles = host.PILL_ROLES["option" if getattr(self, key) == value else "ghost"]
             p.paint(host.C)
 
+    def _face_identity(self, ident):
+        """Last of all the fix swaps this identity's face (its first
+        reference picture) onto the picture's biggest face."""
+        self.face = ident
+        if not ident:
+            return self._status()
+        rec = self.owner.studio.lib.get("identities", ident) or {}
+        if not rec.get("references"):
+            return self._status("%s has no reference picture to take the face from."
+                                % rec.get("name", ident), "warn")
+        self._status("Last, the face becomes %s's." % rec["name"])
+
     def _status(self, text=None, role="muted"):
         n = len(self.spots)
         if text is None:
@@ -2885,13 +2909,14 @@ class FixWindow:
         self._status()
 
     def _redraw(self):
-        if not self.spots:
-            return self._status("Click the part of the picture to redraw first.", "warn")
+        if not self.spots and not self.face:
+            return self._status("Click the part of the picture to redraw first, or "
+                                "choose whose face to swap in.", "warn")
         s = self.owner.studio.fix_base(self.settings)
         s.update(mode="fix", seed=-1, fix={
             "image": self.path, "target": self.target, "strength": self.strength,
             "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots],
-            "locks": [dict(sp) for sp in self.locks]})
+            "locks": [dict(sp) for sp in self.locks], "face_swap": self.face})
         self.owner.say("Fixing %s%s" % (ig.fix_words(s["fix"]), ELLIPSIS), "muted")
         self.owner.host._spawn(self.owner.s.event_id, self.owner._submit, s)
         self.win.destroy()

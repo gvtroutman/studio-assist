@@ -915,10 +915,12 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["fc1_3n"]["inputs"]["mask"], ["fc1_s3", 0])    # only it redrawn
         self.assertEqual(g["fc1_a3"]["inputs"]["mask"], ["fc1_s3", 0])    # only it blended
 
-    def swap_job(self, spots, client=None, **fix):
+    def swap_job(self, spots, client=None, identities=(), **fix):
         """A fix whose spots may carry photos, on a 5090 with FLUX, Qwen and SAM3."""
         self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
                                 client_factory=client or SwapClient)
+        if identities:
+            self.studio.lib.save("identities", list(identities))
         src = os.path.join(self.dir, "made.png")
         with open(src, "wb") as f:
             f.write(ig.oval_png(256))
@@ -1001,6 +1003,112 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rows[5], b"\x00\x00" + b"\xff" * 6 + b"\x00\x00")
         self.assertEqual(rows[0], b"\x00" * 10)
         self.assertEqual(sum(r.count(b"\xff") for r in rows), 36)
+
+    def face_swap_job(self, spots, faces, refs=1, colour=True):
+        """swap_job with Sitter's face (`refs` reference pictures), on a 5090
+        whose SAM3 finds `faces` (x, y, w, h) in the fixed picture and one
+        face in each reference."""
+        class FaceFindClient(SwapClient):
+            def node_types(self):
+                return set(SwapClient.NODES) | ({"ColorTransfer"} if colour else set())
+
+            def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                graph = self.graphs[int(pid[3:]) - 1]
+                if "q0_v" not in graph:
+                    return super().listen_for_progress(pid, on_event, stop, timeout)
+                out = {}
+                for i in range(len([k for k in graph if k.endswith("_v")])):
+                    found = faces if i == 0 else [(300, 100, 200, 240)]
+                    out.update({
+                        "q%d_v" % i: {"text": [json.dumps([[
+                            {"x": x, "y": y, "width": w, "height": h}
+                            for x, y, w, h in found]])]},
+                        "q%d_w" % i: {"text": ["256" if i == 0 else "860"]},
+                        "q%d_h" % i: {"text": ["256" if i == 0 else "960"]}})
+                return {"status": {"completed": True}, "outputs": out}
+        paths = []
+        for k in range(refs):
+            paths.append(os.path.join(self.dir, "me%d.png" % k))
+            with open(paths[-1], "wb") as f:
+                f.write(PNG)
+        job, graphs, _ = self.swap_job(spots, client=FaceFindClient, face_swap="sitter",
+                                       identities=[{"id": "sitter", "name": "Sitter",
+                                                    "references": paths}])
+        return job, graphs, paths
+
+    def test_a_fix_ends_with_a_face_swap_on_the_biggest_face(self):
+        job, graphs, (me,) = self.face_swap_job([{"x": 60, "y": 60, "size": 64}],
+                                                [(150, 20, 20, 24), (40, 100, 50, 60)])
+        self.assertEqual(job.status, "complete", job.detail)
+        redraw, find, swap = graphs               # spots first, then find, then swap
+        self.assertIn("fc1_4", redraw)
+        self.assertEqual(find["t"]["inputs"]["text"], "face:8")
+        self.assertEqual(find["q0_i"]["inputs"]["image"], "ImageStudio/fix_00001_.png [output]")
+        self.assertEqual(find["q1_i"]["inputs"]["image"], "studio_me0.png")
+        self.assertEqual(swap["fi"]["inputs"]["image"], "ImageStudio/fix_00001_.png [output]")
+        self.assertNotIn("sw2_c", swap)           # the biggest face only
+        region = swap["sw1_c"]["inputs"]["crop_region"]
+        self.assertLessEqual(region["x"], 40)
+        self.assertGreaterEqual(region["x"] + region["width"], 90)
+        pos = swap["sw1_pos"]["inputs"]
+        self.assertIn("has the face of the person in picture 2", pos["prompt"])
+        self.assertEqual(swap["sw1_t"]["inputs"]["text"], "face")   # blended by its outline
+        ref = swap[pos["image2"][0]]["inputs"]              # the reference, cut to its face
+        self.assertEqual(ref["crop_region"], ig.head_square(
+            (300, 100, 200, 240), 860, 960, ig.FACE_SWAP_REF_PAD))
+        self.assertEqual(swap[ref["image"][0]]["inputs"]["image"], "studio_me0.png")
+        self.assertEqual(swap["sw1_tn"]["inputs"]["image_ref"], ["sw1_c", 0])  # its colours
+        self.assertEqual(swap["sw1_b4"]["inputs"]["source"], ["sw1_tn", 0])
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["fix"]["face_swap"], "sitter")
+        self.assertIn("then a face swap", rec["prompt"])
+        self.assertTrue(any("Sitter's face swapped in" in n for n in rec.get("notes", [])),
+                        rec.get("notes"))
+
+    def test_a_face_swap_uses_every_reference_picture(self):
+        job, graphs, paths = self.face_swap_job([], [(40, 100, 50, 60)], refs=2)
+        self.assertEqual(job.status, "complete", job.detail)
+        pos = graphs[-1]["sw1_pos"]["inputs"]
+        self.assertIn("pictures 2 and 3", pos["prompt"])    # two: a slot each
+        self.assertEqual(graphs[-1]["sw1_r1"]["class_type"], "ImageCropV2")
+        self.assertEqual(pos["image3"], ["sw1_r1", 0])
+        FakeClient.instances.clear()
+        job, graphs, paths = self.face_swap_job([], [(40, 100, 50, 60)], refs=3)
+        self.assertEqual(job.status, "complete", job.detail)
+        find, swap = graphs
+        self.assertIn("q3_v", find)
+        pos = swap["sw1_pos"]["inputs"]
+        self.assertIn("in picture 2", pos["prompt"])        # three: side by side in one
+        self.assertEqual(pos["image2"], ["sw1_h2", 0])
+        self.assertNotIn("image3", pos)
+        self.assertEqual(swap["sw1_h1"]["inputs"]["image2"], ["sw1_r1", 0])
+        self.assertTrue(any("3 reference pictures" in n for n in
+                            self.studio.history.list()[0]["notes"]))
+
+    def test_a_face_swap_alone_is_a_fix_and_needs_a_face(self):
+        job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], colour=False)
+        self.assertEqual(job.status, "complete", job.detail)
+        find, swap = graphs
+        self.assertEqual(find["q0_i"]["inputs"]["image"], "studio_made.png")
+        self.assertEqual(swap["fi"]["inputs"]["image"], "studio_made.png")
+        self.assertNotIn("sw1_tn", swap)          # no ColorTransfer: said, not failed
+        self.assertTrue(any("ColorTransfer" in n for n in job.notes), job.notes)
+        self.assertEqual(ig.fix_words({"spots": [], "face_swap": "me.png"}), "a face swap")
+        FakeClient.instances.clear()
+        job, graphs, _ = self.face_swap_job([], [])
+        self.assertEqual(job.status, "failed")
+        self.assertIn("no face", job.detail)
+        self.assertEqual(len(graphs), 1)          # the finder alone
+
+    def test_a_face_swap_needs_an_identity_with_a_reference(self):
+        job, graphs, _ = self.swap_job([], face_swap="partner", identities=[
+            {"id": "partner", "name": "Partner"}])
+        self.assertEqual(job.status, "failed")
+        self.assertIn("Partner has no reference picture", job.detail)
+        self.assertEqual(graphs, [])
+        job, _, _ = self.swap_job([], face_swap="nobody")
+        self.assertEqual(job.status, "failed")
+        self.assertIn("nobody", job.detail)
 
     def test_swap_prompts(self):
         fix = {"target": "hand", "spots": [{"x": 1, "y": 1, "size": 64, "photo": "a.png"}]}
@@ -1937,6 +2045,29 @@ class TestImageStudioTab(unittest.TestCase):
         spot = ig.clean_fix(job["fix"])["spots"][0]
         self.assertEqual(spot["photo"], hat)
         self.assertGreaterEqual(len(spot["outline"]), 4)
+        self.assertEqual(job["fix"]["face_swap"], "")
+
+    def test_fix_a_spot_can_end_with_a_face_swap_alone(self):
+        import studio_images_ui as ui_mod
+        s, ui = self.tab()
+        src = os.path.join(self.dir, "fixme.png")
+        with open(src, "wb") as f:
+            f.write(ig.oval_png(256))
+        sent = []
+        ui.host._spawn = lambda sid, fn, arg: sent.append(arg)
+        self.addCleanup(lambda: delattr(ui.host, "_spawn"))
+        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
+        fw._face_identity("sitter")
+        self.assertIn("no reference picture", fw.msg.cget("text"))
+        fw._face_identity("")
+        fw._redraw()
+        self.assertEqual(sent, [])                # nothing marked and no face
+        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
+        fw._face_identity("sitter")
+        fw._redraw()
+        (job,) = sent
+        self.assertEqual(job["fix"]["face_swap"], "sitter")
+        self.assertEqual(job["fix"]["spots"], [])
 
     def test_fix_a_spot_finds_in_one_click_and_locks(self):
         import studio_images_ui as ui_mod
