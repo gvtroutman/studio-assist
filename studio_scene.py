@@ -950,32 +950,48 @@ KNUCKLE_Y = -0.098                   # the palm's end, down from the wrist
 RELAXED = 10                         # each joint's curl at rest, degrees
 
 
-def _fingers(part, side, sign, grip, at, side_x, side_z):
-    """A hand's four fingers and thumb: [(part, "hand", faces)]. `grip` is
-    (curl, spread, thumb) in degrees, `at` the wrist's frame (down the hand
-    is -y, the palm faces +z)."""
+def hand_joints(sign, grip):
+    """A hand's 21 points in DWPose's order - the wrist, then thumb, index,
+    middle, ring and little finger, four each from the base out - in the
+    wrist's frame (down the hand is -y, the palm faces +z). `grip` is
+    (curl, spread, thumb) in degrees. The mesh and the pose map both come
+    from these, so what is drawn is what the ControlNet is told."""
     curl, spread, thumb = grip
-    out = []
-    for i, (x, length, w) in enumerate(FINGERS):
-        # Each of three joints bends by the curl, toward the palm; a spread
-        # fans the fingers out from between the middle and ring fingers.
-        fan = math.radians(spread * (1.5 - i) / 1.5) * -sign
-        p, bend = (x * -sign, KNUCKLE_Y, 0.012), 0.0
-        girth = w
-        for frac in (0.45, 0.3, 0.25):
-            bend += math.radians(RELAXED + curl)
-            d = (math.sin(fan) * math.cos(bend), -math.cos(fan) * math.cos(bend),
-                 math.sin(bend))
-            q = add(p, mul(d, length * frac))
-            out.append((part, "hand", prism(at(p), at(q), side_x, (girth, girth * 0.9),
-                                            (girth * 0.9, girth * 0.85), 6)))
-            p, girth = q, girth * 0.88
     # The thumb, its two joints swung from alongside the palm to across it.
     t = thumb / 90.0
     lerp = lambda a, b: tuple(u + (v - u) * t for u, v in zip(a, b))   # noqa: E731
     base = (-sign * 0.03, -0.03, 0.012)
     knuckle = lerp((-sign * 0.045, -0.08, 0.032), (-sign * 0.03, -0.075, 0.058))
     tip = lerp((-sign * 0.045, -0.12, 0.04), (0.0, -0.1, 0.078))
+    pts = [(0.0, 0.0, 0.0), base, knuckle, mul(add(knuckle, tip), 0.5), tip]
+    for i, (x, length, _) in enumerate(FINGERS):
+        # Each of three joints bends by the curl, toward the palm; a spread
+        # fans the fingers out from between the middle and ring fingers.
+        fan = math.radians(spread * (1.5 - i) / 1.5) * -sign
+        p, bend = (x * -sign, KNUCKLE_Y, 0.012), 0.0
+        pts.append(p)
+        for frac in (0.45, 0.3, 0.25):
+            bend += math.radians(RELAXED + curl)
+            d = (math.sin(fan) * math.cos(bend), -math.cos(fan) * math.cos(bend),
+                 math.sin(bend))
+            p = add(p, mul(d, length * frac))
+            pts.append(p)
+    return pts
+
+
+def _fingers(part, side, sign, grip, at, side_x, side_z):
+    """A hand's four fingers and thumb: [(part, "hand", faces)], through
+    `at`, the wrist's frame."""
+    pts = hand_joints(sign, grip)
+    out = []
+    for i, (_, _, w) in enumerate(FINGERS):
+        chain = pts[5 + 4 * i: 9 + 4 * i]
+        girth = w
+        for p, q in zip(chain, chain[1:]):
+            out.append((part, "hand", prism(at(p), at(q), side_x, (girth, girth * 0.9),
+                                            (girth * 0.9, girth * 0.85), 6)))
+            girth *= 0.88
+    base, knuckle, tip = pts[1], pts[2], pts[4]
     out += [(part, "hand", prism(at(base), at(knuckle), side_z, (0.013, 0.012),
                                  (0.011, 0.01), 6)),
             (part, "hand", prism(at(knuckle), at(tip), side_z, (0.011, 0.01),
@@ -2666,11 +2682,21 @@ HIDDEN_BEHIND = 0.3            # m of something nearer at its pixel that hides a
 def rigs(obj):
     """The people in an object as [(skeleton, k, shift)]: a skeleton point p
     is at p * k + shift in the world, as `painted_pieces` places their faces.
-    One for a person, one per member for a crowd, none for a prop."""
+    One for a person, one per member for a crowd, none for a prop. The
+    skeleton also has "hands": {"l"/"r": 21 points} as `hand_joints` puts
+    them, in the skeleton's space, each hand closed on what it holds."""
     def placed(controls, root, shape, look, k, x, y, z):
-        low = min(p[1] for _, faces, _ in person_pieces(controls, root, shape, outfit(look))
+        dressed = outfit(look)
+        low = min(p[1] for _, faces, _ in person_pieces(controls, root, shape, dressed)
                   for f in faces for p in f) * k
-        return skeleton(controls, root, shape), k, (x, y - low, z)
+        controls = gripped(controls, dressed.get("held") or {})
+        sk = skeleton(controls, root, shape)
+        sk["hands"] = {}
+        for side, sign in (("l", 1), ("r", -1)):
+            wp, wm = sk["wrist_" + side]
+            grip = tuple(float(controls.get(g % side, 0) or 0) for g in GRIP_KEYS[1:])
+            sk["hands"][side] = [add(wp, apply(wm, v)) for v in hand_joints(sign, grip)]
+        return sk, k, (x, y - low, z)
     x, y, z = obj["position"]
     if obj["asset"] == "person":
         look = obj.get("look") or {}
@@ -2832,7 +2858,19 @@ def pose_figures(scene, width=None, height=None):
                     s = cam.project(world(add(hp, apply(hm, local))))
                     if s:
                         face.append((s[0] / width, s[1] / height))
-            out.append({"points": pts, "face": face,
+            # The hands, as DWPose finds them: only where the wrist is seen,
+            # a finger point hidden by what stands in front left out.
+            hands = {}
+            for side, name, wi in (("r", "right", 4), ("l", "left", 7)):
+                if not pts[wi]:
+                    continue
+                hp2 = []
+                for p in sk["hands"][side]:
+                    s = cam.project(world(p))
+                    hp2.append([s[0] / width, s[1] / height] if s and not hidden(world(p))
+                               else None)
+                hands[name] = hp2
+            out.append({"points": pts, "face": face, "hand_points": hands,
                         "depth": cam.to_camera(world(hp))[2]})
     out.sort(key=lambda f: -f["depth"])
     return out
@@ -3061,6 +3099,35 @@ def _arm(sk, side, bent, hip_y):
     return "hanging relaxed at the side"
 
 
+HELD_WORDS = {"stein": "fingers wrapped round the beer stein",
+              "pretzel": "pinching the pretzel between thumb and fingers"}
+
+
+def hand_words(controls, held):
+    """What each hand is doing, as phrases, for the fingers the pose map's
+    hands are too small to carry alone. A hand at rest says nothing."""
+    c = gripped(controls, held)
+    g = lambda k: float(c.get(k, 0) or 0)                 # noqa: E731
+    if "accordion" in held:
+        return ["right fingers on the accordion keys", "left hand on the accordion's bass end"]
+    out = []
+    for side, name in (("r", "right"), ("l", "left")):
+        kind = next((k for k in HELD_WORDS if side in held.get(k, ((),))[0]), None)
+        curl, spread = g("fingers_%s_curl" % side), g("fingers_%s_spread" % side)
+        if kind:
+            words = HELD_WORDS[kind]
+        elif curl >= 60:
+            words = "clenched in a fist" if g("thumb_%s_curl" % side) >= 40 else "fingers curled in"
+        elif curl >= 25:
+            words = "fingers loosely curled"
+        elif spread >= 12:
+            words = "open with the fingers spread"
+        else:
+            continue
+        out.append("%s hand %s" % (name, words))
+    return out
+
+
 def posture_words(obj):
     """How a person stands, as phrases: the torso, the arms, the legs (unless
     a named pose that says them - kneeling, sitting - is chosen), and the
@@ -3088,6 +3155,7 @@ def posture_words(obj):
         out.append(BOTH_ARMS[arms["r"]])
     else:
         out += ["right arm " + arms["r"], "left arm " + arms["l"]]
+    out += hand_words(c, outfit(look).get("held") or {})
     if obj["pose"].get("preset") not in LEG_POSES:
         sl, sr = g("leg_l_step"), g("leg_r_step")
         bl, br = g("leg_l_bend"), g("leg_r_bend")
