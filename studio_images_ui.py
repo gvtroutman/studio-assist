@@ -479,14 +479,12 @@ class ImageStudio:
         self.cap(f, "Prompt").pack(**pad)
         setup = self.sections["Settings"]
         self.cap(setup, "Preset").pack(**pad)
-        row = self.frame(setup)
-        row.pack(side="top", fill="x", **pad)
-        self.preset_pill = self.choice(
-            row, [(k, ig.PRESETS[k]["label"]) for k in ig.PRESET_ORDER],
-            self.settings["preset"], self._set_preset)
-        self.preset_pill.pack(side="left")
+        self.preset_row = self.frame(setup)
+        self.preset_row.pack(side="top", fill="x", **pad)
+        self.preset_mix = set()       # LoRA ids the picked saved mix put in the rows
         self.preset_about = self.label(setup, ig.PRESETS["standard"]["about"], "faint",
                                        self.host.f_small, wraplength=self.px(380))
+        self._build_presets()
 
         self.cap(setup, "Model and backend").pack(**pad)
         self.model_row = self.frame(setup)
@@ -576,6 +574,8 @@ class ImageStudio:
         self.add_lora_pill.pack(side="left")
         self.button(lrow, "Library…", self.edit_loras, kind="ghost").pack(
             side="left", padx=(self.px(6), 0))
+        self.button(lrow, "Save as preset…", self.save_preset, kind="ghost").pack(
+            side="left", padx=(self.px(6), 0))
 
         self._build_advanced(self.adv_box)
 
@@ -642,6 +642,7 @@ class ImageStudio:
         LoRA rows. Called again after any editor saves."""
         lib = self.studio.lib
         self._rebuild_models()
+        self._build_presets()
         for w in self.char_row.winfo_children():
             w.destroy()
         chars = [("", "No character")] + [(c["id"], c["name"]) for c in lib.all("characters")]
@@ -731,14 +732,129 @@ class ImageStudio:
         self.settings[key] = value
         self._recheck()
 
+    def _build_presets(self):
+        """The Preset row: the built-ins, then the saved LoRA mixes, and a
+        Delete beside a saved one. Built again when a mix is saved or
+        deleted."""
+        for w in self.preset_row.winfo_children():
+            w.destroy()
+        lib = self.studio.lib
+        mixes = lib.all("presets")
+        items = [(k, ig.PRESETS[k]["label"]) for k in ig.PRESET_ORDER]
+        if mixes:
+            items += [(None, "")] + [(m["id"], m["name"]) for m in mixes]
+        if self.settings["preset"] not in dict(items):
+            self.settings["preset"] = "standard"
+        self.preset_pill = self.choice(self.preset_row, items, self.settings["preset"],
+                                       self._set_preset)
+        self.preset_pill.pack(side="left")
+        info = ig.preset_info(lib, self.settings["preset"])
+        if info["custom"]:
+            self.button(self.preset_row, "Delete", self.delete_preset, kind="ghost").pack(
+                side="left", padx=(self.px(6), 0))
+        self.preset_about.config(text=info["about"])
+
     def _set_preset(self, key):
+        """A preset picked. A saved mix replaces the LoRA rows the last mix
+        put there with its own (a row added by hand stays) and opens
+        Advanced so they show; a built-in takes the last mix's rows away."""
         self.settings["preset"] = key
-        self.preset_about.config(text=ig.PRESETS[key]["about"])
+        info = ig.preset_info(self.studio.lib, key)
+        for r in [r for r in self.loras if r["id"] in self.preset_mix]:
+            r["row"].destroy()
+            self.loras.remove(r)
+        self.preset_mix = set()
+        for sel in info["loras"]:
+            if self.studio.lib.get("loras", sel["id"]):
+                for r in [r for r in self.loras if r["id"] == sel["id"]]:
+                    r["row"].destroy()
+                    self.loras.remove(r)
+                self._add_lora(sel["id"], sel["strength"], recheck=False)
+                self.preset_mix.add(sel["id"])
+        if info["loras"] and not self.adv_open:
+            self._toggle_advanced()
+        self._build_presets()
         if not self.refine_set:
-            self.refine.set(bool(ig.PRESETS[key]["values"].get("refine")))
+            self.refine.set(bool(info["values"].get("refine")))
         if not self.faces_set:
-            self.faces.set(bool(ig.PRESETS[key]["values"].get("face_detail")))
+            self.faces.set(bool(info["values"].get("face_detail")))
         self._recheck()
+
+    def save_preset(self):
+        """The LoRA rows, with their strengths, saved as a preset under a
+        name; the same name replaces that preset. It rides on the built-in
+        preset now chosen (or the chosen mix's)."""
+        rows = [{"id": r["id"], "strength": round(r["var"].get(), 2)} for r in self.loras]
+        if not rows:
+            self.say("Add a LoRA or two first (Add LoRA), then save them as a preset.",
+                     "warn")
+            return None
+        lib = self.studio.lib
+        info = ig.preset_info(lib, self.settings["preset"])
+
+        def done(name):
+            old = next((m for m in lib.all("presets")
+                        if m["name"].lower() == name.lower()), None)
+            rec = {"id": old["id"] if old else "", "name": name, "base": info["base"],
+                   "loras": rows}
+            try:
+                lib.save("presets", [m for m in lib.all("presets") if m is not old] + [rec])
+            except OSError as e:
+                self.say("Could not save the preset: %s" % e, "err")
+                return
+            saved = next(m for m in lib.all("presets") if m["name"] == name)
+            self.settings["preset"] = saved["id"]
+            self.preset_mix = {r["id"] for r in rows}
+            self._build_presets()
+            self.say("Saved preset %s. Pick it under Preset to load these LoRAs." % name,
+                     "muted")
+        return self._ask_name("Save LoRAs as a preset", "Preset name",
+                              info["label"] if info["custom"] else "", done)
+
+    def delete_preset(self):
+        lib = self.studio.lib
+        rec = lib.get("presets", self.settings["preset"])
+        if rec is None:
+            return
+        try:
+            lib.save("presets", [m for m in lib.all("presets") if m["id"] != rec["id"]])
+        except OSError as e:
+            self.say("Could not delete the preset: %s" % e, "err")
+            return
+        self.preset_mix = set()         # its LoRAs stay in the rows until taken off
+        self.settings["preset"] = rec["base"]
+        self._build_presets()
+        self._recheck()
+        self.say("Deleted preset %s; its LoRAs are still in the rows." % rec["name"],
+                 "muted")
+
+    def _ask_name(self, title, label, value, then):
+        """A small window asking for a name; `then(name)` on Save or Return."""
+        top = tk.Toplevel(self.host)
+        top.title(title)
+        top.transient(self.host)
+        self.skin(top, bg="bg")
+        self.label(top, label, "text").pack(side="top", anchor="w", padx=self.px(12),
+                                            pady=(self.px(10), self.px(4)))
+        var = tk.StringVar(value=value)
+        e = self.host._entry(top, var)
+        e.master.pack(side="top", fill="x", padx=self.px(12))
+        row = self.frame(top)
+        row.pack(side="top", fill="x", padx=self.px(12), pady=self.px(10))
+
+        def ok(_ev=None):
+            name = var.get().strip()
+            if name:
+                top.destroy()
+                then(name)
+        self.button(row, "Save", ok, kind="accent").pack(side="right")
+        self.button(row, "Cancel", top.destroy, kind="ghost").pack(
+            side="right", padx=(0, self.px(6)))
+        e.bind("<Return>", ok)
+        e.bind("<Escape>", lambda _ev: top.destroy())
+        e.focus_set()
+        top.var, top.ok = var, ok       # for the tests
+        return top
 
     def _build_style_tiles(self, styles):
         """The styles as a grid of pictures: each one the same photo in that
@@ -1313,8 +1429,8 @@ class ImageStudio:
         for d in s.get("loras") or []:
             if isinstance(d, dict):
                 self._add_lora(d.get("id"), d.get("strength"), recheck=False)
-        self.preset_pill.set(text=ig.PRESETS.get(self.settings["preset"], ig.PRESETS[
-            "standard"])["label"] + "  ▾")
+        self.preset_mix = set()
+        self._build_presets()
         if not self.adv_open:
             self._toggle_advanced()
         self._show_section("Settings")
@@ -1623,7 +1739,7 @@ class ImageStudio:
         self.wrap(self.label(right, prompt[:140] + ("\u2026" if len(prompt) > 140 else ""),
                              "text", bg="card"), right, self.px(12))
         model = self.studio.lib.get("models", s.get("model")) or {}
-        preset = ig.PRESETS.get(s.get("preset"), {}).get("label", s.get("preset"))
+        preset = ig.preset_info(self.studio.lib, s.get("preset"))["label"]
         meta = self.label(right, "", "faint", self.host.f_small, bg="card")
         meta.pack(side="top", fill="x")
         self.wrap(meta, right, self.px(12))
