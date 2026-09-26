@@ -992,7 +992,13 @@ def new_scene(details=""):
     return {"version": VERSION, "details": details, "frame": "portrait", "redraw": REDRAW,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
-            "room": new_room(), "objects": []}
+            "room": new_room(), "objects": [], "enrich": new_enrich()}
+
+
+def new_enrich():
+    """Enrich's memory: `added` details are in the words, `seen` were offered
+    and skipped, `never` the user asked not to be offered again."""
+    return {"added": [], "seen": [], "never": []}
 
 
 def new_object(asset_id, taken=()):
@@ -1143,6 +1149,11 @@ def clean_scene(d):
                             % (raw.get("asset") if isinstance(raw, dict) else raw))
         else:
             s["objects"].append(o)
+    given = d.get("enrich") if isinstance(d.get("enrich"), dict) else {}
+    for key in s["enrich"]:
+        raw = given.get(key) if isinstance(given.get(key), list) else []
+        s["enrich"][key] = [str(x).strip()[:ENRICH_CHARS] for x in raw
+                            if isinstance(x, str) and x.strip()][-ENRICH_KEEP:]
     return s, problems
 
 
@@ -1696,6 +1707,9 @@ def scene_text(scene):
         if not said:
             out.notes.append("%s has no description; the picture has only its shape and "
                              "name to go on." % obj["name"])
+    for detail in (scene.get("enrich") or {}).get("added") or []:
+        if detail.strip():
+            parts.append(detail.strip())
     parts.append(camera_words(scene))
     out.text = "\n".join(p if p.endswith((".", "!", "?")) else p + "." for p in parts)
     return out
@@ -1737,3 +1751,118 @@ def generation(scene, reference, characters=None):
                 idents.append(rec["identity"])
         extra["scene_identities"] = idents
     return words, reference, extra
+
+
+# ---------------------------------------------------------------- enrich
+# One lived-in detail at a time, from the model on the LLM PC, around the
+# people and never between or on them. The user adds, skips or bans each;
+# the scene remembers all three so the next offer is a new one.
+
+ENRICH_KEEP = 40          # per list, newest kept
+ENRICH_CHARS = 400
+ENRICH_ANGLES = [
+    "something left behind or in use on a surface (a glass, food, a bag, a jacket)",
+    "a photographic imperfection (a person half cut off at the frame edge, uneven "
+    "light, a soft out-of-focus foreground shape, glare, haze)",
+    "people in the far background going about their own business, softly out of focus",
+    "wear and weather on the place itself (worn ground, stains, puddles, scuffs, "
+    "peeling paint, fallen leaves)",
+    "light: where it comes from, its colour and how it falls unevenly on things",
+    "signage, writing or decoration that belongs to this exact place, slightly worn",
+    "a small sign of what happened a minute ago (a spill, a chair pushed back, "
+    "crumpled napkins)",
+]
+ENRICH_SYSTEM = """You help stage a photograph. You suggest ONE believable, lived-in detail \
+that would make the scene feel like a real snapshot taken in that moment, not people \
+pasted into a themed background.
+
+Rules:
+- Favour photographic imperfections and environmental storytelling over decorative \
+clutter. A jacket over a bench, an empty glass, a stranger half cut off by the frame \
+edge or uneven warm light is worth more than one more themed prop.
+- Enrich AROUND the people. Never put anything or anyone between them, in front of \
+their faces or in their hands, and never change who they are, their clothes or their \
+pose. Place the detail somewhere specific: foreground edge, mid-background, far \
+background, above, on the ground beside them.
+- Be concrete and visual: materials, colours, state, how the light falls on it, how \
+sharp or blurred it is. One or two sentences, 25 to 60 words, written as a line of \
+an image prompt, not advice.
+- Suggest something new: nothing already in the scene, nothing offered before, \
+nothing like what the user banned.
+
+Answer with JSON only: {"detail": "<the prompt line>", "why": "<under 15 words>"}"""
+
+
+def enrich_angle(scene):
+    """The kind of detail to ask for this time: a rotation, so the offers
+    vary instead of settling on steins forever."""
+    e = scene.get("enrich") or new_enrich()
+    return ENRICH_ANGLES[(len(e["added"]) + len(e["seen"])) % len(ENRICH_ANGLES)]
+
+
+def enrich_messages(scene):
+    e = scene.get("enrich") or new_enrich()
+    said = []
+    for title, key in (("Already added", "added"), ("Offered before, skipped", "seen"),
+                       ("Never suggest these or anything like them", "never")):
+        if e[key]:
+            said.append("%s:\n%s" % (title, "\n".join("- " + x for x in e[key][-20:])))
+    user = ("The scene as the image prompt describes it:\n%s\n\n%s\n\nThis time, look for: %s."
+            % (scene_text(scene).text, "\n\n".join(said) or "Nothing has been added yet.",
+               enrich_angle(scene)))
+    return [{"role": "system", "content": ENRICH_SYSTEM},
+            {"role": "user", "content": user}]
+
+
+def read_suggestion(text):
+    """-> (detail, why) from the model's reply, or (None, None). Takes the
+    JSON asked for, or failing that the first real line of prose."""
+    text = re.sub(r"(?s)<think>.*?(</think>|$)", "", text or "").strip()
+    m = re.search(r"(?s)\{.*\}", text)
+    if m:
+        try:
+            d = json.loads(m.group(0))
+        except ValueError:
+            d = None
+        if isinstance(d, dict) and isinstance(d.get("detail"), str) and d["detail"].strip():
+            why = d.get("why") if isinstance(d.get("why"), str) else ""
+            return _tidy(d["detail"]), why.strip()[:160]
+    for line in text.splitlines():
+        line = _tidy(line)
+        if len(line) > 12 and not line.startswith(("{", "}", "```")):
+            return line, ""
+    return None, None
+
+
+def _tidy(s):
+    s = re.sub(r"^(?:suggested enrichment|detail|suggestion)\s*:\s*", "", s.strip(), flags=re.I)
+    s = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", s)
+    return s.strip().strip('"\'\u201c\u201d').strip()[:ENRICH_CHARS]
+
+
+def _same(a, b):
+    key = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    return key(a) == key(b)
+
+
+def suggest(scene, llm, tries=2):
+    """-> (detail, why): one new detail from `llm` (anything with
+    `chat(messages, max_tokens=)` returning an OpenAI reply). Raises
+    RuntimeError when nothing usable came back."""
+    e = scene.get("enrich") or new_enrich()
+    old = e["added"] + e["seen"] + e["never"]
+    for _ in range(tries):
+        reply = llm.chat(enrich_messages(scene), max_tokens=700)
+        msg = ((reply.get("choices") or [{}])[0].get("message") or {})
+        detail, why = read_suggestion(msg.get("content") or "")
+        if detail and not any(_same(detail, x) for x in old):
+            return detail, why
+    raise RuntimeError("The model offered nothing new for this scene. Try again, "
+                       "or add a line to Scene details for it to build on.")
+
+
+def enrich_answer(scene, detail, answer):
+    """Remember the user's answer: 'add', 'skip' or 'never'."""
+    e = scene.setdefault("enrich", new_enrich())
+    key = {"add": "added", "skip": "seen", "never": "never"}[answer]
+    e[key] = (e[key] + [detail.strip()[:ENRICH_CHARS]])[-ENRICH_KEEP:]
