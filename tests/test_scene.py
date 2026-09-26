@@ -159,7 +159,9 @@ class TestBodyAndClothes(unittest.TestCase):
     def test_no_clothes_is_the_plain_mannequin_in_its_colour(self):
         o = self.person(weight=2)
         own = sc.hex_rgb(o["colour"])
-        self.assertEqual({rgb for _, _, rgb in sc.painted_pieces(o)}, {own})
+        # Skin is the object's colour; the eyes are their own.
+        self.assertEqual({rgb for _, _, rgb in sc.painted_pieces(o)},
+                         {own, sc.EYE_WHITE, sc.EYE_DARK})
 
     def test_clothes_colour_what_they_cover(self):
         o = self.person(top="white t-shirt", bottom="blue jeans", footwear="black boots")
