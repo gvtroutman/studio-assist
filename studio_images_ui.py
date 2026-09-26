@@ -1942,19 +1942,26 @@ class ImageStudio:
 
     # ------------------------------------------------------- person cut-out
     def _pick_person(self, editor):
-        """The selected reference photo (else the first) cut down to one
-        person on white: SAM3 finds everyone; with more than one, a click
-        says who. The cut-out takes the photo's place in the list, so it is
-        the face reference when the photo was; the photo stays after it."""
+        """A photo - the selected reference, else one chosen from disk -
+        cropped by a drag, then cut down to one person on white: SAM3 finds
+        everyone in the crop; with more than one, a click says who. The
+        cut-out takes the photo's place in the list (the front for a photo
+        from disk), so it is the face reference when the photo was; a listed
+        photo stays after it."""
         w = editor.widgets.get("references")
         pics = w[1] if w else None
-        if not pics or not pics["paths"]:
-            editor.status("Add a reference photo first.", "warn")
+        if pics is None:
             return
-        i = min(pics["sel"]) if pics["sel"] else 0
-        path = pics["paths"][i]
+        if pics["sel"]:
+            path = pics["paths"][min(pics["sel"])]
+        else:
+            path = filedialog.askopenfilename(
+                parent=editor.win, title="A photo with the person in it", filetypes=[
+                    ("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
+            if not path:
+                return
         rec = editor.records[editor.current]
-        editor.status("Finding the people in the photo" + ELLIPSIS)
+        editor.status("Opening the photo" + ELLIPSIS)
 
         def later(fn):
             self._post("call", lambda: editor.win.winfo_exists() and fn())
@@ -1982,15 +1989,16 @@ class ImageStudio:
                 editor.status("Cut out. Save keeps it.")
             later(done)
 
-        def find():
+        def find(region):
             try:
-                found = self.studio.find_people(path)
+                found = self.studio.find_people(path, region)
             except (ig.ComfyError, OSError) as e:
                 later(lambda: editor.status(str(e), "err"))
                 return
             boxes = found["boxes"]
             if not boxes:
-                later(lambda: editor.status("SAM3 found nobody in that photo.", "warn"))
+                later(lambda: editor.status("SAM3 found nobody in %s." % (
+                    "that crop" if region else "that photo"), "warn"))
             elif len(boxes) == 1:
                 later(lambda: editor.status("One person; cutting them out" + ELLIPSIS))
                 cut(found, boxes[0])
@@ -1998,20 +2006,35 @@ class ImageStudio:
                 later(lambda: self._choose_person(editor, found, lambda b: (
                     editor.status("Cutting them out" + ELLIPSIS),
                     self.host._spawn(self.s.event_id, cut, found, b))))
-        self.host._spawn(self.s.event_id, find)
 
-    def _choose_person(self, editor, found, then):
-        """A window with the photo and a numbered box round each person; a
-        click picks the one under it."""
-        top = tk.Toplevel(editor.win)
-        top.title("Who is it?")
-        top.transient(editor.win)
+        def cropped(region):
+            editor.status("Finding the people in the %s" % ("crop" if region else "photo")
+                          + ELLIPSIS)
+            self.host._spawn(self.s.event_id, find, region)
+
+        def look():
+            try:
+                photo = self.studio.look_at(path)
+            except (ig.ComfyError, OSError) as e:
+                later(lambda: editor.status(str(e), "err"))
+                return
+            later(lambda: (editor.status("Drag round the part of the photo to look in."),
+                           self._crop_photo(editor, photo, cropped)))
+        self.host._spawn(self.s.event_id, look)
+
+    def _show_found(self, parent, found, name, title, heading):
+        """A Toplevel over `parent` called `title`, `heading` above found's
+        preview (written to references/`name` for Tk) on a canvas;
+        -> (window, canvas, k), k the canvas px per picture px."""
+        top = tk.Toplevel(parent)
+        top.title(title)
+        top.transient(parent)
         self.skin(top, bg="bg")
-        self.label(top, "%d people. Click the one this identity is." % len(found["boxes"]),
-                   "text").pack(side="top", fill="x", padx=self.px(12), pady=(self.px(10), 0))
+        self.label(top, heading, "text").pack(side="top", fill="x", padx=self.px(12),
+                                              pady=(self.px(10), 0))
         img = None
         if found["preview"]:
-            tmp = os.path.join(self.studio.lib.root, "references", "_people.png")
+            tmp = os.path.join(self.studio.lib.root, "references", name)
             try:
                 os.makedirs(os.path.dirname(tmp), exist_ok=True)
                 with open(tmp, "wb") as f:
@@ -2022,12 +2045,84 @@ class ImageStudio:
         k = img.width() / float(found["width"]) if img else self.px(640) / float(
             max(found["width"], found["height"]))
         cw, ch = int(found["width"] * k), int(found["height"] * k)
-        cv = tk.Canvas(top, width=cw, height=ch, bd=0, highlightthickness=0, cursor="hand2")
+        cv = tk.Canvas(top, width=cw, height=ch, bd=0, highlightthickness=0)
         self.skin(cv, bg="card")
         cv.pack(side="top", padx=self.px(12), pady=self.px(10))
         if img:
             top._img = img
             cv.create_image(0, 0, image=img, anchor="nw")
+        return top, cv, k
+
+    def _crop_photo(self, editor, photo, then):
+        """A window with the photo: a drag marks the part to look in, the
+        rest dimmed. `then` gets its crop_region, or None for the whole
+        photo; Cancel or closing the window calls nothing."""
+        top, cv, k = self._show_found(editor.win, photo, "_photo.png", "Crop the photo",
+                                      "Drag round the person, or use the whole photo.")
+        cv.configure(cursor="crosshair")
+        cw, ch = int(cv["width"]), int(cv["height"])
+        accent = self.host.C["accent"]
+        drag = {"from": None, "to": None}
+        # Four dimming panels round the crop, and its outline; moved on each drag.
+        shade = [cv.create_rectangle(0, 0, 0, 0, fill="black", outline="", stipple="gray50",
+                                     state="hidden") for _ in range(4)]
+        edge = cv.create_rectangle(0, 0, 0, 0, outline=accent, width=self.px(2),
+                                   state="hidden")
+
+        def region():
+            if not drag["from"] or not drag["to"]:
+                return None
+            (x0, y0), (x1, y1) = drag["from"], drag["to"]
+            return ig.crop_region(x0 / k, y0 / k, x1 / k, y1 / k,
+                                  photo["width"], photo["height"])
+
+        def draw():
+            r = region()
+            state = "normal" if r else "hidden"
+            if r:
+                x0, y0 = r["x"] * k, r["y"] * k
+                x1, y1 = x0 + r["width"] * k, y0 + r["height"] * k
+                for item, box in zip(shade, ((0, 0, cw, y0), (0, y1, cw, ch),
+                                             (0, y0, x0, y1), (x1, y0, cw, y1))):
+                    cv.coords(item, *box)
+                cv.coords(edge, x0, y0, x1, y1)
+            for item in shade + [edge]:
+                cv.itemconfigure(item, state=state)
+            use.set(state="normal" if r else "disabled")
+
+        def press(ev):
+            drag["from"], drag["to"] = (ev.x, ev.y), None
+            draw()
+
+        def move(ev):
+            drag["to"] = (min(max(ev.x, 0), cw), min(max(ev.y, 0), ch))
+            draw()
+
+        def finish(r):
+            top.destroy()
+            then(r)
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<B1-Motion>", move)
+        cv.bind("<ButtonRelease-1>", move)
+        row = self.frame(top)
+        row.pack(side="top", fill="x", padx=self.px(12), pady=(0, self.px(10)))
+        use = self.button(row, "Use crop", lambda: region() and finish(region()))
+        use.pack(side="right")
+        self.button(row, "Whole photo", lambda: finish(None), kind="ghost").pack(
+            side="right", padx=(0, self.px(4)))
+        self.button(row, "Cancel", top.destroy, kind="ghost").pack(side="left")
+        top.bind("<Return>", lambda ev: region() and finish(region()))
+        top.bind("<Escape>", lambda ev: top.destroy())
+        draw()
+        return top
+
+    def _choose_person(self, editor, found, then):
+        """A window with the photo (or its crop) and a numbered box round
+        each person; a click picks the one under it."""
+        top, cv, k = self._show_found(
+            editor.win, found, "_people.png", "Who is it?",
+            "%d people. Click the one this identity is." % len(found["boxes"]))
+        cv.configure(cursor="hand2")
         accent = self.host.C["accent"]
         for n, (x, y, w, h) in enumerate(found["boxes"], 1):
             cv.create_rectangle(x * k, y * k, (x + w) * k, (y + h) * k, outline=accent,

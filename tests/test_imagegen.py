@@ -2312,7 +2312,7 @@ class PersonCutoutTest(unittest.TestCase):
                 return str(len(self.graphs))
 
             def get_history(self, pid):
-                if pid == "1":
+                if "GetImageSize" in str(self.graphs[int(pid) - 1]):   # a people_graph
                     return {"outputs": {
                         "5": {"text": [json.dumps([{"x": 5, "y": 5, "width": 50,
                                                      "height": 90}])]},
@@ -2334,3 +2334,32 @@ class PersonCutoutTest(unittest.TestCase):
             self.assertEqual(s.cut_person(found, found["boxes"][0]), b"cut.png")
             region = s.client(b).graphs[1]["2"]["inputs"]["crop_region"]
             self.assertEqual(region, {"x": 2, "y": 2, "width": 56, "height": 96})
+            # Cropped first: SAM3 looks in the crop, the cut lands in the photo.
+            found = s.find_people(__file__, {"x": 300, "y": 40, "width": 100, "height": 100})
+            g = s.client(b).graphs[2]
+            self.assertEqual(g["4"]["inputs"]["image"], ["c", 0])
+            self.assertEqual(g["9"]["inputs"]["images"], ["c", 0])
+            s.cut_person(found, found["boxes"][0])
+            region = s.client(b).graphs[3]["2"]["inputs"]["crop_region"]
+            self.assertEqual(region, {"x": 302, "y": 42, "width": 56, "height": 96})
+            # SAM3 is aimed at the picked person, in the cut's own pixels.
+            self.assertEqual(s.client(b).graphs[3]["5"]["inputs"]["bboxes"],
+                             {"x": 3, "y": 3, "width": 50, "height": 90})
+            # look_at: the size and preview, no SAM3 run.
+            photo = s.look_at(__file__)
+            self.assertNotIn("4", s.client(b).graphs[4])
+            self.assertEqual((photo["width"], photo["height"], photo["preview"]),
+                             (100, 100, b"pv.png"))
+
+    def test_crop_region_orders_clamps_and_drops_slips(self):
+        self.assertEqual(ig.crop_region(300, 250, 100, -20, 400, 300),
+                         {"x": 100, "y": 0, "width": 200, "height": 250})
+        self.assertIsNone(ig.crop_region(10, 10, 30, 200, 400, 300))     # too thin
+        self.assertIsNone(ig.crop_region(-5, -5, 500, 400, 400, 300))    # the whole photo
+
+    def test_people_graph_without_sam3_only_sizes_and_previews(self):
+        g = ig.people_graph("a.png", None)
+        self.assertFalse({"2", "3", "4", "5", "c"} & set(g))
+        self.assertEqual(g["9"]["inputs"]["images"], ["1", 0])
+        self.assertEqual(ig.people_found({"outputs": {
+            "7": {"text": ["10"]}, "8": {"text": ["20"]}}})[:3], (10, 20, []))
