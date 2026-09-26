@@ -1045,10 +1045,13 @@ def fill(wf, values, loras=()):
 
     - `"{{name}}"` as a whole value becomes the value itself, typed (a seed
       stays an int, a link stays a list); inside a longer string it is text.
-    - A node with `"_when": "x"` is kept only when x is set and truthy;
-      `"_unless": "x"` the reverse.
+    - A node with `"_when": "x"` is kept only when x is set and truthy
+      (`["x", "y"]`: when either is - one ControlNet loader for the pose
+      and the depth map); `"_unless": "x"` the reverse.
     - `switches` name a link chosen by a value: `{"when": "x", "then": link,
-      "else": link}`, then used as `"{{name}}"`.
+      "else": link}`, then used as `"{{name}}"`. A branch may be
+      `"{{other}}"`, a switch named before it: the depth ControlNet hangs
+      off the pose's output when there is one, else off the prompt.
     - `lora_chain` names the model (and clip) outputs the LoRAs hang off;
       `{{model_out}}` / `{{clip_out}}` are the end of the chain.
     Anything left unfilled, or a link to a node that was dropped, is an error
@@ -1076,11 +1079,18 @@ def fill(wf, values, loras=()):
     elif loras:
         raise TemplateError("Workflow %s takes no LoRAs." % wf["id"])
     for name, sw in (wf.get("switches") or {}).items():
-        v[name] = sw["then"] if v.get(sw["when"]) else sw["else"]
+        pick = sw["then"] if v.get(sw["when"]) else sw["else"]
+        m = PLACEHOLDER.fullmatch(pick.strip()) if isinstance(pick, str) else None
+        if m:
+            if m.group(1) not in v:
+                raise TemplateError("Workflow %s: switch %s names %s, which is not a "
+                                    "switch before it." % (wf["id"], name, m.group(1)))
+            pick = v[m.group(1)]
+        v[name] = pick
 
     kept = {}
     for nid, node in graph.items():
-        if "_when" in node and not v.get(node["_when"]):
+        if "_when" in node and not any(v.get(w) for w in _names(node["_when"])):
             continue
         if "_unless" in node and v.get(node["_unless"]):
             continue
@@ -1704,10 +1714,15 @@ FOLDER_WORDS = {"diffusion_models": "diffusion model", "checkpoints": "checkpoin
                 "controlnet": "ControlNet", "upscale_models": "upscale model"}
 
 
+def _names(when):
+    """A node's `_when`: one name or a list of them."""
+    return when if isinstance(when, list) else [when]
+
+
 def uses(wf, var):
     """Whether a template does anything with `var` (a node kept or dropped by
     it, or a switch on it) - so a setting it ignores is not recorded as done."""
-    return (any(n.get("_when") == var or n.get("_unless") == var
+    return (any(var in _names(n.get("_when")) or n.get("_unless") == var
                 for n in wf["graph"].values())
             or any(sw.get("when") == var for sw in (wf.get("switches") or {}).values()))
 
@@ -1763,7 +1778,7 @@ def default_settings():
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "face_detail": None, "batch": 1, "pose": None,
+            "face_detail": None, "batch": 1, "pose": None, "composition": None,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -2445,6 +2460,17 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     plan_items(p, s, wf, v, backend, lacking("items"), nodes)
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
+    # Denoise below 1 over an empty latent leaves noise in the picture: it
+    # only means something with a source picture to start from.
+    if ("source_image" not in p.images and uses(wf, "source_image")
+            and float(v.get("denoise") or 1.0) < 1.0):
+        if s.get("denoise") not in (None, ""):
+            p.notes.append("Denoise %s is for a source picture; there is none, so the "
+                           "picture is made from noise (1.0)." % s["denoise"])
+        v["denoise"] = 1.0
+    comp = s.get("composition") if isinstance(s.get("composition"), dict) else {}
+    if p.references.get("composition") and comp.get("strength") not in (None, ""):
+        v["composition_strength"] = round(float(comp["strength"]), 3)
     pose = s.get("pose") if isinstance(s.get("pose"), dict) else {}
     if p.references.get("pose") and pose.get("strength") not in (None, ""):
         v["pose_strength"] = round(float(pose["strength"]), 3)

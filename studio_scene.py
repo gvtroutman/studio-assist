@@ -5,9 +5,11 @@ picture before the Image Studio makes it.
 
 Not a 3D package and not a slicer, though it is laid out like one: a person
 and a couple of props on a floor, one camera, and the frame that camera sees.
-That frame goes to the Image Studio as a `source` reference (image to image),
-and the words written on each object go into the prompt as written. The
-pieces:
+What the picture is made from is what that frame means (`scene_maps`): a
+pose map of every body's joints and a depth map of the whole frame, for the
+FLUX ControlNet - and the grey frame itself as a `source` (image to image)
+only when asked, or for a model with no ControlNet. The words written on
+each object go into the prompt as written. The pieces:
 
 - **The rig** (`JOINTS`): a mannequin of fifteen joints posed by forward
   kinematics from a handful of named controls (`CONTROLS`) - head, torso, and
@@ -60,6 +62,7 @@ import struct
 import zlib
 
 import studio_icons
+import studio_pose
 
 VERSION = 1
 FULL_FRAME_DIAGONAL = 43.27    # mm; a lens is read against a full-frame sensor
@@ -80,7 +83,17 @@ FRAMES = [
 ]
 FRAME_SIZES = {k: (w, h) for k, _, w, h in FRAMES}
 LENSES = (24, 35, 50, 85)
-REDRAW = 0.7                   # denoise: how far the picture may move from the blockout
+# What the picture is made from (`scene_maps`), each 0 for off: the pose map's
+# and the depth map's ControlNet strengths, and how much of the grey frame
+# itself is kept (1 - denoise). The frame is off by default: image to image
+# from it copies the mannequins' blocky look at any denoise that keeps the
+# layout, which the two maps keep without it.
+POSE_STRENGTH = 0.85
+DEPTH_STRENGTH = 0.55
+FRAME_KEEP = 0.0
+FRAME_KEEP_MAX = 0.7
+FALLBACK_KEEP = 0.3            # the frame kept for a model with no ControlNet (denoise 0.7)
+DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet scales it
 
 COLOURS = [                    # (hex, name) offered for any object
     ("#c9b8a6", "mannequin"), ("#e8c07a", "yellow"), ("#d9774b", "orange"),
@@ -1416,7 +1429,9 @@ def new_room():
 
 
 def new_scene(details=""):
-    return {"version": VERSION, "details": details, "frame": "portrait", "redraw": REDRAW,
+    return {"version": VERSION, "details": details, "frame": "portrait",
+            "pose_strength": POSE_STRENGTH, "depth_strength": DEPTH_STRENGTH,
+            "frame_keep": FRAME_KEEP,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
             "room": new_room(), "objects": []}
@@ -1563,7 +1578,11 @@ def clean_scene(d):
         return s, ["Not a scene file."]
     s["details"] = str(d.get("details") or "")
     s["frame"] = d.get("frame") if d.get("frame") in FRAME_SIZES else s["frame"]
-    s["redraw"] = _num(d.get("redraw"), REDRAW, 0.05, 1.0)
+    # A scene saved before the maps had `redraw` (denoise from the frame); it
+    # opens with the maps and no frame, as a new one does.
+    s["pose_strength"] = _num(d.get("pose_strength"), POSE_STRENGTH, 0.0, 1.0)
+    s["depth_strength"] = _num(d.get("depth_strength"), DEPTH_STRENGTH, 0.0, 1.0)
+    s["frame_keep"] = _num(d.get("frame_keep"), FRAME_KEEP, 0.0, FRAME_KEEP_MAX)
     cam = d.get("camera") if isinstance(d.get("camera"), dict) else {}
     c = s["camera"]
     c["target"] = _vec(cam.get("target"), c["target"], -100, 100)
@@ -2118,18 +2137,251 @@ def png(scene):
     return rgb_png(rasterise(render(scene, w, h), w, h), w, h)
 
 
-def write_reference(scene, folder=None):
-    """Render the frame to `<scenes>/renders/<hash>.png` and return the path.
-    Named by content, so History's settings keep pointing at the picture that
-    was sent, and the same frame twice is one file."""
-    data = png(scene)
+def _write(data, prefix, folder=None):
+    """PNG bytes -> `<scenes>/renders/<prefix>_<hash>.png`, its path. Named by
+    content, so History's settings keep pointing at the picture that was
+    sent, and the same picture twice is one file."""
     folder = folder or os.path.join(scenes_dir(), "renders")
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, "scene_%s.png" % hashlib.sha1(data).hexdigest()[:16])
+    path = os.path.join(folder, "%s_%s.png" % (prefix, hashlib.sha1(data).hexdigest()[:16]))
     if not os.path.isfile(path):
-        with open(path, "wb") as f:
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
             f.write(data)
+        os.replace(tmp, path)
     return path
+
+
+def write_reference(scene, folder=None):
+    """Render the frame and write it (`_write`) -> its path."""
+    return _write(png(scene), "scene", folder)
+
+
+# ==================================================================== maps
+# What the picture is made from when the model's workflow has a ControlNet:
+# not the grey frame - image to image copies its blocky mannequins at any
+# denoise low enough to keep the layout - but what the frame means. Where
+# each body's joints are (`pose_png`: OpenPose, drawn as the Image Studio's
+# stick figure is) and how far every pixel is from the camera (`depth_png`).
+# Both are seen through the one camera, so they fall exactly where the
+# viewport's frame shows the mannequins and the props.
+OPENPOSE_OF_COCO = {0: 0, 1: 15, 2: 14, 3: 17, 4: 16, 5: 5, 6: 2, 7: 6, 8: 3, 9: 7,
+                    10: 4, 11: 11, 12: 8, 13: 12, 14: 9, 15: 13, 16: 10}
+FACE_UNIT = 0.032              # m: half the gap between the eyes, studio_pose.FACE's unit
+SEEN_FACING = -0.25            # a head point is drawn when it faces the camera this much
+HIDDEN_BEHIND = 0.3            # m of something nearer at its pixel that hides a point
+
+
+def rigs(obj):
+    """The people in an object as [(skeleton, k, shift)]: a skeleton point p
+    is at p * k + shift in the world, as `painted_pieces` places their faces.
+    One for a person, one per member for a crowd, none for a prop."""
+    def placed(controls, root, shape, look, k, x, y, z):
+        low = min(p[1] for _, faces, _ in person_pieces(controls, root, shape, outfit(look))
+                  for f in faces for p in f) * k
+        return skeleton(controls, root, shape), k, (x, y - low, z)
+    x, y, z = obj["position"]
+    if obj["asset"] == "person":
+        look = obj.get("look") or {}
+        shape = body_shape(look)
+        return [placed(obj["pose"]["controls"], euler(*obj["rotation"]), shape, look,
+                       obj["scale"][0] * shape["height"], x, y, z)]
+    if obj["asset"] != "crowd":
+        return []
+    turn = obj["rotation"][0]
+    out = []
+    for m in crowd_members(obj["crowd"]):
+        shape = body_shape(m["look"])
+        at = apply(euler(turn), (m["at"][0], 0, m["at"][1]))
+        out.append(placed(m["controls"], euler(turn + m["yaw"]), shape, m["look"],
+                          obj["scale"][0] * shape["height"] * m["size"],
+                          x + at[0], y, z + at[2]))
+    return out
+
+
+def pose_figures(scene, width=None, height=None):
+    """Every person the camera sees, as `studio_pose.render_figures` takes
+    them, far to near: {"points": the 18 OpenPose points as fractions of the
+    frame, None where not seen; "face": the 68 dots, or []; "depth": m}.
+
+    Which head points are seen is decided the way DWPose would find them:
+    the nose and eyes only on the side of the head facing the camera, the
+    far ear hidden in profile. The face dots are a real face's, turned with
+    the head in 3D, drawn whenever the nose is seen - in profile too, as
+    DWPose draws them: a figure without them comes back seen from behind
+    (studio_pose.face_points)."""
+    if width is None:
+        width, height = frame_size(scene)
+    cam = Camera(scene["camera"], width, height)
+    # What stands in front: a point with a surface more than HIDDEN_BEHIND
+    # nearer than it at its pixel is hidden, as a photo would hide it - a
+    # crowd member's limbs drawn through the person in front of them read
+    # as that person's own and turned them round (2026-09-25). The body's
+    # own surface is nearer than its joints by less than that.
+    k_depth = DEPTH_EDGE / float(max(width, height))
+    dw, dh = max(64, int(round(width * k_depth))), max(64, int(round(height * k_depth)))
+    zb = depth_values(scene, dw, dh)
+
+    def hidden(p):
+        c = cam.to_camera(p)
+        x, y = int(cam.to_screen(c)[0] * dw / width), int(cam.to_screen(c)[1] * dh / height)
+        if not (0 <= x < dw and 0 <= y < dh) or zb[y * dw + x] <= 0:
+            return False
+        return 1.0 / zb[y * dw + x] < c[2] - HIDDEN_BEHIND
+    out = []
+    for obj in scene["objects"]:
+        for sk, k, shift in rigs(obj):
+            def world(p, k=k, shift=shift):
+                return add(mul(p, k), shift)
+            hp, hm = sk["head"]
+            coco = {i: world(sk[j][0]) for i, j in KP_JOINTS.items()}
+            coco.update({i: world(add(hp, apply(hm, v))) for i, v in KP_HEAD.items()})
+            to_cam = norm(sub(cam.eye, world(hp)))
+            fwd, side = column(hm, 2), column(hm, 0)     # the face looks +Z; +X is their left
+            faces_way = {0: fwd, 1: norm(add(fwd, mul(side, 0.35))),
+                         2: norm(add(fwd, mul(side, -0.35))), 3: side, 4: mul(side, -1)}
+            pts = [None] * 18
+            for i, p in coco.items():
+                if i in faces_way and dot(faces_way[i], to_cam) <= SEEN_FACING:
+                    continue
+                s = cam.project(p)
+                if s and not hidden(p):
+                    pts[OPENPOSE_OF_COCO[i]] = [s[0] / width, s[1] / height]
+            if pts[2] and pts[5]:                  # the neck, as OpenPose makes it
+                pts[1] = [(pts[2][0] + pts[5][0]) / 2, (pts[2][1] + pts[5][1]) / 2]
+            if not any(p and 0 <= p[0] <= 1 and 0 <= p[1] <= 1 for p in pts):
+                continue
+            face = []
+            if pts[0]:
+                for u, v in studio_pose.FACE:
+                    local = (u * FACE_UNIT, KP_HEAD[1][1] - v * FACE_UNIT,
+                             0.10 - 0.012 * u * u)
+                    s = cam.project(world(add(hp, apply(hm, local))))
+                    if s:
+                        face.append((s[0] / width, s[1] / height))
+            out.append({"points": pts, "face": face,
+                        "depth": cam.to_camera(world(hp))[2]})
+    out.sort(key=lambda f: -f["depth"])
+    return out
+
+
+def pose_png(scene):
+    """The OpenPose picture of everyone in the frame, or None if no one is."""
+    w, h = frame_size(scene)
+    figures = pose_figures(scene, w, h)
+    return studio_pose.render_figures(figures, w, h) if figures else None
+
+
+def _fill_depth(zb, width, height, pts):
+    """A convex face's 1/z into the z-buffer `zb`, nearest kept. `pts` are
+    (sx, sy, 1/z): 1/z is linear across the screen for a flat face, so each
+    pixel is a sum, not a division."""
+    x0, y0, q0 = pts[0]
+    best = None
+    for i in range(1, len(pts) - 1):
+        (x1, y1, q1), (x2, y2, q2) = pts[i], pts[i + 1]
+        det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if best is None or abs(det) > abs(best[0]):
+            best = (det, x1, y1, q1, x2, y2, q2)
+    det, x1, y1, q1, x2, y2, q2 = best
+    if abs(det) < 1e-6:
+        return                                   # edge-on
+    b = ((q1 - q0) * (y2 - y0) - (q2 - q0) * (y1 - y0)) / det
+    c = ((x1 - x0) * (q2 - q0) - (x2 - x0) * (q1 - q0)) / det
+    a = q0 - b * x0 - c * y0
+    ys = [p[1] for p in pts]
+    top = max(0, int(math.ceil(min(ys) - 0.5)))
+    bottom = min(height - 1, int(math.floor(max(ys) - 0.5)))
+    edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+    edges = [(p, q) if p[1] <= q[1] else (q, p) for p, q in edges if p[1] != q[1]]
+    for y in range(top, bottom + 1):
+        yc = y + 0.5
+        xs = [p[0] + (yc - p[1]) * (q[0] - p[0]) / (q[1] - p[1])
+              for p, q in edges if p[1] <= yc < q[1]]
+        if len(xs) < 2:
+            continue
+        xa = max(0, int(math.ceil(min(xs) - 0.5)))
+        xb = min(width - 1, int(math.floor(max(xs) - 0.5)))
+        q = a + b * (xa + 0.5) + c * yc
+        for i in range(y * width + xa, y * width + xb + 1):
+            if q > zb[i]:
+                zb[i] = q
+            q += b
+
+
+def depth_values(scene, width, height):
+    """1/z (1/m) of the nearest surface at each pixel, row by row, 0 where
+    the camera sees only sky: the floor, the walls that face into the room,
+    and every object, as `render` draws them but without the shadows."""
+    cam = Camera(scene["camera"], width, height)
+    room = scene.get("room") or new_room()
+    faces = []
+    if cam.eye[1] > 0:
+        r = FLOOR_REACH
+        faces.append([(-r, 0, -r), (r, 0, -r), (r, 0, r), (-r, 0, r)])
+    if room["walls"]:
+        faces += [quad for quad, origin, _ in walls(room)
+                  if dot(newell(quad), sub(origin, cam.eye)) < 0]
+    for obj in scene["objects"]:
+        for _, fs, _ in painted_pieces(obj):
+            faces += [f for f in fs if dot(newell(f), sub(centroid(f), cam.eye)) < 0]
+    zb = [0.0] * (width * height)
+    for f in faces:
+        c = clip_near([cam.to_camera(p) for p in f])
+        if len(c) >= 3:
+            _fill_depth(zb, width, height, [cam.to_screen(p) + (1.0 / p[2],) for p in c])
+    return zb
+
+
+def depth_png(scene, edge=DEPTH_EDGE):
+    """The frame as a depth map, the kind a depth ControlNet was trained on
+    (Depth Anything's): grey by nearness - 1/z from the farthest thing seen
+    (black) to the nearest (white), the sky black. Smaller than the frame,
+    with the same shape: the ControlNet scales it to the picture."""
+    w, h = frame_size(scene)
+    k = edge / float(max(w, h))
+    dw, dh = max(64, int(round(w * k))), max(64, int(round(h * k)))
+    zb = depth_values(scene, dw, dh)
+    seen = [q for q in zb if q > 0]
+    lo, hi = (min(seen), max(seen)) if seen else (0.0, 1.0)
+    span = (hi - lo) or 1.0
+    grey = bytes(0 if q <= 0 else int(round(255 * (q - lo) / span)) for q in zb)
+    rgb = bytearray(dw * dh * 3)
+    for i in range(3):
+        rgb[i::3] = grey
+    return rgb_png(bytes(rgb), dw, dh)
+
+
+MAP_KINDS = ("pose", "composition", "source")
+
+
+def scene_maps(scene, takes, folder=None):
+    """Draw and write what the picture is made from, for a model whose
+    workflows take the reference kinds `takes` -> ({kind: path}, notes).
+
+    - `pose`: the pose map, when the strength is above 0 and anyone is in
+      the frame.
+    - `composition`: the depth map, when its strength is above 0.
+    - `source`: the grey frame, image to image, when some of it is kept - or
+      for a model with neither ControlNet input, which has only the frame to
+      go on (`FALLBACK_KEEP`, the old default)."""
+    notes = []
+    maps = {}
+    controlled = "pose" in takes or "composition" in takes
+    if "pose" in takes and scene["pose_strength"] > 0:
+        data = pose_png(scene)
+        if data:
+            maps["pose"] = _write(data, "pose", folder)
+        elif any(o["asset"] in ("person", "crowd") for o in scene["objects"]):
+            notes.append("No one is in the frame, so no pose map was sent.")
+    if "composition" in takes and scene["depth_strength"] > 0:
+        maps["composition"] = _write(depth_png(scene), "depth", folder)
+    if "source" in takes and (scene["frame_keep"] > 0 or not controlled):
+        maps["source"] = write_reference(scene, folder)
+    if not maps:
+        notes.append("Pose, layout and frame are all off: the picture has only the words "
+                     "to go on.")
+    return maps, notes
 
 
 # ==================================================================== words
@@ -2252,10 +2504,15 @@ def people(scene):
     return [o for o in scene["objects"] if o["asset"] == "person"]
 
 
-def generation(scene, reference, characters=None):
+def generation(scene, maps, characters=None):
     """What the Image Studio is handed: the words for its Scene field, and
-    the settings Generate adds to the form's (the frame's size, the redraw
-    strength, the reference, and the whole scene for History).
+    the settings Generate adds to the form's (the frame's size, the maps
+    from `scene_maps` as references with their strengths, the denoise when
+    the frame is one, and the whole scene for History). -> (words, extra).
+
+    `pose` and `composition` are always laid over the form's, None when not
+    sent, so the form's own drawn figure (and its hands' words) does not
+    ride along with a scene's.
 
     A scene with people in it says every person's look in their own line,
     so the form's one person is blanked for this job - said twice, the
@@ -2269,8 +2526,17 @@ def generation(scene, reference, characters=None):
     w, h = frame_size(scene)
     words = scene_text(scene)
     s, _ = clean_scene(scene)
-    extra = {"width": w, "height": h, "denoise": round(scene["redraw"], 3),
-             "scene_layout": copy.deepcopy(s)}
+    extra = {"width": w, "height": h, "scene_layout": copy.deepcopy(s),
+             "references": dict(maps), "pose": None, "composition": None}
+    if "pose" in maps:
+        extra["pose"] = {"strength": round(s["pose_strength"], 3)}
+    if "composition" in maps:
+        extra["composition"] = {"strength": round(s["depth_strength"], 3)}
+    if "source" in maps:
+        keep = s["frame_keep"]
+        if "pose" not in maps and "composition" not in maps:
+            keep = max(keep, FALLBACK_KEEP)
+        extra["denoise"] = round(1 - keep, 3)
     folks = people(s)
     if folks:
         extra.update({k: "" for k in ig.SLOTS})
@@ -2283,7 +2549,7 @@ def generation(scene, reference, characters=None):
             if rec and rec.get("identity") and rec["identity"] not in idents:
                 idents.append(rec["identity"])
         extra["scene_identities"] = idents
-    return words, reference, extra
+    return words, extra
 
 
 # ==================================================================== pose from a photo

@@ -221,6 +221,26 @@ class TestFill(unittest.TestCase):
         self.assertEqual(full["40"]["inputs"]["latent_image"], ["22", 0])
         self.assertEqual(full["9"]["inputs"]["images"], ["45", 0])
 
+    def test_a_node_may_be_kept_by_any_of_several_values(self):
+        wf = {"id": "t", "graph": {
+            "1": {"_when": ["a", "b"], "class_type": "Shared", "inputs": {}},
+            "2": {"class_type": "SaveImage", "inputs": {}}}}
+        self.assertNotIn("1", ig.fill(wf, {}))
+        self.assertIn("1", ig.fill(wf, {"b": "x.png"}))
+        self.assertTrue(ig.uses(wf, "b"))
+
+    def test_a_switch_may_fall_back_to_an_earlier_switch(self):
+        wf = {"id": "t", "switches": {
+            "first": {"when": "a", "then": ["A", 0], "else": ["P", 0]},
+            "last": {"when": "b", "then": ["B", 0], "else": "{{first}}"}},
+            "graph": {"P": {"class_type": "P", "inputs": {}},
+                      "A": {"_when": "a", "class_type": "A", "inputs": {}},
+                      "B": {"_when": "b", "class_type": "B", "inputs": {}},
+                      "S": {"class_type": "S", "inputs": {"in": "{{last}}"}}}}
+        self.assertEqual(ig.fill(wf, {})["S"]["inputs"]["in"], ["P", 0])
+        self.assertEqual(ig.fill(wf, {"a": 1})["S"]["inputs"]["in"], ["A", 0])
+        self.assertEqual(ig.fill(wf, {"a": 1, "b": 1})["S"]["inputs"]["in"], ["B", 0])
+
     def test_a_missing_value_is_named(self):
         with self.assertRaises(ig.TemplateError) as cm:
             ig.fill(self.wf(), {"clip_l": "c", "t5": "t", "vae": "v", "prompt": "p", "seed": 1})
@@ -579,6 +599,50 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         g = ig.fill(p.workflow, p.values)
         self.assertFalse({"50", "51", "52"} & set(g))
         self.assertEqual(g["40"]["inputs"]["positive"], ["11", 0])
+
+    def test_a_depth_map_chains_after_the_pose_on_one_controlnet(self):
+        pose, depth = (os.path.join(self.dir, n) for n in ("pose.png", "depth.png"))
+        for path in (pose, depth):
+            with open(path, "wb") as f:
+                f.write(PNG)
+        cn = "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors"
+        inv = dict(FLUX_FILES, controlnet={cn})
+        p = self.plan(model="flux-dev", inventory=inv, scene="x",
+                      references={"pose": pose, "composition": depth},
+                      pose={"strength": 0.8}, composition={"strength": 0.4})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.images, {"pose_image": pose, "composition_image": depth})
+        self.assertEqual((p.values["pose_strength"], p.values["composition_strength"]),
+                         (0.8, 0.4))
+        g = ig.fill(p.workflow, dict(p.values, pose_image="p.png", composition_image="d.png"))
+        self.assertEqual([n for n in g if g[n]["class_type"] == "ControlNetLoader"], ["50"])
+        self.assertEqual(g["54"]["inputs"]["positive"], ["52", 0])
+        self.assertEqual(g["54"]["inputs"]["control_net"], ["50", 0])
+        self.assertEqual(g["40"]["inputs"]["positive"], ["54", 0])
+        self.assertEqual(g["40"]["inputs"]["negative"], ["54", 1])
+        self.assertEqual(g["40"]["inputs"]["denoise"], 1.0)
+        # The depth map alone hangs off the prompt.
+        p = self.plan(model="flux-dev", inventory=inv, scene="x",
+                      references={"composition": depth})
+        g = ig.fill(p.workflow, dict(p.values, composition_image="d.png"))
+        self.assertNotIn("52", g)
+        self.assertEqual(g["54"]["inputs"]["positive"], ["11", 0])
+        self.assertEqual(g["40"]["inputs"]["positive"], ["54", 0])
+
+    def test_flux_takes_a_source_picture_and_denoise_needs_one(self):
+        src = os.path.join(self.dir, "frame.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        p = self.plan(model="flux-dev", scene="x", references={"source": src}, denoise=0.8)
+        self.assertEqual((p.images, p.values["denoise"]), ({"source_image": src}, 0.8))
+        g = ig.fill(p.workflow, dict(p.values, source_image="f.png"))
+        self.assertNotIn("20", g)
+        self.assertEqual(g["40"]["inputs"]["latent_image"], ["22", 0])
+        self.assertEqual(g["40"]["inputs"]["denoise"], 0.8)
+        # Denoise with nothing to start from would leave noise in the picture.
+        p = self.plan(model="flux-dev", scene="x", denoise=0.8)
+        self.assertEqual(p.values["denoise"], 1.0)
+        self.assertTrue(any("Denoise 0.8" in n for n in p.notes), p.notes)
 
     def test_redux_reference_needs_its_files(self):
         src = os.path.join(self.dir, "style.png")

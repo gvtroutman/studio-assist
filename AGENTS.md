@@ -68,8 +68,8 @@ this PC's files and the web instead. Two moving parts:
   one, no tkinter (the editor is `PoseEditor` in the tab's module).
 - **`studio_scene.py`**, **`studio_scene_ui.py`** — the Image Studio's Scene Builder: a
   posable mannequin and simple props on a floor (and walls, each wearing a picture
-  made from words), one camera, and the frame it sees,
-  rendered to the PNG the Image Studio makes the picture from. See *The Scene Builder*.
+  made from words), one camera, and the frame it sees, drawn as the pose and depth
+  maps (and, when asked, the grey frame) the Image Studio makes the picture from. See *The Scene Builder*.
   **`comfy_nodes/studio_dwpose`** is its one ComfyUI node (a photo's pose points), kept
   here and copied into a backend's `custom_nodes`; it is not stdlib-only, it runs there.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
@@ -469,8 +469,9 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `/history` and the WebSocket on every backend, then prints each model's
   readiness.
 - **Workflows are files.** `comfy_workflows/<id>.json` is an API-format graph plus:
-  `{{placeholders}}` (a whole value keeps its type), `_when`/`_unless` nodes,
-  `switches` (a link chosen by a value), `lora_chain` (where LoRAs hang;
+  `{{placeholders}}` (a whole value keeps its type), `_when`/`_unless` nodes (a
+  `_when` list keeps the node when any of them is set), `switches` (a link chosen
+  by a value; a branch may be `"{{other}}"`, a switch named before it), `lora_chain` (where LoRAs hang;
   `{{model_out}}`/`{{clip_out}}` are its end), `references` (which reference kind
   feeds which image input), `files` and `needs` (what must be on the backend), and
   `stages.refining`. `fill()` is the whole adapter and refuses an unfilled value or a
@@ -574,8 +575,8 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   size and strength (`pose`), so Reuse Settings reopens the figure, not a PNG.
   A picture chosen with Choose… replaces the drawn pose; it must already be a
   skeleton, since no preprocessor (DWPose) is installed.
-  `flux_dev_baseline` applies it with `ControlNetApplyAdvanced` (nodes 50-52,
-  `_when: pose_image`) to the first pass only, at `pose_strength` 0.9 to
+  `flux_dev_baseline` applies it with `ControlNetApplyAdvanced` (nodes 50-52;
+  the loader, 50, is shared with the depth map's 53-54) to the first pass only, at `pose_strength` 0.9 to
   `pose_end` 0.65 of the steps - Shakker's recommendation for pose on Union
   Pro 2.0, which leaves the last steps to the model's own detail. The refine
   and face passes keep the plain conditioning. The ControlNet file is named in
@@ -648,9 +649,14 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `lora_chain` (identity, style and added LoRAs, `LoraLoader` on model and
   clip), a `refine` pass (flux_hq's upscale and tiled low-denoise redraw), and
   the face pass (below). With no LoRA, refine or face pass the filled graph is
-  the baseline node for node; a test holds it to that. References (Redux,
-  image to image) are still only in `flux_hq.json`, which the tests keep
-  covered through a `flux-hq` model of their own; they are the next layer.
+  the baseline node for node; a test holds it to that. Image to image (a
+  `source` reference, nodes 21-22, at `denoise`) and a `composition` reference
+  - a depth map through the pose's ControlNet, chained after it (53-54, at
+  `composition_strength` 0.55 to `composition_end` 0.5) - came with the Scene
+  Builder's maps (2026-09-25). Redux is still only in `flux_hq.json`, which the
+  tests keep covered through a `flux-hq` model of their own. A denoise below 1
+  with no source picture is put back to 1 by compose and said: over an empty
+  latent it only leaves noise in the picture.
 - **The face pass** is the chat bridge's face detail (`studio_comfy_mcp.
   face_detail`) for a template with a `face_detail` section. The run that
   makes the picture also runs SAM3 on it (`add_face_finder`, nodes `fd*`);
@@ -837,23 +843,51 @@ bottom. It blocks out a picture; it is not a 3D package. `studio_scene.py` is th
 (no tkinter, tested headless), `studio_scene_ui.SceneBuilder` the window, a collaborator
 of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 
-- **Generate goes through the Image Studio, never beside it.** The builder renders the
-  frame (`write_reference`, under `image-studio/scenes/renders/`, named by content hash),
-  writes the scene's words into the form's Scene field, sets the form's `source`
-  reference, and calls `ImageStudio.generate(extra=...)`. `extra` lays the frame's
-  size, the denoise (`redraw`), `scene_layout` (the whole scene) and `scene_file` over
-  the form's settings for that job alone: History records them, and the next plain
+- **Generate goes through the Image Studio, never beside it.** The builder draws the
+  scene's maps (`scene_maps`, under `image-studio/scenes/renders/`, named by content
+  hash), writes the scene's words into the form's Scene field, and calls
+  `ImageStudio.generate(extra=...)`. `extra` lays the frame's size, the maps as
+  `references` (the form's pose, composition and source slots replaced; its face and
+  style kept), their strengths, the denoise when the frame is one of them,
+  `scene_layout` (the whole scene) and `scene_file` over the form's settings for that
+  job alone - the form's own slots are not touched: History records them, and the next plain
   Generate from the form carries none of them. Routing, refusals, the queue, the face
   pass and Generate Again are the Image Studio's, unchanged.
-- **The frame is a `source` reference, because that is what exists.** No backend has
-  pose or depth ControlNet, IP-Adapter or PuLID (see the Image Studio's references), so
-  the blockout is image to image at `redraw` denoise (0.7 by default; lower keeps the
-  layout, higher lets the picture leave the grey shapes behind). A model whose
-  workflow declares no `source` input - the FLUX baseline today - would silently make a
-  picture without the frame, so `SceneBuilder.check()` says so the moment something is
-  added and Generate refuses, naming the models that do take one. When a pose
-  ControlNet lands, it is a new reference kind in a workflow; the builder already has
-  the skeleton to draw a pose map from (`skeleton()`).
+- **The scene is sent as what it means, not as the grey frame.** Image to image
+  from the frame (until 2026-09-25, at denoise 0.7) copied the mannequins' blocky
+  look into the people: any denoise low enough to keep the layout keeps the
+  shapes too. For a model whose workflow has the ControlNet inputs (the FLUX
+  baseline) the builder sends two maps instead, each with its own slider (0 is
+  off), and the words say how things look:
+  - **Pose** (`pose_png`, reference kind `pose`, default 0.85): every person
+    and crowd member's skeleton (`rigs`: the same placement `painted_pieces`
+    gives their faces) projected through the camera as OpenPose, drawn by
+    `studio_pose.render_figures`, far to near. Head points are dropped as
+    DWPose would miss them - nose and eyes on the side facing the camera, the
+    far ear in profile - and the 68 face dots are `studio_pose.FACE` turned
+    with the head in 3D (`FACE_UNIT` is half the eye gap), drawn whenever the
+    nose is seen, profile included, or the person comes back seen from behind.
+    A joint with something more than `HIDDEN_BEHIND` (0.3 m) nearer at its pixel
+    is dropped, as a photo hides it (the depth map's z-buffer): live on the 5090,
+    crowd limbs drawn through the man in front turned him round; hidden, he faced
+    the camera on the same seed.
+  - **Layout (depth)** (`depth_png`, kind `composition`, default 0.55): a
+    z-buffer of 1/z over every face, the floor and the inward walls (`_fill_depth`:
+    1/z is linear across a flat face on screen), grey from farthest (black) to
+    nearest (white), sky black - Depth Anything's convention, which Union Pro 2.0
+    learnt. 512 px on the long edge; the ControlNet scales it.
+  - **Grey frame kept** (`frame_keep`, kind `source`, default 0 = not sent): 1 -
+    denoise. 0.1-0.25 pins props and exact framing on top of the maps.
+  A model with neither ControlNet input (Z-Image) gets the frame alone, at
+  `FALLBACK_KEEP` 0.3 kept at least (the old 0.7 denoise). `SceneBuilder.takes()`
+  reads which of the three a model's workflows have; `check()` refuses only a model
+  with none. A backend lacking the ControlNet file is compose's warning, and that
+  picture is made from the words. A scene saved with `redraw` opens with the
+  defaults. The maps are named in the status line after Generate, for looking at.
+  Measured 2026-09-25 (FLUX on the 5090, seed 4242, ~16 s): the same Oktoberfest
+  scene from the frame at 0.7 came back a flat vector illustration; from the maps,
+  a photograph with the two people where and as they stand. The crowd's raised
+  arms were not kept at 0.85/0.65: small figures follow the pose loosely.
 - **The viewport is the frame.** The canvas always looks through the one camera; the lit
   rectangle is `render()` at the generation size, the same polygon list `png()`
   rasterises, so what is inside it is exactly the reference. Outside it is dimmed
@@ -871,9 +905,9 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   (`character_look`: blank where it has none, the expression and gaze kept) and, if the
   person still has the default name, its name; it is a copy, like the form's. The look is
   said in that person's line, `Name (a person, where, facing): look. Description`.
-- **The mannequin wears the look, because the frame is what the picture copies.** At
-  `redraw` denoise a heavyset person drawn as the rest mannequin is pulled thin again,
-  so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
+- **The mannequin wears the look, because the maps are drawn from it.** The depth
+  map carries each body's outline (and the frame, when kept, its colours): a
+  heavyset person drawn as the rest mannequin is pulled thin again, so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
   Height sliders, plus a Body type word `BUILDS` knows, as steps added to them (clamped,
   so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
   Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
