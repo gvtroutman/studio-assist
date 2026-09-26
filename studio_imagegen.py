@@ -1198,6 +1198,8 @@ FACE_NODES = {"CheckpointLoaderSimple", "SAM3_Detect", "PreviewAny", "GetImageSi
 FACE_BOX_GROW = 0.15           # of its size the found face's box grows, as the part always blended
 FACE_HEAD_GROW = 12            # px at FACE_EDIT the head's mask grows before it is softened
 FACE_HEAD_SOFT = (21, 7.0)     # ImageBlur radius and sigma of its edge, at FACE_EDIT
+FACE_DEPTH_STRENGTH = 0.5      # a face's own head depth map, in its redraw (`face_graph`)
+FACE_DEPTH_END = 0.5           # ... over the first half of the steps: the shape, not the skin
 
 
 # The Visual Critic's redraws (Studio._refine). A hand at 0.6 kept its shape
@@ -1465,7 +1467,10 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
     `faces`, beside `crops`, says who each is (None for no one known):
     {"words": the person's own words for FACE_PROMPT, "image": a LoadImage
     name of their face picture or None, "denoise": this face's}. A face with
-    an image is drawn to it through PuLID (`pulid_file`). `boxes`, beside
+    an image is drawn to it through PuLID (`pulid_file`); one with a
+    "depth" (a LoadImage name: their head's depth map over the crop,
+    `studio_scene.depth_crop_png`) is drawn to that shape through the
+    workflow's ControlNet. `boxes`, beside
     `crops`, are the faces the finder found (x, y, w, h): each is blended
     back whole, whatever SAM3 makes of the head around it."""
     fd = wf["face_detail"]
@@ -1546,6 +1551,20 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             g[n + "3n"] = {"class_type": "SetLatentNoiseMask", "inputs": {
                 "samples": latent, "mask": [n + "3h", 0]}}
             latent = [n + "3n", 0]
+        if face.get("depth") and values.get("controlnet"):
+            # Their head's shape, drawn for this crop from the scene's camera:
+            # at FACE_EDIT the jaw and chin are hundreds of pixels, where in
+            # the whole frame's depth map they were a few.
+            if "fcn" not in g:
+                g["fcn"] = {"class_type": "ControlNetLoader",
+                            "inputs": {"control_net_name": values["controlnet"]}}
+            g[n + "d"] = {"class_type": "LoadImage", "inputs": {"image": face["depth"]}}
+            g[n + "dc"] = {"class_type": "ControlNetApplyAdvanced", "inputs": {
+                "positive": positive, "negative": negative, "control_net": ["fcn", 0],
+                "image": [n + "d", 0],
+                "strength": face.get("depth_strength") or FACE_DEPTH_STRENGTH,
+                "start_percent": 0.0, "end_percent": FACE_DEPTH_END, "vae": links["vae"]}}
+            positive, negative = [n + "dc", 0], [n + "dc", 1]
         g[n + "4"] = {"class_type": "KSampler", "inputs": {
             "seed": (seed + i + 1) % (MAX_SEED + 1), "steps": values["steps"], "cfg": 1.0,
             "sampler_name": values["sampler"], "scheduler": values["scheduler"],
