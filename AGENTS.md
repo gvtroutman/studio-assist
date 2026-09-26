@@ -773,6 +773,20 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
   chosen action. Faces are not matched to characters: a face correction
   redraws every face with every character's description.
 
+### Fix a spot: the user clicks what to redraw
+
+"Fix a spot" under the preview (and on its right-click menu) opens `FixWindow`:
+the picture large, each click a square to redraw (the wheel sizes it, a
+right-click removes it), what it is (Hand / Face / Something else), how much to
+change (Light 0.45 / Medium 0.65 / Strong 0.85) and optional words. Redraw
+queues a job with `mode: "fix"`; `Studio.run_fix` composes the picture's own
+settings (`fix_base`: no references, pose, face pass or critic), and runs
+`face_graph` on the uploaded picture with the squares as crops (`head`
+False, so no SAM3 is needed). Only inside the squares changes; the result is
+a new history record with `fix`, and Generate Again / New seed retry the fix.
+Needs a template with a `face_detail` section: `flux_dev_baseline` and, since
+this, `zimage_hq` (which also lets the face pass run on Z-Image).
+
 ### Try On: dressing a person from pictures
 
 **Retired from the form on 2026-09-25.** Gavin did not want the finished

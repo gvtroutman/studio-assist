@@ -19,6 +19,15 @@
     "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]}
   },
   "stages": {"refining": ["42", "43", "44", "45"]},
+  "face_detail": {
+    "model": ["4", 0], "vae": ["3", 0],
+    "positive": ["f10", 0], "negative": ["f12", 0],
+    "nodes": {
+      "f10": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": "{{face_prompt}}", "clip": ["2", 0]}},
+      "f12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["f10", 0]}}
+    }
+  },
   "graph": {
     "1": {"class_type": "UNETLoader",
           "inputs": {"unet_name": "{{model}}", "weight_dtype": "default"}},

@@ -1211,6 +1211,73 @@ CRITIC_DENOISE = {"FACE_CORRECTION": 0.45, "LOCAL_INPAINT": 0.6,
 REGION_PAD = 1.6
 
 
+# Fix a spot: the user clicks the parts of a finished picture to redraw (a
+# hand, most often). Each spot is a square round the click, redrawn by the
+# face pass's crop-redraw-blend on the picture's own model and LoRAs, and
+# blended back through the oval; everything outside the squares is kept
+# pixel for pixel. The squares are the user's, so no SAM3 is needed.
+FIX_TARGETS = {"hand": "a natural human hand with five fingers, clear knuckles and nails",
+               "face": "a natural face with clear eyes and teeth",
+               "other": ""}
+FIX_STRENGTHS = {"light": 0.45, "medium": 0.65, "strong": 0.85}
+FIX_PROMPT = "Close-up detail of %s, sharp and natural, matching the light and colour " \
+             "around it. Part of this picture: %s"
+FIX_MIN = 64                          # px: a smaller square is not worth redrawing
+
+
+def clean_fix(fix):
+    """The fix a job carries, made safe: {"image", "target", "words",
+    "strength", "spots": [{"x", "y", "size"}]} - the spots' centres and
+    sides in the picture's own pixels."""
+    fix = fix if isinstance(fix, dict) else {}
+    spots = []
+    for sp in fix.get("spots") or []:
+        try:
+            x, y, size = int(sp["x"]), int(sp["y"]), int(sp["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if size >= FIX_MIN:
+            spots.append({"x": x, "y": y, "size": size})
+    target = fix.get("target") if fix.get("target") in FIX_TARGETS else "hand"
+    strength = fix.get("strength")
+    if strength in FIX_STRENGTHS:
+        strength = FIX_STRENGTHS[strength]
+    try:
+        strength = min(1.0, max(0.2, float(strength)))
+    except (TypeError, ValueError):
+        strength = FIX_STRENGTHS["medium"]
+    return {"image": _str(fix.get("image")), "target": target,
+            "words": _str(fix.get("words")), "strength": strength, "spots": spots[:8]}
+
+
+def fix_words(fix):
+    """What a fix redraws, in words: "2 hands", "the collar"."""
+    f = clean_fix(fix)
+    n = len(f["spots"])
+    if f["words"]:
+        return f["words"]
+    noun = {"hand": "hand", "face": "face"}.get(f["target"], "spot")
+    return "%d %s%s" % (n, noun, "" if n == 1 else "s")
+
+
+def fix_crops(width, height, spots):
+    """Each spot -> the square face_graph redraws, kept inside the picture."""
+    crops = []
+    for sp in spots:
+        side = min(sp["size"], width, height)
+        x = min(max(0, sp["x"] - side // 2), width - side)
+        y = min(max(0, sp["y"] - side // 2), height - side)
+        crops.append({"x": x, "y": y, "width": side, "height": side, "head": False})
+    return crops
+
+
+def fix_prompt(fix, prompt):
+    """The close-up prompt a fix's squares are redrawn from."""
+    f = clean_fix(fix)
+    what = ", ".join(x for x in (f["words"], FIX_TARGETS[f["target"]]) if x) or "this detail"
+    return FIX_PROMPT % (what, prompt)
+
+
 def png_size(raw):
     """(width, height) from a PNG's header, or None."""
     if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
@@ -2567,6 +2634,8 @@ def summary(settings):
     """One line for a job row before its prompt is composed."""
     if settings.get("mode") == "dress":
         return "Try On: " + outfit_text(clean_outfit(settings.get("outfit")))
+    if settings.get("mode") == "fix":
+        return "Fix: " + fix_words(settings.get("fix"))
     return ". ".join(x for x in (_field(settings, "scene"), person_text(settings),
                                  _field(settings, "camera")) if x)
 
@@ -3775,6 +3844,8 @@ class Studio:
             return self.queue._finish(job, "failed", h["detail"])
         if job.settings.get("mode") == "dress":
             return self.run_dress(job, client, say)
+        if job.settings.get("mode") == "fix":
+            return self.run_fix(job, client, say)
         plan = compose(job.settings, self.lib, b, self.inventories.get(b["id"]),
                        self.workflow_loader, self.nodes.get(b["id"]))
         job.plan = plan
@@ -3885,6 +3956,96 @@ class Studio:
         job.progress = 1.0
         self.queue._finish(job, "complete",
                            "; ".join(plan.warnings[:1]) if plan.warnings else "")
+
+    # ------------------------------------------------------------ fix a spot
+    @staticmethod
+    def fix_base(settings):
+        """The settings a fix redraws with: the picture's own, less what made
+        the picture and is not wanted in a close-up (references, pose, the
+        face pass, the critic)."""
+        s = {k: v for k, v in (settings or {}).items() if k not in ("mode", "fix")}
+        s.update(references={}, item_refs={}, pose=None, composition=None,
+                 face_detail=False, auto_refine=False, batch=1)
+        return s
+
+    def run_fix(self, job, client, say):
+        """Fix a spot, on the lane's thread: the squares the user clicked on a
+        finished picture redrawn with its own model, LoRAs and prompt, and
+        blended back. A new picture in the history; the old one is kept."""
+        b, s = job.backend, job.settings
+        fix = clean_fix(s.get("fix"))
+        src = fix["image"]
+        problem = ""
+        if not src or not os.path.isfile(src):
+            problem = "The picture to fix (%s) is not on this PC." % (src or "none")
+        elif not fix["spots"]:
+            problem = "Click the part of the picture to redraw."
+        size = file_size_of(src) if not problem else None
+        if size is None and not problem:
+            problem = "Could not read the size of %s." % src
+        plan = None
+        if not problem:
+            plan = compose(self.fix_base(s), self.lib, b, self.inventories.get(b["id"]),
+                           self.workflow_loader, self.nodes.get(b["id"]))
+            job.plan = plan
+            if plan.errors:
+                problem = " ".join(plan.errors)
+            elif not plan.workflow.get("face_detail"):
+                problem = ("The %s workflow has no redraw section, so its pictures cannot "
+                           "be fixed." % plan.workflow.get("label"))
+        if problem:
+            return self.queue._finish(job, "failed", problem)
+        values = dict(plan.values)
+        try:
+            say("uploading", "uploading the picture", None)
+            for var, path in plan.images.items():
+                values[var] = client.upload_image(path)
+            image = client.upload_image(src)
+            oval = os.path.join(self.lib.root, "face_oval.png")
+            if not os.path.isfile(oval):
+                os.makedirs(self.lib.root, exist_ok=True)
+                with open(oval, "wb") as fh:
+                    fh.write(oval_png())
+            crops = fix_crops(size[0], size[1], fix["spots"])
+            values["face_prompt"] = fix_prompt(fix, plan.prompt)
+            values["face_denoise"] = fix["strength"]
+            values["filename_prefix"] = "ImageStudio/fix_%s" % job.id
+            graph = face_graph(plan.workflow, values, plan.loras, image, crops,
+                               client.upload_image(oval), values["filename_prefix"])
+        except (ComfyError, TemplateError, OSError) as e:
+            return self.queue._finish(job, "failed", "Could not set up the fix on %s: %s"
+                                      % (b["name"], e))
+        job.graph = graph
+        if b.get("shares_llm_gpu") and self.make_room is not None:
+            say(detail="clearing LM Studio off the GPU")
+            try:
+                self.make_room(b)
+            except Exception as e:
+                job.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
+        try:
+            files = self._run_pass(job, client, graph, say, "Redrawing " + fix_words(fix))
+        except ComfyError as e:
+            if job.cancel.is_set():
+                return self.queue._finish(job, "cancelled")
+            return self.queue._finish(job, "failed", "The fix failed on %s: %s"
+                                      % (b["name"], e))
+        if files is None or job.cancel.is_set():
+            return self.queue._finish(job, "cancelled")
+        say("decoding", "fetching the picture from %s" % b["name"], None)
+        try:
+            pictures = [(f["filename"], client.fetch(f)) for f in files]
+        except ComfyError as e:
+            return self.queue._finish(job, "failed", "The picture was made but could not be "
+                                      "fetched from %s: %s" % (b["name"], e))
+        plan.notes.append("Fixed %s at denoise %s from %s." % (
+            fix_words(fix), fix["strength"], os.path.basename(src)))
+        rec = self.record_for(job, graph)
+        rec["prompt"] = "Fix %s: %s" % (fix_words(fix), plan.prompt)
+        rec["fix"] = fix
+        job.record = self.history.add(rec, pictures)
+        job.outputs = list(job.record["images"])
+        job.progress = 1.0
+        self.queue._finish(job, "complete")
 
     # ------------------------------------------------------------ try on
     def sam3_on(self, backend):
