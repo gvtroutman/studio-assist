@@ -64,10 +64,12 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
+  **`studio_pose.py`** is its pose: OpenPose stick figures and the picture drawn from
+  one, no tkinter (the editor is `PoseEditor` in the tab's module).
 - **`studio_scene.py`**, **`studio_scene_ui.py`** — the Image Studio's Scene Builder: a
   posable mannequin and simple props on a floor (and walls, each wearing a picture
-  made from words), one camera, and the frame it sees,
-  rendered to the PNG the Image Studio makes the picture from. See *The Scene Builder*.
+  made from words), one camera, and the frame it sees, drawn as the pose and depth
+  maps (and, when asked, the grey frame) the Image Studio makes the picture from. See *The Scene Builder*.
   **`comfy_nodes/studio_dwpose`** is its one ComfyUI node (a photo's pose points), kept
   here and copied into a backend's `custom_nodes`; it is not stdlib-only, it runs there.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
@@ -467,8 +469,9 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `/history` and the WebSocket on every backend, then prints each model's
   readiness.
 - **Workflows are files.** `comfy_workflows/<id>.json` is an API-format graph plus:
-  `{{placeholders}}` (a whole value keeps its type), `_when`/`_unless` nodes,
-  `switches` (a link chosen by a value), `lora_chain` (where LoRAs hang;
+  `{{placeholders}}` (a whole value keeps its type), `_when`/`_unless` nodes (a
+  `_when` list keeps the node when any of them is set), `switches` (a link chosen
+  by a value; a branch may be `"{{other}}"`, a switch named before it), `lora_chain` (where LoRAs hang;
   `{{model_out}}`/`{{clip_out}}` are its end), `references` (which reference kind
   feeds which image input), `files` and `needs` (what must be on the backend), and
   `stages.refining`. `fill()` is the whole adapter and refuses an unfilled value or a
@@ -500,11 +503,30 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   (`item_refs`, copied under `references/`). Choosing one copies its look onto the
   form (blanking what it does not set) rather than linking to it, so history holds
   the whole look and Generate Again does not change when the character is edited.
-- **Item pictures go only where a workflow declares an `item` reference.** None
-  does yet (Redux in `flux_hq` is taken by style/composition, and nothing does
-  IP-Adapter), so today every item picture comes back as a warning naming the items,
-  and the item's words carry it. A picture of something not worn today is skipped
-  without a word.
+- **Item pictures go into the picture itself, through FLUX Kontext**
+  (2026-09-25; before, Try On redrew the finished picture, which Gavin did not
+  want). They are chosen on the form's Clothes, Hair and Accessories tabs as in
+  the creator (`item_rows`; the Hair tab keeps one picture, item name `hair`),
+  and copied under `references/`. `plan_items` takes the pictures of what is
+  worn today (`outfit_of`: clothes, hair, accessories; anything else skipped
+  without a word). When the workflow has an `items` section (the FLUX
+  baseline) and the backend has `kontext_model`
+  (`flux1-dev-kontext_fp8_scaled.safetensors`, Comfy-Org's fp8: BFL's full
+  weights are gated), the model file becomes Kontext, guidance
+  `item_guidance` 2.5 unless the form sets one, and `add_item_refs` puts the
+  pictures side by side on white (`ImageStitch`), through
+  `FluxKontextImageScale` and `VAEEncode`, onto the prompt as one
+  `ReferenceLatent`. One picture of them all, since Kontext [dev] was trained on
+  one reference. The prompt gains `ITEM_PROMPT` ("look exactly as in the
+  reference picture ... one person, not the reference picture itself"), which
+  the face pass's prompt leaves out. The LoRA chain, pose ControlNet, refine and
+  face pass all run on Kontext unchanged. Without Kontext, or with a workflow
+  that has no `items` section, a warning names the missing piece and the
+  words alone describe the items. Measured on the 5090 (832x1216): 17-18 s, 21
+  s with a drawn pose (which it follows). A dirndl photographed on a model came
+  out right in every detail (lacing, apron, trim, lace hem) across scenes and
+  poses. But her pendant came along, and without an identity LoRA the face
+  drifted toward hers. Pictures of the item alone, on white, are best.
 - **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
   described, or named in the scene, `PEOPLE`) says outright that every person has
   two hands, each with four fingers and a thumb, two feet, two eyes and a
@@ -525,9 +547,81 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 - **A reference is typed** (face, pose, composition, style, source) and used only
   where the workflow declares that kind. Otherwise it is a warning, not a silent
   reuse. As of 2026-09-25 `flux_hq` takes `source` (image to image) and
-  `style`/`composition` (Redux, when its two files are on the backend). Nothing on
-  either machine does face or pose conditioning yet (no PuLID, IP-Adapter or
-  ControlNet), so the likeness is the identity LoRA's.
+  `style`/`composition` (Redux, when its two files are on the backend), and the
+  FLUX baseline takes `pose` (below). Nothing does face conditioning yet (no PuLID
+  or IP-Adapter in a shipped workflow), so the likeness is the identity LoRA's.
+- **The camera is aimed on a diagram, not typed** (`CameraAim`, the Camera row).
+  From above, the camera is dragged round the person (`turn`, 45° steps toward
+  their left); from the side, up and down (`height`) and in and out (`shot`,
+  face to wide). It is `settings["view"]`, None until touched, so an untouched
+  form prompts as before. `view_text` goes *first* in the prompt, since FLUX
+  weighs the start most, and every shot but the face says the whole head is in
+  the frame with space above it: asked for because FLUX, left alone, cut heads
+  off. With a drawn pose only the height is said (and a warning says why): the
+  figure already frames and faces the person, and words that disagree fight the
+  ControlNet. The free-text Camera field stays, for lens, light and film.
+- **The pose is a stick figure the user drags** (`PoseEditor`, the Pose row's
+  Draw…). It is OpenPose's 18 body joints in its colours on black, because that
+  is the picture pose ControlNets were trained on; `studio_pose.render` draws it
+  the way OpenPose's own preprocessor does (limbs at 60%, joints full), with
+  `struct` and `zlib`, in ~30 ms. Dragging a joint carries what hangs off it
+  (`CHILDREN`), Shift moves it alone, the empty frame moves the figure, the wheel
+  resizes it, right-click hides a joint (it stays placed, so it can come back;
+  hidden limbs are not drawn). Points are fractions of the frame, and the frame
+  is the picture's size as last composed (`planned_size`); a size changed since
+  the pose was drawn is `refit` at Generate - scaled and centred, never
+  stretched - and redrawn. The picture is named by a hash of the points and size
+  under `image-studio/poses/`, and the settings keep the points, hidden joints,
+  size and strength (`pose`), so Reuse Settings reopens the figure, not a PNG.
+  A picture chosen with Choose… replaces the drawn pose; it must already be a
+  skeleton, since no preprocessor (DWPose) is installed.
+  `flux_dev_baseline` applies it with `ControlNetApplyAdvanced` (nodes 50-52;
+  the loader, 50, is shared with the depth map's 53-54) to the first pass only, at `pose_strength` 0.9 to
+  `pose_end` 0.65 of the steps - Shakker's recommendation for pose on Union
+  Pro 2.0, which leaves the last steps to the model's own detail. The refine
+  and face passes keep the plain conditioning. The ControlNet file is named in
+  the workflow's defaults, not the model record (so a `models.json` saved
+  before it still finds it: compose `borrowed`), and is kept in the values -
+  and the record - only when a pose is used. Without the file the pose is a
+  warning and the picture is made without it; with no pose the graph is the
+  baseline node for node.
+- **A pose's face needs its 68 dots, or the person turns away.** Measured on the
+  5090 (2026-09-25, seeds 7, 99 and 4242): a body-only skeleton came back seen
+  from behind every time - swapping left and right did not change it, and
+  neither did spreading the eyes. Union Pro 2.0 learnt its poses from DWPose,
+  which draws a face's 68 landmarks whenever it sees one, so a head without them
+  reads as the back of one. `face_points` puts a generic frontal face (`FACE`,
+  iBUG order) on any figure whose nose and both eyes are shown, turned and sized
+  by the eyes; with it all three faced the camera. The head must stay a real
+  one's size (eyes ~1/27 of the height apart): doubled, the dots gave caricature
+  heads. The profile preset, with one eye, gets no face. The picture's name
+  includes `DRAWING`: bump it whenever `render()` changes, or a pose drawn before
+  keeps its old cached picture - which is how the first face-dot test ran
+  against the old drawing. A posed FLUX picture at 832x1216 took 14-15 s on the
+  5090 against 12 s without.
+- **The editor draws a mannequin; the model gets a skeleton.** Since 2026-09-25
+  `PoseEditor` draws a wooden artist's mannequin (tapered limbs on ball joints,
+  a torso, a head that shows its facing, hands with fingers; the person's right
+  darker) from the same 18 points, and "What the model sees" shows the skeleton
+  `render` makes. Hands are DWPose's 21 points (`hand_points`), carried on from
+  the forearm at `HAND_LENGTH` of it, palm to the viewer unless `back`. A shape
+  (`HAND_SHAPES`: relaxed, open, fist, grab, point, peace, thumbs up, OK) is
+  bends per finger joint, foreshortened as a bend toward the viewer would be,
+  so a fist's tips come back onto the palm. A click on a hand (not a drag)
+  gives it the next shape; the menus beside the frame do too, and turn it over.
+  `pose["hands"]` holds each side's shape and `back`; a pose saved before hands
+  existed has none and keeps its picture's name. What held on the 5090 (seed
+  4242 and others, a full-length man, hands ~70 px): the skeleton alone gave
+  open, pointing and a fist on an outstretched arm, but not peace, thumbs up or
+  a fist on a hanging arm; holding the ControlNet to 85% of the steps changed
+  nothing, and thinner hand lines lost the fists (the dots are now ~0.034 of the
+  hand's span). So compose also writes the shapes into the prompt (`HAND_WORDS`,
+  `hands_text`): one shaped hand then comes out right (peace, thumbs up), but
+  two different shapes bleed - the stronger gesture lands on both hands - and
+  FLUX does not keep the person's right and left apart in words. The next step,
+  if hands must be exact, is a hand pass like the face pass: the hands' places
+  are known from the pose, so each can be cropped, redrawn at 1024 px with its
+  own skeleton crop and its own one-hand prompt, and blended back.
 - **One lane per backend, one job per picture.** `JobQueue` runs a thread per
   backend, so the two GPUs work at once. A batch of N is N jobs with seeds s..s+N-1,
   spread over every capable backend, so each picture's record states its exact seed.
@@ -555,9 +649,14 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `lora_chain` (identity, style and added LoRAs, `LoraLoader` on model and
   clip), a `refine` pass (flux_hq's upscale and tiled low-denoise redraw), and
   the face pass (below). With no LoRA, refine or face pass the filled graph is
-  the baseline node for node; a test holds it to that. References (Redux,
-  image to image) are still only in `flux_hq.json`, which the tests keep
-  covered through a `flux-hq` model of their own; they are the next layer.
+  the baseline node for node; a test holds it to that. Image to image (a
+  `source` reference, nodes 21-22, at `denoise`) and a `composition` reference
+  - a depth map through the pose's ControlNet, chained after it (53-54, at
+  `composition_strength` 0.55 to `composition_end` 0.5) - came with the Scene
+  Builder's maps (2026-09-25). Redux is still only in `flux_hq.json`, which the
+  tests keep covered through a `flux-hq` model of their own. A denoise below 1
+  with no source picture is put back to 1 by compose and said: over an empty
+  latent it only leaves noise in the picture.
 - **The face pass** is the chat bridge's face detail (`studio_comfy_mcp.
   face_detail`) for a template with a `face_detail` section. The run that
   makes the picture also runs SAM3 on it (`add_face_finder`, nodes `fd*`);
@@ -583,6 +682,77 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   ~2.6 it/s, 11-12 s end to end including the model load. The 3090 has no FLUX
   files (its entry expects `t5xxl_fp8_e4m3fn_scaled` and fp8 weights), so Auto
   never sends FLUX there. Z-Image Turbo at 1024² took 18-30 s there.
+
+### Try On: dressing a person from pictures
+
+**Retired from the form on 2026-09-25.** Gavin did not want the finished
+picture redrawn: item pictures now go into the picture itself (*Item pictures
+go into the picture itself*, above). The Try On window, its button, the
+picture menu's entry and Generate's dress pass are gone. The engine is kept
+(`submit_dress`, `run_dress`, `_dress`, the graphs) only so Generate Again
+still remakes a Try On record in history. Reuse on one says it has no form to go back to.
+
+Clothes, hair and accessories from pictures, put on a person who is already
+drawn. A Try On job is an ordinary `Job` with `settings["mode"] == "dress"` and
+the outfit in `settings["outfit"]`; it has a queue row, a history record
+(`dress_record`) and Generate Again like any other.
+
+- **The recipe is `comfy_workflows/qwen_dress.json` plus code.** The file holds
+  the loaders (Qwen-Image-Edit 2509 fp8, its 7B encoder, VAE, the Lightning
+  4-step LoRA) and two model chains: plain (node 6) and with kingroka's Clothes
+  Try On LoRA (node 9, `clothes_tryon_qwen-edit-lora.safetensors`, strength 1.5
+  as its page says; CivitAI 1940532, SHA-256 `741606…528f`). `built_by` marks
+  it as finished in code (`dress_graph`, `dress_head_graph`), so it is not
+  offered as a model's workflow and the fill test skips it. 6 steps at CFG 1
+  (the author uses 6-8 on 4-step Lightning).
+- **The clothes go on as the LoRA was trained**: one picture, every garment in
+  a column on white on the left (`ResizeAndPadImage`, `ImageStitch`), the person
+  on the right, the whole canvas 1 MP, and its own prompt, word for word ("put
+  the clothes on the left onto the person on the right."). The person's half
+  is cut back out with `ImageCrop` at exactly the size it went in: **the
+  canvas is sampled at the size it is built at, never resampled**. Scaled to
+  1 MP in between, the cut landed a few pixels off and left a white edge. At
+  2 MP (`tryon_megapixels`) the person drifted left and went soft; 1 is right.
+  The LoRA follows the body well: long sleeves over a t-shirt, ripped jeans,
+  a trucker jacket's pockets and buttons (5090, 2026-09-25).
+- **The LoRA does not do shoes, hats or accessories** (its author says so, and a
+  column of glasses and a necklace was ignored). Hair and accessories are
+  Qwen's own multi-picture edit: the person as picture 1, what to put on as
+  pictures 2 and 3, two accessories to a pass. **The wording decides whether
+  anything happens.** Any "keep the face, pose and background the same" or
+  "same framing" clause, and the edit was not made, seed after seed. "The
+  person in picture 1 now has the hair of the person in picture 2" and "The
+  person in picture 1 wears the glasses from picture 2 and the gold necklace
+  from picture 3" were made. Say "picture", as `TextEncodeQwenImageEditPlus`
+  labels them. Hair as words alone is "Change the person's hair to …".
+- **Hair and head accessories are drawn on a head crop.** On a full-length
+  picture the accessory pass was a coin toss: no change, the right edit, or a
+  head-and-shoulders portrait with a new face, by seed. So the first run
+  (`dress_graph` with `find_head`) draws the clothes and the body's
+  accessories (a watch, a belt, a bag: anything `HEAD_WORDS` does not name),
+  ends in a preview, and SAM3 finds the faces. The second run
+  (`dress_head_graph`) crops `head_region` around the largest one, enlarges it
+  to 1 MP, draws the hair and head accessories there, and blends back only
+  the person (SAM3's "person" before and after, grown `PERSON_GROW`, softened,
+  times a soft rectangle). Through the rectangle alone the crop's redrawn
+  background showed as a pale box behind the head. A head crop over
+  `HEAD_SHARE` of the picture (a portrait) is the whole picture. Without SAM3
+  on the backend it is one run on the whole picture, and the record says so.
+  The 5090 has had `sam3.1_multiplex_fp16.safetensors` (Comfy-Org, 1.75 GB,
+  in `D:\ComfyUI-models\checkpoints`) since 2026-09-25, which the face pass
+  there needs too.
+- **Measured on the 5090 (832x1216)**: the clothes alone 15 s; clothes, hair,
+  glasses and a necklace 72-74 s (a SAM3 load is ~20 s of it); a FLUX picture
+  dressed the same way 60 s end to end. Dressing redraws the person at ~1 MP
+  and scales back, so a refined picture loses some of its refine; the face
+  pass runs after dressing, on the dressed picture. Fidelity is best on a
+  picture of a person in plain clothes. On a FLUX picture whose words already
+  named the clothes, the result was looser (a tartan for a buffalo check,
+  black frames for tortoiseshell).
+- The try-on LoRA and SAM3 are on the 5090; the 3090 has the edit model, the
+  Lightning LoRA and SAM3 but not the try-on LoRA, so `dress_route` sends a Try
+  On with clothes to the 5090 (the primary first either way) and names the
+  missing file when nothing can take it.
 
 ### The app the user connects by hand: `BridgeSpec`
 
@@ -673,23 +843,51 @@ bottom. It blocks out a picture; it is not a 3D package. `studio_scene.py` is th
 (no tkinter, tested headless), `studio_scene_ui.SceneBuilder` the window, a collaborator
 of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 
-- **Generate goes through the Image Studio, never beside it.** The builder renders the
-  frame (`write_reference`, under `image-studio/scenes/renders/`, named by content hash),
-  writes the scene's words into the form's Scene field, sets the form's `source`
-  reference, and calls `ImageStudio.generate(extra=...)`. `extra` lays the frame's
-  size, the denoise (`redraw`), `scene_layout` (the whole scene) and `scene_file` over
-  the form's settings for that job alone: History records them, and the next plain
+- **Generate goes through the Image Studio, never beside it.** The builder draws the
+  scene's maps (`scene_maps`, under `image-studio/scenes/renders/`, named by content
+  hash), writes the scene's words into the form's Scene field, and calls
+  `ImageStudio.generate(extra=...)`. `extra` lays the frame's size, the maps as
+  `references` (the form's pose, composition and source slots replaced; its face and
+  style kept), their strengths, the denoise when the frame is one of them,
+  `scene_layout` (the whole scene) and `scene_file` over the form's settings for that
+  job alone - the form's own slots are not touched: History records them, and the next plain
   Generate from the form carries none of them. Routing, refusals, the queue, the face
   pass and Generate Again are the Image Studio's, unchanged.
-- **The frame is a `source` reference, because that is what exists.** No backend has
-  pose or depth ControlNet, IP-Adapter or PuLID (see the Image Studio's references), so
-  the blockout is image to image at `redraw` denoise (0.7 by default; lower keeps the
-  layout, higher lets the picture leave the grey shapes behind). A model whose
-  workflow declares no `source` input - the FLUX baseline today - would silently make a
-  picture without the frame, so `SceneBuilder.check()` says so the moment something is
-  added and Generate refuses, naming the models that do take one. When a pose
-  ControlNet lands, it is a new reference kind in a workflow; the builder already has
-  the skeleton to draw a pose map from (`skeleton()`).
+- **The scene is sent as what it means, not as the grey frame.** Image to image
+  from the frame (until 2026-09-25, at denoise 0.7) copied the mannequins' blocky
+  look into the people: any denoise low enough to keep the layout keeps the
+  shapes too. For a model whose workflow has the ControlNet inputs (the FLUX
+  baseline) the builder sends two maps instead, each with its own slider (0 is
+  off), and the words say how things look:
+  - **Pose** (`pose_png`, reference kind `pose`, default 0.85): every person
+    and crowd member's skeleton (`rigs`: the same placement `painted_pieces`
+    gives their faces) projected through the camera as OpenPose, drawn by
+    `studio_pose.render_figures`, far to near. Head points are dropped as
+    DWPose would miss them - nose and eyes on the side facing the camera, the
+    far ear in profile - and the 68 face dots are `studio_pose.FACE` turned
+    with the head in 3D (`FACE_UNIT` is half the eye gap), drawn whenever the
+    nose is seen, profile included, or the person comes back seen from behind.
+    A joint with something more than `HIDDEN_BEHIND` (0.3 m) nearer at its pixel
+    is dropped, as a photo hides it (the depth map's z-buffer): live on the 5090,
+    crowd limbs drawn through the man in front turned him round; hidden, he faced
+    the camera on the same seed.
+  - **Layout (depth)** (`depth_png`, kind `composition`, default 0.55): a
+    z-buffer of 1/z over every face, the floor and the inward walls (`_fill_depth`:
+    1/z is linear across a flat face on screen), grey from farthest (black) to
+    nearest (white), sky black - Depth Anything's convention, which Union Pro 2.0
+    learnt. 512 px on the long edge; the ControlNet scales it.
+  - **Grey frame kept** (`frame_keep`, kind `source`, default 0 = not sent): 1 -
+    denoise. 0.1-0.25 pins props and exact framing on top of the maps.
+  A model with neither ControlNet input (Z-Image) gets the frame alone, at
+  `FALLBACK_KEEP` 0.3 kept at least (the old 0.7 denoise). `SceneBuilder.takes()`
+  reads which of the three a model's workflows have; `check()` refuses only a model
+  with none. A backend lacking the ControlNet file is compose's warning, and that
+  picture is made from the words. A scene saved with `redraw` opens with the
+  defaults. The maps are named in the status line after Generate, for looking at.
+  Measured 2026-09-25 (FLUX on the 5090, seed 4242, ~16 s): the same Oktoberfest
+  scene from the frame at 0.7 came back a flat vector illustration; from the maps,
+  a photograph with the two people where and as they stand. The crowd's raised
+  arms were not kept at 0.85/0.65: small figures follow the pose loosely.
 - **The viewport is the frame.** The canvas always looks through the one camera; the lit
   rectangle is `render()` at the generation size, the same polygon list `png()`
   rasterises, so what is inside it is exactly the reference. Outside it is dimmed
@@ -700,6 +898,26 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   pose - in parentheses before the user's text (and a person's look between the two),
   and it says "a person" so the anatomy constants apply. An object outside the frame is left out of the words and said so,
   and so is an object with no description. A test holds punctuation and case verbatim.
+  "Outside" is none of its box on screen: its middle alone dropped a person framed head
+  and shoulders, whose middle is below the frame; left / centre / right is the seen part's.
+- **A person is said from their controls, as the pose map draws them.** Each person's
+  line is `Name (a person, where, facing, [gaze], framing, [named pose]): look.
+  Posture. Description`. `posture_words` reads the posed skeleton, not the sliders, so
+  a combination says what it looks like: the torso's bend, lean and turn; each arm
+  from where its wrist ends up against the crown (`HEAD_TOP` above the head joint),
+  shoulder and hips ("raised above the head", "reaching forward at shoulder height",
+  "bent, the hand in front of the chest", "swinging forward"...), both arms in one
+  phrase when they match (`BOTH_ARMS`); the legs (stride, weight on one leg, wide
+  stance) unless a named pose in `LEG_POSES` says them; the head's nod and tilt.
+  Left and right are theirs, as captions say them. `gaze_words` says where the head
+  looks when that is not the body's way ("head turned towards the camera"), and
+  `framing_words` how much of them the frame shows ("seen from the knees up"). A
+  look with a Gaze keeps it: the head words are left out rather than contradict it.
+  Heights, degrees and body words are not added: the look's sliders already say
+  build and height, the anatomy constants say natural proportions, and numbers do
+  little in a prompt. Live (2026-09-25, same seed): an arm raised in both the map and
+  the words was drawn raised; a front-on carrying pose (forearms towards the
+  camera, so short in the map) was not, in one seed of two.
 - **Each person carries their own look.** A person object has `look` (the Image
   Studio's `LOOKS` slots and `SLIDERS`, sparse, cleaned by `clean_look`) and
   `character`. The inspector's Look section is the form's own `look_rows` /
@@ -707,9 +925,9 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   (`character_look`: blank where it has none, the expression and gaze kept) and, if the
   person still has the default name, its name; it is a copy, like the form's. The look is
   said in that person's line, `Name (a person, where, facing): look. Description`.
-- **The mannequin wears the look, because the frame is what the picture copies.** At
-  `redraw` denoise a heavyset person drawn as the rest mannequin is pulled thin again,
-  so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
+- **The mannequin wears the look, because the maps are drawn from it.** The depth
+  map carries each body's outline (and the frame, when kept, its colours): a
+  heavyset person drawn as the rest mannequin is pulled thin again, so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
   Height sliders, plus a Body type word `BUILDS` knows, as steps added to them (clamped,
   so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
   Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
