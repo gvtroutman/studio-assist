@@ -897,5 +897,66 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertNotIn("scene_layout", ui.collect())
 
 
+class FakeLLM:
+    def __init__(self, *replies):
+        self.replies, self.sent = list(replies), []
+
+    def chat(self, messages, max_tokens=None):
+        self.sent.append(messages)
+        return {"choices": [{"message": {"content": self.replies.pop(0)}}]}
+
+
+class EnrichTest(unittest.TestCase):
+    def scene(self):
+        s = staged("person")
+        s["details"] = "A Munich street during Oktoberfest"
+        return s
+
+    def test_reads_json_prose_and_thinking(self):
+        self.assertEqual(sc.read_suggestion('<think>hmm</think>{"detail": "A pretzel basket '
+                                            'on a far table.", "why": "food"}'),
+                         ("A pretzel basket on a far table.", "food"))
+        self.assertEqual(sc.read_suggestion("Suggested enrichment: - A jacket over a bench.")[0],
+                         "A jacket over a bench.")
+        self.assertEqual(sc.read_suggestion(""), (None, None))
+
+    def test_prompt_carries_scene_history_and_rotates(self):
+        s = self.scene()
+        first = sc.enrich_angle(s)
+        sc.enrich_answer(s, "Blue-and-white bunting overhead.", "never")
+        sc.enrich_answer(s, "Two half-full steins on a far table.", "skip")
+        user = sc.enrich_messages(s)[1]["content"]
+        self.assertIn("Oktoberfest", user)
+        self.assertIn("bunting", user)
+        self.assertIn("Never suggest", user)
+        self.assertNotEqual(sc.enrich_angle(s), first)
+
+    def test_suggest_refuses_repeats_then_gives_up(self):
+        s = self.scene()
+        sc.enrich_answer(s, "A jacket draped over a bench.", "skip")
+        llm = FakeLLM('{"detail": "a jacket draped over a bench"}',
+                      '{"detail": "Condensation beading on a stein at the frame edge."}')
+        self.assertEqual(sc.suggest(s, llm)[0],
+                         "Condensation beading on a stein at the frame edge.")
+        with self.assertRaises(RuntimeError):
+            sc.suggest(s, FakeLLM('{"detail": "A jacket draped over a bench."}',
+                                  "{}"))
+
+    def test_added_goes_into_words_and_survives_a_save(self):
+        s = self.scene()
+        sc.enrich_answer(s, "Warm tent light spills unevenly across the cobbles.", "add")
+        text = sc.scene_text(s).text
+        self.assertIn("Warm tent light spills unevenly across the cobbles.", text)
+        self.assertLess(text.index("cobbles"), text.index("Shot from"))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.scene.json")
+            sc.save(s, path)
+            back, problems = sc.load(path)
+        self.assertEqual(back["enrich"]["added"], s["enrich"]["added"])
+        self.assertEqual(problems, [])
+        old, _ = sc.clean_scene({"objects": [], "enrich": {"added": [3, "  ", "x" * 999]}})
+        self.assertEqual(old["enrich"]["added"], ["x" * sc.ENRICH_CHARS])
+
+
 if __name__ == "__main__":
     unittest.main()

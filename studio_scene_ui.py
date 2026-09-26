@@ -80,6 +80,8 @@ class SceneBuilder:
         self.taken = set()            # ids of the finished picture jobs already used
         self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
         self.bake_after = None
+        self.suggestion = None        # (detail, why) offered by Enrich, awaiting an answer
+        self.enriching = False
 
         win = self.win = tk.Toplevel(host)
         win.title("Scene Builder")
@@ -98,6 +100,7 @@ class SceneBuilder:
         o.button(foot, "Save", self.save).pack(side="right", padx=(0, o.px(6)))
         o.button(foot, "Open…", self.open).pack(side="right", padx=(0, o.px(6)))
         o.button(foot, "New", self.new, kind="ghost").pack(side="right", padx=(0, o.px(6)))
+        o.button(foot, "✨ Enrich", self.enrich).pack(side="right", padx=(0, o.px(14)))
         self.model_row = o.frame(foot)
         self.model_row.pack(side="right", padx=(0, o.px(14)))
         self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(520))
@@ -352,6 +355,7 @@ class SceneBuilder:
         o.label(p, "Where this is and what matters in it: the place, the light, the "
                 "weather, the state of things.", "faint", self.host.f_small,
                 wraplength=o.px(310)).pack(side="top", fill="x")
+        self._enrich_box(p)
 
         o.cap(p, "Frame")
         o.choice(p, [(k, label) for k, label, _, _ in sc.FRAMES], s["frame"],
@@ -389,6 +393,111 @@ class SceneBuilder:
                 "composition.", "faint", self.host.f_small,
                 wraplength=o.px(310)).pack(side="top", fill="x")
         self._words_box()
+
+    def _enrich_box(self, p):
+        """The detail Enrich offered, with its three answers, and the details
+        already added, each removable."""
+        o, e = self.owner, self.scene.setdefault("enrich", sc.new_enrich())
+        if self.suggestion:
+            detail, why = self.suggestion
+            o.cap(p, "Suggested detail")
+            card = o.frame(p, "card")
+            card.pack(side="top", fill="x")
+            o.label(card, detail, "text", self.host.f_ui, bg="card",
+                    wraplength=o.px(300)).pack(side="top", fill="x", padx=o.px(8),
+                                                pady=(o.px(6), 0))
+            if why:
+                o.label(card, why, "faint", self.host.f_small, bg="card",
+                        wraplength=o.px(300)).pack(side="top", fill="x", padx=o.px(8))
+            row = o.frame(card, "card")
+            row.pack(side="top", fill="x", padx=o.px(8), pady=o.px(6))
+            o.button(row, "Add", lambda: self._answer("add"), kind="accent",
+                     bg="card").pack(side="left")
+            o.button(row, "Skip", lambda: self._answer("skip"), bg="card").pack(
+                side="left", padx=(o.px(4), 0))
+            o.button(row, "Don't suggest again", lambda: self._answer("never"),
+                     kind="ghost", bg="card").pack(side="left", padx=(o.px(4), 0))
+        if e["added"]:
+            o.cap(p, "Lived-in details")
+            for i, detail in enumerate(e["added"]):
+                row = o.frame(p, "card")
+                row.pack(side="top", fill="x", pady=(0, o.px(3)))
+                o.button(row, "×", lambda i=i: self._unadd(i), kind="ghost",
+                         bg="card").pack(side="right", anchor="n")
+                o.label(row, detail, "text", self.host.f_small, bg="card",
+                        wraplength=o.px(270)).pack(side="left", fill="x", expand=True,
+                                                   padx=o.px(8), pady=o.px(4))
+
+    def _llm(self):
+        """The model the tabs already use, or what the host has loaded: a new
+        load on the shared card would cost more than the suggestion."""
+        import studio_agent as eng
+        base = getattr(self.host, "host", None) or eng.DEFAULT_HOST
+        llm = getattr(self.host, "llm", None)
+        model = getattr(llm, "model", None)
+        if not model:
+            ok, loaded, ids, _, err = eng.probe_models(base)
+            if not ok:
+                raise RuntimeError("Cannot reach the LLM PC at %s (%s)." % (base, err))
+            model = eng.pick_model(loaded, ids, getattr(self.host, "want_model", None))
+            if not model:
+                raise RuntimeError("The LLM PC serves no model.")
+        return eng.LLM(base, model, temperature=0.9, timeout=180)
+
+    def enrich(self):
+        """Ask the LLM PC for one lived-in detail, off the UI thread."""
+        if self.enriching:
+            return
+        self.enriching = True
+        self.suggestion = None
+        if self.sel is not None:
+            self.select(None)
+        else:
+            self._inspect()
+        self.status("Asking the LLM PC for one lived-in detail…", "muted")
+        mine, scene, box = self.scene, copy.deepcopy(self.scene), {}
+
+        def work():
+            try:
+                box["got"] = sc.suggest(scene, self._llm())
+            except Exception as ex:      # the host's errors are all worth saying
+                box["error"] = ex
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+
+        def wait():
+            if worker.is_alive():
+                self.win.after(150, wait)
+                return
+            self.enriching = False
+            if self.scene is not mine:       # New or Open while it thought
+                return
+            if "error" in box:
+                self.status("Enrich: %s" % box["error"], "err")
+                return
+            self.suggestion = box["got"]
+            self.status("One detail suggested — Add, Skip, or Don't suggest again.", "muted")
+            if self.sel is None:
+                self._inspect()
+        self.win.after(150, wait)
+
+    def _answer(self, answer):
+        if not self.suggestion:
+            return
+        detail = self.suggestion[0]
+        sc.enrich_answer(self.scene, detail, answer)
+        self.suggestion = None
+        self.status({"add": "Added to the words.", "skip": "Skipped.",
+                     "never": "Won't be suggested again."}[answer], "muted")
+        self._inspect()
+        self.changed()
+
+    def _unadd(self, i):
+        added = self.scene["enrich"]["added"]
+        if 0 <= i < len(added):
+            sc.enrich_answer(self.scene, added.pop(i), "skip")
+            self._inspect()
+            self.changed()
 
     def _inspect_room(self):
         o, p, room = self.owner, self.panel, self.scene["room"]
@@ -944,7 +1053,7 @@ class SceneBuilder:
         if not self._ask_save():
             return
         self.scene = sc.new_scene()
-        self.making = {}
+        self.making, self.suggestion = {}, None
         self.path, self.dirty = None, False
         self.select(None)
         self._list()
@@ -969,7 +1078,7 @@ class SceneBuilder:
             return False
         self.scene, self.path, self.dirty = scene, path, False
         self.sel = None
-        self.making = {}
+        self.making, self.suggestion = {}, None
         self._list()
         self._inspect()
         self.draw()

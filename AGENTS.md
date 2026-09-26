@@ -780,6 +780,16 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   The viewport cannot texture a canvas polygon, so it draws the room in each
   picture's mean colour at once and puts a half-size bake (`_bake`, 150 ms
   after the last change) over the frame: a drag is never held up by one.
+- **✨ Enrich offers one lived-in detail at a time.** The button asks the model the
+  tabs already use (`Chat.llm`, else what LM Studio has loaded: never a new load on the
+  shared card) for one detail, through `sc.suggest` off the UI thread. `ENRICH_SYSTEM`
+  holds the rules: photographic imperfection and storytelling over themed clutter,
+  around the people, never between them or on them, 25-60 concrete words. A different
+  `ENRICH_ANGLES` kind is asked for each time. Add / Skip / Don't suggest again are
+  kept in `scene["enrich"]` (`added`, `seen`, `never`, 40 each) and saved with the
+  scene, so a reopened scene gets something new and a repeat is re-asked once.
+  Added details go into the words as written, before the camera line. The mannequin
+  does not draw them.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
