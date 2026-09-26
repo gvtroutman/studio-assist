@@ -589,6 +589,58 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   files (its entry expects `t5xxl_fp8_e4m3fn_scaled` and fp8 weights), so Auto
   never sends FLUX there. Z-Image Turbo at 1024² took 18-30 s there.
 
+### The Visual Critic: automatic refinement after a picture is made
+
+"Automatic refinement" under Generate (`auto_refine`, off by default) runs
+`Studio._refine` on the lane's thread after the picture and its face pass:
+the host's vision model (`Chat.vision`, handed to `Studio` as `vision`) looks
+at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
+`studio_critic.py` is the logic, no tkinter and no I/O of its own. The rules:
+
+- **Three states, kept apart.** The *intent* (`intent_from`: the composed
+  prompt and the form's words) is a read-only mapping; nothing writes into
+  it. The *canonical state* (`initial_canonical`: character_a from the look
+  slots and identities, the scene, the camera and style) holds one value per
+  key; every key the form set is `locked`. The *corrections* are rebuilt from
+  each look and never accumulate.
+- **The critic returns JSON, every observation with a status** (MATCH,
+  MISMATCH, UNCERTAIN, NEW_USEFUL_DETAIL), a confidence and a severity.
+  `clean_result` makes anything malformed safe: an unknown status is
+  UNCERTAIN, never a fix. No JSON at all keeps the picture, with a warning.
+- **The planner prefers the smallest edit** (`plan_next_refinement`,
+  `action_for`). A *major* scene/camera/lighting/body fault is the only
+  thing that makes a new picture (`_regenerate`: `prompt_override` in
+  `compose`, a new seed), and then it is the only action. Otherwise faces
+  (FACE_CORRECTION), hands and small things (LOCAL_INPAINT,
+  OBJECT_CORRECTION) run together, and a whole-picture touch-up
+  (GLOBAL_REFINEMENT, denoise 0.2) waits until nothing local is left.
+  Mismatches under `MIN_CONFIDENCE` (0.6) are logged and ignored. The loop
+  stops when the critic says nothing meaningful is wrong.
+- **There is no inpainting node here; the face pass is the local editor.**
+  Every local fix is `face_graph` - SAM3 finds the thing (`add_face_finder`
+  on a `LoadImage`, prompt `face:8`, `hand:4`, `<object>:4`), each box is
+  cropped, redrawn with the job's model and LoRAs from a prompt compiled for
+  it, and blended back through the soft oval. A crop with `mask` False and
+  its own `edit` size is the whole-picture pass. So anything outside a
+  crop is untouched pixel for pixel, which is what "preserve" means here;
+  "keep X" in a FLUX prompt at CFG 1 does nothing. Hands stay at denoise 0.6
+  (`CRITIC_DENOISE`) for the reason in the hand-pass note: higher left
+  double hands. Only a template with a `face_detail` section (today
+  `flux_dev_baseline`) can take a local fix.
+- **Good inventions are promoted, once.** A NEW_USEFUL_DETAIL at 0.75 or
+  more, on a key the user did not set and not also called a mismatch, is set
+  at its key (`merge_canonical`; "Hair colour" and "hair_color" are one key)
+  and goes into the next prompt.
+- **Two outputs from one compiler.** `build_refinement_instructions` writes
+  the sectioned text (ORIGINAL USER INTENT, CANONICAL ..., PRESERVE,
+  CORRECT) to the log; `generator_prompt` is the prose FLUX reads, with a
+  close-up head for a crop.
+- **The record says what happened.** `record["refinement"]` holds the
+  intent, final canonical state, the pass history and why it stopped;
+  `image-studio/visual_critic.log` has each pass's matches, mismatches and
+  chosen action. Faces are not matched to characters: a face correction
+  redraws every face with every character's description.
+
 ### The app the user connects by hand: `BridgeSpec`
 
 Not every app has a bridge written here, and the user may already have one installed —
