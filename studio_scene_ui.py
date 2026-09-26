@@ -551,11 +551,31 @@ class SceneBuilder:
                      put_scene("depth_strength"), 0.0, 1.0, 0.05)
         self._slider(p, "frame_keep", "Grey frame kept", lambda: s["frame_keep"],
                      put_scene("frame_keep"), 0.0, sc.FRAME_KEEP_MAX, 0.05)
+        self._slider(p, "face_likeness", "Face likeness", lambda: s["face_likeness"],
+                     put_scene("face_likeness"), *sc.FACE_LIKENESS_RANGE, 0.05)
+        real = tk.BooleanVar(value=s["real_faces"])
+
+        def flip():
+            s["real_faces"] = bool(real.get())
+            self.changed()
+        b = tk.Checkbutton(p, text="Real faces where a photo's angle fits", variable=real,
+                           command=flip, anchor="w", font=self.host.f_small, bd=0,
+                           highlightthickness=0)
+        o.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
+               activeforeground="text")
+        b.pack(side="top", fill="x")
+        self.vars["real_faces"] = (real, lambda: s["real_faces"])
         o.label(p, "Pose holds each body's joints; layout holds where everything is and "
                 "how far away. Both leave how things look to the words. The grey frame "
                 "is off by default: kept, the picture copies the mannequins' blocky "
                 "shapes - 0.1 to 0.25 pins props and framing. 0 turns any of them off. "
-                "A model with no ControlNet uses the frame alone, 0.3 kept at least.",
+                "A model with no ControlNet uses the frame alone, 0.3 kept at least. "
+                "Face likeness: a face with a face picture is drawn from it in the picture "
+                "itself, then redrawn close up at this strength last of all. Higher looks "
+                "more like the picture; past 0.6 the head can stop matching the body. "
+                "Real faces: then each person's own face is pasted over theirs from the "
+                "photo of them turned most like it - only when it is close enough for "
+                "the face's size; the PuLID picture is kept beside it in History.",
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
         self._words_box()
 
@@ -703,7 +723,71 @@ class SceneBuilder:
             def uniform(x):
                 scale[:] = [x, x, x]
             self._slider(p, "size", "Size", lambda: scale[0], uniform, 0.5, 1.3, 0.01)
+        if a["kind"] == "person":
+            self._face_controls(obj)
         self._words_box()
+
+    def _face_controls(self, obj):
+        """The face this person is drawn with, last of all: a picture of
+        theirs, else their character's identity's, else none (the face is
+        redrawn from the words)."""
+        o, p = self.owner, self.panel
+        o.cap(p, "Face")
+        lib = o.studio.lib
+        path, source = sc.face_picture(obj, {c["id"]: c for c in lib.all("characters")},
+                                       {d["id"]: d for d in lib.all("identities")})
+        row = o.frame(p)
+        row.pack(side="top", fill="x")
+        thumb = self._face_thumb(path)
+        if thumb is not None:
+            tk.Label(row, image=thumb, bd=0).pack(side="left", padx=(0, o.px(6)))
+            self.face_thumb = thumb
+        o.label(row, os.path.basename(path) if path else "None: drawn from the words",
+                "muted" if path else "faint", self.host.f_small).pack(side="left")
+        o.button(row, "Clear", lambda: self._set_face(""), kind="ghost").pack(side="right")
+        o.button(row, "Choose…", self.choose_face, kind="quiet").pack(side="right")
+        o.label(p, ("From %s. " % source if path else "") +
+                "Their face is drawn from it in the picture itself, then refined close up "
+                "at the end. Use a clear, front-on picture of this one person: in a picture "
+                "of two, the bigger face is taken. Say glasses and skin in the look. FLUX "
+                "only.", "faint", self.host.f_small,
+                wraplength=o.px(310)).pack(side="top", fill="x")
+
+    def _face_thumb(self, path, side=48):
+        """A small PhotoImage of `path`, or None when Tk cannot read it
+        (Tk reads PNG and GIF; a JPEG is shown by name alone)."""
+        if not path or not path.lower().endswith((".png", ".gif")):
+            return None
+        try:
+            img = tk.PhotoImage(master=self.win, file=path)
+        except tk.TclError:
+            return None
+        k = max(1, -(-max(img.width(), img.height()) // side))
+        return img.subsample(k, k)
+
+    def choose_face(self):
+        obj = self.obj()
+        if obj is None or obj["asset"] != "person":
+            return
+        path = filedialog.askopenfilename(
+            parent=self.win, title="A picture of %s's face" % obj["name"],
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
+        if path:
+            try:
+                path = self.owner.studio.lib.keep_reference(path, "scene faces")
+            except OSError as e:
+                self.status("Could not keep a copy of %s: %s" % (os.path.basename(path), e),
+                            "err")
+                return
+            self._set_face(path)
+
+    def _set_face(self, path):
+        obj = self.obj()
+        if obj is None or obj["asset"] != "person":
+            return
+        obj["face"] = path
+        self._inspect()
+        self.changed()
 
     def _look_controls(self, obj):
         """Who this person is, as the Image Studio's character creator says
@@ -1639,7 +1723,8 @@ class SceneBuilder:
             self.status("Could not write the scene's pictures: %s" % e, "err")
             return False
         chars = {c["id"]: c for c in o.studio.lib.all("characters")}
-        words, extra = sc.generation(self.scene, maps, chars)
+        idents = {d["id"]: d for d in o.studio.lib.all("identities")}
+        words, extra = sc.generation(self.scene, maps, chars, idents)
         # The scene's maps take the form's pose, composition and source
         # slots for this job; its other references (a face, a style) stay.
         refs = {k: x for k, x in (o.collect().get("references") or {}).items()

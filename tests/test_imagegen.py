@@ -126,6 +126,35 @@ class FaceClient(FakeClient):
         return entry
 
 
+class PulidClient(FaceClient):
+    """FaceClient with PuLID installed and its weights."""
+
+    def node_types(self):
+        return set(FaceClient.NODES) | ig.PULID_NODES
+
+    def get_json(self, path, timeout=None):
+        assert path == "/object_info/PulidFluxModelLoader", path
+        return {"PulidFluxModelLoader": {"input": {"required": {
+            "pulid_file": [["pulid_flux_v0.9.1.safetensors"]]}}}}
+
+
+class PasteClient(PulidClient):
+    """PulidClient with the real-face paste node; `report` is what it says."""
+    report = []
+
+    def node_types(self):
+        return super().node_types() | {ig.PASTE_NODE}
+
+    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        graph = self.graphs[int(pid[3:]) - 1]
+        if "pp" in graph:
+            return {"status": {"completed": True}, "outputs": {
+                "pp": {"text": [json.dumps(PasteClient.report)]},
+                "ps": {"images": [{"filename": "real_00001_.png", "subfolder": "ImageStudio",
+                                   "type": "output"}]}}}
+        return super().listen_for_progress(pid, on_event, stop, timeout)
+
+
 def settle(jobs, seconds=5):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -297,6 +326,24 @@ class TestFill(unittest.TestCase):
         self.assertEqual(len(crops), 1)
         self.assertEqual(crops[0]["width"], 200)
         self.assertIsNone(ig.face_boxes({"outputs": {}}))
+
+    def test_faces_are_matched_to_the_nearest_person_once(self):
+        boxes = [(100, 100, 40, 40), (500, 100, 40, 40), (900, 900, 30, 30)]
+        people = [{"name": "a", "at": [0.52, 0.13]}, {"name": "b", "at": [0.5, 0.11]},
+                  {"name": "c", "at": [0.1, 0.9]}]
+        got = ig.match_faces(1000, 1000, boxes, people)
+        self.assertEqual({i: p["name"] for i, p in got.items()}, {1: "a"})   # b loses the tie
+        # a big face with a likeness to draw is redrawn anyway
+        self.assertEqual([i for i, _ in ig.indexed_crops(2000, 2000, [(0, 0, 700, 700)],
+                                                         keep={0})], [0])
+        self.assertEqual(ig.face_crops(2000, 2000, [(0, 0, 700, 700)]), [])
+
+    def test_a_region_mask_is_white_over_its_region_at_the_frames_shape(self):
+        import studio_icons
+        rgba, w, h = studio_icons.png_to_rgba(ig.region_png([0.5, 0.0, 1.0, 0.5], 800, 1600))
+        self.assertEqual((w, h), (32, 64))
+        at = lambda x, y: rgba[(y * w + x) * 4]
+        self.assertEqual((at(20, 10), at(5, 10), at(20, 40)), (255, 0, 0))
 
     def test_the_face_graph_keeps_only_what_the_redraw_needs(self):
         wf = ig.load_workflow("flux_dev_baseline")
@@ -801,6 +848,128 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rec["face_graph"]["fs"]["inputs"]["filename_prefix"],
                          "ImageStudio/flux_dev_baseline_%s_faces" % job.id)
         self.assertTrue(any("Face pass: 1 face" in n for n in rec["notes"]), rec["notes"])
+
+    def scene_faces(self, face):
+        """A scene's person where FaceClient's one face is, and one who is not
+        in the picture."""
+        return {"likeness": 0.85, "people": [
+            {"id": "p1", "name": "Lilya", "at": [0.43, 0.35], "words": "A woman in her 30s.",
+             "face": face, "from": "", "region": [0.35, 0.25, 0.5, 0.45]},
+            {"id": "p2", "name": "Gavin", "at": [0.9, 0.9], "words": "A man.", "face": "",
+             "from": ""}]}
+
+    def test_a_scene_face_is_redrawn_as_its_person_and_to_their_face_picture(self):
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=PulidClient)
+        FaceClient.fail_pass = False
+        face = os.path.join(self.dir, "lilya.png")
+        with open(face, "wb") as f:
+            f.write(PNG)
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                       backend="5090", seed=5, face_detail=True,
+                                       scene_faces=self.scene_faces(face)))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        client = PulidClient.instances[-1]
+        first, second = client.graphs
+        # Her face goes into the picture itself, over her head only.
+        self.assertEqual(first["40"]["inputs"]["model"], ["pb_1", 0])
+        self.assertEqual(first["pb_1"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(first["pb_1f"]["inputs"]["image"], "studio_lilya.png")
+        self.assertEqual(first["pb_1k"]["inputs"]["image"], ["pb_1m", 0])
+        mask = [u for u in client.uploads if "face_regions" in u]
+        self.assertEqual(len(mask), 1)
+        self.assertIn(face, client.uploads)
+        k = second["fc1_4"]["inputs"]
+        self.assertEqual(k["model"], ["fc1_p", 0])
+        self.assertEqual(k["denoise"], 0.85)          # the scene's likeness
+        self.assertEqual(second["fc1_p"]["inputs"]["image"], ["fc1_r", 0])
+        self.assertEqual(second["fc1_r"]["inputs"]["image"], "studio_lilya.png")
+        self.assertEqual(second["pl1"]["inputs"]["pulid_file"], "pulid_flux_v0.9.1.safetensors")
+        # Her own words, on a copy of the face prompt's conditioning.
+        pos = second[k["positive"][0]]
+        text = second[pos["inputs"]["conditioning"][0]]["inputs"]["text"]
+        self.assertIn("A woman in her 30s.", text)
+        self.assertEqual(second["f10"]["inputs"]["text"].count("A woman in her 30s"), 0)
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["face_detail"]["likeness"], ["Lilya"])
+        self.assertTrue(any("Gavin's face was not found" in n for n in rec["notes"]))
+        self.assertTrue(any("Likeness: Lilya" in n for n in rec["notes"]), rec["notes"])
+
+    def test_without_pulid_a_scene_face_is_redrawn_from_its_words_and_says_so(self):
+        self.face_studio()
+        face = os.path.join(self.dir, "lilya.png")
+        with open(face, "wb") as f:
+            f.write(PNG)
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                       backend="5090", seed=5, face_detail=True,
+                                       scene_faces=self.scene_faces(face)))
+        settle(jobs)
+        first, second = FaceClient.instances[-1].graphs
+        self.assertFalse([n for n in first if n.startswith("pb")])
+        self.assertNotIn("fc1_p", second)
+        self.assertEqual(second["fc1_4"]["inputs"]["denoise"], 0.4)
+        rec = self.studio.history.list()[0]
+        self.assertTrue(any("lacks PuLID" in w for w in rec["warnings"]), rec["warnings"])
+
+    def real_scene(self, client, report, real=True):
+        """A scene job whose face Lilya has two photos, on `client`."""
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=client)
+        FaceClient.fail_pass = False
+        PasteClient.report = report
+        photos = []
+        for name in ("lilya.png", "lilya_left.png"):
+            photos.append(os.path.join(self.dir, name))
+            with open(photos[-1], "wb") as f:
+                f.write(PNG)
+        faces = self.scene_faces(photos[0])
+        faces["real"] = real
+        faces["people"][0]["photos"] = photos
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                       backend="5090", seed=5, face_detail=True,
+                                       scene_faces=faces))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        return client.instances[-1], self.studio.history.list()[0]
+
+    def test_a_real_face_is_pasted_last_and_the_pulid_picture_kept_beside_it(self):
+        client, rec = self.real_scene(PasteClient, [
+            {"name": "Lilya", "pasted": True, "reference": "studio_lilya_left.png",
+             "difference": 3.5, "tolerance": 19.2, "confidence": 0.82}])
+        first, second, third = client.graphs
+        self.assertEqual(third["pi"]["inputs"]["image"], "ImageStudio/faces_00001_.png [output]")
+        faces = json.loads(third["pp"]["inputs"]["faces"])
+        self.assertEqual(faces, [{"name": "Lilya", "box": [400, 300, 90, 110],
+                                  "references": ["studio_lilya.png", "studio_lilya_left.png"]}])
+        self.assertEqual(third["pp"]["inputs"]["seed"], 5)
+        self.assertTrue(third["ps"]["inputs"]["filename_prefix"].endswith("_real"))
+        self.assertNotIn("KSampler", {n["class_type"] for n in third.values()})   # no redraw
+        self.assertEqual(len(rec["images"]), 2)          # the pasted one first, PuLID's kept
+        self.assertEqual(rec["paste_graph"], third)
+        self.assertEqual(rec["face_detail"]["real"][0]["reference"],
+                         os.path.join(self.dir, "lilya_left.png"))
+        self.assertTrue(any("Real face: Lilya from lilya_left.png" in n for n in rec["notes"]),
+                        rec["notes"])
+
+    def test_a_face_no_photo_fits_is_left_as_pulid_drew_it(self):
+        client, rec = self.real_scene(PasteClient, [
+            {"name": "Lilya", "pasted": False, "why": "no photo at this angle (30 degrees off, "
+                                                      "19 allowed)"}])
+        self.assertEqual(len(client.graphs), 3)
+        self.assertEqual(len(rec["images"]), 1)          # nothing pasted: nothing twice
+        self.assertIsNone(rec["paste_graph"])
+        self.assertTrue(any("Lilya kept as PuLID drew it - no photo at this angle" in n
+                            for n in rec["notes"]), rec["notes"])
+
+    def test_real_faces_need_the_node_and_the_scene_to_ask(self):
+        client, rec = self.real_scene(PulidClient, [])
+        self.assertEqual(len(client.graphs), 2)
+        self.assertEqual(len(rec["images"]), 1)
+        self.assertTrue(any("has no StudioFacePaste node" in n for n in rec["notes"]))
+        client, rec = self.real_scene(PasteClient, [], real=False)
+        self.assertEqual(len(client.graphs), 2)
+        self.assertFalse(any("Real face" in n for n in rec["notes"]))
 
     def test_a_failed_face_pass_keeps_the_picture(self):
         self.face_studio()

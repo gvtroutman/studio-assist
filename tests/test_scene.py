@@ -1003,6 +1003,60 @@ class TestWords(unittest.TestCase):
         self.assertEqual(extra["scene_layout"]["objects"][0]["name"], "Person")
 
 
+    def test_people_get_the_face_pass_told_where_each_face_is(self):
+        s = staged("person", "person")
+        s["objects"][1]["position"] = [0.8, 0.0, 0.0]
+        s["objects"][0]["description"] = "Laughing."
+        _, extra = sc.generation(s, {"pose": "/x/p.png"})
+        self.assertTrue(extra["face_detail"])
+        faces = extra["scene_faces"]
+        self.assertEqual(faces["likeness"], sc.FACE_LIKENESS)
+        a, b = faces["people"]
+        self.assertLess(a["at"][0], b["at"][0])              # left to right as placed
+        self.assertTrue(0.05 < a["at"][1] < 0.5)             # a face is high in the frame
+        x0, y0, x1, y1 = a["region"]                         # the head, round the face
+        self.assertTrue(x0 < a["at"][0] < x1 and y0 < a["at"][1] < y1)
+        self.assertLess(x1, b["region"][2])
+        self.assertLess(x1 - x0, 0.3)
+        self.assertIn("Laughing.", a["words"])
+        self.assertIn("steel workshop", a["words"])
+        self.assertEqual((a["face"], b["face"]), ("", ""))
+        s["objects"][1]["position"] = [40.0, 0.0, 0.0]       # out of the frame
+        _, extra = sc.generation(s, {"pose": "/x/p.png"})
+        self.assertEqual(len(extra["scene_faces"]["people"]), 1)
+
+    def test_a_face_picture_is_the_persons_own_or_their_identitys(self):
+        folder = tempfile.mkdtemp()
+        own, ref = os.path.join(folder, "own.png"), os.path.join(folder, "ref.jpg")
+        for path in (own, ref):
+            with open(path, "wb") as f:
+                f.write(b"x")
+        s = staged("person")
+        obj = s["objects"][0]
+        obj["character"] = "lil"
+        chars = {"lil": {"id": "lil", "identity": "lilya"}}
+        idents = {"lilya": {"id": "lilya", "name": "Lilya", "references": [ref],
+                            "use_references": True}}
+        self.assertEqual(sc.face_picture(obj, chars, idents), (ref, "Lilya's profile"))
+        obj["face"] = own
+        _, extra = sc.generation(s, {"pose": "/x/p.png"}, chars, idents)
+        self.assertEqual(extra["scene_faces"]["people"][0]["face"], own)
+        # every photo of them goes to the real-face paste, their own first
+        self.assertEqual(extra["scene_faces"]["people"][0]["photos"], [own, ref])
+        self.assertIs(extra["scene_faces"]["real"], True)
+        s["real_faces"] = False
+        again, _ = sc.clean_scene(json.loads(json.dumps(s)))
+        self.assertIs(again["real_faces"], False)
+        self.assertIs(sc.clean_scene({})[0]["real_faces"], sc.REAL_FACES)
+        s["real_faces"] = True
+        # kept through a save, and said when the file has gone
+        again, problems = sc.clean_scene(json.loads(json.dumps(s)))
+        self.assertEqual(again["objects"][0]["face"], own)
+        os.remove(own)
+        _, problems = sc.clean_scene(json.loads(json.dumps(s)))
+        self.assertTrue(any("face picture" in p for p in problems), problems)
+
+
 class TestIntoCompose(TempStudioMixin, unittest.TestCase):
     """The frame and the words through the Image Studio's own compose()."""
 

@@ -70,8 +70,9 @@ this PC's files and the web instead. Two moving parts:
   posable mannequin and simple props on a floor (and walls, each wearing a picture
   made from words), one camera, and the frame it sees, drawn as the pose and depth
   maps (and, when asked, the grey frame) the Image Studio makes the picture from. See *The Scene Builder*.
-  **`comfy_nodes/studio_dwpose`** is its one ComfyUI node (a photo's pose points), kept
-  here and copied into a backend's `custom_nodes`; it is not stdlib-only, it runs there.
+  **`comfy_nodes/studio_dwpose`** (a photo's pose points) and **`comfy_nodes/studio_facepaste`**
+  (a person's real face, pasted last) are its ComfyUI nodes, kept here and copied into a
+  backend's `custom_nodes`; they are not stdlib-only, they run there.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -1085,6 +1086,57 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   The viewport cannot texture a canvas polygon, so it draws the room in each
   picture's mean colour at once and puts a half-size bake (`_bake`, 150 ms
   after the last change) over the frame: a drag is never held up by one.
+- **A face picture is drawn in twice: into the picture, then refined last.** A person's
+  face picture is theirs (**Face** at the foot of their panel, copied under
+  `references/scene-faces`) or their character's identity's first reference
+  (`face_picture`). `face_targets` gives each seen person's face position (head joint +
+  `FACE_UP`, projected), their head `region` (`FACE_REGION`, in head heights), and their
+  own words (look, description, the scene's details). **In the picture itself**
+  (`Studio._faces_into_picture`, `add_pulid`): one `ApplyPulidFlux` per face at
+  `PULID_BASE_WEIGHT`, chained on the samplers' model, each confined by a `region_png`
+  attention mask - so FLUX draws their head, hair and skin with the body. **Last**, the
+  face pass (always on for a scene with people) matches SAM3's boxes to the positions
+  (`match_faces`), redraws each face from its person's words plus the style (`_restated`),
+  and a face with a picture with PuLID again at the scene's **Face likeness** (the
+  redraw's denoise, default 0.6: on a full-length pair 0.45 left both faces thinner and
+  younger than their photos, 0.6 was fuller and still seamless, 0.75 put a faint box
+  round Lilya's head - measured 2026-09-26).
+  Why both, measured 2026-09-25: PuLID only in the last pass needed 0.85-0.92 to
+  change a stranger's face into theirs, and then read as a sticker - a smooth pale face
+  on a tan neck, a halo of repainted background where the stranger's bigger hair was,
+  the SX-70 grain gone. With the likeness in the base picture the last pass only
+  refines, and 0.45 is seamless; 0.9 put the halo back. A light whole-picture redraw
+  after the faces was tried to unify grain: at 0.2 it repainted the whole wall and
+  washed the likeness out - do not add one. The face pass's blend: only the oval is
+  noised (`SetLatentNoiseMask`, hard-edged at `FACE_REDRAWN`; a soft noise mask left a
+  pale ring), and the head is blended back, not the oval - SAM3 "head" on the redraw OR
+  the original crop, OR the found face box (`FACE_BOX_GROW`, never below the chin;
+  SAM3's "head" can come back as hair alone or holed over the face), inside the oval,
+  softened. A face picture must show one face: PuLID takes the biggest, and the
+  profile photos are of two people. Glasses and skin come from the look's words, not
+  the picture. FLUX.1 only (`_pulid` says why not). ~60 s for two faces on the 5090.
+- **Then their real face, but only where a photo's angle fits.** PuLID's face is *like*
+  the person's, never theirs; their own pixels are them, but a front-on photo pasted over
+  a turned head came out doubled (2026-09-25). So with **Real faces** ticked (the scene's
+  `real_faces`, on by default) a third run, `Studio._real_faces` -> `paste_graph`, hands
+  ComfyUI's `StudioFacePaste` (`comfy_nodes/studio_facepaste`) each matched face's finder
+  box and every photo of that person (`face_photos`: their Face picture, then their
+  identity's references). The node reads yaw and pitch of the drawn face and of each photo
+  (InsightFace antelopev2, the one PuLID installs, on the CPU, ~1 s a face) and pastes only
+  when the nearest photo is within a tolerance that **shrinks as the face grows**
+  (`TOLERANCE`: ~22 degrees at 48 px, 8 at 160 px, 6 beyond) - a miss that vanishes at
+  60 px shows on a close-up. Roll does not count; the alignment turns the photo. It aligns
+  on the inner face (so the face keeps its own width), keeps the outline's hull plus a
+  forehead - not hair, not ears - moves the photo's LAB mean and spread to the drawn face's,
+  blurs it to the picture's sharpness, adds the grain it lacks, and feathers it in. **No
+  redraw after**: a diffusion pass is what loses a likeness. Two traps in InsightFace's
+  2d106 points: the outline's 33 are not numbered round the jaw (a polygon of them
+  zig-zags, hence the hull), and point 16 is not the chin (the axis comes from the five
+  key points). The grain is a median deviation: a spread counted glasses' edges as grain.
+  The report (`ui.text`) says per face which photo, both angles, the tolerance, and why
+  not; it lands in the notes and `face_detail.real`. When anything was pasted the record's
+  `images` are the pasted picture first and the PuLID one beside it; when nothing was, the
+  PuLID one alone. A backend without the node says so in the notes and keeps PuLID's.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
