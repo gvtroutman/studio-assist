@@ -2392,8 +2392,8 @@ class TestGui(unittest.TestCase):
             self.app._host_probed(False)
             self.assertEqual(self.app.host_timer, first, "one pending probe, not two")
 
-            self.app.host_timer = None    # as the timer firing does
             self.app._retry_host()
+            self.assertNotIn(first, self.app.tk.call("after", "info"))
             self.assertEqual(spawned, [(None, self.app._boot_host, False, True)])
             self.assertIsNone(self.app.host_timer, "the probe itself re-arms, on failure")
 
@@ -2408,9 +2408,10 @@ class TestGui(unittest.TestCase):
             self.assertIsNotNone(self.app.host_timer, "...and the next is scheduled")
 
             spawned.clear()
-            self.app.host_timer = None
+            second = self.app.host_timer
             self.app.host_booting = True  # Connect is already probing
             self.app._retry_host()
+            self.assertNotIn(second, self.app.tk.call("after", "info"))
             self.assertEqual(spawned, [])
             self.app.host_booting = False
             self.app.llm = eng.LLM(self.app.host, "m1")

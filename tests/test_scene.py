@@ -2,6 +2,7 @@
 a PNG, scene files, the words sent with the frame, and the window driven in
 process through the Image Studio against a fake ComfyUI. No network, no GPU."""
 
+import copy
 import json
 import math
 import os
@@ -124,6 +125,26 @@ class TestLookAt(unittest.TestCase):
 
 
 class TestBodyAndClothes(unittest.TestCase):
+    def test_chest_size_changes_only_the_chest_for_both_subjects(self):
+        for subject in ("a man", "a woman"):
+            meshes = []
+            for step in (-3, 0, 3):
+                person = self.person(subject=subject, chest_size=step)
+                restored = sc.clean_object(person)
+                self.assertEqual(restored["look"].get("chest_size", 0), step)
+                meshes.append(sc.person_pieces({}, shape=sc.body_shape(restored["look"])))
+            changed = []
+            for small, normal, large in zip(*meshes):
+                if small != large:
+                    changed.append(normal)
+                    widths = [max(p[0] for f in item[1] for p in f) -
+                              min(p[0] for f in item[1] for p in f)
+                              for item in (small, normal, large)]
+                    self.assertLess(widths[0], widths[1])
+                    self.assertLess(widths[1], widths[2])
+            self.assertEqual(len(changed), 1)
+        self.assertEqual(sc.body_shape({}), sc.REST_SHAPE)
+
     def person(self, **look):
         o = sc.new_object("person")
         o["look"] = look
@@ -1563,6 +1584,43 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual(sb.scene["details"], "A loading dock at dawn")
         self.assertIs(ui.build_scene(), sb)                   # raised, not a second one
 
+    def test_file_actions_and_generation_have_separate_space(self):
+        ui, sb = self.builder()
+        menu = sb._file_menu()
+        self.addCleanup(menu.destroy)
+        labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)
+                  if menu.type(i) != "separator"]
+        self.assertEqual(labels, ["New scene", "Open scene…", "Recover scene…", "Save scene",
+                                  "Save scene as…"])
+        for control in (sb.file_pill, sb.picture_pill, sb.go,
+                        sb.history_pill, sb.undo_pill, sb.redo_pill,
+                        *sb.tool_pills.values()):
+            self.assertTrue(control.winfo_ismapped())
+            self.assertGreaterEqual(control.winfo_width(), control.winfo_reqwidth())
+        self.assertLess(sb.file_pill.winfo_rooty(), sb.canvas.winfo_rooty())
+        self.assertGreater(sb.go.winfo_rooty(), sb.canvas.winfo_rooty())
+
+    def test_person_controls_follow_the_selected_task(self):
+        ui, sb = self.builder()
+        person = sb.add("person")
+        before = copy.deepcopy(person)
+        self.assertIn("x", sb.vars)
+        self.assertNotIn("arm_r_raise", sb.vars)
+        sb._inspector_tab("Look")
+        self.assertEqual(sb.vars, {})
+        self.assertTrue(sb.look_vars)
+        sb.select(person["id"], "hand_r")
+        self.assertEqual(sb.inspector_section, "Pose")
+        self.assertIn("arm_r_raise", sb.vars)
+        self.assertNotIn("x", sb.vars)
+        sb._inspector_tab("Look")
+        sb.select(person["id"], "hand_r")
+        self.assertEqual(sb.inspector_section, "Pose")
+        sb.select(person["id"], "body")
+        self.assertEqual(sb.inspector_section, "Object")
+        self.assertIn("x", sb.vars)
+        self.assertEqual(person, before)
+
     def test_the_builder_goes_with_its_form(self):
         """It writes into the Image Studio's form, so closing the tab closes
         it - on the UI thread, since Session.close runs on a worker."""
@@ -1787,6 +1845,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         want = str(sb.vars["arm_r_raise"][0])
         scale = next(w for row in sb.panel.winfo_children() for w in row.winfo_children()
                      if isinstance(w, tk.Scale) and str(w.cget("variable")) == want)
+        self.app.update()                                     # map the rebuilt inspector before dragging
         scale.set(40)                                          # as a drag of the slider
         self.app.update()
         self.assertEqual(person["pose"]["controls"]["arm_r_raise"], 40)

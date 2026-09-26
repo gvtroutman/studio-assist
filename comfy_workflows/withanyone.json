@@ -1,0 +1,31 @@
+{
+  "id": "withanyone",
+  "label": "Family photo (WithAnyone)",
+  "about": "Generate one to four people from individual face photos. Scene Builder supplies face positions; poses, clothes and surroundings come from the words. No face redraw or photo paste follows this recipe.",
+  "families": ["flux1"],
+  "multi_identity": {"sampler": "40", "max_people": 4},
+  "defaults": {
+    "steps": 25, "guidance": 4.0, "siglip_weight": 0.8,
+    "width": 1024, "height": 1024, "encoder_device": "cpu",
+    "filename_prefix": "ImageStudio/withanyone"
+  },
+  "files": {
+    "model": "diffusion_models", "identity_model": "diffusion_models",
+    "siglip": "diffusers", "clip_l": "text_encoders", "t5": "text_encoders", "vae": "vae"
+  },
+  "references": {"face": "face1"},
+  "stages": {"loading": ["2", "10", "face1", "face2", "face3", "face4"], "sampling": ["40"], "decoding": ["3", "41", "9"]},
+  "graph": {
+    "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "{{clip_l}}", "clip_name2": "{{t5}}", "type": "flux", "device": "cpu"}},
+    "10": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["2", 0]}},
+    "face1": {"class_type": "LoadImage", "inputs": {"image": "{{face1}}"}},
+    "40": {"class_type": "StudioWithAnyone", "inputs": {
+      "conditioning": ["10", 0], "model": "{{model}}", "identity_model": "{{identity_model}}", "siglip": "{{siglip}}",
+      "face1": ["face1", 0], "boxes": "{{identity_boxes}}", "width": "{{width}}", "height": "{{height}}",
+      "steps": "{{steps}}", "guidance": "{{guidance}}", "siglip_weight": "{{siglip_weight}}", "seed": "{{seed}}"
+    }},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+    "41": {"class_type": "VAEDecodeTiled", "inputs": {"samples": ["40", 0], "vae": ["3", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8}},
+    "9": {"class_type": "SaveImage", "inputs": {"images": ["41", 0], "filename_prefix": "{{filename_prefix}}"}}
+  }
+}
