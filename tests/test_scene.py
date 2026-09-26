@@ -1196,6 +1196,136 @@ class TestPoseFromPhoto(unittest.TestCase):
         self.assertEqual(sc.photo_people({"people": []}), [])
 
 
+def picture_of(people, distance=5.0, eye_y=1.6, lens=35.0, size=(1344, 768)):
+    """A pose finder's answer for a photo of `people` [(x, z, preset, yaw)]
+    stood in a scene, taken by a level camera at `distance` from the origin."""
+    w, h = size
+    cam = sc.Camera({"target": [0, eye_y, 0], "yaw": 0, "pitch": 0, "distance": distance,
+                     "lens": lens}, w, h)
+    folk = []
+    for x, z, preset, yaw in people:
+        c = sc.pose_controls(preset)
+        pelvis = (x, sc.pelvis_height(c, yaw), z)
+        pts = [[0.0, 0.0, 0.0] for _ in range(133)]
+        for i, p in sc.pose_points(c, yaw).items():
+            sx, sy, _ = cam.project(sc.add(pelvis, p))
+            pts[i] = [sx, sy, 0.9]
+        xs, ys = [p[0] for p in pts[:17]], [p[1] for p in pts[:17]]
+        folk.append({"box": [min(xs), min(ys) - 20, max(xs), max(ys)], "score": 0.9,
+                     "points": pts})
+    return {"width": w, "height": h, "people": folk}
+
+
+class TestSceneFromPicture(unittest.TestCase):
+    TRUTH = [(-1.0, 0.0, "standing", 0), (1.2, -2.0, "walking", 40),
+             (0.2, 1.0, "pointing", -30)]
+
+    def test_everyone_stands_where_they_were_turned_as_they_were(self):
+        scene, notes = sc.picture_scene(picture_of(self.TRUTH))
+        self.assertEqual(notes, [])
+        self.assertEqual(scene["frame"], "landscape")
+        cam = scene["camera"]
+        self.assertAlmostEqual(cam["target"][1], 1.6, delta=0.1)     # the eye's height
+        self.assertEqual(cam["pitch"], 0.0)
+        eye = sc.Camera(cam, *sc.frame_size(scene)).eye
+        got = sorted((o["position"][0], o["position"][2] - eye[2], o) for o in
+                     scene["objects"])
+        for (x, z, preset, yaw), (gx, gz, o) in zip(sorted(self.TRUTH), got):
+            with self.subTest(preset=preset):
+                self.assertAlmostEqual(gx, x, delta=0.15)
+                self.assertAlmostEqual(gz, z - 5.0, delta=0.25)      # from the eye
+                toward = math.degrees(math.atan2(eye[0] - gx, eye[2] - o["position"][2]))
+                turned = (o["rotation"][0] - toward + 180) % 360 - 180
+                self.assertLess(abs(turned - yaw), 15)
+                self.assertEqual(o["position"][1], 0.0)
+        self.assertEqual(sc.clean_scene(scene)[1], [])               # a scene that saves
+
+    def boxed(self, n, data):
+        """Where found person `n` (1 is the most prominent) is, as a reply
+        gives it: in the photo's pixels, its height a little off, as the
+        vision model's are."""
+        b = sc.photo_people(data)[n - 1]["box"]
+        return [round(b[0]) + 6, round(b[1]) + 30, round(b[2]) - 4, round(b[3]) - 10]
+
+    def test_the_words_go_to_the_setting_the_floor_and_each_person(self):
+        data = picture_of(self.TRUTH)
+        reply = json.dumps({"setting": "A beer tent at night", "floor": "wooden boards",
+                            "people": [
+            {"box": self.boxed(2, data), "name": "Walker", "doing": "carrying two steins",
+             "top": "white linen shirt", "bottom": "lederhosen", "hair": "", "age": "none",
+             "subject": "man", "mood": "happy"},
+            {"box": self.boxed(1, data), "name": "Walker", "age": "in their 30s..."},
+            {"box": [0, 0, 5, 5], "name": "Nobody"},                  # no one is there
+            "junk", {"name": "Boxless"}]})
+        read = sc.picture_answer("Sure! ```json\n%s\n```" % reply, 1344, 768)
+        self.assertEqual(len(read["people"]), 4)
+        scene, _ = sc.picture_scene(data, read)
+        self.assertEqual(scene["details"], "A beer tent at night")
+        self.assertEqual(scene["room"]["floor"]["prompt"], "wooden boards")
+        walker = next(o for o in scene["objects"] if o["name"] == "Walker")
+        self.assertEqual(walker["description"], "carrying two steins")
+        self.assertEqual(walker["look"], {"top": "white linen shirt", "bottom": "lederhosen",
+                                          "subject": "a man"})   # no "mood" slot, no "none"
+        other = next(o for o in scene["objects"] if o["name"] == "Walker 2")
+        self.assertEqual(other["look"], {"age": "in their 30s"})  # the example's "..." gone
+        self.assertEqual(len(scene["objects"]), 3)
+        self.assertIn("Person 3", [o["name"] for o in scene["objects"]])
+
+    def test_the_vision_models_own_order_does_not_matter(self):
+        """It is matched by where each person is, not by number: a 7B model
+        listed the band first and put its clothes on the audience."""
+        data = picture_of(self.TRUTH)
+        said = [{"box": [x / 1344.0 for x in self.boxed(n, data)], "name": "P%d" % n}
+                for n in (3, 1, 2)]
+        for s in said:
+            s["box"] = [s["box"][0], s["box"][1] * 1344 / 768, s["box"][2],
+                        s["box"][3] * 1344 / 768]
+        got = sc.match_people(sc.photo_people(data), said, 1344, 768)
+        self.assertEqual({n: s["name"] for n, s in got.items()},
+                         {1: "P1", 2: "P2", 3: "P3"})
+
+    def test_a_box_in_percentages_is_read_as_such(self):
+        read = sc.picture_answer('{"people": [{"box": [10, 20, 30, 40], "name": "A"}]}',
+                                 2000, 1000)
+        self.assertEqual(read["people"][0]["box"], [0.1, 0.2, 0.3, 0.4])
+        read = sc.picture_answer('{"people": [{"bbox_2d": [200, 100, 600, 1000]}]}',
+                                 2000, 1000)
+        self.assertEqual(read["people"][0]["box"], [0.1, 0.1, 0.3, 1.0])
+
+    def test_a_reply_that_is_not_json_leaves_the_words_empty(self):
+        for text in ("I can't see the people.", "{broken", "", None, "[1, 2]"):
+            self.assertEqual(sc.picture_answer(text),
+                             {"setting": "", "floor": "", "people": []})
+
+    def test_the_question_gives_the_photos_size_and_how_many(self):
+        q = sc.picture_question([{"box": [0, 0, 50, 100]}, {"box": [100, 50, 200, 200]}],
+                                200, 150)
+        self.assertIn("200 x 150 pixels", q)
+        self.assertIn("It shows 2 people", q)
+
+    def test_the_frame_is_the_photos_shape(self):
+        self.assertEqual(sc.picture_frame(1100, 1000), "square")
+        self.assertEqual(sc.picture_frame(4000, 3000), "landscape")     # 4:3 is nearer 7:4
+        self.assertEqual(sc.picture_frame(3000, 4000), "portrait")
+        self.assertEqual(sc.picture_frame(1920, 1080), "landscape")
+
+    def test_no_one_to_pose_is_refused_in_words(self):
+        with self.assertRaisesRegex(ValueError, "found no one"):
+            sc.picture_scene({"width": 100, "height": 100, "people": []})
+        few = picture_of(self.TRUTH[:1])
+        for i in range(3, 17):
+            few["people"][0]["points"][i] = [0, 0, 0]
+        with self.assertRaisesRegex(ValueError, "enough of themselves"):
+            sc.picture_scene(few)
+
+    def test_past_the_limit_the_smaller_people_are_left_out_and_said(self):
+        crowd = [(-4 + i * 0.8, -1.0 - (i % 3), "standing", 0)
+                 for i in range(sc.PICTURE_PEOPLE + 2)]
+        scene, notes = sc.picture_scene(picture_of(crowd, distance=9.0))
+        self.assertEqual(len(scene["objects"]), sc.PICTURE_PEOPLE)
+        self.assertIn("2 smaller people were left out", notes[0])
+
+
 class PoseClient(FakeClient):
     """A ComfyUI with the pose finder, answering with one person."""
     answer = None
@@ -1361,6 +1491,51 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb.pose_from_photo(person["id"], path="C:/photos/empty.jpg")
         self.pump(lambda: person["id"] not in sb.posing, 10)
         self.assertIn("found no one in empty.jpg", sb.msg.cget("text"))
+
+    def test_a_picture_makes_a_new_scene_with_its_people_and_words(self):
+        ui, sb = self.builder()
+        sb.add("crate" if "crate" in sc.ASSET else "box")
+        sb.dirty = False                                      # nothing to ask about
+        answer = picture_of(TestSceneFromPicture.TRUTH)
+        real = ui.studio.find_poses
+        ui.studio.find_poses = lambda path, stop=None: (answer, {"name": "5090"})
+        self.addCleanup(setattr, ui.studio, "find_poses", real)
+
+        class Eyes:
+            asked = []
+
+            def ask(self, path, question, max_tokens=400):
+                Eyes.asked.append((path, question))
+                box = sc.photo_people(answer)[0]["box"]
+                return json.dumps({"setting": "An alpine meadow",
+                                   "people": [{"box": box, "name": "Hiker"}]})
+        self.app.vision, was = Eyes(), getattr(self.app, "vision", None)
+        self.addCleanup(setattr, self.app, "vision", was)
+        self.assertTrue(sb.from_picture("C:/photos/meadow.jpg"))
+        self.assertFalse(sb.from_picture("C:/photos/again.jpg"))   # one at a time
+        self.pump(lambda: not sb.picturing, 60)
+        self.assertEqual(sb.scene["details"], "An alpine meadow")
+        self.assertEqual(len(sb.scene["objects"]), 3)             # the crate is gone
+        self.assertIn("Hiker", [o["name"] for o in sb.scene["objects"]])
+        self.assertIn("It shows 3 people", Eyes.asked[0][1])
+        self.assertIsNone(sb.path)
+        self.assertTrue(sb.dirty)
+        self.assertIn("Made a scene from meadow.jpg: 3 people", sb.msg.cget("text"))
+        self.assertEqual(sb.history.labels()[-1], "From meadow.jpg")
+
+        self.app.vision = None                                  # no eyes: still a scene
+        sb.dirty = False
+        sb.from_picture("C:/photos/meadow.jpg")
+        self.pump(lambda: not sb.picturing, 60)
+        self.assertEqual(sb.scene["details"], "")
+        self.assertIn("no vision model is connected", sb.msg.cget("text"))
+
+        before = sb.scene
+        ui.studio.find_poses = lambda path, stop=None: ({"people": []}, {"name": "5090"})
+        sb.from_picture("C:/photos/empty.jpg")
+        self.pump(lambda: not sb.picturing, 10)
+        self.assertIn("Could not make a scene from empty.jpg", sb.msg.cget("text"))
+        self.assertIs(sb.scene, before)                           # the scene is kept
 
     def test_undo_and_redo_put_the_scene_back(self):
         ui, sb = self.builder()
