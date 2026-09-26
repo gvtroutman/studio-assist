@@ -483,7 +483,10 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   another family or workflow, or `null` for "not installed there". A LoRA has `file`
   and `files` per backend. Compatibility is decided on the family *resolved for the
   backend the job lands on*: an incompatible LoRA is left out with a warning, and a
-  LoRA of unknown family is applied with one. Nothing is dropped silently.
+  LoRA of unknown family is applied with one. Nothing is dropped silently — except an
+  **"Always on"** LoRA (`always` in the library): it joins every picture whose model it
+  suits, at its library strength, and is skipped quietly for other families, because
+  "suits" is the rule the user set. One added by hand keeps the form's strength.
 - **Identity and style are separate records.** An identity is a LoRA, a trigger, a
   strength and reference photos (copied under `image-studio/references/`). A style
   is a LoRA and/or prompt additions plus look defaults. The precedence is model
