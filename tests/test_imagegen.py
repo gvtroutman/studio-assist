@@ -876,6 +876,59 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             {"id": "p2", "name": "Gavin", "at": [0.9, 0.9], "words": "A man.", "face": "",
              "from": ""}]}
 
+    def test_a_head_shape_goes_into_its_face_redraw_as_far_as_the_turn_agrees(self):
+        import studio_scene as sc
+        s = sc.new_scene("")
+        p = sc.new_object("person")
+        p["head"] = {"jaw_width": 0.9}
+        s["objects"].append(p)
+        s["frame"] = "square"
+        s["camera"].update(target=[0.0, 1.3, 0.0], distance=2.6, lens=50.0)
+        faces = self.scene_faces("")
+        faces["head_depth"] = 0.4
+        faces["people"][0].update(id=p["id"], head=p["head"], facing=0.5)
+
+        def run(drawn_nose, pose_node=True):
+            class HeadClient(FaceClient):
+                def node_types(self):
+                    return set(FaceClient.NODES) | ({ig.POSE_NODE} if pose_node else set())
+
+                def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                    graph = self.graphs[int(pid[3:]) - 1]
+                    if graph.get("2", {}).get("class_type") == ig.POSE_NODE:
+                        if not pose_node:
+                            raise ig.ComfyError("no such node")
+                        pts = [[0, 0, 0.0]] * 133
+                        pts[23], pts[39] = [410, 350, 0.9], [480, 350, 0.9]
+                        pts[53] = [410 + 70 * drawn_nose, 360, 0.9]
+                        return {"outputs": {"2": {"text": [json.dumps(
+                            {"people": [{"box": [380, 280, 520, 700], "points": pts}]})]}}}
+                    return super().listen_for_progress(pid, on_event, stop, timeout)
+            self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                    client_factory=HeadClient)
+            jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                           backend="5090", seed=5, face_detail=True,
+                                           scene_layout=s, scene_faces=faces))
+            settle(jobs)
+            self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+            return HeadClient.instances[-1].graphs[-1], self.studio.history.list()[0]
+
+        second, rec = run(0.52)                            # drawn as the mannequin turns
+        self.assertEqual(second["fc1_dc"]["inputs"]["strength"], 0.4)
+        self.assertTrue(second["fc1_d"]["inputs"]["image"].startswith("studio_head_"))
+        self.assertEqual(rec["face_detail"]["head_depth"], {"Lilya": 0.4})
+        second, rec = run(0.85)                            # about 29 degrees off: half
+        self.assertEqual(second["fc1_dc"]["inputs"]["strength"], 0.2)
+        self.assertTrue(any("half strength" in n for n in rec["notes"]), rec["notes"])
+        second, rec = run(1.0)                             # turned the other way: none
+        self.assertNotIn("fc1_dc", second)
+        self.assertTrue(any("was not used" in n for n in rec["notes"]), rec["notes"])
+        second, rec = run(0.5, pose_node=False)            # the turn unread: half
+        self.assertEqual(second["fc1_dc"]["inputs"]["strength"], 0.2)
+        faces["head_depth"] = 0.0                          # turned off in the scene
+        second, rec = run(0.5)
+        self.assertNotIn("fc1_dc", second)
+
     def test_a_scene_face_is_redrawn_as_its_person_and_to_their_face_picture(self):
         self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
                                 client_factory=PulidClient)
