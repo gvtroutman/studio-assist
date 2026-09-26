@@ -792,6 +792,19 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   inspector's Clothes and Accessories tabs only: on every tab they pushed the pose
   sliders below the scrolled panel's visible area, and a Tk Scale that is not mapped
   never runs its command.
+- **Undo is whole-scene snapshots.** `History` keeps up to 200 steps of the scene as
+  JSON text, and `change_label` names each from what differs from the step before
+  ("Move Crate", "Pose Ada", "Move the camera"), so no edit has to say what it is -
+  a new control gets undo for free as long as it goes through `changed()` (or
+  `remember_soon()` for the name and description boxes, which only retitle). A step is
+  recorded once edits stop for 600 ms, so a slider dragged or a sentence typed is one
+  step; a viewport drag records on release, never mid-drag. Undo and redo record a
+  pending edit first. Camera moves are steps: the frame is the output. A restore puts
+  the snapshot into the *same* scene dict, because a pose still being found from a
+  photo checks `self.scene is scene` before landing. `dirty` after undo is compared
+  with the snapshot taken at Save, so undoing back to it clears the asterisk. Ctrl+Z
+  is bound on the window but passed through in a Text or Entry, which undo their own
+  typing. New and Open start a new history.
 - **The rig is forward kinematics over named controls.** `JOINTS` is the skeleton,
   `CONTROLS` the handful of sliders grouped by part (body, head, each hand and foot),
   `POSES` presets of them. A click on the mannequin selects the part under it (each
