@@ -68,6 +68,8 @@ this PC's files and the web instead. Two moving parts:
   posable mannequin and simple props on a floor (and walls, each wearing a picture
   made from words), one camera, and the frame it sees,
   rendered to the PNG the Image Studio makes the picture from. See *The Scene Builder*.
+  **`comfy_nodes/studio_dwpose`** is its one ComfyUI node (a photo's pose points), kept
+  here and copied into a backend's `custom_nodes`; it is not stdlib-only, it runs there.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -745,6 +747,27 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   face carries its object and part as canvas tags), and the inspector shows that
   part's sliders. Moving any slider by hand clears the preset name, so the words stop
   claiming "kneeling" for a pose that no longer is.
+- **A photo's pose is fitted, not copied.** **From a photo…** in the Pose section sends
+  the photo to the first enabled backend with `StudioDWPoseKeypoints`
+  (`Studio.find_poses`: LoadImage and that node, not a job, nothing in History), which
+  answers DWPose's 133 COCO-WholeBody points per person as JSON text. The node is ours,
+  in `comfy_nodes/studio_dwpose` (copy it into ComfyUI's `custom_nodes`, restart), because
+  it needs only what ComfyUI's venv already has - onnxruntime, OpenCV, numpy - and
+  `yolox_l.onnx` + `dw-ll_ucoco_384.onnx` from huggingface.co/yzd-v/DWPose in a `dwpose`
+  model folder (`D:\ComfyUI-models\dwpose` on the 5090, named in its
+  extra_model_paths.yaml). It runs on the CPU on purpose, about a second a photo: the
+  5090's onnxruntime-gpu 1.30 wants CUDA 13 DLLs its cu128 torch does not ship, and the
+  GPU stays the picture's. `fit_pose` (stdlib) then searches the controls and the yaw
+  for the mannequin whose joints, seen front on with no perspective and scaled to fit,
+  fall on the photo's points: every facing coarsely on the head, shoulders and hips
+  alone (a limb still at rest pulls the torso to make up for it), then each limb from a
+  spread of starts, then all of it. A flat photo cannot say whether a limb reaches
+  towards the camera or away, so the cost leans on the rest pose (`PRIOR`) and against
+  arms swung back and the body leaning back (`BACKWARDS`); without that, an arm straight
+  up came back as the body leaning back. The most prominent person is used (biggest box
+  times score); the person is turned to face the scene's camera plus the photo's yaw;
+  a part the photo does not show is left at rest and said so; the preset becomes Custom.
+  Hands and feet are not fitted: the rig has no finger or ankle controls.
 - **A move is on a level plane through the object's middle**, not the floor. A ray
   through a person's chest meets the floor far behind them nearly edge on, and a 60 px
   drag moved one 14 m; when even the middle's plane is edge on, the drag falls back to
