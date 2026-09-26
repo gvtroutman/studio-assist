@@ -101,6 +101,8 @@ FACE_LIKENESS = 0.6            # how far a face given a picture is redrawn at th
 REAL_FACES = True              # then their own face pasted over it, where a photo's angle fits
 FACE_LIKENESS_RANGE = (0.3, 0.95)
 DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet scales it
+DEPTH_RELIEF = 3.0             # each body's own depth stretched this much in the depth map
+DEPTH_CLIP = (0.02, 0.995)     # the depth map's grey spans these shares of what is seen
 
 COLOURS = [                    # (hex, name) offered for any object
     ("#c9b8a6", "mannequin"), ("#e8c07a", "yellow"), ("#d9774b", "orange"),
@@ -2920,27 +2922,46 @@ def _fill_depth(zb, width, height, pts):
             q += b
 
 
-def depth_values(scene, width, height):
+def depth_values(scene, width, height, relief=1.0):
     """1/z (1/m) of the nearest surface at each pixel, row by row, 0 where
     the camera sees only sky: the floor, the walls that face into the room,
-    and every object, as `render` draws them but without the shadows."""
+    and every object, as `render` draws them but without the shadows.
+
+    `relief` stretches each body's depth about its own middle (a person, a
+    crowd member, a prop), where it is on screen unchanged: a body 0.3 m
+    thick at 5 m is a flat cut-out in true 1/z, where Depth Anything - what
+    the ControlNet learnt from - gives it rounded relief."""
     cam = Camera(scene["camera"], width, height)
     room = scene.get("room") or new_room()
-    faces = []
+    groups = [[]]
     if cam.eye[1] > 0:
         r = FLOOR_REACH
-        faces.append([(-r, 0, -r), (r, 0, -r), (r, 0, r), (-r, 0, r)])
+        groups[0].append([(-r, 0, -r), (r, 0, -r), (r, 0, r), (-r, 0, r)])
     if room["walls"]:
-        faces += [quad for quad, origin, _ in walls(room)
-                  if dot(newell(quad), sub(origin, cam.eye)) < 0]
+        groups[0] += [quad for quad, origin, _ in walls(room)
+                      if dot(newell(quad), sub(origin, cam.eye)) < 0]
     for obj in scene["objects"]:
-        for _, fs, _ in painted_pieces(obj):
-            faces += [f for f in fs if dot(newell(f), sub(centroid(f), cam.eye)) < 0]
+        bodies = {}
+        for part, fs, _ in painted_pieces(obj):
+            key = part if obj["asset"] == "crowd" else None
+            bodies.setdefault(key, []).extend(
+                f for f in fs if dot(newell(f), sub(centroid(f), cam.eye)) < 0)
+        groups += bodies.values()
     zb = [0.0] * (width * height)
-    for f in faces:
-        c = clip_near([cam.to_camera(p) for p in f])
-        if len(c) >= 3:
-            _fill_depth(zb, width, height, [cam.to_screen(p) + (1.0 / p[2],) for p in c])
+    for n, faces in enumerate(groups):
+        cams = [clip_near([cam.to_camera(p) for p in f]) for f in faces]
+        cams = [c for c in cams if len(c) >= 3]
+        if not cams:
+            continue
+        mid = None
+        if n and relief != 1.0:
+            zs = [p[2] for c in cams for p in c]
+            mid = (min(zs) + max(zs)) / 2
+        for c in cams:
+            _fill_depth(zb, width, height,
+                        [cam.to_screen(p) + (1.0 / (p[2] if mid is None else
+                                                    max(NEAR, mid + relief * (p[2] - mid))),)
+                         for p in c])
     return zb
 
 
@@ -2952,11 +2973,16 @@ def depth_png(scene, edge=DEPTH_EDGE):
     w, h = frame_size(scene)
     k = edge / float(max(w, h))
     dw, dh = max(64, int(round(w * k))), max(64, int(round(h * k)))
-    zb = depth_values(scene, dw, dh)
-    seen = [q for q in zb if q > 0]
-    lo, hi = (min(seen), max(seen)) if seen else (0.0, 1.0)
+    zb = depth_values(scene, dw, dh, DEPTH_RELIEF)
+    seen = sorted(q for q in zb if q > 0)
+    if seen:
+        lo = seen[int(DEPTH_CLIP[0] * (len(seen) - 1))]
+        hi = seen[int(DEPTH_CLIP[1] * (len(seen) - 1))]
+    else:
+        lo, hi = 0.0, 1.0
     span = (hi - lo) or 1.0
-    grey = bytes(0 if q <= 0 else int(round(255 * (q - lo) / span)) for q in zb)
+    grey = bytes(0 if q <= 0 else max(1, min(255, int(round(255 * (q - lo) / span))))
+                 for q in zb)
     rgb = bytearray(dw * dh * 3)
     for i in range(3):
         rgb[i::3] = grey
