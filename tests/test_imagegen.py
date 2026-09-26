@@ -451,6 +451,34 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(model="flux-dev", scene="x", loras=[{"id": "sx70", "strength": 0.3}])
         self.assertEqual(p.loras, [("sx70.safetensors", 0.3)])
 
+    def test_a_saved_lora_mix_is_a_preset_on_its_built_in(self):
+        lib = self.studio.lib
+        lib.save("presets", [
+            {"name": "Film look", "base": "hq_final",
+             "loras": [{"id": "sx70", "strength": 0.4}, {"id": "sx70", "strength": 1},
+                       {"id": "gone", "strength": 5}]},
+            {"name": "Standard", "base": "nonsense"}])
+        film, std = lib.all("presets")
+        self.assertEqual(film["id"], "film-look")
+        self.assertEqual(film["loras"], [{"id": "sx70", "strength": 0.4},
+                                         {"id": "gone", "strength": 2.0}])
+        self.assertEqual((std["id"], std["base"]), ("mix-standard", "standard"))
+        info = ig.preset_info(lib, "film-look")
+        self.assertTrue(info["custom"])
+        self.assertEqual((info["label"], info["role"]), ("Film look", "hires"))
+        self.assertIn("SX-70 0.4", info["about"])
+        self.assertIn("gone (missing)", info["about"])
+        self.assertFalse(ig.preset_info(lib, "hq_final")["custom"])
+        self.assertEqual(ig.preset_info(lib, "no-such")["label"], "Standard")
+        # The mix brings its built-in's values; its LoRAs come from the rows.
+        p = self.plan(model="flux-dev", scene="x", preset="film-look",
+                      loras=[{"id": "sx70", "strength": 0.4}])
+        self.assertTrue(p.values["refine"])
+        self.assertEqual(p.loras, [("sx70.safetensors", 0.4)])
+        lib.save("presets", [{"name": "Me", "base": "identity"}])
+        p = self.plan(model="flux-dev", scene="x", preset="me")
+        self.assertTrue(any("needs a person" in e for e in p.errors), p.errors)
+
     def test_z_image_is_the_default_model(self):
         self.assertEqual(ig.default_settings()["model"], "z-image-turbo")
 
@@ -2212,6 +2240,51 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("left out", ui.warn.cget("text"))
         ui._drop_lora(ui.loras[0])
         self.assertNotIn("left out", ui.warn.cget("text"))
+
+    def test_loras_saved_as_a_preset_come_back_when_it_is_picked(self):
+        s, ui = self.tab()
+        lib = ui.studio.lib
+        lib.save("loras", [{"id": "a", "file": "a.safetensors", "name": "A"},
+                           {"id": "b", "file": "b.safetensors", "name": "B"},
+                           {"id": "c", "file": "c.safetensors", "name": "C"}])
+        lib.save("presets", [])
+        self.addCleanup(lambda: (lib.save("presets", []), ui._set_preset("standard")))
+        ui._set_preset("identity")
+        for r in list(ui.loras):
+            ui._drop_lora(r)
+        ui._add_lora("a", 0.5)
+        ui._add_lora("b", 0.35)
+        top = ui.save_preset()
+        top.var.set("Real skin")
+        top.ok()
+        (mix,) = lib.all("presets")
+        self.assertEqual(mix["base"], "identity")
+        self.assertEqual(mix["loras"], [{"id": "a", "strength": 0.5},
+                                        {"id": "b", "strength": 0.35}])
+        self.assertEqual(ui.collect()["preset"], "real-skin")
+        # A built-in takes the mix's rows away; a row added by hand stays.
+        ui._add_lora("c", 1.0)
+        ui._set_preset("standard")
+        self.assertEqual([r["id"] for r in ui.loras], ["c"])
+        ui._set_preset("real-skin")
+        self.assertEqual([(r["id"], r["var"].get()) for r in ui.loras],
+                         [("c", 1.0), ("a", 0.5), ("b", 0.35)])
+        self.assertIn("A 0.5", ui.preset_about.cget("text"))
+        self.assertTrue(ui.adv_open)
+        # Saving under the same name replaces it; Delete keeps the rows.
+        ui._drop_lora(ui.loras[0])
+        top = ui.save_preset()
+        self.assertEqual(top.var.get(), "Real skin")
+        top.var.set("real SKIN")
+        top.ok()
+        self.assertEqual(len(lib.all("presets")), 1)
+        ui.delete_preset()
+        self.assertEqual(lib.all("presets"), [])
+        self.assertEqual(ui.collect()["preset"], "identity")
+        self.assertEqual([r["id"] for r in ui.loras], ["a", "b"])
+        for r in list(ui.loras):
+            ui._drop_lora(r)
+        self.assertIsNone(ui.save_preset())              # nothing to save
 
     def test_the_camera_is_aimed_by_dragging_and_comes_back_with_reuse(self):
         s, ui = self.tab()
