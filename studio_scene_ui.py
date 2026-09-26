@@ -22,7 +22,9 @@ The mouse, in the viewport:
   lifts it), Rotate turns it, Scale sizes it;
 - left on empty floor or sky: orbit the camera;
 - right (or middle): pan the camera; the wheel: in and out.
-Keys, with the viewport focused: M, R, S for the tools, Delete.
+Keys, with the viewport focused: M, R, S for the tools, Delete. Anywhere in
+the window but a text box: Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo; the
+History menu over the viewport jumps to any step (`studio_scene.History`).
 
 **Floor and walls**, the second row of the list, dresses the room: a few words
 for the floor or the walls, and Make sends them to the Image Studio as a text
@@ -150,6 +152,14 @@ class SceneBuilder:
             pill.pack(side="left", padx=(0, o.px(4)))
             self.tool_pills[key] = pill
         o.button(bar, "Reset camera", self.reset_camera, kind="ghost").pack(side="right")
+        small = dict(kind="quiet", font=host.f_small, padx=o.px(10))
+        self.history_pill = o.button(bar, "History ▾", lambda: None, **small)
+        self.history_pill.command = self._history_menu
+        self.history_pill.pack(side="right", padx=(0, o.px(10)))
+        self.redo_pill = o.button(bar, "Redo", self.redo, **small)
+        self.redo_pill.pack(side="right", padx=(0, o.px(3)))
+        self.undo_pill = o.button(bar, "Undo", self.undo, **small)
+        self.undo_pill.pack(side="right", padx=(0, o.px(3)))
         o.label(mid, "Drag an object to move, rotate or size it · drag empty space to "
                 "orbit · right-drag to pan · wheel to zoom", "faint", host.f_small).pack(
             side="bottom", fill="x", pady=(o.px(4), 0))
@@ -170,7 +180,15 @@ class SceneBuilder:
         c.bind("<Button-5>", lambda ev: self._zoom(1))
         c.bind("<Key>", self._key)
         host._repaint_on_theme(c, self.draw)
+        # On the window, so they work wherever the focus is - except in a
+        # text box, which undoes its own typing (`_undo_key`).
+        for seq, fn in (("<Control-z>", self.undo), ("<Control-Z>", self.redo),
+                        ("<Control-y>", self.redo), ("<Control-Y>", self.redo)):
+            win.bind(seq, lambda ev, fn=fn: self._undo_key(ev, fn))
 
+        self.history = sc.History(self.scene)
+        self.remember_after = None
+        self._undo_buttons()
         self._models()
         self._list()
         self._inspect()
@@ -190,12 +208,126 @@ class SceneBuilder:
         return next((x for x in self.scene["objects"] if x["id"] == oid), None)
 
     def changed(self, rebuild_list=False):
-        """The scene changed: redraw, and say what the words will be."""
+        """The scene changed: redraw, say what the words will be, and make
+        it an undo step once the edit settles."""
         self.dirty = True
         if rebuild_list:
             self._list()
         self.draw()
         self._words()
+        self.remember_soon()
+
+    # ============================================================== history
+    # Every edit reaches `changed()` (or `remember_soon()` for the few that
+    # only retitle), and a step is recorded once edits stop for REMEMBER ms:
+    # a slider dragged or a word typed is one step, not one per tick. A
+    # viewport drag records on release. Undo and redo record anything still
+    # pending first, so the last edit is never the one skipped.
+    REMEMBER = 600
+
+    def remember_soon(self):
+        if self.remember_after is not None:
+            self.win.after_cancel(self.remember_after)
+        self.remember_after = self.win.after(self.REMEMBER, self.remember)
+
+    def remember(self):
+        """Record the scene as it is now as an undo step, if it changed."""
+        if self.remember_after is not None:
+            try:
+                self.win.after_cancel(self.remember_after)
+            except tk.TclError:
+                pass
+            self.remember_after = None
+        if self.drag:                 # mid-drag: the release records it
+            return None
+        label = self.history.record(self.scene, self.sel)
+        if label:
+            self._undo_buttons()
+        return label
+
+    def undo(self):
+        return self._step(-1)
+
+    def redo(self):
+        return self._step(1)
+
+    def _step(self, way):
+        if self.drag:
+            return False
+        self.remember()
+        h = self.history
+        if way < 0:
+            undone = h.steps[h.at][0]
+            return self._restore(h.undo(), "Undid", undone)
+        return self._restore(h.redo(), "Redid")
+
+    def go_to(self, i):
+        """Put the scene back (or forward) to history step `i`."""
+        if self.drag:
+            return False
+        self.remember()
+        return self._restore(self.history.go(i), "Back to")
+
+    def _restore(self, got, verb, what=None):
+        if got is None:
+            if verb != "Back to":
+                self.status("Nothing to %s." % ("undo" if verb == "Undid" else "redo"),
+                            "muted")
+            return False
+        scene, sel = got
+        # In place, so a pose still being found from a photo lands in it
+        # (`pose_from_photo` checks it is the same scene).
+        self.scene.clear()
+        self.scene.update(scene)
+        ids = {x["id"] for x in self.scene["objects"]}
+        self.sel = sel if sel == ROOM or sel in ids else None
+        obj = self.obj()
+        if obj is None or obj["asset"] != "person":
+            self.part = "body"
+        self.dirty = self.history.unsaved(self.scene)
+        self._undo_buttons()
+        self._list()
+        self._inspect()
+        self.draw()
+        h = self.history
+        self.status("%s: %s." % (verb, what or h.steps[h.at][0]), "muted")
+        return True
+
+    def _forget(self, label="New scene"):
+        """A different scene: its history starts again, with nothing unsaved."""
+        if self.remember_after is not None:
+            self.win.after_cancel(self.remember_after)
+            self.remember_after = None
+        self.history.reset(self.scene, label=label)
+        self._undo_buttons()
+
+    def _undo_buttons(self):
+        h = self.history
+        self.undo_pill.set(state="normal" if h.can_undo() else "disabled")
+        self.redo_pill.set(state="normal" if h.can_redo() else "disabled")
+
+    def _undo_key(self, ev, fn):
+        # A text box or a name entry undoes its own typing, as it would anywhere.
+        if isinstance(ev.widget, (tk.Text, tk.Entry)):
+            return None
+        fn()
+        return "break"
+
+    def _history_menu(self):
+        """Every step, newest first: the one the scene is in is marked, the
+        ones after it (still redoable) are faint. Choosing one goes there."""
+        self.remember()
+        o, h, pill = self.owner, self.history, self.history_pill
+        menu = tk.Menu(pill, tearoff=0)
+        o.skin(menu, bg="card", fg="text", activebackground="sel",
+               activeforeground="text")
+        for i in range(len(h.steps) - 1, -1, -1):
+            label = h.steps[i][0]
+            menu.add_command(label=("●  " if i == h.at else "     ") + label,
+                             command=lambda i=i: self.go_to(i))
+            if i > h.at:
+                menu.entryconfig(menu.index("end"), foreground=self.host.C["faint"])
+        menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
 
     def _title(self):
         name = os.path.basename(self.path) if self.path else "untitled"
@@ -453,6 +585,7 @@ class SceneBuilder:
             face["prompt"] = v
             self.dirty = True
             self._words()
+            self.remember_soon()
         self._text(p, face["prompt"], said, height=2)
         row = o.frame(p)
         row.pack(side="top", fill="x", pady=(o.px(4), 0))
@@ -488,6 +621,7 @@ class SceneBuilder:
             self.dirty = True
             self._list()
             self._words()
+            self.remember_soon()
         e.bind("<KeyRelease>", renamed)
 
         o.cap(p, {"person": "What they are doing",
@@ -499,6 +633,7 @@ class SceneBuilder:
             self.dirty = True
             self._title()
             self._words()
+            self.remember_soon()
         self._text(p, obj["description"], described)
         o.label(p, ("Their action, and what matters about them: PPE (hard hat, "
                     "hi-vis, gloves, face shield up or down), what they hold. "
@@ -1204,6 +1339,7 @@ class SceneBuilder:
             self.drag = None
             self.sync()
             self._title()
+            self.remember()
 
     def _pan_start(self, ev):
         self.drag = {"kind": "pan", "x": ev.x, "y": ev.y,
@@ -1257,6 +1393,7 @@ class SceneBuilder:
         self.scene = sc.new_scene()
         self.making = {}
         self.path, self.dirty = None, False
+        self._forget()
         self.select(None)
         self._list()
         self._inspect()
@@ -1281,6 +1418,7 @@ class SceneBuilder:
         self.scene, self.path, self.dirty = scene, path, False
         self.sel = None
         self.making = {}
+        self._forget("Opened %s" % os.path.basename(path))
         self._list()
         self._inspect()
         self.draw()
@@ -1298,6 +1436,7 @@ class SceneBuilder:
             self.status("Could not save: %s" % e, "err")
             return False
         self.path, self.dirty = path, False
+        self.history.mark_saved(self.scene)
         self._title()
         self.status("Saved %s." % os.path.basename(path), "ok")
         return True
@@ -1319,6 +1458,9 @@ class SceneBuilder:
                 self.save()
         elif not final and not self._ask_save():
             return
+        if self.remember_after is not None:
+            self.win.after_cancel(self.remember_after)
+            self.remember_after = None
         self.win.destroy()
         if self.owner.scene_builder is self:
             self.owner.scene_builder = None
