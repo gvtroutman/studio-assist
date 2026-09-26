@@ -453,6 +453,10 @@ class ImageStudio:
         self.scene.bind("<KeyRelease>", lambda ev: self._recheck())
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
 
+        # Person and Camera live in the scene builder now. They are still built,
+        # into a frame that is never packed, so the settings they hold keep
+        # round-tripping through save, reuse and generate.
+        form, f = f, self.frame(f)
         self.cap(f, "Person").pack(**pad)
         crow = self.frame(f)
         crow.pack(side="top", fill="x", **pad)
@@ -508,6 +512,7 @@ class ImageStudio:
         self.label(f, "Lens, light, film:\u201c85mm, shallow depth of field, "
                    "golden hour\u201d.", "faint", self.host.f_small,
                    wraplength=self.px(380)).pack(side="top", fill="x", **pad)
+        f = form
 
         self.cap(f, "Style").pack(**pad)
         self.style_box = self.frame(f)
