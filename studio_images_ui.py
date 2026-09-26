@@ -1435,7 +1435,8 @@ class ImageStudio:
         self.act_vary = self.button(acts, "New seed", lambda: self._again_selected(True),
                                     bg="card")
         self.act_reuse = self.button(acts, "Reuse settings", self._reuse_selected, bg="card")
-        for p in (self.act_again, self.act_vary, self.act_reuse):
+        self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
+        for p in (self.act_again, self.act_vary, self.act_reuse, self.act_fix):
             p.pack(side="left", padx=(0, self.px(6)))
             p.set(state="disabled")
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
@@ -1475,6 +1476,7 @@ class ImageStudio:
         menu = tk.Menu(self.preview, tearoff=0)
         self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
         menu.add_command(label="Open", command=self._open_selected)
+        menu.add_command(label="Fix a spot" + ELLIPSIS, command=self._fix_selected)
         menu.add_command(label="Show in folder", command=lambda: self._open_selected(True))
         menu.add_command(label="Copy path", command=lambda: (
             self.host.clipboard_clear(), self.host.clipboard_append(path)))
@@ -1742,6 +1744,7 @@ class ImageStudio:
         rec = self._selected_record()
         for p in (self.act_again, self.act_vary, self.act_reuse):
             p.set(state="normal" if rec or item[0] == "job" else "disabled")
+        self.act_fix.set(state="normal" if path and os.path.isfile(path) else "disabled")
 
     @staticmethod
     def clip(text, n=180):
@@ -1804,7 +1807,15 @@ class ImageStudio:
         if settings.get("mode") == "dress":
             return self.say("That was a Try On, which the form no longer has; Generate "
                             "Again remakes it.", "warn")
-        self.apply(settings)
+        self.apply(self.studio.fix_base(settings) if settings.get("mode") == "fix"
+                   else settings)
+
+    def _fix_selected(self):
+        """Fix a spot on the picture shown: mark the parts to redraw."""
+        path, s = self.pending_preview, self._selected_settings()
+        if not path or not os.path.isfile(path) or s is None:
+            return self.say("Choose a finished picture to fix.", "warn")
+        FixWindow(self, path, s)
 
     def _open_selected(self, select=False):
         path = self.pending_preview
@@ -2424,6 +2435,205 @@ class RecordEditor:
         self._reload_list(idx if idx is not None and idx < len(self.records) else None)
         self.status("Saved.", "ok")
         self.owner._saved(self.kind)
+
+
+class FixWindow:
+    """Fix a spot: the picture large, and each click on it marks a square to
+    redraw - a hand, most often. The wheel sizes the square under the pointer
+    (or the next one), a right-click takes one away. Redraw queues a fix job
+    (studio_imagegen `run_fix`): only the squares change, the rest of the
+    picture is kept pixel for pixel, and the result is a new picture in the
+    history beside the old one."""
+
+    TARGETS = [("hand", "Hand"), ("face", "Face"), ("other", "Something else")]
+    STRENGTHS = [("light", "Light"), ("medium", "Medium"), ("strong", "Strong")]
+
+    def __init__(self, owner, path, settings):
+        self.owner = o = owner
+        host = owner.host
+        self.path, self.settings = path, settings
+        self.spots = []                   # [{"x", "y", "size"}] in the picture's pixels
+        self.target, self.strength = "hand", "medium"
+        self.hover = None
+        self.img = None
+        try:
+            full = tk.PhotoImage(master=host, file=path)
+            self.w, self.h = full.width(), full.height()
+        except (tk.TclError, OSError):
+            self.w = self.h = 0
+        self.size = max(ig.FIX_MIN, int(max(self.w, self.h) * 0.16))
+        win = self.win = tk.Toplevel(host)
+        win.title("Fix a spot")
+        win.transient(host)
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(860), host._px(820)))
+
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(12), pady=(0, o.px(12)))
+        self.go = o.button(foot, "Redraw", self._redraw, kind="accent")
+        self.go.pack(side="right")
+        o.button(foot, "Clear", self._clear, kind="ghost").pack(side="right",
+                                                               padx=(0, o.px(6)))
+        self.msg = o.label(foot, "", "muted", host.f_small)
+        self.msg.pack(side="left", fill="x", expand=True)
+
+        opts = o.frame(win)
+        opts.pack(side="bottom", fill="x", padx=o.px(12), pady=(o.px(8), o.px(8)))
+        self.pills = {}
+        for key, items, label in (("target", self.TARGETS, "Redraw"),
+                                  ("strength", self.STRENGTHS, "Change")):
+            row = o.frame(opts)
+            row.pack(side="top", fill="x", pady=(0, o.px(4)))
+            o.label(row, label, "muted", width=10).pack(side="left")
+            for value, text in items:
+                p = o.button(row, text, lambda k=key, v=value: self._pick(k, v),
+                             kind="ghost")
+                p.pack(side="left", padx=(0, o.px(4)))
+                self.pills[(key, value)] = p
+        row = o.frame(opts)
+        row.pack(side="top", fill="x")
+        o.label(row, "Describe", "muted", width=10).pack(side="left")
+        self.words = tk.StringVar()
+        e = host._entry(row, self.words)
+        e.master.pack(side="left", fill="x", expand=True)
+
+        self.canvas = tk.Canvas(win, bd=0, highlightthickness=0, cursor="crosshair")
+        host._skin(self.canvas, bg="card")
+        self.canvas.pack(side="top", fill="both", expand=True, padx=o.px(12),
+                         pady=(o.px(12), 0))
+        self.canvas.bind("<Configure>", lambda ev: self._layout())
+        self.canvas.bind("<Button-1>", self._add)
+        self.canvas.bind("<Button-3>", self._remove)
+        self.canvas.bind("<Motion>", self._move)
+        self.canvas.bind("<Leave>", lambda ev: self._move(None))
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self._paint_pills()
+        self._status()
+
+    # ------------------------------------------------------------- picture
+    def _layout(self):
+        """Fit the picture to the canvas; `k` is screen px per picture px."""
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if not self.w or cw < 20 or ch < 20:
+            return
+        side = min(cw, ch * self.w / float(self.h)) if self.w >= self.h else \
+            min(ch, cw * self.h / float(self.w))
+        self.img = photo_at(self.path, int(side), self.owner.host)
+        if self.img is None:
+            return
+        self.k = self.img.width() / float(self.w)
+        self.ox = (cw - self.img.width()) // 2
+        self.oy = (ch - self.img.height()) // 2
+        self._draw()
+
+    def _to_pic(self, ev):
+        if self.img is None:
+            return None
+        x, y = (ev.x - self.ox) / self.k, (ev.y - self.oy) / self.k
+        if 0 <= x < self.w and 0 <= y < self.h:
+            return int(x), int(y)
+        return None
+
+    def _under(self, at):
+        """The index of the square `at` (picture px) is inside, or None."""
+        for i in range(len(self.spots) - 1, -1, -1):
+            sp = self.spots[i]
+            if abs(sp["x"] - at[0]) <= sp["size"] / 2 and abs(sp["y"] - at[1]) <= sp["size"] / 2:
+                return i
+        return None
+
+    def _draw(self):
+        c, C = self.canvas, self.owner.host.C
+        c.delete("all")
+        if self.img is None:
+            c.create_text(c.winfo_width() // 2, c.winfo_height() // 2, fill=C["faint"],
+                          text="No preview for %s" % os.path.basename(self.path))
+            return
+
+        def square(sp, **kw):
+            half = sp["size"] * self.k / 2
+            x, y = self.ox + sp["x"] * self.k, self.oy + sp["y"] * self.k
+            c.create_rectangle(x - half, y - half, x + half, y + half, **kw)
+        c.create_image(self.ox, self.oy, image=self.img, anchor="nw")
+        for n, sp in enumerate(self.spots, 1):
+            square(sp, outline=C["accent"], width=max(2, self.owner.px(2)))
+            c.create_text(self.ox + sp["x"] * self.k, self.oy + (sp["y"] - sp["size"] / 2)
+                          * self.k - self.owner.px(8), text=str(n), fill=C["accent"],
+                          font=self.owner.host.f_small)
+        if self.hover is not None and self._under(self.hover) is None:
+            square({"x": self.hover[0], "y": self.hover[1], "size": self.size},
+                   outline=C["muted"], dash=(4, 3))
+
+    # --------------------------------------------------------------- mouse
+    def _add(self, ev):
+        at = self._to_pic(ev)
+        if at is None or self._under(at) is not None:
+            return
+        if len(self.spots) >= 8:
+            return self._status("Eight at a time; redraw these first.", "warn")
+        self.spots.append({"x": at[0], "y": at[1], "size": self.size})
+        self._draw()
+        self._status()
+
+    def _remove(self, ev):
+        at = self._to_pic(ev)
+        i = self._under(at) if at else None
+        if i is not None:
+            del self.spots[i]
+            self._draw()
+            self._status()
+
+    def _move(self, ev):
+        self.hover = self._to_pic(ev) if ev is not None else None
+        self._draw()
+
+    def _wheel(self, ev):
+        grow = 1.1 if ev.delta > 0 else 1 / 1.1
+        at = self._to_pic(ev)
+        i = self._under(at) if at else None
+        top = max(ig.FIX_MIN, min(self.w, self.h))
+        if i is not None:
+            sp = self.spots[i]
+            sp["size"] = int(min(top, max(ig.FIX_MIN, sp["size"] * grow)))
+        else:
+            self.size = int(min(top, max(ig.FIX_MIN, self.size * grow)))
+        self._draw()
+
+    # ------------------------------------------------------------- options
+    def _pick(self, key, value):
+        setattr(self, key, value)
+        self._paint_pills()
+
+    def _paint_pills(self):
+        host = self.owner.host
+        for (key, value), p in self.pills.items():
+            p.roles = host.PILL_ROLES["option" if getattr(self, key) == value else "ghost"]
+            p.paint(host.C)
+
+    def _status(self, text=None, role="muted"):
+        n = len(self.spots)
+        if text is None:
+            text = ("Click each part to redraw. The wheel sizes the square; right-click "
+                    "removes one." if not n else
+                    "%d marked. Only inside the squares changes." % n)
+        self.msg.config(text=text)
+        self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def _clear(self):
+        self.spots = []
+        self._draw()
+        self._status()
+
+    def _redraw(self):
+        if not self.spots:
+            return self._status("Click the part of the picture to redraw first.", "warn")
+        s = self.owner.studio.fix_base(self.settings)
+        s.update(mode="fix", seed=-1, fix={
+            "image": self.path, "target": self.target, "strength": self.strength,
+            "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots]})
+        self.owner.say("Fixing %s%s" % (ig.fix_words(s["fix"]), ELLIPSIS), "muted")
+        self.owner.host._spawn(self.owner.s.event_id, self.owner._submit, s)
+        self.win.destroy()
 
 
 class CharacterCreator:
