@@ -44,6 +44,7 @@ import uuid
 
 import studio_critic as critic
 import studio_doctor as doctor
+import studio_mannequin as mq
 from studio_comfy_mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, ComfyError,
                               Unreachable, _explain, head_square, outputs_of, oval_png,
                               preview_of, status_messages)
@@ -312,6 +313,8 @@ def clean_identity(d):
         "reference_strength": _num(d.get("reference_strength", 0.6), float, 0.6, 0.0, 2.0),
         "use_references": d.get("use_references", True) is not False,
         "notes": _str(d.get("notes")),
+        # The Scene Builder's head shape for them (`studio_mannequin.HEAD_SHAPE`).
+        "head": mq.clean_head(d.get("head")),
     }
 
 
