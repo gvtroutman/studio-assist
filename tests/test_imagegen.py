@@ -235,6 +235,8 @@ class TestFill(unittest.TestCase):
 
     def test_every_shipped_template_fills(self):
         for wf in ig.list_workflows():
+            if wf.get("built_by"):            # finished in code: tested with its builder
+                continue
             vals = {k: "x.safetensors" for k in (wf.get("files") or {})}
             vals.update(prompt="p", seed=1)
             loras = [("l.safetensors", 0.5)] if wf.get("lora_chain") else []
@@ -439,7 +441,7 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(style="none", subject="a man", accessories="glasses",
                       item_refs={"glasses": pic, "hat": pic})
         self.assertEqual(p.images, {})
-        self.assertTrue(any("Pictures of the glasses" in w and "no item reference input" in w
+        self.assertTrue(any("Pictures of the glasses" in w and "takes no item pictures" in w
                             for w in p.warnings), p.warnings)
         self.assertFalse(any("hat" in w for w in p.warnings))          # not worn today
 
@@ -517,6 +519,66 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(p.images, {"source_image": src})
         self.assertEqual(p.values["denoise"], 0.7)
         self.assertTrue(any(w.startswith("Pose reference") for w in p.warnings), p.warnings)
+
+    def test_the_camera_leads_the_prompt_and_keeps_the_head_in(self):
+        p = self.plan(model="flux-dev", scene="On a pier.", subject="a woman",
+                      view={"shot": "waist", "turn": 90, "height": "low"})
+        self.assertEqual(p.errors, [])
+        self.assertTrue(p.prompt.startswith("Medium shot from the waist up"), p.prompt)
+        self.assertIn("whole head in the frame", p.prompt)
+        self.assertIn("subject's left", p.prompt)
+        self.assertIn("low angle", p.prompt)
+        self.assertNotIn("eye-level", self.plan(model="flux-dev", scene="x").prompt)
+        # With a drawn pose the figure frames itself: only the height is said.
+        src = os.path.join(self.dir, "pose.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        posed = self.plan(model="flux-dev", scene="x", references={"pose": src},
+                          pose={"points": [[0.5, 0.5]] * 18},
+                          view={"shot": "face", "turn": 180, "height": "high"})
+        self.assertTrue(posed.prompt.startswith("High angle shot"), posed.prompt)
+        self.assertNotIn("behind", posed.prompt)
+        self.assertTrue(any("drawn pose decides the framing" in w for w in posed.warnings))
+
+    def test_a_camera_snaps_to_its_steps(self):
+        self.assertIsNone(ig.clean_view(None))
+        self.assertEqual(ig.clean_view({"turn": -170, "shot": "?", "height": 3}),
+                         {"shot": "full", "turn": 180, "height": "eye"})
+        self.assertEqual(ig.clean_view({"turn": 100})["turn"], 90)
+        self.assertEqual(ig.view_label({"shot": "head", "turn": -45, "height": "overhead"}),
+                         "Head and shoulders, overhead, from their right, three-quarter")
+
+    def test_a_pose_goes_through_the_controlnet_on_flux(self):
+        src = os.path.join(self.dir, "pose.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        cn = "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors"
+        inv = dict(FLUX_FILES, controlnet={cn})
+        p = self.plan(model="flux-dev", inventory=inv, scene="x", references={"pose": src},
+                      pose={"points": [[0.5, 0.5]] * 18, "strength": 0.75,
+                            "hands": {"right": {"shape": "fist"}}})
+        self.assertEqual(p.errors, [])
+        self.assertTrue(p.prompt.endswith("Right hand clenched in a fist."), p.prompt)
+        self.assertEqual(p.values["prompt"], p.prompt)
+        self.assertEqual(p.images, {"pose_image": src})
+        self.assertEqual((p.values["controlnet"], p.values["pose_strength"]), (cn, 0.75))
+        g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"))
+        self.assertEqual(g["52"]["class_type"], "ControlNetApplyAdvanced")
+        self.assertEqual(g["40"]["inputs"]["positive"], ["52", 0])
+        self.assertEqual(g["40"]["inputs"]["negative"], ["52", 1])
+        self.assertEqual(g["52"]["inputs"]["strength"], 0.75)
+        # Without the ControlNet on the backend the pose is left out, in words.
+        p = self.plan(model="flux-dev", scene="x", references={"pose": src})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.images, {})
+        self.assertTrue(any("Pose reference" in w and cn in w for w in p.warnings),
+                        p.warnings)
+        # And with no pose, nothing of it is recorded or in the graph.
+        p = self.plan(model="flux-dev", inventory=inv, scene="x")
+        self.assertNotIn("controlnet", p.values)
+        g = ig.fill(p.workflow, p.values)
+        self.assertFalse({"50", "51", "52"} & set(g))
+        self.assertEqual(g["40"]["inputs"]["positive"], ["11", 0])
 
     def test_redux_reference_needs_its_files(self):
         src = os.path.join(self.dir, "style.png")
@@ -863,6 +925,304 @@ class TestLibrary(unittest.TestCase):
             os.path.join(ig.STYLE_EXAMPLES_DIR, "cinema.png"))
         self.assertIsNone(ig.style_example(ig.clean_style({"name": "Brand new"})))
 
+DRESS_FILES = {"diffusion_models": {"qwen_image_edit_2509_fp8_e4m3fn.safetensors"},
+               "text_encoders": {"qwen_2.5_vl_7b_fp8_scaled.safetensors"},
+               "vae": {"qwen_image_vae.safetensors"},
+               "loras": {"Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors",
+                         "clothes_tryon_qwen-edit-lora.safetensors"},
+               "checkpoints": {"sam3.1_multiplex_fp16.safetensors"}}
+
+
+class DressClient(FakeClient):
+    """A ComfyUI with the Qwen edit model, the try-on LoRA and SAM3. A dress
+    run with a head to find answers with its preview and one face; the run
+    that saves answers with its picture."""
+    NODES = FakeClient.node_types(None) | ig.DRESS_NODES | ig.FACE_NODES
+    face = (380, 60, 70, 90)          # a full-length picture's face, x y w h
+
+    def inventory(self):
+        inv = super().inventory()
+        for kind, files in DRESS_FILES.items():
+            inv[kind] = inv.get(kind, set()) | files
+        return inv
+
+    def node_types(self):
+        return set(DressClient.NODES)
+
+    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        graph = self.graphs[int(pid[3:]) - 1]
+        ks = sorted(n for n in graph if n.endswith("_ks"))
+        for n in ks:
+            on_event("executing", n)
+            on_event("progress", (6, 6, n))
+        out = {}
+        if "dp" in graph:
+            out["dp"] = {"images": [{"filename": "dress_p.png", "subfolder": "",
+                                     "type": "temp"}]}
+        if "ds" in graph:
+            out["ds"] = {"images": [{"filename": "dress_00001_.png", "subfolder": "ImageStudio",
+                                     "type": "output"}]}
+        if "fd4" in graph:
+            x, y, w, h = DressClient.face
+            out.update({"fd4": {"text": [json.dumps([[{"x": x, "y": y, "width": w,
+                                                       "height": h}]])]},
+                        "fd6": {"text": ["832"]}, "fd7": {"text": ["1216"]}})
+        if not out:
+            return super().listen_for_progress(pid, on_event, stop, timeout)
+        return {"status": {"completed": True}, "outputs": out}
+
+
+def ran(cls):
+    """The graphs the 5090's client was sent (Studio makes one per backend)."""
+    return next(c for c in cls.instances if c.backend["id"] == "5090" and c.graphs).graphs
+
+
+def png_of(width, height):
+    """A PNG header saying width x height: all picture_size reads."""
+    import struct
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(
+        ">II", width, height) + b"\x08\x02\x00\x00\x00"
+
+
+class TestTryOn(TempStudioMixin, unittest.TestCase):
+    def pic(self, name, size=(832, 1216)):
+        path = os.path.join(self.dir, name + ".png")
+        with open(path, "wb") as f:
+            f.write(png_of(*size))
+        return path
+
+    def outfit(self, hair=True, acc=True):
+        return ig.clean_outfit({
+            "clothes": [{"name": "plaid shirt", "path": self.pic("shirt")},
+                        {"name": "jeans", "path": self.pic("jeans")}],
+            "hair": {"path": self.pic("hair")} if hair else None,
+            "accessories": [{"name": "glasses", "path": self.pic("glasses")},
+                            {"name": "wristwatch", "path": self.pic("watch")},
+                            {"name": "gold necklace", "path": self.pic("necklace")}]
+            if acc else []})
+
+    def dress_studio(self):
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=DressClient)
+
+    def test_picture_sizes_from_headers_alone(self):
+        import struct
+        self.assertEqual(ig.picture_size(png_of(832, 1216)), (832, 1216))
+        jpeg = (b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 9
+                + b"\xff\xc0" + struct.pack(">HBHH", 17, 8, 1216, 832) + b"\x00" * 12)
+        self.assertEqual(ig.picture_size(jpeg), (832, 1216))
+        self.assertEqual(ig.picture_size(b"GIF89a" + struct.pack("<HH", 64, 32)), (64, 32))
+        bmp = b"BM" + b"\x00" * 16 + struct.pack("<ii", 100, -50)
+        self.assertEqual(ig.picture_size(bmp), (100, 50))
+        webp = b"RIFF\x00\x00\x00\x00WEBPVP8X" + b"\x00" * 8 + (639).to_bytes(3, "little") \
+            + (479).to_bytes(3, "little")
+        self.assertEqual(ig.picture_size(webp), (640, 480))
+        self.assertIsNone(ig.picture_size(b"not a picture at all"))
+
+    def test_passes_clothes_then_body_then_head_in_words_that_work(self):
+        passes = ig.dress_passes(self.outfit())
+        self.assertEqual([(x["kind"], x["where"]) for x in passes],
+                         [("clothes", "body"), ("accessories", "body"), ("hair", "head"),
+                          ("accessories", "head")])
+        self.assertEqual(passes[0]["prompt"], ig.TRYON_PROMPT)
+        self.assertEqual([i["name"] for i in passes[1]["items"]], ["wristwatch"])
+        self.assertEqual(passes[2]["prompt"], "The person in picture 1 now has the hair of the "
+                                              "person in picture 2.")
+        self.assertEqual(passes[3]["prompt"], "The person in picture 1 wears the glasses from "
+                                              "picture 2 and the gold necklace from picture 3.")
+        for x in passes:                 # "keep it the same" stopped every edit, live
+            self.assertNotIn("same", x["prompt"].lower())
+            self.assertNotIn("keep", x["prompt"].lower())
+        words = ig.dress_passes(ig.clean_outfit({"hair": {"words": "short red hair"}}))
+        self.assertEqual(words[0]["prompt"], "Change the person's hair to short red hair.")
+        self.assertEqual(ig.dress_passes(ig.clean_outfit({})), [])
+
+    def test_the_clothes_go_left_of_the_person_and_come_back_exactly(self):
+        wf = ig.load_workflow(ig.DRESS_WORKFLOW)
+        o = self.outfit(hair=False, acc=False)
+        passes = ig.dress_passes(o)
+        pictures = {x: "up_" + os.path.basename(x) for x in ig.outfit_pictures(o)}
+        v = dict(ig.dress_values(wf, self.backend("5090")), seed=7)
+        g = ig.dress_graph(wf, v, passes, "person.png", (832, 1216), pictures, "out")
+        cw, ch = ig.panel_size(832, 1216, 0.5)
+        self.assertEqual(g["d1_in"]["inputs"]["direction"], "right")
+        self.assertEqual(g["d1_in"]["inputs"]["image2"], ["d1_p", 0])      # person on the right
+        self.assertEqual((g["d1_p"]["inputs"]["width"], g["d1_p"]["inputs"]["height"]), (cw, ch))
+        self.assertEqual(g["d1_f0"]["inputs"]["target_height"]
+                         + g["d1_f1"]["inputs"]["target_height"], ch)       # a column as tall
+        self.assertEqual(g["d1_cut"]["inputs"], {"image": ["d1_dec", 0], "width": cw,
+                                                 "height": ch, "x": cw, "y": 0})
+        self.assertEqual(g["d1_enc"]["inputs"]["pixels"], ["d1_in", 0])    # no resample between
+        self.assertEqual(g["d1_ks"]["inputs"]["model"], ["9", 0])          # the try-on chain
+        self.assertEqual(g["7"]["inputs"]["lora_name"], "clothes_tryon_qwen-edit-lora.safetensors")
+        self.assertEqual(g["7"]["inputs"]["strength_model"], 1.5)
+        self.assertEqual(g["d1_pos"]["inputs"]["prompt"], ig.TRYON_PROMPT)
+        self.assertEqual((g["dz"]["inputs"]["width"], g["dz"]["inputs"]["height"]), (832, 1216))
+        self.assertEqual(g["ds"]["inputs"]["filename_prefix"], "out")
+        self.assertEqual(g["d1_ks"]["inputs"]["seed"], 7)
+        hair = ig.dress_passes(ig.clean_outfit({"hair": {"words": "red hair"}}))
+        g2 = ig.dress_graph(wf, v, hair, "person.png", (832, 1216), {}, "out")
+        self.assertNotIn("7", g2)                     # no try-on LoRA without clothes
+        self.assertEqual(g2["d1_ks"]["inputs"]["model"], ["6", 0])
+
+    def test_the_head_crop_is_head_and_shoulders_or_nothing(self):
+        crop = ig.head_region((380, 60, 70, 90), 832, 1216)
+        self.assertLessEqual(crop["y"], 60 - 45)                   # the hair above
+        self.assertGreaterEqual(crop["y"] + crop["height"], 60 + 90 + 2 * 90)   # the neck
+        self.assertEqual((crop["width"] % 16, crop["height"] % 16), (0, 0))
+        self.assertIsNone(ig.head_region((300, 200, 400, 500), 1024, 1024))    # a portrait
+        wf = ig.load_workflow(ig.DRESS_WORKFLOW)
+        o = self.outfit(acc=False)
+        head = [x for x in ig.dress_passes(o) if x["where"] == "head"]
+        pictures = {x: "up_" + os.path.basename(x) for x in ig.outfit_pictures(o)}
+        g = ig.dress_head_graph(wf, dict(wf["defaults"], seed=3), head, "p.png [temp]",
+                                (832, 1216), crop, "mask.png", (832, 1216), pictures, "out",
+                                first=1, sam3="sam3.pt")
+        self.assertEqual(g["hc"]["inputs"]["crop_region"], crop)
+        self.assertEqual(g["hb"]["inputs"]["mask"], ["hp8", 0])    # the person, not the box
+        self.assertEqual((g["hb"]["inputs"]["x"], g["hb"]["inputs"]["y"]), (crop["x"], crop["y"]))
+        self.assertEqual(g["h1_ks"]["inputs"]["seed"], 4)
+        self.assertEqual(g["h1_out"]["inputs"]["width"], crop["width"])
+
+    def test_generate_draws_a_character_from_its_item_pictures(self):
+        refs = {"leather jacket": self.pic("jacket"), "glasses": self.pic("glasses"),
+                "hair": self.pic("hair"), "hat": self.pic("hat")}
+        s = dict(ig.default_settings(), model="flux-dev", scene="On a pier.",
+                 outerwear="leather jacket", accessories="glasses", item_refs=refs,
+                 face_detail=True)
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"}, **KONTEXT_FILES)
+        p = ig.compose(s, self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual(p.errors, [])
+        # Clothes, then the hair, then accessories; the hat is not worn today.
+        self.assertEqual([n for n, _ in p.items], ["leather jacket", "hair", "glasses"])
+        self.assertEqual(p.references["item: glasses"], refs["glasses"])
+        self.assertEqual(p.values["model"], "flux1-dev-kontext_fp8_scaled.safetensors")
+        self.assertEqual(p.values["guidance"], 2.5)
+        self.assertIn("The leather jacket, hair and glasses look exactly as in the reference",
+                      p.prompt)
+        self.assertNotIn("reference", p.values["face_prompt"])     # the face has none
+        self.assertFalse(any("Pictures of the" in w for w in p.warnings), p.warnings)
+        self.assertTrue(any("FLUX.1 Kontext" in n for n in p.notes), p.notes)
+        mine = ig.compose(dict(s, guidance=4.0), self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual(mine.values["guidance"], 4.0)             # the form's wins
+        short = ig.compose(s, self.studio.lib, self.backend("5090"), FLUX_FILES)
+        self.assertEqual(short.items, [])
+        self.assertEqual(short.values["model"], "flux1-dev.safetensors")
+        self.assertTrue(any("flux1-dev-kontext_fp8_scaled.safetensors" in w
+                            and "words alone" in w for w in short.warnings), short.warnings)
+        plain = ig.compose(dict(s, item_refs={}), self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual((plain.items, plain.values["model"]), ([], "flux1-dev.safetensors"))
+        self.assertNotIn("kontext_model", plain.values)
+
+    def test_the_item_pictures_are_one_reference_on_the_prompt(self):
+        wf = ig.load_workflow("flux_dev_baseline")
+        g = ig.fill(wf, dict(wf["defaults"], model="m", clip_l="c", t5="t", vae="v",
+                             prompt="p", seed=1))
+        was = g["11"]["inputs"]["conditioning"]
+        ig.add_item_refs(g, wf["items"], ["a.png", "b.png", "c.png"])
+        self.assertEqual(g["11"]["inputs"]["conditioning"], ["ik3", 0])
+        self.assertEqual(g["ik3"]["inputs"]["conditioning"], was)
+        self.assertEqual(g["is3"]["inputs"]["image1"], ["is2", 0])
+        self.assertEqual(g["is3"]["inputs"]["image2"], ["it3", 0])
+        self.assertEqual(g["ik1"]["inputs"]["image"], ["is3", 0])
+        self.assertEqual(g["ik2"]["inputs"]["vae"], ["3", 0])
+        one = ig.fill(wf, dict(wf["defaults"], model="m", clip_l="c", t5="t", vae="v",
+                               prompt="p", seed=1))
+        ig.add_item_refs(one, wf["items"], ["a.png"])
+        self.assertEqual(one["ik1"]["inputs"]["image"], ["it1", 0])
+        self.assertFalse([n for n in one if n.startswith("is")])
+
+    def test_a_try_on_job_dresses_the_body_then_the_head_and_lands_in_history(self):
+        self.dress_studio()
+        o = self.outfit()
+        jobs = self.studio.submit({"mode": "dress", "seed": 11, "backend": "auto",
+                                   "outfit": dict(o, person=self.pic("person"))})
+        settle(jobs)
+        job = jobs[0]
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(job.backend["id"], "5090")
+        first, second = ran(DressClient)
+        self.assertIn("dp", first)
+        self.assertEqual([n for n in sorted(first) if n.endswith("_ks")], ["d1_ks", "d2_ks"])
+        self.assertEqual(second["hi"]["inputs"]["image"], "dress_p.png [temp]")
+        self.assertEqual([n for n in sorted(second) if n.endswith("_ks")], ["h1_ks", "h2_ks"])
+        self.assertEqual(second["h1_ks"]["inputs"]["seed"], 13)     # after the body's two
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["prompt"], "Try On: plaid shirt, jeans, the hair in the picture, "
+                                        "glasses, wristwatch and gold necklace")
+        self.assertEqual(rec["dress"]["head_crop"], second["hc"]["inputs"]["crop_region"])
+        self.assertEqual([l["name"] for l in rec["loras"]], ["Lightning 4-step",
+                                                             "Clothes Try On"])
+        self.assertEqual(rec["settings"]["mode"], "dress")
+        self.assertIn("Try On", ig.summary(rec["settings"]))
+        again = ig.again(rec)
+        self.assertEqual((again["seed"], again["prefer_backend"]), (11, "5090"))
+
+    def test_without_sam3_everything_is_one_run_on_the_whole_picture(self):
+        class NoSam(DressClient):
+            def inventory(self):
+                return dict(super().inventory(), checkpoints=set())
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=NoSam)
+        jobs = self.studio.submit_dress({"outfit": dict(self.outfit(),
+                                                        person=self.pic("person"))})
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        self.assertEqual(len(ran(NoSam)), 1)
+        rec = self.studio.history.list()[0]
+        self.assertTrue(any("no SAM3" in n for n in rec["notes"]), rec["notes"])
+
+    def test_a_try_on_needs_a_person_and_something_to_put_on(self):
+        self.dress_studio()
+        jobs = self.studio.submit_dress({"outfit": {"person": self.pic("person")}})
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "failed")
+        self.assertIn("Add something to put on", jobs[0].detail)
+        jobs = self.studio.submit_dress({"outfit": dict(self.outfit(), person="")})
+        settle(jobs)
+        self.assertIn("Choose the person", jobs[0].detail)
+
+    def test_nowhere_to_try_on_says_what_is_missing(self):
+        jobs = None
+        with self.assertRaises(ig.ComfyError) as e:     # FakeClient has no Qwen files
+            jobs = self.studio.submit_dress({"outfit": dict(self.outfit(),
+                                                            person=self.pic("person"))})
+        self.assertIsNone(jobs)
+        self.assertIn("clothes_tryon_qwen-edit-lora.safetensors", str(e.exception))
+
+    def test_a_generated_picture_is_made_from_its_item_pictures(self):
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=KontextClient)
+        refs = {"leather jacket": self.pic("jacket")}
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+                                       scene="On a pier.", outerwear="leather jacket",
+                                       item_refs=refs, backend="5090", seed=5))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        graphs = ran(KontextClient)
+        self.assertEqual(len(graphs), 1)                             # one pass, no Try On
+        g = graphs[0]
+        self.assertEqual(g["1"]["inputs"]["unet_name"], "flux1-dev-kontext_fp8_scaled.safetensors")
+        self.assertEqual(g["it1"]["inputs"]["image"], "studio_jacket.png")
+        self.assertEqual(g["11"]["inputs"]["conditioning"], ["ik3", 0])
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["references"]["item: leather jacket"], refs["leather jacket"])
+        self.assertEqual(rec["model"]["file"], "flux1-dev-kontext_fp8_scaled.safetensors")
+        self.assertIsNone(rec["dress"])
+
+
+KONTEXT_FILES = {"diffusion_models": FLUX_FILES["diffusion_models"]
+                 | {"flux1-dev-kontext_fp8_scaled.safetensors"}}
+
+
+class KontextClient(FakeClient):
+    """A ComfyUI with FLUX Kontext and the nodes that give it a reference."""
+    def inventory(self):
+        return dict(super().inventory(), **KONTEXT_FILES)
+
+    def node_types(self):
+        return FakeClient.node_types(self) | ig.ITEM_NODES
+
 
 def _headless():
     try:
@@ -963,6 +1323,89 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("left out", ui.warn.cget("text"))
         ui._drop_lora(ui.loras[0])
         self.assertNotIn("left out", ui.warn.cget("text"))
+
+    def test_the_camera_is_aimed_by_dragging_and_comes_back_with_reuse(self):
+        s, ui = self.tab()
+        self.assertIsNone(ui.collect()["view"])
+
+        class Ev:
+            def __init__(self, x, y):
+                self.x, self.y = x, y
+        a, k = ui.aim, ui.aim.k
+        cx, cy, r = a.TOP
+        a._press(Ev(int((cx + r) * k), int(cy * k)))             # round to their left
+        a._press(Ev(int((a.FIG_X + a.REACH["head"]) * k), int(a.ROWS["high"] * k)))
+        view = ui.collect()["view"]
+        self.assertEqual(view, {"shot": "head", "turn": 90, "height": "high"})
+        self.assertIn("Head and shoulders", ui.aim_note.cget("text"))
+        ui._aimed(None)
+        self.assertIsNone(ui.collect()["view"])
+        ui.apply(dict(ig.default_settings(), view=view))
+        self.assertEqual(ui.collect()["view"], view)
+
+    def test_a_drawn_pose_becomes_the_pose_reference(self):
+        s, ui = self.tab()
+        ui.settings["model"] = "flux-dev"
+        ui.adv["width"].set("832")
+        ui.adv["height"].set("1216")
+        ed = ui.edit_pose()
+        self.app.update()
+        self.assertEqual(ed.size, (832, 1216))
+
+        class Ev:
+            def __init__(self, x, y, state=0, delta=0):
+                self.x, self.y, self.state, self.delta = x, y, state, delta
+        wrist = list(ed.points[7])
+        at = (int(wrist[0] * ed.vw), int(wrist[1] * ed.vh))
+        ed._press(Ev(*at))
+        ed._move(Ev(at[0] + 20, at[1] - 40))
+        self.assertLess(ed.points[7][1], wrist[1])
+        ed._toggle(Ev(*[int(c) for c in (ed.points[17][0] * ed.vw, ed.points[17][1] * ed.vh)]))
+        self.assertIn(17, ed.hidden)
+        ed._preset("walking")
+        ed._undo()
+        self.assertIn(17, ed.hidden)
+        # A click on a hand, not a drag, gives it its next shape; the menu agrees.
+        hand = ed._hand_points()["right"]
+        hx = int(sum(p[0] for p in hand) / len(hand) * ed.vw)
+        hy = int(sum(p[1] for p in hand) / len(hand) * ed.vh)
+        ed._press(Ev(hx, hy))
+        ed._release(Ev(hx, hy))
+        self.assertEqual(ed.hands["right"]["shape"], "open")
+        self.assertIn("Open", ed.hand_pills["right"].cget("text"))
+        ed._flip("left")
+        ed._mirror()                                  # hands swap with the sides
+        self.assertTrue(ed.hands["right"]["back"])
+        self.assertEqual(ed.hands["left"]["shape"], "open")
+        ed._undo()
+        self.assertEqual(ed.hands["right"]["shape"], "open")
+        for view in ("model", "figure"):
+            ed._see(view)
+            self.app.update()
+        ed.strength.set(0.8)
+        ed._use()
+        self.app.update()
+        path = ui.refs["pose"]
+        self.assertTrue(os.path.isfile(path))
+        self.assertIn("drawn figure", ui.ref_labels["pose"].cget("text"))
+        got = ui.collect()
+        self.assertEqual((got["pose"]["strength"], got["pose"]["hidden"]), (0.8, [17]))
+        self.assertEqual(got["pose"]["hands"]["right"], {"shape": "open", "back": False})
+        # A new size refits the figure at Generate rather than stretching it.
+        ui.adv["width"].set("1024")
+        ui.adv["height"].set("1024")
+        ui._fit_pose()
+        self.assertEqual((ui.pose["width"], ui.pose["height"]), (1024, 1024))
+        self.assertNotEqual(ui.refs["pose"], path)
+        ui._clear_ref("pose")
+        self.assertIsNone(ui.pose)
+        self.assertIsNone(ui.collect()["pose"])
+        ui.apply(got)
+        self.assertEqual(ui.pose["hidden"], [17])
+        self.assertEqual(ui.refs["pose"], path)
+        ui._clear_ref("pose")
+        for k in ("width", "height"):
+            ui.adv[k].set("")
 
     def test_editors_open_and_save(self):
         s, ui = self.tab()
@@ -1080,6 +1523,29 @@ class TestImageStudioTab(unittest.TestCase):
         self.pump(lambda: all(j.status in ig.FINISHED for j in ui.jobs))
         self.app.update()
         self.assertFalse([k for k in self.app.anim if k[0] == "images-clock"])
+
+    def test_item_pictures_are_chosen_on_the_form(self):
+        s, ui = self.tab()
+        pic = os.path.join(self.dir, "jacket.png")
+        with open(pic, "wb") as f:
+            f.write(PNG)
+        ui.text["outerwear"].set("leather jacket")
+        ui._show_looks("Clothes")
+        ui._set_item("leather jacket", pic)
+        self.app.update()
+        kept = ui.collect()["item_refs"]["leather jacket"]
+        self.assertNotEqual(kept, pic)                  # copied, so history keeps it
+        self.assertTrue(os.path.isfile(kept))
+        texts = [w.cget("text") for row in ui.look_box.winfo_children()
+                 for w in row.winfo_children() if type(w).__name__ == "Label"]
+        self.assertIn("leather jacket", texts)
+        ui._set_item("leather jacket", None)
+        self.assertNotIn("leather jacket", ui.collect()["item_refs"])
+        ui._show_looks("Hair")
+        self.app.update()
+        # A Try On record from before stays out of the form, and says why.
+        ui.reuse({"mode": "dress", "seed": 4})
+        self.assertNotIn("dress", ui.collect())
 
 
 if __name__ == "__main__":
