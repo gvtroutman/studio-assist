@@ -543,6 +543,83 @@ class TestRoom(unittest.TestCase):
         self.assertEqual(len(sc.grid_lines(s, 896, 1152)), 10)
 
 
+class TestHistory(unittest.TestCase):
+    """Undo and redo are whole-scene snapshots, each step named from what
+    differs between it and the one before."""
+
+    def test_undo_and_redo_walk_the_steps_and_hand_back_copies(self):
+        s = staged()
+        h = sc.History(s)
+        self.assertFalse(h.can_undo() or h.can_redo())
+        self.assertIsNone(h.record(s))                        # nothing changed
+        box = sc.new_object("box", s["objects"])
+        s["objects"].append(box)
+        self.assertEqual(h.record(s, box["id"]), "Add Crate")
+        box["position"][0] = 1.5
+        self.assertEqual(h.record(s, box["id"]), "Move Crate")
+        scene, sel = h.undo()
+        self.assertEqual(scene["objects"][0]["position"][0], 0.0)
+        self.assertEqual(sel, box["id"])                      # what moved back
+        scene["objects"][0]["position"][0] = 9                # a copy, not a step
+        scene, _ = h.undo()
+        self.assertEqual(scene["objects"], [])
+        self.assertIsNone(h.undo())
+        scene, _ = h.redo()
+        self.assertEqual(scene["objects"][0]["position"][0], 0.0)
+        self.assertEqual(h.labels(), ["Start", "Add Crate", "Move Crate"])
+
+    def test_an_edit_after_undo_drops_the_redo_steps(self):
+        s = staged("box")
+        h = sc.History(s)
+        s["frame"] = "landscape"
+        h.record(s)
+        s, _ = h.undo()
+        s["details"] = "A quarry"
+        self.assertEqual(h.record(s), "Edit the scene details")
+        self.assertFalse(h.can_redo())
+        self.assertEqual(h.labels(), ["Start", "Edit the scene details"])
+
+    def test_the_steps_are_bounded(self):
+        s = staged()
+        h = sc.History(s)
+        for i in range(h.LIMIT + 20):
+            s["details"] = "Step %d" % i
+            h.record(s)
+        self.assertEqual(len(h.steps), h.LIMIT)
+        self.assertEqual(h.at, h.LIMIT - 1)
+
+    def test_unsaved_is_against_the_saved_scene_not_the_edit_count(self):
+        s = staged("box")
+        h = sc.History(s)
+        self.assertFalse(h.unsaved(s))
+        s["objects"][0]["colour"] = "#ff0000"
+        h.record(s)
+        self.assertTrue(h.unsaved(s))
+        s, _ = h.undo()
+        self.assertFalse(h.unsaved(s))                        # back where it was saved
+
+    def test_steps_are_named_for_what_changed(self):
+        base = staged("person", "box")
+
+        def said(edit):
+            after = json.loads(json.dumps(base))
+            edit(after)
+            return sc.change_label(base, after)
+        person = lambda s: s["objects"][0]  # noqa: E731
+        self.assertEqual(said(lambda s: s["objects"].pop(1)), "Delete Crate")
+        self.assertEqual(said(lambda s: person(s)["pose"].update(preset="")), "Pose Person")
+        self.assertEqual(said(lambda s: person(s)["look"].update(hair="red")),
+                         "Change Person's look")
+        self.assertEqual(said(lambda s: person(s)["rotation"].__setitem__(0, 30)),
+                         "Turn Person")
+        self.assertEqual(said(lambda s: person(s).update(name="Ada")), "Rename Person")
+        self.assertEqual(said(lambda s: s["camera"].update(yaw=40)), "Move the camera")
+        self.assertEqual(said(lambda s: s["room"].update(walls=True)),
+                         "Change the floor and walls")
+        self.assertEqual(said(lambda s: [o["position"].__setitem__(0, 2)
+                                         for o in s["objects"]]), "Change 2 objects")
+
+
 class TestSceneFile(unittest.TestCase):
     def test_save_and_open_keep_everything(self):
         s = staged("person", "box")
@@ -1005,6 +1082,95 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb.pose_from_photo(person["id"], path="C:/photos/empty.jpg")
         self.pump(lambda: person["id"] not in sb.posing, 10)
         self.assertIn("found no one in empty.jpg", sb.msg.cget("text"))
+
+    def test_undo_and_redo_put_the_scene_back(self):
+        ui, sb = self.builder()
+        self.assertEqual(sb.undo_pill.state, "disabled")
+        person = sb.add("person")
+        sb.remember()                                         # the edit has settled
+        self.assertEqual(sb.undo_pill.state, "normal")
+        x, y = self.centre_of(sb, "p:body")
+        start = list(person["position"])
+        sb._press(Ev(x, y))
+        sb._motion(Ev(x + 60, y))
+        self.assertEqual(sb.history.labels()[-1], "Add Person")   # not mid-drag
+        sb._release(Ev(x + 60, y))
+        self.assertEqual(sb.history.labels()[-1], "Move Person")  # one step per drag
+        moved = list(sb.obj(person["id"])["position"])
+        self.assertNotEqual(moved, start)
+
+        self.assertTrue(sb.undo())
+        self.assertEqual(sb.obj(person["id"])["position"], start)
+        self.assertEqual(sb.sel, person["id"])
+        self.assertAlmostEqual(sb.vars["x"][0].get(), start[0], places=2)
+        self.assertIn("Undid: Move Person", sb.msg.cget("text"))
+        self.assertEqual(sb.redo_pill.state, "normal")
+        self.assertTrue(sb.redo())
+        self.assertEqual(sb.obj(person["id"])["position"], moved)
+
+        sb.go_to(0)                                           # from the History menu
+        self.assertEqual(sb.scene["objects"], [])
+        self.assertEqual(sb.lb.size(), 2)                     # the scene and room rows
+        self.assertIsNone(sb.sel)
+        self.assertFalse(sb.dirty)                            # as the window opened
+        self.assertTrue(sb.redo())
+        self.assertTrue(sb.dirty)
+
+    def test_a_slider_drag_is_one_step_and_undo_takes_a_pending_edit(self):
+        import tkinter as tk
+        ui, sb = self.builder()
+        sb.add("box")
+        sb.remember()
+        steps = len(sb.history.steps)
+        want = str(sb.vars["x"][0])
+        scale = next(w for row in sb.panel.winfo_children() for w in row.winfo_children()
+                     if isinstance(w, tk.Scale) and str(w.cget("variable")) == want)
+        start = sb.obj()["position"][0]
+        for v in (0.5, 1.0, 1.5, 2.0):
+            scale.set(start + v)
+            self.app.update()
+        self.assertEqual(len(sb.history.steps), steps)        # still settling
+        sb.undo()                                             # records it, then undoes it
+        self.assertEqual(sb.obj()["position"][0], start)
+        self.assertEqual(sb.history.labels()[-1], "Move Crate")
+        self.assertEqual(len(sb.history.steps), steps + 1)
+
+    def test_ctrl_z_is_the_scenes_except_in_a_text_box(self):
+        import tkinter as tk
+        ui, sb = self.builder()
+        sb.add("box")
+        sb.remember()
+        sb.canvas.focus_force()
+        self.app.update()
+        sb.canvas.event_generate("<Control-z>")
+        self.app.update()
+        self.assertEqual(sb.scene["objects"], [])
+        sb.canvas.event_generate("<Control-y>")
+        self.app.update()
+        self.assertEqual(len(sb.scene["objects"]), 1)
+        ev = Ev(0, 0)
+        ev.widget = tk.Text(sb.panel)
+        self.assertIsNone(sb._undo_key(ev, sb.undo))
+        self.assertEqual(len(sb.scene["objects"]), 1)
+
+    def test_a_new_or_opened_scene_starts_a_new_history(self):
+        ui, sb = self.builder()
+        sb.add("box")
+        sb.remember()
+        sb.dirty = False
+        sb.new()
+        self.assertEqual(sb.history.labels(), ["New scene"])
+        self.assertEqual(sb.undo_pill.state, "disabled")
+        sb.add("barrel")
+        path = os.path.join(self.dir, "undo.scene.json")
+        self.assertTrue(sb.save(path))
+        sb.remember()
+        sb.undo()
+        self.assertTrue(sb.dirty)                             # the saved scene had a barrel
+        sb.redo()
+        self.assertFalse(sb.dirty)
+        self.assertTrue(sb.open(path))
+        self.assertEqual(sb.history.labels(), ["Opened undo.scene.json"])
 
     def test_click_a_hand_to_pose_it_and_drag_to_move(self):
         ui, sb = self.builder()

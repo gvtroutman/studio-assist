@@ -1617,6 +1617,126 @@ def scenes_dir():
     return os.path.join(ig.studio_dir(), "scenes")
 
 
+# ================================================================== history
+# Undo is whole-scene snapshots, not inverse operations: a scene is a few KB
+# of JSON (a crowd is its settings, not its people), and a snapshot cannot
+# get out of step with an edit the way a hand-written inverse can. Each step
+# is named from what differs between it and the one before (`change_label`),
+# so no edit in the window has to say what it is.
+
+OBJECT_CHANGES = [             # (field, how the step is named), first match wins
+    ("pose", "Pose %s"), ("look", "Change %s's look"), ("character", "Change %s's look"),
+    ("crowd", "Change the crowd %s"), ("colour", "Colour %s"), ("position", "Move %s"),
+    ("rotation", "Turn %s"), ("scale", "Size %s"), ("name", "Rename %s"),
+    ("description", "Describe %s"),
+]
+SCENE_CHANGES = [("camera", "Move the camera"), ("room", "Change the floor and walls"),
+                 ("frame", "Change the frame"), ("details", "Edit the scene details"),
+                 ("redraw", "Change the redraw strength"),
+                 # branch scene-controlnet replaces `redraw` with these three;
+                 # drop the row above when it merges
+                 ("pose_strength", "Change the pose strength"),
+                 ("depth_strength", "Change the layout strength"),
+                 ("frame_keep", "Change how much frame is kept")]
+
+
+def change_label(before, after):
+    """-> a few words for what changed from scene `before` to scene `after`."""
+    was = {o["id"]: o for o in before.get("objects", [])}
+    now = {o["id"]: o for o in after.get("objects", [])}
+    added = [o for i, o in now.items() if i not in was]
+    gone = [o for i, o in was.items() if i not in now]
+    if added or gone:
+        verb, some = ("Add", added) if added and not gone else \
+            ("Delete", gone) if gone and not added else ("Change", added + gone)
+        return "%s %s" % (verb, some[0]["name"] if len(some) == 1 else
+                          "%d objects" % len(some))
+    edited = [(was[i], o) for i, o in now.items() if o != was[i]]
+    if len(edited) > 1:
+        return "Change %d objects" % len(edited)
+    if edited:
+        a, b = edited[0]
+        for key, words in OBJECT_CHANGES:
+            if a.get(key) != b.get(key):
+                return words % (a["name"] if key == "name" else b["name"])
+        return "Change %s" % b["name"]
+    if [o["id"] for o in before.get("objects", [])] != \
+            [o["id"] for o in after.get("objects", [])]:
+        return "Reorder the objects"
+    for key, words in SCENE_CHANGES:
+        if before.get(key) != after.get(key):
+            return words
+    return "Change the scene"
+
+
+class History:
+    """A scene's undo and redo: `steps` of (label, snapshot, selection),
+    `at` the one the scene is in now. `record` after an edit, `undo` /
+    `redo` / `go` to move, each handing back (scene, selection) to put up.
+    The selection is the one the step was made with, so undoing a move
+    selects what moved back. Snapshots are JSON text: compared as strings,
+    and no step shares a list with the live scene."""
+    LIMIT = 200
+
+    def __init__(self, scene, sel=None, label="Start"):
+        self.reset(scene, sel, label)
+
+    @staticmethod
+    def snap(scene):
+        return json.dumps(scene, sort_keys=True)
+
+    def reset(self, scene, sel=None, label="Start"):
+        self.steps = [(label, self.snap(scene), sel)]
+        self.at = 0
+        self.saved = self.steps[0][1]
+
+    def mark_saved(self, scene):
+        self.saved = self.snap(scene)
+
+    def unsaved(self, scene):
+        return self.snap(scene) != self.saved
+
+    def record(self, scene, sel=None):
+        """-> the new step's label, or None when nothing changed. A step
+        recorded after an undo throws the redo steps away, as everywhere."""
+        now = self.snap(scene)
+        prev = self.steps[self.at][1]
+        if now == prev:
+            return None
+        label = change_label(json.loads(prev), scene)
+        del self.steps[self.at + 1:]
+        self.steps.append((label, now, sel))
+        if len(self.steps) > self.LIMIT:
+            del self.steps[:len(self.steps) - self.LIMIT]
+        self.at = len(self.steps) - 1
+        return label
+
+    def can_undo(self):
+        return self.at > 0
+
+    def can_redo(self):
+        return self.at < len(self.steps) - 1
+
+    def labels(self):
+        return [label for label, _, _ in self.steps]
+
+    def go(self, i):
+        """-> (scene, selection) at step `i`, or None if that is where it is.
+        The selection is from the step nearest `i` that is crossed."""
+        i = max(0, min(len(self.steps) - 1, i))
+        if i == self.at:
+            return None
+        crossed = self.steps[i + 1] if i < self.at else self.steps[i]
+        self.at = i
+        return json.loads(self.steps[i][1]), crossed[2]
+
+    def undo(self):
+        return self.go(self.at - 1) if self.can_undo() else None
+
+    def redo(self):
+        return self.go(self.at + 1) if self.can_redo() else None
+
+
 # ================================================================= textures
 
 class Texture:
