@@ -2438,8 +2438,11 @@ class RecordEditor:
 
 
 class FixWindow:
-    """Fix a spot: the picture large, and each click on it marks a square to
-    redraw - a hand, most often. The wheel sizes the square under the pointer
+    """Fix a spot: the picture large. A drag round a part draws a freehand
+    outline, and only inside it is redrawn; a click marks a square instead.
+    A click on a marked spot gives it a photo of what goes there (a hat, a
+    hand), swapped in by Qwen-Image-Edit; a second click takes the photo off.
+    The wheel sizes the square under the pointer
     (or the next one), a right-click takes one away. Redraw queues a fix job
     (studio_imagegen `run_fix`): only the squares change, the rest of the
     picture is kept pixel for pixel, and the result is a new picture in the
@@ -2519,7 +2522,9 @@ class FixWindow:
         self.canvas.pack(side="top", fill="both", expand=True, padx=o.px(12),
                          pady=(o.px(12), 0))
         self.canvas.bind("<Configure>", lambda ev: self._layout())
-        self.canvas.bind("<Button-1>", self._add)
+        self.canvas.bind("<Button-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Button-3>", self._remove)
         self.canvas.bind("<Motion>", self._move)
         self.canvas.bind("<Leave>", lambda ev: self._move(None))
@@ -2582,19 +2587,86 @@ class FixWindow:
             c.create_text(self.ox + sp["x"] * self.k, self.oy + (sp["y"] - sp["size"] / 2)
                           * self.k - self.owner.px(8), text="locked", fill=C["ok"],
                           font=self.owner.host.f_small)
+        line = max(2, self.owner.px(2))
         for n, sp in enumerate(self.spots, 1):
-            square(sp, outline=C["accent"], width=max(2, self.owner.px(2)))
-            c.create_text(self.ox + sp["x"] * self.k, self.oy + (sp["y"] - sp["size"] / 2)
-                          * self.k - self.owner.px(8), text=str(n), fill=C["accent"],
+            label = str(n)
+            if sp.get("photo"):
+                label += " · " + os.path.basename(sp["photo"])
+            if sp.get("outline"):
+                flat = [v for x, y in sp["outline"]
+                        for v in (self.ox + x * self.k, self.oy + y * self.k)]
+                c.create_polygon(*flat, outline=C["accent"], fill="", width=line)
+                top = min(y for _, y in sp["outline"])
+            else:
+                square(sp, outline=C["accent"], width=line)
+                top = sp["y"] - sp["size"] / 2
+            c.create_text(self.ox + sp["x"] * self.k, self.oy + top * self.k
+                          - self.owner.px(8), text=label, fill=C["accent"],
                           font=self.owner.host.f_small)
+        trail = getattr(self, "trail", None)
+        if trail and len(trail) >= 2:
+            c.create_line(*[v for p in trail for v in p], fill=C["accent"], width=line)
+            return
         if self.hover is not None and self._under(self.hover) is None:
             square({"x": self.hover[0], "y": self.hover[1], "size": self.size},
                    outline=C["ok" if self.mode == "lock" else "muted"], dash=(4, 3))
 
     # --------------------------------------------------------------- mouse
+    DRAG = 6                          # screen px a press moves before it is a lasso
+
+    def _press(self, ev):
+        self.press = (ev.x, ev.y)
+        self.trail = []               # the lasso so far, in screen px
+
+    def _drag(self, ev):
+        if getattr(self, "press", None) is None:
+            return
+        if not self.trail:
+            if abs(ev.x - self.press[0]) + abs(ev.y - self.press[1]) < self.DRAG:
+                return
+            self.trail = [self.press]
+        last = self.trail[-1]
+        if abs(ev.x - last[0]) + abs(ev.y - last[1]) >= 3:
+            self.trail.append((ev.x, ev.y))
+            self._draw()
+
+    def _release(self, ev):
+        press, trail = getattr(self, "press", None), getattr(self, "trail", [])
+        self.press, self.trail = None, []
+        if press is None:
+            return
+        if len(trail) >= 3:
+            return self._lasso(trail)
+        self._add(ev)
+
+    def _lasso(self, trail):
+        """A freehand outline, closed: only inside it is redrawn (or, in Lock
+        mode, kept - as the square round it)."""
+        pts = []
+        for x, y in trail:
+            px = min(self.w - 1, max(0, int((x - self.ox) / self.k)))
+            py = min(self.h - 1, max(0, int((y - self.oy) / self.k)))
+            pts.append((px, py))
+        step = max(1, len(pts) // ig.FIX_OUTLINE_MAX + 1)
+        spot = ig.outline_spot(pts[::step])
+        spot["size"] = min(spot["size"], max(ig.FIX_MIN, min(self.w, self.h)))
+        marks = self._marks()
+        if marks is self.spots and len(marks) >= ig.FIX_MAX_SPOTS:
+            return self._status("Eight at a time; redraw these first.", "warn")
+        if marks is self.locks:
+            spot.pop("outline")
+        marks.append(spot)
+        self._draw()
+        self._status()
+
     def _add(self, ev):
         at = self._to_pic(ev)
-        if at is None or self._under(at) is not None:
+        if at is None:
+            return
+        i = self._under(at)
+        if i is not None:
+            if self.mode != "lock":
+                self._photo(i)
             return
         marks = self._marks()
         if marks is self.spots and len(marks) >= ig.FIX_MAX_SPOTS:
@@ -2602,6 +2674,22 @@ class FixWindow:
         marks.append({"x": at[0], "y": at[1], "size": self.size})
         self._draw()
         self._status()
+
+    def _photo(self, i):
+        """A click on a marked spot: a photo of what goes there instead
+        (Qwen-Image-Edit swaps it in), or, with one already, take it off."""
+        sp = self.spots[i]
+        if sp.get("photo"):
+            sp.pop("photo")
+            self._draw()
+            return self._status("Spot %d: photo taken off; it is redrawn." % (i + 1))
+        path = filedialog.askopenfilename(
+            parent=self.win, title="A photo of what goes in spot %d" % (i + 1),
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
+        if path:
+            sp["photo"] = path
+            self._draw()
+            self._status("Spot %d becomes what %s shows." % (i + 1, os.path.basename(path)))
 
     def _remove(self, ev):
         at = self._to_pic(ev)
@@ -2687,9 +2775,10 @@ class FixWindow:
     def _status(self, text=None, role="muted"):
         n = len(self.spots)
         if text is None:
-            text = ("Click each part to redraw, or Find. The wheel sizes the square; "
-                    "right-click removes one." if not n else
-                    "%d marked. Only inside the squares changes." % n)
+            text = ("Drag round each part to redraw (or click for a square), or Find. "
+                    "Right-click removes one." if not n else
+                    "%d marked; only inside them changes. Click one to give it a photo "
+                    "of what goes there." % n)
             if self.locks:
                 text += " %d locked." % len(self.locks)
         self.msg.config(text=text)
