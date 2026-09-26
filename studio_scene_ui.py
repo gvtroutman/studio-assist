@@ -111,9 +111,17 @@ class SceneBuilder:
         left.pack_propagate(False)
         left.pack(side="left", fill="y", padx=o.px(12), pady=o.px(12))
         o.cap(left, "Library")
-        for a in sc.ASSETS:
-            o.button(left, "+  " + a["label"], lambda a=a["id"]: self.add(a),
-                     anchor="w").pack(side="top", fill="x", pady=(0, o.px(3)))
+        # People one button each; shapes and props a menu each, or the list
+        # of what is in the scene has no room left.
+        for gid, glabel in sc.ASSET_GROUPS:
+            items = [a for a in sc.ASSETS if a["group"] == gid]
+            if gid == "people":
+                for a in items:
+                    o.button(left, "+  " + a["label"], lambda a=a["id"]: self.add(a),
+                             anchor="w").pack(side="top", fill="x", pady=(0, o.px(3)))
+            else:
+                self._library_menu(left, glabel, items).pack(side="top", fill="x",
+                                                             pady=(0, o.px(3)))
         o.cap(left, "In the scene")
         self.lb = tk.Listbox(left, width=1, bd=0, highlightthickness=0, activestyle="none",
                              font=host.f_ui, exportselection=False)
@@ -209,6 +217,21 @@ class SceneBuilder:
                                           sc.ASSET[asset_id]["about"]), "muted")
         self.check()                  # says now, not at Generate, if the frame would go unused
         return obj
+
+    def _library_menu(self, parent, label, items):
+        """A library button that posts a menu of `items` to add."""
+        o = self.owner
+        pill = o.button(parent, "+  %s  ▾" % label, lambda: None, anchor="w")
+
+        def post():
+            menu = tk.Menu(pill, tearoff=0)
+            o.skin(menu, bg="card", fg="text", activebackground="sel",
+                   activeforeground="text")
+            for a in items:
+                menu.add_command(label=a["label"], command=lambda a=a["id"]: self.add(a))
+            menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
+        pill.command = post
+        return pill
 
     def _form_look(self, obj):
         """The scene's first person takes the look already on the form, since
@@ -467,7 +490,9 @@ class SceneBuilder:
             self._words()
         e.bind("<KeyRelease>", renamed)
 
-        o.cap(p, "What they are doing" if a["kind"] == "person" else "Description")
+        o.cap(p, {"person": "What they are doing",
+                  "crowd": "Who they are and what they are doing"}.get(a["kind"],
+                                                                       "Description"))
 
         def described(v):
             obj["description"] = v
@@ -478,26 +503,32 @@ class SceneBuilder:
         o.label(p, ("Their action, and what matters about them: PPE (hard hat, "
                     "hi-vis, gloves, face shield up or down), what they hold. "
                     "Sent exactly as written." if a["kind"] == "person" else
+                    "All of them at once: \"Oktoberfest revellers in traditional "
+                    "dress, laughing\". Sent exactly as written; the mannequins "
+                    "only show where they stand." if a["kind"] == "crowd" else
                     "What it is and its state: open or closed, on or off, full or "
                     "empty. Sent exactly as written."),
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
                                                                        fill="x")
         if a["kind"] == "person":
             self._look_controls(obj)
+        if a["kind"] == "crowd":
+            self._crowd_controls(obj)
 
-        o.cap(p, "Colour (skin, and whatever is not worn)" if a["kind"] == "person"
-              else "Colour")
-        sw = o.frame(p)
-        sw.pack(side="top", fill="x")
-        for hexc, cname in sc.COLOURS:
-            chip = tk.Canvas(sw, width=o.px(20), height=o.px(20), highlightthickness=0,
-                             bd=0, cursor="hand2")
-            o.skin(chip, bg="bg")
-            ring = "accent" if hexc.lower() == obj["colour"].lower() else "border"
-            chip.create_oval(1, 1, o.px(19), o.px(19), fill=hexc,
-                             outline=self.host.C[ring], width=2)
-            chip.bind("<Button-1>", lambda ev, h=hexc: self._set_colour(h))
-            chip.pack(side="left", padx=(0, o.px(3)))
+        if a["kind"] != "crowd":          # a crowd's colours are its people's own
+            o.cap(p, "Colour (skin, and whatever is not worn)" if a["kind"] == "person"
+                  else "Colour")
+            sw = o.frame(p)
+            sw.pack(side="top", fill="x")
+            for hexc, cname in sc.COLOURS:
+                chip = tk.Canvas(sw, width=o.px(20), height=o.px(20), highlightthickness=0,
+                                 bd=0, cursor="hand2")
+                o.skin(chip, bg="bg")
+                ring = "accent" if hexc.lower() == obj["colour"].lower() else "border"
+                chip.create_oval(1, 1, o.px(19), o.px(19), fill=hexc,
+                                 outline=self.host.C[ring], width=2)
+                chip.bind("<Button-1>", lambda ev, h=hexc: self._set_colour(h))
+                chip.pack(side="left", padx=(0, o.px(3)))
 
         if a["kind"] == "person":
             self._pose_controls(obj)
@@ -580,6 +611,75 @@ class SceneBuilder:
         if self.look_section in ("Clothes", "Accessories"):
             self._outfit_controls(obj)
         self.look_vars, self.look_changed = text, changed
+
+    def _crowd_controls(self, obj):
+        """How many, over how much floor, facing which way, doing what, and
+        dressed from which outfit presets; Shuffle deals a new crowd."""
+        o, p, c = self.owner, self.panel, obj["crowd"]
+        o.cap(p, "Crowd")
+
+        def put(key, conv=float):
+            def write(x):
+                c[key] = conv(x)
+            return write
+        self._slider(p, "crowd_count", "People", lambda: c["count"],
+                     put("count", lambda x: int(round(x))), *sc.CROWD_LIMITS["count"])
+        self._slider(p, "crowd_width", "Spread wide (m)", lambda: c["width"], put("width"),
+                     *sc.CROWD_LIMITS["width"], 0.25)
+        self._slider(p, "crowd_depth", "Spread deep (m)", lambda: c["depth"], put("depth"),
+                     *sc.CROWD_LIMITS["depth"], 0.25)
+
+        def pick(key):
+            def picked(v):
+                c[key] = v
+                self.changed()
+            return picked
+        for key, label, items in (("facing", "Facing", sc.CROWD_FACING),
+                                  ("activity", "Doing", sc.CROWD_ACTIVITY)):
+            row = o.frame(p)
+            row.pack(side="top", fill="x", pady=(o.px(4), 0))
+            o.label(row, label, "muted", self.host.f_small, width=16).pack(side="left")
+            o.choice(row, items, c[key], pick(key)).pack(side="left")
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        o.label(row, "Dressed in", "muted", self.host.f_small, width=16).pack(side="left")
+        presets = self.owner.studio.lib.all("outfits")
+        items = [("", "Everyday clothes")]
+        if presets:
+            items += [("*", "Every outfit preset, mixed")] + [
+                (r["id"], r["name"]) for r in presets]
+        now = c.get("dressed", "")
+        if now and now not in dict(items):
+            items.append((now, now + " (as it was)"))
+        o.choice(row, items, now, lambda v: self._dress_crowd(obj, v)).pack(side="left")
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(o.px(6), 0))
+        o.button(row, "Shuffle the people", lambda: self._shuffle_crowd(obj)).pack(
+            side="left")
+        o.label(p, "Each person is different: height, build, skin, clothes, pose. "
+                "Shuffle deals a new set; the words say only the crowd.", "faint",
+                self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
+
+    def _dress_crowd(self, obj, choice):
+        """Dress a crowd from outfit presets: copies of their looks, as a
+        character's look is copied onto a person."""
+        presets = self.owner.studio.lib.all("outfits")
+        if choice == "*":
+            wear = presets
+        elif choice:
+            wear = [r for r in presets if r["id"] == choice]
+            if not wear:
+                return                      # "as it was": keep what it wears
+        else:
+            wear = []
+        obj["crowd"]["wear"] = [dict(r["looks"]) for r in wear]
+        obj["crowd"]["dressed"] = choice
+        self.changed()
+
+    def _shuffle_crowd(self, obj):
+        import random
+        obj["crowd"]["seed"] = random.randrange(1, 2 ** 31)
+        self.changed()
 
     def _look_tab(self, name):
         self.look_section = name
@@ -947,14 +1047,26 @@ class SceneBuilder:
                 c.create_image(ox, oy, image=img, anchor="nw")
         for a, b, axis in sc.grid_lines(self.scene, w, h):
             c.create_line(*at((a, b)), fill=GRID_AXIS if axis else GRID)
+        # The chosen object is outlined face by face - but a crowd, whose
+        # faces are many small people, gets a box round it instead, or the
+        # outline is all there is to see of them.
+        sel = self.obj()
+        crowd = sel is not None and sel["asset"] == "crowd"
+        around = []
         for poly in polys:
             if poly.owner is None:
                 continue
             fill = rgb_hex(poly.rgb)
             chosen = poly.owner == self.sel
             c.create_polygon(at(poly.pts), fill=fill,
-                             outline=C["accent"] if chosen else fill,
+                             outline=C["accent"] if chosen and not crowd else fill,
                              tags=("o:" + poly.owner, "p:" + str(poly.part)))
+            if chosen and crowd:
+                around += at(poly.pts)
+        if around:
+            c.create_rectangle(min(around[0::2]) - 4, min(around[1::2]) - 4,
+                               max(around[0::2]) + 4, max(around[1::2]) + 4,
+                               outline=C["accent"], dash=(4, 3), width=2)
         x0, y0, x1, y1 = ox, oy, ox + w * k, oy + h * k
         for box in ((0, 0, cw, y0), (0, y1, cw, ch), (0, y0, x0, y1), (x1, y0, cw, y1)):
             c.create_rectangle(*box, fill=C["bg"], outline="", stipple="gray50")
@@ -1082,7 +1194,7 @@ class SceneBuilder:
             obj["rotation"][0] = round((yaw + 180) % 360 - 180, 1)
         elif d["kind"] == "scale":
             f = 2 ** (-dy / 150.0)
-            lo, hi = (0.5, 1.3) if obj["asset"] == "person" else (0.05, 5)
+            lo, hi = (0.5, 1.3) if obj["asset"] in ("person", "crowd") else (0.05, 5)
             obj["scale"] = [round(max(lo, min(hi, v * f)), 3) for v in start["scale"]]
         self.dirty = True
         self.draw()

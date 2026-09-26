@@ -763,6 +763,27 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   ring and those outside it) that the window draws on a plain floor; on a pictured
   floor the bake has them multiplied in, and the bake's key has two halves so that
   moving only a shadow keeps the last bake up until the new one, not a plain floor.
+- **Shapes and props are meshes in a unit box.** `MESHES` holds each as parts in
+  x, z -0.5..0.5 and y 0..1, each with its own colour or None for the object's (a
+  tree's trunk is brown whatever colour its leaves are), scaled by the object's scale
+  in metres, so a table is 1.4 m because its scale says so. Each part is one convex
+  solid, since `outward` orients faces from the middle. The library lists them by
+  `group`: People as buttons, Shapes and Props as a menu each - eighteen buttons left
+  the scene list no room.
+- **A background crowd is one object of many people.** `crowd_members` deals
+  `count` mannequins into a `width` x `depth` area, at least `CROWD_SPACING` apart (as
+  many as fit), each with their own height, build, skin, hair, clothes, pose
+  (standing, chatting, walking, cheering) and facing, all from `seed`: the same
+  settings give the same crowd, and Shuffle is a new seed. Different people in the
+  frame is the point - one mannequin copied reads to the model as one person cloned.
+  `wear` dresses them from outfit presets, copied on like a character's look
+  (`dressed` only remembers which, for the dropdown). The words say the crowd in one
+  line, "a background crowd of N people", with the user's description as written;
+  the members' dealt clothes are never said, only drawn. It is not one of `people()`,
+  so a scene of a crowd and props leaves the form's person in place, as props alone
+  do. `crowd_pieces` is cached by its settings (a drag of anything else redraws it
+  unchanged), each member is a part `m<n>` so each casts their own shadow, and a
+  selected crowd is boxed rather than outlined face by face.
 - **Outfit presets are a library kind.** `outfits.json` beside `characters.json`
   (`clean_outfit`, five starters in `_default_outfits` worded in the mannequin's own
   colour, shoe and hat words). A preset holds `OUTFIT_KEYS` - the Clothes and
