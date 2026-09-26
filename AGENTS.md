@@ -726,7 +726,16 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   it are dropped, or a big one sorts in front and shows through), a fall down the back
   as long as the style says, a bun, ponytail or braids; under a hat only what hangs
   below it. The colour is the first `CLOTH` word in the garment ("black
-  leather jacket" is black), else the slot's default. What is not worn is the object's
+  leather jacket" is black), else the slot's default. Costume words are drawn too: a
+  dirndl is a dress to mid-calf with white puffed sleeves and an apron (each piece's
+  colour from the words next to it, `_near`: "a green dirndl with a pink apron"),
+  lederhosen are knee-length with braces, a flower crown (`HATS` "crown") is a ring of
+  leaves and flowers of every colour unless one is said, and an alpine / German hat has
+  a band and a feather. `HELD` puts carried things in the Accessories slot on the
+  mannequin: an accordion across the chest (the Carrying pose puts the hands on it)
+  and a beer stein upright in front of the right palm, or both when the words say
+  more than one. Anything else typed in a slot is still sent as written; it only
+  goes undrawn. What is not worn is the object's
   colour. The words are still sent as written; this only draws them. Every look edit
   in the inspector goes through `changed()`, so the viewport follows each keystroke
   and slider step.
@@ -741,6 +750,27 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 - **Everything stands on its floor.** An object's lowest point is put at its position's
   y (`object_pieces`), so a crouch drops the hips, a kneel puts the knee down and a
   tipped drum lies on the floor; y is the floor it stands on (a platform, a step).
+- **What touches the floor leaves a shadow on it**, or the picture made from the frame
+  draws the person hovering: the blockout was geometrically right (soles exactly at
+  y 0) and still read as pasted on. `shadow_polys` adds, per object, soft nested rings
+  under each part within `CONTACT_REACH` of its lowest point (each planted foot, a
+  knee, a box's base - a lifted foot casts none) and a faint one under its outline up
+  to `AMBIENT_REACH`. They are `Poly`s with `dim`: `rasterise` multiplies what is under
+  them rather than painting, so a pictured floor stays pictured. They belong to the
+  room (owner None, drawn after it, before every object), which is why an object
+  standing at y > 0 casts none - its platform would be drawn over it. Tk cannot
+  multiply, so each carries a flat stand-in `rgb` (the floor's colour darkened by its
+  ring and those outside it) that the window draws on a plain floor; on a pictured
+  floor the bake has them multiplied in, and the bake's key has two halves so that
+  moving only a shadow keeps the last bake up until the new one, not a plain floor.
+- **Outfit presets are a library kind.** `outfits.json` beside `characters.json`
+  (`clean_outfit`, five starters in `_default_outfits` worded in the mannequin's own
+  colour, shoe and hat words). A preset holds `OUTFIT_KEYS` - the Clothes and
+  Accessories slots - and putting one on (`wear_outfit`) replaces all of them, so a
+  slot it leaves blank comes off; body, face and hair stay. The controls are on the
+  inspector's Clothes and Accessories tabs only: on every tab they pushed the pose
+  sliders below the scrolled panel's visible area, and a Tk Scale that is not mapped
+  never runs its command.
 - **The rig is forward kinematics over named controls.** `JOINTS` is the skeleton,
   `CONTROLS` the handful of sliders grouped by part (body, head, each hand and foot),
   `POSES` presets of them. A click on the mannequin selects the part under it (each

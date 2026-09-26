@@ -72,6 +72,7 @@ class SceneBuilder:
         self.sel = None               # an object's id; None is the scene and camera
         self.part = "body"
         self.look_section = ig.LOOKS[0][0]
+        self.outfit_name = ""        # the outfit preset box, kept across redraws
         self.tool = "move"
         self.drag = None
         self.vars = {}                # key -> (DoubleVar, read) for the inspector's sliders
@@ -576,6 +577,8 @@ class SceneBuilder:
         if self.look_section == ig.SLIDER_SECTION:
             o.slider_rows(p, steps, changed)
         relight[0] = o.look_rows(p, section, text, changed)
+        if self.look_section in ("Clothes", "Accessories"):
+            self._outfit_controls(obj)
         self.look_vars, self.look_changed = text, changed
 
     def _look_tab(self, name):
@@ -602,6 +605,101 @@ class SceneBuilder:
         self._list()
         self._inspect()
         self.changed()
+
+    def _outfit_controls(self, obj):
+        """Clothes presets, kept in the Image Studio's library (`outfits`):
+        put one on, or save what this person wears under a name. Putting
+        one on replaces the Clothes and Accessories slots, as a copy."""
+        o, p = self.owner, self.panel
+        lib = o.studio.lib
+        o.cap(p, "Outfit presets")
+        row = o.frame(p)
+        row.pack(side="top", fill="x")
+        presets = [(r["id"], r["name"]) for r in lib.all("outfits")]
+        o.choice(row, presets or [("", "No presets yet")], "",
+                 self._put_on_outfit).pack(side="left")
+        o.label(row, "puts on its clothes and accessories", "faint",
+                self.host.f_small).pack(side="left", padx=(o.px(6), 0))
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        name = tk.StringVar(value=self.outfit_name)
+        e = self.host._entry(row, name)
+        e.master.pack(side="left", fill="x", expand=True)
+
+        def typed(_ev=None):
+            self.outfit_name = name.get()
+        e.bind("<KeyRelease>", typed)
+        o.button(row, "Delete", lambda: self._delete_outfit(name.get()),
+                 kind="ghost", font=self.host.f_small).pack(side="right",
+                                                            padx=(o.px(4), 0))
+        o.button(row, "Save outfit", lambda: self._save_outfit(name.get()),
+                 font=self.host.f_small).pack(side="right", padx=(o.px(4), 0))
+
+    def _put_on_outfit(self, oid):
+        obj = self.obj()
+        rec = self.owner.studio.lib.get("outfits", oid) if oid else None
+        if obj is None or obj["asset"] != "person" or rec is None:
+            return
+        obj["look"] = sc.wear_outfit(rec, obj["look"])
+        self.outfit_name = rec["name"]
+        self._inspect()
+        self.changed()
+
+    def _save_outfit(self, name):
+        """What the selected person wears, as a preset called `name`; a
+        preset of that name already is replaced, after asking."""
+        obj, name = self.obj(), name.strip()
+        if obj is None or obj["asset"] != "person":
+            return
+        if not name:
+            self.status("Name the outfit first, in the box beside Save outfit.", "warn")
+            return
+        looks = sc.outfit_looks(obj["look"])
+        if not looks:
+            self.status("This person wears nothing in the Clothes or Accessories "
+                        "slots yet, so there is no outfit to save.", "warn")
+            return
+        lib = self.owner.studio.lib
+        records = [dict(r) for r in lib.all("outfits")]
+        same = next((r for r in records if r["name"].lower() == name.lower()), None)
+        if same is not None:
+            if not messagebox.askyesno("Scene Builder", "Replace the outfit preset "
+                                       "\"%s\"?" % same["name"], parent=self.win):
+                return
+            same["looks"] = looks
+        else:
+            records.append({"name": name, "looks": looks})
+        try:
+            lib.save("outfits", records)
+        except OSError as e:
+            self.status("Could not save the outfit: %s" % e, "err")
+            return
+        self.outfit_name = name
+        self.status("Saved the outfit \"%s\"." % name, "ok")
+        self._inspect()
+
+    def _delete_outfit(self, name):
+        lib = self.owner.studio.lib
+        name = name.strip()
+        rec = next((r for r in lib.all("outfits") if r["name"].lower() == name.lower()),
+                   None)
+        if rec is None:
+            self.status("No outfit preset is called \"%s\". Type the name of one "
+                        "to delete it." % name if name else
+                        "Type the name of the outfit preset to delete.", "warn")
+            return
+        if not messagebox.askyesno("Scene Builder", "Delete the outfit preset \"%s\"? "
+                                   "People already wearing it keep their clothes."
+                                   % rec["name"], parent=self.win):
+            return
+        try:
+            lib.save("outfits", [r for r in lib.all("outfits") if r is not rec])
+        except OSError as e:
+            self.status("Could not delete the outfit: %s" % e, "err")
+            return
+        self.outfit_name = ""
+        self.status("Deleted the outfit \"%s\"." % rec["name"], "ok")
+        self._inspect()
 
     def _clear_look(self):
         obj = self.obj()
@@ -838,12 +936,13 @@ class SceneBuilder:
         polys = sc.render(self.scene, w, h)
         at = lambda pts: [v for x, y in pts for v in (ox + x * k, oy + y * k)]  # noqa
         room = [p for p in polys if p.owner is None]
-        # The room flat first, everywhere (outside the frame too); then, in
-        # the frame, its pictures once baked for this view.
+        # The room flat first, everywhere (outside the frame too), shadows
+        # as their flat stand-in colours; then, in the frame, its pictures
+        # once baked for this view, shadows multiplied in.
         for poly in room:
             c.create_polygon(at(poly.pts), fill=rgb_hex(poly.rgb), outline="")
         if any(p.tex for p in room):
-            img = self._backdrop(w, h, k)
+            img = self._backdrop(w, h, k, room)
             if img is not None:
                 c.create_image(ox, oy, image=img, anchor="nw")
         for a, b, axis in sc.grid_lines(self.scene, w, h):
@@ -863,7 +962,8 @@ class SceneBuilder:
         c.create_text(x0 + 6, y0 - 4, anchor="sw", fill=C["muted"], font=self.host.f_small,
                       text="Frame %d x %d · %dmm" % (w, h, round(self.scene["camera"]["lens"])))
 
-    def _backdrop_key(self, w, h, k):
+    def _backdrop_key(self, w, h, k, room_polys=None):
+        """-> (the view and the room's pictures, the shadows on them)."""
         room = self.scene["room"]
         stamps = []
         for key, _, _ in sc.SURFACES:
@@ -871,19 +971,26 @@ class SceneBuilder:
                 stamps.append(os.path.getmtime(room[key]["image"]))
             except OSError:
                 stamps.append(None)
-        return json.dumps([w, h, round(k, 5), self.scene["camera"], room, stamps],
-                          sort_keys=True)
+        if room_polys is None:
+            room_polys = [p for p in sc.render(self.scene, w, h) if p.owner is None]
+        shadows = [[round(v, 1) for pt in p.pts for v in pt] for p in room_polys if p.dim]
+        return (json.dumps([w, h, round(k, 5), self.scene["camera"], room, stamps],
+                           sort_keys=True), json.dumps(shadows))
 
-    def _backdrop(self, w, h, k):
+    def _backdrop(self, w, h, k, room_polys):
         """The room's pictures for this exact view, or None while they bake
         (the flat colours stand in). A new view asks for a bake a moment after
-        the last change, so a drag is never held up by one."""
-        key = self._backdrop_key(w, h, k)
+        the last change, so a drag is never held up by one. When only the
+        shadows moved - an object dragged over a pictured floor - the last
+        bake stays up meanwhile, so the floor does not flash plain."""
+        key = self._backdrop_key(w, h, k, room_polys)
         if self.backdrop[0] == key:
             return self.backdrop[1]
         if self.bake_after is not None:
             self.win.after_cancel(self.bake_after)
         self.bake_after = self.win.after(150, self._bake)
+        if self.backdrop[0] is not None and self.backdrop[0][0] == key[0]:
+            return self.backdrop[1]
         return None
 
     def _bake(self):

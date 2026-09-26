@@ -812,6 +812,18 @@ class TestLibrary(unittest.TestCase):
         self.assertEqual([b["id"] for b in lib.all("backends")], ["5090", "3090"])
         self.assertTrue(lib.problems)
 
+    def test_outfit_presets_keep_only_clothes_and_start_with_some(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        self.assertIn("Casual", [r["name"] for r in lib.all("outfits")])
+        for r in lib.all("outfits"):
+            self.assertTrue(r["looks"])
+            self.assertLessEqual(set(r["looks"]), set(ig.OUTFIT_KEYS))
+        lib.save("outfits", [{"name": "Red night", "looks": {
+            "top": "red sweater", "hair": "black", "weight": 2, "footwear": " "}}])
+        self.assertEqual(ig.Library(lib.root).all("outfits"),
+                         [{"id": "red-night", "name": "Red night",
+                           "looks": {"top": "red sweater"}}])
+
     def test_scan_adds_unknown_loras_with_guesses(self):
         lib = ig.Library(tempfile.mkdtemp())
         n = lib.merge_loras("3090", ["gavin_identity_flux.safetensors",
