@@ -951,6 +951,8 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         mask = [u for u in client.uploads if "face_regions" in u]
         self.assertEqual(len(mask), 1)
         self.assertIn(face, client.uploads)
+        # The redraw is of the picture just made, not her face picture.
+        self.assertEqual(second["fi"]["inputs"]["image"], "ImageStudio_00001_.png [output]")
         k = second["fc1_4"]["inputs"]
         self.assertEqual(k["model"], ["fc1_p", 0])
         self.assertEqual(k["denoise"], 0.85)          # the scene's likeness
