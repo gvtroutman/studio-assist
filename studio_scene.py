@@ -58,7 +58,7 @@ import zlib
 
 import studio_icons
 
-VERSION = 1
+VERSION = 2                    # 2: the shape library grew past box and cylinder
 FULL_FRAME_DIAGONAL = 43.27    # mm; a lens is read against a full-frame sensor
 NEAR = 0.05                    # m; the camera's near plane
 FLOOR_REACH = 30.0             # m from the origin the floor is drawn to
@@ -1267,6 +1267,30 @@ def clean_object(d, taken=()):
     return o
 
 
+# A version-1 file had only a box and a cylinder, so a table was a box named
+# "Table". Opened now, a stand-in whose name ends in a newer prop's word
+# becomes that prop, keeping its place, size and colour. Only box -> boxy
+# props and cylinder -> round ones, so a cylinder "Round table" stays round.
+UPGRADE_TO = {"box": ("table", "chair", "shelves", "car", "wedge", "plane"),
+              "cylinder": ("cone", "frustum", "capsule")}
+UPGRADED = "Updated to the newer shapes"
+
+
+def upgrade_object(d):
+    """A version-1 object -> the same object as the newer asset its name
+    says it is, or unchanged."""
+    if not isinstance(d, dict) or d.get("asset") not in UPGRADE_TO:
+        return d
+    words = re.sub(r"\s+\d+$", "", str(d.get("name") or "")).lower().split()
+    if not words:
+        return d
+    for aid in UPGRADE_TO[d["asset"]]:
+        a = ASSET[aid]
+        if words[-1] in {aid, a["label"].lower(), a["name"].lower().split()[-1]}:
+            return dict(d, asset=aid)
+    return d
+
+
 def clean_scene(d):
     """-> (scene, problems). A file from an older or hand-edited scene opens
     with what can be read, and says what could not."""
@@ -1297,13 +1321,21 @@ def clean_scene(d):
         if r[key]["image"] and not os.path.isfile(r[key]["image"]):
             problems.append("The %s picture %s is missing, so it is drawn plain."
                             % (label.lower(), os.path.basename(r[key]["image"])))
+    older, moved = _num(d.get("version"), 1) < 2, []
     for raw in d.get("objects") or []:
+        if older:
+            new = upgrade_object(raw)
+            if new is not raw:
+                moved.append(str(new.get("name")))
+            raw = new
         o = clean_object(raw, s["objects"])
         if o is None:
             problems.append("An object of unknown kind %r was left out."
                             % (raw.get("asset") if isinstance(raw, dict) else raw))
         else:
             s["objects"].append(o)
+    if moved:
+        problems.append(UPGRADED + ": %s. Save to keep them." % ", ".join(moved))
     given = d.get("enrich") if isinstance(d.get("enrich"), dict) else {}
     for key in s["enrich"]:
         raw = given.get(key) if isinstance(given.get(key), list) else []
