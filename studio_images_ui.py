@@ -454,12 +454,15 @@ class ImageStudio:
         self.scene.pack(fill="x")
         self.scene.bind("<KeyRelease>", lambda ev: self._recheck())
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
+        # As wide as the scene box above it: the way into the Scene Builder
+        # is the scene's own, not a small aside beside a hint.
         srow = self.frame(f)
         srow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
-        self.button(srow, "Scene Builder…", self.build_scene, kind="ghost").pack(side="left")
-        self.label(srow, "Stage a person and props in 3D; the frame becomes the source "
-                   "picture.", "faint", self.host.f_small, wraplength=self.px(250)).pack(
-            side="left", padx=(self.px(6), 0))
+        self.button(srow, "Scene Builder…", self.build_scene).pack(side="top", fill="x")
+        self.label(srow, "Stage people and props in 3D, or make a scene from a picture; "
+                   "the frame becomes the source picture.", "faint", self.host.f_small,
+                   wraplength=self.px(380)).pack(side="top", fill="x",
+                                                 pady=(self.px(3), 0))
 
         self.cap(f, "Person").pack(**pad)
         crow = self.frame(f)
