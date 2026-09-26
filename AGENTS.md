@@ -809,6 +809,13 @@ prompt: glasses redrawn at 0.85 from "a woman, whole figure in view,
 dancing" came back as a tiny dancer in the head (2026-09-26). A spot Find
 made (not a face with SAM3) is redrawn and blended only in its box grown by
 `FIX_AREA_GROW` (`fix_areas` -> crop `area`), not the oval's whole reach.
+Inside that box only the thing's own outline is redrawn and blended: Find
+keeps the SAM3 word that found each spot (`word`), and `face_graph` asks
+SAM3 for it again in the crop, grows it `FIX_SHAPE_GROW` px and multiplies
+it by the box (nodes `s0`-`s3`). Live on 2026-09-26 a glasses fix changed
+~1,000 px, all on the frames. `found_spots` drops accessories over
+`FIX_FIND_MAX` of the picture and boxes mostly inside a kept one of the same
+word ("bag" found the apron, so it is no longer asked for).
 
 ### Try On: dressing a person from pictures
 

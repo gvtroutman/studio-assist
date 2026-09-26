@@ -1224,7 +1224,8 @@ FIX_STRENGTHS = {"light": 0.45, "medium": 0.65, "strong": 0.85}
 # in view, dancing") redrew a glasses crop as a tiny dancer (2026-09-26).
 FIX_PROMPT = "Close-up photo detail of %s, sharp and natural, matching the light and " \
              "colour around it."
-FIX_AREA_GROW = 0.2                   # of its size Find's box grows, as the part redrawn
+FIX_AREA_GROW = 0.35                  # of its size Find's box grows: the most redrawn
+FIX_SHAPE_GROW = 24                   # px at FACE_EDIT the found thing's own outline grows
 FIX_AREA_SOFT = (15, 5.0)             # ImageBlur radius and sigma of its edge, at FACE_EDIT
 FIX_MIN = 64                          # px: a smaller square is not worth redrawing
 FIX_MAX_SPOTS = 8
@@ -1233,7 +1234,13 @@ FIX_MAX_SPOTS = 8
 # asked for each; a face square is padded like the face pass's.
 FIX_FIND = {"hand": ["hand:8"], "face": ["face:8"],
             "other": ["glasses:4", "hat:4", "necklace:4", "earring:8", "bracelet:4",
-                      "watch:4", "bag:4"]}
+                      "watch:4"]}
+# Live on a dirndl (2026-09-26): "bag" came back as the apron and bodice, and
+# one necklace as three boxes. An accessory bigger than this share of the
+# picture is not one, and a box mostly inside a kept one of the same word
+# is the same thing again.
+FIX_FIND_MAX = {"other": 0.06, "hand": 0.12}
+FIX_FIND_SAME = 0.6
 FIX_FIND_PAD = {"hand": 1.5, "face": FACE_PAD, "other": 1.4}
 FIX_FACE_MASK = "face"                # SAM3's word for a face fix's true blend mask
 FIX_CONTEXT = 1.5                     # the crop redrawn is this x the spot: the photo round it
@@ -1257,6 +1264,8 @@ def _spots(items, limit):
                 del spot["box"]
         except (KeyError, TypeError, ValueError):
             pass
+        if isinstance(sp.get("word"), str) and sp["word"].strip():
+            spot["word"] = sp["word"].strip()[:40]
         out.append(spot)
     return out[:limit]
 
@@ -1323,6 +1332,8 @@ def fix_areas(crops, spots):
         y1 = min(crop["height"], int(by + bh + gy - crop["y"]))
         if x1 - x0 >= 8 and y1 - y0 >= 8:
             crop["area"] = (x0, y0, x1, y1)
+            if sp.get("word"):
+                crop["word"] = sp["word"]
     return crops
 
 
@@ -1337,10 +1348,26 @@ def found_spots(width, height, boxes, kind):
     FIX_FIND_PAD, at least FIX_MIN, largest first, at most FIX_MAX_SPOTS."""
     pad = FIX_FIND_PAD.get(kind, 1.5)
     out = []
-    for bx, by, bw, bh in sorted(boxes, key=lambda b: -b[2] * b[3]):
+    kept = []
+    for b in sorted(boxes, key=lambda b: -b[2] * b[3]):
+        bx, by, bw, bh = b[:4]
+        if bw * bh > FIX_FIND_MAX.get(kind, 1.0) * width * height:
+            continue
+        word = b[4] if len(b) > 4 else None
+
+        def inside(k):
+            ix = max(0, min(bx + bw, k[0] + k[2]) - max(bx, k[0]))
+            iy = max(0, min(by + bh, k[1] + k[3]) - max(by, k[1]))
+            return ix * iy >= FIX_FIND_SAME * bw * bh
+        if any((k[4] if len(k) > 4 else None) == word and inside(k) for k in kept):
+            continue
+        kept.append(b)
         side = int(min(max(FIX_MIN, max(bw, bh) * pad), width, height))
-        out.append({"x": int(bx + bw / 2.0), "y": int(by + bh / 2.0), "size": side,
-                    "box": [int(bx), int(by), int(bw), int(bh)]})
+        sp = {"x": int(bx + bw / 2.0), "y": int(by + bh / 2.0), "size": side,
+              "box": [int(bx), int(by), int(bw), int(bh)]}
+        if len(b) > 4 and b[4]:
+            sp["word"] = str(b[4])        # what SAM3 was asked: it finds the outline again
+        out.append(sp)
     return out[:FIX_MAX_SPOTS]
 
 
@@ -1362,9 +1389,10 @@ def parts_graph(image, sam3, prompts):
     return g
 
 
-def parts_found(entry, n):
+def parts_found(entry, n, words=None):
     """What parts_graph said about its `n` prompts -> (width, height,
-    [(x, y, w, h)]), or None when it said nothing."""
+    [(x, y, w, h)]), or None when it said nothing. With `words` (one per
+    prompt) each box ends with the word that found it."""
     out = entry.get("outputs") or {}
 
     def text(node):
@@ -1378,10 +1406,10 @@ def parts_found(entry, n):
     if width is None or height is None:
         return None
     boxes = []
-    for b in said:
+    for b, word in zip(said, words or [None] * n):
         b = b[0] if b and isinstance(b[0], list) else b or []
-        boxes += [(x["x"], x["y"], x["width"], x["height"]) for x in b
-                  if max(x["width"], x["height"]) >= 12]
+        boxes += [(x["x"], x["y"], x["width"], x["height"]) + ((word,) if word else ())
+                  for x in b if max(x["width"], x["height"]) >= 12]
     return int(width), int(height), boxes
 
 
@@ -1797,8 +1825,27 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             g[n + "a2"] = {"class_type": "MaskComposite", "inputs": {
                 "destination": [n + "a0", 0], "source": [n + "a1", 0], "x": ax0, "y": ay0,
                 "operation": "or"}}
+            shape = n + "a2"
+            if crop.get("word") and values.get("sam3"):
+                # The thing's own outline, found again in the crop, grown a
+                # little and kept inside the box: glasses are redrawn as
+                # glasses, not as the block round them.
+                if "fx1" not in g:
+                    g["fx1"] = {"class_type": "CheckpointLoaderSimple",
+                                "inputs": {"ckpt_name": values["sam3"]}}
+                g[n + "s0"] = {"class_type": "CLIPTextEncode", "inputs": {
+                    "text": crop["word"], "clip": ["fx1", 1]}}
+                g[n + "s1"] = {"class_type": "SAM3_Detect", "inputs": {
+                    "model": ["fx1", 0], "image": [n + "2", 0], "conditioning": [n + "s0", 0],
+                    "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+                g[n + "s2"] = {"class_type": "GrowMask", "inputs": {
+                    "mask": [n + "s1", 0], "expand": FIX_SHAPE_GROW, "tapered_corners": True}}
+                g[n + "s3"] = {"class_type": "MaskComposite", "inputs": {
+                    "destination": [n + "s2", 0], "source": [n + "a2", 0], "x": 0, "y": 0,
+                    "operation": "multiply"}}
+                shape = n + "s3"
             g[n + "3n"] = {"class_type": "SetLatentNoiseMask", "inputs": {
-                "samples": latent, "mask": [n + "a2", 0]}}
+                "samples": latent, "mask": [shape, 0]}}
             latent = [n + "3n", 0]
         elif crop.get("mask") is not False:
             g[n + "3m"] = {"class_type": "ImageScale", "inputs": {
@@ -1834,7 +1881,7 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
         g[n + "5"] = {"class_type": "VAEDecode", "inputs": {"samples": [n + "4", 0],
                                                             "vae": links["vae"]}}
         drawn = [n + "5", 0]
-        redrawn = n + ("a2" if area else "3h")
+        redrawn = (shape if area else n + "3h")
         if values.get("match_tone") and redrawn in g:
             # The redraw's colours and tone curves moved to the original's
             # over the part redrawn: a hand keeps the picture's grade.
@@ -1853,7 +1900,7 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             continue
         blend = ["fo", 0]
         if area:
-            g[n + "a3"] = {"class_type": "MaskToImage", "inputs": {"mask": [n + "a2", 0]}}
+            g[n + "a3"] = {"class_type": "MaskToImage", "inputs": {"mask": [shape, 0]}}
             g[n + "a4"] = {"class_type": "ImageBlur", "inputs": {
                 "image": [n + "a3", 0], "blur_radius": FIX_AREA_SOFT[0],
                 "sigma": FIX_AREA_SOFT[1]}}
@@ -3761,7 +3808,8 @@ class Studio:
         c = self.client(backend)
         prompts = FIX_FIND.get(kind) or FIX_FIND["hand"]
         said = parts_found(self._run_quick(c, parts_graph(c.upload_image(path), sam3,
-                                                          prompts)), len(prompts))
+                                                          prompts)), len(prompts),
+                           [p.split(":")[0] for p in prompts])
         if said is None:
             raise ComfyError("SAM3 said nothing about the picture.")
         width, height, boxes = said
@@ -4200,6 +4248,8 @@ class Studio:
             crops = fix_crops(size[0], size[1], [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
                                                  for sp in fix["spots"]], head=bool(sam))
             fix_areas(crops, fix["spots"])
+            if any(c.get("word") for c in crops):    # found things redrawn by their outline
+                values["sam3"] = self.sam3_on(b)
             boxes = [sp.get("box") for sp in fix["spots"]] if sam else None
             values["face_prompt"] = fix_prompt(fix, plan.prompt)
             values["face_denoise"] = fix["strength"]

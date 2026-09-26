@@ -900,6 +900,21 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["fc1_6"]["inputs"]["image"], ["fc1_t", 0])
         self.assertIn("fix_oval", g["fo"]["inputs"]["image"])
 
+    def test_found_glasses_are_redrawn_by_their_own_outline(self):
+        job, client, src = self.fix_job(target="other", words="glasses", spots=[
+            {"x": 40, "y": 40, "size": 64, "box": [30, 30, 20, 20], "word": "glasses"}])
+        with open(src, "wb") as f:                # a picture big enough for the box
+            f.write(ig.oval_png(256))
+        jobs = self.studio.submit(dict(job.settings))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        g = FaceClient.instances[-1].graphs[-1]
+        self.assertEqual(g["fc1_s0"]["inputs"]["text"], "glasses")
+        self.assertEqual(g["fc1_s1"]["inputs"]["image"], ["fc1_2", 0])   # in the original
+        self.assertEqual(g["fc1_s3"]["inputs"]["source"], ["fc1_a2", 0])  # kept in the box
+        self.assertEqual(g["fc1_3n"]["inputs"]["mask"], ["fc1_s3", 0])    # only it redrawn
+        self.assertEqual(g["fc1_a3"]["inputs"]["mask"], ["fc1_s3", 0])    # only it blended
+
     def test_without_the_tone_node_a_fix_says_so(self):
         job, client, _ = self.fix_job()
         self.assertEqual(job.status, "complete", job.detail)
@@ -1233,7 +1248,7 @@ class TestFixSpots(unittest.TestCase):
                                                   "a woman dancing"))
         spot = {"x": 589, "y": 250, "size": 207, "box": [541, 198, 96, 103]}
         (crop,) = ig.fix_areas(ig.fix_crops(1024, 1024, [dict(spot, size=310)]), [spot])
-        self.assertEqual(crop["area"], (87, 82, 222, 226))
+        self.assertEqual(crop["area"], (73, 66, 236, 242))
         (face,) = ig.fix_areas(ig.fix_crops(1024, 1024, [spot], head=True), [spot])
         self.assertNotIn("area", face)                # a face keeps SAM3's own mask
 
@@ -1246,6 +1261,10 @@ class TestFixSpots(unittest.TestCase):
                                                            "height": 60}]])]},
                             "p1v": {"text": [json.dumps([{"x": 5, "y": 5, "width": 4,
                                                           "height": 4}])]}}}
+        self.assertEqual(ig.parts_found(said, 2, ["glasses", "hat"])[2],
+                         [(100, 100, 40, 60, "glasses")])
+        self.assertEqual(ig.found_spots(1000, 800, [(100, 100, 40, 60, "glasses")],
+                                        "other")[0]["word"], "glasses")
         width, height, boxes = ig.parts_found(said, 2)
         self.assertEqual((width, height, boxes), (1000, 800, [(100, 100, 40, 60)]))
         (sp,) = ig.found_spots(width, height, boxes, "hand")
