@@ -53,6 +53,7 @@ STYLE_EXAMPLES_DIR = os.path.join(HERE, "style_examples")
 
 MAX_SEED = 2 ** 32 - 1
 JOB_TIMEOUT = 1800            # seconds a job may run before it is given up on
+POSE_NODE = "StudioDWPoseKeypoints"   # comfy_nodes/studio_dwpose: a photo's pose points
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
@@ -2389,6 +2390,48 @@ class Studio:
             return None
         return compose(settings, self.lib, b, self.inventories.get(b["id"]),
                        self.workflow_loader, self.nodes.get(b["id"]))
+
+    # ------------------------------------------------------------ poses
+    def find_poses(self, path, stop=None):
+        """The people in the picture at `path` and their pose points, from
+        the first enabled backend that is up and has POSE_NODE: -> (the
+        node's JSON, parsed; that backend). Not a job - a second or so on
+        the CPU, no model loaded, nothing kept in History. Network I/O: call
+        it off the UI thread. Raises ComfyError saying why no backend could."""
+        why = []
+        for b in self.backends():
+            if not b["enabled"]:
+                continue
+            nodes = self.nodes.get(b["id"]) or set()
+            if POSE_NODE not in nodes:          # a ComfyUI restarted since it was read
+                h = self.check(b)
+                nodes = self.nodes.get(b["id"]) or set()
+                if not h.get("ok"):
+                    why.append("%s is offline (%s)" % (b["name"], h.get("detail", "")))
+                    continue
+            if POSE_NODE not in nodes:
+                why.append("%s has no %s node" % (b["name"], POSE_NODE))
+                continue
+            c = self.client(b)
+            graph = {"1": {"class_type": "LoadImage",
+                           "inputs": {"image": c.upload_image(path)}},
+                     "2": {"class_type": POSE_NODE, "inputs": {"image": ["1", 0]}}}
+            entry = c.listen_for_progress(c.queue_workflow(graph), lambda *a: None,
+                                          stop=stop, timeout=180)
+            if entry is None:
+                raise ComfyError("Stopped before %s answered." % b["name"])
+            text = ((entry.get("outputs") or {}).get("2") or {}).get("text") or []
+            try:
+                return json.loads(text[0]), b
+            except (IndexError, TypeError, ValueError):
+                raise ComfyError("%s could not find the pose: %s" % (
+                    b["name"], "; ".join(run_errors(entry, graph)) or "it said nothing"))
+        raise ComfyError(
+            "No backend can find a pose in a photo: %s. The finder is a ComfyUI node "
+            "of ours: copy comfy_nodes/studio_dwpose into ComfyUI's custom_nodes, put "
+            "yolox_l.onnx and dw-ll_ucoco_384.onnx (huggingface.co/yzd-v/DWPose) in a "
+            "'dwpose' model folder, and restart ComfyUI."
+            % ("; ".join(why) or "no backend is enabled"))
 
     def submit(self, settings):
         """Queue the form's settings: one job per picture in the batch, each

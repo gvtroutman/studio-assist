@@ -37,6 +37,7 @@ slow for every mouse move.
 import base64
 import copy
 import json
+import math
 import os
 import threading
 import tkinter as tk
@@ -77,6 +78,7 @@ class SceneBuilder:
         self.tool_pills = {}
         self.frame_rect = (0, 0, 1, 1, 1.0)      # ox, oy, w, h, scale on the canvas
         self.making = {}              # surface -> words sent, while its picture is made
+        self.posing = set()           # ids of the people a photo's pose is being found for
         self.taken = set()            # ids of the finished picture jobs already used
         self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
         self.bake_after = None
@@ -613,10 +615,19 @@ class SceneBuilder:
         o, p = self.owner, self.panel
         pose = obj["pose"]
         o.cap(p, "Pose")
-        self.pose_pill = o.choice(p, [(k, label) for k, label, _ in sc.POSES] +
+        row = o.frame(p)
+        row.pack(side="top", fill="x")
+        self.pose_pill = o.choice(row, [(k, label) for k, label, _ in sc.POSES] +
                                   ([("", "Custom")] if not pose["preset"] else []),
                                   pose["preset"], self._set_pose)
-        self.pose_pill.pack(side="top", anchor="w")
+        self.pose_pill.pack(side="left")
+        busy = obj["id"] in self.posing
+        photo = o.button(row, "Finding the pose…" if busy else "From a photo…",
+                         lambda: self.pose_from_photo(obj["id"]), kind="ghost",
+                         font=self.host.f_small)
+        photo.pack(side="left", padx=(o.px(6), 0))
+        if busy:
+            photo.set(state="disabled")
         tabs = o.frame(p)
         tabs.pack(side="top", fill="x", pady=(o.px(8), o.px(4)))
         for i, (part, label) in enumerate(sc.PARTS):
@@ -693,6 +704,87 @@ class SceneBuilder:
         obj["pose"] = {"preset": preset, "controls": sc.pose_controls(preset)}
         self._inspect()
         self.changed()
+
+    def pose_from_photo(self, oid, path=None):
+        """Pose a person as the most prominent person in a photo: a backend's
+        pose finder (`Studio.find_poses`) reads the photo's points and
+        `studio_scene.fit_pose` fits the controls and the way they face to
+        them, both off the UI thread; the result lands through `_posed`."""
+        obj = self.obj(oid)
+        if obj is None or "pose" not in obj or oid in self.posing:
+            return False
+        if path is None:
+            path = filedialog.askopenfilename(
+                parent=self.win, title="A photo of the pose for %s" % obj["name"],
+                filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                           ("All files", "*.*")])
+        if not path:
+            return False
+        shape = sc.body_shape(obj.get("look"))
+        box = {}
+
+        def work():
+            try:
+                data, b = self.owner.studio.find_poses(path)
+                folk = sc.photo_people(data)
+                if not folk:
+                    raise ValueError("%s found no one in %s." % (b["name"],
+                                                                os.path.basename(path)))
+                box["fit"] = sc.fit_pose(folk[0]["points"], shape, folk[0]["box"])
+                box["count"] = len(folk)
+            except (ig.ComfyError, OSError, ValueError) as e:
+                box["error"] = e
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        self.posing.add(oid)
+        if self.sel == oid:
+            self._inspect()
+        self.status("Finding the pose in %s…" % os.path.basename(path), "muted")
+
+        scene = self.scene
+
+        def wait():
+            if worker.is_alive():
+                self.win.after(100, wait)
+                return
+            self.posing.discard(oid)
+            if self.scene is scene:       # not another scene opened meanwhile
+                self._posed(oid, path, box)
+        self.win.after(100, wait)
+        return True
+
+    def _posed(self, oid, path, box):
+        obj = self.obj(oid)
+        if obj is None:                   # deleted meanwhile
+            return
+        name = os.path.basename(path)
+        if "error" in box:
+            if self.sel == oid:
+                self._inspect()
+            self.status("Could not pose from %s: %s" % (name, box["error"]), "err")
+            return
+        fit = box["fit"]
+        obj["pose"] = {"preset": "", "controls": fit.controls}
+        # The photo's camera is the scene's: facing it, then turned as they were.
+        w, h = sc.frame_size(self.scene)
+        eye = sc.Camera(self.scene["camera"], w, h).eye
+        x, _, z = obj["position"]
+        toward = math.degrees(math.atan2(eye[0] - x, eye[2] - z))
+        obj["rotation"][0] = round((toward + fit.yaw + 180) % 360 - 180, 1)
+        if self.sel == oid:
+            self._inspect()
+        self.changed()
+        said = ["Posed %s from %s" % (obj["name"], name)]
+        if box["count"] > 1:
+            said.append("the most prominent of %d people" % box["count"])
+        if fit.unseen:
+            said.append("the photo does not show %s, so %s at rest"
+                        % (" or ".join(fit.unseen), "it is" if len(fit.unseen) == 1
+                                                    else "they are"))
+        self.status("; ".join(said) + "." + (
+            " The fit is rough: adjust it by hand." if fit.rough else
+            " A flat photo cannot say how far a limb reaches towards the camera; "
+            "adjust it by hand if it looks off."), "err" if fit.rough else "ok")
 
     def _reset_part(self):
         obj = self.obj()
