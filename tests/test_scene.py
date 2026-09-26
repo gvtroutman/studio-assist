@@ -1327,7 +1327,34 @@ class TestSceneFromPicture(unittest.TestCase):
     def test_a_reply_that_is_not_json_leaves_the_words_empty(self):
         for text in ("I can't see the people.", "{broken", "", None, "[1, 2]"):
             self.assertEqual(sc.picture_answer(text),
-                             {"setting": "", "floor": "", "people": []})
+                             {"setting": "", "floor": "", "walls": "", "indoors": False,
+                              "people": []})
+
+    def test_an_indoor_photo_gets_walls_round_the_camera_and_people(self):
+        data = picture_of(self.TRUTH)
+        read = sc.picture_answer(json.dumps({
+            "setting": "A beer hall", "floor": "worn oak boards", "indoors": True,
+            "walls": "dark wood panelling..."}), 1344, 768)
+        self.assertEqual(read["walls"], "dark wood panelling")
+        scene, _ = sc.picture_scene(data, read)
+        room = scene["room"]
+        self.assertTrue(room["walls"])
+        self.assertEqual(room["wall"]["prompt"], "dark wood panelling")
+        eye = sc.Camera(scene["camera"], 100, 100).eye
+        for x, z in [(eye[0], eye[2])] + [(o["position"][0], o["position"][2])
+                                          for o in scene["objects"]]:
+            self.assertLess(abs(x), room["width"] / 2)            # inside, not in a wall
+            self.assertLess(abs(z), room["depth"] / 2)
+        self.assertGreater(room["height"], eye[1])
+
+    def test_an_outdoor_photo_has_no_walls(self):
+        for reply in ({"indoors": False, "walls": "a stone church"},
+                      {"indoors": "no", "walls": "brick"}, {"walls": "brick"}):
+            read = sc.picture_answer(json.dumps(reply))
+            self.assertEqual((read["indoors"], read["walls"]), (False, ""))
+            scene, _ = sc.picture_scene(picture_of(self.TRUTH), read)
+            self.assertFalse(scene["room"]["walls"])
+        self.assertTrue(sc.picture_answer('{"indoors": "true"}')["indoors"])
 
     def test_the_question_gives_the_photos_size_and_how_many(self):
         q = sc.picture_question([{"box": [0, 0, 50, 100]}, {"box": [100, 50, 200, 200]}],
@@ -1564,8 +1591,24 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertTrue(sb.dirty)
         self.assertIn("Made a scene from meadow.jpg: 3 people", sb.msg.cget("text"))
         self.assertEqual(sb.history.labels()[-1], "From meadow.jpg")
+        self.assertEqual(sb.making, {})                    # no floor said: nothing made
 
-        self.app.vision = None                                  # no eyes: still a scene
+        # Indoors, the floor and walls it saw are made at once.
+        Eyes.ask = lambda self, path, question, max_tokens=400: json.dumps(
+            {"setting": "A beer hall", "floor": "oak boards", "indoors": True,
+             "walls": "whitewashed plaster"})
+        sb.dirty = False
+        n = len(ui.jobs)
+        sb.from_picture("C:/photos/hall.jpg")
+        self.pump(lambda: not sb.picturing, 60)
+        self.assertTrue(sb.scene["room"]["walls"])
+        self.assertEqual(len(ui.jobs), n + 2)
+        self.assertEqual({j.settings["scene_texture"] for j in ui.jobs[:2]},
+                         {"floor", "wall"})
+        self.pump(lambda: sb.scene["room"]["floor"]["image"]
+                  and sb.scene["room"]["wall"]["image"])
+
+        self.app.vision = None                                 # no eyes: still a scene
         sb.dirty = False
         sb.from_picture("C:/photos/meadow.jpg")
         self.pump(lambda: not sb.picturing, 60)

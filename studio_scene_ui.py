@@ -1894,6 +1894,17 @@ class SceneBuilder:
                 % (name, n, "person" if n == 1 else "people")]
         if "unread" in box:
             said.append("the words are left to you, as %s" % box["unread"])
+        # The floor and walls the photo showed are made at once, as a Make
+        # on each would; one that is not sent is said, and Make is still there.
+        room = self.scene["room"]
+        made = [sc.SURFACE_NAMES[k].lower() for k, _, _ in sc.SURFACES
+                if room[k]["prompt"].strip() and (k != "wall" or room["walls"])
+                and self.make_texture(k)]
+        if made:
+            said.append("making the %s in the Image Studio" % " and ".join(made))
+        elif room["floor"]["prompt"].strip():
+            said.append("the floor was not sent to the Image Studio (%s)"
+                        % (self.owner.note.cget("text") or "see the form"))
         self.status("; ".join(said) + ". " + " ".join(box["notes"]) + (
             " The lens and camera tilt are guessed; a flat picture cannot say them."),
             "warn" if box["notes"] or "unread" in box else "ok")
