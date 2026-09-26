@@ -42,6 +42,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import studio_critic as critic
 import studio_doctor as doctor
 from studio_comfy_mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, ComfyError,
                               Unreachable, _explain, head_square, outputs_of, oval_png,
@@ -1087,17 +1088,34 @@ FACE_NODES = {"CheckpointLoaderSimple", "SAM3_Detect", "PreviewAny", "GetImageSi
               "ImageCropV2", "ImageScale", "ImageToMask", "ImageCompositeMasked", "LoadImage"}
 
 
+# The Visual Critic's redraws (Studio._refine). A hand at 0.6 kept its shape
+# in the reverted hand pass of 2026-09-25, and 0.85-0.9 left double hands, so
+# a local fix stays at 0.6: it mends fingers, it does not re-pose them.
+CRITIC_DENOISE = {"FACE_CORRECTION": 0.45, "LOCAL_INPAINT": 0.6,
+                  "OBJECT_CORRECTION": 0.6, "GLOBAL_REFINEMENT": 0.2}
+REGION_PAD = 1.6
+
+
+def png_size(raw):
+    """(width, height) from a PNG's header, or None."""
+    if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+        return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    return None
+
+
 def _is_link(x):
     return isinstance(x, list) and len(x) == 2 and isinstance(x[0], str) and isinstance(x[1], int)
 
 
-def add_face_finder(graph, sam3):
+def add_face_finder(graph, sam3, pixels=None, prompt="face:8"):
     """Into a filled graph: SAM3's face boxes and the picture's size for its
-    SaveImage's picture, as PreviewAny text (read by `face_boxes`)."""
-    save = next(nid for nid, n in graph.items() if n["class_type"] == "SaveImage")
-    pixels = graph[save]["inputs"]["images"]
+    SaveImage's picture (or `pixels`), as PreviewAny text (read by
+    `face_boxes`). `prompt` finds something else: "hand:4"."""
+    if pixels is None:
+        save = next(nid for nid, n in graph.items() if n["class_type"] == "SaveImage")
+        pixels = graph[save]["inputs"]["images"]
     graph["fd1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}}
-    graph["fd2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "face:8",
+    graph["fd2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt,
                                                                "clip": ["fd1", 1]}}
     graph["fd3"] = {"class_type": "SAM3_Detect", "inputs": {
         "model": ["fd1", 0], "image": pixels, "conditioning": ["fd2", 0], "threshold": 0.3,
@@ -1141,7 +1159,9 @@ def face_graph(wf, values, loras, image, crops, oval, prefix):
     blended back through `oval`, saved under `prefix`. The model, VAE and
     conditioning come from the template's `face_detail` section, filled like
     the rest (so the LoRA chain is the job's), keeping only the nodes they
-    need."""
+    need. A crop may carry its own `edit` (width, height) to redraw at and
+    `mask` False to lay the redraw back whole (the Visual Critic's
+    whole-picture pass); a face crop has neither."""
     fd = wf["face_detail"]
     values = dict(wf.get("defaults") or {}, **{k: x for k, x in values.items() if x is not None})
     extra = dict(fd.get("nodes") or {})
@@ -1161,11 +1181,14 @@ def face_graph(wf, values, loras, image, crops, oval, prefix):
     g["fo"] = {"class_type": "LoadImage", "inputs": {"image": oval}}
     seed, last = int(values["seed"]), ["fi", 0]
     for i, crop in enumerate(crops):
-        n, side = "fc%d_" % (i + 1), crop["width"]
-        g[n + "1"] = {"class_type": "ImageCropV2", "inputs": {"image": last, "crop_region": crop}}
+        n, side, tall = "fc%d_" % (i + 1), crop["width"], crop["height"]
+        ew, eh = crop.get("edit") or (FACE_EDIT, FACE_EDIT)
+        region = {k: crop[k] for k in ("x", "y", "width", "height")}
+        g[n + "1"] = {"class_type": "ImageCropV2", "inputs": {"image": last,
+                                                              "crop_region": region}}
         g[n + "2"] = {"class_type": "ImageScale", "inputs": {
-            "image": [n + "1", 0], "upscale_method": "lanczos", "width": FACE_EDIT,
-            "height": FACE_EDIT, "crop": "disabled"}}
+            "image": [n + "1", 0], "upscale_method": "lanczos", "width": ew,
+            "height": eh, "crop": "disabled"}}
         g[n + "3"] = {"class_type": "VAEEncode", "inputs": {"pixels": [n + "2", 0],
                                                             "vae": links["vae"]}}
         g[n + "4"] = {"class_type": "KSampler", "inputs": {
@@ -1178,10 +1201,16 @@ def face_graph(wf, values, loras, image, crops, oval, prefix):
                                                             "vae": links["vae"]}}
         g[n + "6"] = {"class_type": "ImageScale", "inputs": {
             "image": [n + "5", 0], "upscale_method": "lanczos", "width": side,
-            "height": side, "crop": "disabled"}}
+            "height": tall, "crop": "disabled"}}
+        if crop.get("mask") is False:
+            g[n + "9"] = {"class_type": "ImageCompositeMasked", "inputs": {
+                "destination": last, "source": [n + "6", 0], "x": crop["x"], "y": crop["y"],
+                "resize_source": False}}
+            last = [n + "9", 0]
+            continue
         g[n + "7"] = {"class_type": "ImageScale", "inputs": {
             "image": ["fo", 0], "upscale_method": "bilinear", "width": side,
-            "height": side, "crop": "disabled"}}
+            "height": tall, "crop": "disabled"}}
         g[n + "8"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "7", 0],
                                                               "channel": "red"}}
         g[n + "9"] = {"class_type": "ImageCompositeMasked", "inputs": {
@@ -1257,7 +1286,8 @@ def default_settings():
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
-            "face_detail": None, "batch": 1,
+            "face_detail": None, "batch": 1, "auto_refine": False,
+            "refine_passes": 3,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -1696,6 +1726,10 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if why == "added" and rec["trigger"] and rec["trigger"] not in " ".join(parts):
             parts.append(rec["trigger"])
     p.prompt = ". ".join(x.rstrip(" .") for x in parts if x) + ("." if parts else "")
+    if s.get("prompt_override"):
+        # The Visual Critic's regeneration: its compiled prompt, built round
+        # the prompt above (studio_critic.generator_prompt), in its place.
+        p.prompt = s["prompt_override"]
     if not p.prompt:
         p.errors.append("Describe the scene or the person, or choose a person.")
     p.negative = ", ".join(x for x in (s["negative"].strip(),
@@ -1945,6 +1979,7 @@ class Job:
         self.graph = None             # the graph as submitted
         self.face_graph = None        # the face pass's graph, when it ran
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
+        self.refinement = None        # the Visual Critic's passes, when it ran
         self.notes = []               # things said on the way (no live progress, ...)
         self.cancel = threading.Event()
 
@@ -2265,12 +2300,13 @@ class Studio:
     LM Studio off a shared GPU before a job there (Chat._images_make_room)."""
 
     def __init__(self, root=None, notify=lambda job: None, make_room=None,
-                 client_factory=None, workflow_loader=load_workflow):
+                 client_factory=None, workflow_loader=load_workflow, vision=None):
         self.lib = Library(root)
         self.history = History(os.path.join(self.lib.root, "history"))
         self.client_factory = client_factory or ComfyUIClient   # read late: tests swap it
         self.workflow_loader = workflow_loader
         self.make_room = make_room
+        self.vision = vision          # () -> studio_agent.Vision or None: the critic's eyes
         self.clients = {}
         self.health = {}              # backend id -> health dict (+ "at")
         self.inventories = {}         # backend id -> {kind: set}
@@ -2669,6 +2705,8 @@ class Studio:
             files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
             if graph2 is not None:
                 job.face_graph = graph2
+        if job.settings.get("auto_refine") and not job.cancel.is_set():
+            files = self._refine(job, client, plan, values, files, say)
         if job.cancel.is_set():
             return self.queue._finish(job, "cancelled")
         say("decoding", "fetching the picture from %s" % b["name"], None)
@@ -2748,6 +2786,206 @@ class Studio:
         plan.notes.append("Face pass: %d face%s redrawn at %d px, denoise %s" % (
             n, "" if n == 1 else "s", FACE_EDIT, values.get("face_denoise")))
         return files2, graph
+
+    # ------------------------------------------------------ Visual Critic
+    def _refine(self, job, client, plan, values, files, say):
+        """Automatic refinement, on the lane's thread: the vision model looks
+        at the picture (studio_critic), what it finds right is left alone,
+        and what it finds wrong is redrawn with the tool the fault calls for -
+        the face pass's crop-redraw-blend for faces, hands and objects, the
+        same at low denoise over the whole picture for a touch-up, and a new
+        picture only for a structural failure. Up to `refine_passes` passes,
+        stopping as soon as the critic finds nothing meaningful. Never loses
+        the picture: any failure keeps the last good one. -> files."""
+        s = job.settings
+        try:
+            vision = self.vision() if self.vision else None
+        except Exception:
+            vision = None
+        if vision is None:
+            plan.warnings.append("Automatic refinement needs a vision model on the LLM host "
+                                 "and none is served; the picture is as made.")
+            return files
+        idents = [self.lib.get("identities", x.get("id") if isinstance(x, dict) else x)
+                  for x in s.get("identities") or []]
+        idents = [i for i in idents if i]
+        style = self.lib.get("styles", s.get("style")) if s.get("style") else None
+        intent = critic.intent_from(s, plan.prompt)
+        canonical = critic.initial_canonical(s, SLOTS, [i["name"] for i in idents],
+                                             style["name"] if style else None)
+        refs = [plan.references["face"]] if plan.references.get("face") else []
+        refs += [i["references"][0] for i in idents if i.get("references")
+                 and i["references"][0] not in refs]
+        passes = max(0, min(int(s.get("refine_passes") or critic.MAX_PASSES), 6))
+        history = [{"pass": 0, "type": "initial_generation", "image": files[0]["filename"]}]
+        log, stop = [], "pass limit reached"
+        for n in range(1, passes + 1):
+            if job.cancel.is_set():
+                stop = "cancelled"
+                break
+            say("refining", "Analyzing result" + ("" if n == 1 else " again") + "...", None)
+            try:
+                raw = client.fetch(files[0])
+                result = critic.analyze_generated_image(vision, raw, intent, canonical, refs)
+            except Exception as e:
+                plan.warnings.append("The Visual Critic could not read the picture (%s); "
+                                     "it is kept as it was." % e)
+                stop = "critic failed"
+                break
+            nxt = critic.plan_next_refinement(result, canonical)
+            canonical, promoted = critic.merge_canonical(canonical, nxt["promote"])
+            text = critic.log_text(n, result, nxt)
+            log.append(text)
+            self._critic_log(job, text)
+            if not nxt["needs_pass"]:
+                stop = "no meaningful problems left"
+                break
+            self._critic_log(job, critic.build_refinement_instructions(
+                intent, canonical, nxt["preserve"], nxt["correct"]))
+            done, errors = [], []
+            for action in nxt["actions"]:
+                if job.cancel.is_set():
+                    break
+                say("refining", critic.progress_text(action) + "...", None)
+                try:
+                    got = self._correct(job, client, plan, values, files, raw, action,
+                                        intent, canonical, n, say)
+                except (ComfyError, TemplateError, OSError, ValueError) as e:
+                    errors.append("%s: %s" % (action["type"], e))
+                    continue
+                if got:
+                    files = got
+                    done.append(action)
+            history.append({"pass": n, "type": " + ".join(a["type"].lower() for a in done)
+                            or "none", "changes": [c for a in done for c in a["corrections"]],
+                            "promoted": promoted, "errors": errors,
+                            "image": files[0]["filename"]})
+            for e in errors:
+                plan.warnings.append("Refinement pass %d could not run %s" % (n, e))
+            if not done:
+                stop = "nothing could be corrected"
+                break
+        job.refinement = {"intent": dict(intent), "canonical": canonical,
+                          "history": history, "stopped": stop, "log": log}
+        made = [h for h in history[1:] if h["type"] != "none"]
+        plan.notes.append("Visual Critic: %d refinement pass%s; stopped: %s." % (
+            len(made), "" if len(made) == 1 else "es", stop))
+        return files
+
+    def _critic_log(self, job, text):
+        """The debug log: image-studio/visual_critic.log, a block per look."""
+        try:
+            os.makedirs(self.lib.root, exist_ok=True)
+            with open(os.path.join(self.lib.root, "visual_critic.log"), "a",
+                      encoding="utf-8") as f:
+                f.write("[%s job %s]\n%s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                job.id, text))
+        except OSError:
+            pass
+
+    def _correct(self, job, client, plan, values, files, raw, action, intent, canonical,
+                 n, say):
+        """One planned correction on the current picture. -> the new files, or
+        None when there was nothing to redraw (no face or hand found)."""
+        kind, target, fixes = action["type"], action["target"], action["corrections"]
+        b, wf = job.backend, plan.workflow
+        if kind == "FULL_REGENERATION":
+            return self._regenerate(job, client, critic.generator_prompt(
+                intent, canonical, fixes), n, say)
+        if not wf.get("face_detail"):
+            raise ValueError("the %s workflow has no redraw section" % wf.get("label"))
+        f = files[0]
+        image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                f["filename"], f.get("type") or "output")
+        v = dict(values, seed=(int(values["seed"]) + 1000 * n) % (MAX_SEED + 1))
+        if kind == "GLOBAL_REFINEMENT":
+            w, h = png_size(raw) or (int(values["width"]), int(values["height"]))
+            scale = min(1.0, (1.05e6 / float(w * h)) ** 0.5)
+            crops = [{"x": 0, "y": 0, "width": w, "height": h, "mask": False,
+                      "edit": (max(256, int(w * scale) // 16 * 16),
+                               max(256, int(h * scale) // 16 * 16))}]
+            v["face_prompt"] = critic.generator_prompt(intent, canonical, fixes)
+        else:
+            sam3 = self._sam3_of(b)
+            if not sam3:
+                raise ValueError("%s has no SAM3 checkpoint to find the %s"
+                                 % (b["name"], target))
+            found = face_boxes(self._run_quick(client, add_face_finder(
+                {"fi": {"class_type": "LoadImage", "inputs": {"image": image}}}, sam3,
+                ["fi", 0], ("face:8" if kind == "FACE_CORRECTION" else "%s:4" % target))))
+            if not found or not found[2]:
+                return None
+            w, h, boxes = found
+            if kind == "FACE_CORRECTION":
+                crops = [head_square(bx, w, h, FACE_PAD) for bx in boxes]
+                v["face_prompt"] = FACE_PROMPT % critic.generator_prompt(intent, canonical,
+                                                                         fixes)
+            else:
+                crops = [head_square(bx, w, h, REGION_PAD) for bx in boxes[:4]]
+                v["face_prompt"] = critic.generator_prompt(intent, canonical, fixes,
+                                                           focus=target) + (
+                    " " + anatomy_text() if target == "hand" else "")
+            crops = [c for c in crops if c["width"] >= 64]
+            if not crops:
+                return None
+        v["face_denoise"] = CRITIC_DENOISE[kind] if kind != "FACE_CORRECTION" else max(
+            CRITIC_DENOISE[kind], float(values.get("face_denoise") or 0))
+        oval = os.path.join(self.lib.root, "face_oval.png")
+        if not os.path.isfile(oval):
+            os.makedirs(self.lib.root, exist_ok=True)
+            with open(oval, "wb") as fh:
+                fh.write(oval_png())
+        graph = face_graph(wf, v, plan.loras, image, crops, client.upload_image(oval),
+                           "%s_pass%d_%s" % (values["filename_prefix"], n, kind.lower()))
+        return self._run_pass(job, client, graph, say, critic.progress_text(action))
+
+    def _regenerate(self, job, client, prompt, n, say):
+        """A new picture from the compiled prompt and a new seed, for a
+        structural failure only. The face pass is left to the critic."""
+        b = job.backend
+        s = copy.deepcopy(job.settings)
+        s.update(prompt_override=prompt, face_detail=False, auto_refine=False,
+                 seed=(int(s.get("seed") or 0) + 7919 * n) % (MAX_SEED + 1))
+        p = compose(s, self.lib, b, self.inventories.get(b["id"]), self.workflow_loader,
+                    self.nodes.get(b["id"]))
+        if p.errors:
+            raise ValueError(" ".join(p.errors))
+        v = dict(p.values)
+        for var, path in p.images.items():
+            v[var] = client.upload_image(path)
+        v["filename_prefix"] = "ImageStudio/%s_%s_regen%d" % (
+            p.workflow.get("id", "job"), job.id, n)
+        return self._run_pass(job, client, fill(p.workflow, v, p.loras), say,
+                              "Regenerating the picture")
+
+    def _sam3_of(self, backend):
+        inv = self.inventories.get(backend["id"]) or {}
+        sam = sorted(c for c in inv.get("checkpoints") or () if SAM3 in c.lower())
+        return sam[0] if sam else None
+
+    def _run_pass(self, job, client, graph, say, label):
+        """Run one refinement graph to its end. -> files, or None if cancelled.
+        Raises ComfyError when it ends without a picture."""
+        job.prompt_id = client.queue_workflow(graph)
+
+        def on_event(kind, data):
+            if kind == "progress" and data[1]:
+                say("refining", "%s · step %d of %d" % (label, data[0], data[1]),
+                    data[0] / float(data[1]))
+        watch = client.watch() if hasattr(client, "watch") else None
+        try:
+            entry = client.listen_for_progress(
+                job.prompt_id, on_event, stop=job.cancel.is_set,
+                **({"watch": watch} if watch is not None else {}))
+        finally:
+            if watch is not None:
+                watch.close()
+        if entry is None:
+            return None
+        out = outputs_of(entry)
+        if not out:
+            raise ComfyError("; ".join(run_errors(entry, graph)) or "no picture")
+        return out
 
     def _progress(self, job, graph, say):
         """The on_event for one job: ComfyUI's events as Queued -> Loading ->
@@ -2852,6 +3090,7 @@ class Studio:
             "settings": s,
             "graph": graph,
             "face_graph": job.face_graph,
+            "refinement": job.refinement,
         }
 
     def close(self):

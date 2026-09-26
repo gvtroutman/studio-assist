@@ -88,7 +88,8 @@ def photo_at(path, side, master):
 class ImageStudio:
     def __init__(self, host, session):
         self.host, self.s = host, session
-        self.studio = ig.Studio(notify=self._notify, make_room=host._images_make_room)
+        self.studio = ig.Studio(notify=self._notify, make_room=host._images_make_room,
+                                vision=lambda: getattr(host, "vision", None))
         self.settings = ig.default_settings()
         self.idents = {}              # identity id -> (BooleanVar, DoubleVar, scale row)
         self.loras = []               # [{"id", "var", "row"}]
@@ -112,6 +113,7 @@ class ImageStudio:
         self.refine_set = False       # the user touched it; the preset no longer decides
         self.faces = tk.BooleanVar(value=False)
         self.faces_set = False        # likewise for the face pass
+        self.auto_refine = tk.BooleanVar(value=False)   # the Visual Critic
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
         self._build(session.frame)
@@ -400,6 +402,15 @@ class ImageStudio:
         self.go.pack(side="left")
         self.label(grow, "Ctrl+Enter in the scene", "faint", self.host.f_small).pack(
             side="left", padx=(self.px(10), 0))
+        # The Visual Critic (studio_critic): the vision model checks the
+        # picture and the faults it finds are redrawn, up to three passes.
+        b = tk.Checkbutton(f, text="Automatic refinement (a vision model checks the picture "
+                           "and fixes what is wrong)", variable=self.auto_refine,
+                           anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
+                           wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(12)), before=grow, **pad)
         self._rebuild_choices()
 
     def _rebuild_choices(self):
@@ -885,6 +896,7 @@ class ImageStudio:
         s["references"] = dict(self.refs)
         s["refine"] = bool(self.refine.get())
         s["face_detail"] = bool(self.faces.get())
+        s["auto_refine"] = bool(self.auto_refine.get())
         for key, _, kind in ADVANCED:
             raw = self.adv[key].get().strip()
             if not raw:
@@ -935,6 +947,7 @@ class ImageStudio:
         self.refine_set = True
         self.faces.set(bool(s.get("face_detail")))
         self.faces_set = True
+        self.auto_refine.set(bool(s.get("auto_refine")))
         for r in list(self.loras):
             r["row"].destroy()
         self.loras = []
