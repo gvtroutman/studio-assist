@@ -1121,8 +1121,7 @@ class SceneBuilder:
         except (OSError, ValueError) as e:
             self.status("Could not open %s: %s" % (os.path.basename(path), e), "err")
             return False
-        self.scene, self.path = scene, path
-        self.dirty = any(p.startswith(sc.UPGRADED) for p in problems)
+        self.scene, self.path, self.dirty = scene, path, False
         self.sel = None
         self.making, self.suggestion = {}, None
         self._list()
