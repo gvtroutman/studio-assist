@@ -14,9 +14,14 @@ pieces:
   each hand and foot - and `POSES`, presets of those controls. Everything
   stands on its floor: an object's lowest point is put at its `position` y
   (`ground`), so a crouch drops the hips and a tipped drum lies on the floor.
-- **Props** (`ASSETS`): a box and a cylinder, sized by scale in metres. What a
-  prop *is* - a crate, a workbench, a gas cylinder - is its name and its
-  description; the shape only holds its place in the frame.
+- **Shapes and props** (`ASSETS`, `MESHES`): box, cylinder, sphere, cone,
+  wedge and pyramid, and props made of a few parts - table, chair, bench,
+  barrel, tree, bush, lamp post, parasol, car, fence - each sized by scale in
+  metres. What a prop *is* is its name and its description; the shape only
+  holds its place in the frame.
+- **A background crowd** (`crowd_members`): one object, many mannequins -
+  each their own height, build, skin, clothes, pose and facing, dealt from a
+  seed - said in the words as one line.
 - **The room** (`new_room`): the floor, and optionally four walls around the
   origin. Either can wear a picture - one the Image Studio makes from a few
   words (`texture_settings`), or a PNG from disk - repeated every `size`
@@ -49,6 +54,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import struct
 import zlib
@@ -1026,23 +1032,161 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
 
 
 # ==================================================================== assets
-# What the library offers. A prop's mesh is a unit shape standing on the
-# floor, sized by the object's scale; the person is the rig above. Blender
+# What the library offers. A shape or a prop is a mesh in a unit box
+# (x and z -0.5..0.5, y 0..1), standing on the floor, sized by the object's
+# scale in metres; the person is the rig above, and a crowd is people. Blender
 # can make better ones later; the scene file names an asset by id, not by
-# geometry, so a scene keeps opening when the geometry improves.
+# geometry, so a scene keeps opening when the geometry improves. `group` is
+# where the library lists it.
 ASSETS = [
-    {"id": "person", "label": "Person", "kind": "person", "name": "Person",
-     "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
+    {"id": "person", "label": "Person", "kind": "person", "group": "people",
+     "name": "Person", "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
      "about": "A posable mannequin, 1.8 m. Describe who they are and what they are doing."},
-    {"id": "box", "label": "Box", "kind": "prop", "name": "Crate", "colour": "#8a6a4a",
-     "scale": [0.6, 0.6, 0.6],
+    {"id": "crowd", "label": "Background crowd", "kind": "crowd", "group": "people",
+     "name": "Crowd", "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
+     "about": "Background people, as many as you like in an area. Describe them "
+              "together: who they are, what they wear, what they are doing."},
+    {"id": "box", "label": "Box", "kind": "prop", "group": "shape", "name": "Crate",
+     "colour": "#8a6a4a", "scale": [0.6, 0.6, 0.6],
      "about": "Any boxy thing: a crate, a bench, a cabinet, a wall. Size it in metres."},
-    {"id": "cylinder", "label": "Cylinder", "kind": "prop", "name": "Drum",
-     "colour": "#4f7fb5", "scale": [0.6, 0.9, 0.6],
+    {"id": "cylinder", "label": "Cylinder", "kind": "prop", "group": "shape",
+     "name": "Drum", "colour": "#4f7fb5", "scale": [0.6, 0.9, 0.6],
      "about": "Any round thing: a drum, a gas cylinder, a post, a pipe laid down."},
+    {"id": "sphere", "label": "Sphere", "kind": "prop", "group": "shape", "name": "Ball",
+     "colour": "#b0342f", "scale": [0.5, 0.5, 0.5],
+     "about": "Any round thing: a ball, a globe lamp, a boulder. Size it in metres."},
+    {"id": "cone", "label": "Cone", "kind": "prop", "group": "shape", "name": "Cone",
+     "colour": "#d9772f", "scale": [0.4, 0.7, 0.4],
+     "about": "A traffic cone, a spire, a pile of sand. Size it in metres."},
+    {"id": "wedge", "label": "Wedge", "kind": "prop", "group": "shape", "name": "Ramp",
+     "colour": "#8b8d91", "scale": [1.0, 0.5, 1.5],
+     "about": "A ramp or a slope, rising towards its back. Size it in metres."},
+    {"id": "pyramid", "label": "Pyramid", "kind": "prop", "group": "shape",
+     "name": "Pyramid", "colour": "#cdbb9a", "scale": [1.0, 0.8, 1.0],
+     "about": "A pyramid, a roof, a pointed pile. Size it in metres."},
+    {"id": "table", "label": "Table", "kind": "prop", "group": "prop", "name": "Table",
+     "colour": "#8a6a4a", "scale": [1.4, 0.75, 0.8],
+     "about": "A table on four legs. Say what it is and what is on it."},
+    {"id": "chair", "label": "Chair", "kind": "prop", "group": "prop", "name": "Chair",
+     "colour": "#8a6a4a", "scale": [0.45, 0.9, 0.45],
+     "about": "A chair, its back behind it. Turn it to face the way it is sat in."},
+    {"id": "bench", "label": "Bench", "kind": "prop", "group": "prop", "name": "Bench",
+     "colour": "#8a6a4a", "scale": [1.8, 0.45, 0.35],
+     "about": "A long bench, as at a beer garden table or in a park."},
+    {"id": "barrel", "label": "Barrel", "kind": "prop", "group": "prop", "name": "Barrel",
+     "colour": "#7a5536", "scale": [0.6, 0.9, 0.6],
+     "about": "A barrel with hoops: a beer keg, a rain barrel. Lay it down with Tip."},
+    {"id": "tree", "label": "Tree", "kind": "prop", "group": "prop", "name": "Tree",
+     "colour": "#4f7d4a", "scale": [2.6, 4.5, 2.6],
+     "about": "A leafy tree. Say what kind, and the season."},
+    {"id": "bush", "label": "Bush", "kind": "prop", "group": "prop", "name": "Bush",
+     "colour": "#4f7d4a", "scale": [1.2, 0.9, 1.0],
+     "about": "A shrub or a hedge; stretch it wide for a hedge."},
+    {"id": "lamp", "label": "Lamp post", "kind": "prop", "group": "prop",
+     "name": "Lamp post", "colour": "#2e2a28", "scale": [0.4, 3.5, 0.4],
+     "about": "A street lamp. Say whether it is lit."},
+    {"id": "parasol", "label": "Parasol", "kind": "prop", "group": "prop",
+     "name": "Parasol", "colour": "#e9e0c6", "scale": [2.4, 2.4, 2.4],
+     "about": "A garden or market umbrella on a pole."},
+    {"id": "car", "label": "Car", "kind": "prop", "group": "prop", "name": "Car",
+     "colour": "#3f6fb0", "scale": [1.8, 1.45, 4.4],
+     "about": "A car, its front towards +Z. Say the make, the era and its state."},
+    {"id": "fence", "label": "Fence", "kind": "prop", "group": "prop", "name": "Fence",
+     "colour": "#e9e2cc", "scale": [3.0, 1.1, 0.1],
+     "about": "A fence of posts and rails. Stretch it as long as it needs to be."},
 ]
 ASSET = {a["id"]: a for a in ASSETS}
-UNIT = {"box": box((-0.5, 0, -0.5), (0.5, 1, 0.5)), "cylinder": cylinder()}
+ASSET_GROUPS = [("people", "People"), ("shape", "Shapes"), ("prop", "Props")]
+
+
+def _slab(x0, y0, z0, x1, y1, z1):
+    return box((x0, y0, z0), (x1, y1, z1))
+
+
+def _post(x, z, y0, y1, r, n=8):
+    return prism((x, y0, z), (x, y1, z), (1, 0, 0), (r, r), (r, r), n)
+
+
+def _wedge():
+    v = [(-0.5, 0, 0.5), (0.5, 0, 0.5), (0.5, 0, -0.5), (-0.5, 0, -0.5),
+         (-0.5, 1, -0.5), (0.5, 1, -0.5)]
+    return outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (3, 2, 5, 4), (0, 4, 5, 1),
+                                                (0, 3, 4), (1, 5, 2))])
+
+
+def _pyramid():
+    v = [(-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5), (0, 1, 0)]
+    return outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (0, 1, 4), (1, 2, 4),
+                                                (2, 3, 4), (3, 0, 4))])
+
+
+def _legs(top, inset, r):
+    return [_slab(sx * (0.5 - inset) - r, 0, sz * (0.5 - inset) - r,
+                  sx * (0.5 - inset) + r, top, sz * (0.5 - inset) + r)
+            for sx in (1, -1) for sz in (1, -1)]
+
+
+def _car():
+    dark, tyre = "#2b3440", "#1f1f22"
+    wheels = [(prism((sx * 0.5, 0.2, sz * 0.3), (sx * 0.38, 0.2, sz * 0.3), (0, 1, 0),
+                     (0.2, 0.065), (0.2, 0.065), 12), tyre)
+              for sx in (1, -1) for sz in (1, -1)]
+    v = [(-0.44, 0.5, 0.18), (0.44, 0.5, 0.18), (0.44, 0.5, -0.36), (-0.44, 0.5, -0.36),
+         (-0.38, 0.86, 0.06), (0.38, 0.86, 0.06), (0.38, 0.86, -0.28), (-0.38, 0.86, -0.28)]
+    cab = outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+                                               (3, 2, 6, 7), (0, 3, 7, 4), (1, 2, 6, 5))])
+    return [(_slab(-0.5, 0.14, -0.5, 0.5, 0.5, 0.5), None), (cab, dark)] + wheels
+
+
+def _barrel():
+    out = [(prism((0, 0, 0), (0, 0.5, 0), (1, 0, 0), (0.42, 0.42), (0.5, 0.5), 14), None),
+           (prism((0, 0.5, 0), (0, 1, 0), (1, 0, 0), (0.5, 0.5), (0.42, 0.42), 14), None)]
+    for y, r in ((0.1, 0.446), (0.3, 0.482), (0.7, 0.482), (0.9, 0.446)):
+        out.append((prism((0, y - 0.025, 0), (0, y + 0.025, 0), (1, 0, 0), (r, r), (r, r),
+                          14), "#3b2f28"))
+    return out
+
+
+def _fence():
+    out = [(_slab(x - 0.012, 0, -0.35, x + 0.012, 1, 0.35), None)
+           for x in (-0.488, -0.244, 0, 0.244, 0.488)]
+    out += [(_slab(-0.5, y, -0.25, 0.5, y + 0.09, 0.25), None) for y in (0.3, 0.72)]
+    return out
+
+
+# Each shape and prop: [(faces, colour or None for the object's own)].
+MESHES = {
+    "box": [(_slab(-0.5, 0, -0.5, 0.5, 1, 0.5), None)],
+    "cylinder": [(cylinder(), None)],
+    "sphere": [(ellipsoid((0, 0.5, 0), IDENTITY, (0.5, 0.5, 0.5), 14, 9), None)],
+    "cone": [(prism((0, 0, 0), (0, 1, 0), (1, 0, 0), (0.5, 0.5), (0.004, 0.004), 16), None)],
+    "wedge": [(_wedge(), None)],
+    "pyramid": [(_pyramid(), None)],
+    "table": [(_slab(-0.5, 0.94, -0.5, 0.5, 1, 0.5), None)] + [
+        (leg, None) for leg in _legs(0.94, 0.06, 0.035)],
+    "chair": [(_slab(-0.5, 0.47, -0.5, 0.5, 0.52, 0.5), None),
+              (_slab(-0.5, 0.52, -0.5, 0.5, 1, -0.4), None)] + [
+        (leg, None) for leg in _legs(0.47, 0.06, 0.05)],
+    "bench": [(_slab(-0.5, 0.85, -0.5, 0.5, 1, 0.5), None)] + [
+        (_slab(sx * 0.42 - 0.03, 0, -0.4, sx * 0.42 + 0.03, 0.85, 0.4), None)
+        for sx in (1, -1)],
+    "barrel": _barrel(),
+    "tree": [(prism((0, 0, 0), (0, 0.5, 0), (1, 0, 0), (0.05, 0.05), (0.035, 0.035), 8),
+              "#5a3e2b"),
+             (ellipsoid((0, 0.66, 0), IDENTITY, (0.5, 0.3, 0.5), 12, 7), None),
+             (ellipsoid((0.08, 0.86, -0.05), IDENTITY, (0.32, 0.14, 0.32), 10, 5), None)],
+    "bush": [(ellipsoid((0, 0.5, 0), IDENTITY, (0.5, 0.5, 0.5), 12, 7), None)],
+    "lamp": [(_post(0, 0, 0, 0.94, 0.12), None),
+             (_slab(-0.25, 0, -0.25, 0.25, 0.05, 0.25), None),
+             (ellipsoid((0, 0.95, 0), IDENTITY, (0.5, 0.05, 0.5), 10, 5), "#f2e6b0")],
+    "parasol": [(_post(0, 0, 0, 0.93, 0.018), "#8b8d91"),
+                (_slab(-0.12, 0, -0.12, 0.12, 0.03, 0.12), "#8b8d91"),
+                (prism((0, 0.76, 0), (0, 0.92, 0), (1, 0, 0), (0.5, 0.5), (0.03, 0.03), 12),
+                 None)],
+    "car": _car(),
+    "fence": _fence(),
+}
+UNIT = {k: [f for faces, _ in parts for f in faces] for k, parts in MESHES.items()}
 
 
 def painted_pieces(obj):
@@ -1060,15 +1204,177 @@ def painted_pieces(obj):
         pieces = [(part, [[mul(p, k) for p in f] for f in faces], rgb or own)
                   for part, faces, rgb in person_pieces(obj["pose"]["controls"], rot,
                                                         shape, outfit(look))]
+    elif obj["asset"] == "crowd":
+        pieces = crowd_pieces(obj)
+        if not pieces:
+            return []
     else:
-        faces = [[apply(rot, (p[0] * sx, p[1] * sy, p[2] * sz)) for p in f]
-                 for f in UNIT[obj["asset"]]]
-        pieces = [("body", [t for f in faces for t in tiles(f)], own)]
+        pieces = []
+        for mesh, rgb in MESHES[obj["asset"]]:
+            faces = [[apply(rot, (p[0] * sx, p[1] * sy, p[2] * sz)) for p in f]
+                     for f in mesh]
+            pieces.append(("body", [t for f in faces for t in tiles(f)],
+                           hex_rgb(rgb) if rgb else own))
     low = min(p[1] for _, faces, _ in pieces for f in faces for p in f)
     x, y, z = obj["position"]
     shift = (x, y - low, z)
     return [(part, [[add(p, shift) for p in f] for f in faces], rgb)
             for part, faces, rgb in pieces]
+
+
+# ==================================================================== crowds
+# A background crowd is one object: `count` people stood in a `width` x
+# `depth` area around its position, each a mannequin of their own - height,
+# build, skin, clothes, pose and facing drawn from `seed` - so the picture
+# gets many different people, not one person copied. Shuffle is a new seed.
+# `wear` is a list of outfit presets' looks (copied on, like a character's)
+# the crowd is dressed from; empty is everyday clothes.
+CROWD_LIMITS = {"count": (1, 40), "width": (1.0, 30.0), "depth": (0.5, 30.0)}
+CROWD_FACING = [("mixed", "Every way"), ("forward", "All one way"),
+                ("inward", "Towards the middle"), ("outward", "Away from the middle")]
+CROWD_ACTIVITY = [("mixed", "Mixed"), ("standing", "Standing about"),
+                  ("walking", "Walking"), ("cheering", "Cheering, raising a glass")]
+CROWD_SPACING = 0.6            # m between two people, at least
+CROWD_SKIN = ("#f1d3bd", "#e8c0a0", "#d9a67c", "#c68b5e", "#a86f45", "#8a5534",
+              "#6b3f25", "#4f2d1b")
+CROWD_TOPS = ("t-shirt", "shirt", "sweater", "hoodie", "blouse", "polo shirt",
+              "summer dress", "jacket")
+CROWD_BOTTOMS = ("jeans", "trousers", "chinos", "skirt", "shorts")
+CROWD_COLOURS = ("black", "white", "grey", "navy", "blue", "red", "green", "olive",
+                 "khaki", "beige", "brown", "burgundy", "mustard", "teal", "pink", "charcoal")
+CROWD_HAIR = ("black", "dark brown", "brown", "light brown", "auburn", "blonde", "grey",
+              "red")
+CROWD_STYLES = ("short", "short", "shoulder-length", "long", "in a ponytail", "in a bun",
+                "buzz cut", "bald", "curly")
+
+
+def new_crowd():
+    return {"count": 12, "width": 6.0, "depth": 3.0, "seed": 1, "facing": "mixed",
+            "activity": "mixed", "wear": [], "dressed": ""}
+
+
+def clean_crowd(d):
+    d = d if isinstance(d, dict) else {}
+    c = new_crowd()
+    c["count"] = int(round(_num(d.get("count"), c["count"], *CROWD_LIMITS["count"])))
+    for k in ("width", "depth"):
+        c[k] = _num(d.get(k), c[k], *CROWD_LIMITS[k])
+    c["seed"] = int(_num(d.get("seed"), 1, 0, 2 ** 31))
+    c["facing"] = d.get("facing") if d.get("facing") in dict(CROWD_FACING) else "mixed"
+    c["activity"] = (d.get("activity") if d.get("activity") in dict(CROWD_ACTIVITY)
+                     else "mixed")
+    wear = d.get("wear") if isinstance(d.get("wear"), list) else []
+    import studio_imagegen as ig
+    c["wear"] = [{k: str(w[k]).strip() for k in ig.OUTFIT_KEYS
+                  if isinstance(w.get(k), str) and w[k].strip()}
+                 for w in wear[:20] if isinstance(w, dict)]
+    c["wear"] = [w for w in c["wear"] if w]
+    c["dressed"] = str(d.get("dressed") or "")[:80]
+    return c
+
+
+def _crowd_pose(rng, activity):
+    kind = activity if activity != "mixed" else rng.choice(
+        ("standing", "standing", "chatting", "walking", "walking", "cheering"))
+    if kind == "walking":
+        c = dict(POSE_VALUES["walking"])
+        if rng.random() < 0.5:               # the other foot forward
+            for a, b in (("leg_l_step", "leg_r_step"), ("leg_l_bend", "leg_r_bend"),
+                         ("arm_l_raise", "arm_r_raise"), ("arm_l_bend", "arm_r_bend")):
+                c[a], c[b] = c.get(b, 0), c.get(a, 0)
+    elif kind == "cheering":
+        side = rng.choice("lr")
+        c = dict(POSE_VALUES["standing"])
+        c.update({"arm_%s_raise" % side: rng.uniform(130, 170),
+                  "arm_%s_bend" % side: rng.uniform(10, 50),
+                  "arm_%s_out" % side: rng.uniform(5, 25)})
+    elif kind == "chatting":
+        side = rng.choice("lr")
+        c = dict(POSE_VALUES["standing"])
+        c.update({"arm_%s_raise" % side: rng.uniform(20, 50),
+                  "arm_%s_bend" % side: rng.uniform(60, 100)})
+    else:
+        c = dict(POSE_VALUES["standing"])
+        c.update(arm_l_bend=rng.uniform(5, 30), arm_r_bend=rng.uniform(5, 30),
+                 leg_l_out=rng.uniform(0, 6), leg_r_out=rng.uniform(0, 6))
+    c["head_turn"] = rng.uniform(-30, 30)
+    c["head_nod"] = rng.uniform(-10, 12)
+    out = pose_controls("standing")
+    out.update({k: v for k, v in c.items() if k in out})
+    return out, kind
+
+
+def crowd_members(crowd):
+    """The crowd's people: [{"at": (x, z) around the middle, "yaw", "controls",
+    "look", "skin", "size"}], the same for the same settings every time."""
+    rng = random.Random(crowd["seed"])
+    w, d = crowd["width"], crowd["depth"]
+    spots = []
+    for _ in range(crowd["count"]):
+        for _try in range(60):
+            x, z = rng.uniform(-w / 2, w / 2), rng.uniform(-d / 2, d / 2)
+            if all((x - a) ** 2 + (z - b) ** 2 >= CROWD_SPACING ** 2 for a, b in spots):
+                spots.append((x, z))
+                break
+    out = []
+    for x, z in spots:
+        controls, kind = _crowd_pose(rng, crowd["activity"])
+        facing = crowd["facing"]
+        if facing == "forward":
+            yaw = rng.uniform(-25, 25)
+        elif facing in ("inward", "outward"):
+            yaw = math.degrees(math.atan2(-x, -z)) + rng.uniform(-20, 20)
+            if facing == "outward":
+                yaw += 180
+        else:
+            yaw = rng.uniform(-180, 180)
+        if crowd["wear"]:
+            look = dict(rng.choice(crowd["wear"]))
+        else:
+            top = rng.choice(CROWD_TOPS)
+            look = {"top": "%s %s" % (rng.choice(CROWD_COLOURS), top),
+                    "footwear": rng.choice(("black shoes", "brown shoes", "white sneakers",
+                                            "boots"))}
+            if "dress" not in top:
+                look["bottom"] = "%s %s" % (rng.choice(CROWD_COLOURS),
+                                            rng.choice(CROWD_BOTTOMS))
+        look.update(hair=rng.choice(CROWD_HAIR), hair_style=rng.choice(CROWD_STYLES),
+                    weight=rng.choice((-1, 0, 0, 0, 1, 1, 2)),
+                    stature=rng.choice((-1, 0, 0, 1)))
+        out.append({"at": (x, z), "yaw": yaw, "controls": controls, "look": look,
+                    "skin": hex_rgb(rng.choice(CROWD_SKIN)), "size": rng.uniform(0.94, 1.04)})
+    return out
+
+
+_CROWD_CACHE = {}
+
+
+def crowd_pieces(obj):
+    """The crowd's faces around the origin, [(part, faces, rgb)], each person
+    on the floor; part is "m<n>", person by person, so each casts their own
+    shadow. Cached by the object's settings: a drag of another object
+    redraws a crowd many times unchanged."""
+    key = json.dumps([obj["crowd"], obj["rotation"][0], obj["scale"][0]], sort_keys=True)
+    hit = _CROWD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    turn = obj["rotation"][0]
+    rot = euler(turn)
+    pieces = []
+    for i, m in enumerate(crowd_members(obj["crowd"])):
+        shape = body_shape(m["look"])
+        k = obj["scale"][0] * shape["height"] * m["size"]
+        own = person_pieces(m["controls"], euler(turn + m["yaw"]), shape, outfit(m["look"]))
+        faces = [(fs, rgb or m["skin"]) for _, fs, rgb in own]
+        low = min(p[1] * k for fs, _ in faces for f in fs for p in f)
+        at = apply(rot, (m["at"][0], 0, m["at"][1]))
+        shift = (at[0], -low, at[2])
+        pieces += [("m%d" % i, [[add(mul(p, k), shift) for p in f] for f in fs], rgb)
+                   for fs, rgb in faces]
+    if len(_CROWD_CACHE) > 64:
+        _CROWD_CACHE.clear()
+    _CROWD_CACHE[key] = pieces
+    return pieces
 
 
 def object_pieces(obj):
@@ -1133,6 +1439,8 @@ def new_object(asset_id, taken=()):
         obj["pose"] = {"preset": "standing", "controls": pose_controls("standing")}
         obj["character"] = ""
         obj["look"] = {}
+    elif a["kind"] == "crowd":
+        obj["crowd"] = new_crowd()
     return obj
 
 
@@ -1241,6 +1549,8 @@ def clean_object(d, taken=()):
             k: _num(given.get(k), start[k], *CONTROL_RANGE[k]) for k in CONTROL_KEYS}}
         o["character"] = str(d.get("character") or "")
         o["look"] = clean_look(d.get("look"))
+    if "crowd" in base:
+        o["crowd"] = clean_crowd(d.get("crowd"))
     return o
 
 
@@ -1590,7 +1900,14 @@ def render(scene, width=None, height=None):
     faces = []
     for obj in scene["objects"]:
         pieces = painted_pieces(obj)
-        polys += shadow_polys(pieces, cam, floor)
+        if obj["asset"] == "crowd":          # each person their own shadow
+            members = {}
+            for piece in pieces:
+                members.setdefault(piece[0], []).append(piece)
+            for group in members.values():
+                polys += shadow_polys(group, cam, floor)
+        else:
+            polys += shadow_polys(pieces, cam, floor)
         for part, fs, rgb in pieces:
             for f in fs:
                 n = newell(f)
@@ -1900,7 +2217,18 @@ def scene_text(scene):
         about = []
         if obj["asset"] == "person":
             about.append("a person")
+        elif obj["asset"] == "crowd":
+            n = len(crowd_members(obj["crowd"]))
+            about.append("a background crowd of %d %s" % (n, "person" if n == 1 else "people"))
         about += where
+        if obj["asset"] == "crowd":
+            c = obj["crowd"]
+            about.append({"mixed": "facing every way", "inward": "gathered, facing each other",
+                          "outward": "facing outwards"}.get(c["facing"])
+                         or facing(scene, obj))
+            if c["activity"] != "mixed":
+                about.append({"standing": "standing about", "walking": "walking",
+                              "cheering": "cheering, raising a glass"}[c["activity"]])
         if obj["asset"] == "person":
             about.append(facing(scene, obj))
             preset = obj["pose"].get("preset")
