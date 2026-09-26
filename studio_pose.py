@@ -374,7 +374,7 @@ def render_figures(figures, width, height):
                     buf[i + 1] = int(buf[i + 1] * keep + cg)
                     buf[i + 2] = int(buf[i + 2] * keep + cb)
 
-    def draw(points, hands, face):
+    def draw(points, hands, face, given=None):
         pix = [None if p is None else (p[0] * w, p[1] * h) for p in points]
         for n, (a, b) in enumerate(LIMBS):
             if pix[a] and pix[b]:
@@ -389,20 +389,27 @@ def render_figures(figures, width, height):
         # points blue - sized to the hand as DWPose's are (radius 4 on a ~150
         # px hand). Twice that made a fist or a thumb a blue blob the model
         # could not read.
-        for hand in hand_points(points, 1, 1, hands).values():
-            at = [(x * w, y * h) for x, y in hand]
-            span = math.hypot(at[12][0] - at[0][0], at[12][1] - at[0][1])
-            span = max(span, math.hypot(at[9][0] - at[0][0], at[9][1] - at[0][1]) * 2)
+        for hand in (hand_points(points, 1, 1, hands) if given is None else given).values():
+            at = [p and (p[0] * w, p[1] * h) for p in hand]
+            if not at[0]:
+                continue
+            # Sized by the hand's length in 3D terms: its longest reach from
+            # the wrist, so a fist seen end on is not drawn as a blob.
+            span = max([math.hypot(p[0] - at[0][0], p[1] - at[0][1]) for p in at if p] +
+                       [math.hypot(at[9][0] - at[0][0], at[9][1] - at[0][1]) * 2
+                        if at[9] else 0])
             thin, knot = max(1.0, span * 0.018), max(1.5, span * 0.034)
             for n, (a, b) in enumerate(HAND_EDGES):
-                rgb = tuple(int(c * 255) for c in
-                            colorsys.hsv_to_rgb(n / len(HAND_EDGES), 1, 1))
-                blot(at[a][0], at[a][1], at[b][0], at[b][1], thin, rgb, 1.0)
-            for x, y in at:
-                blot(x, y, x, y, knot, HAND_JOINT, 1.0)
+                if at[a] and at[b]:
+                    rgb = tuple(int(c * 255) for c in
+                                colorsys.hsv_to_rgb(n / len(HAND_EDGES), 1, 1))
+                    blot(at[a][0], at[a][1], at[b][0], at[b][1], thin, rgb, 1.0)
+            for p in at:
+                if p:
+                    blot(p[0], p[1], p[0], p[1], knot, HAND_JOINT, 1.0)
 
     for fig in figures:
-        draw(fig["points"], fig.get("hands"), fig.get("face"))
+        draw(fig["points"], fig.get("hands"), fig.get("face"), fig.get("hand_points"))
     return studio_icons.png(bytes(buf), w, h)
 
 
