@@ -17,10 +17,12 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import filedialog
 
+import studio_civitai as civitai
 import studio_imagegen as ig
 import studio_pose as sp
 import studio_scene_ui
@@ -310,6 +312,18 @@ class ImageStudio:
                 arg.refresh()
         elif what == "call":
             arg()
+        elif what == "import-said":
+            dlg, text, role = arg
+            if dlg.win.winfo_exists():
+                dlg.status(text, role)
+        elif what == "import-done":
+            dlg, editor, rid, text, role = arg
+            if dlg.win.winfo_exists():
+                dlg.finished(text, role)
+            if editor is not None and editor.win.winfo_exists():
+                editor.reload(rid)
+            self._rebuild_choices()
+            self._recheck()
         elif what == "library":
             self._rebuild_choices()
             self._recheck()
@@ -1874,11 +1888,20 @@ class ImageStudio:
             ("always", "Always on (every picture from a model it suits)", "bool"),
             ("family", "Trained for", ("choice", [("", "unknown")] + list(ig.FAMILIES.items()))),
             ("preview", "Preview image", "path"),
+            ("source", "Where it came from", "text"),
             ("notes", "Notes", "long"),
         ], template={"file": "new_lora.safetensors", "category": "Other"},
-            extra=("Scan backends", self._scan_loras),
+            extra=[("Import from CivitAI…", lambda ed: LoraImport(self, ed)),
+                   ("Scan backends", self._scan_loras)],
             label=lambda r: "%s — %s%s" % (r["category"], r["name"],
                                             "  (always on)" if r.get("always") else ""))
+
+    def lora_folders(self):
+        """[(backend id, "name — folder")] for every backend whose LoRA folder
+        is on this PC: the only places a file can be put."""
+        return [(b["id"], "%s — %s" % (b["name"], b["lora_dir"]))
+                for b in self.studio.backends()
+                if b.get("lora_dir") and os.path.isdir(b["lora_dir"])]
 
     def _scan_loras(self, editor):
         editor.status("Scanning" + ELLIPSIS)
@@ -2084,8 +2107,8 @@ class RecordEditor:
         owner.button(btns, "Duplicate", self._dup).pack(side="left", padx=(owner.px(4), 0))
         owner.button(btns, "Delete", self._delete, kind="ghost").pack(
             side="left", padx=(owner.px(4), 0))
-        if extra:
-            owner.button(left, extra[0], lambda: extra[1](self)).pack(
+        for text, fn in ([extra] if isinstance(extra, tuple) else extra or []):
+            owner.button(left, text, lambda fn=fn: fn(self)).pack(
                 side="top", anchor="w", pady=(owner.px(8), 0))
         right = owner.frame(win)
         right.pack(side="left", fill="both", expand=True, pady=owner.px(12),
@@ -2104,9 +2127,11 @@ class RecordEditor:
         self.msg.config(text=text)
         self.owner.skin(self.msg, bg="bg", fg=role)
 
-    def reload(self):
+    def reload(self, select_id=None):
         self.records = [dict(r) for r in self.owner.studio.lib.all(self.kind)]
-        self._reload_list(0 if self.records else None)
+        at = next((i for i, r in enumerate(self.records) if r.get("id") == select_id), 0)
+        self.current = None
+        self._reload_list(at if self.records else None)
         self.status("Library updated.")
 
     def refresh(self):
@@ -3142,3 +3167,202 @@ class PoseEditor:
                              "hands": {s: dict(v) for s, v in self.hands.items()},
                              "strength": round(self.strength.get(), 2)})
         self.win.destroy()
+
+class LoraImport:
+    """The LoRA library's import window: CivitAI links pasted one per line,
+    and/or .safetensors files picked from disk, each made into a library
+    record by `studio_civitai` on a worker thread. The file itself can be
+    put into a backend's LoRA folder on this PC (a download for a link, a
+    copy for a file); a folder on the other machine is never assumed."""
+
+    def __init__(self, owner, editor=None):
+        self.owner, self.editor = owner, editor
+        o, host = owner, owner.host
+        self.files = []
+        self.stop = None
+        self.busy = False
+        win = self.win = tk.Toplevel(editor.win if editor else host)
+        win.title("Import LoRAs")
+        win.transient(editor.win if editor else host)
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(600), host._px(440)))
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        body = o.frame(win)
+        body.pack(side="top", fill="both", expand=True, padx=o.px(14), pady=o.px(12))
+        o.label(body, "CivitAI links, one per line: a model page, a download link or "
+                "an AIR (urn:air:…)", "muted", host.f_small).pack(side="top", fill="x")
+        self.links = tk.Text(body, height=4, wrap="none", bd=0, highlightthickness=0,
+                             font=host.f_ui, padx=o.px(6), pady=o.px(4))
+        o.skin(self.links, bg="card", fg="text", insertbackground="accent")
+        self.links.pack(side="top", fill="x", pady=(o.px(2), 0))
+        pasted = self._clipboard_link()
+        if pasted:
+            self.links.insert("1.0", pasted + "\n")
+
+        o.label(body, "…and/or LoRA files on this PC", "muted", host.f_small).pack(
+            side="top", fill="x", pady=(o.px(10), o.px(2)))
+        row = o.frame(body)
+        row.pack(side="top", fill="x")
+        o.button(row, "Add .safetensors files…", self.add_files).pack(side="left")
+        o.button(row, "Clear", self.clear_files, kind="ghost").pack(
+            side="left", padx=(o.px(4), 0))
+        self.file_list = o.label(body, "No files.", "faint", host.f_small,
+                                 wraplength=o.px(560))
+        self.file_list.pack(side="top", fill="x", pady=(o.px(2), 0))
+
+        o.label(body, "Put the LoRA file in", "muted", host.f_small).pack(
+            side="top", fill="x", pady=(o.px(10), o.px(2)))
+        folders = owner.lora_folders()
+        self.dest = folders[0][0] if folders else ""
+        choices = folders + [("", "Nowhere - only add the profile (the file is already "
+                                  "on the backend)")]
+        o.choice(body, choices, self.dest, self._set_dest).pack(side="top", anchor="w")
+        if not folders:
+            o.label(body, "No backend has a LoRA folder on this PC (Backends… → LoRA "
+                    "folder), so files cannot be placed; profiles still can.", "faint",
+                    host.f_small, wraplength=o.px(560)).pack(
+                side="top", fill="x")
+
+        self.lookup = tk.BooleanVar(value=True)
+        cb = tk.Checkbutton(body, text="Look files up on CivitAI by their hash",
+                            variable=self.lookup, anchor="w", font=host.f_ui, bd=0,
+                            highlightthickness=0)
+        o.skin(cb, bg="bg", fg="text", activebackground="bg", selectcolor="card",
+               activeforeground="text")
+        cb.pack(side="top", fill="x", pady=(o.px(10), 0))
+
+        o.label(body, "CivitAI API key (only some downloads need one; kept beside the "
+                "library)", "muted", host.f_small).pack(
+            side="top", fill="x", pady=(o.px(10), o.px(2)))
+        self.token = tk.StringVar(value=civitai.load_token(owner.studio.lib.root))
+        e = host._entry(body, self.token)
+        e.config(show="•")
+        e.master.pack(side="top", fill="x")
+
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(14), pady=(0, o.px(12)))
+        self.go = o.button(foot, "Import", self.start, kind="accent")
+        self.go.pack(side="right")
+        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(440))
+        self.msg.pack(side="left", fill="x", expand=True)
+
+    @staticmethod
+    def _one_line(text):
+        return " ".join(str(text).split())
+
+    def _clipboard_link(self):
+        try:
+            text = self.win.clipboard_get()
+        except tk.TclError:
+            return ""
+        lines = [ln.strip() for ln in text.splitlines()
+                 if ln.strip() and not ln.strip().isdigit() and civitai.parse_link(ln)]
+        return "\n".join(lines[:20])
+
+    def _set_dest(self, value):
+        self.dest = value
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(parent=self.win, filetypes=[
+            ("LoRA files", "*.safetensors"), ("All files", "*.*")])
+        for p in paths:
+            if p not in self.files:
+                self.files.append(p)
+        self._show_files()
+
+    def clear_files(self):
+        self.files = []
+        self._show_files()
+
+    def _show_files(self):
+        self.file_list.config(text="\n".join(os.path.basename(p) for p in self.files)
+                              or "No files.")
+
+    def status(self, text, role="muted"):
+        self.msg.config(text=text)
+        self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def finished(self, text, role):
+        self.busy = False
+        self.status(text, role)
+
+    def close(self):
+        if self.stop is not None:
+            self.stop.set()
+        self.win.destroy()
+
+    def start(self):
+        if self.busy:
+            return
+        links = [ln.strip() for ln in self.links.get("1.0", "end").splitlines()
+                 if ln.strip()]
+        bad = [ln for ln in links if civitai.parse_link(ln) is None]
+        if bad:
+            self.status("Not a CivitAI link: %s" % bad[0], "err")
+            return
+        if not links and not self.files:
+            self.status("Paste a link or add a file first.", "warn")
+            return
+        lib = self.owner.studio.lib
+        token = self.token.get().strip()
+        if token != civitai.load_token(lib.root) and not os.environ.get(civitai.TOKEN_ENV):
+            try:
+                civitai.save_token(lib.root, token)
+            except OSError as e:
+                self.status("Could not keep the API key: %s" % e, "warn")
+        folder = ""
+        if self.dest:
+            b = self.owner.studio.backend(self.dest)
+            folder = b.get("lora_dir", "") if b else ""
+        dirs = [f for f in (b.get("lora_dir") for b in self.owner.studio.backends()) if f]
+        self.stop = threading.Event()
+        self.busy = True
+        self.status("Importing" + ELLIPSIS, "accent")
+        self.owner.host._spawn(self.owner.s.event_id, self._work, links, list(self.files),
+                               folder, dirs, token, self.lookup.get(), self.stop)
+
+    def _work(self, links, files, folder, dirs, token, lookup, stop):
+        """Off the UI thread: one item at a time, each failure said and the
+        rest still done."""
+        o = self.owner
+        lib = o.studio.lib
+        client = civitai.Client(token)
+        post = o.host.q.put
+        ev = o.s.event_id
+        last = ""
+
+        def say(text, role="muted"):
+            post(("images", ev, ("import-said", (self, self._one_line(text), role))))
+
+        added = updated = 0
+        failed = []
+        items = [("link", x) for x in links] + [("file", x) for x in files]
+        for kind, item in items:
+            if stop.is_set():
+                break
+            try:
+                if kind == "link":
+                    rec, new = civitai.import_link(lib, client, item, folder, say, stop)
+                else:
+                    rec, new = civitai.import_file(lib, client, item, folder, dirs, lookup,
+                                                   say)
+            except Exception as e:          # said, and the next item still runs
+                why = e if isinstance(e, civitai.CivitAIError) else "%s: %s" % (
+                    type(e).__name__, e)
+                failed.append("%s: %s" % (os.path.basename(item) if kind == "file" else item,
+                                          why))
+                say(failed[-1], "err")
+                continue
+            last = rec["id"]
+            added, updated = added + new, updated + (not new)
+        bits = []
+        if added:
+            bits.append("%d added" % added)
+        if updated:
+            bits.append("%d already there, empty fields filled" % updated)
+        if failed:
+            bits.append("%d failed - %s" % (len(failed), "; ".join(failed)))
+        text = ("Done: " + ", ".join(bits) + ".") if bits else "Nothing imported."
+        role = "err" if failed and not (added or updated) else "warn" if failed else "ok"
+        o._post("said", ("LoRA import: " + text, role))
+        post(("images", ev, ("import-done", (self, self.editor, last, text, role))))

@@ -87,5 +87,24 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("local edits", self.logged())
 
 
+    def test_check_lists_what_is_new_and_changes_nothing(self):
+        commit(self.dev, "a.txt", "two\n")
+        commit(self.dev, "c.txt", "three\n")
+        run(self.dev, "push", "-q")
+        st = upd.check()
+        self.assertEqual(st["problem"], "")
+        self.assertEqual((st["behind"], st["ahead"]), (2, 0))
+        self.assertEqual(st["commits"], ["c.txt", "a.txt"])
+        self.assertEqual(self.read("a.txt"), "one\n")
+        self.assertEqual(self.logged(), "")
+
+    def test_pull_says_what_happened(self):
+        self.assertEqual(upd.pull(), (False, "Already up to date with origin/main."))
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q")
+        changed, msg = upd.pull()
+        self.assertTrue(changed)
+        self.assertIn("Reopen Studio Assist", msg)
+
 if __name__ == "__main__":
     unittest.main()
