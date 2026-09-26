@@ -5,21 +5,26 @@ picture before the Image Studio makes it.
 
 Not a 3D package and not a slicer, though it is laid out like one: a person
 and a couple of props on a floor, one camera, and the frame that camera sees.
-That frame goes to the Image Studio as a `source` reference (image to image),
-and the words written on each object go into the prompt as written. The
-pieces:
+What the picture is made from is what that frame means (`scene_maps`): a
+pose map of every body's joints and a depth map of the whole frame, for the
+FLUX ControlNet - and the grey frame itself as a `source` (image to image)
+only when asked, or for a model with no ControlNet. The words written on
+each object go into the prompt as written. The pieces:
 
 - **The rig** (`JOINTS`): a mannequin of fifteen joints posed by forward
   kinematics from a handful of named controls (`CONTROLS`) - head, torso, and
   each hand and foot - and `POSES`, presets of those controls. Everything
   stands on its floor: an object's lowest point is put at its `position` y
   (`ground`), so a crouch drops the hips and a tipped drum lies on the floor.
-- **Props** (`ASSETS`): simple shapes - box, cylinder, sphere, cone,
-  frustum, capsule, wedge, panel - and compound props (table, chair,
-  shelves, car) built of several shapes under one transform, all sized by
-  scale in metres. What a prop *is* - a crate, a workbench, a gas cylinder -
-  is its name and its description; the shape is a stand-in that only holds
-  its place in the frame. `STAND_INS` start a shape already named and sized.
+- **Shapes and props** (`ASSETS`, `MESHES`): box, cylinder, sphere, cone,
+  frustum, capsule, wedge, pyramid and panel, and props made of a few parts -
+  table, chair, bench, shelves, barrel, tree, bush, lamp post, parasol, car,
+  fence - each sized by scale in metres. What a prop *is* is its name and its
+  description; the shape is a stand-in that only holds its place in the
+  frame. `STAND_INS` start a shape already named and sized.
+- **A background crowd** (`crowd_members`): one object, many mannequins -
+  each their own height, build, skin, clothes, pose and facing, dealt from a
+  seed - said in the words as one line.
 - **The room** (`new_room`): the floor, and optionally four walls around the
   origin. Either can wear a picture - one the Image Studio makes from a few
   words (`texture_settings`), or a PNG from disk - repeated every `size`
@@ -52,11 +57,13 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import struct
 import zlib
 
 import studio_icons
+import studio_pose
 
 VERSION = 1
 FULL_FRAME_DIAGONAL = 43.27    # mm; a lens is read against a full-frame sensor
@@ -77,7 +84,20 @@ FRAMES = [
 ]
 FRAME_SIZES = {k: (w, h) for k, _, w, h in FRAMES}
 LENSES = (24, 35, 50, 85)
-REDRAW = 0.7                   # denoise: how far the picture may move from the blockout
+# What the picture is made from (`scene_maps`), each 0 for off: the pose map's
+# and the depth map's ControlNet strengths, and how much of the grey frame
+# itself is kept (1 - denoise). The frame is off by default: image to image
+# from it copies the mannequins' blocky look at any denoise that keeps the
+# layout, which the two maps keep without it.
+POSE_STRENGTH = 0.85
+DEPTH_STRENGTH = 0.55
+FRAME_KEEP = 0.0
+FRAME_KEEP_MAX = 0.7
+FALLBACK_KEEP = 0.3            # the frame kept for a model with no ControlNet (denoise 0.7)
+FACE_LIKENESS = 0.6            # how far a face given a picture is redrawn at the end
+REAL_FACES = True              # then their own face pasted over it, where a photo's angle fits
+FACE_LIKENESS_RANGE = (0.3, 0.95)
+DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet scales it
 
 COLOURS = [                    # (hex, name) offered for any object
     ("#c9b8a6", "mannequin"), ("#e8c07a", "yellow"), ("#d9774b", "orange"),
@@ -279,12 +299,6 @@ def lathe(profile, seg=16):
     return outward(faces)
 
 
-def sphere(seg=16, rings=8):
-    """A unit sphere standing on the floor: radius 0.5, its bottom at y 0."""
-    return lathe([(0.5 * math.sin(math.pi * j / rings), 0.5 - 0.5 * math.cos(math.pi * j / rings))
-                  for j in range(rings + 1)], seg)
-
-
 def cone(top=0.0, seg=16):
     """A unit cone on the floor: radius 0.5 at the base, `top` at height 1
     (a frustum when `top` is more than 0)."""
@@ -297,23 +311,6 @@ def capsule(seg=16, rings=4):
     cap = [(0.5 * math.sin(math.pi / 2 * j / rings), 0.25 - 0.25 * math.cos(math.pi / 2 * j / rings))
            for j in range(rings + 1)]
     return lathe(cap + [(r, 1 - y) for r, y in reversed(cap)], seg)
-
-
-def wedge():
-    """A unit ramp: 1 wide, 1 deep, 1 tall at its back (-z), 0 at its front."""
-    v = [(-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5),
-         (-0.5, 1, -0.5), (0.5, 1, -0.5)]
-    idx = [(0, 1, 2, 3), (0, 1, 5, 4), (3, 2, 5, 4), (0, 3, 4), (1, 2, 5)]
-    return outward([[v[i] for i in f] for f in idx])
-
-
-def fit(faces, lo, hi):
-    """A unit shape (x and z -0.5..0.5, y 0..1) moved and sized into the
-    box lo..hi of the same unit space: a part of a compound prop."""
-    size = sub(hi, lo)
-    mid = (lo[0] + size[0] / 2, lo[1], lo[2] + size[2] / 2)
-    return [[add(mid, (p[0] * size[0], p[1] * size[1], p[2] * size[2])) for p in f]
-            for f in faces]
 
 
 # ==================================================================== the rig
@@ -501,7 +498,8 @@ CLOTH = [
     ("denim", "#4d6a8f"), ("jeans", "#4d6a8f"), ("blue", "#3f6fb0"), ("teal", "#2f7f7f"),
     ("turquoise", "#3aa6a6"), ("green", "#4f7d4a"), ("olive", "#6b6b3a"),
     ("khaki", "#b3a37a"), ("chinos", "#b3a37a"), ("beige", "#cdbb9a"), ("camel", "#b08a5a"),
-    ("tan", "#b48d64"), ("brown", "#6b4a33"), ("leather", "#3b2a22"), ("red", "#b0342f"),
+    ("tan", "#b48d64"), ("brown", "#6b4a33"), ("leather", "#3b2a22"),
+    ("lederhosen", "#5b4030"), ("loden", "#4a5a3c"), ("red", "#b0342f"),
     ("burgundy", "#6e2233"), ("maroon", "#6e2233"), ("wine", "#6e2233"), ("pink", "#e39ab0"),
     ("orange", "#d9772f"), ("yellow", "#e2c23c"), ("mustard", "#c9a032"),
     ("purple", "#6b4a8f"), ("lavender", "#b4a4d6"), ("gold", "#c9a54a"),
@@ -509,7 +507,9 @@ CLOTH = [
 ]
 CLOTH_DEFAULT = {"top": "#8d97a3", "bottom": "#4c5566", "outerwear": "#5e564d",
                  "footwear": "#34302d", "hat": "#4a4540", "glasses": "#2e2a28",
-                 "sunglasses": "#1c1c20", "goggles": "#b9c7cf"}
+                 "sunglasses": "#1c1c20", "goggles": "#b9c7cf", "alpine": "#4a5a3c",
+                 "dirndl": "#7a2433", "apron": "#ecebe6", "blouse": "#ecebe6",
+                 "accordion": "#a3262a", "stein": "#d9d3c2"}
 # What the Shoes slot names, by shape: first match wins, anything else is a
 # plain shoe (loafers, oxfords, brogues) on a thin dark sole.
 SHOES = [
@@ -528,11 +528,16 @@ HEEL = 0.065                     # m a heel lifts the heel of the foot
 # first match wins, so "hard hat" is not read as a plain "hat". The kinds
 # are shapes (`HAT_SHAPES`); the words say the rest.
 HATS = [
+    ("crown", ("flower crown", "floral crown", "flower wreath", "floral wreath",
+               "crown of flowers", "wreath of flowers", "flower headband", "blumenkranz")),
     ("hard hat", ("hard hat", "hardhat", "helmet", "safety helmet")),
     ("top hat", ("top hat",)),
     ("cap", ("baseball cap", "cap", "trucker cap", "flat cap")),
     ("beanie", ("beanie", "headscarf", "head scarf", "bandana", "hijab", "turban",
                 "beret", "hood", "balaclava", "headwrap", "do-rag", "durag")),
+    ("alpine", ("alpine hat", "tyrolean hat", "tyrolean", "tirolean hat", "bavarian hat",
+                "german hat", "trachten hat", "feathered hat", "hat with a feather",
+                "loden hat", "gamsbart")),
     ("wide", ("sun hat", "sunhat", "cowboy hat", "stetson", "sombrero", "straw hat")),
     ("hat", ("hat", "fedora", "trilby", "panama", "bowler", "bucket hat", "boater")),
 ]
@@ -554,7 +559,21 @@ HAT_SHAPES = {
                 (0.252, (0.02, 0.024))], None),
     "wide": ([(0.15, (0.093, 0.108)), (0.25, (0.078, 0.09))], (0.2, 0.21)),
     "hat": ([(0.15, (0.093, 0.108)), (0.25, (0.076, 0.088))], (0.15, 0.165)),
+    "alpine": ([(0.15, (0.093, 0.108)), (0.235, (0.078, 0.09)), (0.27, (0.045, 0.055))],
+               (0.128, 0.143)),
 }
+# The flowers of a flower crown, round the head in turn, unless a colour is said.
+CROWN_FLOWERS = ("#e39ab0", "#ecebe6", "#e2c23c", "#b0342f", "#b4a4d6", "#d9772f")
+CROWN_LEAVES = "#4f7d4a"
+# Things carried, from the Accessories slot: (kind, the words that name it).
+# The words are sent as written; this only puts something in the hands.
+HELD = [
+    ("accordion", ("accordion", "accordian", "squeezebox", "concertina")),
+    ("stein", ("beer stein", "beer steins", "stein", "steins", "beer mug", "beer mugs",
+               "tankard", "tankards", "masskrug", "maßkrug", "maß", "pint of beer",
+               "glass of beer", "beer glass", "beer glasses")),
+]
+BOTH_HANDS = ("steins", "mugs", "tankards", "glasses", "two", "both hands", "pair", "each hand")
 TORSO = ("chest", "belly")
 SLEEVES = ("upper_arm", "forearm")
 LEGS = ("hips", "thigh", "shin")
@@ -562,6 +581,13 @@ LEGS = ("hips", "thigh", "shin")
 
 def _said(text, *words):
     return any(re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(w), text) for w in words)
+
+
+def _near(text, word):
+    """The words just before `word` in `text` ("a pink apron" -> "a pink
+    apron"), for what colour one piece of a garment is."""
+    m = re.search(r"((?:[\w-]+\s+){0,2})%s" % re.escape(word), text)
+    return m.group(0) if m else ""
 
 
 def _has_colour(text):
@@ -599,24 +625,36 @@ def _hem(text, default):
 
 def outfit(look=None):
     """The look's Clothes -> {"regions": {region: rgb}, "hems": [(reach, rgb,
-    outer)], "boots": (height m, rgb) or None}. Empty for a person with no
-    clothes said, who stays the plain mannequin."""
+    outer)], "boots": (height m, rgb) or None, "apron", "braces": rgb or None,
+    "hat", "glasses", "hair", "shoes", "held": {kind: (sides, rgb)}}. Empty
+    for a person with no clothes said, who stays the plain mannequin."""
     look = look if isinstance(look, dict) else {}
     said = {k: str(look.get(k) or "").strip().lower()
             for k in ("top", "bottom", "outerwear", "footwear")}
-    regions, hems, boots = {}, [], None
+    regions, hems, boots, apron, braces = {}, [], None, None, None
     top = said["top"]
     dress = False
     if top:
         rgb = cloth_colour(top, "top")
-        if _said(top, "dress", "gown", "frock", "sundress"):
+        if _said(top, "dress", "gown", "frock", "sundress", "dirndl", "dirndls"):
             dress = True
+            dirndl = _said(top, "dirndl", "dirndls")
+            if dirndl:                    # "a green dirndl with a pink apron" is green
+                own = _near(top, "dirndl")
+                rgb = cloth_colour(own if _has_colour(own) else "", "dirndl")
             cover = TORSO + ("hips",)
             if _said(top, "long-sleeve", "long-sleeved", "long sleeve", "long sleeves"):
                 cover += SLEEVES
             elif _said(top, "short-sleeve", "short-sleeved", "short sleeve", "t-shirt"):
                 cover += ("upper_arm",)
-            hems.append((_hem(top, 1.0), rgb, False))
+            elif dirndl:                  # the blouse's puffed sleeves, white
+                blouse = _near(top, "blouse")
+                regions["upper_arm"] = cloth_colour(
+                    blouse if _has_colour(blouse) else "", "blouse")
+            hems.append((_hem(top, 1.35 if dirndl else 1.0), rgb, False))
+            if dirndl or _said(top, "apron"):
+                bib = _near(top, "apron")
+                apron = cloth_colour(bib if _has_colour(bib) else "", "apron")
         elif _said(top, "suit", "tuxedo", "jumpsuit", "overalls", "boilersuit",
                    "coverall", "coveralls", "onesie"):
             cover = TORSO + SLEEVES + LEGS
@@ -637,13 +675,16 @@ def outfit(look=None):
         if _said(bottom, "skirt", "kilt", "sarong"):
             cover = ("hips",)
             hems.append((_hem(bottom, 0.9), rgb, False))
-        elif _said(bottom, "shorts", "briefs", "trunks", "boxers", "swimsuit"):
+        elif _said(bottom, "shorts", "briefs", "trunks", "boxers", "swimsuit",
+                   "lederhosen"):
             cover = ("hips", "thigh")
         else:
             cover = LEGS
         if dress:                         # under a dress, only the legs show
             cover = tuple(c for c in cover if c != "hips")
         regions.update(dict.fromkeys(cover, rgb))
+        if _said(bottom, "lederhosen", "suspenders", "braces", "dungarees") and not dress:
+            braces = rgb
     outer = said["outerwear"]
     if outer:
         rgb = cloth_colour(outer, "outerwear")
@@ -667,19 +708,30 @@ def outfit(look=None):
         if kind == "boots":
             boots = (0.09 if _said(feet, "ankle") else 0.24, rgb)
     hat = glasses = None
+    held = {}
     for item in (str(look.get("accessories") or "").lower().split(",")):
         item = item.strip()
+        kind = next((k for k, words in HELD if _said(item, *words)), None)
+        if kind and kind not in held:
+            sides = ("l", "r") if kind == "stein" and _said(item, *BOTH_HANDS) else ("r",)
+            held[kind] = (sides, cloth_colour(item if _has_colour(item) else "", kind))
+            continue                      # "a red accordion" is not a red hat
         kind = next((k for k, words in HATS if _said(item, *words)), None)
         if kind and not hat:
             rgb = cloth_colour(item, "hat")
             if kind == "hard hat" and not _has_colour(item):
                 rgb = hex_rgb("#e2c23c")          # a hard hat unsaid is site yellow
+            elif kind == "alpine" and not _has_colour(item):
+                rgb = hex_rgb(CLOTH_DEFAULT["alpine"])    # loden green
+            elif kind == "crown" and not _has_colour(item):
+                rgb = None                                # flowers of every colour
             hat = (kind, rgb)
         kind = next((k for k, words in GLASSES if _said(item, *words)), None)
         if kind and not glasses:
             glasses = (kind, cloth_colour(item, kind))
     return {"regions": regions, "hems": hems, "boots": boots, "hat": hat,
-            "glasses": glasses, "hair": hairdo(look), "shoes": shoes}
+            "glasses": glasses, "hair": hairdo(look), "shoes": shoes, "apron": apron,
+            "braces": braces, "held": held}
 
 
 # Hair, from the look's Hair section: the colour's words, and the style's
@@ -830,7 +882,8 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     # The head, less what a scalp of hair covers: a big face of it sorts in
     # front of the hair over it and shows through as a pale speck.
     hair = dressed.get("hair")
-    scalp = bool(hair and hair["cap"] and not dressed.get("hat"))
+    hat = dressed.get("hat")
+    scalp = bool(hair and hair["cap"] and not (hat and hat[0] != "crown"))
     skull = [[at("head", p) for p in f]
              for f in ellipsoid((0, 0.11, 0.01), IDENTITY, (0.085, 0.115, 0.1))
              if not (scalp and centroid(f)[1] > hairline(centroid(f)[0], centroid(f)[2] - 0.01))]
@@ -861,8 +914,19 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     out.append(("head", "head", outward([[nose[i] for i in f] for f in idx])))
     head_box = lambda lo, hi: outward([[at("head", p) for p in f]    # noqa: E731
                                        for f in box(lo, hi)])
-    if dressed.get("hat"):
-        kind, rgb = dressed["hat"]
+    if hat and hat[0] == "crown":
+        # Flowers round the head where a band would sit, on a ring of leaves.
+        rgb = hat[1]
+        out.append(("head", hex_rgb(CROWN_LEAVES), prism(
+            at("head", (0, 0.168, 0.01)), at("head", (0, 0.184, 0.01)), X("head"),
+            (0.084, 0.098), (0.08, 0.094), 12)))
+        for i in range(10):
+            t = 2 * math.pi * i / 10
+            c = at("head", (0.083 * math.sin(t), 0.18, 0.01 + 0.097 * math.cos(t)))
+            out.append(("head", rgb or hex_rgb(CROWN_FLOWERS[i % len(CROWN_FLOWERS)]),
+                        ellipsoid(c, M("head"), (0.022, 0.02, 0.022), 6, 4)))
+    elif hat:
+        kind, rgb = hat
         rings, brim = HAT_SHAPES[kind]
         for (y0, r0), (y1, r1) in zip(rings, rings[1:]):
             out.append(("head", rgb, prism(at("head", (0, y0, 0.01)),
@@ -874,6 +938,13 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                            X("head"), brim, brim, 16)))
         if kind == "cap":                 # the visor, forward over the eyes
             out.append(("head", rgb, head_box((-0.07, 0.14, 0.07), (0.07, 0.152, 0.2))))
+        if kind == "alpine":              # a cord band and the feather at its side
+            out.append(("head", tuple(int(c * 0.55) for c in rgb), prism(
+                at("head", (0, 0.152, 0.01)), at("head", (0, 0.172, 0.01)), X("head"),
+                (0.094, 0.109), (0.092, 0.107), 12)))
+            out.append(("head", (216, 212, 200), prism(
+                at("head", (0.085, 0.17, -0.03)), at("head", (0.098, 0.27, -0.06)),
+                X("head"), (0.01, 0.025), (0.004, 0.012), 4)))
     if hair:
         rgb, v = hair["rgb"], hair["volume"]
         hp = lambda v3: at("head", v3)                     # noqa: E731
@@ -945,6 +1016,53 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             out.append((foot, shaft[1], prism(at("ankle_" + side, (0, -0.02, 0)), shin_end,
                                               X("knee_" + side), r((0.05, 0.05), shin),
                                               r((0.052, 0.052), shin))))
+    # Braces over the chest: two straps down the front, a bar across them.
+    if dressed.get("braces"):
+        rgb, fz = dressed["braces"], 0.1 * chest + 0.012
+        for sx in (1, -1):
+            out.append(("body", rgb, prism(at("spine", (sx * 0.075, -0.02, 0.095 * belly + 0.012)),
+                                           at("chest", (sx * 0.085, 0.19, fz)), X("chest"),
+                                           (0.018, 0.006), (0.018, 0.006), 4)))
+        out.append(("body", rgb, prism(at("chest", (-0.09, 0.1, fz + 0.004)),
+                                       at("chest", (0.09, 0.1, fz + 0.004)), (0, 1, 0),
+                                       (0.025, 0.006), (0.025, 0.006), 4)))
+    held = dressed.get("held") or {}
+    if "accordion" in held:
+        # Across the chest, bellows between two ends; the Carrying pose puts
+        # the hands on it.
+        _, rgb = held["accordion"]
+        z = 0.11 * chest + 0.13
+        chest_box = lambda lo, hi: outward([[at("chest", p) for p in f]   # noqa: E731
+                                            for f in box(lo, hi)])
+        out += [("body", rgb, chest_box((-0.23, -0.2, z - 0.1), (-0.15, 0.12, z + 0.1))),
+                ("body", rgb, chest_box((0.15, -0.2, z - 0.1), (0.23, 0.12, z + 0.1))),
+                ("body", (236, 235, 230), chest_box((0.155, -0.18, z + 0.1),
+                                                    (0.225, 0.1, z + 0.115)))]   # keys
+        for i in range(8):                # the bellows' pleats, dark and light
+            x0 = -0.15 + 0.3 * i / 8
+            deep = 0.085 if i % 2 else 0.07
+            out.append(("body", (42, 37, 34) if i % 2 else tuple(int(c * 0.45) for c in rgb),
+                        chest_box((x0, -0.18, z - deep), (x0 + 0.3 / 8, 0.1, z + deep))))
+    if "stein" in held:
+        sides, rgb = held["stein"]
+        for side in sides:
+            # Upright whatever the arm does, in front of the palm.
+            c = at("wrist_" + side, (0, -0.1, 0.085))
+            lo, hi = add(c, (0, -0.085, 0)), add(c, (0, 0.085, 0))
+            out.append(("hand_" + side, rgb, prism(lo, hi, (1, 0, 0), (0.048, 0.048),
+                                                   (0.045, 0.045), 10)))
+            out.append(("hand_" + side, (246, 242, 230), prism(
+                hi, add(hi, (0, 0.022, 0)), (1, 0, 0), (0.046, 0.046), (0.04, 0.04), 10)))
+    if dressed.get("apron"):
+        # A plate down the front of the skirt, from the waist to the knee.
+        fwd = column(M("pelvis"), 2)
+        knee = mul(add(P("knee_l"), P("knee_r")), 0.5)
+        top_z, low_z = 0.105 * hips + 0.02, 0.08 * thigh + 0.1
+        a, b = at("pelvis", (0.11, 0.02, top_z)), at("pelvis", (-0.11, 0.02, top_z))
+        low = add(add(knee, mul(fwd, low_z)), (0, 0.06, 0))
+        wide = mul(X("pelvis"), 0.14)
+        out.append(("body", dressed["apron"], [[a, add(low, wide), sub(low, wide), b],
+                                               [b, sub(low, wide), add(low, wide), a]]))
     # Hems: a skirt or a coat below the waist, a flared tube from the hips to
     # a line across both legs `reach` of the way down (1 the knee, 2 the
     # ankle), so it follows a step or a seat.
@@ -969,91 +1087,182 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
 
 
 # ==================================================================== assets
-# What the library offers. A prop's mesh is a unit shape standing on the
-# floor, sized by the object's scale; the person is the rig above. Blender
+# What the library offers. A shape or a prop is a mesh in a unit box
+# (x and z -0.5..0.5, y 0..1), standing on the floor, sized by the object's
+# scale in metres; the person is the rig above, and a crowd is people. Blender
 # can make better ones later; the scene file names an asset by id, not by
-# geometry, so a scene keeps opening when the geometry improves.
+# geometry, so a scene keeps opening when the geometry improves. `group` is
+# where the library lists it.
 ASSETS = [
-    {"id": "person", "label": "Person", "kind": "person", "name": "Person",
-     "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
+    {"id": "person", "label": "Person", "kind": "person", "group": "people",
+     "name": "Person", "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
      "about": "A posable mannequin, 1.8 m. Describe who they are and what they are doing."},
-    {"id": "box", "label": "Box", "kind": "prop", "name": "Crate", "colour": "#8a6a4a",
-     "scale": [0.6, 0.6, 0.6],
+    {"id": "crowd", "label": "Background crowd", "kind": "crowd", "group": "people",
+     "name": "Crowd", "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
+     "about": "Background people, as many as you like in an area. Describe them "
+              "together: who they are, what they wear, what they are doing."},
+    {"id": "box", "label": "Box", "kind": "prop", "group": "shape", "name": "Crate",
+     "colour": "#8a6a4a", "scale": [0.6, 0.6, 0.6],
      "about": "Any boxy thing: a crate, a bench, a cabinet, a wall. Size it in metres."},
-    {"id": "cylinder", "label": "Cylinder", "kind": "prop", "name": "Drum",
-     "colour": "#4f7fb5", "scale": [0.6, 0.9, 0.6],
+    {"id": "cylinder", "label": "Cylinder", "kind": "prop", "group": "shape",
+     "name": "Drum", "colour": "#4f7fb5", "scale": [0.6, 0.9, 0.6],
      "about": "Any round thing: a drum, a gas cylinder, a post, a pipe laid down."},
-    {"id": "sphere", "label": "Sphere", "kind": "prop", "name": "Ball", "colour": "#b5644f",
-     "scale": [0.5, 0.5, 0.5],
-     "about": "Any round lump: a ball, a boulder, a lamp globe, a bush. Squash it for an egg."},
-    {"id": "cone", "label": "Cone", "kind": "prop", "name": "Traffic cone",
-     "colour": "#d9772b", "scale": [0.35, 0.7, 0.35],
-     "about": "Anything that tapers to a point: a traffic cone, a tree, a tent, a spire."},
-    {"id": "frustum", "label": "Frustum", "kind": "prop", "name": "Lampshade",
-     "colour": "#7d8a94", "scale": [0.4, 0.4, 0.4],
+    {"id": "sphere", "label": "Sphere", "kind": "prop", "group": "shape", "name": "Ball",
+     "colour": "#b0342f", "scale": [0.5, 0.5, 0.5],
+     "about": "Any round thing: a ball, a globe lamp, a boulder. Size it in metres."},
+    {"id": "cone", "label": "Cone", "kind": "prop", "group": "shape", "name": "Cone",
+     "colour": "#d9772f", "scale": [0.4, 0.7, 0.4],
+     "about": "A traffic cone, a spire, a pile of sand. Size it in metres."},
+    {"id": "wedge", "label": "Wedge", "kind": "prop", "group": "shape", "name": "Ramp",
+     "colour": "#8b8d91", "scale": [1.0, 0.5, 1.5],
+     "about": "A ramp or a slope, rising towards its back. Size it in metres."},
+    {"id": "pyramid", "label": "Pyramid", "kind": "prop", "group": "shape",
+     "name": "Pyramid", "colour": "#cdbb9a", "scale": [1.0, 0.8, 1.0],
+     "about": "A pyramid, a roof, a pointed pile. Size it in metres."},
+    {"id": "table", "label": "Table", "kind": "prop", "group": "prop", "name": "Table",
+     "colour": "#8a6a4a", "scale": [1.4, 0.75, 0.8],
+     "about": "A table on four legs. Say what it is and what is on it."},
+    {"id": "chair", "label": "Chair", "kind": "prop", "group": "prop", "name": "Chair",
+     "colour": "#8a6a4a", "scale": [0.45, 0.9, 0.45],
+     "about": "A chair, its back behind it. Turn it to face the way it is sat in."},
+    {"id": "bench", "label": "Bench", "kind": "prop", "group": "prop", "name": "Bench",
+     "colour": "#8a6a4a", "scale": [1.8, 0.45, 0.35],
+     "about": "A long bench, as at a beer garden table or in a park."},
+    {"id": "barrel", "label": "Barrel", "kind": "prop", "group": "prop", "name": "Barrel",
+     "colour": "#7a5536", "scale": [0.6, 0.9, 0.6],
+     "about": "A barrel with hoops: a beer keg, a rain barrel. Lay it down with Tip."},
+    {"id": "tree", "label": "Tree", "kind": "prop", "group": "prop", "name": "Tree",
+     "colour": "#4f7d4a", "scale": [2.6, 4.5, 2.6],
+     "about": "A leafy tree. Say what kind, and the season."},
+    {"id": "bush", "label": "Bush", "kind": "prop", "group": "prop", "name": "Bush",
+     "colour": "#4f7d4a", "scale": [1.2, 0.9, 1.0],
+     "about": "A shrub or a hedge; stretch it wide for a hedge."},
+    {"id": "lamp", "label": "Lamp post", "kind": "prop", "group": "prop",
+     "name": "Lamp post", "colour": "#2e2a28", "scale": [0.4, 3.5, 0.4],
+     "about": "A street lamp. Say whether it is lit."},
+    {"id": "parasol", "label": "Parasol", "kind": "prop", "group": "prop",
+     "name": "Parasol", "colour": "#e9e0c6", "scale": [2.4, 2.4, 2.4],
+     "about": "A garden or market umbrella on a pole."},
+    {"id": "car", "label": "Car", "kind": "prop", "group": "prop", "name": "Car",
+     "colour": "#3f6fb0", "scale": [1.8, 1.45, 4.4],
+     "about": "A car, its front towards +Z. Say the make, the era and its state."},
+    {"id": "fence", "label": "Fence", "kind": "prop", "group": "prop", "name": "Fence",
+     "colour": "#e9e2cc", "scale": [3.0, 1.1, 0.1],
+     "about": "A fence of posts and rails. Stretch it as long as it needs to be."},
+    {"id": "frustum", "label": "Frustum", "kind": "prop", "group": "shape",
+     "name": "Lampshade", "colour": "#7d8a94", "scale": [0.4, 0.4, 0.4],
      "about": "A cone with its top cut off: a lampshade, a stool, a pedestal. Roll it "
               "180 for a bucket or pot."},
-    {"id": "capsule", "label": "Capsule", "kind": "prop", "name": "Bollard",
-     "colour": "#6b6f76", "scale": [0.3, 1.0, 0.3],
+    {"id": "capsule", "label": "Capsule", "kind": "prop", "group": "shape",
+     "name": "Bollard", "colour": "#6b6f76", "scale": [0.3, 1.0, 0.3],
      "about": "A rod with round ends: a bollard, a bolster, a rolled mat, a fire hydrant."},
-    {"id": "wedge", "label": "Wedge", "kind": "prop", "name": "Ramp", "colour": "#8f8a7e",
-     "scale": [1.0, 0.5, 1.5],
-     "about": "A slope, high at the back: a ramp, a roof, a slide, a doorstop, a dune."},
-    {"id": "plane", "label": "Panel", "kind": "prop", "name": "Rug", "colour": "#7a4a5a",
-     "scale": [2.0, 0.02, 1.4],
+    {"id": "plane", "label": "Panel", "kind": "prop", "group": "shape", "name": "Rug",
+     "colour": "#7a4a5a", "scale": [2.0, 0.02, 1.4],
      "about": "A flat sheet: a rug, a poster, a sign, a screen. Tip it upright for a wall."},
-    # Compound props: several shapes under the one transform, laid out in the
-    # unit space (x and z -0.5..0.5, y 0..1) that the scale stretches.
-    {"id": "table", "label": "Table", "kind": "prop", "name": "Table", "colour": "#7b5a3c",
-     "scale": [1.4, 0.75, 0.8], "parts": [
-         ("box", (-0.5, 0.94, -0.5), (0.5, 1.0, 0.5)),
-         ("box", (-0.47, 0, -0.44), (-0.41, 0.94, -0.34)),
-         ("box", (0.41, 0, -0.44), (0.47, 0.94, -0.34)),
-         ("box", (-0.47, 0, 0.34), (-0.41, 0.94, 0.44)),
-         ("box", (0.41, 0, 0.34), (0.47, 0.94, 0.44))],
-     "about": "A top on four legs: a dining table, a desk, a workbench, a counter."},
-    {"id": "chair", "label": "Chair", "kind": "prop", "name": "Chair", "colour": "#6e5039",
-     "scale": [0.45, 0.9, 0.5], "parts": [
-         ("box", (-0.5, 0.48, -0.5), (0.5, 0.53, 0.5)),
-         ("box", (-0.5, 0.53, -0.5), (0.5, 1.0, -0.4)),
-         ("box", (-0.46, 0, -0.46), (-0.34, 0.48, -0.36)),
-         ("box", (0.34, 0, -0.46), (0.46, 0.48, -0.36)),
-         ("box", (-0.46, 0, 0.36), (-0.34, 0.48, 0.46)),
-         ("box", (0.34, 0, 0.36), (0.46, 0.48, 0.46))],
-     "about": "A seat with a back, facing +z: a chair, a stool with a back, a bench seat."},
-    {"id": "shelves", "label": "Shelves", "kind": "prop", "name": "Shelves",
-     "colour": "#8b7355", "scale": [1.0, 1.8, 0.35], "parts": [
-         ("box", (-0.5, 0, -0.5), (-0.46, 1.0, 0.5)),
-         ("box", (0.46, 0, -0.5), (0.5, 1.0, 0.5)),
-         ("box", (-0.46, 0, -0.5), (0.46, 1.0, -0.44)),
-         ("box", (-0.46, 0, -0.5), (0.46, 0.03, 0.5)),
-         ("box", (-0.46, 0.33, -0.5), (0.46, 0.35, 0.5)),
-         ("box", (-0.46, 0.65, -0.5), (0.46, 0.67, 0.5)),
-         ("box", (-0.46, 0.97, -0.5), (0.46, 1.0, 0.5))],
+    {"id": "shelves", "label": "Shelves", "kind": "prop", "group": "prop", "name": "Shelves",
+     "colour": "#8b7355", "scale": [1.0, 1.8, 0.35],
      "about": "An open unit, open to +z: a bookcase, a shop shelf, a dresser, a rack."},
-    {"id": "car", "label": "Car", "kind": "prop", "name": "Car", "colour": "#3d5a7a",
-     "scale": [1.8, 1.45, 4.4], "parts": [
-         ("box", (-0.5, 0.18, -0.5), (0.5, 0.6, 0.5)),
-         ("box", (-0.44, 0.6, -0.3), (0.44, 1.0, 0.2)),
-         ("cylinder", (-0.5, 0, -0.39), (-0.42, 0.45, -0.25)),
-         ("cylinder", (0.42, 0, -0.39), (0.5, 0.45, -0.25)),
-         ("cylinder", (-0.5, 0, 0.25), (-0.42, 0.45, 0.39)),
-         ("cylinder", (0.42, 0, 0.25), (0.5, 0.45, 0.39))],
-     "about": "A car blocked out, nose to +z: a saloon, a taxi, a van if made taller."},
 ]
 ASSET = {a["id"]: a for a in ASSETS}
-SHAPE_MESH = {"box": box((-0.5, 0, -0.5), (0.5, 1, 0.5)), "cylinder": cylinder(),
-              "sphere": sphere(), "cone": cone(), "frustum": cone(0.32),
-              "capsule": capsule(), "wedge": wedge(),
-              "plane": box((-0.5, 0, -0.5), (0.5, 1, 0.5))}
-# Wheels lie on their side: a cylinder turned about z before it is fitted.
-_WHEEL = outward([[(p[1] - 0.5, p[0] + 0.5, p[2]) for p in f] for f in SHAPE_MESH["cylinder"]])
-UNIT = dict(SHAPE_MESH)
-for _a in ASSETS:
-    if "parts" in _a:
-        UNIT[_a["id"]] = [f for shape, lo, hi in _a["parts"] for f in
-                          fit(_WHEEL if (_a["id"], shape) == ("car", "cylinder")
-                              else SHAPE_MESH[shape], lo, hi)]
+ASSET_GROUPS = [("people", "People"), ("shape", "Shapes"), ("prop", "Props")]
+
+
+def _slab(x0, y0, z0, x1, y1, z1):
+    return box((x0, y0, z0), (x1, y1, z1))
+
+
+def _post(x, z, y0, y1, r, n=8):
+    return prism((x, y0, z), (x, y1, z), (1, 0, 0), (r, r), (r, r), n)
+
+
+def _wedge():
+    v = [(-0.5, 0, 0.5), (0.5, 0, 0.5), (0.5, 0, -0.5), (-0.5, 0, -0.5),
+         (-0.5, 1, -0.5), (0.5, 1, -0.5)]
+    return outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (3, 2, 5, 4), (0, 4, 5, 1),
+                                                (0, 3, 4), (1, 5, 2))])
+
+
+def _pyramid():
+    v = [(-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5), (0, 1, 0)]
+    return outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (0, 1, 4), (1, 2, 4),
+                                                (2, 3, 4), (3, 0, 4))])
+
+
+def _legs(top, inset, r):
+    return [_slab(sx * (0.5 - inset) - r, 0, sz * (0.5 - inset) - r,
+                  sx * (0.5 - inset) + r, top, sz * (0.5 - inset) + r)
+            for sx in (1, -1) for sz in (1, -1)]
+
+
+def _car():
+    dark, tyre = "#2b3440", "#1f1f22"
+    wheels = [(prism((sx * 0.5, 0.2, sz * 0.3), (sx * 0.38, 0.2, sz * 0.3), (0, 1, 0),
+                     (0.2, 0.065), (0.2, 0.065), 12), tyre)
+              for sx in (1, -1) for sz in (1, -1)]
+    v = [(-0.44, 0.5, 0.18), (0.44, 0.5, 0.18), (0.44, 0.5, -0.36), (-0.44, 0.5, -0.36),
+         (-0.38, 0.86, 0.06), (0.38, 0.86, 0.06), (0.38, 0.86, -0.28), (-0.38, 0.86, -0.28)]
+    cab = outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
+                                               (3, 2, 6, 7), (0, 3, 7, 4), (1, 2, 6, 5))])
+    return [(_slab(-0.5, 0.14, -0.5, 0.5, 0.5, 0.5), None), (cab, dark)] + wheels
+
+
+def _barrel():
+    out = [(prism((0, 0, 0), (0, 0.5, 0), (1, 0, 0), (0.42, 0.42), (0.5, 0.5), 14), None),
+           (prism((0, 0.5, 0), (0, 1, 0), (1, 0, 0), (0.5, 0.5), (0.42, 0.42), 14), None)]
+    for y, r in ((0.1, 0.446), (0.3, 0.482), (0.7, 0.482), (0.9, 0.446)):
+        out.append((prism((0, y - 0.025, 0), (0, y + 0.025, 0), (1, 0, 0), (r, r), (r, r),
+                          14), "#3b2f28"))
+    return out
+
+
+def _fence():
+    out = [(_slab(x - 0.012, 0, -0.35, x + 0.012, 1, 0.35), None)
+           for x in (-0.488, -0.244, 0, 0.244, 0.488)]
+    out += [(_slab(-0.5, y, -0.25, 0.5, y + 0.09, 0.25), None) for y in (0.3, 0.72)]
+    return out
+
+
+# Each shape and prop: [(faces, colour or None for the object's own)].
+MESHES = {
+    "box": [(_slab(-0.5, 0, -0.5, 0.5, 1, 0.5), None)],
+    "cylinder": [(cylinder(), None)],
+    "sphere": [(ellipsoid((0, 0.5, 0), IDENTITY, (0.5, 0.5, 0.5), 14, 9), None)],
+    "cone": [(prism((0, 0, 0), (0, 1, 0), (1, 0, 0), (0.5, 0.5), (0.004, 0.004), 16), None)],
+    "wedge": [(_wedge(), None)],
+    "pyramid": [(_pyramid(), None)],
+    "table": [(_slab(-0.5, 0.94, -0.5, 0.5, 1, 0.5), None)] + [
+        (leg, None) for leg in _legs(0.94, 0.06, 0.035)],
+    "chair": [(_slab(-0.5, 0.47, -0.5, 0.5, 0.52, 0.5), None),
+              (_slab(-0.5, 0.52, -0.5, 0.5, 1, -0.4), None)] + [
+        (leg, None) for leg in _legs(0.47, 0.06, 0.05)],
+    "bench": [(_slab(-0.5, 0.85, -0.5, 0.5, 1, 0.5), None)] + [
+        (_slab(sx * 0.42 - 0.03, 0, -0.4, sx * 0.42 + 0.03, 0.85, 0.4), None)
+        for sx in (1, -1)],
+    "barrel": _barrel(),
+    "tree": [(prism((0, 0, 0), (0, 0.5, 0), (1, 0, 0), (0.05, 0.05), (0.035, 0.035), 8),
+              "#5a3e2b"),
+             (ellipsoid((0, 0.66, 0), IDENTITY, (0.5, 0.3, 0.5), 12, 7), None),
+             (ellipsoid((0.08, 0.86, -0.05), IDENTITY, (0.32, 0.14, 0.32), 10, 5), None)],
+    "bush": [(ellipsoid((0, 0.5, 0), IDENTITY, (0.5, 0.5, 0.5), 12, 7), None)],
+    "lamp": [(_post(0, 0, 0, 0.94, 0.12), None),
+             (_slab(-0.25, 0, -0.25, 0.25, 0.05, 0.25), None),
+             (ellipsoid((0, 0.95, 0), IDENTITY, (0.5, 0.05, 0.5), 10, 5), "#f2e6b0")],
+    "parasol": [(_post(0, 0, 0, 0.93, 0.018), "#8b8d91"),
+                (_slab(-0.12, 0, -0.12, 0.12, 0.03, 0.12), "#8b8d91"),
+                (prism((0, 0.76, 0), (0, 0.92, 0), (1, 0, 0), (0.5, 0.5), (0.03, 0.03), 12),
+                 None)],
+    "car": _car(),
+    "fence": _fence(),
+    "frustum": [(cone(0.32), None)],
+    "capsule": [(capsule(), None)],
+    "plane": [(_slab(-0.5, 0, -0.5, 0.5, 1, 0.5), None)],
+    "shelves": [(_slab(x0, y0, z0, x1, y1, z1), None) for x0, y0, z0, x1, y1, z1 in (
+        (-0.5, 0, -0.5, -0.46, 1.0, 0.5), (0.46, 0, -0.5, 0.5, 1.0, 0.5),
+        (-0.46, 0, -0.5, 0.46, 1.0, -0.44), (-0.46, 0, -0.5, 0.46, 0.03, 0.5),
+        (-0.46, 0.33, -0.5, 0.46, 0.35, 0.5), (-0.46, 0.65, -0.5, 0.46, 0.67, 0.5),
+        (-0.46, 0.97, -0.5, 0.46, 1.0, 0.5))],
+}
+UNIT = {k: [f for faces, _ in parts for f in faces] for k, parts in MESHES.items()}
 
 # Box and Cylinder are stand-ins: the shape holds a place, the name says
 # what it is. These start one already named and sized (label, asset, name,
@@ -1088,15 +1297,177 @@ def painted_pieces(obj):
         pieces = [(part, [[mul(p, k) for p in f] for f in faces], rgb or own)
                   for part, faces, rgb in person_pieces(obj["pose"]["controls"], rot,
                                                         shape, outfit(look))]
+    elif obj["asset"] == "crowd":
+        pieces = crowd_pieces(obj)
+        if not pieces:
+            return []
     else:
-        faces = [[apply(rot, (p[0] * sx, p[1] * sy, p[2] * sz)) for p in f]
-                 for f in UNIT[obj["asset"]]]
-        pieces = [("body", [t for f in faces for t in tiles(f)], own)]
+        pieces = []
+        for mesh, rgb in MESHES[obj["asset"]]:
+            faces = [[apply(rot, (p[0] * sx, p[1] * sy, p[2] * sz)) for p in f]
+                     for f in mesh]
+            pieces.append(("body", [t for f in faces for t in tiles(f)],
+                           hex_rgb(rgb) if rgb else own))
     low = min(p[1] for _, faces, _ in pieces for f in faces for p in f)
     x, y, z = obj["position"]
     shift = (x, y - low, z)
     return [(part, [[add(p, shift) for p in f] for f in faces], rgb)
             for part, faces, rgb in pieces]
+
+
+# ==================================================================== crowds
+# A background crowd is one object: `count` people stood in a `width` x
+# `depth` area around its position, each a mannequin of their own - height,
+# build, skin, clothes, pose and facing drawn from `seed` - so the picture
+# gets many different people, not one person copied. Shuffle is a new seed.
+# `wear` is a list of outfit presets' looks (copied on, like a character's)
+# the crowd is dressed from; empty is everyday clothes.
+CROWD_LIMITS = {"count": (1, 40), "width": (1.0, 30.0), "depth": (0.5, 30.0)}
+CROWD_FACING = [("mixed", "Every way"), ("forward", "All one way"),
+                ("inward", "Towards the middle"), ("outward", "Away from the middle")]
+CROWD_ACTIVITY = [("mixed", "Mixed"), ("standing", "Standing about"),
+                  ("walking", "Walking"), ("cheering", "Cheering, raising a glass")]
+CROWD_SPACING = 0.6            # m between two people, at least
+CROWD_SKIN = ("#f1d3bd", "#e8c0a0", "#d9a67c", "#c68b5e", "#a86f45", "#8a5534",
+              "#6b3f25", "#4f2d1b")
+CROWD_TOPS = ("t-shirt", "shirt", "sweater", "hoodie", "blouse", "polo shirt",
+              "summer dress", "jacket")
+CROWD_BOTTOMS = ("jeans", "trousers", "chinos", "skirt", "shorts")
+CROWD_COLOURS = ("black", "white", "grey", "navy", "blue", "red", "green", "olive",
+                 "khaki", "beige", "brown", "burgundy", "mustard", "teal", "pink", "charcoal")
+CROWD_HAIR = ("black", "dark brown", "brown", "light brown", "auburn", "blonde", "grey",
+              "red")
+CROWD_STYLES = ("short", "short", "shoulder-length", "long", "in a ponytail", "in a bun",
+                "buzz cut", "bald", "curly")
+
+
+def new_crowd():
+    return {"count": 12, "width": 6.0, "depth": 3.0, "seed": 1, "facing": "mixed",
+            "activity": "mixed", "wear": [], "dressed": ""}
+
+
+def clean_crowd(d):
+    d = d if isinstance(d, dict) else {}
+    c = new_crowd()
+    c["count"] = int(round(_num(d.get("count"), c["count"], *CROWD_LIMITS["count"])))
+    for k in ("width", "depth"):
+        c[k] = _num(d.get(k), c[k], *CROWD_LIMITS[k])
+    c["seed"] = int(_num(d.get("seed"), 1, 0, 2 ** 31))
+    c["facing"] = d.get("facing") if d.get("facing") in dict(CROWD_FACING) else "mixed"
+    c["activity"] = (d.get("activity") if d.get("activity") in dict(CROWD_ACTIVITY)
+                     else "mixed")
+    wear = d.get("wear") if isinstance(d.get("wear"), list) else []
+    import studio_imagegen as ig
+    c["wear"] = [{k: str(w[k]).strip() for k in ig.OUTFIT_KEYS
+                  if isinstance(w.get(k), str) and w[k].strip()}
+                 for w in wear[:20] if isinstance(w, dict)]
+    c["wear"] = [w for w in c["wear"] if w]
+    c["dressed"] = str(d.get("dressed") or "")[:80]
+    return c
+
+
+def _crowd_pose(rng, activity):
+    kind = activity if activity != "mixed" else rng.choice(
+        ("standing", "standing", "chatting", "walking", "walking", "cheering"))
+    if kind == "walking":
+        c = dict(POSE_VALUES["walking"])
+        if rng.random() < 0.5:               # the other foot forward
+            for a, b in (("leg_l_step", "leg_r_step"), ("leg_l_bend", "leg_r_bend"),
+                         ("arm_l_raise", "arm_r_raise"), ("arm_l_bend", "arm_r_bend")):
+                c[a], c[b] = c.get(b, 0), c.get(a, 0)
+    elif kind == "cheering":
+        side = rng.choice("lr")
+        c = dict(POSE_VALUES["standing"])
+        c.update({"arm_%s_raise" % side: rng.uniform(130, 170),
+                  "arm_%s_bend" % side: rng.uniform(10, 50),
+                  "arm_%s_out" % side: rng.uniform(5, 25)})
+    elif kind == "chatting":
+        side = rng.choice("lr")
+        c = dict(POSE_VALUES["standing"])
+        c.update({"arm_%s_raise" % side: rng.uniform(20, 50),
+                  "arm_%s_bend" % side: rng.uniform(60, 100)})
+    else:
+        c = dict(POSE_VALUES["standing"])
+        c.update(arm_l_bend=rng.uniform(5, 30), arm_r_bend=rng.uniform(5, 30),
+                 leg_l_out=rng.uniform(0, 6), leg_r_out=rng.uniform(0, 6))
+    c["head_turn"] = rng.uniform(-30, 30)
+    c["head_nod"] = rng.uniform(-10, 12)
+    out = pose_controls("standing")
+    out.update({k: v for k, v in c.items() if k in out})
+    return out, kind
+
+
+def crowd_members(crowd):
+    """The crowd's people: [{"at": (x, z) around the middle, "yaw", "controls",
+    "look", "skin", "size"}], the same for the same settings every time."""
+    rng = random.Random(crowd["seed"])
+    w, d = crowd["width"], crowd["depth"]
+    spots = []
+    for _ in range(crowd["count"]):
+        for _try in range(60):
+            x, z = rng.uniform(-w / 2, w / 2), rng.uniform(-d / 2, d / 2)
+            if all((x - a) ** 2 + (z - b) ** 2 >= CROWD_SPACING ** 2 for a, b in spots):
+                spots.append((x, z))
+                break
+    out = []
+    for x, z in spots:
+        controls, kind = _crowd_pose(rng, crowd["activity"])
+        facing = crowd["facing"]
+        if facing == "forward":
+            yaw = rng.uniform(-25, 25)
+        elif facing in ("inward", "outward"):
+            yaw = math.degrees(math.atan2(-x, -z)) + rng.uniform(-20, 20)
+            if facing == "outward":
+                yaw += 180
+        else:
+            yaw = rng.uniform(-180, 180)
+        if crowd["wear"]:
+            look = dict(rng.choice(crowd["wear"]))
+        else:
+            top = rng.choice(CROWD_TOPS)
+            look = {"top": "%s %s" % (rng.choice(CROWD_COLOURS), top),
+                    "footwear": rng.choice(("black shoes", "brown shoes", "white sneakers",
+                                            "boots"))}
+            if "dress" not in top:
+                look["bottom"] = "%s %s" % (rng.choice(CROWD_COLOURS),
+                                            rng.choice(CROWD_BOTTOMS))
+        look.update(hair=rng.choice(CROWD_HAIR), hair_style=rng.choice(CROWD_STYLES),
+                    weight=rng.choice((-1, 0, 0, 0, 1, 1, 2)),
+                    stature=rng.choice((-1, 0, 0, 1)))
+        out.append({"at": (x, z), "yaw": yaw, "controls": controls, "look": look,
+                    "skin": hex_rgb(rng.choice(CROWD_SKIN)), "size": rng.uniform(0.94, 1.04)})
+    return out
+
+
+_CROWD_CACHE = {}
+
+
+def crowd_pieces(obj):
+    """The crowd's faces around the origin, [(part, faces, rgb)], each person
+    on the floor; part is "m<n>", person by person, so each casts their own
+    shadow. Cached by the object's settings: a drag of another object
+    redraws a crowd many times unchanged."""
+    key = json.dumps([obj["crowd"], obj["rotation"][0], obj["scale"][0]], sort_keys=True)
+    hit = _CROWD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    turn = obj["rotation"][0]
+    rot = euler(turn)
+    pieces = []
+    for i, m in enumerate(crowd_members(obj["crowd"])):
+        shape = body_shape(m["look"])
+        k = obj["scale"][0] * shape["height"] * m["size"]
+        own = person_pieces(m["controls"], euler(turn + m["yaw"]), shape, outfit(m["look"]))
+        faces = [(fs, rgb or m["skin"]) for _, fs, rgb in own]
+        low = min(p[1] * k for fs, _ in faces for f in fs for p in f)
+        at = apply(rot, (m["at"][0], 0, m["at"][1]))
+        shift = (at[0], -low, at[2])
+        pieces += [("m%d" % i, [[add(mul(p, k), shift) for p in f] for f in fs], rgb)
+                   for fs, rgb in faces]
+    if len(_CROWD_CACHE) > 64:
+        _CROWD_CACHE.clear()
+    _CROWD_CACHE[key] = pieces
+    return pieces
 
 
 def object_pieces(obj):
@@ -1138,7 +1509,10 @@ def new_room():
 
 
 def new_scene(details=""):
-    return {"version": VERSION, "details": details, "frame": "portrait", "redraw": REDRAW,
+    return {"version": VERSION, "details": details, "frame": "portrait",
+            "pose_strength": POSE_STRENGTH, "depth_strength": DEPTH_STRENGTH,
+            "frame_keep": FRAME_KEEP, "face_likeness": FACE_LIKENESS,
+            "real_faces": REAL_FACES,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
             "room": new_room(), "objects": [], "enrich": new_enrich()}
@@ -1173,6 +1547,9 @@ def new_object(asset_id, taken=(), stand_in=None):
         obj["pose"] = {"preset": "standing", "controls": pose_controls("standing")}
         obj["character"] = ""
         obj["look"] = {}
+        obj["face"] = ""
+    elif a["kind"] == "crowd":
+        obj["crowd"] = new_crowd()
     return obj
 
 
@@ -1209,6 +1586,23 @@ def character_look(rec, look=None):
         look.pop(k, None)
     look.update((rec or {}).get("looks") or {})
     return clean_look(look)
+
+
+def wear_outfit(rec, look=None):
+    """A clothes preset put on a person: every clothes and accessories slot
+    is the preset's, blank where it has none; the body, face and hair stay."""
+    import studio_imagegen as ig
+    look = dict(look or {})
+    for k in ig.OUTFIT_KEYS:
+        look.pop(k, None)
+    look.update((rec or {}).get("looks") or {})
+    return clean_look(look)
+
+
+def outfit_looks(look):
+    """What a person wears, as a preset keeps it."""
+    import studio_imagegen as ig
+    return {k: look[k] for k in ig.OUTFIT_KEYS if (look or {}).get(k)}
 
 
 def look_text(obj):
@@ -1264,6 +1658,9 @@ def clean_object(d, taken=()):
             k: _num(given.get(k), start[k], *CONTROL_RANGE[k]) for k in CONTROL_KEYS}}
         o["character"] = str(d.get("character") or "")
         o["look"] = clean_look(d.get("look"))
+        o["face"] = str(d.get("face") or "")
+    if "crowd" in base:
+        o["crowd"] = clean_crowd(d.get("crowd"))
     return o
 
 
@@ -1276,7 +1673,13 @@ def clean_scene(d):
         return s, ["Not a scene file."]
     s["details"] = str(d.get("details") or "")
     s["frame"] = d.get("frame") if d.get("frame") in FRAME_SIZES else s["frame"]
-    s["redraw"] = _num(d.get("redraw"), REDRAW, 0.05, 1.0)
+    # A scene saved before the maps had `redraw` (denoise from the frame); it
+    # opens with the maps and no frame, as a new one does.
+    s["pose_strength"] = _num(d.get("pose_strength"), POSE_STRENGTH, 0.0, 1.0)
+    s["depth_strength"] = _num(d.get("depth_strength"), DEPTH_STRENGTH, 0.0, 1.0)
+    s["frame_keep"] = _num(d.get("frame_keep"), FRAME_KEEP, 0.0, FRAME_KEEP_MAX)
+    s["face_likeness"] = _num(d.get("face_likeness"), FACE_LIKENESS, *FACE_LIKENESS_RANGE)
+    s["real_faces"] = bool(d.get("real_faces", REAL_FACES))
     cam = d.get("camera") if isinstance(d.get("camera"), dict) else {}
     c = s["camera"]
     c["target"] = _vec(cam.get("target"), c["target"], -100, 100)
@@ -1304,6 +1707,9 @@ def clean_scene(d):
                             % (raw.get("asset") if isinstance(raw, dict) else raw))
         else:
             s["objects"].append(o)
+            if o.get("face") and not os.path.isfile(o["face"]):
+                problems.append("%s's face picture %s is missing, so their face is drawn "
+                                "from the words." % (o["name"], os.path.basename(o["face"])))
     given = d.get("enrich") if isinstance(d.get("enrich"), dict) else {}
     for key in s["enrich"]:
         raw = given.get(key) if isinstance(given.get(key), list) else []
@@ -1333,6 +1739,123 @@ def load(path):
 def scenes_dir():
     import studio_imagegen as ig        # lazily: the engine is heavy, this is a path
     return os.path.join(ig.studio_dir(), "scenes")
+
+
+# ================================================================== history
+# Undo is whole-scene snapshots, not inverse operations: a scene is a few KB
+# of JSON (a crowd is its settings, not its people), and a snapshot cannot
+# get out of step with an edit the way a hand-written inverse can. Each step
+# is named from what differs between it and the one before (`change_label`),
+# so no edit in the window has to say what it is.
+
+OBJECT_CHANGES = [             # (field, how the step is named), first match wins
+    ("pose", "Pose %s"), ("look", "Change %s's look"), ("character", "Change %s's look"),
+    ("crowd", "Change the crowd %s"), ("colour", "Colour %s"), ("position", "Move %s"),
+    ("rotation", "Turn %s"), ("scale", "Size %s"), ("name", "Rename %s"),
+    ("description", "Describe %s"),
+]
+SCENE_CHANGES = [("camera", "Move the camera"), ("room", "Change the floor and walls"),
+                 ("frame", "Change the frame"), ("details", "Edit the scene details"),
+                 ("pose_strength", "Change the pose strength"),
+                 ("depth_strength", "Change the layout strength"),
+                 ("frame_keep", "Change how much frame is kept")]
+
+
+def change_label(before, after):
+    """-> a few words for what changed from scene `before` to scene `after`."""
+    was = {o["id"]: o for o in before.get("objects", [])}
+    now = {o["id"]: o for o in after.get("objects", [])}
+    added = [o for i, o in now.items() if i not in was]
+    gone = [o for i, o in was.items() if i not in now]
+    if added or gone:
+        verb, some = ("Add", added) if added and not gone else \
+            ("Delete", gone) if gone and not added else ("Change", added + gone)
+        return "%s %s" % (verb, some[0]["name"] if len(some) == 1 else
+                          "%d objects" % len(some))
+    edited = [(was[i], o) for i, o in now.items() if o != was[i]]
+    if len(edited) > 1:
+        return "Change %d objects" % len(edited)
+    if edited:
+        a, b = edited[0]
+        for key, words in OBJECT_CHANGES:
+            if a.get(key) != b.get(key):
+                return words % (a["name"] if key == "name" else b["name"])
+        return "Change %s" % b["name"]
+    if [o["id"] for o in before.get("objects", [])] != \
+            [o["id"] for o in after.get("objects", [])]:
+        return "Reorder the objects"
+    for key, words in SCENE_CHANGES:
+        if before.get(key) != after.get(key):
+            return words
+    return "Change the scene"
+
+
+class History:
+    """A scene's undo and redo: `steps` of (label, snapshot, selection),
+    `at` the one the scene is in now. `record` after an edit, `undo` /
+    `redo` / `go` to move, each handing back (scene, selection) to put up.
+    The selection is the one the step was made with, so undoing a move
+    selects what moved back. Snapshots are JSON text: compared as strings,
+    and no step shares a list with the live scene."""
+    LIMIT = 200
+
+    def __init__(self, scene, sel=None, label="Start"):
+        self.reset(scene, sel, label)
+
+    @staticmethod
+    def snap(scene):
+        return json.dumps(scene, sort_keys=True)
+
+    def reset(self, scene, sel=None, label="Start"):
+        self.steps = [(label, self.snap(scene), sel)]
+        self.at = 0
+        self.saved = self.steps[0][1]
+
+    def mark_saved(self, scene):
+        self.saved = self.snap(scene)
+
+    def unsaved(self, scene):
+        return self.snap(scene) != self.saved
+
+    def record(self, scene, sel=None):
+        """-> the new step's label, or None when nothing changed. A step
+        recorded after an undo throws the redo steps away, as everywhere."""
+        now = self.snap(scene)
+        prev = self.steps[self.at][1]
+        if now == prev:
+            return None
+        label = change_label(json.loads(prev), scene)
+        del self.steps[self.at + 1:]
+        self.steps.append((label, now, sel))
+        if len(self.steps) > self.LIMIT:
+            del self.steps[:len(self.steps) - self.LIMIT]
+        self.at = len(self.steps) - 1
+        return label
+
+    def can_undo(self):
+        return self.at > 0
+
+    def can_redo(self):
+        return self.at < len(self.steps) - 1
+
+    def labels(self):
+        return [label for label, _, _ in self.steps]
+
+    def go(self, i):
+        """-> (scene, selection) at step `i`, or None if that is where it is.
+        The selection is from the step nearest `i` that is crossed."""
+        i = max(0, min(len(self.steps) - 1, i))
+        if i == self.at:
+            return None
+        crossed = self.steps[i + 1] if i < self.at else self.steps[i]
+        self.at = i
+        return json.loads(self.steps[i][1]), crossed[2]
+
+    def undo(self):
+        return self.go(self.at - 1) if self.can_undo() else None
+
+    def redo(self):
+        return self.go(self.at + 1) if self.can_redo() else None
 
 
 # ================================================================= textures
@@ -1551,12 +2074,14 @@ def frame_size(scene):
 class Poly:
     """One face on screen: points in frame pixels, a colour, its depth, and
     the object and part it belongs to (None for the room). `tex` is a
-    `TexMap` when the face wears a picture; `rgb` is then its mean colour."""
-    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex")
+    `TexMap` when the face wears a picture; `rgb` is then its mean colour.
+    `dim` (0-1) makes it a shadow: it darkens what is under it by that
+    factor instead of painting over it, and `rgb` is only a stand-in."""
+    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex", "dim")
 
-    def __init__(self, pts, rgb, depth, owner, part, tex=None):
+    def __init__(self, pts, rgb, depth, owner, part, tex=None, dim=None):
         self.pts, self.rgb, self.depth, self.owner, self.part = pts, rgb, depth, owner, part
-        self.tex = tex
+        self.tex, self.dim = tex, dim
 
 
 class TexMap:
@@ -1611,9 +2136,20 @@ def render(scene, width=None, height=None):
         width, height = frame_size(scene)
     cam = Camera(scene["camera"], width, height)
     polys = room_polys(scene, cam)
+    tex = texture((scene.get("room") or new_room())["floor"]["image"])
+    floor = tex.mean if tex else FLOOR
     faces = []
     for obj in scene["objects"]:
-        for part, fs, rgb in painted_pieces(obj):
+        pieces = painted_pieces(obj)
+        if obj["asset"] == "crowd":          # each person their own shadow
+            members = {}
+            for piece in pieces:
+                members.setdefault(piece[0], []).append(piece)
+            for group in members.values():
+                polys += shadow_polys(group, cam, floor)
+        else:
+            polys += shadow_polys(pieces, cam, floor)
+        for part, fs, rgb in pieces:
             for f in fs:
                 n = newell(f)
                 if dot(n, sub(centroid(f), cam.eye)) >= 0:
@@ -1626,6 +2162,77 @@ def render(scene, width=None, height=None):
                                   obj["id"], part))
     faces.sort(key=lambda p: -p.depth)
     return polys + faces
+
+
+# Contact shadows: (metres grown past the footprint, factor it darkens by).
+# Rings overlap, so the middle is the product of them all: dark where the
+# sole meets the floor, fading out past it. Without them the mannequin reads
+# as pasted on the floor, and the picture made from the frame draws the
+# person hovering over it.
+CONTACT = tuple((0.1 * (1 - i / 7.0) + 0.01, 0.93) for i in range(7))
+AMBIENT_SHADOW = tuple((0.2 * (1 - i / 4.0) + 0.02, 0.96) for i in range(4))
+CONTACT_REACH = 0.04           # m above its lowest point a part still touches
+AMBIENT_REACH = 0.3            # m above it whose outline casts the faint shadow
+
+
+def hull(pts):
+    """The convex hull of 2D points, counter-clockwise (monotone chain)."""
+    pts = sorted(set(pts))
+    if len(pts) < 3:
+        return pts
+    cross2 = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])  # noqa
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and cross2(out[-2], out[-1], p) <= 0:
+                out.pop()
+            out.append(p)
+        return out[:-1]
+    return half(pts) + half(reversed(pts))
+
+
+def grown(outline, r, sides=16):
+    """A floor outline grown by `r` metres all round, corners rounded."""
+    ring = [(math.cos(2 * math.pi * i / sides) * r, math.sin(2 * math.pi * i / sides) * r)
+            for i in range(sides)]
+    return hull([(x + dx, z + dz) for x, z in outline for dx, dz in ring])
+
+
+def shadow_polys(pieces, cam, floor=FLOOR):
+    """The soft shadow an object leaves on the floor, as `dim` polys: a
+    dark contact ring under each part that touches (each foot, a knee, a
+    box's base) and a faint one under the whole body. Only for an object on
+    the floor itself: one standing on a platform at y > 0 would have its
+    shadow drawn under the platform, since the room is drawn first."""
+    pts = [p for _, faces, _ in pieces for f in faces for p in f]
+    if not pts or cam.eye[1] <= 0:
+        return []
+    low = min(p[1] for p in pts)
+    if low > 0.02:
+        return []
+    touching = {}
+    for part, faces, _ in pieces:
+        for f in faces:
+            for p in f:
+                if p[1] <= low + CONTACT_REACH:
+                    touching.setdefault(part, []).append((p[0], p[2]))
+    whole = hull([(p[0], p[2]) for p in pts if p[1] <= low + AMBIENT_REACH])
+    rings = [(whole, AMBIENT_SHADOW)] if len(whole) >= 3 else []
+    rings += [(hull(foot), CONTACT) for foot in touching.values()]
+    out = []
+    for outline, steps in rings:
+        if not outline:
+            continue
+        seen = 1.0
+        for r, k in steps:
+            seen *= k
+            c = clip_near([cam.to_camera((x, 0.001, z)) for x, z in grown(outline, r)])
+            if len(c) >= 3:
+                out.append(Poly([cam.to_screen(p) for p in c],
+                                tuple(int(v * seen) for v in floor), float("inf"),
+                                None, "shadow", dim=k))
+    return out
 
 
 def room_polys(scene, cam):
@@ -1708,6 +2315,7 @@ def rasterise(polys, width, height, sky=SKY, flat=False):
             continue
         colour = bytes(poly.rgb)
         tex = None if flat else poly.tex
+        dim = bytes(int(v * poly.dim) for v in range(256)) if poly.dim else None
         edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
         edges = [(a, b) if a[1] <= b[1] else (b, a) for a, b in edges if a[1] != b[1]]
         for y in range(y0, y1 + 1):
@@ -1721,8 +2329,11 @@ def rasterise(polys, width, height, sky=SKY, flat=False):
             if xb < xa:
                 continue
             row = y * stride
-            buf[row + xa * 3:row + (xb + 1) * 3] = (tex.span(y, xa, xb) if tex else
-                                                    colour * (xb - xa + 1))
+            a, b = row + xa * 3, row + (xb + 1) * 3
+            if dim:
+                buf[a:b] = bytes(buf[a:b]).translate(dim)
+            else:
+                buf[a:b] = tex.span(y, xa, xb) if tex else colour * (xb - xa + 1)
     return bytes(buf)
 
 
@@ -1748,18 +2359,251 @@ def png(scene):
     return rgb_png(rasterise(render(scene, w, h), w, h), w, h)
 
 
-def write_reference(scene, folder=None):
-    """Render the frame to `<scenes>/renders/<hash>.png` and return the path.
-    Named by content, so History's settings keep pointing at the picture that
-    was sent, and the same frame twice is one file."""
-    data = png(scene)
+def _write(data, prefix, folder=None):
+    """PNG bytes -> `<scenes>/renders/<prefix>_<hash>.png`, its path. Named by
+    content, so History's settings keep pointing at the picture that was
+    sent, and the same picture twice is one file."""
     folder = folder or os.path.join(scenes_dir(), "renders")
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, "scene_%s.png" % hashlib.sha1(data).hexdigest()[:16])
+    path = os.path.join(folder, "%s_%s.png" % (prefix, hashlib.sha1(data).hexdigest()[:16]))
     if not os.path.isfile(path):
-        with open(path, "wb") as f:
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
             f.write(data)
+        os.replace(tmp, path)
     return path
+
+
+def write_reference(scene, folder=None):
+    """Render the frame and write it (`_write`) -> its path."""
+    return _write(png(scene), "scene", folder)
+
+
+# ==================================================================== maps
+# What the picture is made from when the model's workflow has a ControlNet:
+# not the grey frame - image to image copies its blocky mannequins at any
+# denoise low enough to keep the layout - but what the frame means. Where
+# each body's joints are (`pose_png`: OpenPose, drawn as the Image Studio's
+# stick figure is) and how far every pixel is from the camera (`depth_png`).
+# Both are seen through the one camera, so they fall exactly where the
+# viewport's frame shows the mannequins and the props.
+OPENPOSE_OF_COCO = {0: 0, 1: 15, 2: 14, 3: 17, 4: 16, 5: 5, 6: 2, 7: 6, 8: 3, 9: 7,
+                    10: 4, 11: 11, 12: 8, 13: 12, 14: 9, 15: 13, 16: 10}
+FACE_UNIT = 0.032              # m: half the gap between the eyes, studio_pose.FACE's unit
+SEEN_FACING = -0.25            # a head point is drawn when it faces the camera this much
+HIDDEN_BEHIND = 0.3            # m of something nearer at its pixel that hides a point
+
+
+def rigs(obj):
+    """The people in an object as [(skeleton, k, shift)]: a skeleton point p
+    is at p * k + shift in the world, as `painted_pieces` places their faces.
+    One for a person, one per member for a crowd, none for a prop."""
+    def placed(controls, root, shape, look, k, x, y, z):
+        low = min(p[1] for _, faces, _ in person_pieces(controls, root, shape, outfit(look))
+                  for f in faces for p in f) * k
+        return skeleton(controls, root, shape), k, (x, y - low, z)
+    x, y, z = obj["position"]
+    if obj["asset"] == "person":
+        look = obj.get("look") or {}
+        shape = body_shape(look)
+        return [placed(obj["pose"]["controls"], euler(*obj["rotation"]), shape, look,
+                       obj["scale"][0] * shape["height"], x, y, z)]
+    if obj["asset"] != "crowd":
+        return []
+    turn = obj["rotation"][0]
+    out = []
+    for m in crowd_members(obj["crowd"]):
+        shape = body_shape(m["look"])
+        at = apply(euler(turn), (m["at"][0], 0, m["at"][1]))
+        out.append(placed(m["controls"], euler(turn + m["yaw"]), shape, m["look"],
+                          obj["scale"][0] * shape["height"] * m["size"],
+                          x + at[0], y, z + at[2]))
+    return out
+
+
+def pose_figures(scene, width=None, height=None):
+    """Every person the camera sees, as `studio_pose.render_figures` takes
+    them, far to near: {"points": the 18 OpenPose points as fractions of the
+    frame, None where not seen; "face": the 68 dots, or []; "depth": m}.
+
+    Which head points are seen is decided the way DWPose would find them:
+    the nose and eyes only on the side of the head facing the camera, the
+    far ear hidden in profile. The face dots are a real face's, turned with
+    the head in 3D, drawn whenever the nose is seen - in profile too, as
+    DWPose draws them: a figure without them comes back seen from behind
+    (studio_pose.face_points)."""
+    if width is None:
+        width, height = frame_size(scene)
+    cam = Camera(scene["camera"], width, height)
+    # What stands in front: a point with a surface more than HIDDEN_BEHIND
+    # nearer than it at its pixel is hidden, as a photo would hide it - a
+    # crowd member's limbs drawn through the person in front of them read
+    # as that person's own and turned them round (2026-09-25). The body's
+    # own surface is nearer than its joints by less than that.
+    k_depth = DEPTH_EDGE / float(max(width, height))
+    dw, dh = max(64, int(round(width * k_depth))), max(64, int(round(height * k_depth)))
+    zb = depth_values(scene, dw, dh)
+
+    def hidden(p):
+        c = cam.to_camera(p)
+        x, y = int(cam.to_screen(c)[0] * dw / width), int(cam.to_screen(c)[1] * dh / height)
+        if not (0 <= x < dw and 0 <= y < dh) or zb[y * dw + x] <= 0:
+            return False
+        return 1.0 / zb[y * dw + x] < c[2] - HIDDEN_BEHIND
+    out = []
+    for obj in scene["objects"]:
+        for sk, k, shift in rigs(obj):
+            def world(p, k=k, shift=shift):
+                return add(mul(p, k), shift)
+            hp, hm = sk["head"]
+            coco = {i: world(sk[j][0]) for i, j in KP_JOINTS.items()}
+            coco.update({i: world(add(hp, apply(hm, v))) for i, v in KP_HEAD.items()})
+            to_cam = norm(sub(cam.eye, world(hp)))
+            fwd, side = column(hm, 2), column(hm, 0)     # the face looks +Z; +X is their left
+            faces_way = {0: fwd, 1: norm(add(fwd, mul(side, 0.35))),
+                         2: norm(add(fwd, mul(side, -0.35))), 3: side, 4: mul(side, -1)}
+            pts = [None] * 18
+            for i, p in coco.items():
+                if i in faces_way and dot(faces_way[i], to_cam) <= SEEN_FACING:
+                    continue
+                s = cam.project(p)
+                if s and not hidden(p):
+                    pts[OPENPOSE_OF_COCO[i]] = [s[0] / width, s[1] / height]
+            if pts[2] and pts[5]:                  # the neck, as OpenPose makes it
+                pts[1] = [(pts[2][0] + pts[5][0]) / 2, (pts[2][1] + pts[5][1]) / 2]
+            if not any(p and 0 <= p[0] <= 1 and 0 <= p[1] <= 1 for p in pts):
+                continue
+            face = []
+            if pts[0]:
+                for u, v in studio_pose.FACE:
+                    local = (u * FACE_UNIT, KP_HEAD[1][1] - v * FACE_UNIT,
+                             0.10 - 0.012 * u * u)
+                    s = cam.project(world(add(hp, apply(hm, local))))
+                    if s:
+                        face.append((s[0] / width, s[1] / height))
+            out.append({"points": pts, "face": face,
+                        "depth": cam.to_camera(world(hp))[2]})
+    out.sort(key=lambda f: -f["depth"])
+    return out
+
+
+def pose_png(scene):
+    """The OpenPose picture of everyone in the frame, or None if no one is."""
+    w, h = frame_size(scene)
+    figures = pose_figures(scene, w, h)
+    return studio_pose.render_figures(figures, w, h) if figures else None
+
+
+def _fill_depth(zb, width, height, pts):
+    """A convex face's 1/z into the z-buffer `zb`, nearest kept. `pts` are
+    (sx, sy, 1/z): 1/z is linear across the screen for a flat face, so each
+    pixel is a sum, not a division."""
+    x0, y0, q0 = pts[0]
+    best = None
+    for i in range(1, len(pts) - 1):
+        (x1, y1, q1), (x2, y2, q2) = pts[i], pts[i + 1]
+        det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if best is None or abs(det) > abs(best[0]):
+            best = (det, x1, y1, q1, x2, y2, q2)
+    det, x1, y1, q1, x2, y2, q2 = best
+    if abs(det) < 1e-6:
+        return                                   # edge-on
+    b = ((q1 - q0) * (y2 - y0) - (q2 - q0) * (y1 - y0)) / det
+    c = ((x1 - x0) * (q2 - q0) - (x2 - x0) * (q1 - q0)) / det
+    a = q0 - b * x0 - c * y0
+    ys = [p[1] for p in pts]
+    top = max(0, int(math.ceil(min(ys) - 0.5)))
+    bottom = min(height - 1, int(math.floor(max(ys) - 0.5)))
+    edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+    edges = [(p, q) if p[1] <= q[1] else (q, p) for p, q in edges if p[1] != q[1]]
+    for y in range(top, bottom + 1):
+        yc = y + 0.5
+        xs = [p[0] + (yc - p[1]) * (q[0] - p[0]) / (q[1] - p[1])
+              for p, q in edges if p[1] <= yc < q[1]]
+        if len(xs) < 2:
+            continue
+        xa = max(0, int(math.ceil(min(xs) - 0.5)))
+        xb = min(width - 1, int(math.floor(max(xs) - 0.5)))
+        q = a + b * (xa + 0.5) + c * yc
+        for i in range(y * width + xa, y * width + xb + 1):
+            if q > zb[i]:
+                zb[i] = q
+            q += b
+
+
+def depth_values(scene, width, height):
+    """1/z (1/m) of the nearest surface at each pixel, row by row, 0 where
+    the camera sees only sky: the floor, the walls that face into the room,
+    and every object, as `render` draws them but without the shadows."""
+    cam = Camera(scene["camera"], width, height)
+    room = scene.get("room") or new_room()
+    faces = []
+    if cam.eye[1] > 0:
+        r = FLOOR_REACH
+        faces.append([(-r, 0, -r), (r, 0, -r), (r, 0, r), (-r, 0, r)])
+    if room["walls"]:
+        faces += [quad for quad, origin, _ in walls(room)
+                  if dot(newell(quad), sub(origin, cam.eye)) < 0]
+    for obj in scene["objects"]:
+        for _, fs, _ in painted_pieces(obj):
+            faces += [f for f in fs if dot(newell(f), sub(centroid(f), cam.eye)) < 0]
+    zb = [0.0] * (width * height)
+    for f in faces:
+        c = clip_near([cam.to_camera(p) for p in f])
+        if len(c) >= 3:
+            _fill_depth(zb, width, height, [cam.to_screen(p) + (1.0 / p[2],) for p in c])
+    return zb
+
+
+def depth_png(scene, edge=DEPTH_EDGE):
+    """The frame as a depth map, the kind a depth ControlNet was trained on
+    (Depth Anything's): grey by nearness - 1/z from the farthest thing seen
+    (black) to the nearest (white), the sky black. Smaller than the frame,
+    with the same shape: the ControlNet scales it to the picture."""
+    w, h = frame_size(scene)
+    k = edge / float(max(w, h))
+    dw, dh = max(64, int(round(w * k))), max(64, int(round(h * k)))
+    zb = depth_values(scene, dw, dh)
+    seen = [q for q in zb if q > 0]
+    lo, hi = (min(seen), max(seen)) if seen else (0.0, 1.0)
+    span = (hi - lo) or 1.0
+    grey = bytes(0 if q <= 0 else int(round(255 * (q - lo) / span)) for q in zb)
+    rgb = bytearray(dw * dh * 3)
+    for i in range(3):
+        rgb[i::3] = grey
+    return rgb_png(bytes(rgb), dw, dh)
+
+
+MAP_KINDS = ("pose", "composition", "source")
+
+
+def scene_maps(scene, takes, folder=None):
+    """Draw and write what the picture is made from, for a model whose
+    workflows take the reference kinds `takes` -> ({kind: path}, notes).
+
+    - `pose`: the pose map, when the strength is above 0 and anyone is in
+      the frame.
+    - `composition`: the depth map, when its strength is above 0.
+    - `source`: the grey frame, image to image, when some of it is kept - or
+      for a model with neither ControlNet input, which has only the frame to
+      go on (`FALLBACK_KEEP`, the old default)."""
+    notes = []
+    maps = {}
+    controlled = "pose" in takes or "composition" in takes
+    if "pose" in takes and scene["pose_strength"] > 0:
+        data = pose_png(scene)
+        if data:
+            maps["pose"] = _write(data, "pose", folder)
+        elif any(o["asset"] in ("person", "crowd") for o in scene["objects"]):
+            notes.append("No one is in the frame, so no pose map was sent.")
+    if "composition" in takes and scene["depth_strength"] > 0:
+        maps["composition"] = _write(depth_png(scene), "depth", folder)
+    if "source" in takes and (scene["frame_keep"] > 0 or not controlled):
+        maps["source"] = write_reference(scene, folder)
+    if not maps:
+        notes.append("Pose, layout and frame are all off: the picture has only the words "
+                     "to go on.")
+    return maps, notes
 
 
 # ==================================================================== words
@@ -1771,15 +2615,25 @@ class Words:
 
 
 def placement(scene, obj):
-    """Where an object sits in the frame, in words, or None outside it."""
+    """Where an object sits in the frame, in words, or None outside it. In
+    it is any of its box on screen: its middle alone left a person framed
+    head and shoulders out of the words, the middle being their hips below
+    the frame. Left, centre or right is read off the part that is seen."""
     w, h = frame_size(scene)
     cam = Camera(scene["camera"], w, h)
     lo, hi = bounds(obj)
-    mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2)
-    p = cam.project(mid)
-    if p is None or not (0 <= p[0] <= w and 0 <= p[1] <= h):
+    corners = [cam.project((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+               for z in (lo[2], hi[2])]
+    corners = [p for p in corners if p]
+    if not corners:
         return None
-    x = p[0] / w
+    x0, x1 = max(0, min(p[0] for p in corners)), min(w, max(p[0] for p in corners))
+    y0, y1 = max(0, min(p[1] for p in corners)), min(h, max(p[1] for p in corners))
+    if x0 >= x1 or y0 >= y1:
+        return None
+    mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2)
+    p = (0, 0, cam.to_camera(mid)[2])
+    x = (x0 + x1) / 2 / w
     where = ["left of frame" if x < 1 / 3 else "right of frame" if x > 2 / 3
              else "centre of frame"]
     d = scene["camera"]["distance"]
@@ -1790,24 +2644,164 @@ def placement(scene, obj):
     return where
 
 
+def _way(cam, fwd, at):
+    """(cos to the camera, frame side) of a direction `fwd` from `at`, level."""
+    fwd = norm((fwd[0], 0, fwd[2]))
+    to_cam = norm((cam.eye[0] - at[0], 0, cam.eye[2] - at[2]))
+    return dot(fwd, to_cam), "right" if dot(fwd, cam.r) > 0 else "left"
+
+
 def facing(scene, obj):
     """Which way a person faces, as the picture will show it."""
     w, h = frame_size(scene)
     cam = Camera(scene["camera"], w, h)
-    fwd = apply(euler(*obj["rotation"]), (0, 0, 1))
-    fwd = norm((fwd[0], 0, fwd[2]))
-    to_cam = norm((cam.eye[0] - obj["position"][0], 0, cam.eye[2] - obj["position"][2]))
-    c = dot(fwd, to_cam)
+    c, side = _way(cam, apply(euler(*obj["rotation"]), (0, 0, 1)), obj["position"])
     if c > 0.7:
         return "facing the camera"
     if c < -0.7:
         return "back to the camera"
-    side = "right" if dot(fwd, cam.r) > 0 else "left"
     if c > 0.2:
         return "three-quarter view, turned to frame %s" % side
     if c < -0.2:
         return "turned away, towards frame %s" % side
     return "in profile, facing frame %s" % side
+
+
+# ------------------------------------------------------------ a person, in words
+# What the controls know that the look's words do not: how the person stands
+# (`posture_words`), where their head looks against their body (`gaze_words`)
+# and how much of them the frame shows (`framing_words`). Read off the posed
+# skeleton rather than the sliders, so combinations come out as what they
+# look like - a raised arm bent back is a hand above the head either way -
+# and they agree with the pose map the ControlNet is given, which is drawn
+# from the same skeleton: words that disagree with a ControlNet fight it.
+LEG_POSES = ("walking", "crouching", "kneeling", "sitting")   # named: the legs are said
+HEAD_TOP = 0.2                 # m from the head joint (the top of the neck) to the crown
+BOTH_ARMS = {"hanging relaxed at the side": "arms relaxed at the sides",
+             "raised above the head": "both arms raised above the head",
+             "reaching forward at shoulder height": "both arms reaching forward",
+             "stretched out to the side": "arms stretched out to the sides",
+             "bent, the hand in front of the chest": "both arms bent, hands in front of the chest",
+             "bent, the hand in front of the waist": "both arms bent, hands in front of the waist",
+             "held forward": "both arms held forward",
+             "swinging forward": "both arms swinging forward",
+             "held out from the body": "arms held out from the body",
+             "swinging back": "both arms swinging back"}
+
+
+def _arm(sk, side, bent, hip_y):
+    """One arm's place, in words, from the skeleton (+Z forward, +X their left)."""
+    s, w = sk["shoulder_" + side][0], sk["wrist_" + side][0]
+    ahead, out = w[2] - s[2], abs(w[0]) - abs(s[0])
+    if w[1] > sk["head"][0][1] + HEAD_TOP:
+        return "raised above the head"
+    if w[1] > s[1] - 0.12:
+        return ("reaching forward at shoulder height" if ahead >= out
+                else "stretched out to the side")
+    if ahead > 0.15:
+        if bent:
+            return "bent, the hand in front of the %s" % (
+                "chest" if w[1] > (s[1] + hip_y) / 2 else "waist")
+        return "held forward" if ahead > 0.3 else "swinging forward"
+    if out > 0.18:
+        return "held out from the body"
+    if ahead < -0.15:
+        return "swinging back"
+    return "hanging relaxed at the side"
+
+
+def posture_words(obj):
+    """How a person stands, as phrases: the torso, the arms, the legs (unless
+    a named pose that says them - kneeling, sitting - is chosen), and the
+    head's nod and tilt (unless the look's Gaze says where they look).
+    Left and right are theirs, as a caption says "her right hand"."""
+    c = obj["pose"]["controls"]
+    look = obj.get("look") or {}
+    g = lambda k: float(c.get(k, 0) or 0)                 # noqa: E731
+    sk = skeleton(c, IDENTITY, body_shape(look))
+    out = []
+    bend = g("bend")
+    if bend >= 50:
+        out.append("bent well forward at the waist")
+    elif bend >= 18:
+        out.append("leaning forward")
+    elif bend <= -12:
+        out.append("leaning back")
+    if abs(g("lean")) >= 10:
+        out.append("leaning to their %s" % ("left" if g("lean") > 0 else "right"))
+    if abs(g("twist")) >= 20:
+        out.append("shoulders turned to their %s" % ("left" if g("twist") > 0 else "right"))
+    hip_y = sk["pelvis"][0][1]
+    arms = {side: _arm(sk, side, g("arm_%s_bend" % side) >= 60, hip_y) for side in "rl"}
+    if arms["r"] == arms["l"]:
+        out.append(BOTH_ARMS[arms["r"]])
+    else:
+        out += ["right arm " + arms["r"], "left arm " + arms["l"]]
+    if obj["pose"].get("preset") not in LEG_POSES:
+        sl, sr = g("leg_l_step"), g("leg_r_step")
+        bl, br = g("leg_l_bend"), g("leg_r_bend")
+        if abs(sl - sr) >= 25:
+            out.append("mid-stride, %s foot forward" % ("left" if sl > sr else "right"))
+        elif min(g("leg_l_out"), g("leg_r_out")) >= 12:
+            out.append("feet planted wide apart")
+        elif abs(bl - br) >= 12:
+            out.append("weight on the %s leg, the other knee relaxed"
+                       % ("right" if bl > br else "left"))
+    if not str(look.get("gaze") or "").strip():
+        if g("head_nod") >= 20:
+            out.append("looking down")
+        elif g("head_nod") <= -15:
+            out.append("looking up")
+    if abs(g("head_tilt")) >= 15:
+        out.append("head tilted")
+    return out
+
+
+def gaze_words(scene, obj):
+    """Where a person's head looks, as the picture shows it, when that is
+    not the way their body faces (a head turned back over the shoulder,
+    towards the camera): '' otherwise, or when the look's Gaze says it."""
+    if str((obj.get("look") or {}).get("gaze") or "").strip():
+        return ""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    rig = rigs(obj)[0]
+    hp, hm = rig[0]["head"]
+    at = add(mul(hp, rig[1]), rig[2])
+    body, _ = _way(cam, apply(euler(*obj["rotation"]), (0, 0, 1)), obj["position"])
+    head, side = _way(cam, column(hm, 2), at)
+    if abs(head - body) < 0.35:
+        return ""
+    if head > 0.7:
+        return "head turned towards the camera"
+    if head < -0.2:
+        return "head turned away from the camera"
+    return "looking towards frame %s" % side
+
+
+def framing_words(scene, obj):
+    """How much of a person the frame shows: 'whole figure in view', 'seen
+    from the knees up', ... - '' when none of them is in it."""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    sk, k, shift = rigs(obj)[0]
+
+    def seen(*joints):
+        for j in joints:
+            p = cam.project(add(mul(sk[j][0], k), shift))
+            if p is None or not (0 <= p[0] <= w and 0 <= p[1] <= h):
+                return False
+        return True
+    top = seen("head")
+    if seen("ankle_l", "ankle_r"):
+        return "whole figure in view" if top else "head out of the top of the frame"
+    if seen("knee_l") or seen("knee_r"):
+        return "seen from the knees up"
+    if seen("pelvis"):
+        return "seen from the waist up"
+    if seen("shoulder_l") or seen("shoulder_r"):
+        return "head and shoulders"
+    return ""
 
 
 def camera_words(scene):
@@ -1847,18 +2841,34 @@ def scene_text(scene):
         about = []
         if obj["asset"] == "person":
             about.append("a person")
+        elif obj["asset"] == "crowd":
+            n = len(crowd_members(obj["crowd"]))
+            about.append("a background crowd of %d %s" % (n, "person" if n == 1 else "people"))
         about += where
+        if obj["asset"] == "crowd":
+            c = obj["crowd"]
+            about.append({"mixed": "facing every way", "inward": "gathered, facing each other",
+                          "outward": "facing outwards"}.get(c["facing"])
+                         or facing(scene, obj))
+            if c["activity"] != "mixed":
+                about.append({"standing": "standing about", "walking": "walking",
+                              "cheering": "cheering, raising a glass"}[c["activity"]])
+        posture = ""
         if obj["asset"] == "person":
             about.append(facing(scene, obj))
+            about += [x for x in (gaze_words(scene, obj), framing_words(scene, obj)) if x]
             preset = obj["pose"].get("preset")
             if preset in POSE_NAMES and preset != "standing":
                 about.append(POSE_NAMES[preset].lower())
+            posture = ", ".join(posture_words(obj))
+            posture = posture[:1].upper() + posture[1:]
         line = "%s (%s)" % (obj["name"].strip() or ASSET[obj["asset"]]["label"],
                             ", ".join(about))
         desc = obj["description"].strip()
         look = look_text(obj) if obj["asset"] == "person" else ""
-        said = ". ".join(x for x in (look, desc) if x)
+        said = ". ".join(x for x in (look, posture, desc) if x)
         parts.append(line + (": " + said if said else ""))
+        said = look or desc
         if not said:
             out.notes.append("%s has no description; the picture has only its shape and "
                              "name to go on." % obj["name"])
@@ -1874,10 +2884,97 @@ def people(scene):
     return [o for o in scene["objects"] if o["asset"] == "person"]
 
 
-def generation(scene, reference, characters=None):
+# ==================================================================== faces
+# The face pass (studio_imagegen) redraws every face in the finished picture
+# close up. A scene knows who each face is: where each person's face falls in
+# the frame, and their own words, so a face is redrawn as that person rather
+# than as the whole prompt's blend of everyone - and, when the person has a
+# face picture (their own, or their character's identity's), redrawn to be
+# that face (PuLID), at the scene's `face_likeness`.
+FACE_UP = 0.1                  # m from the head joint (the top of the neck) to the face's middle
+# The part of the frame a person's face picture is drawn into in the picture
+# itself (PuLID's attention mask), in head heights (head joint to crown)
+# around the face: wide enough for the hair, short of the next person's head.
+FACE_REGION = {"side": 1.1, "above": 0.5, "below": 0.6}
+
+
+def face_picture(obj, characters=None, identities=None):
+    """-> (path, where it came from) of the face a person is drawn with, or
+    ('', ''): the person's own, else their character's identity's first
+    reference picture."""
+    if obj.get("face") and os.path.isfile(obj["face"]):
+        return obj["face"], "their own face picture"
+    rec = (characters or {}).get(obj.get("character")) if obj.get("character") else None
+    ident = (identities or {}).get(rec.get("identity")) if rec and rec.get("identity") else None
+    if ident and ident.get("use_references", True):
+        for path in ident.get("references") or []:
+            if os.path.isfile(path):
+                return path, "%s's profile" % ident["name"]
+    return "", ""
+
+
+def face_photos(obj, characters=None, identities=None):
+    """Every photo of a person's face there is, their own face picture
+    first, then their character's identity's references: the real-face
+    paste picks the one whose head is turned most like the drawn one's."""
+    out = []
+    if obj.get("face") and os.path.isfile(obj["face"]):
+        out.append(obj["face"])
+    rec = (characters or {}).get(obj.get("character")) if obj.get("character") else None
+    ident = (identities or {}).get(rec.get("identity")) if rec and rec.get("identity") else None
+    if ident and ident.get("use_references", True):
+        out += [p for p in ident.get("references") or [] if os.path.isfile(p) and p not in out]
+    return out
+
+
+def face_targets(scene, characters=None, identities=None):
+    """Every person whose face is in the frame: {"id", "name", "at": [x, y]
+    (the face's middle, as fractions of the frame), "region": [x0, y0, x1,
+    y1] (their head and hair, the same way), "words" (what they look
+    like, their own description, the scene's details), "face" (a picture's
+    path or ''), "from", "photos" (every photo of their face, `face_photos`)}. Crowds are left out: their faces are background."""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    details = scene["details"].strip().rstrip(".")
+    out = []
+    for obj in people(scene):
+        sk, k, shift = rigs(obj)[0]
+        hp, hm = sk["head"]
+        up = column(hm, 1)
+        p = cam.project(add(mul(add(hp, mul(up, FACE_UP)), k), shift))
+        if p is None or not (0 <= p[0] <= w and 0 <= p[1] <= h):
+            continue
+        neck = cam.project(add(mul(hp, k), shift))
+        crown = cam.project(add(mul(add(hp, mul(up, HEAD_TOP)), k), shift))
+        head = (math.hypot(crown[0] - neck[0], crown[1] - neck[1])
+                if neck and crown else 0.05 * h)
+        top, bottom = min(neck[1], crown[1]) if neck and crown else p[1], (
+            max(neck[1], crown[1]) if neck and crown else p[1])
+        region = [max(0.0, (p[0] - FACE_REGION["side"] * head) / w),
+                  max(0.0, (top - FACE_REGION["above"] * head) / h),
+                  min(1.0, (p[0] + FACE_REGION["side"] * head) / w),
+                  min(1.0, (bottom + FACE_REGION["below"] * head) / h)]
+        said = [x.strip().rstrip(".") for x in (look_text(obj), obj["description"], details)
+                if x and x.strip()]
+        face, source = face_picture(obj, characters, identities)
+        out.append({"id": obj["id"], "name": obj["name"],
+                    "at": [round(p[0] / w, 4), round(p[1] / h, 4)],
+                    "region": [round(x, 4) for x in region],
+                    "words": ". ".join(said) + ("." if said else ""),
+                    "face": face, "from": source,
+                    "photos": face_photos(obj, characters, identities)})
+    return out
+
+
+def generation(scene, maps, characters=None, identities=None):
     """What the Image Studio is handed: the words for its Scene field, and
-    the settings Generate adds to the form's (the frame's size, the redraw
-    strength, the reference, and the whole scene for History).
+    the settings Generate adds to the form's (the frame's size, the maps
+    from `scene_maps` as references with their strengths, the denoise when
+    the frame is one, and the whole scene for History). -> (words, extra).
+
+    `pose` and `composition` are always laid over the form's, None when not
+    sent, so the form's own drawn figure (and its hands' words) does not
+    ride along with a scene's.
 
     A scene with people in it says every person's look in their own line,
     so the form's one person is blanked for this job - said twice, the
@@ -1885,14 +2982,27 @@ def generation(scene, reference, characters=None):
     item pictures (compose matches them to the form's clothes, now blank;
     no workflow takes one yet, and the words carry the items). The identity
     whose LoRA carries a scene character's face rides along as
-    `scene_identities`, for the form to add to its own. `characters` is
-    {id: record}."""
+    `scene_identities`, for the form to add to its own. `characters` and
+    `identities` are {id: record}.
+
+    A scene with people always gets the face pass, told who each face is
+    (`scene_faces`, from `face_targets`): each redrawn in their own words,
+    and to their face picture's likeness where they have one."""
     import studio_imagegen as ig
     w, h = frame_size(scene)
     words = scene_text(scene)
     s, _ = clean_scene(scene)
-    extra = {"width": w, "height": h, "denoise": round(scene["redraw"], 3),
-             "scene_layout": copy.deepcopy(s)}
+    extra = {"width": w, "height": h, "scene_layout": copy.deepcopy(s),
+             "references": dict(maps), "pose": None, "composition": None}
+    if "pose" in maps:
+        extra["pose"] = {"strength": round(s["pose_strength"], 3)}
+    if "composition" in maps:
+        extra["composition"] = {"strength": round(s["depth_strength"], 3)}
+    if "source" in maps:
+        keep = s["frame_keep"]
+        if "pose" not in maps and "composition" not in maps:
+            keep = max(keep, FALLBACK_KEEP)
+        extra["denoise"] = round(1 - keep, 3)
     folks = people(s)
     if folks:
         extra.update({k: "" for k in ig.SLOTS})
@@ -1905,7 +3015,11 @@ def generation(scene, reference, characters=None):
             if rec and rec.get("identity") and rec["identity"] not in idents:
                 idents.append(rec["identity"])
         extra["scene_identities"] = idents
-    return words, reference, extra
+        extra["face_detail"] = True
+        extra["scene_faces"] = {"likeness": round(s["face_likeness"], 3),
+                                "real": s["real_faces"],
+                                "people": face_targets(s, characters, identities)}
+    return words, extra
 
 
 # ---------------------------------------------------------------- enrich
@@ -1938,8 +3052,9 @@ WHERE = {"behind": (2.2, 0, 0.0), "behind_left": (1.6, -1, 0.0),
          "left": (0.0, -1, 0.0), "right": (0.0, 1, 0.0),
          "foreground_left": (-1.2, -1, 0.0), "foreground_right": (-1.2, 1, 0.0),
          "above": (1.2, 0, 2.4)}
-SHAPES = ("box", "cylinder", "sphere", "cone", "frustum", "capsule", "wedge", "plane",
-          "table", "chair", "shelves", "car", "person", "none")
+SHAPES = ("box", "cylinder", "sphere", "cone", "frustum", "capsule", "wedge", "pyramid",
+          "plane", "table", "chair", "bench", "shelves", "barrel", "tree", "bush", "lamp",
+          "parasol", "car", "fence", "person", "none")
 ENRICH_SYSTEM = """You help stage a photograph. You suggest ONE believable, lived-in detail \
 that would make the scene feel like a real snapshot taken in that moment, not people \
 pasted into a themed background.
@@ -1962,7 +3077,9 @@ The scene is blocked out in 3D with simple shapes, and your detail is placed in 
 stein, lamp, basket), "sphere" (a ball, bush, boulder, globe lamp), "cone" (a \
 traffic cone, small tree, tent), "frustum" (a lampshade, stool, pedestal), \
 "capsule" (a bollard, bolster, rolled mat), "wedge" (a ramp, slope, awning), \
-"plane" (a rug, poster, sign board, puddle), "table", "chair", "shelves", "car", \
+"pyramid" (a roof, a pointed pile), "plane" (a rug, poster, sign board, puddle), \
+"table", "chair", "bench", "shelves", "barrel" (a keg), "tree", "bush" (a shrub, a \
+hedge), "lamp" (a street lamp), "parasol", "car", "fence", \
 "person" (a whole passer-by, never a part of one), or \
 "none" for what has no body of its own (light, haze, glare, stains, a hand or \
 shoulder cut off by the frame edge, strings of bunting too thin to block out).
@@ -2111,6 +3228,15 @@ def _hides(a, b, share=0.25):
     return w * h > share * max(small, 1e-9)
 
 
+def _middle_in_frame(cam, obj, w, h):
+    """An added detail's middle is in the frame. Stricter than `placement`,
+    which counts any part on screen: a table 18 px in from the edge is not
+    a detail anyone sees."""
+    lo, hi = bounds(obj)
+    p = cam.project(mul(add(lo, hi), 0.5))
+    return p is not None and 0 <= p[0] <= w and 0 <= p[1] <= h
+
+
 def _place(scene, sug):
     """-> a new object for the suggestion, placed clear of everything else
     and inside the frame, or None when it has no body or no such place was
@@ -2194,7 +3320,7 @@ def _place(scene, sug):
                 turn()
                 if not clear():
                     continue
-                if placement(scene, obj) is not None:
+                if _middle_in_frame(cam, obj, w, h):
                     return obj
                 break          # free but out of frame: further out will not help
     return None
@@ -2220,3 +3346,415 @@ def enrich_answer(scene, detail, answer):
     e = scene.setdefault("enrich", new_enrich())
     key = {"add": "added", "placed": "placed", "skip": "seen", "never": "never"}[answer]
     e[key] = (e.get(key, []) + [detail.strip()[:ENRICH_CHARS]])[-ENRICH_KEEP:]
+
+
+# ==================================================================== pose from a photo
+# A photo's pose, as the mannequin's controls. ComfyUI's `StudioDWPoseKeypoints`
+# node (comfy_nodes/studio_dwpose) finds each person's COCO-WholeBody points in
+# the picture; `fit_pose` searches the controls and the way the person faces
+# for the pose whose joints, seen from the front with no perspective, fall on
+# them. A flat picture cannot say how far a limb reaches towards the camera,
+# so the search leans a little towards the rest pose and away from arms thrown
+# back: the fit is a start to adjust, not a measurement.
+SEEN = 0.3                    # a point DWPose is less sure of than this is not used
+KP_JOINTS = {5: "shoulder_l", 6: "shoulder_r", 7: "elbow_l", 8: "elbow_r",
+             9: "wrist_l", 10: "wrist_r", 11: "hip_l", 12: "hip_r",
+             13: "knee_l", 14: "knee_r", 15: "ankle_l", 16: "ankle_r"}
+KP_HEAD = {0: (0, 0.09, 0.135),                                 # the nose's tip
+           1: (0.032, 0.125, 0.095), 2: (-0.032, 0.125, 0.095),  # the eyes
+           3: (0.085, 0.10, 0.0), 4: (-0.085, 0.10, 0.0)}        # the ears
+# Which points show each group of controls; a group none of them shows is
+# left at rest and said so.
+KP_GROUPS = [("head", "the head", (0, 1, 2, 3, 4), ("head_turn", "head_nod", "head_tilt")),
+             ("body", "the body", (5, 6, 11, 12), ("bend", "twist", "lean"))]
+for _side, _name, _o in (("l", "left", 0), ("r", "right", 1)):
+    KP_GROUPS += [
+        ("hand_" + _side, "the %s arm" % _name, (7 + _o, 9 + _o),
+         ("arm_%s_raise" % _side, "arm_%s_out" % _side, "arm_%s_bend" % _side)),
+        ("foot_" + _side, "the %s leg" % _name, (13 + _o, 15 + _o),
+         ("leg_%s_step" % _side, "leg_%s_out" % _side, "leg_%s_bend" % _side))]
+PRIOR = 1.5e-4                 # per (90 degrees from rest)^2, against a misfit in heights^2
+BACKWARDS = 4e-4               # per (45 degrees)^2 an arm is swung back, or the body leans back
+LIMB_TRIES = {
+    "arm": [(r, o, b) for r in (-30, 20, 60, 100, 140, 175) for o in (0, 45, 90)
+            for b in (0, 60, 120)],
+    "leg": [(s, o, b) for s in (-30, 0, 30, 60, 90, 115) for o in (0, 25, 45)
+            for b in (0, 45, 90, 135)],
+}
+
+
+class PoseFit:
+    """What `fit_pose` found: `controls` (every CONTROL_KEYS), `yaw` (deg the
+    person is turned from facing the camera; + is to frame right), `error`
+    (the joints' root-mean-square distance from the photo's points, as a
+    fraction of the person's height) and `unseen` (the parts the photo did
+    not show, left at rest); `scale`, the photo's pixels a metre at the
+    person, and `pelvis`, where in the photo their pelvis falls (x, y px) -
+    how big and where they stand, for `picture_scene`."""
+
+    def __init__(self, controls, yaw, error, unseen, scale=0.0, pelvis=(0.0, 0.0)):
+        self.controls, self.yaw, self.error, self.unseen = controls, yaw, error, unseen
+        self.scale, self.pelvis = scale, pelvis
+
+    @property
+    def rough(self):
+        return self.error > 0.05
+
+
+def photo_people(data):
+    """The node's JSON (text or parsed) -> its people, most prominent first
+    (the biggest box, weighed by how sure the finder was), each
+    {"box": [x0, y0, x1, y1], "score", "points": [[x, y, score] * 133]}."""
+    if isinstance(data, (str, bytes)):
+        data = json.loads(data)
+    folk = [p for p in (data or {}).get("people") or []
+            if isinstance(p, dict) and len(p.get("points") or ()) >= 17
+            and len(p.get("box") or ()) == 4]
+
+    def size(p):
+        b = p["box"]
+        return (b[2] - b[0]) * (b[3] - b[1]) * p.get("score", 1)
+    return sorted(folk, key=size, reverse=True)
+
+
+def pose_points(controls, yaw=0.0, shape=None):
+    """{COCO point index: world position} of the mannequin, pelvis at the
+    origin, turned `yaw` degrees."""
+    sk = skeleton(controls, euler(yaw), shape)
+    out = {i: sk[j][0] for i, j in KP_JOINTS.items()}
+    hp, hm = sk["head"]
+    for i, v in KP_HEAD.items():
+        out[i] = add(hp, apply(hm, v))
+    return out
+
+
+def _misfit(model, target):
+    """Mean squared distance of the model's points, seen from the front and
+    scaled and moved to fit best, from `target` [(index, x, y, weight)] (y
+    down). None when no positive scale fits."""
+    placed = _laid_over(model, target)
+    return placed and placed[0]
+
+
+def _laid_over(model, target):
+    """-> (the misfit, the scale, where the pelvis falls) for the model laid
+    best over `target`: the scale in target units a metre, the pelvis (the
+    model's origin) as a target (x, y). None when no positive scale fits."""
+    sw = sum(t[3] for t in target)
+    mx = sum(model[i][0] * w for i, _, _, w in target) / sw
+    my = sum(-model[i][1] * w for i, _, _, w in target) / sw
+    dx = sum(x * w for _, x, _, w in target) / sw
+    dy = sum(y * w for _, _, y, w in target) / sw
+    num = den = 0.0
+    for i, x, y, w in target:
+        ax, ay = model[i][0] - mx, -model[i][1] - my
+        num += w * (ax * (x - dx) + ay * (y - dy))
+        den += w * (ax * ax + ay * ay)
+    if den <= 0 or num <= 0:
+        return None
+    s = num / den
+    err = 0.0
+    for i, x, y, w in target:
+        ex = s * (model[i][0] - mx) - (x - dx)
+        ey = s * (-model[i][1] - my) - (y - dy)
+        err += w * (ex * ex + ey * ey)
+    return err / sw, s, (dx - s * mx, dy - s * my)
+
+
+def fit_pose(points, shape=None, box=None):
+    """A person's 133 [x, y, score] (DWPose's order) -> PoseFit. `box` is
+    their [x0, y0, x1, y1]; its height is the unit the fit is judged in.
+    Raises ValueError when too little of the body is seen to fit anything."""
+    seen = {i: (float(p[0]), float(p[1]), float(p[2])) for i, p in enumerate(points[:17])
+            if len(p) >= 3 and p[2] >= SEEN}
+    if sum(i in seen for i in (5, 6, 11, 12)) < 2 or len(seen) < 5:
+        raise ValueError("The photo does not show enough of the person to pose from "
+                         "(it needs the shoulders or hips and a few more joints).")
+    ys = [p[1] for p in seen.values()]
+    tall = max((box[3] - box[1]) if box else 0, max(ys) - min(ys), 1.0)
+    target = [(i, x / tall, y / tall, s) for i, (x, y, s) in seen.items()]
+    rest = pose_controls("standing")
+    free, unseen = [], []
+    for _part, name, idx, keys in KP_GROUPS:
+        if any(i in seen for i in idx):
+            free += keys
+        else:
+            unseen.append(name)
+
+    core = [t for t in target if t[0] in (0, 1, 2, 3, 4, 5, 6, 11, 12)]
+
+    def cost(state, target=target):
+        m = _misfit(pose_points(state, state["_yaw"], shape), target)
+        if m is None:
+            return float("inf")
+        prior = sum(((state[k] - rest[k]) / 90.0) ** 2 for k in free) * PRIOR
+        back = [state["bend"]] + [state["arm_%s_raise" % s] for s in ("l", "r")]
+        prior += sum(min(0.0, v) ** 2 for v in back) / 45.0 ** 2 * BACKWARDS
+        return m + prior
+
+    def move(state, k, d):
+        trial = dict(state)
+        if k == "_yaw":
+            trial[k] = (state[k] + d + 180) % 360 - 180
+        else:
+            lo, hi = CONTROL_RANGE[k]
+            trial[k] = min(hi, max(lo, state[k] + d))
+        return trial
+
+    def descend(state, keys, steps, target=target):
+        """Coordinate descent: each key a step either way while that helps,
+        then smaller steps."""
+        best = cost(state, target)
+        for step in steps:
+            for _ in range(8):
+                better = False
+                for k in keys:
+                    for d in (step, -step):
+                        trial = move(state, k, d)
+                        c = cost(trial, target)
+                        if c < best - 1e-12:
+                            state, best, better = trial, c, True
+                            break
+                if not better:
+                    break
+        return state, best
+
+    def limbs(state):
+        """Each limb from a spread of starts, the rest held: a limb towards
+        or away from the camera looks alike from the front."""
+        for _part, _name, _idx, limb in KP_GROUPS[2:]:
+            if limb[0] not in free:
+                continue
+            kind = "arm" if limb[0].startswith("arm") else "leg"
+            tries = LIMB_TRIES[kind] + [tuple(state[k] for k in limb)]
+            ranked = sorted(tries, key=lambda v: cost(dict(state, **dict(zip(limb, v)))))
+            state = min((descend(dict(state, **dict(zip(limb, v))), limb, (12, 6, 3))
+                         for v in ranked[:2]), key=lambda r: r[1])[0]
+        return state
+
+    # Every way the person might face, on the head, shoulders and hips alone
+    # (a limb still at rest would pull the torso to make up for it); then,
+    # from the best three, the limbs, and all of it together, twice.
+    keys = ["_yaw"] + free
+    trunk = ["_yaw"] + [k for k in ("bend", "twist", "lean", "head_turn", "head_nod",
+                                    "head_tilt") if k in free]
+    starts = sorted((descend(dict(rest, _yaw=float(yaw)), trunk, (24, 12, 6), core)
+                     for yaw in range(-180, 180, 30)), key=lambda r: r[1])
+    results = []
+    for state, _ in starts[:3]:
+        for steps in ((12, 6, 3), (8, 4, 2, 1)):
+            state = descend(limbs(state), keys, steps)[0]
+        results.append((state, cost(state)))
+    state, _ = min(results, key=lambda r: r[1])
+    err, scale, (px, py) = (_laid_over(pose_points(state, state["_yaw"], shape), target)
+                            or (0.0, 0.0, (0.0, 0.0)))
+    controls = {k: float(round(state[k])) for k in CONTROL_KEYS}
+    return PoseFit(controls, float(round(state["_yaw"])), math.sqrt(err), unseen,
+                   scale * tall, (px * tall, py * tall))
+
+
+# ==================================================== a scene from a picture
+# **From a picture…** makes a whole scene from one photo: every person the
+# pose finder sees (the most prominent `PICTURE_PEOPLE`), each posed by
+# `fit_pose` and stood where they are in it, and - when the vision model can
+# look - the setting, the floor and each person's clothes and doing in words.
+# Where a person stands comes from how big they are in the photo: the fit's
+# scale (pixels a metre, which a bent or turned pose does not fool the way a
+# box's height would) is how far they are from a lens of `PICTURE_LENS`, and
+# the camera is level at the height that puts every pelvis at its own pose's
+# height above the floor. A flat photo cannot say its lens or its tilt, so
+# both are a start to adjust, as each pose is.
+PICTURE_PEOPLE = 10
+PICTURE_LENS = 35.0
+PICTURE_SLOTS = ("subject", "age", "hair", "hair_style", "facial_hair", "top", "bottom",
+                 "outerwear", "footwear", "accessories", "expression")
+PICTURE_QUESTION = (
+    "This photo, %d x %d pixels, is to be rebuilt as a 3D scene and photographed again. "
+    "It shows %d people. Answer with JSON only, no other words, in this shape:\n"
+    '{"setting": "one or two sentences for the picture: the place, the light, the time '
+    'of day, what is around - not the people", "floor": "what the ground is, in a few '
+    'words", "people": [{"box": [left, top, right, bottom], "name": "a short name for '
+    'them, like Accordion player", "doing": "what they are doing and holding, in a few '
+    'words", "subject": "a man, a woman, a young woman, an older man...", "age": "in '
+    'their 30s...", "hair": "its colour", "hair_style": "", "facial_hair": "", "top": "", '
+    '"bottom": "", "outerwear": "", "footwear": "", "accessories": "", "expression": ""}]}\n'
+    "One entry for every person, including anyone seen from behind or cut off at an "
+    "edge; the box is where they are in the photo, in its pixels. Leave a field empty "
+    "when the photo does not show it.")
+# How far apart (in photo widths) a described person's middle may be from a
+# found one's and still be them. The vision model places a person across
+# the frame well and up and down loosely, so across counts for more.
+PICTURE_MATCH = 0.12
+
+
+def picture_question(folk, width, height):
+    """What the vision model is asked about a photo with `folk` in it. It
+    is not given our boxes to number: a 7B model numbered them in its own
+    order and put the band's clothes on the audience. It gives its own
+    boxes, and `match_people` pairs them."""
+    return PICTURE_QUESTION % (int(width or 0), int(height or 0), len(folk))
+
+
+def picture_answer(text, width=0, height=0):
+    """The vision model's reply -> {"setting", "floor", "people": [{...,
+    "box": [x0, y0, x1, y1] as fractions of the photo, or absent}]}, every
+    other value a string; what cannot be read is left out, never raised: a
+    scene without the words is still a scene. A box of numbers no bigger
+    than 100 in a bigger photo is read as percentages."""
+    out = {"setting": "", "floor": "", "people": []}
+    m = re.search(r"\{.*\}", text or "", re.S)
+    try:
+        data = json.loads(m.group(0)) if m else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        return out
+    for k in ("setting", "floor"):
+        if isinstance(data.get(k), str):
+            out[k] = data[k].strip()
+    for p in data.get("people") or []:
+        if not isinstance(p, dict):
+            continue
+        said = {k: _said_word(k, v) for k, v in p.items() if isinstance(v, str)}
+        said = {k: v for k, v in said.items() if v}
+        box = p.get("box") or p.get("bbox_2d") or p.get("bbox")
+        try:
+            box = [float(v) for v in box][:4] if len(box) >= 4 else None
+        except (TypeError, ValueError):
+            box = None
+        if box and box[2] > box[0] and box[3] > box[1]:
+            pct = max(box) <= 100 and max(width, height) > 100
+            w, h = (100.0, 100.0) if pct else (float(width or 1), float(height or 1))
+            said["box"] = [box[0] / w, box[1] / h, box[2] / w, box[3] / h]
+        out["people"].append(said)
+    return out
+
+
+UNSAID = ("", "none", "n/a", "na", "unknown", "not visible", "not shown", "unclear", "-")
+
+
+def _said_word(key, value):
+    """One field of the reply, cleaned: the example's trailing "..." (a 7B
+    model copies "in their 30s..." back), nothing for "none" and the like,
+    and a person as "a man", not "man", as the look's Who slot says it."""
+    v = value.strip().rstrip(".…").strip()
+    if v.lower() in UNSAID:
+        return ""
+    if key == "subject" and not re.match(r"(?i)(a|an|the)\s", v):
+        v = ("an " if v[:1].lower() in "aeiou" else "a ") + v
+    return v
+
+
+def match_people(folk, said, width, height):
+    """{n: what was said of the found person n (1 is folk[0])}: each
+    described person paired with the found one whose middle is nearest,
+    nearest pairs first, one each; too far apart is no one."""
+    w, h = float(width or 1), float(height or 1)
+
+    def mid(b):
+        return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+
+    pairs = []
+    for n, p in enumerate(folk, 1):
+        fx, fy = mid(p["box"])
+        for i, s in enumerate(said):
+            if "box" not in s:
+                continue
+            sx, sy = mid(s["box"])
+            d = abs(fx / w - sx) + 0.35 * abs(fy / h - sy)
+            if d <= PICTURE_MATCH:
+                pairs.append((d, n, i))
+    out, used = {}, set()
+    for _, n, i in sorted(pairs):
+        if n not in out and i not in used:
+            out[n] = said[i]
+            used.add(i)
+    return out
+
+
+def picture_frame(width, height):
+    """The frame whose shape is nearest the photo's."""
+    aspect = float(width) / max(1.0, float(height))
+    return min(FRAMES, key=lambda f: abs(math.log(f[2] / float(f[3]) / aspect)))[0]
+
+
+def pelvis_height(controls, yaw=0.0, shape=None):
+    """How far the pelvis is above the floor in this pose (m)."""
+    shape = shape or REST_SHAPE
+    low = min(p[1] for _, faces, _ in person_pieces(controls, euler(yaw), shape)
+              for f in faces for p in f)
+    return -low * shape["height"]
+
+
+def picture_scene(data, read=None, lens=PICTURE_LENS):
+    """The pose finder's JSON for a photo (and `picture_answer` of it, or
+    None) -> (scene, notes). Raises ValueError when no one in it can be
+    posed: a scene of nobody is not what was asked for."""
+    pw, ph = float(data.get("width") or 0), float(data.get("height") or 0)
+    folk = photo_people(data)
+    if not folk or pw <= 0 or ph <= 0:
+        raise ValueError("The pose finder found no one in the picture.")
+    read = read or {"setting": "", "floor": "", "people": []}
+    words = match_people(folk[:PICTURE_PEOPLE], read["people"], pw, ph)
+    notes = []
+    if len(folk) > PICTURE_PEOPLE:
+        notes.append("%d smaller people were left out; add a background crowd for them."
+                     % (len(folk) - PICTURE_PEOPLE))
+    scene = new_scene(read["setting"])
+    scene["frame"] = picture_frame(pw, ph)
+    fw, fh = FRAME_SIZES[scene["frame"]]
+    g = max(fw / pw, fh / ph)                     # the frame covers the photo, centred
+    ox, oy = (fw - pw * g) / 2, (fh - ph * g) / 2
+    cam = Camera({"target": [0, 0, 0], "yaw": 0, "pitch": 0, "distance": 1,
+                  "lens": lens}, fw, fh)
+    placed = []
+    for n, p in enumerate(folk[:PICTURE_PEOPLE], 1):
+        try:
+            fit = fit_pose(p["points"], None, p["box"])
+        except ValueError:
+            notes.append("Person %d shows too little of themselves to pose, so is left "
+                         "out." % n)
+            continue
+        if fit.scale <= 0:
+            continue
+        sx, sy = fit.pelvis[0] * g + ox, fit.pelvis[1] * g + oy
+        depth = cam.k / (fit.scale * g)
+        ray = add(cam.f, add(mul(cam.r, (sx - fw / 2) / cam.k),
+                             mul(cam.u, -(sy - fh / 2) / cam.k)))
+        rel = mul(ray, depth)                         # from the eye, the eye at 0
+        placed.append((n, fit, rel, depth, pelvis_height(fit.controls, fit.yaw)))
+    if not placed:
+        raise ValueError("No one in the picture shows enough of themselves to pose from.")
+    # Near people count for more: a far one's height is a few pixels, and
+    # the photo's tilt (taken as level) moves it the most.
+    weight = [fit.scale ** 2 for _, fit, *_ in placed]
+    eye_y = sum(w * (ph_ - rel[1]) for w, (_, _, rel, _, ph_) in zip(weight, placed))         / sum(weight)
+    eye_y = min(30.0, max(0.2, eye_y))
+    dist = placed[0][3]                   # the camera turns about the most prominent
+    scene["camera"] = {"target": [0.0, round(eye_y, 3), 0.0], "yaw": 0.0, "pitch": 0.0,
+                       "distance": round(dist, 3), "lens": lens}
+    if read["floor"]:
+        scene["room"]["floor"]["prompt"] = read["floor"]
+    rough = []
+    for n, fit, rel, _, _ in sorted(placed, key=lambda t: t[3], reverse=True):
+        obj = new_object("person", scene["objects"])
+        said = words.get(n) or {}
+        if said.get("name"):
+            obj["name"], k = said["name"][:40], 2
+            while any(o["name"] == obj["name"] for o in scene["objects"]):
+                obj["name"], k = "%s %d" % (said["name"][:40], k), k + 1
+        elif len(placed) > 1:
+            obj["name"] = "Person %d" % n
+        obj["description"] = said.get("doing", "")
+        obj["look"] = clean_look({k: said[k] for k in PICTURE_SLOTS if k in said})
+        x, z = rel[0], dist + rel[2]
+        obj["position"] = [round(x, 3), 0.0, round(z, 3)]
+        toward = math.degrees(math.atan2(0.0 - x, dist - z))
+        obj["rotation"][0] = round((toward + fit.yaw + 180) % 360 - 180, 1)
+        obj["pose"] = {"preset": "", "controls": fit.controls}
+        scene["objects"].append(obj)
+        if fit.rough:
+            rough.append(obj["name"])
+    if rough:
+        notes.append("The pose is rough for %s: adjust by hand." % ", ".join(rough))
+    return scene, notes

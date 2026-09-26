@@ -12,6 +12,7 @@ Re-check an entry only when a later change touches its code; then move it to
 | Scene Builder Enrich (`suggest`, `read_suggestion`, `enrich_messages`, `enrich_answer`, words, save/load) | `EnrichTest` (incl. `place_suggestion`: every WHERE in frame, no floor overlap, no hiding/covering subjects, fallback, passer-by not a subject) + live runs on qwen3-coder-30b, frame rendered and checked | uncommitted | 2026-09-26 |
 | Scene Builder shapes and props (`lathe`, `sphere`, `cone`, `capsule`, `wedge`, `fit`, compound `UNIT`, `STAND_INS`, Library buttons) | `TestShapesAndProps` + window test; every shape and prop rendered to PNG and checked by eye | uncommitted | 2026-09-26 |
 | Visual Critic (`studio_critic`, `Studio._refine`, `_correct`, `_regenerate`, `face_graph` whole-picture crop) | `tests/test_critic.py` against fake ComfyUI and fake vision; NOT yet run live | uncommitted | 2026-09-26 |
+| Merge of scene-from-picture into main (one asset library, `face_graph` with per-face words/PuLID and the Critic's `edit`/`mask`/`head` crops, `_middle_in_frame` for Enrich) | full suite 838 OK; all 13 saved scenes open with every object | uncommitted | 2026-09-26 |
 
 ## Needs re-check
 
