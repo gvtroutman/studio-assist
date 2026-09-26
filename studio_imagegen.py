@@ -698,7 +698,15 @@ class ComfyUIClient:
     def health(self):
         """-> {"ok", "detail", "device", "vram_free", "vram_total", "queue"}."""
         try:
-            stats = self.get_json("/system_stats", timeout=5)
+            try:
+                stats = self.get_json("/system_stats", timeout=5)
+            except Unreachable as e:
+                # ComfyUI stops answering HTTP while it stages a model or
+                # finishes a job: a busy server, not a dead one. A refusal
+                # fails at once; only a timeout is worth the longer wait.
+                if "timed out" not in str(e).lower():
+                    raise
+                stats = self.get_json("/system_stats", timeout=15)
             q = self.get_queue()
         except (ComfyError, ValueError) as e:
             return {"ok": False, "detail": str(e), "queue": 0}
