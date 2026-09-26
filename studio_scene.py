@@ -3834,7 +3834,8 @@ PICTURE_QUESTION = (
     "It shows %d people. Answer with JSON only, no other words, in this shape:\n"
     '{"setting": "one or two sentences for the picture: the place, the light, the time '
     'of day, what is around - not the people", "floor": "what the ground is, in a few '
-    'words", "people": [{"box": [left, top, right, bottom], "name": "a short name for '
+    'words", "indoors": true or false, "walls": "indoors, what the walls are, in a few '
+    'words (material, colour, what hangs on them); outdoors, empty", "people": [{"box": [left, top, right, bottom], "name": "a short name for '
     'them, like Accordion player", "doing": "what they are doing and holding, in a few '
     'words", "subject": "a man, a woman, a young woman, an older man...", "age": "in '
     'their 30s...", "hair": "its colour", "hair_style": "", "facial_hair": "", "top": "", '
@@ -3862,7 +3863,7 @@ def picture_answer(text, width=0, height=0):
     other value a string; what cannot be read is left out, never raised: a
     scene without the words is still a scene. A box of numbers no bigger
     than 100 in a bigger photo is read as percentages."""
-    out = {"setting": "", "floor": "", "people": []}
+    out = {"setting": "", "floor": "", "walls": "", "indoors": False, "people": []}
     m = re.search(r"\{.*\}", text or "", re.S)
     try:
         data = json.loads(m.group(0)) if m else {}
@@ -3873,6 +3874,15 @@ def picture_answer(text, width=0, height=0):
     for k in ("setting", "floor"):
         if isinstance(data.get(k), str):
             out[k] = data[k].strip()
+    if isinstance(data.get("walls"), str):
+        out["walls"] = _said_word("walls", data["walls"])
+    indoors = data.get("indoors")
+    if isinstance(indoors, str):
+        indoors = indoors.strip().lower() in ("true", "yes", "indoors")
+    # Walls said outdoors are a building's side, not a room round the camera.
+    out["indoors"] = indoors is True
+    if not out["indoors"]:
+        out["walls"] = ""
     for p in data.get("people") or []:
         if not isinstance(p, dict):
             continue
@@ -3947,6 +3957,29 @@ def pelvis_height(controls, yaw=0.0, shape=None):
     return -low * shape["height"]
 
 
+# Room made round a photo taken indoors: this much (m) beyond the camera and
+# the people, so the camera stands inside it and no one is in a wall.
+PICTURE_ROOM_MARGIN = 1.5
+
+
+def picture_room(room, placed, dist, eye_y, walls=""):
+    """Four walls round an indoor photo's camera and people, and the walls'
+    words. The room is centred on the origin, so each half-size is the
+    farthest thing from it that side plus `PICTURE_ROOM_MARGIN`."""
+    m = PICTURE_ROOM_MARGIN
+    xs = [abs(rel[0]) for _, _, rel, _, _ in placed]
+    zs = [abs(dist + rel[2]) for _, _, rel, _, _ in placed] + [dist]
+    lo, hi = ROOM_LIMITS["width"]
+    room["width"] = round(min(hi, max(lo, 2 * (max(xs) + m))), 2)
+    lo, hi = ROOM_LIMITS["depth"]
+    room["depth"] = round(min(hi, max(lo, 2 * (max(zs) + m))), 2)
+    lo, hi = ROOM_LIMITS["height"]
+    room["height"] = round(min(hi, max(lo, 3.0, eye_y + 0.8)), 2)
+    room["walls"] = True
+    if walls:
+        room["wall"]["prompt"] = walls
+
+
 def picture_scene(data, read=None, lens=PICTURE_LENS):
     """The pose finder's JSON for a photo (and `picture_answer` of it, or
     None) -> (scene, notes). Raises ValueError when no one in it can be
@@ -3955,7 +3988,8 @@ def picture_scene(data, read=None, lens=PICTURE_LENS):
     folk = photo_people(data)
     if not folk or pw <= 0 or ph <= 0:
         raise ValueError("The pose finder found no one in the picture.")
-    read = read or {"setting": "", "floor": "", "people": []}
+    read = dict({"setting": "", "floor": "", "walls": "", "indoors": False,
+                 "people": []}, **(read or {}))
     words = match_people(folk[:PICTURE_PEOPLE], read["people"], pw, ph)
     notes = []
     if len(folk) > PICTURE_PEOPLE:
@@ -3996,6 +4030,8 @@ def picture_scene(data, read=None, lens=PICTURE_LENS):
                        "distance": round(dist, 3), "lens": lens}
     if read["floor"]:
         scene["room"]["floor"]["prompt"] = read["floor"]
+    if read["indoors"]:
+        picture_room(scene["room"], placed, dist, eye_y, read["walls"])
     rough = []
     for n, fit, rel, _, _ in sorted(placed, key=lambda t: t[3], reverse=True):
         obj = new_object("person", scene["objects"])
