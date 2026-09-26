@@ -796,7 +796,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   kept in `scene["enrich"]` (`added`, `seen`, `never`, 40 each) and saved with the
   scene, so a reopened scene gets something new and a repeat is re-asked once.
   **Add puts a detail with a body into the scene** (`place_suggestion`): the model
-  names a `shape` (box, cylinder, a whole person), a true size, a colour and a `WHERE`
+  names a `shape` (any prop asset id, or a whole person), a true size, a colour and a `WHERE`
   word, never coordinates. The position is worked out here from the subjects' middle
   and spread along the camera's floor-level forward and right. A spot is refused if it
   overlaps something on the floor, if its frame rectangle hides behind a subject or
@@ -806,6 +806,19 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   description carries the words; select it and drag to adjust. Light, haze, stains
   and a hand at the frame edge are `none`, and those go into the words as written
   (`added`), before the camera line.
+- **Shapes are stand-ins; props are shapes under one transform.** `SHAPE_MESH` holds
+  the primitives (box, cylinder, sphere, cone, frustum, capsule, wedge, and `plane`,
+  a thin box labelled Panel), each a unit solid standing on the floor (x and z
+  -0.5..0.5, y 0..1), most turned by `lathe`. A compound prop (table, chair, shelves,
+  car) is an `ASSETS` entry with `parts`, each a primitive `fit` into a sub-box of that
+  unit space, merged into one `UNIT` mesh. So a compound is one object with one
+  transform and one colour, scale is its overall size in metres (Enrich's `size` still
+  means the same), and a scene file names it by id, never by geometry. Parts are not
+  selectable on their own: that is the price of keeping selection, dragging and
+  saving unchanged. `STAND_INS` (Cabinet, Door, Post, Tree…) only start a shape named,
+  sized and coloured through `new_object(..., stand_in)`; nothing about the preset is
+  saved. What a prop is comes only from its name and description (`scene_text`), and
+  the Library and inspector say so.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle

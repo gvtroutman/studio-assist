@@ -717,6 +717,16 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertFalse(sb.win.winfo_exists())
         self.assertIsNot(ui.build_scene(), sb)
 
+    def test_the_library_adds_shapes_props_and_stand_ins(self):
+        ui, sb = self.builder()
+        post = sb.add("cylinder", "Post")
+        chair = sb.add("chair")
+        self.app.update()
+        self.assertEqual((post["name"], post["scale"]), ("Post", [0.15, 2.5, 0.15]))
+        self.assertTrue(sb.canvas.find_withtag("o:" + chair["id"]) or
+                        any(p.owner == chair["id"] for p in sc.render(sb.scene)))
+        self.assertEqual(sb.stand_in_btn.winfo_ismapped(), 1)
+
     def test_click_a_hand_to_pose_it_and_drag_to_move(self):
         ui, sb = self.builder()
         person = sb.add("person")
@@ -904,6 +914,67 @@ class FakeLLM:
     def chat(self, messages, max_tokens=None):
         self.sent.append(messages)
         return {"choices": [{"message": {"content": self.replies.pop(0)}}]}
+
+
+class TestShapesAndProps(unittest.TestCase):
+    """The library past box and cylinder: primitives, compound props under one
+    transform, and stand-ins that start a shape named and sized."""
+
+    def test_every_prop_stands_on_the_floor_at_its_scale(self):
+        for a in sc.ASSETS:
+            if a["kind"] != "prop":
+                continue
+            with self.subTest(asset=a["id"]):
+                obj = sc.new_object(a["id"])
+                obj["position"] = [1.0, 0.3, -2.0]
+                lo, hi = sc.bounds(obj)
+                self.assertAlmostEqual(lo[1], 0.3, places=6)
+                size = [h - l for l, h in zip(lo, hi)]
+                for got, want in zip(size, obj["scale"]):
+                    self.assertAlmostEqual(got, want, delta=0.03 * want + 0.01)
+
+    def test_every_face_turns_outward(self):
+        for key, faces in sc.SHAPE_MESH.items():
+            with self.subTest(shape=key):
+                mid = sc.centroid([p for f in faces for p in f])
+                for f in faces:
+                    self.assertGreaterEqual(
+                        sc.dot(sc.newell(f), sc.sub(sc.centroid(f), mid)), -1e-9)
+
+    def test_a_compound_prop_is_one_object_that_turns_as_one(self):
+        s = staged("table")
+        t = s["objects"][0]
+        t["rotation"] = [90.0, 0.0, 0.0]
+        lo, hi = sc.bounds(t)
+        self.assertAlmostEqual(hi[0] - lo[0], 0.8, delta=0.03)     # its depth, now across
+        self.assertAlmostEqual(hi[2] - lo[2], 1.4, delta=0.03)
+        self.assertEqual({p.owner for p in sc.render(s)[1:]}, {"table"})
+        saved, problems = sc.clean_scene(json.loads(json.dumps(s)))
+        self.assertEqual(problems, [])
+        self.assertEqual(saved["objects"][0]["asset"], "table")
+        self.assertNotIn("parts", saved["objects"][0])            # by id, not geometry
+
+    def test_a_stand_in_starts_named_and_sized(self):
+        s = staged()
+        cab = sc.new_object("box", s["objects"], "Cabinet")
+        self.assertEqual((cab["name"], cab["scale"]), ("Cabinet", [0.9, 1.9, 0.5]))
+        s["objects"].append(cab)
+        again = sc.new_object("box", s["objects"], "Cabinet")
+        self.assertEqual(again["name"], "Cabinet 2")
+        self.assertEqual(sc.new_object("box", (), "Drum")["name"], "Crate")  # not a box's
+        for label, aid, _, _, _ in sc.STAND_INS:
+            self.assertIn(aid, sc.ASSET, label)
+        self.assertIn("Cabinet", sc.scene_text(dict(s, objects=[dict(cab, description="Grey "
+                                                                     "steel, doors shut.")])).text)
+
+    def test_enrich_can_place_the_new_shapes(self):
+        got = sc.read_suggestion('{"detail": "A bush in a pot.", "shape": "sphere", '
+                                 '"size": [0.8, 0.8, 0.8], "where": "behind_right"}')
+        self.assertEqual(got["shape"], "sphere")
+        s = staged("person")
+        obj = sc.place_suggestion(s, got)
+        self.assertEqual(obj["asset"], "sphere")
+        self.assertEqual(obj["scale"], [0.8, 0.8, 0.8])
 
 
 class EnrichTest(unittest.TestCase):
