@@ -830,6 +830,16 @@ class Vision:
         self.needs_load = False
         self.llm = LLM(base_url, model, timeout=timeout)
 
+    def fit(self, prompt_tokens):
+        """The model loaded with a window that holds `prompt_tokens` and an
+        answer. A just-in-time load is 8,192 tokens, and past its window LM
+        Studio drops the start of the request without a word - the picture
+        with it - so a critic with two reference photos was judging a prompt
+        it could only read. -> the window now, or None when the host does not
+        say."""
+        window, _ = fit_model(self.llm.base_url, self.model, prompt_tokens)
+        return window
+
     def _ask(self, text, mime, data, max_tokens):
         response = self.llm.chat([{"role": "user", "content": [
             {"type": "text", "text": text},

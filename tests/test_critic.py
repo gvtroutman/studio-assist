@@ -6,6 +6,7 @@ Nothing here touches the network or a GPU."""
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -166,6 +167,41 @@ class WholePictureGraphTest(unittest.TestCase):
         self.assertNotIn("mask", g["fc1_9"]["inputs"])
         self.assertEqual(g["fc1_1"]["inputs"]["crop_region"],
                          {"x": 0, "y": 0, "width": 1216, "height": 832})
+
+
+class WindowTest(unittest.TestCase):
+    """A just-in-time load is 8,192 tokens; past it LM Studio drops the start
+    of the request - the picture - and the critic judged the prompt alone."""
+    INTENT = {"prompt": "a woman on a hill", "scene": "", "camera": ""}
+
+    def vision(self, window):
+        v = FakeVision([{"needs_refinement": False, "observations": []}])
+        v.fitted = []
+        v.fit = lambda need: v.fitted.append(need) or window
+        return v
+
+    def test_the_window_is_fitted_to_the_picture_and_its_references(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref = os.path.join(d, "r.jpg")
+            with open(ref, "wb") as f:
+                f.write(b"x")
+            v = self.vision(32768)
+            critic.analyze_generated_image(v, b"png", self.INTENT, {}, [ref, ref])
+        self.assertGreater(v.fitted[0], 3 * critic.IMAGE_TOKENS)
+        self.assertEqual(len(v.asked), 1)
+
+    def test_an_answer_cut_off_keeps_the_observations_it_finished(self):
+        text = ('{"summary": "s", "needs_refinement": true, "observations": ['
+                '{"feature": "a", "status": "MATCH"}, {"feature": "b", "status": "MIS')
+        got = critic._json_in(text)
+        self.assertEqual([o["feature"] for o in got["observations"]], ["a"])
+
+    def test_a_window_too_small_fails_rather_than_guessing(self):
+        v = self.vision(4096)
+        with self.assertRaises(ValueError) as e:
+            critic.analyze_generated_image(v, b"png", self.INTENT, {}, [])
+        self.assertIn("4,096", str(e.exception))
+        self.assertEqual(v.asked, [])
 
 
 class FakeVision:
