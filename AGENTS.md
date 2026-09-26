@@ -795,8 +795,17 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   `ENRICH_ANGLES` kind is asked for each time. Add / Skip / Don't suggest again are
   kept in `scene["enrich"]` (`added`, `seen`, `never`, 40 each) and saved with the
   scene, so a reopened scene gets something new and a repeat is re-asked once.
-  Added details go into the words as written, before the camera line. The mannequin
-  does not draw them.
+  **Add puts a detail with a body into the scene** (`place_suggestion`): the model
+  names a `shape` (box, cylinder, a whole person), a true size, a colour and a `WHERE`
+  word, never coordinates. The position is worked out here from the subjects' middle
+  and spread along the camera's floor-level forward and right. A spot is refused if it
+  overlaps something on the floor, if its frame rectangle hides behind a subject or
+  covers one (`_hides`), or if it is outside the frame. The search pulls in, steps
+  back, then falls back to behind-on-that-side and far background. A passer-by it
+  placed is not a subject, or the middle drifts back with each one. The object's
+  description carries the words; select it and drag to adjust. Light, haze, stains
+  and a hand at the frame edge are `none`, and those go into the words as written
+  (`added`), before the camera line.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle

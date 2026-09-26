@@ -9,7 +9,7 @@ Re-check an entry only when a later change touches its code; then move it to
 | Area | What was checked | Commit | Date |
 | --- | --- | --- | --- |
 | Pick person (`people_found`, `pick_box`, `cutout_region`, `cutout_graph`, `find_people`, `cut_person`) | unit tests + live run on the 5090: 2 people found, one cut out clean | uncommitted | 2026-09-26 |
-| Scene Builder Enrich (`suggest`, `read_suggestion`, `enrich_messages`, `enrich_answer`, words, save/load) | `EnrichTest` with a fake LLM + live run on qwen3-coder-30b: 3 distinct, well-placed details | uncommitted | 2026-09-26 |
+| Scene Builder Enrich (`suggest`, `read_suggestion`, `enrich_messages`, `enrich_answer`, words, save/load) | `EnrichTest` (incl. `place_suggestion`: every WHERE in frame, no floor overlap, no hiding/covering subjects, fallback, passer-by not a subject) + live runs on qwen3-coder-30b, frame rendered and checked | uncommitted | 2026-09-26 |
 
 ## Needs re-check
 

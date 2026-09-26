@@ -996,9 +996,10 @@ def new_scene(details=""):
 
 
 def new_enrich():
-    """Enrich's memory: `added` details are in the words, `seen` were offered
-    and skipped, `never` the user asked not to be offered again."""
-    return {"added": [], "seen": [], "never": []}
+    """Enrich's memory: `added` details are in the words, `placed` became
+    objects (the object's description carries the words), `seen` were
+    offered and skipped, `never` the user asked not to be offered again."""
+    return {"added": [], "placed": [], "seen": [], "never": []}
 
 
 def new_object(asset_id, taken=()):
@@ -1755,8 +1756,12 @@ def generation(scene, reference, characters=None):
 
 # ---------------------------------------------------------------- enrich
 # One lived-in detail at a time, from the model on the LLM PC, around the
-# people and never between or on them. The user adds, skips or bans each;
-# the scene remembers all three so the next offer is a new one.
+# people and never between or on them. A detail with a body (a table, a
+# stein, a passer-by) is placed in the scene as a box, cylinder or person,
+# its words that object's description; light, haze and the like stay words.
+# The model names a place (`WHERE`), never coordinates: where that is comes
+# from the people and the camera here. The user adds, skips or bans each;
+# the scene remembers all of it so the next offer is a new one.
 
 ENRICH_KEEP = 40          # per list, newest kept
 ENRICH_CHARS = 400
@@ -1772,6 +1777,14 @@ ENRICH_ANGLES = [
     "a small sign of what happened a minute ago (a spill, a chair pushed back, "
     "crumpled napkins)",
 ]
+# where -> (metres further from the camera than the people, side: -1 left,
+# 1 right, 0 centred, None alternating; height of its lowest point)
+WHERE = {"behind": (2.2, 0, 0.0), "behind_left": (1.6, -1, 0.0),
+         "behind_right": (1.6, 1, 0.0), "far_background": (6.0, None, 0.0),
+         "left": (0.0, -1, 0.0), "right": (0.0, 1, 0.0),
+         "foreground_left": (-1.2, -1, 0.0), "foreground_right": (-1.2, 1, 0.0),
+         "above": (1.2, 0, 2.4)}
+SHAPES = ("box", "cylinder", "person", "none")
 ENRICH_SYSTEM = """You help stage a photograph. You suggest ONE believable, lived-in detail \
 that would make the scene feel like a real snapshot taken in that moment, not people \
 pasted into a themed background.
@@ -1782,31 +1795,61 @@ clutter. A jacket over a bench, an empty glass, a stranger half cut off by the f
 edge or uneven warm light is worth more than one more themed prop.
 - Enrich AROUND the people. Never put anything or anyone between them, in front of \
 their faces or in their hands, and never change who they are, their clothes or their \
-pose. Place the detail somewhere specific: foreground edge, mid-background, far \
-background, above, on the ground beside them.
+pose.
 - Be concrete and visual: materials, colours, state, how the light falls on it, how \
 sharp or blurred it is. One or two sentences, 25 to 60 words, written as a line of \
 an image prompt, not advice.
 - Suggest something new: nothing already in the scene, nothing offered before, \
 nothing like what the user banned.
 
-Answer with JSON only: {"detail": "<the prompt line>", "why": "<under 15 words>"}"""
+The scene is blocked out in 3D with simple shapes, and your detail is placed in it:
+- "shape": "box" (a table, bench, crate, stall, sign board), "cylinder" (a barrel, \
+post, stein, lamp, basket), "person" (a whole passer-by, never a part of one), or \
+"none" for what has no body of its own (light, haze, glare, stains, a hand or \
+shoulder cut off by the frame edge, strings of bunting too thin to block out).
+- "size": [width, height, depth] in metres, true to life (a table is about \
+[1.8, 0.75, 0.8], a stein [0.1, 0.2, 0.1], a person [0.5, 1.75, 0.3]).
+- "where": one of %s.
+- "name": two or three words. "colour": its main colour as #rrggbb. \
+"facing" (a person only): "camera", "side" or "away".
+
+Answer with JSON only: {"detail": "<the prompt line>", "why": "<under 15 words>", \
+"shape": "...", "name": "...", "size": [w, h, d], "colour": "#rrggbb", "where": "...", \
+"facing": "..."}""" % ", ".join(WHERE)
+
+
+def new_suggestion(detail, why=""):
+    return {"detail": detail, "why": why, "shape": "none", "name": "", "size": None,
+            "colour": "", "where": "behind", "facing": "camera"}
 
 
 def enrich_angle(scene):
     """The kind of detail to ask for this time: a rotation, so the offers
     vary instead of settling on steins forever."""
     e = scene.get("enrich") or new_enrich()
-    return ENRICH_ANGLES[(len(e["added"]) + len(e["seen"])) % len(ENRICH_ANGLES)]
+    n = sum(len(e.get(k) or []) for k in ("added", "placed", "seen"))
+    return ENRICH_ANGLES[n % len(ENRICH_ANGLES)]
 
 
 def enrich_messages(scene):
     e = scene.get("enrich") or new_enrich()
     said = []
-    for title, key in (("Already added", "added"), ("Offered before, skipped", "seen"),
-                       ("Never suggest these or anything like them", "never")):
-        if e[key]:
-            said.append("%s:\n%s" % (title, "\n".join("- " + x for x in e[key][-20:])))
+    for title, keys in (("Already added", ("added", "placed")),
+                        ("Offered before, skipped", ("seen",)),
+                        ("Never suggest these or anything like them", ("never",))):
+        items = [x for k in keys for x in e.get(k) or []][-20:]
+        if items:
+            said.append("%s:\n%s" % (title, "\n".join("- " + x for x in items)))
+    placed = {x.lower() for x in e.get("placed") or []}
+    busy = {}
+    for o in scene["objects"]:
+        if o["description"].strip().lower() in placed:
+            spot = " ".join(placement(scene, o) or [])
+            if spot:
+                busy[spot] = busy.get(spot, 0) + 1
+    if busy:
+        said.append("Places already used by added details (choose a different \"where\"): %s"
+                    % ", ".join("%s (%d)" % kv for kv in sorted(busy.items())))
     user = ("The scene as the image prompt describes it:\n%s\n\n%s\n\nThis time, look for: %s."
             % (scene_text(scene).text, "\n\n".join(said) or "Nothing has been added yet.",
                enrich_angle(scene)))
@@ -1815,23 +1858,40 @@ def enrich_messages(scene):
 
 
 def read_suggestion(text):
-    """-> (detail, why) from the model's reply, or (None, None). Takes the
-    JSON asked for, or failing that the first real line of prose."""
+    """-> a suggestion (`new_suggestion`'s keys) from the model's reply, or
+    None. Takes the JSON asked for, cleaned field by field, or failing that
+    the first real line of prose, as words only."""
     text = re.sub(r"(?s)<think>.*?(</think>|$)", "", text or "").strip()
     m = re.search(r"(?s)\{.*\}", text)
+    d = None
     if m:
         try:
             d = json.loads(m.group(0))
         except ValueError:
             d = None
-        if isinstance(d, dict) and isinstance(d.get("detail"), str) and d["detail"].strip():
-            why = d.get("why") if isinstance(d.get("why"), str) else ""
-            return _tidy(d["detail"]), why.strip()[:160]
+    if isinstance(d, dict) and isinstance(d.get("detail"), str) and d["detail"].strip():
+        why = d.get("why") if isinstance(d.get("why"), str) else ""
+        out = new_suggestion(_tidy(d["detail"]), why.strip()[:160])
+        if d.get("shape") in SHAPES:
+            out["shape"] = d["shape"]
+        if isinstance(d.get("name"), str):
+            out["name"] = _tidy(d["name"])[:40]
+        size = d.get("size")
+        if (isinstance(size, list) and len(size) == 3
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in size)):
+            out["size"] = [min(max(float(v), 0.05), 8.0) for v in size]
+        if isinstance(d.get("colour"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", d["colour"]):
+            out["colour"] = d["colour"].lower()
+        if d.get("where") in WHERE:
+            out["where"] = d["where"]
+        if d.get("facing") in ("camera", "side", "away"):
+            out["facing"] = d["facing"]
+        return out
     for line in text.splitlines():
         line = _tidy(line)
         if len(line) > 12 and not line.startswith(("{", "}", "```")):
-            return line, ""
-    return None, None
+            return new_suggestion(line)
+    return None
 
 
 def _tidy(s):
@@ -1846,23 +1906,158 @@ def _same(a, b):
 
 
 def suggest(scene, llm, tries=2):
-    """-> (detail, why): one new detail from `llm` (anything with
-    `chat(messages, max_tokens=)` returning an OpenAI reply). Raises
-    RuntimeError when nothing usable came back."""
+    """-> one new suggestion from `llm` (anything with `chat(messages,
+    max_tokens=)` returning an OpenAI reply). Raises RuntimeError when
+    nothing usable came back."""
     e = scene.get("enrich") or new_enrich()
-    old = e["added"] + e["seen"] + e["never"]
+    old = [x for k in e for x in e[k]]
     for _ in range(tries):
-        reply = llm.chat(enrich_messages(scene), max_tokens=700)
+        reply = llm.chat(enrich_messages(scene), max_tokens=900)
         msg = ((reply.get("choices") or [{}])[0].get("message") or {})
-        detail, why = read_suggestion(msg.get("content") or "")
-        if detail and not any(_same(detail, x) for x in old):
-            return detail, why
+        got = read_suggestion(msg.get("content") or "")
+        if got and not any(_same(got["detail"], x) for x in old):
+            return got
     raise RuntimeError("The model offered nothing new for this scene. Try again, "
                        "or add a line to Scene details for it to build on.")
 
 
+def _flat(v):
+    return norm((v[0], 0.0, v[2]))
+
+
+def _overlaps(a, b, gap=0.15):
+    (alo, ahi), (blo, bhi) = a, b
+    return (alo[0] < bhi[0] + gap and blo[0] < ahi[0] + gap and
+            alo[2] < bhi[2] + gap and blo[2] < ahi[2] + gap)
+
+
+def _screen_rect(cam, obj):
+    """The frame rectangle an object's box covers, or None if behind the eye."""
+    lo, hi = bounds(obj)
+    pts = [cam.project((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+           for z in (lo[2], hi[2])]
+    if any(p is None for p in pts):
+        return None
+    return (min(p[0] for p in pts), min(p[1] for p in pts),
+            max(p[0] for p in pts), max(p[1] for p in pts))
+
+
+def _hides(a, b, share=0.25):
+    """Do frame rectangles a and b overlap by more than `share` of the smaller?"""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return False
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return w * h > share * max(small, 1e-9)
+
+
+def _place(scene, sug):
+    """-> a new object for the suggestion, placed clear of everything else
+    and inside the frame, or None when it has no body or no such place was
+    found (the caller keeps it as words then). It is not added to the scene.
+
+    `where` is measured from the people: their middle, how far they spread
+    across the frame, and the camera's own forward and right on the floor,
+    so "behind_left" is behind them and to the left as the picture sees it
+    from any orbit. A place that is taken is pushed further out; one that
+    leaves the frame is pulled in towards the people."""
+    if sug.get("shape") not in ("box", "cylinder", "person"):
+        return None
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    fwd, right = _flat(cam.f), _flat(cam.r)
+    # The subjects: a passer-by Enrich placed before is scenery, or the
+    # people's middle drifts off towards the far background with each one.
+    placed = [x.lower() for x in (scene.get("enrich") or {}).get("placed") or []]
+    folks = [o for o in people(scene) if o["description"].strip().lower() not in placed]
+    if folks:
+        centre = tuple(sum(o["position"][i] for o in folks) / len(folks) for i in range(3))
+    else:
+        centre = (cam.target[0], 0.0, cam.target[2])
+    spread = max([abs(dot(sub(o["position"], centre), right)) for o in folks] or [0.0]) + 0.6
+    obj = new_object(sug["shape"], scene["objects"])
+    size = sug.get("size")
+    if sug["shape"] == "person":
+        k = min(max((size[1] if size else 1.75) / 1.8, 0.5), 1.1)
+        obj["scale"] = [round(k, 3)] * 3
+    elif size:
+        obj["scale"] = list(size)
+    if sug.get("name"):
+        taken, name, n = {o["name"] for o in scene["objects"]}, sug["name"], 2
+        while name in taken:
+            name, n = "%s %d" % (sug["name"], n), n + 1
+        obj["name"] = name
+    obj["description"] = sug["detail"]
+    if sug.get("colour"):
+        obj["colour"] = sug["colour"]
+    where = sug.get("where") if sug.get("where") in WHERE else "behind"
+    ahead, side, lift = WHERE[where]
+    half = max(obj["scale"][0], obj["scale"][2]) / 2
+    if side is None:
+        side = -1 if len(scene["objects"]) % 2 else 1
+        across = side * (0.3 * spread + 1.0)
+    else:
+        across = side * (spread + half + 0.4)
+
+    def turn():
+        """Face as asked, measured on the line to the lens from where it stands."""
+        to_cam = _flat(sub(cam.eye, obj["position"]))
+        across_ = (-to_cam[2], 0.0, to_cam[0])
+        if dot(across_, right) < 0:
+            across_ = mul(across_, -1)
+        face = {"side": across_, "away": mul(to_cam, -1)}.get(sug.get("facing"), to_cam)
+        obj["rotation"] = [round(math.degrees(math.atan2(face[0], face[2])), 1), 0.0, 0.0]
+    # A narrow frame has little room beside the people, and more further
+    # back: try the place, then the place pulled in towards them, then
+    # both a step further from the camera. A taken spot is pushed out.
+    others = [bounds(o) for o in scene["objects"]]
+    subjects = [r for r in (_screen_rect(cam, o) for o in folks) if r]
+
+    def clear():
+        """Free on the floor, and in the frame neither hiding behind a
+        subject nor standing in front of one."""
+        if any(_overlaps(bounds(obj), b) for b in others):
+            return False
+        mine = _screen_rect(cam, obj)
+        return mine is not None and not any(_hides(mine, r) for r in subjects)
+    backs = (0.0, 0.8, 1.6, 2.6, 4.0) if ahead >= 0 else (0.0, 0.4, 0.9)
+    for back in backs:
+        for pull in (1.0, 0.85, 0.7, 0.55, 0.4):
+            for nudge in range(4):
+                a, s = ahead + back, across * pull
+                if s:
+                    s += math.copysign(0.6 * nudge, s)
+                else:
+                    a += 0.6 * nudge
+                pos = add(add(centre, mul(fwd, a)), mul(right, s))
+                obj["position"] = [round(pos[0], 2), lift, round(pos[2], 2)]
+                turn()
+                if not clear():
+                    continue
+                if placement(scene, obj) is not None:
+                    return obj
+                break          # free but out of frame: further out will not help
+    return None
+
+
+def place_suggestion(scene, sug):
+    """-> a new object for the suggestion, placed clear of everyone and in
+    frame; else the same thing behind the people on its side, else far off;
+    else None (a thing with no body, or no room anywhere: it stays words).
+    The object is not added to the scene."""
+    where = sug.get("where") or "behind"
+    side = "_left" if where.endswith("left") else "_right" if where.endswith("right") else ""
+    for w in dict.fromkeys((where, "behind" + side, "far_background")):
+        obj = _place(scene, dict(sug, where=w))
+        if obj:
+            return obj
+    return None
+
+
 def enrich_answer(scene, detail, answer):
-    """Remember the user's answer: 'add', 'skip' or 'never'."""
+    """Remember the user's answer: 'add' (in the words), 'placed' (an object
+    now carries it), 'skip' or 'never'."""
     e = scene.setdefault("enrich", new_enrich())
-    key = {"add": "added", "skip": "seen", "never": "never"}[answer]
-    e[key] = (e[key] + [detail.strip()[:ENRICH_CHARS]])[-ENRICH_KEEP:]
+    key = {"add": "added", "placed": "placed", "skip": "seen", "never": "never"}[answer]
+    e[key] = (e.get(key, []) + [detail.strip()[:ENRICH_CHARS]])[-ENRICH_KEEP:]
