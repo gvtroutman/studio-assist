@@ -20,9 +20,14 @@ The mouse, in the viewport:
 - left on an object: select it (a click on a hand selects the hand's
   controls) and drag it with the tool - Move slides it on its floor (Shift
   lifts it), Rotate turns it, Scale sizes it;
+- with Look at: click a person and a ring of head poses opens round their
+  head - ahead, up, down, left, right and the diagonals, as the camera sees
+  them - with Camera and Point... under it; after Point, a click on a face, a
+  prop, the floor or the sky is where they look, followed as they move (Esc
+  closes the ring; a crowd has no heads to pose);
 - left on empty floor or sky: orbit the camera;
 - right (or middle): pan the camera; the wheel: in and out.
-Keys, with the viewport focused: M, R, S for the tools, Delete. Anywhere in
+Keys, with the viewport focused: M, R, S, L for the tools, Esc, Delete. Anywhere in
 the window but a text box: Ctrl+Z undo, Ctrl+Y or Ctrl+Shift+Z redo; the
 History menu over the viewport jumps to any step (`studio_scene.History`).
 
@@ -49,7 +54,8 @@ import studio_imagegen as ig
 import studio_scene as sc
 
 FILETYPES = [("Scenes", "*.scene.json"), ("JSON", "*.json"), ("All files", "*.*")]
-TOOLS = [("move", "Move", "m"), ("rotate", "Rotate", "r"), ("scale", "Scale", "s")]
+TOOLS = [("move", "Move", "m"), ("rotate", "Rotate", "r"), ("scale", "Scale", "s"),
+         ("look", "Look at", "l")]
 GRID = "#9c978f"
 GRID_AXIS = "#b1aca4"
 SCENE_ROW = "Scene and camera"
@@ -57,6 +63,15 @@ ROOM_ROW = "Floor and walls"
 ROOM = "\0room"              # the room's row in the list; never an object's id
 BAKE = 2                      # the viewport's pictures are baked at 1/BAKE size
 REACH = 20                    # m either way an object can be placed
+
+
+def _inside(x, y, pts):
+    """Even-odd: is (x, y) inside the polygon `pts`?"""
+    hit = False
+    for (ax, ay), (bx, by) in zip(pts, pts[1:] + pts[:1]):
+        if (ay > y) != (by > y) and x < ax + (y - ay) * (bx - ax) / (by - ay):
+            hit = not hit
+    return hit
 
 
 def rgb_hex(rgb):
@@ -76,6 +91,8 @@ class SceneBuilder:
         self.look_section = ig.LOOKS[0][0]
         self.outfit_name = ""        # the outfit preset box, kept across redraws
         self.tool = "move"
+        self.aiming = None          # Look at: the person whose point the next click is
+        self.ring = None            # Look at: {"oid", "x", "y"} while the ring is up
         self.drag = None
         self.vars = {}                # key -> (DoubleVar, read) for the inspector's sliders
         self.tool_pills = {}
@@ -219,6 +236,7 @@ class SceneBuilder:
         """The scene changed: redraw, say what the words will be, and make
         it an undo step once the edit settles."""
         self.dirty = True
+        sc.aim_heads(self.scene)
         if rebuild_list:
             self._list()
         self.draw()
@@ -1215,12 +1233,25 @@ class SceneBuilder:
 
             def write(x, key=key):
                 ctl[key] = x
+                if key in ("head_turn", "head_nod") and obj.pop("look_at", None):
+                    self.status("%s no longer looks at a point." % obj["name"])
                 if pose["preset"]:        # moved by hand: no longer the preset
                     pose["preset"] = ""
                     self.pose_pill.set(text="Custom  ▾")
             self._slider(p, key, label, lambda key=key: ctl[key], write, lo, hi)
         o.button(p, "Reset %s" % sc.PART_NAMES[self.part].lower(), self._reset_part,
                  kind="ghost").pack(side="top", anchor="w", pady=(o.px(4), 0))
+        if self.part == "head":
+            eyes = o.frame(p)
+            eyes.pack(side="top", fill="x", pady=(o.px(4), 0))
+            o.button(eyes, "Look at camera", self.look_at_camera,
+                     kind="ghost").pack(side="left")
+            if obj.get("look_at"):
+                o.button(eyes, "Stop looking", self.stop_looking,
+                         kind="ghost").pack(side="left", padx=(o.px(6), 0))
+            o.label(p, "Or press L and click where they should look.",
+                    "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
+                                                                           fill="x")
         o.label(p, "Click a hand, foot or the head in the viewport to pose that part.",
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
                                                                        fill="x")
@@ -1371,6 +1402,10 @@ class SceneBuilder:
 
     def set_tool(self, tool):
         self.tool = tool
+        self.aiming = self.ring = None
+        if tool == "look":
+            self.status("Click a person to choose where they look.")
+        self.draw()
         for key, pill in self.tool_pills.items():
             kind = "accent" if key == tool else "quiet"
             pill.roles = self.host.PILL_ROLES[kind]
@@ -1440,12 +1475,24 @@ class SceneBuilder:
             c.create_rectangle(min(around[0::2]) - 4, min(around[1::2]) - 4,
                                max(around[0::2]) + 4, max(around[1::2]) + 4,
                                outline=C["accent"], dash=(4, 3), width=2)
+        # Where the chosen person looks: a dashed line from their eyes to a dot.
+        if sel is not None and sel.get("look_at"):
+            cam = sc.Camera(self.scene["camera"], w, h)
+            a, b = cam.project(sc.eye_point(sel)), cam.project(sel["look_at"])
+            if a and b:
+                c.create_line(*at([a[:2], b[:2]]), fill=C["accent"], dash=(4, 3), width=2)
+            if b:
+                (bx, by), r = at([b[:2]]), 5
+                c.create_oval(bx - r, by - r, bx + r, by + r, fill=C["accent"],
+                              outline=C["bg"], width=2)
         x0, y0, x1, y1 = ox, oy, ox + w * k, oy + h * k
         for box in ((0, 0, cw, y0), (0, y1, cw, ch), (0, y0, x0, y1), (x1, y0, cw, y1)):
             c.create_rectangle(*box, fill=C["bg"], outline="", stipple="gray50")
         c.create_rectangle(x0, y0, x1, y1, outline=C["accent"], width=2)
         c.create_text(x0 + 6, y0 - 4, anchor="sw", fill=C["muted"], font=self.host.f_small,
                       text="Frame %d x %d · %dmm" % (w, h, round(self.scene["camera"]["lens"])))
+        if self.ring and self.obj(self.ring["oid"]) is not None:
+            self._draw_ring()
 
     def _backdrop_key(self, w, h, k, room_polys=None):
         """-> (the view and the room's pictures, the shadows on them)."""
@@ -1509,6 +1556,10 @@ class SceneBuilder:
     def _press(self, ev):
         self.canvas.focus_set()
         oid, part = self.hit(ev.x, ev.y)
+        # Look at: a click on a person opens the ring of head poses round
+        # their head; its Point item makes the next click where they look.
+        if self.tool == "look" and self._ring_press(ev.x, ev.y, oid):
+            return
         cam = copy.deepcopy(self.scene["camera"])
         if oid is None:
             self.select(None)
@@ -1527,6 +1578,130 @@ class SceneBuilder:
             grab = None               # edge on: move by the screen instead
         self.drag = {"kind": self.tool, "x": ev.x, "y": ev.y, "grab": grab, "mid": mid,
                      "start": copy.deepcopy(obj), "shift": bool(ev.state & 0x0001)}
+
+    RING = 62                # px, the ring's radius
+    RING_ITEM = 17           # px, each item's
+
+    def _ring_items(self):
+        """-> [(key, label, x, y)] for the open ring: the head poses round
+        it, and Camera and Point under it."""
+        r = self.ring
+        items = []
+        for key, label, dx, dy in sc.HEAD_POSES:
+            f = self.RING * (0.71 if dx and dy else 1)
+            items.append((key, label, r["x"] + dx * f, r["y"] + dy * f))
+        below = r["y"] + self.RING + 2.4 * self.RING_ITEM
+        items += [("camera", "Camera", r["x"] - 40, below),
+                  ("point", "Point\u2026", r["x"] + 40, below)]
+        return items
+
+    def _ring_press(self, x, y, oid):
+        """A click with Look at; True when it was used up here."""
+        if self.aiming:
+            aiming, self.aiming = self.obj(self.aiming), None
+            if aiming is not None:
+                self._look_at(aiming, x, y, oid)
+                return True
+        if self.ring:
+            obj = self.obj(self.ring["oid"])
+            hit = next((k for k, _, ix, iy in self._ring_items()
+                        if abs(x - ix) <= self.RING_ITEM * (2 if k in ("camera", "point")
+                                                            else 1) + 3
+                        and abs(y - iy) <= self.RING_ITEM + 3), None)
+            self.ring = None
+            if obj is None or not hit:
+                self.draw()
+            elif hit == "camera":
+                self.look_at_camera()
+            elif hit == "point":
+                self.aiming = obj["id"]
+                self.status("Click where %s should look - a face, a thing, the floor."
+                            % obj["name"])
+                self.draw()
+            else:
+                sc.head_pose(self.scene, obj, hit)
+                label = next(lb for k, lb, _, _ in sc.HEAD_POSES if k == hit)
+                self.status("%s looks %s." % (obj["name"], label.lower()))
+                self.sync()
+                self.changed()
+            return True
+        if oid is None:
+            return False
+        obj = self.obj(oid)
+        if obj["asset"] == "crowd":
+            self.status("A crowd's heads can't be posed - only a person's.")
+            return True
+        if obj["asset"] != "person":
+            return False
+        self.select(oid, "head")
+        w, h = sc.frame_size(self.scene)
+        sk, k, shift = sc.rigs(obj)[0]
+        head = sc.Camera(self.scene["camera"], w, h).project(
+            sc.add(sc.mul(sk["head"][0], k), shift))
+        ox, oy, _, _, fk = self.frame_rect
+        cx, cy = (ox + head[0] * fk, oy + head[1] * fk) if head else (x, y)
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        m = self.RING + self.RING_ITEM + 4           # the whole ring on the canvas
+        self.ring = {"oid": oid, "x": max(m, min(cw - m, cx)),
+                     "y": max(m, min(ch - m - 2.4 * self.RING_ITEM, cy))}
+        self.status("Choose where %s looks." % obj["name"])
+        self.draw()
+        return True
+
+    def _draw_ring(self):
+        c, C, r = self.canvas, self.host.C, self.ring
+        c.create_oval(r["x"] - self.RING, r["y"] - self.RING, r["x"] + self.RING,
+                      r["y"] + self.RING, outline=C["accent"], width=2, dash=(3, 3))
+        arrows = {"ahead": "\u25cf", "up": "\u2191", "up_right": "\u2197",
+                  "right": "\u2192", "down_right": "\u2198", "down": "\u2193",
+                  "down_left": "\u2199", "left": "\u2190", "up_left": "\u2196"}
+        for key, label, x, y in self._ring_items():
+            wide = key in ("camera", "point")
+            rx, ry = self.RING_ITEM * (2 if wide else 1), self.RING_ITEM
+            box = c.create_rectangle if wide else c.create_oval
+            box(x - rx, y - ry, x + rx, y + ry, fill=C["bg"], outline=C["accent"],
+                width=2, tags=("ring", "ring:" + key))
+            c.create_text(x, y, text=arrows.get(key, label), fill=C["accent"],
+                          font=self.host.f_small, tags=("ring", "ring:" + key))
+
+    def _look_at(self, obj, x, y, oid):
+        """Point `obj`'s eyes at what is under canvas (x, y): the face
+        clicked, at its depth; else the floor; else far off in the sky."""
+        cam = self.camera()
+        fx, fy = self.to_frame(x, y)
+        ray = cam.ray(fx, fy)
+        point = None
+        if oid is not None:
+            under = [p for p in sc.render(self.scene, *sc.frame_size(self.scene))
+                     if p.owner is not None and _inside(fx, fy, p.pts)]
+            if under:
+                depth = min(p.depth for p in under)
+                point = sc.add(cam.eye, sc.mul(ray, depth / max(1e-6, sc.dot(ray, cam.f))))
+        if point is None:
+            point = cam.on_floor(fx, fy)
+            if point is None or sc.dot(sc.sub(point, cam.eye), sc.sub(point, cam.eye)) > 900:
+                point = sc.add(cam.eye, sc.mul(ray, 30.0))
+        obj["look_at"] = [round(v, 3) for v in point]
+        sc.aim_head(obj)
+        what = self.obj(oid)["name"] if oid is not None and oid != obj["id"] else None
+        self.status("%s looks at %s." % (obj["name"], what or "that point"))
+        self.sync()
+        self.changed()
+
+    def look_at_camera(self):
+        obj = self.obj()
+        if obj is None or obj["asset"] != "person":
+            return
+        obj["look_at"] = [round(v, 3) for v in self.camera().eye]
+        self.sync()
+        self.changed()
+
+    def stop_looking(self):
+        obj = self.obj()
+        if obj is None or not obj.pop("look_at", None):
+            return
+        self.sync()
+        self.changed()
 
     def _motion(self, ev):
         d = self.drag
@@ -1570,6 +1745,7 @@ class SceneBuilder:
             lo, hi = (0.5, 1.3) if obj["asset"] in ("person", "crowd") else (0.05, 5)
             obj["scale"] = [round(max(lo, min(hi, v * f)), 3) for v in start["scale"]]
         self.dirty = True
+        sc.aim_heads(self.scene)
         self.draw()
 
     def _release(self, _ev=None):
@@ -1609,6 +1785,13 @@ class SceneBuilder:
             if key == k:
                 self.set_tool(tool)
                 return "break"
+        if key == "escape":
+            if self.ring or self.aiming:
+                self.ring = self.aiming = None
+                self.draw()
+                return "break"
+            self.select(None)
+            return "break"
         if key in ("delete", "backspace"):
             self.delete()
             return "break"

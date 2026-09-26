@@ -29,6 +29,10 @@ ACTIONS = ("FACE_CORRECTION", "LOCAL_INPAINT", "OBJECT_CORRECTION", "GLOBAL_REFI
 MAX_PASSES = 3
 MIN_CONFIDENCE = 0.6          # below this a mismatch is noted, never corrected
 PROMOTE_CONFIDENCE = 0.75     # and below this an invented detail is not kept
+# What one picture costs the vision model at most: LM Studio scales a large
+# photo down before qwen2.5-vl reads it, and a 4.9 MB reference came to 4,082
+# tokens (a 896x1152 render, 1,316). Measured 2026-09-26.
+IMAGE_TOKENS = 4096
 
 # What each category is checked for. The model is small (a 7B VL at the time
 # of writing); a list it can tick through reads better than an open question.
@@ -172,7 +176,18 @@ def _json_in(text):
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise ValueError("the vision model answered without JSON")
-    return json.loads(text[start:end + 1])
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:
+        pass
+    # An answer cut off at max_tokens: keep every observation it finished.
+    for cut in range(end, start, -1):
+        if text[cut] == "}":
+            try:
+                return json.loads(text[start:cut + 1] + "]}")
+            except ValueError:
+                continue
+    raise ValueError("the vision model's JSON could not be read")
 
 
 def _conf(v, default=0.5):
@@ -212,7 +227,7 @@ def clean_result(raw):
 
 
 def analyze_generated_image(vision, generated_image, original_intent, canonical_state,
-                            reference_images=(), max_tokens=1800):
+                            reference_images=(), max_tokens=3000):
     """The Visual Critic. `vision` is a studio_agent.Vision; `generated_image`
     the picture's PNG bytes; `reference_images` paths of pictures of the
     people (the first two are sent). -> a clean critic result (clean_result).
@@ -227,6 +242,13 @@ def analyze_generated_image(vision, generated_image, original_intent, canonical_
             continue
         mime = vision.MIME.get(path[path.rfind("."):].lower(), "image/png")
         content.append(_image_part(vision, raw, mime))
+    need = len(content[0]["text"]) // 3 + IMAGE_TOKENS * (len(content) - 1) + max_tokens
+    fit = getattr(vision, "fit", None)
+    window = fit(need) if fit else None
+    if isinstance(window, int) and window < need:
+        raise ValueError("the vision model's %s-token window cannot hold the picture, "
+                         "its references and an answer (about %s)"
+                         % ("{:,}".format(window), "{:,}".format(need)))
     response = vision.llm.chat([{"role": "user", "content": content}], max_tokens=max_tokens)
     text = (response["choices"][0]["message"].get("content") or "").strip()
     return clean_result(_json_in(text))

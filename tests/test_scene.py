@@ -91,6 +91,38 @@ class TestRig(unittest.TestCase):
         self.assertEqual({c[0] for c in sc.CONTROLS}, parts)
 
 
+class TestLookAt(unittest.TestCase):
+    def facing(self, obj):
+        sk = sc.rigs(obj)[0][0]
+        way = sc.norm(sc.sub(obj["look_at"], sc.eye_point(obj)))
+        return sc.dot(way, sc.column(sk["head"][1], 2))
+
+    def test_the_head_turns_to_the_point_and_follows_a_move(self):
+        p = sc.new_object("person")
+        p["rotation"] = [30.0, 0.0, 0.0]
+        p["look_at"] = [2.0, 1.2, 3.0]
+        self.assertTrue(sc.aim_head(p))
+        self.assertGreater(self.facing(p), 0.999)
+        p["position"] = [1.5, 0.0, 0.0]
+        sc.aim_heads({"objects": [p]})
+        self.assertGreater(self.facing(p), 0.999)
+        p["look_at"] = [0.0, 1.6, -3.0]                        # behind: as far as it goes
+        sc.aim_head(p)
+        self.assertEqual(abs(p["pose"]["controls"]["head_turn"]), 80)
+
+    def test_a_crowd_or_a_person_without_a_point_is_left_alone(self):
+        self.assertFalse(sc.aim_head(sc.new_object("person")))
+        self.assertFalse(sc.aim_head(dict(sc.new_object("crowd"), look_at=[0, 1, 1])))
+
+    def test_the_point_is_saved_and_named_in_history(self):
+        p = sc.new_object("person")
+        self.assertNotIn("look_at", sc.clean_object(p))
+        p2 = dict(p, look_at=[1, 2, 3])
+        self.assertEqual(sc.clean_object(p2)["look_at"], [1.0, 2.0, 3.0])
+        a, b = {"objects": [p]}, {"objects": [p2]}
+        self.assertEqual(sc.change_label(a, b), "Point Person's eyes")
+
+
 class TestBodyAndClothes(unittest.TestCase):
     def person(self, **look):
         o = sc.new_object("person")
@@ -1680,6 +1712,72 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertNotEqual(person["rotation"][0], 0)
         sb.set_tool("move")
         self.assertAlmostEqual(sb.vars["x"][0].get(), person["position"][0], places=2)
+
+    def test_look_at_opens_a_ring_of_head_poses(self):
+        ui, sb = self.builder()
+        a = sb.add("person")
+        b = sb.add("person")
+        b["position"] = [1.2, 0.0, -0.5]
+        a["position"] = [-0.6, 0.0, 0.0]
+        sb.changed()
+        self.app.update()
+        sb.set_tool("look")
+
+        def ring_item(key):
+            return next((x, y) for k, _, x, y in sb._ring_items() if k == key)
+
+        def open_ring(person):
+            sb._press(Ev(*self.centre_of(sb, "o:" + person["id"])))
+            sb._release()
+            self.assertEqual((sb.sel, sb.ring["oid"]), (person["id"], person["id"]))
+            self.assertTrue(sb.canvas.find_withtag("ring:ahead"))
+
+        open_ring(a)                                           # a faces the camera
+        sb._press(Ev(*ring_item("right")))                     # frame right
+        sb._release()
+        self.assertIsNone(sb.ring)
+        self.assertFalse(sb.canvas.find_withtag("ring"))
+        self.assertEqual(a["pose"]["controls"]["head_turn"], sc.HEAD_TURN)  # their left
+        open_ring(a)
+        sb._press(Ev(*ring_item("down")))
+        sb._release()
+        self.assertEqual(a["pose"]["controls"]["head_turn"], 0)
+        self.assertGreater(a["pose"]["controls"]["head_nod"], 20)
+        self.assertIn("looks down", sb.msg.cget("text"))
+
+        a["rotation"][0] = 180.0                               # turned away: sides swap
+        sc.head_pose(sb.scene, a, "right")
+        self.assertEqual(a["pose"]["controls"]["head_turn"], -sc.HEAD_TURN)
+        a["rotation"][0] = 0.0
+        sb.changed()
+
+        open_ring(a)                                           # Point, then b
+        sb._press(Ev(*ring_item("point")))
+        sb._release()
+        sb._press(Ev(*self.centre_of(sb, "o:" + b["id"])))
+        sb._release()
+        self.assertEqual(sb.sel, a["id"])
+        self.assertGreater(a["look_at"][0], 0.5)               # at b, not the floor
+        self.assertGreater(a["pose"]["controls"]["head_turn"], 10)
+        self.assertIn("looks at " + b["name"], sb.msg.cget("text"))
+        open_ring(a)                                           # a pose drops the point
+        sb._press(Ev(*ring_item("ahead")))
+        sb._release()
+        self.assertNotIn("look_at", a)
+        open_ring(a)
+        sb._press(Ev(*ring_item("camera")))
+        sb._release()
+        self.assertEqual(a["look_at"], [round(v, 3) for v in sb.camera().eye])
+        open_ring(b)                                           # Esc closes, then lets go
+        sb._key(Ev(0, 0, keysym="Escape"))
+        self.assertIsNone(sb.ring)
+        self.assertEqual(sb.sel, b["id"])
+        sb._key(Ev(0, 0, keysym="Escape"))
+        self.assertIsNone(sb.sel)
+        crowd = sb.add("crowd")
+        self.app.update()
+        sb._press(Ev(*self.centre_of(sb, "o:" + crowd["id"])))
+        self.assertIsNone(sb.ring)
 
     def test_a_person_keeps_their_look_in_the_inspector(self):
         ui, sb = self.builder()
