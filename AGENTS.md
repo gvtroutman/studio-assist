@@ -73,6 +73,9 @@ this PC's files and the web instead. Two moving parts:
   **`comfy_nodes/studio_dwpose`** (a photo's pose points) and **`comfy_nodes/studio_facepaste`**
   (a person's real face, pasted last) are its ComfyUI nodes, kept here and copied into a
   backend's `custom_nodes`; they are not stdlib-only, they run there.
+- **`studio_mannequin.py`** — the sections the Scene Builder's person is sculpted from
+  (chest with pecs, waist, seat, mitten hands): functions of the angle round a bone,
+  handed to `studio_scene.loft`. No tkinter.
 - **`studio_civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
   for the Image Studio's LoRA library. No tkinter. See *The Image Studio*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
