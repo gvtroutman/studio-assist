@@ -503,7 +503,7 @@ def skeleton(controls, root=IDENTITY, shape=None):
 
 
 # ==================================================================== the body
-# A person's look sizes the mannequin: the Weight, Muscle and Height sliders
+# A person's look sizes the mannequin: the Weight, Muscle, Chest size and Height sliders
 # (-3..3, as the Image Studio stores them) and a Body type word this table
 # knows, as slider steps it adds. The picture is image to image from the
 # frame, so a heavyset person drawn as the rest mannequin would be pulled
@@ -525,7 +525,7 @@ BUILDS = [
 def body_shape(look=None):
     """A look -> the factors the mannequin is built with, 1 at rest:
     `height` (all of it), `fat` (girth everywhere), `belly`, `muscle`
-    (chest, shoulders and limbs), and how far apart the `shoulders` and
+    (chest, shoulders and limbs), `chest` (independent chest size), and how far apart the `shoulders` and
     `hips` are."""
     look = look if isinstance(look, dict) else {}
     s = {k: _num(look.get(k), 0, -3, 3) for k in ("weight", "muscle", "stature")}
@@ -539,13 +539,13 @@ def body_shape(look=None):
     fat = 1 + (0.17 if w > 0 else 0.08) * w
     muscle = 1 + 0.06 * m
     return {"height": 1 + 0.04 * h, "fat": fat, "belly": 1 + 0.1 * max(0.0, w),
-            "muscle": muscle,
+            "muscle": muscle, "chest": 1 + 0.1 * _num(look.get("chest_size"), 0, -3, 3),
             "shoulders": 1 + 0.35 * (fat - 1) + 0.8 * (muscle - 1) + 0.04 * s["shoulders"],
             "hips": 1 + 0.55 * (fat - 1) + 0.05 * s["curves"]}
 
 
 REST_SHAPE = {"height": 1.0, "fat": 1.0, "belly": 1.0, "muscle": 1.0, "shoulders": 1.0,
-              "hips": 1.0}           # body_shape({}), which needs _num from below
+              "hips": 1.0, "chest": 1.0}  # body_shape({}), which needs _num from below
 
 
 # What a person wears, drawn on the mannequin from the look's Clothes words.
@@ -1044,7 +1044,7 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
     r = lambda rad, ka, kd=None: (rad[0] * ka, rad[1] * (ka if kd is None else kd))  # noqa
     hips = k("hips", 1 + 0.9 * fat)
     belly = k("belly", 1 + 0.9 * fat)
-    chest = k("chest", 1 + 0.7 * fat + mus)
+    chest = k("chest", (1 + 0.7 * fat + mus) * shape.get("chest", 1.0))
     neck = k("neck", 1 + 0.5 * fat + 0.6 * mus) * mq.neck_scale(head)
     upper = k("upper_arm", 1 + 0.7 * fat + 1.3 * mus)
     fore = k("forearm", 1 + 0.5 * fat + 0.8 * mus)
@@ -3109,7 +3109,10 @@ def scene_maps(scene, takes, folder=None):
         maps["composition"] = _write(depth_png(scene), "depth", folder)
     if "source" in takes and (scene["frame_keep"] > 0 or not controlled):
         maps["source"] = write_reference(scene, folder)
-    if not maps:
+    if not maps and "face_positions" in takes:
+        notes.append("Face positions and scene descriptions are sent; body poses and props "
+                     "are guided by words.")
+    elif not maps:
         notes.append("Pose, layout and frame are all off: the picture has only the words "
                      "to go on.")
     return maps, notes
@@ -3519,6 +3522,7 @@ def face_targets(scene, characters=None, identities=None):
         facing = _facing(seen(FACE_SIDE), seen((-FACE_SIDE[0],) + FACE_SIDE[1:]),
                          seen(NOSE_TIP))
         out.append({"id": obj["id"], "name": obj["name"], "facing": facing,
+                    "identity": ((characters or {}).get(obj.get("character")) or {}).get("identity", ""),
                     "head": mq.clean_head(obj.get("head")), "tall": round(head / h, 4),
                     "at": [round(p[0] / w, 4), round(p[1] / h, 4)],
                     "region": [round(x, 4) for x in region],

@@ -1456,7 +1456,10 @@ class Chat(tk.Tk):
         sid = sid or self.active
         if sid is None:
             return
-        s = self.sessions.pop(sid)
+        s = self.sessions[sid]
+        if s.images is not None and not s.images.can_close():
+            return
+        self.sessions.pop(sid)
         s.closed = True
         s.cancel.set()
         self.order.remove(sid)
@@ -1465,7 +1468,7 @@ class Chat(tk.Tk):
         if s.browser is not None:
             s.browser.release()           # out of the frame before it goes
         if s.images is not None:
-            s.images.release()            # the Scene Builder goes with its form
+            s.images.release(confirmed=True)  # checked before removing the tab
         s.frame.destroy()
         self._fit_tabs()
         # Shutting an MCP subprocess down can block for a moment; a turn still
@@ -2904,8 +2907,8 @@ class Chat(tk.Tk):
             self.host_timer = self.after(HOST_RETRY_MS, self._retry_host)
 
     def _retry_host(self):
-        self.host_timer = None
-        if self.host_booting or not self._host_wanted():
+        self._stand_down("host_timer")
+        if self.closing or self.host_booting or not self._host_wanted():
             return                        # Connect is at it, or nothing needs it
         self._spawn(None, self._boot_host, False, True)
 
@@ -4854,13 +4857,16 @@ class Chat(tk.Tk):
     def _quit(self):
         if self.closing:
             return                        # a signal and the close box, together
+        for s in self.sessions.values():
+            if s.images is not None and not s.images.can_close():
+                return
         # Flag first, then cancel: a tick that fires between the two sees the
         # flag and does not re-arm. Leaving them armed is what printed
         # "invalid command name ..._drain" over a window that was already gone.
         self.closing = True
         for s in self.sessions.values():
             if s.images is not None:
-                s.images.release()        # on this thread: an unsaved scene asks first
+                s.images.release(confirmed=True)
         self.anim.clear()
         for timer in ("drain_timer", "host_timer", "anim_timer", "update_timer"):
             self._stand_down(timer)

@@ -9,8 +9,41 @@ instead.
 Ask in plain language — *"make a 1920x1080 title card, 5 seconds at 24fps"* — and it
 builds it in the app the current tab points at, one real undo step at a time.
 
-Inference runs on a machine on the tailnet. Your project data never leaves the LAN,
-and the GPU in the workstation stays free for rendering.
+Chat inference runs on a machine on the tailnet. Image Studio can use either the
+workstation's ComfyUI or a remote backend, according to its backend settings.
+
+## Image Studio
+
+Open **Image Studio** from **+** for a form-based image workspace. Choose a model,
+describe the scene, add identities or reference pictures, and Generate. The queue
+shows progress for each backend; completed pictures and their settings stay in History.
+
+- **Readiness:** the form names missing model files, nodes, reference photos and
+  the optional FaceFusion runtime. **Resolve readiness issues** opens the relevant
+  profile, model or backend settings; **Check connections** refreshes backend information.
+- **Scene Builder:** place and pose people and props, frame the camera, then generate
+  from the scene. Save scenes explicitly; recovery copies are also written after edits
+  settle. **File → Recover scene** opens these copies. Cancelling a save, or a failed
+  save, keeps the scene and its enclosing tab/app open.
+- **Identity profiles:** reference photographs carry the person's face. The optional
+  FaceFusion finish runs locally in its separate environment. Scene Builder supplies
+  each person's target region; ambiguous or missing faces stop the swap rather than
+  choosing another person. In **Fix a spot**, choose an identity and use **Choose face**
+  to click the target. A face-only swap needs no ComfyUI connection.
+- **Recover a finish:** the generated image is saved before the final FaceFusion pass.
+  If the pass fails or is cancelled, keep that image or choose **Retry face swap** in
+  its preview. A retry uses the saved profile settings and reference paths without
+  regenerating the picture. The referenced files must still exist.
+- **Repeat seed** reuses the saved seed and generation parameters with the current
+  library and installed model files; it does not promise an identical image.
+  **New seed** requests a variation. **Reuse settings** loads the form for editing.
+- **Cancel** marks the job immediately and sends the backend interruption in the
+  background, keeping the interface responsive.
+
+Family-photo generation with WithAnyone and model discovery have setup notes in
+[WithAnyone](docs/withanyone.md) and [model discovery](docs/model-discovery.md).
+The Studio Assist process remains standard-library-only; optional image processors
+run in their own environments.
 
 ## Running it
 

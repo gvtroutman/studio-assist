@@ -47,6 +47,8 @@ import json
 import math
 import os
 import threading
+import time
+import uuid
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -86,6 +88,7 @@ class SceneBuilder:
         self.scene = sc.new_scene(details=form_scene)
         self.path = None
         self.dirty = False
+        self.recovery_path = self._new_recovery_path()
         self.sel = None               # an object's id; None is the scene and camera
         self.part = "body"
         self.look_section = ig.LOOKS[0][0]
@@ -111,31 +114,34 @@ class SceneBuilder:
         win.transient(host)
         host._skin(win, bg="bg")
         win.geometry("%dx%d" % (host._px(1240), host._px(780)))
+        win.minsize(host._px(1000), host._px(640))
         win.protocol("WM_DELETE_WINDOW", self.close)
 
         # Fixed before expanding (AGENTS.md: pack order): the foot, both
         # side columns, then the viewport takes what is left.
         foot = o.frame(win)
         foot.pack(side="bottom", fill="x", padx=o.px(12), pady=(0, o.px(12)))
-        self.go = o.button(foot, "Generate", self.generate, kind="accent")
+        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(950))
+        self.msg.pack(side="bottom", fill="x", pady=(o.px(6), 0))
+        self.go = o.button(foot, "Generate picture", self.generate, kind="accent")
         self.go.pack(side="right")
-        o.button(foot, "Save as…", self.save_as).pack(side="right", padx=(0, o.px(6)))
-        o.button(foot, "Save", self.save).pack(side="right", padx=(0, o.px(6)))
-        o.button(foot, "Open…", self.open).pack(side="right", padx=(0, o.px(6)))
-        self.picture_pill = o.button(foot, "From a picture…", self.from_picture)
-        self.picture_pill.pack(side="right", padx=(0, o.px(6)))
-        o.button(foot, "New", self.new, kind="ghost").pack(side="right", padx=(0, o.px(6)))
-        o.button(foot, "✨ Enrich", self.enrich).pack(side="right", padx=(0, o.px(14)))
         self.model_row = o.frame(foot)
-        self.model_row.pack(side="right", padx=(0, o.px(14)))
-        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(520))
-        self.msg.pack(side="left", fill="x", expand=True)
+        self.model_row.pack(side="left", padx=(0, o.px(14)))
+
+        files = o.frame(win)
+        files.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(8), 0))
+        self.file_pill = o.button(files, "File ▾", self._post_file_menu)
+        self.file_pill.pack(side="left")
+        self.picture_pill = o.button(files, "Build from photo…", self.from_picture)
+        self.picture_pill.pack(side="left", padx=(o.px(6), 0))
+        o.button(files, "Suggest details…", self.enrich, kind="ghost").pack(
+            side="left", padx=(o.px(6), 0))
 
         left = o.frame(win)
         left.config(width=o.px(190))
         left.pack_propagate(False)
         left.pack(side="left", fill="y", padx=o.px(12), pady=o.px(12))
-        o.cap(left, "Library")
+        o.cap(left, "Add to scene")
         # People one button each; shapes and props a menu each, or the list
         # of what is in the scene has no room left.
         for gid, glabel in sc.ASSET_GROUPS:
@@ -176,14 +182,16 @@ class SceneBuilder:
                             kind="accent" if key == self.tool else "quiet")
             pill.pack(side="left", padx=(0, o.px(4)))
             self.tool_pills[key] = pill
-        o.button(bar, "Reset camera", self.reset_camera, kind="ghost").pack(side="right")
+        history_bar = o.frame(mid)
+        history_bar.pack(side="top", fill="x", pady=(0, o.px(6)))
+        o.button(history_bar, "Reset camera", self.reset_camera, kind="ghost").pack(side="right")
         small = dict(kind="quiet", font=host.f_small, padx=o.px(10))
-        self.history_pill = o.button(bar, "History ▾", lambda: None, **small)
+        self.history_pill = o.button(history_bar, "History ▾", lambda: None, **small)
         self.history_pill.command = self._history_menu
         self.history_pill.pack(side="right", padx=(0, o.px(10)))
-        self.redo_pill = o.button(bar, "Redo", self.redo, **small)
+        self.redo_pill = o.button(history_bar, "Redo", self.redo, **small)
         self.redo_pill.pack(side="right", padx=(0, o.px(3)))
-        self.undo_pill = o.button(bar, "Undo", self.undo, **small)
+        self.undo_pill = o.button(history_bar, "Undo", self.undo, **small)
         self.undo_pill.pack(side="right", padx=(0, o.px(3)))
         o.label(mid, "Drag an object to move, rotate or size it · drag empty space to "
                 "orbit · right-drag to pan · wheel to zoom", "faint", host.f_small).pack(
@@ -224,6 +232,21 @@ class SceneBuilder:
                         "camera.", "muted")
 
     # ================================================================ state
+    def _file_menu(self):
+        menu = self.host._menu()
+        menu.add_command(label="New scene", command=self.new)
+        menu.add_command(label="Open scene…", command=self.open)
+        menu.add_command(label="Recover scene…", command=self.recover)
+        menu.add_separator()
+        menu.add_command(label="Save scene", command=self.save)
+        menu.add_command(label="Save scene as…", command=self.save_as)
+        return menu
+
+    def _post_file_menu(self):
+        pill = self.file_pill
+        self._file_menu().tk_popup(pill.winfo_rootx(),
+                                  pill.winfo_rooty() + pill.winfo_height())
+
     def status(self, text, role="muted"):
         self.msg.config(text=text)
         self.owner.skin(self.msg, bg="bg", fg=role)
@@ -268,6 +291,8 @@ class SceneBuilder:
             return None
         label = self.history.record(self.scene, self.sel)
         if label:
+            self.dirty = self.history.unsaved(self.scene)
+            self._save_recovery()
             self._undo_buttons()
         return label
 
@@ -311,6 +336,7 @@ class SceneBuilder:
         if obj is None or obj["asset"] != "person":
             self.part = "body"
         self.dirty = self.history.unsaved(self.scene)
+        self._save_recovery()
         self._undo_buttons()
         self._list()
         self._inspect()
@@ -325,6 +351,7 @@ class SceneBuilder:
             self.win.after_cancel(self.remember_after)
             self.remember_after = None
         self.history.reset(self.scene, label=label)
+        self.recovery_path = self._new_recovery_path()
         self._undo_buttons()
 
     def _undo_buttons(self):
@@ -437,7 +464,10 @@ class SceneBuilder:
         self.status("%s removed." % obj["name"], "muted")
 
     def select(self, oid, part=None):
-        if oid != self.sel or (part and part != self.part):
+        section = ("Pose" if part != "body" else "Object") if part else "Object"
+        if (oid != self.sel or (part and part != self.part)
+                or section != getattr(self, "inspector_section", "Object")):
+            self.inspector_section = section
             self.sel = oid
             if part:
                 self.part = part
@@ -445,6 +475,7 @@ class SceneBuilder:
                 self.part = "body"
             self._list()
             self._inspect()
+            self.panel.canvas.yview_moveto(0)
         self.draw()
 
     def rows(self):
@@ -804,6 +835,23 @@ class SceneBuilder:
     def _inspect_object(self, obj):
         o, p = self.owner, self.panel
         a = sc.ASSET[obj["asset"]]
+        if a["kind"] == "person":
+            section = getattr(self, "inspector_section", "Object")
+            tabs = o.frame(p)
+            tabs.pack(side="top", fill="x", pady=(0, o.px(8)))
+            for name in ("Object", "Pose", "Look"):
+                o.button(tabs, name, lambda n=name: self._inspector_tab(n),
+                         kind="accent" if name == section else "quiet").pack(
+                    side="left", padx=(0, o.px(4)))
+            if section == "Pose":
+                self._pose_controls(obj)
+                self._words_box()
+                return
+            if section == "Look":
+                self._look_controls(obj)
+                self._face_controls(obj)
+                self._words_box()
+                return
         o.cap(p, a["label"] if a["kind"] == "person" else "%s - a stand-in" % a["label"])
         name = tk.StringVar(value=obj["name"])
         e = self.host._entry(p, name)
@@ -828,19 +876,6 @@ class SceneBuilder:
             self._words()
             self.remember_soon()
         self._text(p, obj["description"], described)
-        o.label(p, ("Their action, and what matters about them: PPE (hard hat, "
-                    "hi-vis, gloves, face shield up or down), what they hold. "
-                    "Sent exactly as written." if a["kind"] == "person" else
-                    "All of them at once: \"Oktoberfest revellers in traditional "
-                    "dress, laughing\". Sent exactly as written; the mannequins "
-                    "only show where they stand." if a["kind"] == "crowd" else
-                    "The shape only holds its place in the frame: the name and "
-                    "this say what it really is, and its state - open or closed, on "
-                    "or off, full or empty. Sent exactly as written."),
-                "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top",
-                                                                       fill="x")
-        if a["kind"] == "person":
-            self._look_controls(obj)
         if a["kind"] == "crowd":
             self._crowd_controls(obj)
 
@@ -858,9 +893,6 @@ class SceneBuilder:
                                  outline=self.host.C[ring], width=2)
                 chip.bind("<Button-1>", lambda ev, h=hexc: self._set_colour(h))
                 chip.pack(side="left", padx=(0, o.px(3)))
-
-        if a["kind"] == "person":
-            self._pose_controls(obj)
 
         o.cap(p, "Place")
         pos, rot, scale = obj["position"], obj["rotation"], obj["scale"]
@@ -886,9 +918,12 @@ class SceneBuilder:
             def uniform(x):
                 scale[:] = [x, x, x]
             self._slider(p, "size", "Size", lambda: scale[0], uniform, 0.5, 1.3, 0.01)
-        if a["kind"] == "person":
-            self._face_controls(obj)
         self._words_box()
+
+    def _inspector_tab(self, name):
+        self.inspector_section = name
+        self._inspect()
+        self.panel.canvas.yview_moveto(0)
 
     def _face_controls(self, obj):
         """The face this person is drawn with, last of all: a picture of
@@ -1075,6 +1110,7 @@ class SceneBuilder:
         self.changed()
 
     def _look_tab(self, name):
+        self.inspector_section = "Look"
         self.look_section = name
         self._inspect()
 
@@ -1385,6 +1421,7 @@ class SceneBuilder:
         obj = self.obj()
         if obj is None or preset not in sc.POSE_VALUES:
             return
+        self.inspector_section = "Pose"
         obj["pose"] = {"preset": preset, "controls": sc.pose_controls(preset)}
         self._inspect()
         self.changed()
@@ -1880,6 +1917,41 @@ class SceneBuilder:
         return None
 
     # ================================================================ files
+    RECOVERY_KEEP = 20                # the newest recovery copies kept; older ones go
+
+    def _new_recovery_path(self):
+        folder = os.path.join(self.owner.studio.lib.root, "scene-recovery")
+        try:
+            old = sorted((os.path.join(folder, n) for n in os.listdir(folder)
+                          if n.endswith(".scene.json")), key=os.path.getmtime, reverse=True)
+            for path in old[self.RECOVERY_KEEP:]:
+                os.remove(path)
+        except OSError:
+            pass                      # none yet, or one in use: pruning can wait
+        return os.path.join(folder, time.strftime("Scene-%Y%m%d-%H%M%S-")
+                            + uuid.uuid4().hex[:8] + ".scene.json")
+
+    def _save_recovery(self):
+        if not self.dirty or not self.has_content():
+            return                    # nothing unsaved to recover
+        try:
+            sc.save(self.scene, self.recovery_path)
+        except OSError as error:
+            self.status("Could not save the recovery copy: %s. Save the scene to a writable folder."
+                        % error, "warn")
+
+    def recover(self):
+        folder = os.path.join(self.owner.studio.lib.root, "scene-recovery")
+        if not os.path.isdir(folder):
+            return self.status("No recovery copies yet.", "muted")
+        path = filedialog.askopenfilename(parent=self.win, title="Recover a scene",
+                                          initialdir=folder, filetypes=FILETYPES)
+        if path and self.open(path):
+            self.path = None
+            self.dirty = True
+            self._title()
+            self.status("Recovery copy opened. Save as a scene to keep working on it.", "ok")
+
     def _ask_save(self):
         """True to go on (saved, or thrown away), False to stay."""
         if not self.dirty or not self.has_content():
@@ -1992,9 +2064,9 @@ class SceneBuilder:
             "warn" if box["notes"] or "unread" in box else "ok")
 
     def open(self, path=None):
+        if not self._ask_save():
+            return False
         if path is None:
-            if not self._ask_save():
-                return False
             os.makedirs(sc.scenes_dir(), exist_ok=True)
             path = filedialog.askopenfilename(parent=self.win, title="Open a scene",
                                               initialdir=sc.scenes_dir(),
@@ -2040,26 +2112,24 @@ class SceneBuilder:
                                             filetypes=FILETYPES)
         return self.save(path) if path else False
 
-    def close(self, final=False):
-        """Close the window, asking first about unsaved changes. `final` is
-        the Image Studio going away: save or not, but the window goes."""
-        if final and self.dirty and self.has_content():
-            if messagebox.askyesno("Scene Builder", "Save the changes to this scene "
-                                   "before it closes?", parent=self.win):
-                self.save()
-        elif not final and not self._ask_save():
-            return
+    def close(self, final=False, confirmed=False):
+        """False vetoes closing, including when the enclosing tab/app closes."""
+        self._save_recovery()
+        if not confirmed and not self._ask_save():
+            return False
         if self.remember_after is not None:
             self.win.after_cancel(self.remember_after)
             self.remember_after = None
         self.win.destroy()
         if self.owner.scene_builder is self:
             self.owner.scene_builder = None
+        return True
 
     def has_content(self):
         """Anything worth saving or generating from: an object, or a room
         that is more than the plain floor."""
-        return bool(self.scene["objects"]) or self.scene["room"] != sc.new_room()
+        return (bool(self.scene["objects"]) or bool(self.scene.get("details", "").strip())
+                or self.scene["room"] != sc.new_room())
 
     # ============================================================ textures
     def make_texture(self, key):
@@ -2180,10 +2250,13 @@ class SceneBuilder:
         out = set()
         for wid in wids:
             try:
-                refs = self.owner.studio.workflow_loader(wid).get("references") or {}
+                workflow = self.owner.studio.workflow_loader(wid)
+                refs = workflow.get("references") or {}
             except Exception:           # noqa - a broken template is compose()'s to name
                 continue
             out |= {k for k in sc.MAP_KINDS if refs.get(k)}
+            if workflow.get("multi_identity"):
+                out.add("face_positions")
         return out
 
     def check(self):
@@ -2245,7 +2318,9 @@ class SceneBuilder:
         if sent:
             sent_as = {"pose": "pose map", "composition": "depth map", "source": "frame"}
             self.status("Sent to the Image Studio with the %s (%s). %s" % (
-                ", ".join(sent_as[k] for k in sc.MAP_KINDS if k in maps) or "words alone",
+                ", ".join(sent_as[k] for k in sc.MAP_KINDS if k in maps) or
+                ("face positions and words" if "face_positions" in self.takes(o.settings["model"])
+                 else "words alone"),
                 ", ".join(os.path.basename(maps[k]) for k in sc.MAP_KINDS if k in maps),
                 " ".join(words.notes + notes)), "ok")
         else:

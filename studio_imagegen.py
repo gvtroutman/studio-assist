@@ -61,7 +61,7 @@ PASTE_NODE = "StudioFacePaste"        # comfy_nodes/studio_facepaste: a person's
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
-               "clip_vision", "style_models", "controlnet", "upscale_models")
+               "clip_vision", "style_models", "controlnet", "upscale_models", "diffusers")
 
 
 def studio_dir():
@@ -293,6 +293,8 @@ def clean_lora(d):
         "trigger": _str(d.get("trigger")),
         "strength": _num(d.get("strength", 0.8), float, 0.8, -2.0, 2.0),
         "always": bool(d.get("always")),
+        "body_control": _str(d.get("body_control")) if d.get("body_control") in
+                        ("chest_female", "chest_male") else "",
         "family": _str(d.get("family")),
         "preview": _str(d.get("preview")),
         "notes": _str(d.get("notes")),
@@ -311,6 +313,8 @@ def clean_identity(d):
         "trigger": _str(d.get("trigger")),
         "strength": _num(d.get("strength", 0.85), float, 0.85, -2.0, 2.0),
         "references": _strs(d.get("references")),
+        "avatar": _str(d.get("avatar")),
+        "face_swap": d.get("face_swap", True) is not False,
         "reference_strength": _num(d.get("reference_strength", 0.6), float, 0.6, 0.0, 2.0),
         "use_references": d.get("use_references", True) is not False,
         "notes": _str(d.get("notes")),
@@ -475,6 +479,16 @@ def _default_models():
          "defaults": {"steps": 20, "guidance": 3.5, "sampler": "euler",
                       "scheduler": "simple", "width": 1024, "height": 1024},
          "notes": "FLUX.1 [dev]: text to image with LoRAs, refine and the face pass."},
+        {"id": "withanyone", "label": "Family photo (WithAnyone)", "family": "flux1",
+         "workflow": "withanyone",
+         "values": {"model": "flux1-dev.safetensors", "identity_model": "withanyone.safetensors",
+                    "siglip": "siglip-base-patch16-256-i18n", "clip_l": "clip_l.safetensors",
+                    "t5": "t5xxl_fp16.safetensors", "vae": "ae.safetensors"},
+         "backends": {"3090": None},
+         "defaults": {"steps": 25, "guidance": 4.0, "width": 1024, "height": 1024},
+         "notes": "One to four people, one clear face photo each. Scene Builder supplies "
+                  "face positions; words describe poses and clothes. Requires the "
+                  "StudioWithAnyone node and weights; initially enabled for the 32 GB 5090."},
         {"id": "z-image-turbo", "label": "Z-Image Turbo", "family": "z-image",
          "workflow": "zimage_hq",
          "values": {"model": "z_image_turbo_bf16.safetensors",
@@ -778,6 +792,16 @@ class ComfyUIClient:
                 out[kind] = set(self.get_models(kind))
             except ComfyError:
                 out[kind] = set()
+        # ComfyUI's /models lists files, not Diffusers directories. The
+        # WithAnyone node validates complete SigLIP folders and exposes them
+        # as its actual input choices.
+        try:
+            info = self.get_json("/object_info/StudioWithAnyone")
+            choices = info.get("StudioWithAnyone", {}).get("input", {}).get(
+                "required", {}).get("siglip", [[]])[0]
+            out["diffusers"].update(choices if isinstance(choices, list) else [])
+        except ComfyError:
+            pass
         return out
 
     def node_types(self, fresh=False):
@@ -1109,6 +1133,13 @@ def fill(wf, values, loras=()):
     v = dict(wf.get("defaults") or {})
     v.update({k: x for k, x in values.items() if x is not None})
     graph = copy.deepcopy(wf["graph"])
+    if wf.get("multi_identity"):
+        sampler = graph[wf["multi_identity"]["sampler"]]["inputs"]
+        for index in range(2, wf["multi_identity"]["max_people"] + 1):
+            key = "face%d" % index
+            if v.get(key):
+                graph[key] = {"class_type": "LoadImage", "inputs": {"image": v[key]}}
+                sampler[key] = [key, 0]
     chain = wf.get("lora_chain") or {}
     if chain:
         model, clip = chain.get("model"), chain.get("clip")
@@ -1375,9 +1406,13 @@ def clean_fix(fix):
         tone = min(1.0, max(0.0, float(fix.get("tone", FIX_TONE))))
     except (TypeError, ValueError):
         tone = FIX_TONE
+    point = fix.get("face_point")
+    if not (isinstance(point, (list, tuple)) and len(point) == 2
+            and all(isinstance(x, (int, float)) and math.isfinite(x) and 0 <= x <= 1 for x in point)):
+        point = None
     return {"image": _str(fix.get("image")), "target": target, "tone": tone,
             "words": _str(fix.get("words")), "strength": strength, "spots": spots,
-            "locks": locks, "face_swap": _str(fix.get("face_swap"))}
+            "locks": locks, "face_swap": _str(fix.get("face_swap")), "face_point": point}
 
 
 def fix_words(fix):
@@ -2848,6 +2883,8 @@ SLIDERS = [
                           "very heavyset"]),
     ("muscle", "Muscle", ["frail", "soft", "untoned", "", "toned", "muscular",
                           "very muscular"]),
+    ("chest_size", "Chest size", ["very small chest", "small chest", "slightly smaller chest", "",
+                                 "slightly fuller chest", "full chest", "very full chest"]),
     # "stature", not "height": that is the picture's.
     ("stature", "Height", ["very short", "short", "a little short", "",
                           "a little tall", "tall", "very tall"]),
@@ -3227,6 +3264,87 @@ def save_critic_memory(lib, memory):
         pass
 
 
+def plan_identities(p, settings, identities, values):
+    """Keep each photo paired with its own position; never silently drop a person."""
+    scene = settings.get("scene_faces")
+    if scene is not None:
+        people = list(scene.get("people") or [])
+    else:
+        people = [{"name": ident["name"],
+                   "face": (ident["references"] or [""])[0]}
+                  for ident, _ in identities]
+        if not people and (settings.get("references") or {}).get("face"):
+            people = [{"name": "Person", "face": settings["references"]["face"]}]
+    limit = p.workflow["multi_identity"]["max_people"]
+    if not 1 <= len(people) <= limit:
+        p.errors.append("WithAnyone needs one to %d people with individual face photos; "
+                        "this request has %d." % (limit, len(people)))
+        return
+    boxes = []
+    width, height = int(values.get("width", 1024)), int(values.get("height", 1024))
+    for index, person in enumerate(people, 1):
+        name = person.get("name") or "Person %d" % index
+        path = person.get("face")
+        if not path or not os.path.isfile(path):
+            p.errors.append("%s needs an existing face photo for WithAnyone. Set Face in "
+                            "Scene Builder or add a photo to their identity profile." % name)
+            continue
+        box = person.get("region")
+        if scene is None:
+            # Stable left-to-right arrangement for the form. Scene Builder
+            # supplies explicit positions for a different composition.
+            center = (index - 0.5) / len(people)
+            half = min(0.18, 0.38 / len(people))
+            box = [center - half, 0.15, center + half, 0.55]
+        try:
+            box = [float(x) for x in box]
+            valid = (len(box) == 4 and all(math.isfinite(x) and 0 <= x <= 1 for x in box)
+                     and (box[2] - box[0]) * width >= 4
+                     and (box[3] - box[1]) * height >= 4)
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            p.errors.append("%s needs a visible face position inside the frame for WithAnyone." % name)
+            continue
+        key = "face%d" % index
+        p.images[key] = path
+        p.references[key] = path
+        boxes.append(box)
+        p.notes.append("WithAnyone person %d: %s." % (index, name))
+    values["identity_boxes"] = json.dumps(boxes)
+    values["sampler"], values["scheduler"] = "WithAnyone", "flow matching"
+    if width > 2048 or height > 2048:
+        p.errors.append("WithAnyone supports at most 2048 pixels on either side.")
+    if scene is not None:
+        p.notes.append("Scene Builder supplies face positions. Poses, props and clothes "
+                       "are described by the scene's words; this recipe takes no pose or depth map.")
+    else:
+        p.notes.append("People are placed left to right in selection order. Use Scene Builder "
+                       "to set their positions.")
+
+
+def chest_control_look(settings):
+    """A whole-image LoRA can control one person, not different bodies in a group."""
+    scene = settings.get("scene_layout")
+    if isinstance(scene, dict):
+        folks = [o for o in scene.get("objects", [])
+                 if o.get("visible", True) and o.get("asset") in ("person", "crowd")]
+        active = [o for o in folks if (o.get("look") or {}).get("chest_size")]
+        if not active:
+            return {}, ""
+        if len(folks) != 1 or folks[0].get("asset") != "person":
+            return {}, "Chest size LoRAs affect the whole image; separate chest sizes in a group need individual edits."
+        return folks[0].get("look") or {}, ""
+    return settings, ""
+
+
+def chest_control_kind(look):
+    subject = str(look.get("subject") or "").lower()
+    female = bool(re.search(r"\b(woman|women|female)\b", subject))
+    male = bool(re.search(r"\b(man|men|male)\b", subject))
+    return "chest_female" if female and not male else "chest_male" if male and not female else ""
+
+
 def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow,
             nodes=None):
     """The form's settings -> a Plan for `backend`. `inventory` is that
@@ -3270,6 +3388,31 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
 
     # ------------------------------------------------------------ LoRAs
     stack = []                        # (lora record, strength, why)
+    chest_look, chest_note = chest_control_look(s)
+    chest_step = _num(chest_look.get("chest_size"), int, 0, -3, 3)
+    chest_prompt = ""
+    if chest_note:
+        p.warnings.append(chest_note)
+    if chest_step:
+        kind = chest_control_kind(chest_look)
+        candidates = [r for r in lib.all("loras") if r.get("body_control") == kind and kind
+                      and compatibility(r["family"], family) is True]
+        available = [r for r in candidates if inventory is None or
+                     lora_file(r, bid) in inventory.get("loras", ())]
+        if len(available) == 1:
+            rec = available[0]
+            strength = rec["strength"] * chest_step / 3 if kind == "chest_female" else rec["strength"]
+            stack.append((rec, strength, "chest size"))
+            if kind == "chest_male":
+                chest_prompt = { -3: "Flat Male Chest", -2: "Flat Male Chest",
+                                 -1: "Average Male Chest Pectorals", 1: "Medium Male Chest Pectorals",
+                                 2: "Medium Perky Male Chest Pectorals",
+                                 3: "Large Male Chest, 47-60 Inch Chest, Wide and Thick Chest"}[chest_step]
+        else:
+            reason = ("Choose a man or woman in Subject" if not kind else
+                      "More than one matching chest LoRA is assigned in the library" if len(available) > 1 else
+                      "No matching chest LoRA is installed on this backend and assigned in the LoRA library")
+            p.warnings.append("Chest size is using words only. " + reason + ".")
     for ident, strength in idents:
         if ident["lora"]:
             rec = lib.get("loras", ident["lora"])
@@ -3370,6 +3513,8 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if why == "added" and rec["trigger"] and rec["trigger"] not in " ".join(parts):
             parts.append(rec["trigger"])
     p.prompt = ". ".join(x.rstrip(" .") for x in parts if x) + ("." if parts else "")
+    if chest_prompt and any(m["why"] == "chest size" for m in p.lora_meta):
+        p.prompt += " " + chest_prompt + "."
     if s.get("prompt_override"):
         # The Visual Critic's regeneration: its compiled prompt, built round
         # the prompt above (studio_critic.generator_prompt), in its place.
@@ -3420,7 +3565,10 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
 
     # ------------------------------------------------------- references
     refs = {k: x for k, x in (s["references"] or {}).items() if x}
-    if "face" not in refs:
+    if wf.get("multi_identity"):
+        plan_identities(p, s, idents, v)
+        refs.pop("face", None)  # handled per person, never reduced to the first profile
+    if "face" not in refs and not wf.get("multi_identity"):
         for ident, _ in idents:
             if ident["use_references"] and ident["references"]:
                 refs["face"] = ident["references"][0]
@@ -3512,6 +3660,10 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     # checkpoint to find the faces and the stock nodes it is built from. It
     # is a finish, not the picture: without them the picture is made and the
     # pass is left out, said once.
+    if wf.get("multi_identity"):
+        v["face_detail"] = False
+        p.notes.append("WithAnyone draws the identities together. Face redraw, photo paste "
+                       "and automatic refinement are off for this recipe.")
     if v.get("face_detail"):
         asked = s.get("face_detail") or preset["values"].get("face_detail")
         ckpts = (inventory or {}).get("checkpoints") if inventory is not None else None
@@ -3629,6 +3781,7 @@ class Job:
         self.graph = None             # the graph as submitted
         self.face_graph = None        # the face pass's graph, when it ran
         self.paste_graph = None       # the real-face paste's graph, when it ran
+        self.facefusion = []          # verified final swaps, after all redraws
         self.real_faces = None        # [{"name", "box", "photos"}] for the paste, from the face pass
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
         self.dress = None             # {"outfit", "passes", "head_crop", ...} when dressed
@@ -3689,6 +3842,8 @@ class JobQueue:
         if job.status in FINISHED:
             return
         job.cancel.set()
+        job.detail = "Cancelling…"
+        self.notify(job)
         lane = self.lanes.get(job.backend["id"])
         if lane is not None:
             with lane.cv:
@@ -3697,10 +3852,14 @@ class JobQueue:
                     self._finish(job, "cancelled", "cancelled before it started")
                     return
         if job.prompt_id:
-            try:
-                self.studio.client(job.backend).cancel_job(job.prompt_id)
-            except ComfyError:
-                pass
+            # The caller can be Tk. Network timeouts must never hold its event loop.
+            prompt_id = job.prompt_id
+            def interrupt():
+                try:
+                    self.studio.client(job.backend).cancel_job(prompt_id)
+                except ComfyError:
+                    pass
+            threading.Thread(target=interrupt, daemon=True).start()
 
     def close(self):
         self.closed = True
@@ -3790,10 +3949,15 @@ class History:
             with open(path, "wb") as f:
                 f.write(data)
             record["images"].append(path)
+        return self.update(record)
+
+    def update(self, record):
+        """Atomically update metadata without rewriting any image bytes."""
+        folder = self.folder_for(record["created_ts"])
         path = os.path.join(folder, record["id"] + ".json")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2)
+            json.dump({k: v for k, v in record.items() if k != "path"}, f, indent=2)
         os.replace(tmp, path)
         record["path"] = path
         return record
@@ -3817,7 +3981,9 @@ class History:
                         rec = json.load(f)
                 except (OSError, ValueError):
                     continue
-                if isinstance(rec, dict) and isinstance(rec.get("settings"), dict):
+                # A face swap's kept base is left out once the swapped picture is saved.
+                if (isinstance(rec, dict) and isinstance(rec.get("settings"), dict)
+                        and (rec.get("finish") or {}).get("state") != "complete"):
                     rec["path"] = os.path.join(folder, name)
                     recs.append(rec)
             out.extend(sorted(recs, key=lambda r: r.get("created_ts", 0), reverse=True))
@@ -3827,6 +3993,29 @@ class History:
 
 
 AGAIN_PINNED = ("steps", "guidance", "sampler", "scheduler", "width", "height")
+
+
+LOCAL_FACES = {"id": "local-facefusion", "name": "FaceFusion on this PC", "url": "",
+               "release_vram": False}
+
+
+def local_faces(settings):
+    if settings.get("mode") == "faces":
+        return True
+    fix = clean_fix(settings.get("fix"))
+    return (settings.get("mode") == "fix" and bool(fix["face_swap"])
+            and not fix["spots"] and not fix["locks"])
+
+
+def retry_faces(record):
+    """Retry only the finishing pass, using the saved picture and profile snapshot."""
+    finish = record.get("finish") or {}
+    if not record.get("images") or not finish.get("profiles"):
+        raise ComfyError("This picture has no saved face pass to retry. Use Fix a spot.")
+    return {"mode": "faces", "batch": 1, "seed": record.get("seed", -1),
+            "face_finish": {"images": list(record["images"]),
+                            "profiles": copy.deepcopy(finish["profiles"]),
+                            "record": record.get("path")}}
 
 
 def again(record, new_seed=False):
@@ -4207,6 +4396,8 @@ class Studio:
         errors); Auto takes the backend the settings prefer (Generate Again's
         original), then those whose roles include the preset's, when each is
         up and has everything the model's workflow needs."""
+        if local_faces(settings):
+            return dict(LOCAL_FACES), "FaceFusion on this PC; no ComfyUI needed."
         model = self.lib.get("models", settings.get("model"))
         label = model["label"] if model else settings.get("model")
         if settings.get("backend") not in (None, "", "auto"):
@@ -4253,6 +4444,8 @@ class Studio:
         """The backend for each of `count` jobs. A named backend takes them
         all; Auto routes as plan_route says (batch when more than one),
         spreading a batch over every capable backend."""
+        if local_faces(settings):
+            return [dict(LOCAL_FACES) for _ in range(count)]
         if settings.get("backend") not in (None, "", "auto"):
             b = self.backend(settings["backend"])
             if b is None:
@@ -4304,11 +4497,36 @@ class Studio:
     # ------------------------------------------------------------ submit
     def preview(self, settings, backend=None):
         """compose() against a backend, for the form's warnings; no I/O."""
+        import studio_facefusion as facefusion
+        if local_faces(settings):
+            p = Plan()
+            profiles, images = self.face_inputs(settings)
+            p.errors.extend(facefusion.profile_errors(profiles))
+            if not profiles:
+                missing = clean_fix(settings.get("fix"))["face_swap"]
+                p.errors.append("The identity %s is missing. Choose an identity in Manage profiles."
+                                % (missing or "for this picture"))
+            if not images or any(not os.path.isfile(path) for path in images):
+                p.errors.append("The source picture is missing. Choose an existing picture in History.")
+            return p
         b = backend or next((x for x in self.backends() if x["enabled"]), None)
         if b is None:
             return None
-        return compose(settings, self.lib, b, self.inventories.get(b["id"]),
-                       self.workflow_loader, self.nodes.get(b["id"]))
+        p = compose(settings, self.lib, b, self.inventories.get(b["id"]),
+                    self.workflow_loader, self.nodes.get(b["id"]))
+        p.errors.extend(facefusion.profile_errors(facefusion.selected(self.lib, settings)))
+        return p
+
+    def face_inputs(self, settings):
+        if settings.get("mode") == "faces":
+            finish = settings.get("face_finish") or {}
+            return copy.deepcopy(finish.get("profiles") or []), list(finish.get("images") or [])
+        fix = clean_fix(settings.get("fix"))
+        profile = self.lib.get("identities", fix["face_swap"])
+        profiles = [dict(profile)] if profile else []
+        if profiles and fix["face_point"] is not None:
+            profiles[0]["target_point"] = fix["face_point"]
+        return profiles, [fix["image"]]
 
     # ------------------------------------------------------------ poses
     def find_poses(self, path, stop=None):
@@ -4367,7 +4585,8 @@ class Studio:
         else:
             s["seed_mode"] = "fixed"
         jobs = []
-        for i, b in enumerate(self.pick_backends(s, count)):
+        backends = self.pick_backends(s, count)
+        for i, b in enumerate(backends):
             one = copy.deepcopy(s)
             one["seed"] = (seed + i) % (MAX_SEED + 1)
             one["batch"] = 1
@@ -4389,6 +4608,8 @@ class Studio:
             notify(job)
 
         b = job.backend
+        if local_faces(job.settings):
+            return self.run_profile_swap(job, clean_fix(job.settings.get("fix")), say)
         client = self.client(b)
         job.started = time.time()
         if job.cancel.is_set():
@@ -4404,6 +4625,9 @@ class Studio:
         plan = compose(job.settings, self.lib, b, self.inventories.get(b["id"]),
                        self.workflow_loader, self.nodes.get(b["id"]))
         job.plan = plan
+        import studio_facefusion as facefusion
+        profiles = facefusion.selected(self.lib, job.settings)
+        plan.errors.extend(facefusion.profile_errors(profiles))
         if plan.errors:
             return self.queue._finish(job, "failed", " ".join(plan.errors))
 
@@ -4433,8 +4657,8 @@ class Studio:
             types = set(client.node_types())
         except ComfyError:
             types = None
-        if not self._faces_into_picture(job, client, plan, graph, types,
-                                        values.get("width"), values.get("height")):
+        if not plan.workflow.get("multi_identity") and not self._faces_into_picture(
+                job, client, plan, graph, types, values.get("width"), values.get("height")):
             return self.queue._finish(job, "cancelled")
         lacking = missing_nodes(graph, types) if types is not None else []
         if values.get("face_detail"):
@@ -4494,9 +4718,10 @@ class Studio:
             files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
             if graph2 is not None:
                 job.face_graph = graph2
-                if job.real_faces and not job.cancel.is_set():
+                if job.real_faces and not profiles and not job.cancel.is_set():
                     files = self._real_faces(job, client, plan, values, files, say)
-        if job.settings.get("auto_refine") and not job.cancel.is_set():
+        if (job.settings.get("auto_refine") and not plan.workflow.get("multi_identity")
+                and not job.cancel.is_set()):
             files = self._refine(job, client, plan, values, files, say)
         if job.cancel.is_set():
             return self.queue._finish(job, "cancelled")
@@ -4506,11 +4731,103 @@ class Studio:
         except ComfyError as e:
             return self.queue._finish(job, "failed", "The picture was made but could not be "
                                       "fetched from %s: %s" % (b["name"], e))
-        job.record = self.history.add(self.record_for(job, graph), pictures)
-        job.outputs = list(job.record["images"])
+        if profiles:
+            pictures = self.finish_profiles(job, graph, pictures, profiles, say)
+            if pictures is None:
+                return
+        self.save_result(job, self.record_for(job, graph), pictures)
         job.progress = 1.0
         self.queue._finish(job, "complete",
                            "; ".join(plan.warnings[:1]) if plan.warnings else "")
+
+    def finish_profiles(self, job, graph, pictures, profiles, say, checkpoint=None):
+        """Durable checkpoint before a fallible finishing step; never lose the base.
+        A retry passes the checkpoint it retries, already saved."""
+        if checkpoint is None:
+            record = copy.deepcopy(self.record_for(job, graph))
+            record["id"] += "-generated"
+            record["finish"] = {"state": "pending", "profiles": copy.deepcopy(profiles)}
+            record["notes"] = record["notes"] + ["Generated picture saved before the final face swap."]
+            job.record = self.history.add(record, pictures)
+        else:
+            record = job.record = checkpoint
+        job.outputs = list(job.record["images"])
+        say("refining", "Generated picture saved; applying faces")
+        try:
+            result = self._apply_profiles(job, pictures, profiles, say)
+            if job.cancel.is_set():
+                raise RuntimeError("Face swap cancelled.")
+            return result
+        except (RuntimeError, OSError, ValueError) as error:
+            detail = str(error) + " Generated picture kept in History. Retry face swap or use Fix a spot."
+            record["finish"].update(state="cancelled" if job.cancel.is_set() else "failed", error=str(error))
+            self._update_checkpoint(record)
+            self.queue._finish(job, "cancelled" if job.cancel.is_set() else "failed", detail)
+            return None
+
+    def _update_checkpoint(self, record):
+        try:
+            self.history.update(record)
+        except OSError as error:
+            doctor.log_error("Could not update face checkpoint metadata: %s" % error)
+
+    def save_result(self, job, record, pictures):
+        checkpoint = job.record
+        job.record = self.history.add(record, pictures)
+        job.outputs = list(job.record["images"])
+        if checkpoint and checkpoint.get("finish"):
+            checkpoint["finish"].update(state="complete", results=list(job.outputs))
+            self._update_checkpoint(checkpoint)
+
+    def _apply_profiles(self, job, pictures, profiles, say):
+        """Last pixel-changing step: the same HyperSwap recipe as the approved trial."""
+        import studio_facefusion as facefusion
+        result = []
+        for filename, data in pictures:
+            for index, profile in enumerate(profiles):
+                if job.cancel.is_set():
+                    raise RuntimeError("Face swap cancelled.")
+                say("refining", "Applying %s's face" % profile["name"], None)
+                options = ({"face_index": index, "face_count": len(profiles)}
+                           if len(profiles) > 1 else {})
+                data, report = facefusion.swap(data, profile, stop=job.cancel.is_set, **options)
+                job.facefusion.append(report)
+                job.notes.append("%s: FaceFusion applied last; zero pixels changed outside the face mask."
+                                 % profile["name"])
+            result.append((os.path.splitext(filename)[0] + ".png", data))
+        return result
+
+    def run_profile_swap(self, job, fix, say):
+        """An existing picture can receive a profile without a ComfyUI redraw."""
+        profiles, images = self.face_inputs(job.settings)
+        job.started = time.time()
+        job.plan = Plan()
+        job.plan.workflow = {"id": "facefusion", "label": "Apply identity"}
+        job.plan.values = {"seed": job.settings.get("seed")}
+        job.plan.prompt = "Apply faces: " + ", ".join(p["name"] for p in profiles)
+        checkpoint = None
+        try:
+            problems = self.preview(job.settings).errors
+            if problems:
+                raise RuntimeError(" ".join(problems))
+            pictures = []
+            for path in images:
+                with open(path, "rb") as source:
+                    pictures.append((os.path.basename(path), source.read()))
+            saved = (job.settings.get("face_finish") or {}).get("record")
+            if saved:                 # a retry finishes the checkpoint it came from
+                with open(saved, encoding="utf-8") as f:
+                    checkpoint = dict(json.load(f), path=saved)
+        except (OSError, RuntimeError, ValueError) as e:
+            return self.queue._finish(job, "cancelled" if job.cancel.is_set() else "failed", str(e))
+        pictures = self.finish_profiles(job, None, pictures, profiles, say, checkpoint)
+        if pictures is None:
+            return
+        record = self.record_for(job, None)
+        record["fix"] = fix
+        self.save_result(job, record, pictures)
+        job.progress = 1.0
+        self.queue._finish(job, "complete")
 
     # ------------------------------------------------------------ fix a spot
     @staticmethod
@@ -4771,6 +5088,15 @@ class Studio:
         if said[0] is None:
             raise ComfyError("SAM3 said nothing about the picture.")
         width, height, boxes = said[0]
+        point = clean_fix(job.settings.get("fix"))["face_point"]
+        if point is not None:
+            import studio_facefusion as facefusion
+            normalized = [[x / width, y / height, (x + w) / width, (y + h) / height]
+                          for x, y, w, h in boxes]
+            try:
+                boxes = [boxes[facefusion.target_face(normalized, point=point)]]
+            except RuntimeError as error:
+                raise ComfyError(str(error)) from error
         spots = found_spots(width, height, boxes, "face")[:1]
         if not spots:
             return None
@@ -5666,6 +5992,7 @@ class Studio:
             "face_graph": job.face_graph,
             "refinement": job.refinement,
             "paste_graph": job.paste_graph,
+            "facefusion": job.facefusion,
             "dress": job.dress,
         }
 
