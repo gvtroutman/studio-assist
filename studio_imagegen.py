@@ -1258,6 +1258,19 @@ SWAP_PROMPTS = {"hand": "The hand in picture 1 is posed and looks like the %s in
                          "what is there."}
 SWAP_NOUNS = {"hand": "hand", "face": "face", "other": "item"}
 SWAP_GROW = 16                        # px the swapped thing's outline grows at the crop's size
+# A fix can end with a face swap: an identity's face (its first reference
+# picture) put on the picture's biggest face (found again after the spots
+# are done) by the same Qwen swap.
+FACE_SWAP_FIND = "face:8"
+FACE_SWAP_LABEL = "Swapping in %s's face"
+SWAP_SLOTS = 2                        # pictures Qwen 2509 takes beside the one it edits
+# Every reference picture of the identity is used, each cut to its face
+# (SAM3's biggest, FACE_SWAP_REF_PAD times it, with the hair): a half-body
+# photo's face is a tenth of it, too little for Qwen to copy.
+FACE_SWAP_REF_PAD = 1.8
+FACE_SWAP_PROMPT = ("The person in picture 1 has the face of the person in %s: the same "
+                    "eyes, nose, mouth, face shape, eyebrows and skin, turned and lit as "
+                    "the face in picture 1.")
 # A spot can be a freehand outline (the Fix a spot window's drag): only
 # inside it changes. ComfyUI has no polygon mask node, so the outline is
 # drawn here as a mask picture at the crop's size (`outline_png`) and
@@ -1342,9 +1355,11 @@ def _spots(items, limit):
 
 def clean_fix(fix):
     """The fix a job carries, made safe: {"image", "target", "words",
-    "strength", "spots", "locks"} - spots are [{"x", "y", "size", "box"?}],
-    centres and sides in the picture's own pixels (`box` what Find found in
-    it); locks are squares of the same shape the fix may not change."""
+    "strength", "spots", "locks", "face_swap"} - spots are [{"x", "y",
+    "size", "box"?}], centres and sides in the picture's own pixels (`box`
+    what Find found in it); locks are squares of the same shape the fix may
+    not change; `face_swap` the id of the identity whose face is swapped
+    in last ("" for none)."""
     fix = fix if isinstance(fix, dict) else {}
     spots = _spots(fix.get("spots"), FIX_MAX_SPOTS)
     locks = _spots(fix.get("locks"), 16)
@@ -1362,7 +1377,7 @@ def clean_fix(fix):
         tone = FIX_TONE
     return {"image": _str(fix.get("image")), "target": target, "tone": tone,
             "words": _str(fix.get("words")), "strength": strength, "spots": spots,
-            "locks": locks}
+            "locks": locks, "face_swap": _str(fix.get("face_swap"))}
 
 
 def fix_words(fix):
@@ -1370,14 +1385,16 @@ def fix_words(fix):
     a photo"."""
     f = clean_fix(fix)
     n = len(f["spots"])
+    if not n and f["face_swap"]:
+        return "a face swap"
     if f["words"]:
-        return f["words"]
+        return f["words"] + (", then a face swap" if f["face_swap"] else "")
     noun = {"hand": "hand", "face": "face"}.get(f["target"], "spot")
     out = "%d %s%s" % (n, noun, "" if n == 1 else "s")
     k = sum(1 for sp in f["spots"] if sp.get("photo"))
     if k:
         out += " (%s from a photo)" % ("all" if k == n else k)
-    return out
+    return out + (", then a face swap" if f["face_swap"] else "")
 
 
 def fix_crops(width, height, spots, head=False):
@@ -1471,6 +1488,48 @@ def parts_graph(image, sam3, prompts):
             "threshold": 0.3, "refine_iterations": 0, "individual_masks": True}}
         g["p%dv" % i] = {"class_type": "PreviewAny", "inputs": {"source": ["p%dd" % i, 1]}}
     return g
+
+
+def faces_graph(images, sam3, prompt=FACE_SWAP_FIND):
+    """SAM3 asked for `prompt` in each of `images` (LoadImage names), with
+    each picture's size, as PreviewAny text for `faces_found`."""
+    g = {"l": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
+         "t": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["l", 1]}}}
+    for i, image in enumerate(images):
+        n = "q%d_" % i
+        g[n + "i"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+        g[n + "d"] = {"class_type": "SAM3_Detect", "inputs": {
+            "model": ["l", 0], "image": [n + "i", 0], "conditioning": ["t", 0],
+            "threshold": 0.3, "refine_iterations": 0, "individual_masks": True}}
+        g[n + "v"] = {"class_type": "PreviewAny", "inputs": {"source": [n + "d", 1]}}
+        g[n + "s"] = {"class_type": "GetImageSize", "inputs": {"image": [n + "i", 0]}}
+        g[n + "w"] = {"class_type": "PreviewAny", "inputs": {"source": [n + "s", 0]}}
+        g[n + "h"] = {"class_type": "PreviewAny", "inputs": {"source": [n + "s", 1]}}
+    return g
+
+
+def faces_found(entry, n):
+    """What faces_graph said of its `n` pictures -> [(width, height, [(x, y,
+    w, h)] biggest first) or None for a picture it said nothing of]."""
+    out = entry.get("outputs") or {}
+
+    def text(node):
+        t = (out.get(node) or {}).get("text") or []
+        return json.loads(t[0]) if t else None
+    said = []
+    for i in range(n):
+        try:
+            b, w, h = (text("q%d_%s" % (i, k)) for k in "vwh")
+        except ValueError:
+            b = w = h = None
+        if w is None or h is None:
+            said.append(None)
+            continue
+        b = b[0] if b and isinstance(b[0], list) else b or []
+        boxes = [(x["x"], x["y"], x["width"], x["height"]) for x in b
+                 if max(x["width"], x["height"]) >= 12]
+        said.append((int(w), int(h), sorted(boxes, key=lambda x: -x[2] * x[3])))
+    return said
 
 
 def parts_found(entry, n, words=None):
@@ -2318,6 +2377,19 @@ def _dress_pass(g, d, ps, last, size, v, pictures, seed):
     for i, item in enumerate(ps["items"]):
         g[d + "i%d" % i] = {"class_type": "LoadImage", "inputs": {"image": pictures[item["path"]]}}
         loads.append([d + "i%d" % i, 0])
+        if item.get("region"):            # only this part of the picture: a face
+            g[d + "r%d" % i] = {"class_type": "ImageCropV2", "inputs": {
+                "image": loads[-1], "crop_region": dict(item["region"])}}
+            loads[-1] = [d + "r%d" % i, 0]
+    if ps.get("sheet") and len(loads) > 1:
+        # All the pictures side by side as one: Qwen takes three pictures in
+        # all, so more references than two ride in one.
+        for i in range(1, len(loads)):
+            g[d + "h%d" % i] = {"class_type": "ImageStitch", "inputs": {
+                "image1": loads[0], "image2": loads[i], "direction": "right",
+                "match_image_size": True, "spacing_width": 16, "spacing_color": "white"}}
+            loads[0] = [d + "h%d" % i, 0]
+        loads = loads[:1]
     if ps["kind"] == "clothes":
         # The garments in a column as tall as the person, each fitted into
         # its share on white, and the column left of the person: the
@@ -2464,7 +2536,7 @@ def dress_head_graph(wf, values, passes, image, work, crop, mask, size, pictures
 
 
 def swap_graph(wf, values, image, crops, pictures, prompts, oval, prefix, sam3=None,
-               locks=()):
+               locks=(), tone=0.0):
     """Fix a spot from photos: in `image` (a LoadImage name) each of `crops`
     (fix_crops, each with its spot's "photo" path, and fix_areas' `area` and
     `word` when Find made it) is cut out, swapped by Qwen-Image-Edit - the
@@ -2476,6 +2548,11 @@ def swap_graph(wf, values, image, crops, pictures, prompts, oval, prefix, sam3=N
       bigger than the old), grown SWAP_GROW px and softened;
     - else through Find's box grown by FIX_AREA_GROW, softened;
     - else (a clicked square) through `oval`, which reaches the spot alone.
+
+    A crop may carry `photos` ([{"path", "region"?}], each cut to its
+    region) in place of `photo`: more than SWAP_SLOTS go in side by side as
+    one picture. With `tone` the swap's colour moves that far to the
+    crop's (ColorTransfer, reinhard_lab).
 
     Qwen redraws the whole crop a shade off, so nothing outside the mask is
     kept from it. `locks` are laid back from `image` last; the result is
@@ -2491,7 +2568,9 @@ def swap_graph(wf, values, image, crops, pictures, prompts, oval, prefix, sam3=N
         region = {k: crop[k] for k in ("x", "y", "width", "height")}
         g[n + "c"] = {"class_type": "ImageCropV2", "inputs": {"image": last,
                                                              "crop_region": region}}
-        ps = {"kind": "swap", "items": [{"path": crop["photo"]}], "prompt": prompts[i]}
+        items = crop.get("photos") or [{"path": crop["photo"]}]
+        ps = {"kind": "swap", "items": items, "prompt": prompts[i],
+              "sheet": len(items) > SWAP_SLOTS}
         drawn = _dress_pass(g, n, ps, [n + "c", 0], (side, tall), v, pictures,
                             int(v["seed"]) + i)
         area = crop.get("area")
@@ -2538,6 +2617,17 @@ def swap_graph(wf, values, image, crops, pictures, prompts, oval, prefix, sam3=N
             "crop": "disabled"}}
         g[n + "b3"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "b2", 0],
                                                               "channel": "red"}}
+        if tone:
+            # A face from a studio photo comes back pinker and brighter than
+            # the picture: its colour moved to the crop it replaces (Lab
+            # mean and spread over the whole crop). StudioMatchTone's
+            # per-channel curves posterized a smooth face into cyan and
+            # green blotches (live, 2026-09-26).
+            g[n + "tn"] = {"class_type": "ColorTransfer", "inputs": {
+                "image_target": drawn, "image_ref": [n + "c", 0],
+                "method": "reinhard_lab", "source_stats": "per_frame",
+                "strength": float(tone)}}
+            drawn = [n + "tn", 0]
         g[n + "b4"] = {"class_type": "ImageCompositeMasked", "inputs": {
             "destination": last, "source": drawn, "x": crop["x"], "y": crop["y"],
             "resize_source": False, "mask": [n + "b3", 0]}}
@@ -4450,21 +4540,40 @@ class Studio:
         finished picture redrawn with its own model, LoRAs and prompt, and
         blended back. Squares given a photo are swapped for what the photo
         shows by Qwen-Image-Edit first (`swap_graph`), and the rest redrawn
-        on that. A new picture in the history; the old one is kept."""
+        on that. With a `face_swap` identity the fix ends by swapping its
+        face (from all its reference pictures) onto the picture's biggest face
+        (`_face_swap_graph`); it may be the only step. A new picture in the
+        history; the old one is kept."""
         b, s = job.backend, job.settings
         fix = clean_fix(s.get("fix"))
         src = fix["image"]
         swaps = [sp for sp in fix["spots"] if sp.get("photo")]
         plain = [sp for sp in fix["spots"] if not sp.get("photo")]
+        face, who, refs = "", None, []
         problem = ""
-        if not src or not os.path.isfile(src):
+        if fix["face_swap"]:
+            who = self.lib.get("identities", fix["face_swap"])
+            if who is None:
+                problem = "The identity %s to swap the face from is gone." % fix["face_swap"]
+            elif not who["references"]:
+                problem = ("%s has no reference picture, so there is no face to swap in."
+                           % who["name"])
+            else:
+                face, refs = who["name"], list(who["references"])
+        if problem:
+            pass
+        elif not src or not os.path.isfile(src):
             problem = "The picture to fix (%s) is not on this PC." % (src or "none")
-        elif not fix["spots"]:
+        elif not fix["spots"] and not face:
             problem = "Click the part of the picture to redraw."
         else:
             gone = [sp["photo"] for sp in swaps if not os.path.isfile(sp["photo"])]
             if gone:
                 problem = "The photo %s is not on this PC." % gone[0]
+            elif face:
+                refs = [r for r in refs if os.path.isfile(r)]
+                if not refs:
+                    problem = "None of %s's reference pictures is on this PC." % who["name"]
         size = file_size_of(src) if not problem else None
         if size is None and not problem:
             problem = "Could not read the size of %s." % src
@@ -4478,7 +4587,10 @@ class Studio:
             elif plain and not plan.workflow.get("face_detail"):
                 problem = ("The %s workflow has no redraw section, so its pictures cannot "
                            "be fixed." % plan.workflow.get("label"))
-        if swaps and not problem:
+        if face and not problem and not self.sam3_on(b):
+            problem = ("The face swap finds the face with SAM3, and %s has no SAM3 "
+                       "checkpoint." % b["name"])
+        if (swaps or face) and not problem:
             try:
                 swap_wf = self.workflow_loader(DRESS_WORKFLOW)
             except TemplateError as e:
@@ -4490,8 +4602,9 @@ class Studio:
                 if nodes is not None and "SolidMask" not in nodes:
                     missing.append({"text": "the node SolidMask"})
                 if missing:
-                    problem = ("A spot with a photo is swapped by Qwen-Image-Edit, and %s "
-                               "lacks %s." % (b["name"], _and([m["text"] for m in missing])))
+                    problem = ("%s swapped by Qwen-Image-Edit, and %s lacks %s." % (
+                        "A spot with a photo is" if swaps else "The face is", b["name"],
+                        _and([m["text"] for m in missing])))
         if problem:
             return self.queue._finish(job, "failed", problem)
         values = dict(plan.values)
@@ -4560,6 +4673,18 @@ class Studio:
                                    plan.workflow, values, plan.loras, picture, crops, oval,
                                    values["filename_prefix"], boxes=boxes, locks=locks,
                                    mask_word=FIX_FACE_MASK)))
+            if face:
+                photos = {r: client.upload_image(r) for r in refs}
+                sv = dict(dress_values(swap_wf, b), seed=values["seed"])
+                tone = fix["tone"]
+                if tone and "ColorTransfer" not in set(client.node_types()):
+                    tone = 0.0
+                    job.notes.append("%s's ComfyUI has no ColorTransfer (update it), so the "
+                                     "swapped face keeps the photos' colours." % b["name"])
+                graphs.append((FACE_SWAP_LABEL % who["name"],
+                               lambda picture: self._face_swap_graph(
+                                   job, client, picture, refs, photos, swap_wf, sv, oval,
+                                   values["filename_prefix"] + "_face", locks, tone)))
         except (ComfyError, TemplateError, OSError) as e:
             return self.queue._finish(job, "failed", "Could not set up the fix on %s: %s"
                                       % (b["name"], e))
@@ -4570,13 +4695,24 @@ class Studio:
             except Exception as e:
                 job.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
         files = graph = None
+        face_done = False
         for label, graph in graphs:
             if callable(graph):
                 try:
                     graph = graph(image)
                 except (TemplateError, ComfyError) as e:
+                    if job.cancel.is_set():
+                        return self.queue._finish(job, "cancelled")
                     return self.queue._finish(job, "failed", "Could not set up the fix on "
                                               "%s: %s" % (b["name"], e))
+                if graph is None:         # the face swap found no face
+                    if files is None:
+                        return self.queue._finish(job, "failed", "SAM3 found no face in "
+                                                  "the picture to swap.")
+                    graph = job.graph
+                    job.notes.append("SAM3 found no face after the fix, so none was "
+                                     "swapped.")
+                    continue
             job.graph = graph
             try:
                 files = self._run_pass(job, client, graph, say, label)
@@ -4587,6 +4723,7 @@ class Studio:
                                           % (b["name"], e))
             if files is None or job.cancel.is_set():
                 return self.queue._finish(job, "cancelled")
+            face_done = bool(face) and label == FACE_SWAP_LABEL % who["name"]
             f = files[0]              # the next run starts from this one's picture
             image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
                                     f["filename"], f.get("type") or "output")
@@ -4596,11 +4733,16 @@ class Studio:
         except ComfyError as e:
             return self.queue._finish(job, "failed", "The picture was made but could not be "
                                       "fetched from %s: %s" % (b["name"], e))
-        plan.notes.append("Fixed %s at denoise %s from %s." % (
-            fix_words(fix), fix["strength"], os.path.basename(src)))
+        if fix["spots"]:
+            plan.notes.append("Fixed %s at denoise %s from %s." % (
+                fix_words(fix), fix["strength"], os.path.basename(src)))
         if swaps:
             plan.notes.append("Swapped from %s by Qwen-Image-Edit." % _and(
                 sorted({os.path.basename(sp["photo"]) for sp in swaps})))
+        if face_done:
+            plan.notes.append("%s's face swapped in last by Qwen-Image-Edit, from %d "
+                              "reference picture%s." % (who["name"], len(refs),
+                                                        "" if len(refs) == 1 else "s"))
         rec = self.record_for(job, graph)
         rec["prompt"] = "Fix %s: %s" % (fix_words(fix), plan.prompt)
         rec["fix"] = fix
@@ -4608,6 +4750,49 @@ class Studio:
         job.outputs = list(job.record["images"])
         job.progress = 1.0
         self.queue._finish(job, "complete")
+
+    def _face_swap_graph(self, job, client, image, refs, photos, swap_wf, sv, oval, prefix,
+                         locks, tone):
+        """A fix's last run: SAM3 finds the faces in `image` (what the spots
+        made, a LoadImage name) and in each of the identity's `refs` (paths;
+        `photos` maps them to LoadImage names). The picture's biggest face -
+        its subject - is swapped by swap_graph for the face in all of them,
+        each cut to its own face, and blended back through SAM3's face
+        before and after. None when SAM3 finds no face in the picture.
+        Network I/O: it runs the finder."""
+        sam = self.sam3_on(job.backend)
+        names = [image] + [photos[r] for r in refs]
+        job.prompt_id = client.queue_workflow(faces_graph(names, sam))
+        entry = client.listen_for_progress(job.prompt_id, lambda kind, data: None,
+                                           stop=job.cancel.is_set)
+        if entry is None:
+            raise ComfyError("cancelled")
+        said = faces_found(entry, len(names))
+        if said[0] is None:
+            raise ComfyError("SAM3 said nothing about the picture.")
+        width, height, boxes = said[0]
+        spots = found_spots(width, height, boxes, "face")[:1]
+        if not spots:
+            return None
+        for sp in spots:
+            sp["word"] = "face"
+        items = []
+        for ref, got in zip(refs, said[1:]):
+            if got and got[2]:
+                items.append({"path": ref, "region": head_square(
+                    got[2][0], got[0], got[1], FACE_SWAP_REF_PAD)})
+        if not items:                     # no face found in them: the whole pictures
+            items = [{"path": r} for r in refs]
+            job.notes.append("SAM3 found no face in the reference pictures, so Qwen was "
+                             "shown them whole.")
+        crops = fix_crops(width, height, [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
+                                          for sp in spots])
+        fix_areas(crops, spots)
+        crops[0]["photos"] = items
+        where = ("picture 2" if len(items) == 1 or len(items) > SWAP_SLOTS
+                 else "pictures 2 and 3")
+        return swap_graph(swap_wf, sv, image, crops, photos, [FACE_SWAP_PROMPT % where],
+                          oval, prefix, sam3=sam, locks=locks, tone=tone)
 
     # ------------------------------------------------------------ try on
     def sam3_on(self, backend):
