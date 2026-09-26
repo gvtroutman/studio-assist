@@ -972,6 +972,14 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   "bent, the hand in front of the chest", "swinging forward"...), both arms in one
   phrase when they match (`BOTH_ARMS`); the legs (stride, weight on one leg, wide
   stance) unless a named pose in `LEG_POSES` says them; the head's nod and tilt.
+  **Look at** (the L tool): a click on a person opens a ring round their head of
+  `HEAD_POSES` - ahead and the eight directions, left and right as the camera sees
+  them (`head_pose` flips the sign for someone facing away) - with Camera and
+  Point... under it. Point makes the next click the point (a face at its depth,
+  else the floor, else 30 m out along the ray). The point is
+  kept as `look_at` and `aim_head` solves Turn and Look down to it - again on every
+  `changed()` and drag, so the head follows the person. The head only, clamped to its
+  sliders; moving a head slider by hand drops the point. A crowd has none.
   Left and right are theirs, as captions say them. `gaze_words` says where the head
   looks when that is not the body's way ("head turned towards the camera"), and
   `framing_words` how much of them the frame shows ("seen from the knees up"). A

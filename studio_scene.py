@@ -145,6 +145,10 @@ def apply(m, v):
             m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2])
 
 
+def transpose(m):
+    return tuple(tuple(m[j][i] for j in range(3)) for i in range(3))
+
+
 def column(m, i):
     return (m[0][i], m[1][i], m[2][i])
 
@@ -912,6 +916,10 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                     (0.01, 0.1, 0.13), (-0.01, 0.1, 0.13))]
     idx = [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (3, 2, 6, 7), (0, 3, 7, 4), (1, 2, 6, 5)]
     out.append(("head", "head", outward([[nose[i] for i in f] for f in idx])))
+    # Ears at the sides, so a head reads as a head from any side.
+    for sx in (1, -1):
+        out.append(("head", "head", ellipsoid(at("head", (sx * 0.084, 0.1, 0.0)), M("head"),
+                                              (0.013, 0.03, 0.019), 6, 4)))
     head_box = lambda lo, hi: outward([[at("head", p) for p in f]    # noqa: E731
                                        for f in box(lo, hi)])
     if hat and hat[0] == "crown":
@@ -1008,6 +1016,19 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                  X("ankle_" + side),
                                  r((0.045, 0.035), k("foot", 1)),
                                  r((0.042, 0.025), k("foot", 1)), 6)),
+            # Round joints where the limbs meet, so a bent arm or knee is
+            # one limb and not two tubes with a gap between them.
+            (hand, "upper_arm", ellipsoid(P("shoulder_" + side), M("shoulder_" + side),
+                                          (0.058 * upper, 0.056 * upper, 0.056 * upper), 8, 5)),
+            (hand, "forearm", ellipsoid(P("elbow_" + side), M("elbow_" + side),
+                                        (0.043 * fore,) * 3, 8, 4)),
+            (hand, "hand", ellipsoid(P("wrist_" + side), M("wrist_" + side),
+                                     (0.034, 0.03, 0.028), 6, 4)),
+            (hand, "hand", prism(at("wrist_" + side, (0, -0.05, 0.028)),
+                                 at("wrist_" + side, (0, -0.115, 0.052)),
+                                 X("wrist_" + side), (0.012, 0.012), (0.01, 0.01), 6)),
+            (foot, "shin", ellipsoid(P("knee_" + side), M("knee_" + side),
+                                     (0.056 * shin, 0.058 * shin, 0.058 * shin), 8, 4)),
         ]
         if shoes:
             out += [(foot, rgb, faces) for rgb, faces in _shoe(
@@ -1195,15 +1216,32 @@ def _legs(top, inset, r):
 
 
 def _car():
-    dark, tyre = "#2b3440", "#1f1f22"
-    wheels = [(prism((sx * 0.5, 0.2, sz * 0.3), (sx * 0.38, 0.2, sz * 0.3), (0, 1, 0),
-                     (0.2, 0.065), (0.2, 0.065), 12), tyre)
-              for sx in (1, -1) for sz in (1, -1)]
+    tyre, glass, trim = "#1f1f22", "#6f8494", "#3a3a3e"
+    wheels = []
+    for sx in (1, -1):
+        for sz in (1, -1):
+            wheels.append((prism((sx * 0.49, 0.2, sz * 0.3), (sx * 0.38, 0.2, sz * 0.3),
+                                 (0, 1, 0), (0.2, 0.065), (0.2, 0.065), 14), tyre))
+            wheels.append((prism((sx * 0.5, 0.2, sz * 0.3), (sx * 0.49, 0.2, sz * 0.3),
+                                 (0, 1, 0), (0.1, 0.033), (0.1, 0.033), 10), "#b9bcc0"))
     v = [(-0.44, 0.5, 0.18), (0.44, 0.5, 0.18), (0.44, 0.5, -0.36), (-0.44, 0.5, -0.36),
          (-0.38, 0.86, 0.06), (0.38, 0.86, 0.06), (0.38, 0.86, -0.28), (-0.38, 0.86, -0.28)]
     cab = outward([[v[i] for i in f] for f in ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4),
                                                (3, 2, 6, 7), (0, 3, 7, 4), (1, 2, 6, 5))])
-    return [(_slab(-0.5, 0.14, -0.5, 0.5, 0.5, 0.5), None), (cab, dark)] + wheels
+    # The cab's sides are its windows and its roof is the body's colour. (A
+    # pane laid over a face does not work: the painter's sort splits the two
+    # into tiles and interleaves them in stripes.)
+    roof = [f for f in cab if abs(norm(newell(f))[1]) >= 0.9]
+    windows = [f for f in cab if abs(norm(newell(f))[1]) < 0.9]
+    body = [(_slab(-0.5, 0.24, -0.48, 0.5, 0.5, 0.48), None),
+            (_slab(-0.47, 0.14, -0.46, 0.47, 0.24, 0.46), None),         # the sills
+            (_slab(-0.49, 0.14, 0.46, 0.49, 0.27, 0.5), trim),           # bumpers
+            (_slab(-0.49, 0.14, -0.5, 0.49, 0.27, -0.46), trim)]
+    lights = [(_slab(sx * 0.42 - 0.07, 0.36, 0.48, sx * 0.42 + 0.07, 0.43, 0.492), "#f4efd8")
+              for sx in (1, -1)]
+    lights += [(_slab(sx * 0.42 - 0.07, 0.36, -0.492, sx * 0.42 + 0.07, 0.42, -0.48), "#b0342f")
+               for sx in (1, -1)]
+    return body + [(roof, None), (windows, glass)] + lights + wheels
 
 
 def _barrel():
@@ -1216,9 +1254,65 @@ def _barrel():
 
 
 def _fence():
-    out = [(_slab(x - 0.012, 0, -0.35, x + 0.012, 1, 0.35), None)
-           for x in (-0.488, -0.244, 0, 0.244, 0.488)]
+    out = []
+    for x in (-0.488, -0.244, 0, 0.244, 0.488):
+        out.append((_slab(x - 0.012, 0, -0.35, x + 0.012, 0.92, 0.35), None))
+        # A pointed cap: a four-sided prism, its corners on the post's.
+        out.append((prism((x, 0.92, 0), (x, 1, 0), (1, 0, 0), (0.017, 0.495),
+                          (0.0005, 0.005), 4), None))
     out += [(_slab(-0.5, y, -0.25, 0.5, y + 0.09, 0.25), None) for y in (0.3, 0.72)]
+    # Pickets between the posts, on the rails' front.
+    for i in range(20):
+        x = -0.475 + 0.95 * (i + 0.5) / 20
+        if min(abs(x - p) for p in (-0.488, -0.244, 0, 0.244, 0.488)) < 0.025:
+            continue
+        out.append((_slab(x - 0.008, 0.08, 0.25, x + 0.008, 0.88, 0.45), None))
+    return out
+
+
+def _lamp():
+    return [(lathe([(0.34, 0), (0.34, 0.025), (0.2, 0.05), (0.13, 0.08), (0.1, 0.1)], 12), None),
+            (_post(0, 0, 0.1, 0.86, 0.1), None),
+            (lathe([(0.1, 0.86), (0.2, 0.875), (0.2, 0.89)], 10), None),
+            (lathe([(0.2, 0.89), (0.36, 0.95)], 10), "#f2e6b0"),              # the glass
+            (lathe([(0.46, 0.95), (0.46, 0.96), (0.08, 0.99), (0.0, 1.0)], 10), None)]
+
+
+def _parasol():
+    out = [(_post(0, 0, 0, 0.93, 0.018), "#8b8d91"),
+           (_slab(-0.14, 0, -0.14, 0.14, 0.03, 0.14), "#8b8d91"),
+           (lathe([(0.49, 0.76), (0.5, 0.79), (0.3, 0.87), (0.03, 0.925)], 16), None),
+           (ellipsoid((0, 0.94, 0), IDENTITY, (0.025, 0.02, 0.025), 6, 4), "#8b8d91")]
+    for i in range(8):                    # the ribs under the canopy
+        t = 2 * math.pi * (i + 0.5) / 8
+        out.append((prism((0, 0.66, 0), (0.46 * math.cos(t), 0.765, 0.46 * math.sin(t)),
+                          (0, 1, 0), (0.006, 0.006), (0.004, 0.004), 4), "#8b8d91"))
+    return out
+
+
+def _tree():
+    bark = "#5a3e2b"
+    out = [(prism((0, 0, 0), (0, 0.55, 0), (1, 0, 0), (0.06, 0.06), (0.035, 0.035), 10), bark),
+           (prism((0, 0, 0), (0, 0.04, 0), (1, 0, 0), (0.09, 0.09), (0.06, 0.06), 10), bark)]
+    for t, y in ((0.3, 0.42), (2.4, 0.47), (4.3, 0.5)):
+        out.append((prism((0, y - 0.06, 0), (0.22 * math.cos(t), y + 0.08, 0.22 * math.sin(t)),
+                          (0, 1, 0), (0.018, 0.018), (0.01, 0.01), 6), bark))
+    out.append((ellipsoid((0, 0.66, 0), IDENTITY, (0.4, 0.26, 0.4), 12, 7), None))
+    for i, (r, y, s) in enumerate(((0.22, 0.62, 0.26), (0.24, 0.72, 0.24), (0.2, 0.6, 0.27),
+                                   (0.23, 0.74, 0.25), (0.21, 0.66, 0.27))):
+        t = 2 * math.pi * i / 5 + 0.4
+        out.append((ellipsoid((r * math.cos(t), y, r * math.sin(t)), IDENTITY,
+                              (s, s * 0.8, s), 10, 6), None))
+    out.append((ellipsoid((0.04, 0.86, -0.03), IDENTITY, (0.3, 0.14, 0.3), 10, 5), None))
+    return out
+
+
+def _bush():
+    out = [(ellipsoid((0, 0.45, 0), IDENTITY, (0.4, 0.45, 0.4), 12, 7), None)]
+    for i in range(5):
+        t = 2 * math.pi * i / 5
+        out.append((ellipsoid((0.22 * math.cos(t), 0.36 + 0.08 * (i % 2), 0.22 * math.sin(t)),
+                              IDENTITY, (0.27, 0.3, 0.27), 10, 6), None))
     return out
 
 
@@ -1231,26 +1325,30 @@ MESHES = {
     "wedge": [(_wedge(), None)],
     "pyramid": [(_pyramid(), None)],
     "table": [(_slab(-0.5, 0.94, -0.5, 0.5, 1, 0.5), None)] + [
-        (leg, None) for leg in _legs(0.94, 0.06, 0.035)],
-    "chair": [(_slab(-0.5, 0.47, -0.5, 0.5, 0.52, 0.5), None),
-              (_slab(-0.5, 0.52, -0.5, 0.5, 1, -0.4), None)] + [
-        (leg, None) for leg in _legs(0.47, 0.06, 0.05)],
+        (leg, None) for leg in _legs(0.94, 0.06, 0.035)] + [
+        (_slab(x0, 0.84, z0, x1, 0.94, z1), None) for x0, z0, x1, z1 in (   # the apron
+            (-0.41, 0.425, 0.41, 0.44), (-0.41, -0.44, 0.41, -0.425),
+            (0.425, -0.41, 0.44, 0.41), (-0.44, -0.41, -0.425, 0.41))],
+    "chair": [(_slab(-0.5, 0.47, -0.5, 0.5, 0.52, 0.5), None)] + [
+        (leg, None) for leg in _legs(0.47, 0.06, 0.05)] + [
+        # Back posts up from the back legs, a top rail and a slat between.
+        (_slab(sx * 0.44 - 0.05, 0.52, -0.49, sx * 0.44 + 0.05, 1, -0.41), None)
+        for sx in (1, -1)] + [
+        (_slab(-0.39, y0, -0.48, 0.39, y1, -0.43), None) for y0, y1 in ((0.86, 0.98),
+                                                                         (0.68, 0.74))] + [
+        (_slab(-0.39, 0.14, sz * 0.44 - 0.02, 0.39, 0.18, sz * 0.44 + 0.02), None)
+        for sz in (1, -1)],                                               # stretchers
     "bench": [(_slab(-0.5, 0.85, -0.5, 0.5, 1, 0.5), None)] + [
-        (_slab(sx * 0.42 - 0.03, 0, -0.4, sx * 0.42 + 0.03, 0.85, 0.4), None)
-        for sx in (1, -1)],
+        (_slab(sx * 0.42 - 0.03, 0.06, -0.36, sx * 0.42 + 0.03, 0.85, 0.36), None)
+        for sx in (1, -1)] + [
+        (_slab(sx * 0.42 - 0.035, 0, -0.45, sx * 0.42 + 0.035, 0.06, 0.45), None)
+        for sx in (1, -1)] + [                                            # the feet
+        (_slab(-0.39, 0.25, -0.08, 0.39, 0.35, 0.08), None)],            # the stretcher
     "barrel": _barrel(),
-    "tree": [(prism((0, 0, 0), (0, 0.5, 0), (1, 0, 0), (0.05, 0.05), (0.035, 0.035), 8),
-              "#5a3e2b"),
-             (ellipsoid((0, 0.66, 0), IDENTITY, (0.5, 0.3, 0.5), 12, 7), None),
-             (ellipsoid((0.08, 0.86, -0.05), IDENTITY, (0.32, 0.14, 0.32), 10, 5), None)],
-    "bush": [(ellipsoid((0, 0.5, 0), IDENTITY, (0.5, 0.5, 0.5), 12, 7), None)],
-    "lamp": [(_post(0, 0, 0, 0.94, 0.12), None),
-             (_slab(-0.25, 0, -0.25, 0.25, 0.05, 0.25), None),
-             (ellipsoid((0, 0.95, 0), IDENTITY, (0.5, 0.05, 0.5), 10, 5), "#f2e6b0")],
-    "parasol": [(_post(0, 0, 0, 0.93, 0.018), "#8b8d91"),
-                (_slab(-0.12, 0, -0.12, 0.12, 0.03, 0.12), "#8b8d91"),
-                (prism((0, 0.76, 0), (0, 0.92, 0), (1, 0, 0), (0.5, 0.5), (0.03, 0.03), 12),
-                 None)],
+    "tree": _tree(),
+    "bush": _bush(),
+    "lamp": _lamp(),
+    "parasol": _parasol(),
     "car": _car(),
     "fence": _fence(),
     "frustum": [(cone(0.32), None)],
@@ -1659,6 +1757,9 @@ def clean_object(d, taken=()):
         o["character"] = str(d.get("character") or "")
         o["look"] = clean_look(d.get("look"))
         o["face"] = str(d.get("face") or "")
+        at = d.get("look_at")
+        if isinstance(at, (list, tuple)) and len(at) == 3:
+            o["look_at"] = _vec(at, [0.0, 1.6, 0.0], -100, 100)
     if "crowd" in base:
         o["crowd"] = clean_crowd(d.get("crowd"))
     return o
@@ -1749,7 +1850,7 @@ def scenes_dir():
 # so no edit in the window has to say what it is.
 
 OBJECT_CHANGES = [             # (field, how the step is named), first match wins
-    ("pose", "Pose %s"), ("look", "Change %s's look"), ("character", "Change %s's look"),
+    ("look_at", "Point %s's eyes"), ("pose", "Pose %s"), ("look", "Change %s's look"), ("character", "Change %s's look"),
     ("crowd", "Change the crowd %s"), ("colour", "Colour %s"), ("position", "Move %s"),
     ("rotation", "Turn %s"), ("scale", "Size %s"), ("name", "Rename %s"),
     ("description", "Describe %s"),
@@ -2419,6 +2520,88 @@ def rigs(obj):
                           obj["scale"][0] * shape["height"] * m["size"],
                           x + at[0], y, z + at[2]))
     return out
+
+
+# ==================================================================== eyes
+# A person can be given a point to look at (`look_at`, world metres): the
+# head's Turn and Look down controls are solved so the eyes meet it, and
+# solved again whenever the person moves, turns or is re-posed. The head
+# only, within its sliders' range: a point behind them leaves the head
+# turned as far as it goes. A crowd has no eyes to point.
+EYES = (0.0, 0.07, 0.09)       # in the head's frame, m
+
+
+def eye_point(obj):
+    """Where a person's eyes are in the world."""
+    sk, k, shift = rigs(obj)[0]
+    hp, hm = sk["head"]
+    return add(mul(add(hp, apply(hm, EYES)), k), shift)
+
+
+def aim_head(obj):
+    """Turn a person's head to their `look_at`; False when they have none."""
+    target = obj.get("look_at")
+    if obj.get("asset") != "person" or not target:
+        return False
+    ctl = obj["pose"]["controls"]
+    sk, k, shift = rigs(obj)[0]
+    shape = body_shape(obj.get("look"))
+    root = euler(*obj["rotation"])
+    lo_t, hi_t = CONTROL_RANGE["head_turn"]
+    lo_n, hi_n = CONTROL_RANGE["head_nod"]
+    turn = nod = 0.0
+    for _ in range(4):
+        # The neck and head together are not exactly one yaw then one
+        # pitch, so measure where the eyes point and correct the error.
+        ctl["head_turn"], ctl["head_nod"] = turn, nod
+        sk = skeleton(ctl, root, shape)
+        hp, hm = sk["head"]
+        cm = sk["chest"][1]
+        eye = add(mul(add(hp, apply(hm, EYES)), k), shift)
+        want = apply(transpose(cm), sub(target, eye))
+        have = apply(transpose(cm), column(hm, 2))
+        if dot(want, want) < 1e-6:
+            break
+        yaw = lambda v: math.degrees(math.atan2(v[0], v[2]))                  # noqa
+        pitch = lambda v: math.degrees(math.atan2(-v[1], math.hypot(v[0], v[2])))  # noqa
+        d_yaw = (yaw(want) - yaw(have) + 180) % 360 - 180
+        turn = max(lo_t, min(hi_t, turn + d_yaw))
+        nod = max(lo_n, min(hi_n, nod + pitch(want) - pitch(have)))
+    ctl["head_turn"], ctl["head_nod"] = round(turn, 1), round(nod, 1)
+    return True
+
+
+# The Look at ring's head poses: (key, label, dx, dy) where (dx, dy) is the
+# item's place on the ring on screen (right, down +), and the head turns and
+# nods that way as the viewer sees it.
+HEAD_POSES = [("ahead", "Ahead", 0, 0), ("up", "Up", 0, -1), ("up_right", "Up right", 1, -1),
+              ("right", "Right", 1, 0), ("down_right", "Down right", 1, 1),
+              ("down", "Down", 0, 1), ("down_left", "Down left", -1, 1),
+              ("left", "Left", -1, 0), ("up_left", "Up left", -1, -1)]
+HEAD_TURN, HEAD_NOD_UP, HEAD_NOD_DOWN = 60.0, 30.0, 35.0
+
+
+def head_pose(scene, obj, key):
+    """Put a person's head in one of HEAD_POSES, left and right as the
+    camera sees them; any point they looked at is dropped."""
+    _, _, dx, dy = next(h for h in HEAD_POSES if h[0] == key)
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    their_left = apply(euler(*obj["rotation"]), (1, 0, 0))
+    side = 1 if dot(their_left, cam.r) > 0 else -1     # their left on screen right?
+    k = 0.75 if dx and dy else 1.0                     # a diagonal, a little of each
+    ctl = obj["pose"]["controls"]
+    ctl["head_turn"] = dx * side * HEAD_TURN * k
+    ctl["head_nod"] = (HEAD_NOD_DOWN if dy > 0 else HEAD_NOD_UP) * dy * k
+    ctl["head_tilt"] = 0.0
+    obj.pop("look_at", None)
+    obj["pose"]["preset"] = ""
+
+
+def aim_heads(scene):
+    """Every person with a point to look at, looking at it."""
+    for obj in scene["objects"]:
+        aim_head(obj)
 
 
 def pose_figures(scene, width=None, height=None):
