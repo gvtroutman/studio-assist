@@ -54,6 +54,7 @@ STYLE_EXAMPLES_DIR = os.path.join(HERE, "style_examples")
 MAX_SEED = 2 ** 32 - 1
 JOB_TIMEOUT = 1800            # seconds a job may run before it is given up on
 POSE_NODE = "StudioDWPoseKeypoints"   # comfy_nodes/studio_dwpose: a photo's pose points
+PASTE_NODE = "StudioFacePaste"        # comfy_nodes/studio_facepaste: a person's own face
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
@@ -1149,8 +1150,14 @@ def missing_nodes(graph, available):
 # FACE_EDIT px with the job's own model, LoRAs and guidance at `face_denoise`,
 # and blends it back through a soft oval. The identity LoRA is on the model
 # that redraws the face, so the pass is where most of the likeness is drawn.
+FACE_REDRAWN = 0.02            # the oval's weight beyond which the face pass redraws
 FACE_NODES = {"CheckpointLoaderSimple", "SAM3_Detect", "PreviewAny", "GetImageSize",
-              "ImageCropV2", "ImageScale", "ImageToMask", "ImageCompositeMasked", "LoadImage"}
+              "ImageCropV2", "ImageScale", "ImageToMask", "ImageCompositeMasked", "LoadImage",
+              "SetLatentNoiseMask", "ThresholdMask", "CLIPTextEncode", "MaskComposite",
+              "GrowMask", "MaskToImage", "ImageBlur", "SolidMask"}
+FACE_BOX_GROW = 0.15           # of its size the found face's box grows, as the part always blended
+FACE_HEAD_GROW = 12            # px at FACE_EDIT the head's mask grows before it is softened
+FACE_HEAD_SOFT = (21, 7.0)     # ImageBlur radius and sigma of its edge, at FACE_EDIT
 
 
 def _is_link(x):
@@ -1227,19 +1234,182 @@ def face_boxes(entry):
                                      if max(b["width"], b["height"]) >= FACE_MIN]
 
 
-def face_crops(width, height, boxes, pad=FACE_PAD):
+def face_crops(width, height, boxes, pad=FACE_PAD, keep=()):
     """The squares to redraw: every face whose padded square is smaller than
-    FACE_EDIT (one already that big was drawn at full size)."""
-    return [c for c in (head_square(b, width, height, pad) for b in boxes)
-            if c["width"] < FACE_EDIT]
+    FACE_EDIT (one already that big was drawn at full size), and every face
+    whose box index is in `keep` (a face with a likeness to draw) whatever
+    its size."""
+    return [c for _, c in indexed_crops(width, height, boxes, pad, keep)]
 
 
-def face_graph(wf, values, loras, image, crops, oval, prefix):
+def indexed_crops(width, height, boxes, pad=FACE_PAD, keep=()):
+    """face_crops as [(box index, square)]."""
+    out = []
+    for i, b in enumerate(boxes):
+        c = head_square(b, width, height, pad)
+        if c["width"] < FACE_EDIT or i in keep:
+            out.append((i, c))
+    return out
+
+
+# A scene says where each person's face is (studio_scene.face_targets); the
+# finder's boxes are matched to them nearest first, a box taken by one person
+# only, and only within FACE_MATCH of the face's size (or FACE_MATCH_FRAME of
+# the frame, for a face the finder saw small): the model may place a head a
+# little off the mannequin's, but a face across the frame is someone else's.
+FACE_MATCH = 3.0
+FACE_MATCH_FRAME = 0.06
+
+
+def match_faces(width, height, boxes, people):
+    """-> {box index: person} for the people (dicts with "at", as fractions
+    of the frame) whose face the finder found."""
+    pairs = []
+    for i, (x, y, w, h) in enumerate(boxes):
+        cx, cy = x + w / 2.0, y + h / 2.0
+        reach = max(FACE_MATCH * max(w, h), FACE_MATCH_FRAME * max(width, height))
+        for j, person in enumerate(people):
+            px, py = person["at"][0] * width, person["at"][1] * height
+            d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+            if d <= reach:
+                pairs.append((d, i, j))
+    out, used = {}, set()
+    for d, i, j in sorted(pairs):
+        if i not in out and j not in used:
+            out[i] = people[j]
+            used.add(j)
+    return out
+
+
+# A face given a picture is redrawn with PuLID (lldacing's ComfyUI_PuLID_Flux_ll)
+# on the redraw's model: InsightFace reads the picture's face and FLUX draws
+# that face in the pose and light the crop already has. It needs the redraw to
+# go deep (studio_scene.FACE_LIKENESS: at 0.45 the face barely moved, at 0.8-0.9
+# it was the person, measured 2026-09-25) and only FLUX.1 takes it. The picture
+# should show that one face: PuLID takes the biggest face in it.
+PULID_NODES = {"PulidFluxModelLoader", "PulidFluxEvaClipLoader",
+               "PulidFluxInsightFaceLoader", "ApplyPulidFlux"}
+PULID_WEIGHT = 1.0
+PULID_FAMILIES = {"flux1"}
+# The same faces go into the picture itself, each confined to its person's
+# head (`region`, a mask PuLID scales to the latent): the picture is then
+# drawn with their heads, hair and skin, and the face pass only refines. A
+# face drawn into a stranger's head at the end came out a sticker - a smooth
+# pale face on a tan neck, a halo where the stranger's hair had been.
+PULID_BASE_WEIGHT = 1.0
+REGION_EDGE = 64                # px on a region mask's long edge
+
+
+def region_png(region, width, height):
+    """PNG bytes: white over `region` ([x0, y0, x1, y1] fractions) on black,
+    at the frame's shape, REGION_EDGE px on its long edge."""
+    import studio_icons
+    k = REGION_EDGE / float(max(width, height))
+    w, h = max(1, int(round(width * k))), max(1, int(round(height * k)))
+    x0, y0 = int(region[0] * w), int(region[1] * h)
+    x1, y1 = int(round(region[2] * w)), int(round(region[3] * h))
+    px = bytearray(w * h * 4)
+    for y in range(h):
+        for x in range(w):
+            v = 255 if x0 <= x < x1 and y0 <= y < y1 else 0
+            px[(y * w + x) * 4:(y * w + x) * 4 + 4] = bytes((v, v, v, 255))
+    return studio_icons.png(bytes(px), w, h)
+
+
+def add_pulid(graph, pulid_file, faces, weight=PULID_BASE_WEIGHT):
+    """Into a filled graph: one ApplyPulidFlux per (face picture, region
+    mask) - LoadImage names - chained on the model its samplers share, each
+    confined to its mask. Every KSampler on that model takes the chain."""
+    samplers = [n for n in graph.values() if n["class_type"] == "KSampler"]
+    if not samplers or not faces:
+        return graph
+    base = samplers[0]["inputs"]["model"]
+    graph["pb1"] = {"class_type": "PulidFluxModelLoader", "inputs": {"pulid_file": pulid_file}}
+    graph["pb2"] = {"class_type": "PulidFluxEvaClipLoader", "inputs": {}}
+    graph["pb3"] = {"class_type": "PulidFluxInsightFaceLoader", "inputs": {"provider": "CUDA"}}
+    last = base
+    for i, (face, mask) in enumerate(faces, 1):
+        n = "pb_%d" % i
+        graph[n + "f"] = {"class_type": "LoadImage", "inputs": {"image": face}}
+        graph[n + "m"] = {"class_type": "LoadImage", "inputs": {"image": mask}}
+        graph[n + "k"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "m", 0],
+                                                                  "channel": "red"}}
+        graph[n] = {"class_type": "ApplyPulidFlux", "inputs": {
+            "model": last, "pulid_flux": ["pb1", 0], "eva_clip": ["pb2", 0],
+            "face_analysis": ["pb3", 0], "image": [n + "f", 0], "weight": weight,
+            "start_at": 0.0, "end_at": 1.0, "attn_mask": [n + "k", 0]}}
+        last = [n, 0]
+    for node in samplers:
+        if node["inputs"]["model"] == base:
+            node["inputs"]["model"] = last
+    return graph
+
+
+def _restated(g, links, prompt, text, tag):
+    """The positive and negative links of `links` with every node between
+    them and the CLIPTextEncode saying `prompt` copied (ids + `tag`) to say
+    `text` instead: one face's own conditioning beside the shared one."""
+    memo = {}
+
+    def says(nid):
+        if nid not in memo:
+            n = g[nid]
+            memo[nid] = ((n["class_type"] == "CLIPTextEncode" and n["inputs"].get("text") == prompt)
+                         or any(says(x[0]) for x in n["inputs"].values() if _is_link(x)))
+        return memo[nid]
+
+    def copy_of(nid):
+        if not says(nid):
+            return nid
+        new = nid + tag
+        if new not in g:
+            n = g[nid]
+            inputs = {k: [copy_of(x[0]), x[1]] if _is_link(x) else x
+                      for k, x in n["inputs"].items()}
+            if n["class_type"] == "CLIPTextEncode" and inputs.get("text") == prompt:
+                inputs["text"] = text
+            g[new] = {"class_type": n["class_type"], "inputs": inputs}
+        return new
+    return ([copy_of(links["positive"][0]), links["positive"][1]],
+            [copy_of(links["negative"][0]), links["negative"][1]])
+
+
+def paste_graph(image, faces, seed, prefix):
+    """The third run, after the face pass: `image` (a LoadImage name) with
+    each person's own face put over theirs by PASTE_NODE where one of their
+    photos (`faces`: [{"name", "box": [x, y, w, h], "references": [LoadImage
+    names]}]) is turned close enough to the drawn head. No redraw after."""
+    return {"pi": {"class_type": "LoadImage", "inputs": {"image": image}},
+            "pp": {"class_type": PASTE_NODE, "inputs": {
+                "image": ["pi", 0], "faces": json.dumps(faces), "seed": int(seed) % 2 ** 32}},
+            "ps": {"class_type": "SaveImage", "inputs": {"images": ["pp", 0],
+                                                         "filename_prefix": prefix}}}
+
+
+def paste_report(entry):
+    """PASTE_NODE's report from a finished run: [{"name", "pasted", ...}] or []."""
+    text = ((entry.get("outputs") or {}).get("pp") or {}).get("text") or []
+    try:
+        report = json.loads(text[0])
+    except (IndexError, TypeError, ValueError):
+        return []
+    return report if isinstance(report, list) else []
+
+
+def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_file=None,
+               boxes=None):
     """The second run: `image` (a LoadImage name) with each crop redrawn and
     blended back through `oval`, saved under `prefix`. The model, VAE and
     conditioning come from the template's `face_detail` section, filled like
     the rest (so the LoRA chain is the job's), keeping only the nodes they
-    need."""
+    need.
+
+    `faces`, beside `crops`, says who each is (None for no one known):
+    {"words": the person's own words for FACE_PROMPT, "image": a LoadImage
+    name of their face picture or None, "denoise": this face's}. A face with
+    an image is drawn to it through PuLID (`pulid_file`). `boxes`, beside
+    `crops`, are the faces the finder found (x, y, w, h): each is blended
+    back whole, whatever SAM3 makes of the head around it."""
     fd = wf["face_detail"]
     values = dict(wf.get("defaults") or {}, **{k: x for k, x in values.items() if x is not None})
     extra = dict(fd.get("nodes") or {})
@@ -1257,28 +1427,114 @@ def face_graph(wf, values, loras, image, crops, oval, prefix):
     g = {k: g[k] for k in keep}
     g["fi"] = {"class_type": "LoadImage", "inputs": {"image": image}}
     g["fo"] = {"class_type": "LoadImage", "inputs": {"image": oval}}
+    faces = list(faces or []) + [None] * (len(crops) - len(faces or []))
+    # What is blended back is the head - the redrawn one and the one it
+    # replaces, so no old hair is left around the new - found by SAM3 and
+    # kept inside the oval (a neighbour's head in the crop is not). The oval
+    # alone put a disc of redrawn background round every face (2026-09-25).
+    if values.get("sam3"):
+        g["fh1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": values["sam3"]}}
+        g["fh2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "head",
+                                                               "clip": ["fh1", 1]}}
+        g["fh3"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["fo", 0], "upscale_method": "bilinear", "width": FACE_EDIT,
+            "height": FACE_EDIT, "crop": "disabled"}}
+        g["fh4"] = {"class_type": "ImageToMask", "inputs": {"image": ["fh3", 0],
+                                                            "channel": "red"}}
+    if any(f and f.get("image") for f in faces):
+        g["pl1"] = {"class_type": "PulidFluxModelLoader", "inputs": {"pulid_file": pulid_file}}
+        g["pl2"] = {"class_type": "PulidFluxEvaClipLoader", "inputs": {}}
+        g["pl3"] = {"class_type": "PulidFluxInsightFaceLoader", "inputs": {"provider": "CUDA"}}
     seed, last = int(values["seed"]), ["fi", 0]
     for i, crop in enumerate(crops):
         n, side = "fc%d_" % (i + 1), crop["width"]
+        face = faces[i] or {}
+        model, positive, negative = links["model"], links["positive"], links["negative"]
+        if face.get("words") and values.get("face_prompt"):
+            positive, negative = _restated(g, links, values["face_prompt"],
+                                           FACE_PROMPT % face["words"], "_" + n[:-1])
+        if face.get("image"):
+            g[n + "r"] = {"class_type": "LoadImage", "inputs": {"image": face["image"]}}
+            g[n + "p"] = {"class_type": "ApplyPulidFlux", "inputs": {
+                "model": model, "pulid_flux": ["pl1", 0], "eva_clip": ["pl2", 0],
+                "face_analysis": ["pl3", 0], "image": [n + "r", 0], "weight": PULID_WEIGHT,
+                "start_at": 0.0, "end_at": 1.0}}
+            model = [n + "p", 0]
         g[n + "1"] = {"class_type": "ImageCropV2", "inputs": {"image": last, "crop_region": crop}}
         g[n + "2"] = {"class_type": "ImageScale", "inputs": {
             "image": [n + "1", 0], "upscale_method": "lanczos", "width": FACE_EDIT,
             "height": FACE_EDIT, "crop": "disabled"}}
         g[n + "3"] = {"class_type": "VAEEncode", "inputs": {"pixels": [n + "2", 0],
                                                             "vae": links["vae"]}}
+        # Only the oval is redrawn: the crop around it is held as it is, so a
+        # deep redraw (a likeness) cannot change the background it is blended
+        # back onto - at 0.85 an unmasked crop came back as a visible disc.
+        # The redrawn region is the oval's whole reach, hard-edged (a soft
+        # noise mask left a pale ring half-redrawn); the soft oval blends it
+        # back, fading out before that edge.
+        g[n + "3m"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["fo", 0], "upscale_method": "bilinear", "width": FACE_EDIT,
+            "height": FACE_EDIT, "crop": "disabled"}}
+        g[n + "3k"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "3m", 0],
+                                                               "channel": "red"}}
+        g[n + "3h"] = {"class_type": "ThresholdMask", "inputs": {"mask": [n + "3k", 0],
+                                                                "value": FACE_REDRAWN}}
+        g[n + "3n"] = {"class_type": "SetLatentNoiseMask", "inputs": {
+            "samples": [n + "3", 0], "mask": [n + "3h", 0]}}
         g[n + "4"] = {"class_type": "KSampler", "inputs": {
             "seed": (seed + i + 1) % (MAX_SEED + 1), "steps": values["steps"], "cfg": 1.0,
             "sampler_name": values["sampler"], "scheduler": values["scheduler"],
-            "denoise": values["face_denoise"], "model": links["model"],
-            "positive": links["positive"], "negative": links["negative"],
-            "latent_image": [n + "3", 0]}}
+            "denoise": face.get("denoise") or values["face_denoise"], "model": model,
+            "positive": positive, "negative": negative,
+            "latent_image": [n + "3n", 0]}}
         g[n + "5"] = {"class_type": "VAEDecode", "inputs": {"samples": [n + "4", 0],
                                                             "vae": links["vae"]}}
         g[n + "6"] = {"class_type": "ImageScale", "inputs": {
             "image": [n + "5", 0], "upscale_method": "lanczos", "width": side,
             "height": side, "crop": "disabled"}}
+        blend = ["fo", 0]
+        if values.get("sam3"):
+            for k, src in (("h1", [n + "5", 0]), ("h2", [n + "2", 0])):
+                g[n + k] = {"class_type": "SAM3_Detect", "inputs": {
+                    "model": ["fh1", 0], "image": src, "conditioning": ["fh2", 0],
+                    "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+            g[n + "h3"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": [n + "h1", 0], "source": [n + "h2", 0], "x": 0, "y": 0,
+                "operation": "or"}}
+            if boxes and i < len(boxes) and boxes[i]:
+                # SAM3's "head" can come back as the hair alone, or holed
+                # over the face (2026-09-25): the face's own box always is.
+                k = FACE_EDIT / float(side)
+                bx, by, bw, bh = boxes[i]
+                gx, gy = bw * FACE_BOX_GROW / 2, bh * FACE_BOX_GROW / 2
+                x0 = max(0, int((bx - gx - crop["x"]) * k))
+                y0 = max(0, int((by - gy - crop["y"]) * k))
+                x1 = min(FACE_EDIT, int((bx + bw + gx - crop["x"]) * k))
+                y1 = min(FACE_EDIT, int((by + bh - crop["y"]) * k))   # not below the chin
+                if x1 > x0 and y1 > y0:
+                    g[n + "b0"] = {"class_type": "SolidMask", "inputs": {
+                        "value": 0.0, "width": FACE_EDIT, "height": FACE_EDIT}}
+                    g[n + "b1"] = {"class_type": "SolidMask", "inputs": {
+                        "value": 1.0, "width": x1 - x0, "height": y1 - y0}}
+                    g[n + "b2"] = {"class_type": "MaskComposite", "inputs": {
+                        "destination": [n + "b0", 0], "source": [n + "b1", 0], "x": x0,
+                        "y": y0, "operation": "or"}}
+                    g[n + "b3"] = {"class_type": "MaskComposite", "inputs": {
+                        "destination": [n + "h3", 0], "source": [n + "b2", 0], "x": 0,
+                        "y": 0, "operation": "or"}}
+            g[n + "h4"] = {"class_type": "GrowMask", "inputs": {
+                "mask": [n + ("b3" if n + "b3" in g else "h3"), 0], "expand": FACE_HEAD_GROW,
+                "tapered_corners": True}}
+            g[n + "h5"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": [n + "h4", 0], "source": ["fh4", 0], "x": 0, "y": 0,
+                "operation": "multiply"}}
+            g[n + "h6"] = {"class_type": "MaskToImage", "inputs": {"mask": [n + "h5", 0]}}
+            g[n + "h7"] = {"class_type": "ImageBlur", "inputs": {
+                "image": [n + "h6", 0], "blur_radius": FACE_HEAD_SOFT[0],
+                "sigma": FACE_HEAD_SOFT[1]}}
+            blend = [n + "h7", 0]
         g[n + "7"] = {"class_type": "ImageScale", "inputs": {
-            "image": ["fo", 0], "upscale_method": "bilinear", "width": side,
+            "image": blend, "upscale_method": "bilinear", "width": side,
             "height": side, "crop": "disabled"}}
         g[n + "8"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "7", 0],
                                                               "channel": "red"}}
@@ -2630,6 +2886,8 @@ class Job:
         self.record = None            # the history record, once complete
         self.graph = None             # the graph as submitted
         self.face_graph = None        # the face pass's graph, when it ran
+        self.paste_graph = None       # the real-face paste's graph, when it ran
+        self.real_faces = None        # [{"name", "box", "photos"}] for the paste, from the face pass
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
         self.dress = None             # {"outfit", "passes", "head_crop", ...} when dressed
         self.notes = []               # things said on the way (no live progress, ...)
@@ -3198,6 +3456,9 @@ class Studio:
             types = set(client.node_types())
         except ComfyError:
             types = None
+        if not self._faces_into_picture(job, client, plan, graph, types,
+                                        values.get("width"), values.get("height")):
+            return self.queue._finish(job, "cancelled")
         lacking = missing_nodes(graph, types) if types is not None else []
         if values.get("face_detail"):
             if not values.get("sam3"):
@@ -3256,6 +3517,8 @@ class Studio:
             files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
             if graph2 is not None:
                 job.face_graph = graph2
+                if job.real_faces and not job.cancel.is_set():
+                    files = self._real_faces(job, client, plan, values, files, say)
         if job.cancel.is_set():
             return self.queue._finish(job, "cancelled")
         say("decoding", "fetching the picture from %s" % b["name"], None)
@@ -3537,9 +3800,48 @@ class Studio:
             plan.warnings.append("The face finder said nothing; the picture is as made.")
             return files, None
         width, height, boxes = found
-        crops = face_crops(width, height, boxes)
+        scene = job.settings.get("scene_faces") or {}
+        known = match_faces(width, height, boxes, scene.get("people") or [])
+        # A person's own words stand for the whole prompt in their face's
+        # redraw, so the style goes with them: without it an SX-70 picture
+        # got smooth, grainless faces.
+        style = (self.lib.get("styles", job.settings.get("style"))
+                 if job.settings.get("style") else None)
+        style = " ".join(x for x in (style["trigger"], style["prompt"]) if x) if style else ""
+        for person in scene.get("people") or []:
+            if person not in known.values():
+                plan.notes.append("Face pass: %s's face was not found where the scene puts it%s."
+                                  % (person["name"], ", so their face picture was not used"
+                                     if person.get("face") else ""))
+        pulid, why = self._pulid(client, plan, types=None) if any(
+            p.get("face") for p in known.values()) else (None, "")
+        if why:
+            plan.warnings.append(why)
+        likeness = {i for i, p in known.items() if p.get("face") and pulid}
+        pairs = indexed_crops(width, height, boxes, keep=likeness)
+        crops = [c for _, c in pairs]
+        faces = []
+        try:
+            for i, _ in pairs:
+                person = known.get(i)
+                if person is None:
+                    faces.append(None)
+                    continue
+                image = client.upload_image(person["face"]) if i in likeness else None
+                words = " ".join(x for x in (person.get("words"), style) if x)
+                faces.append({"words": words, "image": image,
+                              "denoise": scene.get("likeness") if image else None,
+                              "name": person["name"]})
+        except (ComfyError, OSError) as e:
+            plan.warnings.append("A face picture could not be sent (%s); the faces are "
+                                 "redrawn from the words alone." % e)
+            faces = [dict(f, image=None, denoise=None) if f else None for f in faces]
+            faces += [None] * (len(crops) - len(faces))
         job.face = {"found": len(boxes), "redrawn": len(crops),
-                    "denoise": values.get("face_denoise")}
+                    "denoise": values.get("face_denoise"),
+                    "people": [f["name"] for f in faces if f],
+                    "likeness": [f["name"] for f in faces if f and f.get("image")],
+                    "likeness_denoise": scene.get("likeness")}
         if not crops:
             plan.notes.append("Face pass: %s" % ("no face found" if not boxes else
                                                  "every face was already drawn at full size"))
@@ -3554,7 +3856,9 @@ class Studio:
                 with open(oval, "wb") as fh:
                     fh.write(oval_png())
             graph = face_graph(plan.workflow, values, plan.loras, image, crops,
-                               client.upload_image(oval), values["filename_prefix"] + "_faces")
+                               client.upload_image(oval), values["filename_prefix"] + "_faces",
+                               faces=faces, pulid_file=pulid,
+                               boxes=[boxes[i] for i, _ in pairs])
             say("refining", "redrawing %d face%s at %d px" % (
                 len(crops), "" if len(crops) == 1 else "s", FACE_EDIT), None)
             pid = client.queue_workflow(graph)
@@ -3590,7 +3894,134 @@ class Studio:
             return files, None
         plan.notes.append("Face pass: %d face%s redrawn at %d px, denoise %s" % (
             n, "" if n == 1 else "s", FACE_EDIT, values.get("face_denoise")))
+        drawn = [f for f in faces if f and f.get("image")]
+        if drawn:
+            plan.notes.append("Likeness: %s drawn from their face picture%s at %s." % (
+                ", ".join(f["name"] for f in drawn), "" if len(drawn) == 1 else "s",
+                scene.get("likeness")))
+        if scene.get("real"):
+            job.real_faces = [{"name": p["name"], "box": list(boxes[i]),
+                               "photos": p.get("photos") or ([p["face"]] if p.get("face") else [])}
+                              for i, p in sorted(known.items())
+                              if p.get("photos") or p.get("face")]
         return files2, graph
+
+    def _real_faces(self, job, client, plan, values, files, say):
+        """After the face pass, each person's own face over theirs where a
+        photo of them fits the drawn head's angle (PASTE_NODE decides, face
+        by face, and says why not). -> the files to keep: the pasted picture
+        first and the face pass's beside it, or the face pass's alone when
+        nothing was pasted or the paste could not run."""
+        b = job.backend
+        try:
+            if PASTE_NODE not in set(client.node_types()):
+                plan.notes.append(
+                    "Real faces: %s has no %s node, so the faces are PuLID's. Copy "
+                    "comfy_nodes/studio_facepaste into its custom_nodes and restart ComfyUI."
+                    % (b["name"], PASTE_NODE))
+                return files
+            local, faces = {}, []
+            for p in job.real_faces:
+                names = []
+                for path in p["photos"]:
+                    names.append(client.upload_image(path))
+                    local[names[-1]] = path
+                faces.append({"name": p["name"], "box": p["box"], "references": names})
+            f = files[0]
+            image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                    f["filename"], f.get("type") or "output")
+            graph = paste_graph(image, faces, values["seed"],
+                                values["filename_prefix"] + "_real")
+            say("refining", "matching each face to its photos", None)
+            pid = client.queue_workflow(graph)
+            entry = client.listen_for_progress(pid, lambda *a: None, stop=job.cancel.is_set)
+        except (ComfyError, OSError) as e:
+            plan.warnings.append("The real faces could not be pasted (%s); the faces are "
+                                 "PuLID's." % e)
+            return files
+        if entry is None:
+            return files                      # cancelled; run_job says so
+        report, out = paste_report(entry), outputs_of(entry)
+        for r in report:
+            if r.get("reference") in local:
+                r["reference"] = local[r["reference"]]
+        job.face = dict(job.face or {}, real=report)
+        for r in report:
+            if r.get("pasted"):
+                plan.notes.append("Real face: %s from %s (%s degrees off, %s allowed)." % (
+                    r["name"], os.path.basename(r.get("reference") or "their photo"),
+                    r.get("difference"), r.get("tolerance")))
+            else:
+                plan.notes.append("Real face: %s kept as PuLID drew it - %s." % (
+                    r.get("name"), r.get("why") or "no reason given"))
+        if not out:
+            errors = run_errors(entry, graph)
+            plan.warnings.append("The real-face paste failed (%s); the faces are PuLID's."
+                                 % ("; ".join(errors) or "no picture"))
+            return files
+        if not any(r.get("pasted") for r in report):
+            return files
+        job.paste_graph = graph
+        return out + files
+
+    def _faces_into_picture(self, job, client, plan, graph, types, w, h):
+        """A scene's face pictures into the picture itself (`add_pulid`),
+        each over its person's head. Said, never fatal: without PuLID the
+        faces are still drawn to their pictures by the face pass, or from
+        the words. -> False only when cancelled."""
+        people = [p for p in (job.settings.get("scene_faces") or {}).get("people") or []
+                  if p.get("face") and p.get("region")]
+        if not people:
+            return True
+        pulid, why = self._pulid(client, plan, types)
+        if not pulid:
+            return True                   # the face pass says why, once
+        if not w or not h:
+            return True
+        faces = []
+        try:
+            folder = os.path.join(self.lib.root, "face_regions")
+            os.makedirs(folder, exist_ok=True)
+            for person in people:
+                if job.cancel.is_set():
+                    return False
+                data = region_png(person["region"], w, h)
+                path = os.path.join(folder, hashlib.sha1(data).hexdigest()[:16] + ".png")
+                if not os.path.isfile(path):
+                    with open(path, "wb") as f:
+                        f.write(data)
+                faces.append((client.upload_image(person["face"]), client.upload_image(path)))
+        except (ComfyError, OSError) as e:
+            plan.warnings.append("The face pictures could not be sent (%s); the picture is "
+                                 "drawn without them." % e)
+            return True
+        add_pulid(graph, pulid, faces)
+        plan.notes.append("%s drawn from their face picture%s in the picture itself." % (
+            ", ".join(p["name"] for p in people), "" if len(people) == 1 else "s"))
+        return True
+
+    def _pulid(self, client, plan, types=None):
+        """-> (PuLID weights file, '') when the job's backend can draw a face
+        to a picture, else (None, why not)."""
+        wf = plan.workflow
+        if not set(wf.get("families") or ()) & PULID_FAMILIES:
+            return None, ("The %s workflow cannot draw a face to its picture (only FLUX.1 "
+                          "can, through PuLID); the faces are redrawn from the words."
+                          % wf.get("label", "chosen"))
+        try:
+            types = types or set(client.node_types())
+            if PULID_NODES - types:
+                return None, ("%s's ComfyUI lacks PuLID (%s), which draws a face to its "
+                              "picture; the faces are redrawn from the words." % (
+                                  client.backend["name"], ", ".join(sorted(PULID_NODES - types))))
+            info = client.get_json("/object_info/PulidFluxModelLoader")
+            files = info["PulidFluxModelLoader"]["input"]["required"]["pulid_file"][0]
+        except (ComfyError, KeyError, IndexError, TypeError) as e:
+            return None, "PuLID could not be asked about (%s); the faces are redrawn from the words." % e
+        if not files:
+            return None, ("%s has no PuLID weights (models/pulid); the faces are redrawn from "
+                          "the words." % client.backend["name"])
+        return files[0], ""
 
     def _progress(self, job, graph, say):
         """The on_event for one job: ComfyUI's events as Queued -> Loading ->
@@ -3695,6 +4126,7 @@ class Studio:
             "settings": s,
             "graph": graph,
             "face_graph": job.face_graph,
+            "paste_graph": job.paste_graph,
             "dress": job.dress,
         }
 
