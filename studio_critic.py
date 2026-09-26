@@ -362,6 +362,51 @@ def merge_canonical(canonical_state, promotions):
     return state, changed
 
 
+# ================================================================ the memory
+# What the critic promoted outlives the job: a person's kept details go with
+# that identity, a scene's with its words, and every later picture of either
+# is drawn with them, so the next picture starts where this one ended rather
+# than inventing afresh. {"identities": {id: {key: value}}, "scenes": {scene
+# key: {key: value}}}. The caller reads and writes the file.
+
+def remember(memory, canonical_state, changed, identity_ids=(), scene=""):
+    """A copy of `memory` with the promoted paths in `changed` filed. A
+    person's detail is filed only when the picture had one identity:
+    with two, character_a is not one of them."""
+    memory = copy.deepcopy(memory or {})
+    ids = list(identity_ids)
+    for path in changed:
+        parts = path.split(".")
+        if parts[0] == "characters":
+            if len(ids) != 1 or parts[1] != "character_a":
+                continue
+            value = (canonical_state["characters"].get("character_a") or {}).get(parts[2])
+            bucket = memory.setdefault("identities", {}).setdefault(ids[0], {})
+        else:
+            skey = _key(scene)
+            if not skey:
+                continue
+            value = (canonical_state.get(parts[0]) or {}).get(parts[1])
+            bucket = memory.setdefault("scenes", {}).setdefault(skey, {})
+        if value:
+            bucket[parts[-1]] = value
+    return memory
+
+
+def recall(memory, identity_ids=(), scene="", set_keys=()):
+    """The remembered details for a picture of these people in this scene,
+    leaving out any key the form sets this time. -> [(key, value)]."""
+    memory = memory or {}
+    skip = {_key(k) for k in set_keys}
+    out = []
+    ids = list(identity_ids)
+    if len(ids) == 1:
+        out += sorted((memory.get("identities") or {}).get(ids[0], {}).items())
+    if _key(scene):
+        out += sorted((memory.get("scenes") or {}).get(_key(scene), {}).items())
+    return [(k, v) for k, v in out if k not in skip and v]
+
+
 # ======================================================== the prompt compiler
 
 def build_refinement_instructions(original_intent, canonical_state, preserve, corrections):

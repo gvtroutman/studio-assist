@@ -755,7 +755,14 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
 - **Good inventions are promoted, once.** A NEW_USEFUL_DETAIL at 0.75 or
   more, on a key the user did not set and not also called a mismatch, is set
   at its key (`merge_canonical`; "Hair colour" and "hair_color" are one key)
-  and goes into the next prompt.
+  and goes into the next prompt. **And into every later picture:** each
+  promotion is filed in `image-studio/critic_memory.json` (`remember`) -
+  a person's detail under the identity's id (only when the picture had
+  exactly one identity), a scene's under its words (`_key`'d). `compose`
+  appends what `recall` finds for this job's person and scene to every
+  prompt, auto-refine on or off, skipping any key the form sets, and
+  `_refine` seeds the canonical state with it (unlocked) so the critic
+  checks those details instead of inventing new ones.
 - **Two outputs from one compiler.** `build_refinement_instructions` writes
   the sectioned text (ORIGINAL USER INTENT, CANONICAL ..., PRESERVE,
   CORRECT) to the log; `generator_prompt` is the prose FLUX reads, with a
