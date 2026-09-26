@@ -11,9 +11,9 @@ FLUX ControlNet - and the grey frame itself as a `source` (image to image)
 only when asked, or for a model with no ControlNet. The words written on
 each object go into the prompt as written. The pieces:
 
-- **The rig** (`JOINTS`): a humanoid of fifteen joints - a lofted torso
-  and limbs (`loft`), a face (brows, eyes, nose, lips, chin, ears) and
-  fingers - posed by forward
+- **The rig** (`JOINTS`): a figure of fifteen joints - a lofted torso
+  in blocks and limbs (`loft`), an egg of a head, ball joints, mitten
+  hands - an artist's wooden mannequin, posed by forward
   kinematics from a handful of named controls (`CONTROLS`) - head, torso, and
   each hand and foot - and `POSES`, presets of those controls. Everything
   stands on its floor: an object's lowest point is put at its `position` y
@@ -886,10 +886,6 @@ def _scalp(at, th, rings=4, n=14):
     return outward(faces)
 
 
-EYE_WHITE = (232, 228, 220)
-EYE_DARK = (52, 40, 34)
-
-
 def _jaw(p):
     """The skull's ellipsoid made a head: narrower at the jaw and the chin,
     the back of the neck in under the skull, the face a little flatter."""
@@ -942,60 +938,37 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     toe_drop = HEEL if shoes and shoes[0] == "heels" else 0.0     # up on its toes
     # (part, region, faces); a region is what clothes cover, or the rgb of a
     # piece that is only clothes (a hem, a boot shaft).
-    # The torso is lofted, not stacked: each ring's width and depth follow a
-    # body - the seat behind the hips, the waist in, the chest out in front
-    # and the shoulders' slope - and each piece starts where the one under it
-    # ends, so it reads as one body. Up a bone the `deep` side is the back.
+    # The artist's wooden mannequin: a chest block, an abdomen and a pelvis,
+    # each lofted round and drawn in at its ends so the joins between them
+    # read as joins; a smooth egg of a head with a jaw and no face. Up a
+    # bone the `deep` side is the back.
     wide = shape["shoulders"]
     lf = lambda rows, ka, kd: [(t, (ra * ka, rb * kd), sh * kd)     # noqa: E731
                                for t, ra, rb, sh in rows]
     out = [
-        ("body", "hips", loft(at("pelvis", (0, -0.09, 0)), P("spine"), X("pelvis"), lf(
-            [(0, 0.15, 0.09, 0.0), (0.2, 0.162, 0.105, 0.01), (0.55, 0.165, 0.108, 0.008),
-             (1, 0.15, 0.10, 0.0)], hips * curve, hips), 16)),
-        ("body", "belly", loft(P("spine"), P("chest"), X("spine"), [
-            (0, (0.15 * belly, 0.10 * belly), 0.0),
-            (0.45, (0.138 * belly, 0.094 * belly * shape["belly"]),
+        ("body", "hips", loft(at("pelvis", (0, -0.1, 0)), at("spine", (0, 0.01, 0)),
+                              X("pelvis"), lf(
+            [(0, 0.09, 0.065, 0.0), (0.15, 0.14, 0.092, 0.004), (0.55, 0.162, 0.104, 0.008),
+             (0.88, 0.155, 0.1, 0.004), (1, 0.13, 0.085, 0.0)], hips * curve, hips), 16)),
+        ("body", "belly", loft(at("spine", (0, 0.015, 0)), at("chest", (0, 0.0, 0)),
+                               X("spine"), [
+            (0, (0.12 * belly, 0.082 * belly), 0.0),
+            (0.2, (0.14 * belly, 0.094 * belly), 0.0),
+            (0.55, (0.142 * belly, 0.096 * belly * shape["belly"]),
              -0.006 * shape["belly"] - 0.04 * fat),
-            (1, (0.155 * chest, 0.10 * chest), -0.004)], 16)),
-        ("body", "chest", loft(P("chest"), at("chest", (0, 0.22, 0)), X("chest"), [
-            (0, (0.155 * chest, 0.10 * chest), -0.004),
-            (0.35, (0.168 * chest * wide ** 0.5, 0.11 * chest), -0.018),
-            (0.7, (0.18 * chest * wide, 0.105 * chest), -0.012),
-            (0.88, (0.165 * chest * wide, 0.085 * chest), 0.006),
-            (1, (0.085 * neck, 0.06 * neck), 0.01)], 16)),
-        ("head", "neck", loft(at("neck", (0, -0.03, 0)), at("head", (0, 0.05, 0)), X("neck"), [
-            (0, r((0.058, 0.052), neck), 0.004), (0.5, r((0.047, 0.047), neck), 0.004),
-            (1, r((0.045, 0.045), neck), 0.0)], 10)),
+            (1, (0.13 * belly, 0.088 * belly), 0.0)], 16)),
+        ("body", "chest", loft(at("chest", (0, 0.005, 0)), at("chest", (0, 0.23, 0)),
+                               X("chest"), [
+            (0, (0.125 * chest, 0.085 * chest), 0.0),
+            (0.12, (0.155 * chest, 0.1 * chest), -0.004),
+            (0.45, (0.172 * chest * wide ** 0.5, 0.112 * chest), -0.014),
+            (0.78, (0.185 * chest * wide, 0.102 * chest), -0.006),
+            (0.94, (0.16 * chest * wide, 0.078 * chest), 0.004),
+            (1, (0.08 * neck, 0.055 * neck), 0.006)], 16)),
+        ("head", "neck", loft(at("neck", (0, -0.02, 0)), at("head", (0, 0.04, 0)), X("neck"), [
+            (0, r((0.056, 0.054), neck), 0.0), (0.5, r((0.052, 0.05), neck), 0.0),
+            (1, r((0.05, 0.048), neck), 0.0)], 12)),
         ("head", "head", skull),
-    ]
-    # Trapezius: the slope from the neck down to each shoulder.
-    for sx in (1, -1):
-        out.append(("body", "chest", loft(
-            at("chest", (0, 0.2, 0.005)), at("chest", (sx * 0.16 * wide, 0.17, 0.0)),
-            (0, 1, 0), [(0, r((0.045, 0.05), chest), 0.0), (1, r((0.03, 0.04), chest), 0.0)],
-            8)))
-    # A face, so a head reads as a person's from any side and at any size in
-    # the frame: brows, eyes, the nose's bridge and tip, lips, a chin, ears.
-    hd = lambda c, radii, seg=8, rings=5: ellipsoid(at("head", c), M("head"),   # noqa: E731
-                                                     radii, seg, rings)
-    for sx in (1, -1):
-        out += [("head", "head", hd((sx * 0.033, 0.138, 0.095), (0.026, 0.008, 0.014))),
-                ("head", EYE_WHITE, hd((sx * 0.031, 0.118, 0.093), (0.014, 0.009, 0.01), 8, 4)),
-                ("head", EYE_DARK, hd((sx * 0.031, 0.118, 0.102), (0.006, 0.006, 0.003), 6, 3)),
-                ("head", "head", hd((sx * 0.05, 0.088, 0.074), (0.02, 0.015, 0.013))),
-                ("head", "head", loft(at("head", (sx * 0.08, 0.135, 0.005)),
-                                      at("head", (sx * 0.085, 0.07, -0.002)), X("head"),
-                                      [(0, (0.008, 0.016), 0.0), (0.4, (0.014, 0.022), 0.0),
-                                       (1, (0.008, 0.012), 0.0)], 8))]
-    out += [
-        ("head", "head", loft(at("head", (0, 0.128, 0.1)), at("head", (0, 0.078, 0.126)),
-                              X("head"), [(0, (0.008, 0.007), 0.0), (0.7, (0.012, 0.01), 0.0),
-                                          (1, (0.017, 0.012), 0.0)], 8)),
-        ("head", "head", hd((0, 0.078, 0.12), (0.018, 0.012, 0.013))),
-        ("head", "head", hd((0, 0.047, 0.097), (0.024, 0.006, 0.01), 10, 4)),
-        ("head", "head", hd((0, 0.036, 0.094), (0.021, 0.006, 0.009), 10, 4)),
-        ("head", "head", hd((0, 0.016, 0.07), (0.024, 0.014, 0.014))),
     ]
     head_box = lambda lo, hi: outward([[at("head", p) for p in f]    # noqa: E731
                                        for f in box(lo, hi)])
@@ -1082,23 +1055,25 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             # bone the `deep` side is the front.
             (hand, "upper_arm", loft(P("shoulder_" + side), P("elbow_" + side),
                                      X("shoulder_" + side), [
-                (0, r((0.052, 0.052), upper), 0.0), (0.4, r((0.05, 0.053), upper), 0.004),
-                (0.75, r((0.045, 0.046), upper), 0.002),
+                (0, r((0.056, 0.056), upper), 0.0), (0.4, r((0.057, 0.059), upper), 0.004),
+                (0.75, r((0.05, 0.051), upper), 0.002),
                 (1, r((0.041, 0.041), (upper + fore) / 2), 0.0)])),
             (hand, "forearm", loft(P("elbow_" + side), P("wrist_" + side), X("elbow_" + side), [
-                (0, r((0.041, 0.041), fore), 0.0), (0.25, r((0.045, 0.042), fore), 0.0),
-                (0.7, r((0.036, 0.032), fore), 0.0), (1, r((0.03, 0.022), fore), 0.0)])),
-            (hand, "hand", loft(P("wrist_" + side), at("wrist_" + side, (0, -0.1, 0.004)),
+                (0, r((0.044, 0.044), fore), 0.0), (0.25, r((0.05, 0.047), fore), 0.0),
+                (0.7, r((0.04, 0.036), fore), 0.0), (1, r((0.032, 0.025), fore), 0.0)])),
+            # A mitten of a hand, the fingers as one, curled a little at the end.
+            (hand, "hand", loft(P("wrist_" + side), at("wrist_" + side, (0, -0.19, 0.02)),
                                 X("wrist_" + side), [
-                (0, (0.03, 0.02), 0.0), (0.4, (0.044, 0.02), 0.0),
-                (1, (0.046, 0.016), 0.0)], 8)),
+                (0, (0.028, 0.02), 0.0), (0.3, (0.044, 0.021), 0.0),
+                (0.6, (0.046, 0.017), 0.0), (0.88, (0.04, 0.013), 0.004),
+                (1, (0.022, 0.008), 0.008)], 12)),
             (foot, "thigh", loft(P("hip_" + side), P("knee_" + side), X("hip_" + side), [
-                (0, r((0.08, 0.08), thigh), 0.0), (0.3, r((0.078, 0.08), thigh), 0.004),
+                (0, r((0.084, 0.084), thigh), 0.0), (0.3, r((0.084, 0.086), thigh), 0.004),
                 (0.8, r((0.06, 0.062), (thigh + shin) / 2), 0.004),
                 (1, r((0.055, 0.056), shin), 0.0)])),
             (foot, "shin", loft(P("knee_" + side), shin_end, X("knee_" + side), [
-                (0, r((0.052, 0.052), shin), 0.0), (0.3, r((0.054, 0.058), shin), -0.01),
-                (0.75, r((0.04, 0.042), shin), -0.003), (1, r((0.036, 0.036), shin), 0.0)])),
+                (0, r((0.055, 0.055), shin), 0.0), (0.3, r((0.06, 0.064), shin), -0.01),
+                (0.75, r((0.045, 0.047), shin), -0.003), (1, r((0.036, 0.036), shin), 0.0)])),
             (foot, "foot", loft(at("ankle_" + side, (0, -0.045, -0.055)),
                                 at("ankle_" + side, (0, -0.045 - toe_drop, 0.19 - toe_drop)),
                                 X("ankle_" + side), [
@@ -1110,31 +1085,20 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             # Round joints where the limbs meet, so a bent arm or knee is
             # one limb and not two tubes with a gap between them.
             (hand, "upper_arm", ellipsoid(P("shoulder_" + side), M("shoulder_" + side),
-                                          (0.058 * upper, 0.056 * upper, 0.056 * upper), 8, 5)),
+                                          (0.058 * upper, 0.056 * upper, 0.056 * upper), 12, 8)),
             (hand, "forearm", ellipsoid(P("elbow_" + side), M("elbow_" + side),
-                                        (0.043 * fore,) * 3, 8, 4)),
+                                        (0.043 * fore,) * 3, 12, 8)),
             (hand, "hand", ellipsoid(P("wrist_" + side), M("wrist_" + side),
-                                     (0.034, 0.03, 0.028), 6, 4)),
+                                     (0.032, 0.03, 0.026), 10, 6)),
             (hand, "hand", prism(at("wrist_" + side, (-sign * 0.03, -0.03, 0.012)),
                                  at("wrist_" + side, (-sign * 0.045, -0.08, 0.032)),
                                  X("wrist_" + side), (0.013, 0.012), (0.011, 0.01), 6)),
             (hand, "hand", prism(at("wrist_" + side, (-sign * 0.045, -0.08, 0.032)),
-                                 at("wrist_" + side, (-sign * 0.045, -0.115, 0.045)),
-                                 X("wrist_" + side), (0.011, 0.01), (0.009, 0.009), 6)),
+                                 at("wrist_" + side, (-sign * 0.045, -0.12, 0.04)),
+                                 X("wrist_" + side), (0.011, 0.01), (0.008, 0.008), 6)),
             (foot, "shin", ellipsoid(P("knee_" + side), M("knee_" + side),
-                                     (0.056 * shin, 0.058 * shin, 0.058 * shin), 8, 4)),
+                                     (0.056 * shin, 0.058 * shin, 0.058 * shin), 12, 8)),
         ]
-        # Four fingers from the knuckles, a little curled, longest in the
-        # middle; the little finger on the outside, the thumb within.
-        for i, length in enumerate((0.085, 0.095, 0.09, 0.072)):
-            x = sign * (-0.03 + 0.02 * i)
-            base = at("wrist_" + side, (x, -0.1, 0.004))
-            mid = at("wrist_" + side, (x, -0.1 - 0.55 * length, 0.012))
-            tip = at("wrist_" + side, (x, -0.1 - length, 0.03))
-            out += [(hand, "hand", prism(base, mid, X("wrist_" + side), (0.0095, 0.009),
-                                         (0.0085, 0.008), 6)),
-                    (hand, "hand", prism(mid, tip, X("wrist_" + side), (0.0085, 0.008),
-                                         (0.007, 0.0065), 6))]
         if shoes:
             out += [(foot, rgb, faces) for rgb, faces in _shoe(
                 shoes, lambda v, s=side: at("ankle_" + s, v))]
