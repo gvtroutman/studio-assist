@@ -288,6 +288,8 @@ class TestFill(unittest.TestCase):
                 continue
             vals = {k: "x.safetensors" for k in (wf.get("files") or {})}
             vals.update(prompt="p", seed=1)
+            if wf.get("multi_identity"):
+                vals.update(face1="person.png", identity_boxes="[[0.2,0.1,0.8,0.6]]")
             loras = [("l.safetensors", 0.5)] if wf.get("lora_chain") else []
             for extra in ({}, {"refine": True, "source_image": "s.png"}):
                 g = ig.fill(wf, dict(vals, **extra), loras)
@@ -378,6 +380,47 @@ class TestFill(unittest.TestCase):
 
 
 class TestCompose(TempStudioMixin, unittest.TestCase):
+    def chest_lora(self, kind="chest_female"):
+        lib = self.studio.lib
+        lib.save("loras", lib.all("loras") + [{
+            "id": "chest", "file": "chest.safetensors", "name": "Chest control",
+            "family": "flux1", "body_control": kind, "strength": 2}])
+        return dict(FLUX_FILES, loras=FLUX_FILES["loras"] | {"chest.safetensors"})
+
+    def test_chest_slider_loads_signed_lora_strength_into_graph(self):
+        inv = self.chest_lora()
+        for step, strength in ((-3, -2), (1, 0.667), (3, 2)):
+            p = self.plan(inventory=inv, subject="a woman", chest_size=step)
+            self.assertEqual(p.errors, [])
+            self.assertEqual(p.loras, [("chest.safetensors", strength)])
+            graph = ig.fill(p.workflow, p.values, p.loras)
+            self.assertEqual(graph["lora1"]["inputs"]["strength_model"], strength)
+        self.assertEqual(self.plan(inventory=inv, subject="a woman", chest_size=0).loras, [])
+
+    def test_male_chest_uses_size_words_without_negative_lora_strength(self):
+        inv = self.chest_lora("chest_male")
+        small = self.plan(inventory=inv, subject="a man", chest_size=-3)
+        large = self.plan(inventory=inv, subject="a man", chest_size=3)
+        self.assertEqual(small.loras, large.loras)
+        self.assertIn("Flat Male Chest", small.prompt)
+        self.assertIn("Large Male Chest", large.prompt)
+
+    def test_chest_control_reads_scene_look_and_does_not_change_a_group(self):
+        inv = self.chest_lora()
+        woman = {"asset": "person", "look": {"subject": "a woman", "chest_size": 3}}
+        p = self.plan(inventory=inv, scene="a portrait", scene_layout={"objects": [woman]})
+        self.assertEqual(p.loras, [("chest.safetensors", 2)])
+        p = self.plan(inventory=inv, scene="two people", scene_layout={"objects": [woman, woman]})
+        self.assertEqual(p.loras, [])
+        self.assertTrue(any("whole image" in w for w in p.warnings))
+
+    def test_missing_or_wrong_subject_chest_lora_is_explained(self):
+        self.chest_lora()
+        for subject in ("a man", "a woman", "a person"):
+            p = self.plan(subject=subject, chest_size=3)
+            self.assertEqual(p.loras, [])
+            self.assertTrue(any("words only" in w for w in p.warnings))
+
     def plan(self, backend="5090", inventory=FLUX_FILES, nodes=None, **kw):
         s = ig.default_settings()
         s["model"] = "flux-hq"
@@ -484,6 +527,13 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(ig.slider_word("weight", 3), "very heavyset")
         self.assertEqual(ig.slider_word("muscle", 9), "very muscular")      # clamped
         self.assertEqual(ig.slider_word("stature", -2), "short")
+
+    def test_chest_size_is_in_both_subjects_prompts_and_character_looks(self):
+        self.assertIn("chest_size", ig.CHARACTER_KEYS)
+        for subject in ("a man", "a woman"):
+            self.assertEqual(ig.person_text({"subject": subject, "chest_size": 0}), subject)
+            self.assertIn("small chest", ig.person_text({"subject": subject, "chest_size": -2}))
+            self.assertIn("full chest", ig.person_text({"subject": subject, "chest_size": 2}))
 
     def test_picks_toggle(self):
         self.assertEqual(ig.toggle("", "glasses", True), "glasses")
@@ -1066,39 +1116,26 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
                         rec.get("notes"))
 
     def test_a_face_swap_uses_every_reference_picture(self):
-        job, graphs, paths = self.face_swap_job([], [(40, 100, 50, 60)], refs=2)
-        self.assertEqual(job.status, "complete", job.detail)
-        pos = graphs[-1]["sw1_pos"]["inputs"]
-        self.assertIn("pictures 2 and 3", pos["prompt"])    # two: a slot each
-        self.assertEqual(graphs[-1]["sw1_r1"]["class_type"], "ImageCropV2")
-        self.assertEqual(pos["image3"], ["sw1_r1", 0])
-        FakeClient.instances.clear()
-        job, graphs, paths = self.face_swap_job([], [(40, 100, 50, 60)], refs=3)
-        self.assertEqual(job.status, "complete", job.detail)
-        find, swap = graphs
-        self.assertIn("q3_v", find)
-        pos = swap["sw1_pos"]["inputs"]
-        self.assertIn("in picture 2", pos["prompt"])        # three: side by side in one
-        self.assertEqual(pos["image2"], ["sw1_h2", 0])
-        self.assertNotIn("image3", pos)
-        self.assertEqual(swap["sw1_h1"]["inputs"]["image2"], ["sw1_r1", 0])
-        self.assertTrue(any("3 reference pictures" in n for n in
-                            self.studio.history.list()[0]["notes"]))
+        from unittest.mock import patch
+        with patch('studio_facefusion.swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})) as swap:
+            job, graphs, paths = self.face_swap_job([], [(40, 100, 50, 60)], refs=3)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(swap.call_args.args[1]['references'], paths)
+        self.assertEqual(graphs, [])  # no Qwen redraw or SAM3 dependency
+        self.assertEqual(job.record['facefusion'][0]['outside_mask_changed_pixels'], 0)
 
     def test_a_face_swap_alone_is_a_fix_and_needs_a_face(self):
-        job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], colour=False)
-        self.assertEqual(job.status, "complete", job.detail)
-        find, swap = graphs
-        self.assertEqual(find["q0_i"]["inputs"]["image"], "studio_made.png")
-        self.assertEqual(swap["fi"]["inputs"]["image"], "studio_made.png")
-        self.assertNotIn("sw1_tn", swap)          # no ColorTransfer: said, not failed
-        self.assertTrue(any("ColorTransfer" in n for n in job.notes), job.notes)
-        self.assertEqual(ig.fix_words({"spots": [], "face_swap": "me.png"}), "a face swap")
-        FakeClient.instances.clear()
-        job, graphs, _ = self.face_swap_job([], [])
-        self.assertEqual(job.status, "failed")
-        self.assertIn("no face", job.detail)
-        self.assertEqual(len(graphs), 1)          # the finder alone
+        from unittest.mock import patch
+        with patch('studio_facefusion.swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})):
+            job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], colour=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(graphs, [])
+        self.assertTrue(any('FaceFusion applied last' in n for n in job.notes))
+        with patch('studio_facefusion.swap', side_effect=RuntimeError('no face was found')):
+            job, graphs, _ = self.face_swap_job([], [])
+        self.assertEqual(job.status, 'failed')
+        self.assertIn('no face', job.detail)
+        self.assertEqual(graphs, [])
 
     def test_a_face_swap_needs_an_identity_with_a_reference(self):
         job, graphs, _ = self.swap_job([], face_swap="lilya", identities=[
@@ -1980,6 +2017,34 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIsNotNone(s.images)
         return s, s.images
 
+    def test_generate_stays_visible_and_advanced_keeps_loras(self):
+        _, ui = self.tab()
+        ui._show_section("Image")
+        if ui.adv_open:
+            ui._toggle_advanced()
+        self.app.update()
+        self.assertTrue(ui.go.winfo_ismapped())
+        self.assertFalse(ui.lora_box.winfo_ismapped())
+        self.assertTrue(ui.scene.winfo_ismapped())
+        self.assertFalse(ui.preset_pill.winfo_ismapped())
+        before = ui.collect()
+        for section in ui.sections:
+            ui._show_section(section)
+            self.app.update()
+            self.assertEqual([k for k, box in ui.sections.items() if box.winfo_ismapped()],
+                             [section])
+            self.assertTrue(ui.go.winfo_ismapped())
+            for pill in ui.section_pills.values():
+                self.assertTrue(pill.winfo_ismapped())
+                self.assertGreaterEqual(pill.winfo_width(), pill.winfo_reqwidth())
+        ui._toggle_advanced()
+        self.app.update()
+        self.assertTrue(ui.adv_box.winfo_ismapped())
+        self.assertTrue(ui.go.winfo_ismapped())
+        self.assertEqual(ui.collect(), before)
+        ui._toggle_advanced()
+        ui._show_section("Image")
+
     def test_fix_a_spot_marks_squares_and_queues_a_fix(self):
         import studio_images_ui as ui_mod
         s, ui = self.tab()
@@ -2049,6 +2114,7 @@ class TestImageStudioTab(unittest.TestCase):
 
     def test_fix_a_spot_can_end_with_a_face_swap_alone(self):
         import studio_images_ui as ui_mod
+        from unittest.mock import patch
         s, ui = self.tab()
         src = os.path.join(self.dir, "fixme.png")
         with open(src, "wb") as f:
@@ -2062,9 +2128,18 @@ class TestImageStudioTab(unittest.TestCase):
         fw._face_identity("")
         fw._redraw()
         self.assertEqual(sent, [])                # nothing marked and no face
-        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
         fw._face_identity("gavin")
         fw._redraw()
+        self.assertEqual(sent, [])                # missing reference is caught before queuing
+        self.assertTrue(fw.win.winfo_exists())
+        old_profiles = ui.studio.lib.all("identities")
+        ui.studio.lib.save("identities", old_profiles + [
+            {"id": "gavin", "name": "Gavin", "references": [src]}])
+        try:
+            with patch.object(ui_mod.ff, "available", return_value=True):
+                fw._redraw()
+        finally:
+            ui.studio.lib.save("identities", old_profiles)
         (job,) = sent
         self.assertEqual(job["fix"]["face_swap"], "gavin")
         self.assertEqual(job["fix"]["spots"], [])
@@ -2242,6 +2317,28 @@ class TestImageStudioTab(unittest.TestCase):
         with open(os.path.join(ui.studio.lib.root, "identities.json")) as f:
             self.assertIn("LILYAPERSON", f.read())
 
+    def test_profile_menu_selects_one_person_and_keeps_their_photo_list(self):
+        s, ui = self.tab()
+        ui.studio.lib.save("identities", [
+            {"id": "one", "name": "One", "references": ["a.png", "b.png"],
+             "avatar": "generated.png"},
+            {"id": "two", "name": "Two", "references": ["c.png"]}])
+        ui._rebuild_choices()
+        ui._select_identity("one")
+        self.assertTrue(ui.idents["one"][0].get())
+        self.assertIn("2 reference photos", ui.identity_note.cget("text"))
+        ui._select_identity("two")
+        self.assertFalse(ui.idents["one"][0].get())
+        self.assertTrue(ui.idents["two"][0].get())
+        ui._rebuild_choices()
+        self.assertTrue(ui.idents["two"][0].get())
+        ed = ui.edit_identities()
+        self.assertEqual(ed.widgets["references"][1]["paths"], ["a.png", "b.png"])
+        self.assertEqual(ed.widgets["avatar"][1].get(), "generated.png")
+        ed.win.destroy()
+        ui._select_identity("")
+        self.assertFalse(any(v[0].get() for v in ui.idents.values()))
+
     def test_a_character_goes_from_the_creator_to_the_form_and_history(self):
         s, ui = self.tab()
         ed = ui.edit_characters()
@@ -2290,6 +2387,83 @@ class TestImageStudioTab(unittest.TestCase):
             ui._show_looks(name)
             self.app.update()
         ui.save_as_character().win.destroy()
+
+    def test_model_source_open_fetches_reviewable_results_off_thread(self):
+        import studio_images_ui
+        from unittest.mock import patch
+        _, ui = self.tab()
+        result = {"checked": time.time(), "errors": [], "items": [
+            {"title": "Example", "url": "https://civitai.com/models/123", "kind": "LORA",
+             "why": "Image style", "details": "Review compatibility", "importable": True},
+            {"title": "ComfyUI", "url": "https://github.com/Comfy-Org/ComfyUI/releases/latest",
+             "kind": "Code / library", "why": "Backend changes", "details": "Release notes",
+             "importable": False}]}
+        threads = []
+        def fetch(*args, **kwargs):
+            threads.append(threading.current_thread())
+            return result
+        with patch.object(studio_images_ui.discovery, "discover", side_effect=fetch):
+            dlg = ui.open_model_source("civitai")
+            try:
+                self.pump(lambda: not dlg.busy)
+                self.assertEqual(len(dlg.results.winfo_children()), 2 + len(studio_images_ui.addons.CATALOG))
+                self.assertTrue(all(t is not threading.main_thread() for t in threads))
+                dlg.keep_link(result["items"][0])
+                self.assertIn(result["items"][0]["url"], dlg.links.get("1.0", "end"))
+                dlg.refresh_discoveries(force=True)
+                dlg.win.destroy()
+                self.pump(lambda: not self.app.q.qsize())
+            finally:
+                if dlg.win.winfo_exists():
+                    dlg.win.destroy()
+
+    def test_supported_addon_button_installs_into_selected_comfy_folder(self):
+        import studio_images_ui
+        from unittest.mock import patch
+        _, ui = self.tab()
+        with tempfile.TemporaryDirectory() as root:
+            for name in ("main.py", "folder_paths.py"):
+                with open(os.path.join(root, name), "w") as stream:
+                    stream.write("# fake backend\n")
+            dlg = studio_images_ui.ModelSourceSettings(ui, "huggingface")
+            try:
+                card = dlg.results.winfo_children()[0]
+                actions = card.winfo_children()[-1]
+                button = actions.winfo_children()[0]
+                self.assertEqual(button.cget("text"), "Add to app")
+                with patch.object(studio_images_ui.filedialog, "askdirectory", return_value=root):
+                    button.invoke()
+                    self.pump(lambda: button.cget("text") == "Installed")
+                target = os.path.join(root, "custom_nodes", "studio_matchtone", "__init__.py")
+                self.assertTrue(os.path.isfile(target))
+                self.assertIn("Restart ComfyUI", dlg.message.cget("text"))
+            finally:
+                dlg.win.destroy()
+
+    def test_model_source_buttons_save_and_reopen(self):
+        import studio_images_ui
+        from unittest.mock import patch
+        _, ui = self.tab()
+        with patch.dict(os.environ, {}, clear=True):
+            for source, (_, domain, _) in studio_images_ui.model_sources.SOURCES.items():
+                self.assertTrue(ui.source_buttons[source].winfo_ismapped())
+                dlg = studio_images_ui.ModelSourceSettings(ui, source)
+                try:
+                    link = "https://%s/models/example" % domain
+                    dlg.links.delete("1.0", "end")
+                    dlg.links.insert("1.0", link)
+                    dlg.token.set("test-key")
+                    self.assertTrue(dlg.save())
+                finally:
+                    dlg.win.destroy()
+                dlg = studio_images_ui.ModelSourceSettings(ui, source)
+                try:
+                    self.app.update()
+                    self.assertEqual(dlg.links.get("1.0", "end").strip(), link)
+                    self.assertEqual(dlg.token.get(), "test-key")
+                    self.assertTrue(dlg.message.winfo_ismapped())
+                finally:
+                    dlg.win.destroy()
 
     def test_a_civitai_link_imports_into_the_lora_library(self):
         import urllib.request

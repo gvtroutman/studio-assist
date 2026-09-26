@@ -721,6 +721,48 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   files (its entry expects `t5xxl_fp8_e4m3fn_scaled` and fp8 weights), so Auto
   never sends FLUX there. Z-Image Turbo at 1024² took 18-30 s there.
 
+### Identity profiles and FaceFusion
+
+Selecting a profile in Image Studio's identity menu applies its saved reference
+photos through FaceFusion after all generation and automatic refinement. The
+profile's optional `avatar` is display-only (generated pictures are allowed);
+it never becomes a face reference. `face_swap` defaults to true independently
+of the older `use_references` switch. Profiles without photos retain their LoRA
+behavior. The profile editor keeps technical fields under Advanced settings.
+
+`studio_facefusion.py` is a stdlib adapter to the isolated environment in
+`.runtime/facefusion-venv`; it uses `studio_procs` for cancellation and process
+containment. `tools/facefusion_swap.py` runs the official pipeline, captures its
+mask, restores original pixels outside that mask, and checks the saved PNG.
+Failure is explicit, never a silently substituted generated face. A face-only
+Fix uses this same route. Reports are kept in history's `facefusion` field.
+Reference previews are normalized off the Tk thread by `facefusion_previews.py`.
+Tests in `test_facefusion_profiles.py` mock inference; the GUI tests exercise the
+profile menu and editor. Lilya's live final-pass result matched the approved
+standalone HyperSwap result byte-for-byte.
+
+### Family photos with WithAnyone
+
+`comfy_workflows/withanyone.json` and `comfy_nodes/studio_withanyone` draw one to
+four identities together. `plan_identities` uses Scene Builder's `scene_faces`
+photos and normalized head regions, or selected identity profiles placed left
+to right. A missing photo or invalid region is an error, not a stranger drawn in
+their place. The node refuses reference pictures containing multiple faces.
+`multi_identity` on the workflow adds optional face inputs in `fill`, bypasses
+PuLID injection, disables the face pass and skips the automatic critic redraw.
+Scene Builder's `takes` includes `face_positions` for this workflow: no pose or
+depth map is sent, and the UI says that poses and props come from words.
+
+The node wraps pinned upstream WithAnyone code installed by
+`tools/install_withanyone.py`. Only ComfyUI imports its ML dependencies. The
+wrapper owns the diffusion model for one call, checks cancellation at each step,
+and releases the model in `finally`; ComfyUI's `/free` cannot free upstream
+models that bypass its model patcher. T5, SigLIP and face detection run on CPU;
+VAE decoding is tiled. Initially only the 32 GB 5090 is enabled. SigLIP folder
+readiness comes from the node's `/object_info` choices because `/models` lists
+files, not those directories. See `docs/withanyone.md` and
+`tests/test_withanyone.py`; `tools/try_withanyone.py` exercises the real job path.
+
 ### The Visual Critic: automatic refinement after a picture is made
 
 "Automatic refinement" under Generate (`auto_refine`, off by default) runs
@@ -1017,10 +1059,16 @@ Effects. `docker stop studio-opencode` does; the workspace and the session volum
 
 ### The Scene Builder: a stage for the Image Studio
 
-**Scene Builder…**, under the Image Studio's Scene field, opens one window laid out like a
+**Scene Builder…**, under the Image Studio's prompt field, opens one window laid out like a
 slicer: library and object list on the left, the viewport with Move / Rotate / Scale in
-the middle, the selected object's controls on the right, Open / Save / Generate along the
-bottom. It blocks out a picture; it is not a 3D package. `studio_scene.py` is the engine
+the middle, the selected object's controls on the right, File / Build from photo /
+Suggest details along the top, and Model / Generate picture along the bottom. Undo and
+History have their own row below the editing tools. People have Object / Pose / Look
+inspector sections; clicking a body part opens Pose. Image Studio has Image / People /
+References / Settings sections, keeps Generate outside the scrolling form, and puts
+LoRAs inside Advanced in Settings. Section changes retain settings and reset scrolling.
+Generate inside the builder includes its arrangement; a plain Generate in the form does
+not. It blocks out a picture; it is not a 3D package. `studio_scene.py` is the engine
 (no tkinter, tested headless), `studio_scene_ui.SceneBuilder` the window, a collaborator
 of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 
@@ -1118,10 +1166,21 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   (`character_look`: blank where it has none, the expression and gaze kept) and, if the
   person still has the default name, its name; it is a copy, like the form's. The look is
   said in that person's line, `Name (a person, where, facing): look. Description`.
+- **Chest size can drive a LoRA.** Library records assign `body_control` to
+  `chest_female` (signed strength, scaled by the -3..3 slider) or `chest_male`
+  (fixed strength with the documented male size phrases). `compose` requires
+  a known matching family and an installed file, and reports when only words
+  are available. Scene Builder reads the person's look from `scene_layout`,
+  since generation deliberately blanks the form's person. Multiple people
+  cannot receive independent settings from a whole-image LoRA; report that
+  limitation instead of applying one person's size to everyone. The installer
+  `tools/install_chest_loras.py --folder <local LoRA folder>` downloads and
+  hash-checks CivitAI versions 2520278 (female, Z-Image Turbo) and 3155339
+  (male, Z-Image Base); the latter still needs visual verification on Turbo.
 - **The mannequin wears the look, because the maps are drawn from it.** The depth
   map carries each body's outline (and the frame, when kept, its colours): a
   heavyset person drawn as the rest mannequin is pulled thin again, so `painted_pieces` builds each person to `body_shape(look)` - the Weight, Muscle and
-  Height sliders, plus a Body type word `BUILDS` knows, as steps added to them (clamped,
+  Chest size and Height sliders, plus a Body type word `BUILDS` knows, as steps added to them (clamped,
   so "obese" does not push Weight past +3) - and dresses them in `outfit(look)`: the
   Clothes slots colour the body's regions they cover (a t-shirt the upper arm, a
   sweater the forearm too), a dress, skirt or long coat adds a hem that follows the
@@ -2509,6 +2568,24 @@ folder are exactly that, and their `serve()` loops are gone.
   and the rest is a decision nobody has made yet — the check will keep saying so.
 
 ## Running and testing
+
+### Finishing and recovery
+
+- Scene Builder's close result can veto tab/app closure. `ImageStudio.can_close()`
+  checks before any tab state is removed or `Chat.closing` is set; `release(confirmed=True)`
+  only destroys windows after those checks. Failed saves and cancelled Save As dialogs
+  must leave the app usable. Settled edits write separate scene recovery copies under
+  the Image Studio library; File → Recover scene opens them without replacing originals.
+- Final FaceFusion targets carry the Scene Builder identity and normalized region.
+  Positional form selections require the expected face count. Ambiguous detections
+  must fail with a request to choose the face, never default to the biggest face.
+- Face-only fixes and saved finishing retries use a local queue lane, without any
+  ComfyUI health checks. A generated picture and profile snapshot are persisted before
+  the final face swap; failure leaves that checkpoint available in History.
+- `JobQueue.cancel()` may be called by Tk: set its event immediately, send network
+  interruption on a worker, and let the UI show Cancelling until the job settles.
+- Repeat seed uses current library records and model files. Do not describe it as
+  exact recipe replay. `tests/test_finish_line.py` covers the recovery boundaries offline.
 
 ```bash
 python -m unittest discover -s tests -v      # no network, no apps needed

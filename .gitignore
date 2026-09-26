@@ -9,3 +9,6 @@ venv/
 Thumbs.db
 desktop.ini
 studio-assistant-preview.png
+.work/
+.runtime/
+comfy_nodes/studio_withanyone/vendor/

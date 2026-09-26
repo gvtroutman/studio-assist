@@ -19,11 +19,16 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog
 
 import studio_civitai as civitai
+import studio_model_sources as model_sources
+import studio_discovery as discovery
+import studio_addons as addons
 import studio_imagegen as ig
+import studio_facefusion as ff
 import studio_pose as sp
 import studio_scene_ui
 
@@ -62,9 +67,14 @@ def open_path(path, select=False):
             os.startfile(path)            # noqa - Windows only, like the rest of the app
 
 
-def photo(path, box):
+def photo(path, box, profile=False):
     """A PhotoImage of `path` shrunk by a whole factor to fit `box` px, or None.
-    Tk reads PNG and GIF itself; anything else has no preview."""
+    Tk reads PNG and GIF itself; anything else has no preview. `profile`
+    shows a profile photo's normalized thumbnail (prepare_previews) when
+    there is one; a picture shown as itself never gets it."""
+    if profile:
+        small = ff.preview_path(path)
+        path = small if os.path.isfile(small) else path
     try:
         img = tk.PhotoImage(file=path)
     except (tk.TclError, OSError):
@@ -251,7 +261,7 @@ class ImageStudio:
         self.planned_size = (1024, 1024)   # the picture's size, as last composed
         self.adv = {}                 # setting -> StringVar
         self.text = {}                # look slot and camera setting -> StringVar
-        self.sliders = {}             # weight, muscle, stature -> IntVar
+        self.sliders = {}             # body slider keys -> IntVar
         self.item_refs = {}           # item -> picture, from the character
         self.look_section = ig.LOOKS[0][0]
         self.anatomy = tk.BooleanVar(value=True)
@@ -280,6 +290,7 @@ class ImageStudio:
         are. Not at construction - a tab is built before it is looked at,
         and building must not reach the network."""
         self.refresh_backends()
+        self._prepare_profiles()
 
     # ================================================================ plumbing
     def _notify(self, job):
@@ -383,7 +394,7 @@ class ImageStudio:
         inner.canvas = canvas
         return outer, inner
 
-    def choice(self, parent, items, current, on_pick, bg="bg", width=None):
+    def choice(self, parent, items, current, on_pick, bg="bg", width=None, images=None):
         """A dropdown: a Pill that posts a menu of (value, label) pairs. The
         window has no ttk and wants none (palette roles, Pills everywhere)."""
         labels = dict(items)
@@ -398,7 +409,8 @@ class ImageStudio:
                 if value is None:
                     menu.add_separator()
                 else:
-                    menu.add_command(label=text, command=lambda v=value: pick(v))
+                    extra = {"image": images[value], "compound": "left"} if images and value in images else {}
+                    menu.add_command(label=text, command=lambda v=value: pick(v), **extra)
             menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
 
         def pick(value):
@@ -419,11 +431,13 @@ class ImageStudio:
     def _build(self, root):
         head = self.frame(root)
         head.pack(side="top", fill="x", padx=self.px(18), pady=(0, self.px(6)))
-        self.button(head, "Backends…", self.edit_backends).pack(side="right")
-        self.button(head, "Models…", self.edit_models).pack(side="right",
-                                                                 padx=(0, self.px(6)))
-        self.button(head, "Check", self.refresh_backends).pack(side="right",
-                                                               padx=(0, self.px(6)))
+        self.manage_pill = self.button(head, "Manage ▾", self._manage_menu)
+        self.manage_pill.pack(side="right")
+        self.source_buttons = {}
+        for source, (name, _domain, _env) in model_sources.SOURCES.items():
+            button = self.button(head, name, lambda key=source: self.open_model_source(key))
+            button.pack(side="right", padx=(0, self.px(6)))
+            self.source_buttons[source] = button
         self.health_row = self.frame(head)
         self.health_row.pack(side="left", fill="x", expand=True)
 
@@ -434,34 +448,50 @@ class ImageStudio:
         body.pack(side="top", fill="both", expand=True, padx=self.px(14),
                   pady=(0, self.px(14)))
         # Fixed before expanding (AGENTS.md: pack order).
-        left, self.form = self.scrolled(body)
+        left = self.frame(body)
         left.config(width=self.px(390))
         left.pack_propagate(False)
         left.pack(side="left", fill="y")
+        actions = self.frame(left)
+        actions.pack(side="bottom", fill="x")
+        self.section_bar = self.frame(left)
+        self.section_bar.pack(side="top", fill="x", pady=(0, self.px(8)))
+        scroll, self.form = self.scrolled(left)
+        scroll.pack(side="top", fill="both", expand=True)
         right = self.frame(body)
         right.pack(side="left", fill="both", expand=True, padx=(self.px(14), 0))
-        self._build_form(self.form)
+        self._build_form(self.form, actions)
         self._build_right(right)
 
     # -------------------------------------------------------------- the form
-    def _build_form(self, f):
+    def _build_form(self, f, actions):
         pad = {"padx": (self.px(6), self.px(10))}
-        self.cap(f, "Preset").pack(**pad)
-        row = self.frame(f)
+        self.sections = {name: self.frame(f) for name in
+                         ("Image", "People", "References", "Settings")}
+        self.section_pills = {}
+        for name in self.sections:
+            pill = self.button(self.section_bar, name,
+                               lambda n=name: self._show_section(n),
+                               font=self.host.f_small, padx=self.px(9))
+            pill.pack(side="left", padx=(0, self.px(3)))
+            self.section_pills[name] = pill
+        f = self.sections["Image"]
+        self.cap(f, "Prompt").pack(**pad)
+        setup = self.sections["Settings"]
+        self.cap(setup, "Preset").pack(**pad)
+        row = self.frame(setup)
         row.pack(side="top", fill="x", **pad)
         self.preset_pill = self.choice(
             row, [(k, ig.PRESETS[k]["label"]) for k in ig.PRESET_ORDER],
             self.settings["preset"], self._set_preset)
         self.preset_pill.pack(side="left")
-        self.preset_about = self.label(f, ig.PRESETS["standard"]["about"], "faint",
+        self.preset_about = self.label(setup, ig.PRESETS["standard"]["about"], "faint",
                                        self.host.f_small, wraplength=self.px(380))
-        self.preset_about.pack(side="top", fill="x", **pad)
 
-        self.cap(f, "Model and backend").pack(**pad)
-        self.model_row = self.frame(f)
+        self.cap(setup, "Model and backend").pack(**pad)
+        self.model_row = self.frame(setup)
         self.model_row.pack(side="top", fill="x", **pad)
 
-        self.cap(f, "Scene").pack(**pad)
         shell = self.frame(f, "card")
         shell.pack(side="top", fill="x", **pad)
         self.scene = tk.Text(shell, height=5, wrap="word", bd=0, highlightthickness=0,
@@ -476,20 +506,9 @@ class ImageStudio:
         # is the scene's own, not a small aside beside a hint.
         srow = self.frame(f)
         srow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
-        self.button(srow, "Scene Builder…", self.build_scene).pack(side="top", fill="x")
-        self.label(srow, "Stage people and props in 3D, or make a scene from a picture; "
-                   "the frame becomes the source picture.", "faint", self.host.f_small,
-                   wraplength=self.px(380)).pack(side="top", fill="x",
-                                                 pady=(self.px(3), 0))
-
-        prow = self.frame(f)
-        prow.pack(side="top", fill="x", pady=(self.px(12), 0), **pad)
-        self.pc_pill = self.button(prow, "Person and camera  ▸",
-                                   self._toggle_person, kind="ghost")
-        self.pc_pill.pack(side="left")
-        # Hidden until asked for; what is in it still goes into the prompt.
-        self.pc_open = False
-        self.pc_box = pb = self.frame(f)
+        self.button(srow, "Scene Builder…", self.build_scene).pack(
+            side="top", fill="x")
+        self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
         crow = self.frame(pb)
         crow.pack(side="top", fill="x", **pad)
@@ -501,10 +520,6 @@ class ImageStudio:
             side="left", padx=(self.px(4), 0))
         self.person_box = self.frame(pb)
         self.person_box.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
-        self.label(pb, "Who, and what they look like. Any of these can stay blank; a "
-                   "character fills all but the expression.", "faint", self.host.f_small,
-                   wraplength=self.px(380)).pack(side="top", fill="x",
-                                                 pady=(self.px(6), 0), **pad)
         for key in ig.SLOTS:
             self.text[key] = tk.StringVar()
         for key in ig.SLIDER_KEYS:
@@ -520,14 +535,6 @@ class ImageStudio:
         self.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
                   activeforeground="text")
         b.pack(side="top", fill="x", pady=(self.px(8), 0), **pad)
-        self.label(pb, "Every person: " + ig._and([pos for _, pos, _ in ig.ANATOMY]) + ".",
-                   "faint", self.host.f_small, wraplength=self.px(380)).pack(
-            side="top", fill="x", **pad)
-        self.label(f, "Pictures of the clothes, hair and accessories (Clothes, Hair and "
-                   "Accessories tabs) go into the picture itself: it is then made with "
-                   "FLUX Kontext, which draws from them.", "faint", self.host.f_small,
-                   wraplength=self.px(380)).pack(side="top", fill="x",
-                                                 pady=(self.px(6), 0), **pad)
 
         self.cap(pb, "Camera").pack(**pad)
         self.aim = CameraAim(self, pb, self._aimed)
@@ -550,51 +557,85 @@ class ImageStudio:
         self.style_box = self.frame(f)
         self.style_box.pack(side="top", fill="x", **pad)
 
-        self.cap(f, "References").pack(**pad)
-        self.ref_box = self.frame(f)
+        self.ref_box = self.frame(self.sections["References"])
         self.ref_box.pack(side="top", fill="x", **pad)
         self._build_refs()
 
-        self.cap(f, "LoRAs").pack(**pad)
-        self.lora_box = self.frame(f)
+        arow = self.frame(setup)
+        arow.pack(side="top", fill="x", pady=(self.px(12), 0), **pad)
+        self.adv_pill = self.button(arow, "Advanced  ▸",
+                                    self._toggle_advanced, kind="ghost")
+        self.adv_pill.pack(side="left")
+        self.adv_box = self.frame(setup)
+        self.cap(self.adv_box, "LoRAs").pack(**pad)
+        self.lora_box = self.frame(self.adv_box)
         self.lora_box.pack(side="top", fill="x", **pad)
-        lrow = self.frame(f)
+        lrow = self.frame(self.adv_box)
         lrow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
         self.add_lora_pill = self.button(lrow, "Add LoRA  ▾", self._post_lora_menu)
         self.add_lora_pill.pack(side="left")
         self.button(lrow, "Library…", self.edit_loras, kind="ghost").pack(
             side="left", padx=(self.px(6), 0))
 
-        arow = self.frame(f)
-        arow.pack(side="top", fill="x", pady=(self.px(12), 0), **pad)
-        self.adv_pill = self.button(arow, "Advanced  ▸", self._toggle_advanced,
-                                    kind="ghost")
-        self.adv_pill.pack(side="left")
-        self.adv_box = self.frame(f)
         self._build_advanced(self.adv_box)
 
-        self.warn = self.label(f, "", "warn", self.host.f_small, wraplength=self.px(380))
+        self.warn = self.label(actions, "", "warn", self.host.f_small, wraplength=self.px(350))
         self.warn.pack(side="top", fill="x", pady=(self.px(10), 0), **pad)
+        self.readiness_pill = self.button(actions, "Resolve readiness issues ▾",
+                                          self._readiness_menu, kind="ghost")
+        self.readiness_pill.pack(side="top", anchor="w", **pad)
         # Where the job will go, and why, before Generate (plan_route).
-        self.route_note = self.label(f, "", "muted", self.host.f_small,
+        self.route_note = self.label(setup, "", "muted", self.host.f_small,
                                      wraplength=self.px(380))
         self.route_note.pack(side="top", fill="x", pady=(self.px(6), 0), **pad)
-        grow = self.frame(f)
+        grow = self.frame(actions)
         grow.pack(side="top", fill="x", pady=(self.px(10), self.px(18)), **pad)
         self.go = self.button(grow, "Generate", self.generate, kind="accent")
-        self.go.pack(side="left")
-        self.label(grow, "Ctrl+Enter in the scene", "faint", self.host.f_small).pack(
-            side="left", padx=(self.px(10), 0))
+        self.go.pack(side="top", fill="x")
         # The Visual Critic (studio_critic): the vision model checks the
         # picture and the faults it finds are redrawn, up to three passes.
-        b = tk.Checkbutton(f, text="Automatic refinement (a vision model checks the picture "
-                           "and fixes what is wrong)", variable=self.auto_refine,
+        b = tk.Checkbutton(setup, text="Automatic refinement", variable=self.auto_refine,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
                   activeforeground="text")
-        b.pack(side="top", fill="x", pady=(0, self.px(12)), before=grow, **pad)
+        b.pack(side="top", fill="x", pady=(0, self.px(12)), **pad)
         self._rebuild_choices()
+        self._show_section("Image")
+
+    def _show_section(self, name):
+        for key, box in self.sections.items():
+            box.pack_forget()
+            pill = self.section_pills[key]
+            pill.roles = self.host.PILL_ROLES["accent" if key == name else "quiet"]
+            pill.paint(self.host.C)
+        self.sections[name].pack(side="top", fill="x")
+        self.form.canvas.yview_moveto(0)
+        self.section = name
+
+    def open_model_source(self, source):
+        dialog = ModelSourceSettings(self, source)
+        dialog.refresh_discoveries()
+        return dialog
+
+    def _readiness_menu(self):
+        menu = self.host._menu()
+        for label, action in (("Reference photos and face swaps…", self.edit_identities),
+                              ("Models and required files…", self.edit_models),
+                              ("Backends…", self.edit_backends),
+                              ("Check connections", self.refresh_backends)):
+            menu.add_command(label=label, command=action)
+        pill = self.readiness_pill
+        menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
+
+    def _manage_menu(self):
+        menu = self.host._menu()
+        menu.add_command(label="Models…", command=self.edit_models)
+        menu.add_command(label="Backends…", command=self.edit_backends)
+        menu.add_separator()
+        menu.add_command(label="Check connections", command=self.refresh_backends)
+        p = self.manage_pill
+        menu.tk_popup(p.winfo_rootx(), p.winfo_rooty() + p.winfo_height())
 
     def _rebuild_choices(self):
         """Everything drawn from the library: models, backends, people, styles,
@@ -612,25 +653,27 @@ class ImageStudio:
             w.destroy()
         old = {k: (b.get(), s.get()) for k, (b, s, _) in self.idents.items()}
         self.idents = {}
+        portraits = {}
         for ident in lib.all("identities"):
             on, st = old.get(ident["id"], (False, ident["strength"]))
             bvar, svar = tk.BooleanVar(value=on), tk.DoubleVar(value=st)
-            row = self.frame(self.person_box)
-            row.pack(side="top", fill="x")
-            box = tk.Checkbutton(row, text=ident["name"], variable=bvar, font=self.host.f_ui,
-                                 anchor="w", bd=0, highlightthickness=0,
-                                 command=lambda i=ident["id"]: self._toggle_ident(i))
-            self.skin(box, bg="bg", fg="text", activebackground="bg", selectcolor="card",
-                      activeforeground="text")
-            box.pack(side="left")
-            sc = self.slider(row, svar, 0.0, 1.5, command=lambda _v: self._recheck())
+            sc = self.frame(self.person_box)  # retains legacy strength settings, no control needed
             self.idents[ident["id"]] = (bvar, svar, sc)
-            if on:
-                sc.pack(side="right", fill="x", expand=True, padx=(self.px(8), 0))
-        if not self.idents:
-            self.label(self.person_box, "No identities yet.", "faint").pack(side="left")
-        self.button(self.person_box, "Identities…", self.edit_identities,
+            path = ident.get("avatar") or next(iter(ident["references"]), "")
+            img = photo(path, self.px(40), profile=True) if path else None
+            if img:
+                portraits[ident["id"]] = img
+        self.identity_photos = portraits
+        selected = next((iid for iid, (bv, _, _) in self.idents.items() if bv.get()), "")
+        self.identity_pill = self.choice(self.person_box,
+            [("", "No identity")] + [(i["id"], i["name"]) for i in lib.all("identities")],
+            selected, self._select_identity, images=portraits)
+        self.identity_pill.pack(side="top", anchor="w")
+        self.identity_note = self.label(self.person_box, "", "muted", self.host.f_small)
+        self.identity_note.pack(side="top", anchor="w")
+        self.button(self.person_box, "Manage profiles…", self.edit_identities,
                     kind="ghost").pack(side="top", anchor="w", pady=(self.px(4), 0))
+        self._show_identity()
 
         for w in self.style_box.winfo_children():
             w.destroy()
@@ -750,12 +793,33 @@ class ImageStudio:
             self._recheck()
 
     def _toggle_ident(self, iid):
-        bvar, _, sc = self.idents[iid]
-        if bvar.get():
-            sc.pack(side="right", fill="x", expand=True, padx=(self.px(8), 0))
-        else:
-            sc.pack_forget()
+        self._show_identity()
         self._recheck()
+
+    def _select_identity(self, iid):
+        for key, (bv, _, _) in self.idents.items():
+            bv.set(key == iid)
+        self._show_identity()
+        self._recheck()
+
+    def _show_identity(self):
+        chosen = [self.studio.lib.get("identities", iid) for iid, (bv, _, _) in self.idents.items()
+                  if bv.get()]
+        names = ", ".join(i["name"] for i in chosen)
+        self.identity_pill.set(text=(names or "No identity") + "  ▾")
+        count = sum(len(i["references"]) for i in chosen)
+        self.identity_note.config(text=("%d reference photos · face applied automatically" % count
+                                       if count else "Add reference photos in Manage profiles." if chosen
+                                       else "Choose a person for this picture."))
+
+    def _prepare_profiles(self):
+        profiles = self.studio.lib.all("identities")
+        if not ff.available():
+            return
+        def work():
+            if ff.prepare_previews(profiles):
+                self._post("call", self._rebuild_choices)
+        self.host._spawn(self.s.event_id, work)
 
     # ------------------------------------------------------------- the look
     def _set_character(self, cid):
@@ -773,10 +837,7 @@ class ImageStudio:
                     self.text[key].set(rec["looks"].get(key, ""))
             self.item_refs = dict(rec["item_refs"])
             if rec["identity"] in self.idents:
-                bvar = self.idents[rec["identity"]][0]
-                if not bvar.get():
-                    bvar.set(True)
-                    self._toggle_ident(rec["identity"])
+                self._select_identity(rec["identity"])
             self._show_looks(self.look_section)
         self._recheck()
 
@@ -857,7 +918,7 @@ class ImageStudio:
         menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
 
     def slider_rows(self, parent, vars_, changed, bg="bg"):
-        """Weight, muscle and height as the game's sliders: -3..3, a word
+        """Body proportions as the game's sliders: -3..3, a word
         beside each, nothing said at the middle."""
         for key, label, _ in ig.SLIDERS:
             row = self.frame(parent, bg)
@@ -884,11 +945,14 @@ class ImageStudio:
         for box in (self.look_tabs, self.look_box):
             for w in box.winfo_children():
                 w.destroy()
-        for name, _ in ig.LOOKS:
+        for i, (name, _) in enumerate(ig.LOOKS):
             self.button(self.look_tabs, name, lambda n=name: self._show_looks(n),
                         kind="accent" if name == section else "quiet",
-                        font=self.host.f_small, padx=self.px(6), pady=self.px(2)).pack(
-                side="left", padx=(0, self.px(2)), pady=(self.px(6), self.px(2)))
+                        font=self.host.f_small, padx=self.px(6), pady=self.px(2)).grid(
+                row=i // 3, column=i % 3, sticky="ew", padx=(0, self.px(3)),
+                pady=(self.px(3), self.px(2)))
+        for col in range(3):
+            self.look_tabs.columnconfigure(col, weight=1)
         relight = [None]
 
         def changed():
@@ -968,18 +1032,21 @@ class ImageStudio:
         self.ref_labels = {}
         for kind, label, about in ig.REFERENCE_KINDS:
             row = self.frame(self.ref_box)
-            row.pack(side="top", fill="x", pady=(0, self.px(2)))
-            self.label(row, label, "text", width=13).pack(side="left")
-            clear = self.button(row, "×", lambda k=kind: self._clear_ref(k),
+            row.pack(side="top", fill="x", pady=(0, self.px(14)))
+            self.label(row, label, "text").pack(side="top", anchor="w")
+            name = self.label(row, "—", "faint", self.host.f_small,
+                              wraplength=self.px(340))
+            name.pack(side="top", fill="x", pady=(self.px(3), self.px(4)))
+            buttons = self.frame(row)
+            buttons.pack(side="top", fill="x")
+            clear = self.button(buttons, "Clear", lambda k=kind: self._clear_ref(k),
                                 kind="ghost")
             clear.pack(side="right")
-            self.button(row, "Choose…", lambda k=kind, a=about: self._pick_ref(k, a),
-                        kind="quiet").pack(side="right", padx=(self.px(4), 0))
+            self.button(buttons, "Choose…", lambda k=kind, a=about: self._pick_ref(k, a),
+                        kind="quiet").pack(side="left")
             if kind == "pose":
-                self.button(row, "Draw…", self.edit_pose, kind="quiet").pack(
-                    side="right", padx=(self.px(4), 0))
-            name = self.label(row, "—", "faint", self.host.f_small)
-            name.pack(side="left", fill="x", expand=True)
+                self.button(buttons, "Draw pose…", self.edit_pose, kind="quiet").pack(
+                    side="left", padx=(self.px(4), 0))
             self.ref_labels[kind] = name
 
     def _pick_ref(self, kind, about):
@@ -1137,16 +1204,12 @@ class ImageStudio:
         self._recheck()
 
     def _toggle_person(self):
-        self.pc_open = not self.pc_open
-        self.pc_pill.set(text="Person and camera  " + ("▾" if self.pc_open else "▸"))
-        if self.pc_open:
-            self.pc_box.pack(side="top", fill="x", after=self.pc_pill.master)
-        else:
-            self.pc_box.pack_forget()
+        self._show_section("Image" if self.section == "People" else "People")
 
     def _toggle_advanced(self):
         self.adv_open = not self.adv_open
-        self.adv_pill.set(text="Advanced  " + ("▾" if self.adv_open else "▸"))
+        self.adv_pill.set(text="Advanced  " +
+                         ("▾" if self.adv_open else "▸"))
         if self.adv_open:
             self.adv_box.pack(side="top", fill="x", padx=(self.px(6), self.px(10)),
                               after=self.adv_pill.master)
@@ -1206,6 +1269,7 @@ class ImageStudio:
             bv.set(iid in chosen)
             if chosen.get(iid) is not None:
                 sv.set(chosen[iid])
+        self._show_identity()
         self.scene.delete("1.0", "end")
         self.scene.insert("1.0", s.get("scene") or "")
         for key, var in self.text.items():
@@ -1253,6 +1317,7 @@ class ImageStudio:
             "standard"])["label"] + "  ▾")
         if not self.adv_open:
             self._toggle_advanced()
+        self._show_section("Settings")
         self._recheck()
         self.say("Settings loaded from history. Change anything, then Generate.", "muted")
 
@@ -1431,7 +1496,7 @@ class ImageStudio:
         top.grid(row=0, column=0, sticky="nsew")
         acts = self.frame(top, "card")
         acts.pack(side="bottom", fill="x", padx=self.px(10), pady=(self.px(4), self.px(10)))
-        self.act_again = self.button(acts, "Generate again", self._again_selected, bg="card")
+        self.act_again = self.button(acts, "Repeat seed", self._again_selected, bg="card")
         self.act_vary = self.button(acts, "New seed", lambda: self._again_selected(True),
                                     bg="card")
         self.act_reuse = self.button(acts, "Reuse settings", self._reuse_selected, bg="card")
@@ -1441,6 +1506,7 @@ class ImageStudio:
             p.set(state="disabled")
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
         self.caption.pack(side="bottom", fill="x", padx=self.px(12))
+        self.act_retry_faces = self.button(top, "Retry face swap", self._retry_faces, bg="card")
         self.wrap(self.caption, top, self.px(24))
         self.preview = tk.Label(top, bd=0, highlightthickness=0, text="Nothing yet",
                                 font=self.host.f_ui, cursor="hand2")
@@ -1584,6 +1650,8 @@ class ImageStudio:
                        preset, model.get("label", s.get("model")), job.backend["name"],
                        s.get("seed")) if s.get("mode") != "dress" else
                    "Try On · %s · seed %s" % (job.backend["name"], s.get("seed"))}
+        if ig.local_faces(s):
+            widgets["base"] = "Face swap · this PC"
         for w in (row, right, thumb, thumb.img, status, meta, detail):
             w.bind("<Button-1>", lambda ev: self._select(("job", job)))
         self.rows[job.id] = widgets
@@ -1593,7 +1661,10 @@ class ImageStudio:
         w = self.rows.get(job.id)
         if w is None:
             return
-        w["status"].config(text=job.status.capitalize())
+        cancelling = job.cancel.is_set() and job.status not in ig.FINISHED
+        w["status"].config(text="Cancelling…" if cancelling else job.status.capitalize())
+        if cancelling:
+            w["cancel"].set(state="disabled")
         self.skin(w["status"], bg="card", fg=STATUS_ROLE.get(job.status, "muted"))
         loras = ", ".join("%s %.2f" % (l["name"], l["strength"])
                           for l in (job.plan.lora_meta if job.plan else []))
@@ -1629,7 +1700,7 @@ class ImageStudio:
             self.jobs.insert(0, job)
             if self.view == "queue":
                 self._show_list("queue")
-        if job.status == "complete" and job.outputs and job.id in self.rows:
+        if job.outputs and job.id in self.rows:
             self.set_thumb(self.rows[job.id]["thumb"], job.outputs[0])
             if self.selected is None or self.selected[0] == "job":
                 self._select(("job", job))
@@ -1654,8 +1725,9 @@ class ImageStudio:
                 self.say("A job on %s failed: %s" % (job.backend["name"], job.detail), "err")
                 if self.selected is None or self.selected[0] == "job":
                     self._select(("job", job))
-                    self.preview.config(image="", text="Failed - the reason is below")
-                    self.skin(self.preview, bg="card", fg="err")
+                    if not job.outputs:
+                        self.preview.config(image="", text="Failed - the reason is below")
+                        self.skin(self.preview, bg="card", fg="err")
 
     def _tick(self, _frame):
         """The elapsed clocks and bars, on the window's one tick, and only
@@ -1675,7 +1747,7 @@ class ImageStudio:
         right.pack(side="left", fill="both", expand=True, pady=self.px(6))
         btns = self.frame(right, "card")
         btns.pack(side="top", fill="x")
-        self.button(btns, "Again", lambda: self._again(rec), bg="card").pack(
+        self.button(btns, "Repeat seed", lambda: self._again(rec), bg="card").pack(
             side="right", padx=(0, self.px(6)))
         self.button(btns, "Reuse", lambda: self.reuse(rec["settings"]), bg="card").pack(
             side="right", padx=(0, self.px(4)))
@@ -1692,6 +1764,8 @@ class ImageStudio:
             w.bind("<Button-1>", lambda ev: self._select(("record", rec)))
 
     def describe(self, rec):
+        if rec.get("workflow") == "facefusion":
+            return "Face swap on this PC" + (" · %ss" % rec["duration"] if rec.get("duration") else "")
         bits = [(rec.get("model") or {}).get("label") or "?",
                 (rec.get("backend") or {}).get("name") or "?",
                 "seed %s" % rec.get("seed"),
@@ -1742,6 +1816,15 @@ class ImageStudio:
         self._repaint_preview()
         self.caption.config(text=text)
         rec = self._selected_record()
+        if rec and (rec.get("finish") or {}).get("profiles") and rec["finish"].get("state") != "complete":
+            self.act_retry_faces.pack(side="bottom", anchor="w", padx=self.px(12),
+                                     pady=self.px(4), before=self.preview)
+            self.act_retry_faces.set(state="disabled" if self._face_pass_busy(rec) else "normal")
+            error = rec["finish"].get("error")
+            self.caption.config(text=text + "\nGenerated image kept before the final face swap."
+                                + (" " + error if error else ""))
+        else:
+            self.act_retry_faces.pack_forget()
         for p in (self.act_again, self.act_vary, self.act_reuse):
             p.set(state="normal" if rec or item[0] == "job" else "disabled")
         self.act_fix.set(state="normal" if path and os.path.isfile(path) else "disabled")
@@ -1780,12 +1863,31 @@ class ImageStudio:
         return None
 
     def _again(self, rec, new_seed=False):
-        """The same picture again (its seed, values and backend), or with
-        `new_seed` the same settings on a fresh seed."""
+        """Repeat saved parameters; library entries and backend files remain live."""
         s = ig.again(rec, new_seed)
         self.say(("Same settings, new seed" if new_seed else
-                  "Generating again with seed %s" % s.get("seed")) + ELLIPSIS, "muted")
+                  "Repeating seed %s" % s.get("seed")) +
+                 ". Uses current profiles, styles and model files; the result can differ.", "muted")
         self.host._spawn(self.s.event_id, self._submit, s)
+
+    def _face_pass_busy(self, rec):
+        """A job still finishing `rec`: its own first pass, or a retry of it."""
+        return any(j.status not in ig.FINISHED and (
+            (j.record and j.record["id"] == rec["id"])
+            or (rec.get("path") and (j.settings.get("face_finish") or {}).get("record") == rec["path"]))
+            for j in self.jobs)
+
+    def _retry_faces(self):
+        rec = self._selected_record()
+        if rec:
+            if self._face_pass_busy(rec):
+                return self.say("This face pass is still running. Cancel it before retrying.", "muted")
+            try:
+                settings = ig.retry_faces(rec)
+            except ig.ComfyError as error:
+                return self.say(str(error), "err")
+            self.say("Applying the saved face profiles to the kept picture; no regeneration.", "muted")
+            self.host._spawn(self.s.event_id, self._submit, settings)
 
     def _again_selected(self, new_seed=False):
         rec = self._selected_record()
@@ -1825,6 +1927,8 @@ class ImageStudio:
     # =============================================================== editors
     def _saved(self, kind):
         self._rebuild_choices()
+        if kind == "identities":
+            self._prepare_profiles()
         if kind == "backends":
             self.studio.clients.clear()
             self._paint_health()
@@ -1896,6 +2000,9 @@ class ImageStudio:
             ("category", "Category", ("choice", [(c, c) for c in ig.CATEGORIES])),
             ("trigger", "Trigger phrase", "text"),
             ("strength", "Recommended strength", "number"),
+            ("body_control", "Chest control (female: signed strength; male: size words)",
+             ("choice", [("", "None"), ("chest_female", "Female chest slider"),
+                         ("chest_male", "Male chest sizes")])),
             ("always", "Always on (every picture from a model it suits)", "bool"),
             ("family", "Trained for", ("choice", [("", "unknown")] + list(ig.FAMILIES.items()))),
             ("preview", "Preview image", "path"),
@@ -1930,15 +2037,25 @@ class ImageStudio:
                                   for r in self.studio.lib.all("loras")]
         return RecordEditor(self, "identities", "Identities", [
             ("name", "Name", "text"),
+            ("references", "Reference photos — used to apply this person's face", "paths"),
+            ("avatar", "Profile picture (optional; a generated picture is fine)", "path"),
+            ("face_swap", "Final face swap (needs FaceFusion on this PC)", "bool"),
+            ("notes", "Notes", "long"),
             ("lora", "Identity LoRA", ("choice", loras)),
             ("trigger", "Trigger token", "text"),
             ("strength", "Default LoRA strength", "number"),
-            ("references", "Reference photos", "paths"),
             ("use_references", "Use the first photo as the face reference", "bool"),
             ("reference_strength", "Face reference strength", "number"),
-            ("notes", "Notes", "long"),
-        ], template={"name": "New person", "strength": 0.85},
-            extra=("Pick person…", self._pick_person))
+        ], template={"name": "New person", "strength": 0.85, "face_swap": True},
+            extra=[("Use this person", self._use_profile), ("Pick person…", self._pick_person)])
+
+    def _use_profile(self, editor):
+        if editor.current is None:
+            return
+        if not editor._save():
+            return
+        self._select_identity(editor.records[editor.current]["id"])
+        editor.win.destroy()
 
     # ------------------------------------------------------- person cut-out
     def _pick_person(self, editor):
@@ -2164,16 +2281,25 @@ class ImageStudio:
             ("notes", "Notes", "long"),
         ], template={"name": "New style"})
 
-    def release(self):
+    def can_close(self):
+        sb = self.scene_builder
+        if sb is not None and sb.win.winfo_exists():
+            return sb._ask_save()     # release() -> close() writes the recovery copy
+        return True
+
+    def release(self, confirmed=False):
         """On the UI thread, before the tab's frame goes (`Chat._close_tab`,
         `Chat._quit`): the Scene Builder writes into this form, so it cannot
         outlive it. `close()` runs on a worker thread and must not touch Tk."""
-        sb, self.scene_builder = self.scene_builder, None
+        sb = self.scene_builder
         try:
             if sb is not None and sb.win.winfo_exists():
-                sb.close(final=True)
+                if not sb.close(final=True, confirmed=confirmed):
+                    return False
         except tk.TclError:
             pass
+        self.scene_builder = None
+        return True
 
     def close(self):
         self.studio.close()
@@ -2283,13 +2409,23 @@ class RecordEditor:
                               wraplength=o.px(380))
                 lbl.pack(side="top", fill="x", padx=o.px(8), pady=o.px(2))
                 o.wrap(lbl, box, o.px(20))
+        parent = self.form
         for key, label, kind in self.fields:
-            o.label(self.form, label, "muted", host.f_small).pack(
+            if self.kind == 'identities' and key == 'lora':
+                advanced = o.frame(self.form)
+                def toggle(box=advanced):
+                    if box.winfo_manager():
+                        box.pack_forget()
+                    else:
+                        box.pack(side='top', fill='x')
+                o.button(self.form, 'Advanced settings', toggle, kind='ghost').pack(side='top', anchor='w')
+                parent = advanced
+            o.label(parent, label, "muted", host.f_small).pack(
                 side="top", fill="x", pady=(o.px(8), o.px(2)))
             val = rec.get(key)
             if kind in ("text", "number", "path"):
                 var = tk.StringVar(value="" if val is None else str(val))
-                row = o.frame(self.form)
+                row = o.frame(parent)
                 row.pack(side="top", fill="x")
                 if kind == "path":
                     o.button(row, "Choose…", lambda v=var: self._choose(v)).pack(
@@ -2298,13 +2434,13 @@ class RecordEditor:
                 e.master.pack(side="left", fill="x", expand=True)
                 self.widgets[key] = (kind, var)
                 if kind == "path" and val and os.path.isfile(val):
-                    img = photo(val, o.px(160))
+                    img = photo(val, o.px(160), profile=self.kind == "identities")
                     if img is not None:
                         o.keep.append(img)
-                        tk.Label(self.form, image=img, bd=0).pack(side="top", anchor="w",
+                        tk.Label(parent, image=img, bd=0).pack(side="top", anchor="w",
                                                                   pady=o.px(4))
             elif kind == "long":
-                t = tk.Text(self.form, height=3, wrap="word", bd=0, highlightthickness=0,
+                t = tk.Text(parent, height=3, wrap="word", bd=0, highlightthickness=0,
                             font=host.f_ui, padx=o.px(6), pady=o.px(4))
                 o.skin(t, bg="card", fg="text", insertbackground="accent")
                 t.insert("1.0", val or "")
@@ -2312,7 +2448,7 @@ class RecordEditor:
                 self.widgets[key] = (kind, t)
             elif kind == "bool":
                 var = tk.BooleanVar(value=bool(val))
-                b = tk.Checkbutton(self.form, text="yes", variable=var, anchor="w",
+                b = tk.Checkbutton(parent, text="yes", variable=var, anchor="w",
                                    font=host.f_ui, bd=0, highlightthickness=0)
                 o.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
                        activeforeground="text")
@@ -2320,11 +2456,11 @@ class RecordEditor:
                 self.widgets[key] = (kind, var)
             elif isinstance(kind, tuple) and kind[0] == "choice":
                 var = tk.StringVar(value=val or "")
-                o.choice(self.form, kind[1], val or "", var.set).pack(side="top", anchor="w")
+                o.choice(parent, kind[1], val or "", var.set).pack(side="top", anchor="w")
                 self.widgets[key] = ("choice", var)
             elif isinstance(kind, tuple) and kind[0] == "multi":
                 have, vars_ = set(val or []), {}
-                grid = o.frame(self.form)
+                grid = o.frame(parent)
                 grid.pack(side="top", fill="x")
                 for i, (name, text) in enumerate(kind[1]):
                     var = tk.BooleanVar(value=name in have)
@@ -2337,10 +2473,10 @@ class RecordEditor:
                 self.widgets[key] = ("multi", vars_)
             elif kind == "paths":
                 # A grid of thumbnails; a click selects one for Remove.
-                pics = {"paths": list(val or []), "sel": set(), "grid": o.frame(self.form)}
+                pics = {"paths": list(val or []), "sel": set(), "grid": o.frame(parent)}
                 pics["grid"].pack(side="top", fill="x")
                 self._draw_paths(pics)
-                row = o.frame(self.form)
+                row = o.frame(parent)
                 row.pack(side="top", fill="x", pady=(o.px(4), 0))
                 o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
                     side="left")
@@ -2348,7 +2484,7 @@ class RecordEditor:
                          kind="ghost").pack(side="left", padx=(o.px(4), 0))
                 self.widgets[key] = ("paths", pics)
             elif kind == "kv":
-                t = tk.Text(self.form, height=5, wrap="none", bd=0, highlightthickness=0,
+                t = tk.Text(parent, height=5, wrap="none", bd=0, highlightthickness=0,
                             font=host.f_mono, padx=o.px(6), pady=o.px(4))
                 o.skin(t, bg="card", fg="text", insertbackground="accent")
                 t.insert("1.0", "\n".join("%s = %s" % kv for kv in (val or {}).items()))
@@ -2357,7 +2493,7 @@ class RecordEditor:
             elif kind in ("per_backend", "per_backend_file"):
                 per = {}
                 for b in backends:
-                    row = o.frame(self.form)
+                    row = o.frame(parent)
                     row.pack(side="top", fill="x", pady=(o.px(2), 0))
                     o.label(row, b["name"], "text", width=18).pack(side="left", anchor="n")
                     over = (val or {}).get(b["id"], {} if kind == "per_backend" else "")
@@ -2404,7 +2540,7 @@ class RecordEditor:
             ring = "accent" if i in pics["sel"] else "bg"
             o.skin(tile, bg="card", highlightbackground=ring, highlightcolor=ring)
             tile.grid(row=i // cols, column=i % cols, padx=o.px(2), pady=o.px(2))
-            img = photo(p, side) if os.path.isfile(p) else None
+            img = photo(p, side, profile=self.kind == "identities") if os.path.isfile(p) else None
             if img is not None:
                 o.keep.append(img)
                 lbl = tk.Label(tile, image=img, bd=0, width=side, height=side)
@@ -2530,6 +2666,7 @@ class RecordEditor:
         self._reload_list(idx if idx is not None and idx < len(self.records) else None)
         self.status("Saved.", "ok")
         self.owner._saved(self.kind)
+        return True
 
 
 class FixWindow:
@@ -2563,6 +2700,8 @@ class FixWindow:
         self.target, self.strength, self.mode = "hand", "medium", "redraw"
         self.finding = False
         self.hover = None
+        self.face_point = None
+        self.choosing_face = False
         self.img = None
         try:
             full = tk.PhotoImage(master=host, file=path)
@@ -2620,6 +2759,8 @@ class FixWindow:
         idents = [(i["id"], i["name"]) for i in o.studio.lib.all("identities")]
         self.face_pill = o.choice(row, [("", "None")] + idents, "", self._face_identity)
         self.face_pill.pack(side="left")
+        o.button(row, "Choose face…", self._choose_face, kind="ghost").pack(
+            side="left", padx=o.px(6))
         if not idents:
             o.label(row, "  No identities yet (Library > Identities).", "faint",
                     host.f_small).pack(side="left")
@@ -2689,6 +2830,10 @@ class FixWindow:
             x, y = self.ox + sp["x"] * self.k, self.oy + sp["y"] * self.k
             c.create_rectangle(x - half, y - half, x + half, y + half, **kw)
         c.create_image(self.ox, self.oy, image=self.img, anchor="nw")
+        if self.face_point is not None:
+            x = self.ox + self.face_point[0] * self.w * self.k
+            y = self.oy + self.face_point[1] * self.h * self.k
+            c.create_oval(x - 8, y - 8, x + 8, y + 8, outline=C["ok"], width=2)
         for sp in self.locks:
             square(sp, outline=C["ok"], width=max(2, self.owner.px(2)), dash=(6, 3))
             c.create_text(self.ox + sp["x"] * self.k, self.oy + (sp["y"] - sp["size"] / 2)
@@ -2741,6 +2886,14 @@ class FixWindow:
         press, trail = getattr(self, "press", None), getattr(self, "trail", [])
         self.press, self.trail = None, []
         if press is None:
+            return
+        if self.choosing_face:
+            at = self._to_pic(ev)
+            if at is not None:
+                self.face_point = [at[0] / self.w, at[1] / self.h]
+                self.choosing_face = False
+                self._draw()
+                self._status("Face selected. The swap will use the face under this mark.")
             return
         if len(trail) >= 3:
             return self._lasso(trail)
@@ -2891,6 +3044,10 @@ class FixWindow:
                                 % rec.get("name", ident), "warn")
         self._status("Last, the face becomes %s's." % rec["name"])
 
+    def _choose_face(self):
+        self.choosing_face = True
+        self._status("Click inside the face that should receive the selected identity.")
+
     def _status(self, text=None, role="muted"):
         n = len(self.spots)
         if text is None:
@@ -2916,7 +3073,12 @@ class FixWindow:
         s.update(mode="fix", seed=-1, fix={
             "image": self.path, "target": self.target, "strength": self.strength,
             "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots],
-            "locks": [dict(sp) for sp in self.locks], "face_swap": self.face})
+            "locks": [dict(sp) for sp in self.locks], "face_swap": self.face,
+            "face_point": self.face_point})
+        if ig.local_faces(s):
+            problems = self.owner.studio.preview(s).errors
+            if problems:
+                return self._status(" ".join(problems), "warn")
         self.owner.say("Fixing %s%s" % (ig.fix_words(s["fix"]), ELLIPSIS), "muted")
         self.owner.host._spawn(self.owner.s.event_id, self.owner._submit, s)
         self.win.destroy()
@@ -3663,6 +3825,213 @@ class PoseEditor:
                              "hands": {s: dict(v) for s, v in self.hands.items()},
                              "strength": round(self.strength.get(), 2)})
         self.win.destroy()
+
+class ModelSourceSettings:
+    """Provider settings and reviewable model / upstream-code discoveries."""
+
+    def __init__(self, owner, source):
+        self.owner, self.source = owner, source
+        self.busy = False
+        name, domain, env = model_sources.SOURCES[source]
+        self.win = win = tk.Toplevel(owner.host)
+        win.title(name)
+        win.transient(owner.host)
+        owner.skin(win, bg="bg")
+        win.geometry("%dx%d" % (owner.px(780), owner.px(780)))
+        win.minsize(owner.px(600), owner.px(650))
+        body = owner.frame(win)
+        body.pack(fill="both", expand=True, padx=owner.px(16), pady=owner.px(16))
+        data = model_sources.load(owner.studio.lib.root, source)
+        owner.label(body, "Model links — one per line", "muted").pack(anchor="w")
+        self.links = tk.Text(body, height=3, wrap="word", bd=0,
+                             font=owner.host.f_ui, highlightthickness=0)
+        owner.skin(self.links, bg="card", fg="text", insertbackground="accent")
+        self.links.pack(fill="x", pady=(owner.px(6), owner.px(12)))
+        self.links.insert("1.0", "\n".join(data["links"]))
+        owner.label(body, "API key", "muted").pack(anchor="w")
+        self.token = tk.StringVar(value=data["token"])
+        entry = owner.host._entry(body, self.token)
+        entry.config(show="•")
+        entry.master.pack(fill="x", pady=(owner.px(4), owner.px(8)))
+        if os.environ.get(env):
+            entry.config(state="readonly")
+            note = "API key supplied by %s in your environment." % env
+        else:
+            note = "Saved locally beside your library. The API key is stored unencrypted."
+        owner.label(body, note, "faint", owner.host.f_small,
+                    wraplength=owner.px(540)).pack(fill="x")
+        self.message = owner.label(body, "", "muted", owner.host.f_small,
+                                   wraplength=owner.px(540))
+        self.message.pack(fill="x", pady=owner.px(8))
+        row = owner.frame(body)
+        row.pack(fill="x")
+        owner.button(row, "Save", self.save, kind="accent").pack(side="right")
+        owner.button(row, "Close", win.destroy, kind="ghost").pack(side="right", padx=owner.px(6))
+        if source == "civitai":
+            owner.button(row, "Import LoRAs", self.import_loras).pack(side="left")
+        owner.label(body, "Discover models and code improvements", font=owner.host.f_ui).pack(
+            anchor="w", pady=(owner.px(14), owner.px(4)))
+        owner.label(body, "Checks when opened; successful results are cached for 24 hours. "
+                    "Candidates need review before use.", "faint", owner.host.f_small,
+                    wraplength=owner.px(710)).pack(fill="x")
+        controls = owner.frame(body)
+        controls.pack(fill="x", pady=owner.px(6))
+        self.refresh_button = owner.button(controls, "Refresh now",
+                                           lambda: self.refresh_discoveries(force=True))
+        self.refresh_button.pack(side="right")
+        self.discovery_status = owner.label(controls, "", "muted", owner.host.f_small,
+                                            wraplength=owner.px(530))
+        self.discovery_status.pack(side="left", fill="x", expand=True)
+        scroll, self.results = owner.scrolled(body)
+        scroll.pack(fill="both", expand=True)
+        self.show_discoveries(discovery.cached(owner.studio.lib.root, source))
+
+    def refresh_discoveries(self, force=False):
+        if self.busy:
+            return
+        self.busy = True
+        self.refresh_button.set(state="disabled")
+        self.discovery_status.config(text="Finding models and code releases" + ELLIPSIS)
+        root, source, token = self.owner.studio.lib.root, self.source, self.token.get().strip()
+
+        def work():
+            try:
+                result = discovery.discover(root, source, token, force=force)
+            except Exception:
+                result = {"items": [], "checked": 0, "errors": ["Discovery failed. Try Refresh now."]}
+            self.owner._post("call", lambda: self.show_discoveries(result))
+
+        self.owner.host._spawn(self.owner.s.event_id, work)
+
+    def show_discoveries(self, result):
+        if not self.win.winfo_exists():
+            return
+        self.busy = False
+        self.refresh_button.set(state="normal")
+        for widget in self.results.winfo_children():
+            widget.destroy()
+        checked = result.get("checked", 0)
+        status = ("Checked " + time.strftime("%b %d, %H:%M", time.localtime(checked))) if checked else "No results yet."
+        errors = result.get("errors") or []
+        if errors:
+            status += " · Some feeds unavailable."
+        self.discovery_status.config(text=status)
+        o = self.owner
+        for error in errors:
+            o.label(self.results, error, "warn", o.host.f_small,
+                    wraplength=o.px(680)).pack(fill="x", pady=o.px(4))
+        for item in addons.candidates() + result.get("items", []):
+            card = o.frame(self.results)
+            card.pack(fill="x", pady=o.px(8))
+            title = item["kind"] + " · " + item["title"]
+            if item.get("stale"):
+                title += " (previous result; refresh failed)"
+            o.label(card, title, wraplength=o.px(680)).pack(fill="x")
+            if item["kind"] in ("Code / library", "Supported add-on"):
+                for label, value in (
+                    ("What it does", item.get("purpose", item["why"])),
+                    ("What it can improve", item.get("improves", item["why"])),
+                    ("How it fits the app", item.get("integration", "Refresh for integration details.")),
+                ):
+                    o.label(card, label + ": " + value, "muted", o.host.f_small,
+                            wraplength=o.px(680)).pack(fill="x", pady=(o.px(3), 0))
+                changes = item.get("highlights") or []
+                detail = ("Publisher's release changes:\n" + "\n".join("• " + c for c in changes)
+                          if changes else "No release summary supplied. Review the source for version-specific changes.")
+                if item["kind"] == "Code / library":
+                    o.label(card, detail, "faint", o.host.f_small,
+                            wraplength=o.px(680)).pack(fill="x", pady=o.px(6))
+            else:
+                o.label(card, item["why"], "muted", o.host.f_small,
+                        wraplength=o.px(680)).pack(fill="x")
+                o.label(card, item["details"], "faint", o.host.f_small,
+                        wraplength=o.px(680)).pack(fill="x", pady=o.px(4))
+            actions = o.frame(card)
+            actions.pack(fill="x")
+            if item.get("url"):
+                o.button(actions, "Review source", lambda item=item: self.review_source(item)).pack(side="left")
+            if item["kind"] == "Supported add-on":
+                button = o.button(actions, "Add to app", lambda: None, kind="accent")
+                button.command = lambda item=item, button=button: self.install_addon(item, button)
+                button.pack(side="left")
+            elif item["kind"] == "Code / library":
+                o.label(actions, "Review only — no supported installer yet", "faint", o.host.f_small).pack(
+                    side="left", padx=o.px(6))
+            else:
+                o.button(actions, "Keep link", lambda item=item: self.keep_link(item)).pack(
+                    side="left", padx=o.px(6))
+                if item.get("importable"):
+                    o.button(actions, "Import LoRA", lambda item=item: self.import_candidate(item)).pack(side="left")
+
+    def install_addon(self, item, button):
+        folder = filedialog.askdirectory(parent=self.win,
+                                         title="Choose ComfyUI folder (contains main.py)", mustexist=True)
+        if not folder:
+            return
+        button.set(state="disabled", text="Installing" + ELLIPSIS)
+        self.message.config(text="Installing " + item["title"] + ELLIPSIS)
+
+        def work():
+            try:
+                result = addons.install(item["addon_id"], folder)
+                note = ("Already installed" if result["unchanged"] else "Installed and file verified")
+                note += ": " + result["path"] + ". Restart ComfyUI when its queue is idle, then Check connections."
+                if result["backup"]:
+                    note += " Previous file saved at " + result["backup"]
+                note += " Node loading and required models are checked by ComfyUI after restart."
+                success = True
+            except (OSError, ValueError, SyntaxError) as error:
+                note, success = "Could not install: " + str(error), False
+            self.owner._post("call", lambda: finished(note, success))
+
+        def finished(note, success):
+            self.owner.say(note, "ok" if success else "err")
+            if self.win.winfo_exists():
+                self.message.config(text=note)
+                if button.winfo_exists():
+                    button.set(text="Installed" if success else "Add to app", state="normal")
+
+        self.owner.host._spawn(self.owner.s.event_id, work)
+
+    def review_source(self, item):
+        # Discovery builds these URLs from fixed origins and validated IDs.
+        from urllib.parse import urlsplit
+        url = urlsplit(item["url"])
+        if url.scheme == "https" and url.netloc in ("huggingface.co", "civitai.com", "github.com"):
+            webbrowser.open(item["url"])
+
+    def keep_link(self, item):
+        links = self.links.get("1.0", "end").splitlines()
+        if item["url"] not in links:
+            self.links.insert("end", "\n" + item["url"])
+        self.save()
+
+    def import_candidate(self, item):
+        if not self.save():
+            return
+        dialog = LoraImport(self.owner)
+        dialog.links.delete("1.0", "end")
+        dialog.links.insert("1.0", item["url"])
+
+    def save(self):
+        try:
+            model_sources.save(self.owner.studio.lib.root, self.source,
+                               self.links.get("1.0", "end").splitlines(), self.token.get())
+        except (OSError, ValueError):
+            domain = model_sources.SOURCES[self.source][1]
+            self.message.config(text="Could not save. Check that every link starts with "
+                                "https://%s/ and the library folder is writable." % domain)
+            return False
+        self.message.config(text="Saved.")
+        return True
+
+    def import_loras(self):
+        if self.save():
+            dialog = LoraImport(self.owner)
+            dialog.links.delete("1.0", "end")
+            dialog.links.insert("1.0", self.links.get("1.0", "end").strip())
+            self.win.destroy()
+
 
 class LoraImport:
     """The LoRA library's import window: CivitAI links pasted one per line,
