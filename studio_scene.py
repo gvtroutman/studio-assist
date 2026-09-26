@@ -437,7 +437,8 @@ CLOTH = [
     ("denim", "#4d6a8f"), ("jeans", "#4d6a8f"), ("blue", "#3f6fb0"), ("teal", "#2f7f7f"),
     ("turquoise", "#3aa6a6"), ("green", "#4f7d4a"), ("olive", "#6b6b3a"),
     ("khaki", "#b3a37a"), ("chinos", "#b3a37a"), ("beige", "#cdbb9a"), ("camel", "#b08a5a"),
-    ("tan", "#b48d64"), ("brown", "#6b4a33"), ("leather", "#3b2a22"), ("red", "#b0342f"),
+    ("tan", "#b48d64"), ("brown", "#6b4a33"), ("leather", "#3b2a22"),
+    ("lederhosen", "#5b4030"), ("loden", "#4a5a3c"), ("red", "#b0342f"),
     ("burgundy", "#6e2233"), ("maroon", "#6e2233"), ("wine", "#6e2233"), ("pink", "#e39ab0"),
     ("orange", "#d9772f"), ("yellow", "#e2c23c"), ("mustard", "#c9a032"),
     ("purple", "#6b4a8f"), ("lavender", "#b4a4d6"), ("gold", "#c9a54a"),
@@ -445,7 +446,9 @@ CLOTH = [
 ]
 CLOTH_DEFAULT = {"top": "#8d97a3", "bottom": "#4c5566", "outerwear": "#5e564d",
                  "footwear": "#34302d", "hat": "#4a4540", "glasses": "#2e2a28",
-                 "sunglasses": "#1c1c20", "goggles": "#b9c7cf"}
+                 "sunglasses": "#1c1c20", "goggles": "#b9c7cf", "alpine": "#4a5a3c",
+                 "dirndl": "#7a2433", "apron": "#ecebe6", "blouse": "#ecebe6",
+                 "accordion": "#a3262a", "stein": "#d9d3c2"}
 # What the Shoes slot names, by shape: first match wins, anything else is a
 # plain shoe (loafers, oxfords, brogues) on a thin dark sole.
 SHOES = [
@@ -464,11 +467,16 @@ HEEL = 0.065                     # m a heel lifts the heel of the foot
 # first match wins, so "hard hat" is not read as a plain "hat". The kinds
 # are shapes (`HAT_SHAPES`); the words say the rest.
 HATS = [
+    ("crown", ("flower crown", "floral crown", "flower wreath", "floral wreath",
+               "crown of flowers", "wreath of flowers", "flower headband", "blumenkranz")),
     ("hard hat", ("hard hat", "hardhat", "helmet", "safety helmet")),
     ("top hat", ("top hat",)),
     ("cap", ("baseball cap", "cap", "trucker cap", "flat cap")),
     ("beanie", ("beanie", "headscarf", "head scarf", "bandana", "hijab", "turban",
                 "beret", "hood", "balaclava", "headwrap", "do-rag", "durag")),
+    ("alpine", ("alpine hat", "tyrolean hat", "tyrolean", "tirolean hat", "bavarian hat",
+                "german hat", "trachten hat", "feathered hat", "hat with a feather",
+                "loden hat", "gamsbart")),
     ("wide", ("sun hat", "sunhat", "cowboy hat", "stetson", "sombrero", "straw hat")),
     ("hat", ("hat", "fedora", "trilby", "panama", "bowler", "bucket hat", "boater")),
 ]
@@ -490,7 +498,21 @@ HAT_SHAPES = {
                 (0.252, (0.02, 0.024))], None),
     "wide": ([(0.15, (0.093, 0.108)), (0.25, (0.078, 0.09))], (0.2, 0.21)),
     "hat": ([(0.15, (0.093, 0.108)), (0.25, (0.076, 0.088))], (0.15, 0.165)),
+    "alpine": ([(0.15, (0.093, 0.108)), (0.235, (0.078, 0.09)), (0.27, (0.045, 0.055))],
+               (0.128, 0.143)),
 }
+# The flowers of a flower crown, round the head in turn, unless a colour is said.
+CROWN_FLOWERS = ("#e39ab0", "#ecebe6", "#e2c23c", "#b0342f", "#b4a4d6", "#d9772f")
+CROWN_LEAVES = "#4f7d4a"
+# Things carried, from the Accessories slot: (kind, the words that name it).
+# The words are sent as written; this only puts something in the hands.
+HELD = [
+    ("accordion", ("accordion", "accordian", "squeezebox", "concertina")),
+    ("stein", ("beer stein", "beer steins", "stein", "steins", "beer mug", "beer mugs",
+               "tankard", "tankards", "masskrug", "maßkrug", "maß", "pint of beer",
+               "glass of beer", "beer glass", "beer glasses")),
+]
+BOTH_HANDS = ("steins", "mugs", "tankards", "glasses", "two", "both hands", "pair", "each hand")
 TORSO = ("chest", "belly")
 SLEEVES = ("upper_arm", "forearm")
 LEGS = ("hips", "thigh", "shin")
@@ -498,6 +520,13 @@ LEGS = ("hips", "thigh", "shin")
 
 def _said(text, *words):
     return any(re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(w), text) for w in words)
+
+
+def _near(text, word):
+    """The words just before `word` in `text` ("a pink apron" -> "a pink
+    apron"), for what colour one piece of a garment is."""
+    m = re.search(r"((?:[\w-]+\s+){0,2})%s" % re.escape(word), text)
+    return m.group(0) if m else ""
 
 
 def _has_colour(text):
@@ -535,24 +564,36 @@ def _hem(text, default):
 
 def outfit(look=None):
     """The look's Clothes -> {"regions": {region: rgb}, "hems": [(reach, rgb,
-    outer)], "boots": (height m, rgb) or None}. Empty for a person with no
-    clothes said, who stays the plain mannequin."""
+    outer)], "boots": (height m, rgb) or None, "apron", "braces": rgb or None,
+    "hat", "glasses", "hair", "shoes", "held": {kind: (sides, rgb)}}. Empty
+    for a person with no clothes said, who stays the plain mannequin."""
     look = look if isinstance(look, dict) else {}
     said = {k: str(look.get(k) or "").strip().lower()
             for k in ("top", "bottom", "outerwear", "footwear")}
-    regions, hems, boots = {}, [], None
+    regions, hems, boots, apron, braces = {}, [], None, None, None
     top = said["top"]
     dress = False
     if top:
         rgb = cloth_colour(top, "top")
-        if _said(top, "dress", "gown", "frock", "sundress"):
+        if _said(top, "dress", "gown", "frock", "sundress", "dirndl", "dirndls"):
             dress = True
+            dirndl = _said(top, "dirndl", "dirndls")
+            if dirndl:                    # "a green dirndl with a pink apron" is green
+                own = _near(top, "dirndl")
+                rgb = cloth_colour(own if _has_colour(own) else "", "dirndl")
             cover = TORSO + ("hips",)
             if _said(top, "long-sleeve", "long-sleeved", "long sleeve", "long sleeves"):
                 cover += SLEEVES
             elif _said(top, "short-sleeve", "short-sleeved", "short sleeve", "t-shirt"):
                 cover += ("upper_arm",)
-            hems.append((_hem(top, 1.0), rgb, False))
+            elif dirndl:                  # the blouse's puffed sleeves, white
+                blouse = _near(top, "blouse")
+                regions["upper_arm"] = cloth_colour(
+                    blouse if _has_colour(blouse) else "", "blouse")
+            hems.append((_hem(top, 1.35 if dirndl else 1.0), rgb, False))
+            if dirndl or _said(top, "apron"):
+                bib = _near(top, "apron")
+                apron = cloth_colour(bib if _has_colour(bib) else "", "apron")
         elif _said(top, "suit", "tuxedo", "jumpsuit", "overalls", "boilersuit",
                    "coverall", "coveralls", "onesie"):
             cover = TORSO + SLEEVES + LEGS
@@ -573,13 +614,16 @@ def outfit(look=None):
         if _said(bottom, "skirt", "kilt", "sarong"):
             cover = ("hips",)
             hems.append((_hem(bottom, 0.9), rgb, False))
-        elif _said(bottom, "shorts", "briefs", "trunks", "boxers", "swimsuit"):
+        elif _said(bottom, "shorts", "briefs", "trunks", "boxers", "swimsuit",
+                   "lederhosen"):
             cover = ("hips", "thigh")
         else:
             cover = LEGS
         if dress:                         # under a dress, only the legs show
             cover = tuple(c for c in cover if c != "hips")
         regions.update(dict.fromkeys(cover, rgb))
+        if _said(bottom, "lederhosen", "suspenders", "braces", "dungarees") and not dress:
+            braces = rgb
     outer = said["outerwear"]
     if outer:
         rgb = cloth_colour(outer, "outerwear")
@@ -603,19 +647,30 @@ def outfit(look=None):
         if kind == "boots":
             boots = (0.09 if _said(feet, "ankle") else 0.24, rgb)
     hat = glasses = None
+    held = {}
     for item in (str(look.get("accessories") or "").lower().split(",")):
         item = item.strip()
+        kind = next((k for k, words in HELD if _said(item, *words)), None)
+        if kind and kind not in held:
+            sides = ("l", "r") if kind == "stein" and _said(item, *BOTH_HANDS) else ("r",)
+            held[kind] = (sides, cloth_colour(item if _has_colour(item) else "", kind))
+            continue                      # "a red accordion" is not a red hat
         kind = next((k for k, words in HATS if _said(item, *words)), None)
         if kind and not hat:
             rgb = cloth_colour(item, "hat")
             if kind == "hard hat" and not _has_colour(item):
                 rgb = hex_rgb("#e2c23c")          # a hard hat unsaid is site yellow
+            elif kind == "alpine" and not _has_colour(item):
+                rgb = hex_rgb(CLOTH_DEFAULT["alpine"])    # loden green
+            elif kind == "crown" and not _has_colour(item):
+                rgb = None                                # flowers of every colour
             hat = (kind, rgb)
         kind = next((k for k, words in GLASSES if _said(item, *words)), None)
         if kind and not glasses:
             glasses = (kind, cloth_colour(item, kind))
     return {"regions": regions, "hems": hems, "boots": boots, "hat": hat,
-            "glasses": glasses, "hair": hairdo(look), "shoes": shoes}
+            "glasses": glasses, "hair": hairdo(look), "shoes": shoes, "apron": apron,
+            "braces": braces, "held": held}
 
 
 # Hair, from the look's Hair section: the colour's words, and the style's
@@ -766,7 +821,8 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     # The head, less what a scalp of hair covers: a big face of it sorts in
     # front of the hair over it and shows through as a pale speck.
     hair = dressed.get("hair")
-    scalp = bool(hair and hair["cap"] and not dressed.get("hat"))
+    hat = dressed.get("hat")
+    scalp = bool(hair and hair["cap"] and not (hat and hat[0] != "crown"))
     skull = [[at("head", p) for p in f]
              for f in ellipsoid((0, 0.11, 0.01), IDENTITY, (0.085, 0.115, 0.1))
              if not (scalp and centroid(f)[1] > hairline(centroid(f)[0], centroid(f)[2] - 0.01))]
@@ -797,8 +853,19 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     out.append(("head", "head", outward([[nose[i] for i in f] for f in idx])))
     head_box = lambda lo, hi: outward([[at("head", p) for p in f]    # noqa: E731
                                        for f in box(lo, hi)])
-    if dressed.get("hat"):
-        kind, rgb = dressed["hat"]
+    if hat and hat[0] == "crown":
+        # Flowers round the head where a band would sit, on a ring of leaves.
+        rgb = hat[1]
+        out.append(("head", hex_rgb(CROWN_LEAVES), prism(
+            at("head", (0, 0.168, 0.01)), at("head", (0, 0.184, 0.01)), X("head"),
+            (0.084, 0.098), (0.08, 0.094), 12)))
+        for i in range(10):
+            t = 2 * math.pi * i / 10
+            c = at("head", (0.083 * math.sin(t), 0.18, 0.01 + 0.097 * math.cos(t)))
+            out.append(("head", rgb or hex_rgb(CROWN_FLOWERS[i % len(CROWN_FLOWERS)]),
+                        ellipsoid(c, M("head"), (0.022, 0.02, 0.022), 6, 4)))
+    elif hat:
+        kind, rgb = hat
         rings, brim = HAT_SHAPES[kind]
         for (y0, r0), (y1, r1) in zip(rings, rings[1:]):
             out.append(("head", rgb, prism(at("head", (0, y0, 0.01)),
@@ -810,6 +877,13 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                            X("head"), brim, brim, 16)))
         if kind == "cap":                 # the visor, forward over the eyes
             out.append(("head", rgb, head_box((-0.07, 0.14, 0.07), (0.07, 0.152, 0.2))))
+        if kind == "alpine":              # a cord band and the feather at its side
+            out.append(("head", tuple(int(c * 0.55) for c in rgb), prism(
+                at("head", (0, 0.152, 0.01)), at("head", (0, 0.172, 0.01)), X("head"),
+                (0.094, 0.109), (0.092, 0.107), 12)))
+            out.append(("head", (216, 212, 200), prism(
+                at("head", (0.085, 0.17, -0.03)), at("head", (0.098, 0.27, -0.06)),
+                X("head"), (0.01, 0.025), (0.004, 0.012), 4)))
     if hair:
         rgb, v = hair["rgb"], hair["volume"]
         hp = lambda v3: at("head", v3)                     # noqa: E731
@@ -881,6 +955,53 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
             out.append((foot, shaft[1], prism(at("ankle_" + side, (0, -0.02, 0)), shin_end,
                                               X("knee_" + side), r((0.05, 0.05), shin),
                                               r((0.052, 0.052), shin))))
+    # Braces over the chest: two straps down the front, a bar across them.
+    if dressed.get("braces"):
+        rgb, fz = dressed["braces"], 0.1 * chest + 0.012
+        for sx in (1, -1):
+            out.append(("body", rgb, prism(at("spine", (sx * 0.075, -0.02, 0.095 * belly + 0.012)),
+                                           at("chest", (sx * 0.085, 0.19, fz)), X("chest"),
+                                           (0.018, 0.006), (0.018, 0.006), 4)))
+        out.append(("body", rgb, prism(at("chest", (-0.09, 0.1, fz + 0.004)),
+                                       at("chest", (0.09, 0.1, fz + 0.004)), (0, 1, 0),
+                                       (0.025, 0.006), (0.025, 0.006), 4)))
+    held = dressed.get("held") or {}
+    if "accordion" in held:
+        # Across the chest, bellows between two ends; the Carrying pose puts
+        # the hands on it.
+        _, rgb = held["accordion"]
+        z = 0.11 * chest + 0.13
+        chest_box = lambda lo, hi: outward([[at("chest", p) for p in f]   # noqa: E731
+                                            for f in box(lo, hi)])
+        out += [("body", rgb, chest_box((-0.23, -0.2, z - 0.1), (-0.15, 0.12, z + 0.1))),
+                ("body", rgb, chest_box((0.15, -0.2, z - 0.1), (0.23, 0.12, z + 0.1))),
+                ("body", (236, 235, 230), chest_box((0.155, -0.18, z + 0.1),
+                                                    (0.225, 0.1, z + 0.115)))]   # keys
+        for i in range(8):                # the bellows' pleats, dark and light
+            x0 = -0.15 + 0.3 * i / 8
+            deep = 0.085 if i % 2 else 0.07
+            out.append(("body", (42, 37, 34) if i % 2 else tuple(int(c * 0.45) for c in rgb),
+                        chest_box((x0, -0.18, z - deep), (x0 + 0.3 / 8, 0.1, z + deep))))
+    if "stein" in held:
+        sides, rgb = held["stein"]
+        for side in sides:
+            # Upright whatever the arm does, in front of the palm.
+            c = at("wrist_" + side, (0, -0.1, 0.085))
+            lo, hi = add(c, (0, -0.085, 0)), add(c, (0, 0.085, 0))
+            out.append(("hand_" + side, rgb, prism(lo, hi, (1, 0, 0), (0.048, 0.048),
+                                                   (0.045, 0.045), 10)))
+            out.append(("hand_" + side, (246, 242, 230), prism(
+                hi, add(hi, (0, 0.022, 0)), (1, 0, 0), (0.046, 0.046), (0.04, 0.04), 10)))
+    if dressed.get("apron"):
+        # A plate down the front of the skirt, from the waist to the knee.
+        fwd = column(M("pelvis"), 2)
+        knee = mul(add(P("knee_l"), P("knee_r")), 0.5)
+        top_z, low_z = 0.105 * hips + 0.02, 0.08 * thigh + 0.1
+        a, b = at("pelvis", (0.11, 0.02, top_z)), at("pelvis", (-0.11, 0.02, top_z))
+        low = add(add(knee, mul(fwd, low_z)), (0, 0.06, 0))
+        wide = mul(X("pelvis"), 0.14)
+        out.append(("body", dressed["apron"], [[a, add(low, wide), sub(low, wide), b],
+                                               [b, sub(low, wide), add(low, wide), a]]))
     # Hems: a skirt or a coat below the waist, a flared tube from the hips to
     # a line across both legs `reach` of the way down (1 the knee, 2 the
     # ankle), so it follows a step or a seat.
@@ -1048,6 +1169,23 @@ def character_look(rec, look=None):
         look.pop(k, None)
     look.update((rec or {}).get("looks") or {})
     return clean_look(look)
+
+
+def wear_outfit(rec, look=None):
+    """A clothes preset put on a person: every clothes and accessories slot
+    is the preset's, blank where it has none; the body, face and hair stay."""
+    import studio_imagegen as ig
+    look = dict(look or {})
+    for k in ig.OUTFIT_KEYS:
+        look.pop(k, None)
+    look.update((rec or {}).get("looks") or {})
+    return clean_look(look)
+
+
+def outfit_looks(look):
+    """What a person wears, as a preset keeps it."""
+    import studio_imagegen as ig
+    return {k: look[k] for k in ig.OUTFIT_KEYS if (look or {}).get(k)}
 
 
 def look_text(obj):
@@ -1385,12 +1523,14 @@ def frame_size(scene):
 class Poly:
     """One face on screen: points in frame pixels, a colour, its depth, and
     the object and part it belongs to (None for the room). `tex` is a
-    `TexMap` when the face wears a picture; `rgb` is then its mean colour."""
-    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex")
+    `TexMap` when the face wears a picture; `rgb` is then its mean colour.
+    `dim` (0-1) makes it a shadow: it darkens what is under it by that
+    factor instead of painting over it, and `rgb` is only a stand-in."""
+    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex", "dim")
 
-    def __init__(self, pts, rgb, depth, owner, part, tex=None):
+    def __init__(self, pts, rgb, depth, owner, part, tex=None, dim=None):
         self.pts, self.rgb, self.depth, self.owner, self.part = pts, rgb, depth, owner, part
-        self.tex = tex
+        self.tex, self.dim = tex, dim
 
 
 class TexMap:
@@ -1445,9 +1585,13 @@ def render(scene, width=None, height=None):
         width, height = frame_size(scene)
     cam = Camera(scene["camera"], width, height)
     polys = room_polys(scene, cam)
+    tex = texture((scene.get("room") or new_room())["floor"]["image"])
+    floor = tex.mean if tex else FLOOR
     faces = []
     for obj in scene["objects"]:
-        for part, fs, rgb in painted_pieces(obj):
+        pieces = painted_pieces(obj)
+        polys += shadow_polys(pieces, cam, floor)
+        for part, fs, rgb in pieces:
             for f in fs:
                 n = newell(f)
                 if dot(n, sub(centroid(f), cam.eye)) >= 0:
@@ -1460,6 +1604,77 @@ def render(scene, width=None, height=None):
                                   obj["id"], part))
     faces.sort(key=lambda p: -p.depth)
     return polys + faces
+
+
+# Contact shadows: (metres grown past the footprint, factor it darkens by).
+# Rings overlap, so the middle is the product of them all: dark where the
+# sole meets the floor, fading out past it. Without them the mannequin reads
+# as pasted on the floor, and the picture made from the frame draws the
+# person hovering over it.
+CONTACT = tuple((0.1 * (1 - i / 7.0) + 0.01, 0.93) for i in range(7))
+AMBIENT_SHADOW = tuple((0.2 * (1 - i / 4.0) + 0.02, 0.96) for i in range(4))
+CONTACT_REACH = 0.04           # m above its lowest point a part still touches
+AMBIENT_REACH = 0.3            # m above it whose outline casts the faint shadow
+
+
+def hull(pts):
+    """The convex hull of 2D points, counter-clockwise (monotone chain)."""
+    pts = sorted(set(pts))
+    if len(pts) < 3:
+        return pts
+    cross2 = lambda o, a, b: (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])  # noqa
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and cross2(out[-2], out[-1], p) <= 0:
+                out.pop()
+            out.append(p)
+        return out[:-1]
+    return half(pts) + half(reversed(pts))
+
+
+def grown(outline, r, sides=16):
+    """A floor outline grown by `r` metres all round, corners rounded."""
+    ring = [(math.cos(2 * math.pi * i / sides) * r, math.sin(2 * math.pi * i / sides) * r)
+            for i in range(sides)]
+    return hull([(x + dx, z + dz) for x, z in outline for dx, dz in ring])
+
+
+def shadow_polys(pieces, cam, floor=FLOOR):
+    """The soft shadow an object leaves on the floor, as `dim` polys: a
+    dark contact ring under each part that touches (each foot, a knee, a
+    box's base) and a faint one under the whole body. Only for an object on
+    the floor itself: one standing on a platform at y > 0 would have its
+    shadow drawn under the platform, since the room is drawn first."""
+    pts = [p for _, faces, _ in pieces for f in faces for p in f]
+    if not pts or cam.eye[1] <= 0:
+        return []
+    low = min(p[1] for p in pts)
+    if low > 0.02:
+        return []
+    touching = {}
+    for part, faces, _ in pieces:
+        for f in faces:
+            for p in f:
+                if p[1] <= low + CONTACT_REACH:
+                    touching.setdefault(part, []).append((p[0], p[2]))
+    whole = hull([(p[0], p[2]) for p in pts if p[1] <= low + AMBIENT_REACH])
+    rings = [(whole, AMBIENT_SHADOW)] if len(whole) >= 3 else []
+    rings += [(hull(foot), CONTACT) for foot in touching.values()]
+    out = []
+    for outline, steps in rings:
+        if not outline:
+            continue
+        seen = 1.0
+        for r, k in steps:
+            seen *= k
+            c = clip_near([cam.to_camera((x, 0.001, z)) for x, z in grown(outline, r)])
+            if len(c) >= 3:
+                out.append(Poly([cam.to_screen(p) for p in c],
+                                tuple(int(v * seen) for v in floor), float("inf"),
+                                None, "shadow", dim=k))
+    return out
 
 
 def room_polys(scene, cam):
@@ -1542,6 +1757,7 @@ def rasterise(polys, width, height, sky=SKY, flat=False):
             continue
         colour = bytes(poly.rgb)
         tex = None if flat else poly.tex
+        dim = bytes(int(v * poly.dim) for v in range(256)) if poly.dim else None
         edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
         edges = [(a, b) if a[1] <= b[1] else (b, a) for a, b in edges if a[1] != b[1]]
         for y in range(y0, y1 + 1):
@@ -1555,8 +1771,11 @@ def rasterise(polys, width, height, sky=SKY, flat=False):
             if xb < xa:
                 continue
             row = y * stride
-            buf[row + xa * 3:row + (xb + 1) * 3] = (tex.span(y, xa, xb) if tex else
-                                                    colour * (xb - xa + 1))
+            a, b = row + xa * 3, row + (xb + 1) * 3
+            if dim:
+                buf[a:b] = bytes(buf[a:b]).translate(dim)
+            else:
+                buf[a:b] = tex.span(y, xa, xb) if tex else colour * (xb - xa + 1)
     return bytes(buf)
 
 
