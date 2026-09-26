@@ -80,7 +80,7 @@ class SceneBuilder:
         self.taken = set()            # ids of the finished picture jobs already used
         self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
         self.bake_after = None
-        self.suggestion = None        # (detail, why) offered by Enrich, awaiting an answer
+        self.suggestion = None        # what Enrich offered (sc.new_suggestion), awaiting an answer
         self.enriching = False
 
         win = self.win = tk.Toplevel(host)
@@ -399,7 +399,14 @@ class SceneBuilder:
         already added, each removable."""
         o, e = self.owner, self.scene.setdefault("enrich", sc.new_enrich())
         if self.suggestion:
-            detail, why = self.suggestion
+            sug = self.suggestion
+            detail, why = sug["detail"], sug["why"]
+            if sug["shape"] in sc.ASSET:
+                why = ("Adds a %s%s, %s. " % (sc.ASSET[sug["shape"]]["label"].lower(),
+                                              ' "%s"' % sug["name"] if sug["name"] else "",
+                                              sug["where"].replace("_", " ")) + why).strip()
+            else:
+                why = ("Words only. " + why).strip()
             o.cap(p, "Suggested detail")
             card = o.frame(p, "card")
             card.pack(side="top", fill="x")
@@ -484,11 +491,23 @@ class SceneBuilder:
     def _answer(self, answer):
         if not self.suggestion:
             return
-        detail = self.suggestion[0]
-        sc.enrich_answer(self.scene, detail, answer)
-        self.suggestion = None
-        self.status({"add": "Added to the words.", "skip": "Skipped.",
-                     "never": "Won't be suggested again."}[answer], "muted")
+        sug, self.suggestion = self.suggestion, None
+        obj = sc.place_suggestion(self.scene, sug) if answer == "add" else None
+        if obj:
+            self.scene["objects"].append(obj)
+            sc.enrich_answer(self.scene, sug["detail"], "placed")
+            self.status("Added %s to the scene, %s. Drag it wherever it looks right."
+                        % (obj["name"], ", ".join(sc.placement(self.scene, obj) or [])),
+                        "ok")
+            self.select(obj["id"])
+            self.changed(rebuild_list=True)
+            return
+        sc.enrich_answer(self.scene, sug["detail"], answer)
+        say = {"add": "Added to the words.", "skip": "Skipped.",
+               "never": "Won't be suggested again."}[answer]
+        if answer == "add" and sug["shape"] in sc.ASSET:
+            say = "No free place in the frame for it, so it went into the words."
+        self.status(say, "muted")
         self._inspect()
         self.changed()
 

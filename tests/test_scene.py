@@ -913,12 +913,97 @@ class EnrichTest(unittest.TestCase):
         return s
 
     def test_reads_json_prose_and_thinking(self):
-        self.assertEqual(sc.read_suggestion('<think>hmm</think>{"detail": "A pretzel basket '
-                                            'on a far table.", "why": "food"}'),
-                         ("A pretzel basket on a far table.", "food"))
-        self.assertEqual(sc.read_suggestion("Suggested enrichment: - A jacket over a bench.")[0],
-                         "A jacket over a bench.")
-        self.assertEqual(sc.read_suggestion(""), (None, None))
+        got = sc.read_suggestion('<think>hmm</think>{"detail": "A pretzel basket on a far '
+                                 'table.", "why": "food", "shape": "box", "size": [1.8, 0.75, '
+                                 '0.8], "colour": "#8A6A4A", "where": "behind_left"}')
+        self.assertEqual((got["detail"], got["why"], got["shape"], got["where"], got["colour"]),
+                         ("A pretzel basket on a far table.", "food", "box", "behind_left",
+                          "#8a6a4a"))
+        self.assertEqual(got["size"], [1.8, 0.75, 0.8])
+        prose = sc.read_suggestion("Suggested enrichment: - A jacket over a bench.")
+        self.assertEqual((prose["detail"], prose["shape"]), ("A jacket over a bench.", "none"))
+        self.assertIsNone(sc.read_suggestion(""))
+        # Nonsense fields fall back rather than reaching the scene.
+        bad = sc.read_suggestion('{"detail": "A lamp post.", "shape": "tree", "size": [1, "x"],'
+                                 ' "where": "inside Gavin", "colour": "red"}')
+        self.assertEqual((bad["shape"], bad["size"], bad["where"], bad["colour"]),
+                         ("none", None, "behind", ""))
+
+    def two_people(self):
+        s = self.scene()
+        s["objects"].append(sc.new_object("person", s["objects"]))
+        s["objects"][0]["position"] = [-0.5, 0.0, 0.0]
+        s["objects"][1]["position"] = [0.5, 0.0, 0.0]
+        return s
+
+    def test_places_around_the_people_as_the_camera_sees_it(self):
+        s = self.two_people()
+        cam = sc.Camera(s["camera"], *sc.frame_size(s))
+        for where in sc.WHERE:
+            sug = sc.new_suggestion("A long wooden festival table.")
+            # Close to the lens a table would cover their legs; a basket fits.
+            size = [0.4, 0.3, 0.3] if where.startswith("foreground") else [1.8, 0.75, 0.8]
+            sug.update(shape="box", size=size, where=where, name="Table")
+            obj = sc.place_suggestion(s, sug)
+            self.assertIsNotNone(obj, where)
+            self.assertIsNotNone(sc.placement(s, obj), where)
+            for other in s["objects"]:     # never on top of anyone, nor hidden or hiding
+                self.assertFalse(sc._overlaps(sc.bounds(obj), sc.bounds(other), gap=0), where)
+                self.assertFalse(sc._hides(sc._screen_rect(cam, obj),
+                                           sc._screen_rect(cam, other)), where)
+            depth = sc.dot(sc.sub(obj["position"], (0, 0, 0)), sc._flat(cam.f))
+            across = sc.dot(obj["position"], sc._flat(cam.r))
+            if where.startswith("behind") or where == "far_background":
+                self.assertGreater(depth, 0.5, where)
+            if where.startswith("foreground"):
+                self.assertLess(depth, 0, where)
+            if where.endswith("left"):
+                self.assertLess(across, -0.5, where)
+            if where.endswith("right"):
+                self.assertGreater(across, 0.5, where)
+        above = sc.new_suggestion("Bunting.")
+        above.update(shape="box", size=[3, 0.1, 0.1], where="above")
+        self.assertEqual(sc.place_suggestion(s, above)["position"][1], 2.4)
+
+    def test_placed_object_carries_the_words_and_a_second_goes_elsewhere(self):
+        s = self.two_people()
+        sug = sc.new_suggestion("Two half-full steins on a far table.")
+        sug.update(shape="box", size=[1.8, 0.75, 0.8], where="behind_right", name="Beer table")
+        first = sc.place_suggestion(s, sug)
+        s["objects"].append(first)
+        second = sc.place_suggestion(s, sug)
+        self.assertEqual(second["name"], "Beer table 2")
+        self.assertFalse(sc._overlaps(sc.bounds(first), sc.bounds(second), gap=0))
+        self.assertIn("Beer table (", sc.scene_text(s).text)
+        self.assertIn("Two half-full steins on a far table.", sc.scene_text(s).text)
+        self.assertEqual(first["colour"], sc.ASSET["box"]["colour"])
+
+    def test_a_passer_by_faces_as_asked_and_bodiless_stays_words(self):
+        s = self.two_people()
+        sug = sc.new_suggestion("A blurred couple in dirndl and lederhosen.")
+        sug.update(shape="person", size=[0.5, 1.7, 0.3], where="far_background")
+        obj = sc.place_suggestion(s, sug)
+        self.assertEqual(obj["asset"], "person")
+        self.assertEqual(sc.facing(s, obj), "facing the camera")
+        sug["facing"] = "side"
+        self.assertIn("profile", sc.facing(s, sc.place_suggestion(s, sug)))
+        light = sc.new_suggestion("Warm uneven tent light.")
+        self.assertIsNone(sc.place_suggestion(s, light))
+        # A table too big for the foreground goes behind them, same side.
+        big = sc.new_suggestion("A long table.")
+        big.update(shape="box", size=[1.8, 0.75, 0.8], where="foreground_left")
+        self.assertIsNone(sc._place(s, big))
+        self.assertEqual(sc.placement(s, sc.place_suggestion(s, big))[0], "left of frame")
+
+    def test_a_placed_passer_by_does_not_move_the_subjects(self):
+        s = self.two_people()
+        walker = sc.new_suggestion("A blurred stranger crossing far behind.")
+        walker.update(shape="person", where="far_background")
+        s["objects"].append(sc.place_suggestion(s, walker))
+        sc.enrich_answer(s, walker["detail"], "placed")
+        mat = sc.new_suggestion("A curled beer mat on the cobbles.")
+        mat.update(shape="box", size=[0.3, 0.05, 0.3], where="foreground_left")
+        self.assertGreater(sc.place_suggestion(s, mat)["position"][2], 0.5)
 
     def test_prompt_carries_scene_history_and_rotates(self):
         s = self.scene()
@@ -936,7 +1021,7 @@ class EnrichTest(unittest.TestCase):
         sc.enrich_answer(s, "A jacket draped over a bench.", "skip")
         llm = FakeLLM('{"detail": "a jacket draped over a bench"}',
                       '{"detail": "Condensation beading on a stein at the frame edge."}')
-        self.assertEqual(sc.suggest(s, llm)[0],
+        self.assertEqual(sc.suggest(s, llm)["detail"],
                          "Condensation beading on a stein at the frame edge.")
         with self.assertRaises(RuntimeError):
             sc.suggest(s, FakeLLM('{"detail": "A jacket draped over a bench."}',
