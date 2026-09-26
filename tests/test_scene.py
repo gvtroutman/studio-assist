@@ -364,6 +364,92 @@ class TestRender(unittest.TestCase):
         self.assertNotEqual(sc.write_reference(s, d), a)
 
 
+class TestLibraryAssets(unittest.TestCase):
+    """Shapes, props and the background crowd."""
+
+    def test_every_asset_stands_on_the_floor_and_is_drawn(self):
+        for a in sc.ASSETS:
+            with self.subTest(asset=a["id"]):
+                self.assertIn(a["group"], dict(sc.ASSET_GROUPS))
+                s = staged(a["id"])
+                obj = s["objects"][0]
+                obj["position"] = [0.5, 0.25, -1.0]
+                self.assertAlmostEqual(sc.bounds(obj)[0][1], 0.25)
+                self.assertTrue([p for p in sc.render(s) if p.owner == obj["id"]])
+                again, problems = sc.clean_scene(json.loads(json.dumps(s)))
+                self.assertEqual(problems, [])
+                self.assertEqual(again["objects"][0]["asset"], a["id"])
+
+    def test_a_prop_is_sized_in_metres(self):
+        s = staged("table")
+        s["objects"][0]["scale"] = [2.0, 0.75, 0.8]
+        lo, hi = sc.bounds(s["objects"][0])
+        self.assertAlmostEqual(hi[0] - lo[0], 2.0, places=3)
+        self.assertAlmostEqual(hi[1] - lo[1], 0.75, places=3)
+
+    def test_a_props_parts_keep_their_own_colours(self):
+        tree = staged("tree")["objects"][0]
+        colours = {rgb for _, _, rgb in sc.painted_pieces(tree)}
+        self.assertIn(sc.hex_rgb("#5a3e2b"), colours)             # the trunk
+        self.assertIn(sc.hex_rgb(tree["colour"]), colours)        # the leaves: its colour
+
+    def test_a_crowd_is_many_different_people_the_same_each_time(self):
+        crowd = sc.new_crowd()
+        crowd.update(count=20, width=8, depth=4)
+        a, b = sc.crowd_members(crowd), sc.crowd_members(dict(crowd))
+        self.assertEqual(len(a), 20)
+        self.assertEqual(a, b)
+        for i, m in enumerate(a):
+            self.assertLessEqual(abs(m["at"][0]), 4)
+            self.assertLessEqual(abs(m["at"][1]), 2)
+            for n in a[i + 1:]:
+                gap = math.hypot(m["at"][0] - n["at"][0], m["at"][1] - n["at"][1])
+                self.assertGreaterEqual(gap, sc.CROWD_SPACING)
+        self.assertGreater(len({json.dumps(m["look"], sort_keys=True) for m in a}), 10)
+        crowd["seed"] = 2
+        self.assertNotEqual(sc.crowd_members(crowd), a)
+
+    def test_a_crowd_can_be_dressed_from_presets(self):
+        crowd = sc.new_crowd()
+        crowd["wear"] = [{"top": "dirndl"}, {"bottom": "lederhosen"}]
+        tops = {m["look"].get("top") or m["look"].get("bottom")
+                for m in sc.crowd_members(crowd)}
+        self.assertEqual(tops, {"dirndl", "lederhosen"})
+
+    def test_too_many_for_the_floor_is_as_many_as_fit(self):
+        crowd = sc.new_crowd()
+        crowd.update(count=40, width=1.0, depth=0.5)
+        self.assertLess(len(sc.crowd_members(crowd)), 40)
+
+    def test_a_crowd_is_said_in_one_line_and_is_not_the_scenes_people(self):
+        s = staged("crowd")
+        s["objects"][0]["position"] = [0, 0, -3]
+        s["objects"][0]["description"] = "Oktoberfest revellers, laughing."
+        s["objects"][0]["crowd"].update(count=7, activity="cheering")
+        text = sc.scene_text(s).text
+        self.assertIn("Crowd (a background crowd of 7 people", text)
+        self.assertIn("cheering, raising a glass", text)
+        self.assertIn("Oktoberfest revellers, laughing.", text)
+        self.assertEqual(sc.people(s), [])
+        _, _, extra = sc.generation(s, "/x/ref.png")
+        self.assertNotIn("subject", extra)                     # the form's person stays
+
+    def test_each_person_in_a_crowd_casts_their_own_shadow(self):
+        s = staged("crowd")
+        s["objects"][0]["crowd"].update(count=5, width=6, depth=2)
+        cam = sc.Camera(s["camera"], *sc.frame_size(s))
+        pieces = sc.painted_pieces(s["objects"][0])
+        whole = len(sc.shadow_polys(pieces, cam))
+        each = len([p for p in sc.render(s) if p.dim])
+        self.assertGreater(each, whole)
+
+    def test_a_damaged_crowd_opens_within_its_limits(self):
+        c = sc.clean_crowd({"count": 900, "width": -3, "facing": "sideways",
+                            "wear": [{"top": "dirndl", "hair": "red"}, "junk", {}]})
+        self.assertEqual((c["count"], c["width"], c["facing"]), (40, 1.0, "mixed"))
+        self.assertEqual(c["wear"], [{"top": "dirndl"}])
+
+
 class TestRoom(unittest.TestCase):
     """The floor and walls, and the pictures they wear."""
 
@@ -1032,6 +1118,27 @@ class TestSceneBuilderWindow(unittest.TestCase):
             sb._delete_outfit("red NIGHT")
         self.assertEqual(ui.studio.lib.all("outfits"), [])
         self.assertEqual(b["look"]["top"], "red sweater")    # wearers keep their clothes
+
+    def test_a_background_crowd_in_the_window(self):
+        ui, sb = self.builder()
+        crowd = sb.add("crowd")
+        self.assertIn("crowd_count", sb.vars)
+        self.assertTrue(sb.canvas.find_withtag("o:" + crowd["id"]))
+        seed = crowd["crowd"]["seed"]
+        sb._shuffle_crowd(crowd)
+        self.assertNotEqual(crowd["crowd"]["seed"], seed)
+        preset = ui.studio.lib.all("outfits")[0]
+        sb._dress_crowd(crowd, preset["id"])
+        self.assertEqual(crowd["crowd"]["wear"], [preset["looks"]])
+        sb._dress_crowd(crowd, "*")
+        self.assertEqual(len(crowd["crowd"]["wear"]), len(ui.studio.lib.all("outfits")))
+        sb._dress_crowd(crowd, "")
+        self.assertEqual(crowd["crowd"]["wear"], [])
+        self.assertIn("background crowd", sb.words_label.cget("text"))
+        for asset in ("tree", "sphere"):
+            obj = sb.add(asset)
+            self.assertIn("size0", sb.vars)                      # sized in metres
+            self.assertEqual(sb.sel, obj["id"])
 
     def test_empty_space_orbits_and_the_wheel_zooms(self):
         ui, sb = self.builder()
