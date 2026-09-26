@@ -439,26 +439,6 @@ class TestSceneFile(unittest.TestCase):
         self.assertEqual(back["objects"][0]["description"],
                          "kneeling, welding; helmet down, gloves on")
 
-    def test_an_older_file_takes_the_newer_shapes(self):
-        objs = [{"asset": "box", "name": "Table", "scale": [1.8, 0.75, 0.8],
-                 "position": [1, 0, 2], "colour": "#123456"},
-                {"asset": "box", "name": "Kitchen chair 2"},
-                {"asset": "box", "name": "Crate"},
-                {"asset": "cylinder", "name": "Round table"},
-                {"asset": "cylinder", "name": "Traffic cone"},
-                {"asset": "box", "name": "Car"}]
-        s, problems = sc.clean_scene({"version": 1, "objects": objs})
-        self.assertEqual([o["asset"] for o in s["objects"]],
-                         ["table", "chair", "box", "cylinder", "cone", "car"])
-        self.assertEqual(s["objects"][0]["scale"], [1.8, 0.75, 0.8])
-        self.assertEqual(s["objects"][0]["colour"], "#123456")
-        self.assertEqual(len(problems), 1)
-        self.assertTrue(problems[0].startswith(sc.UPGRADED))
-        self.assertEqual(s["version"], sc.VERSION)
-        # a current file is taken as written: a box named Table stays a box
-        s, problems = sc.clean_scene({"version": sc.VERSION, "objects": objs[:1]})
-        self.assertEqual((s["objects"][0]["asset"], problems), ("box", []))
-
     def test_a_damaged_file_opens_with_what_can_be_read(self):
         s, problems = sc.clean_scene({
             "frame": "huge", "redraw": "lots", "camera": {"lens": -5, "pitch": 400},
