@@ -1162,6 +1162,13 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   whose middle is nearest, across weighted over up-and-down, within `PICTURE_MATCH`;
   anyone unmatched is posed without words. Its replies also copy the example ("in
   their 30s...") and say "man" for "a man"; `_said_word` cleans both.
+  **The room comes with it.** The model also says `indoors` and, indoors, what the
+  walls are. Indoors, `picture_room` puts up four walls round the camera and every
+  person (`PICTURE_ROOM_MARGIN` beyond the farthest, within `ROOM_LIMITS`: the room is
+  centred on the origin, and a camera outside it would look through the near wall);
+  outdoors there are no walls and the setting's words carry the background. Then
+  `_pictured` presses Make on each surface that has words, so the floor and wall
+  pictures are queued in the Image Studio as soon as the scene lands.
 - **A move is on a level plane through the object's middle**, not the floor. A ray
   through a person's chest meets the floor far behind them nearly edge on, and a 60 px
   drag moved one 14 m; when even the middle's plane is edge on, the drag falls back to
