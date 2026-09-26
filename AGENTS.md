@@ -1051,6 +1051,27 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   times score); the person is turned to face the scene's camera plus the photo's yaw;
   a part the photo does not show is left at rest and said so; the preset becomes Custom.
   Hands and feet are not fitted: the rig has no finger or ankle controls.
+- **A picture makes a whole scene, stood where it stands.** **From a picture…** (beside
+  New) sends the photo to the same pose finder, fits every person it sees (the most
+  prominent `PICTURE_PEOPLE`, 10; the rest are said, for a background crowd), and places
+  each one from how big they are: the fit reports `scale` (photo pixels a metre, from the
+  whole laid-over skeleton, so a bent or turned person is not misjudged the way a box's
+  height would be) and where the pelvis falls, and depth is the lens's focal length
+  over that scale (`picture_scene`). The camera is level at `PICTURE_LENS` 35 mm and at
+  the eye height that puts each pelvis at its own pose's height, near people weighted
+  by scale squared (a far one is a few pixels and the photo's real tilt moves it most:
+  unweighted, a couple's camera came out 2.8 m up instead of ~1.2). It orbits the most
+  prominent person. The lens and tilt are guesses and the status says so; a synthetic
+  photo of a scene comes back within centimetres. The words - the setting into Details,
+  the floor, each person's name, doing and look slots - come from the host's vision
+  model (`Vision.ask`), and are optional: no vision model still makes the scene.
+  **The vision model is not given our numbered boxes.** Qwen2.5-VL 7B numbered them in
+  its own order and put the band's instruments on the audience. It is asked for its
+  own box per person (it answers in the photo's pixels, placing people across the frame
+  well and up and down loosely) and `match_people` pairs each with the found person
+  whose middle is nearest, across weighted over up-and-down, within `PICTURE_MATCH`;
+  anyone unmatched is posed without words. Its replies also copy the example ("in
+  their 30s...") and say "man" for "a man"; `_said_word` cleans both.
 - **A move is on a level plane through the object's middle**, not the floor. A ray
   through a person's chest meets the floor far behind them nearly edge on, and a 60 px
   drag moved one 14 m; when even the middle's plane is edge on, the drag falls back to
