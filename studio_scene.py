@@ -14,9 +14,12 @@ pieces:
   each hand and foot - and `POSES`, presets of those controls. Everything
   stands on its floor: an object's lowest point is put at its `position` y
   (`ground`), so a crouch drops the hips and a tipped drum lies on the floor.
-- **Props** (`ASSETS`): a box and a cylinder, sized by scale in metres. What a
-  prop *is* - a crate, a workbench, a gas cylinder - is its name and its
-  description; the shape only holds its place in the frame.
+- **Props** (`ASSETS`): simple shapes - box, cylinder, sphere, cone,
+  frustum, capsule, wedge, panel - and compound props (table, chair,
+  shelves, car) built of several shapes under one transform, all sized by
+  scale in metres. What a prop *is* - a crate, a workbench, a gas cylinder -
+  is its name and its description; the shape is a stand-in that only holds
+  its place in the frame. `STAND_INS` start a shape already named and sized.
 - **The room** (`new_room`): the floor, and optionally four walls around the
   origin. Either can wear a picture - one the Image Studio makes from a few
   words (`texture_settings`), or a PNG from disk - repeated every `size`
@@ -250,6 +253,67 @@ def box(lo, hi):
 def cylinder(seg=16):
     """A unit cylinder standing on the floor: radius 0.5, height 1."""
     return prism((0, 0, 0), (0, 1, 0), (1, 0, 0), (0.5, 0.5), (0.5, 0.5), n=seg)
+
+
+def lathe(profile, seg=16):
+    """A solid turned about the y axis: `profile` is [(radius, y)] from the
+    bottom up. A radius of 0 is a point (a pole, a cone's tip); an end with
+    a radius is capped flat."""
+    rings = [[(r * math.cos(2 * math.pi * (i + 0.5) / seg), y,
+               r * math.sin(2 * math.pi * (i + 0.5) / seg)) for i in range(seg)]
+             for r, y in profile]
+    faces = []
+    for (r0, _), (r1, _), lo, hi in zip(profile, profile[1:], rings, rings[1:]):
+        for i in range(seg):
+            j = (i + 1) % seg
+            if r0 < 1e-9:
+                faces.append([lo[i], hi[j], hi[i]])
+            elif r1 < 1e-9:
+                faces.append([lo[i], lo[j], hi[i]])
+            else:
+                faces.append([lo[i], lo[j], hi[j], hi[i]])
+    if profile[0][0] > 1e-9:
+        faces.append(rings[0][::-1])
+    if profile[-1][0] > 1e-9:
+        faces.append(rings[-1])
+    return outward(faces)
+
+
+def sphere(seg=16, rings=8):
+    """A unit sphere standing on the floor: radius 0.5, its bottom at y 0."""
+    return lathe([(0.5 * math.sin(math.pi * j / rings), 0.5 - 0.5 * math.cos(math.pi * j / rings))
+                  for j in range(rings + 1)], seg)
+
+
+def cone(top=0.0, seg=16):
+    """A unit cone on the floor: radius 0.5 at the base, `top` at height 1
+    (a frustum when `top` is more than 0)."""
+    return lathe([(0.5, 0.0), (top, 1.0)], seg)
+
+
+def capsule(seg=16, rings=4):
+    """A unit capsule standing on the floor: radius 0.5, height 1 end to end,
+    so a round end is half its width. Stretched by scale, the ends go oval."""
+    cap = [(0.5 * math.sin(math.pi / 2 * j / rings), 0.25 - 0.25 * math.cos(math.pi / 2 * j / rings))
+           for j in range(rings + 1)]
+    return lathe(cap + [(r, 1 - y) for r, y in reversed(cap)], seg)
+
+
+def wedge():
+    """A unit ramp: 1 wide, 1 deep, 1 tall at its back (-z), 0 at its front."""
+    v = [(-0.5, 0, -0.5), (0.5, 0, -0.5), (0.5, 0, 0.5), (-0.5, 0, 0.5),
+         (-0.5, 1, -0.5), (0.5, 1, -0.5)]
+    idx = [(0, 1, 2, 3), (0, 1, 5, 4), (3, 2, 5, 4), (0, 3, 4), (1, 2, 5)]
+    return outward([[v[i] for i in f] for f in idx])
+
+
+def fit(faces, lo, hi):
+    """A unit shape (x and z -0.5..0.5, y 0..1) moved and sized into the
+    box lo..hi of the same unit space: a part of a compound prop."""
+    size = sub(hi, lo)
+    mid = (lo[0] + size[0] / 2, lo[1], lo[2] + size[2] / 2)
+    return [[add(mid, (p[0] * size[0], p[1] * size[1], p[2] * size[2])) for p in f]
+            for f in faces]
 
 
 # ==================================================================== the rig
@@ -919,9 +983,94 @@ ASSETS = [
     {"id": "cylinder", "label": "Cylinder", "kind": "prop", "name": "Drum",
      "colour": "#4f7fb5", "scale": [0.6, 0.9, 0.6],
      "about": "Any round thing: a drum, a gas cylinder, a post, a pipe laid down."},
+    {"id": "sphere", "label": "Sphere", "kind": "prop", "name": "Ball", "colour": "#b5644f",
+     "scale": [0.5, 0.5, 0.5],
+     "about": "Any round lump: a ball, a boulder, a lamp globe, a bush. Squash it for an egg."},
+    {"id": "cone", "label": "Cone", "kind": "prop", "name": "Traffic cone",
+     "colour": "#d9772b", "scale": [0.35, 0.7, 0.35],
+     "about": "Anything that tapers to a point: a traffic cone, a tree, a tent, a spire."},
+    {"id": "frustum", "label": "Frustum", "kind": "prop", "name": "Lampshade",
+     "colour": "#7d8a94", "scale": [0.4, 0.4, 0.4],
+     "about": "A cone with its top cut off: a lampshade, a stool, a pedestal. Roll it "
+              "180 for a bucket or pot."},
+    {"id": "capsule", "label": "Capsule", "kind": "prop", "name": "Bollard",
+     "colour": "#6b6f76", "scale": [0.3, 1.0, 0.3],
+     "about": "A rod with round ends: a bollard, a bolster, a rolled mat, a fire hydrant."},
+    {"id": "wedge", "label": "Wedge", "kind": "prop", "name": "Ramp", "colour": "#8f8a7e",
+     "scale": [1.0, 0.5, 1.5],
+     "about": "A slope, high at the back: a ramp, a roof, a slide, a doorstop, a dune."},
+    {"id": "plane", "label": "Panel", "kind": "prop", "name": "Rug", "colour": "#7a4a5a",
+     "scale": [2.0, 0.02, 1.4],
+     "about": "A flat sheet: a rug, a poster, a sign, a screen. Tip it upright for a wall."},
+    # Compound props: several shapes under the one transform, laid out in the
+    # unit space (x and z -0.5..0.5, y 0..1) that the scale stretches.
+    {"id": "table", "label": "Table", "kind": "prop", "name": "Table", "colour": "#7b5a3c",
+     "scale": [1.4, 0.75, 0.8], "parts": [
+         ("box", (-0.5, 0.94, -0.5), (0.5, 1.0, 0.5)),
+         ("box", (-0.47, 0, -0.44), (-0.41, 0.94, -0.34)),
+         ("box", (0.41, 0, -0.44), (0.47, 0.94, -0.34)),
+         ("box", (-0.47, 0, 0.34), (-0.41, 0.94, 0.44)),
+         ("box", (0.41, 0, 0.34), (0.47, 0.94, 0.44))],
+     "about": "A top on four legs: a dining table, a desk, a workbench, a counter."},
+    {"id": "chair", "label": "Chair", "kind": "prop", "name": "Chair", "colour": "#6e5039",
+     "scale": [0.45, 0.9, 0.5], "parts": [
+         ("box", (-0.5, 0.48, -0.5), (0.5, 0.53, 0.5)),
+         ("box", (-0.5, 0.53, -0.5), (0.5, 1.0, -0.4)),
+         ("box", (-0.46, 0, -0.46), (-0.34, 0.48, -0.36)),
+         ("box", (0.34, 0, -0.46), (0.46, 0.48, -0.36)),
+         ("box", (-0.46, 0, 0.36), (-0.34, 0.48, 0.46)),
+         ("box", (0.34, 0, 0.36), (0.46, 0.48, 0.46))],
+     "about": "A seat with a back, facing +z: a chair, a stool with a back, a bench seat."},
+    {"id": "shelves", "label": "Shelves", "kind": "prop", "name": "Shelves",
+     "colour": "#8b7355", "scale": [1.0, 1.8, 0.35], "parts": [
+         ("box", (-0.5, 0, -0.5), (-0.46, 1.0, 0.5)),
+         ("box", (0.46, 0, -0.5), (0.5, 1.0, 0.5)),
+         ("box", (-0.46, 0, -0.5), (0.46, 1.0, -0.44)),
+         ("box", (-0.46, 0, -0.5), (0.46, 0.03, 0.5)),
+         ("box", (-0.46, 0.33, -0.5), (0.46, 0.35, 0.5)),
+         ("box", (-0.46, 0.65, -0.5), (0.46, 0.67, 0.5)),
+         ("box", (-0.46, 0.97, -0.5), (0.46, 1.0, 0.5))],
+     "about": "An open unit, open to +z: a bookcase, a shop shelf, a dresser, a rack."},
+    {"id": "car", "label": "Car", "kind": "prop", "name": "Car", "colour": "#3d5a7a",
+     "scale": [1.8, 1.45, 4.4], "parts": [
+         ("box", (-0.5, 0.18, -0.5), (0.5, 0.6, 0.5)),
+         ("box", (-0.44, 0.6, -0.3), (0.44, 1.0, 0.2)),
+         ("cylinder", (-0.5, 0, -0.39), (-0.42, 0.45, -0.25)),
+         ("cylinder", (0.42, 0, -0.39), (0.5, 0.45, -0.25)),
+         ("cylinder", (-0.5, 0, 0.25), (-0.42, 0.45, 0.39)),
+         ("cylinder", (0.42, 0, 0.25), (0.5, 0.45, 0.39))],
+     "about": "A car blocked out, nose to +z: a saloon, a taxi, a van if made taller."},
 ]
 ASSET = {a["id"]: a for a in ASSETS}
-UNIT = {"box": box((-0.5, 0, -0.5), (0.5, 1, 0.5)), "cylinder": cylinder()}
+SHAPE_MESH = {"box": box((-0.5, 0, -0.5), (0.5, 1, 0.5)), "cylinder": cylinder(),
+              "sphere": sphere(), "cone": cone(), "frustum": cone(0.32),
+              "capsule": capsule(), "wedge": wedge(),
+              "plane": box((-0.5, 0, -0.5), (0.5, 1, 0.5))}
+# Wheels lie on their side: a cylinder turned about z before it is fitted.
+_WHEEL = outward([[(p[1] - 0.5, p[0] + 0.5, p[2]) for p in f] for f in SHAPE_MESH["cylinder"]])
+UNIT = dict(SHAPE_MESH)
+for _a in ASSETS:
+    if "parts" in _a:
+        UNIT[_a["id"]] = [f for shape, lo, hi in _a["parts"] for f in
+                          fit(_WHEEL if (_a["id"], shape) == ("car", "cylinder")
+                              else SHAPE_MESH[shape], lo, hi)]
+
+# Box and Cylinder are stand-ins: the shape holds a place, the name says
+# what it is. These start one already named and sized (label, asset, name,
+# scale in m, colour).
+STAND_INS = [
+    ("Cabinet", "box", "Cabinet", [0.9, 1.9, 0.5], "#7b6a58"),
+    ("Counter", "box", "Counter", [2.0, 0.9, 0.6], "#9a9186"),
+    ("Bed", "box", "Bed", [1.5, 0.55, 2.0], "#cfc7ba"),
+    ("Sofa", "box", "Sofa", [2.0, 0.85, 0.9], "#6a5f73"),
+    ("Wall", "box", "Wall", [3.0, 2.5, 0.15], "#b8b2a8"),
+    ("Door", "box", "Door", [0.9, 2.05, 0.05], "#6b4f36"),
+    ("Drum", "cylinder", "Drum", [0.6, 0.9, 0.6], "#4f7fb5"),
+    ("Post", "cylinder", "Post", [0.15, 2.5, 0.15], "#5b5b5b"),
+    ("Round table", "cylinder", "Round table", [1.0, 0.75, 1.0], "#7b5a3c"),
+    ("Tree trunk", "cylinder", "Tree", [0.4, 4.0, 0.4], "#5a4632"),
+    ("Tree crown", "sphere", "Tree crown", [2.5, 2.2, 2.5], "#4f7a3c"),
+]
 
 
 def painted_pieces(obj):
@@ -1002,8 +1151,13 @@ def new_enrich():
     return {"added": [], "placed": [], "seen": [], "never": []}
 
 
-def new_object(asset_id, taken=()):
-    a = ASSET[asset_id]
+def new_object(asset_id, taken=(), stand_in=None):
+    """A fresh object of an asset; `stand_in`, a label from STAND_INS, starts
+    it named, sized and coloured as that thing."""
+    a = dict(ASSET[asset_id])
+    for label, asset, nm, scale, colour in STAND_INS:
+        if label == stand_in and asset == asset_id:
+            a.update(name=nm, scale=scale, colour=colour)
     names = {o.get("name") for o in taken}
     name, n = a["name"], 2
     while name in names:
@@ -1784,7 +1938,8 @@ WHERE = {"behind": (2.2, 0, 0.0), "behind_left": (1.6, -1, 0.0),
          "left": (0.0, -1, 0.0), "right": (0.0, 1, 0.0),
          "foreground_left": (-1.2, -1, 0.0), "foreground_right": (-1.2, 1, 0.0),
          "above": (1.2, 0, 2.4)}
-SHAPES = ("box", "cylinder", "person", "none")
+SHAPES = ("box", "cylinder", "sphere", "cone", "frustum", "capsule", "wedge", "plane",
+          "table", "chair", "shelves", "car", "person", "none")
 ENRICH_SYSTEM = """You help stage a photograph. You suggest ONE believable, lived-in detail \
 that would make the scene feel like a real snapshot taken in that moment, not people \
 pasted into a themed background.
@@ -1803,8 +1958,12 @@ an image prompt, not advice.
 nothing like what the user banned.
 
 The scene is blocked out in 3D with simple shapes, and your detail is placed in it:
-- "shape": "box" (a table, bench, crate, stall, sign board), "cylinder" (a barrel, \
-post, stein, lamp, basket), "person" (a whole passer-by, never a part of one), or \
+- "shape": "box" (a bench, crate, stall, cabinet), "cylinder" (a barrel, post, \
+stein, lamp, basket), "sphere" (a ball, bush, boulder, globe lamp), "cone" (a \
+traffic cone, small tree, tent), "frustum" (a lampshade, stool, pedestal), \
+"capsule" (a bollard, bolster, rolled mat), "wedge" (a ramp, slope, awning), \
+"plane" (a rug, poster, sign board, puddle), "table", "chair", "shelves", "car", \
+"person" (a whole passer-by, never a part of one), or \
 "none" for what has no body of its own (light, haze, glare, stains, a hand or \
 shoulder cut off by the frame edge, strings of bunting too thin to block out).
 - "size": [width, height, depth] in metres, true to life (a table is about \
@@ -1962,7 +2121,7 @@ def _place(scene, sug):
     so "behind_left" is behind them and to the left as the picture sees it
     from any orbit. A place that is taken is pushed further out; one that
     leaves the frame is pulled in towards the people."""
-    if sug.get("shape") not in ("box", "cylinder", "person"):
+    if sug.get("shape") not in ASSET:
         return None
     w, h = frame_size(scene)
     cam = Camera(scene["camera"], w, h)
