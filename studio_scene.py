@@ -2393,15 +2393,25 @@ class Words:
 
 
 def placement(scene, obj):
-    """Where an object sits in the frame, in words, or None outside it."""
+    """Where an object sits in the frame, in words, or None outside it. In
+    it is any of its box on screen: its middle alone left a person framed
+    head and shoulders out of the words, the middle being their hips below
+    the frame. Left, centre or right is read off the part that is seen."""
     w, h = frame_size(scene)
     cam = Camera(scene["camera"], w, h)
     lo, hi = bounds(obj)
-    mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2)
-    p = cam.project(mid)
-    if p is None or not (0 <= p[0] <= w and 0 <= p[1] <= h):
+    corners = [cam.project((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+               for z in (lo[2], hi[2])]
+    corners = [p for p in corners if p]
+    if not corners:
         return None
-    x = p[0] / w
+    x0, x1 = max(0, min(p[0] for p in corners)), min(w, max(p[0] for p in corners))
+    y0, y1 = max(0, min(p[1] for p in corners)), min(h, max(p[1] for p in corners))
+    if x0 >= x1 or y0 >= y1:
+        return None
+    mid = ((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2)
+    p = (0, 0, cam.to_camera(mid)[2])
+    x = (x0 + x1) / 2 / w
     where = ["left of frame" if x < 1 / 3 else "right of frame" if x > 2 / 3
              else "centre of frame"]
     d = scene["camera"]["distance"]
@@ -2412,24 +2422,164 @@ def placement(scene, obj):
     return where
 
 
+def _way(cam, fwd, at):
+    """(cos to the camera, frame side) of a direction `fwd` from `at`, level."""
+    fwd = norm((fwd[0], 0, fwd[2]))
+    to_cam = norm((cam.eye[0] - at[0], 0, cam.eye[2] - at[2]))
+    return dot(fwd, to_cam), "right" if dot(fwd, cam.r) > 0 else "left"
+
+
 def facing(scene, obj):
     """Which way a person faces, as the picture will show it."""
     w, h = frame_size(scene)
     cam = Camera(scene["camera"], w, h)
-    fwd = apply(euler(*obj["rotation"]), (0, 0, 1))
-    fwd = norm((fwd[0], 0, fwd[2]))
-    to_cam = norm((cam.eye[0] - obj["position"][0], 0, cam.eye[2] - obj["position"][2]))
-    c = dot(fwd, to_cam)
+    c, side = _way(cam, apply(euler(*obj["rotation"]), (0, 0, 1)), obj["position"])
     if c > 0.7:
         return "facing the camera"
     if c < -0.7:
         return "back to the camera"
-    side = "right" if dot(fwd, cam.r) > 0 else "left"
     if c > 0.2:
         return "three-quarter view, turned to frame %s" % side
     if c < -0.2:
         return "turned away, towards frame %s" % side
     return "in profile, facing frame %s" % side
+
+
+# ------------------------------------------------------------ a person, in words
+# What the controls know that the look's words do not: how the person stands
+# (`posture_words`), where their head looks against their body (`gaze_words`)
+# and how much of them the frame shows (`framing_words`). Read off the posed
+# skeleton rather than the sliders, so combinations come out as what they
+# look like - a raised arm bent back is a hand above the head either way -
+# and they agree with the pose map the ControlNet is given, which is drawn
+# from the same skeleton: words that disagree with a ControlNet fight it.
+LEG_POSES = ("walking", "crouching", "kneeling", "sitting")   # named: the legs are said
+HEAD_TOP = 0.2                 # m from the head joint (the top of the neck) to the crown
+BOTH_ARMS = {"hanging relaxed at the side": "arms relaxed at the sides",
+             "raised above the head": "both arms raised above the head",
+             "reaching forward at shoulder height": "both arms reaching forward",
+             "stretched out to the side": "arms stretched out to the sides",
+             "bent, the hand in front of the chest": "both arms bent, hands in front of the chest",
+             "bent, the hand in front of the waist": "both arms bent, hands in front of the waist",
+             "held forward": "both arms held forward",
+             "swinging forward": "both arms swinging forward",
+             "held out from the body": "arms held out from the body",
+             "swinging back": "both arms swinging back"}
+
+
+def _arm(sk, side, bent, hip_y):
+    """One arm's place, in words, from the skeleton (+Z forward, +X their left)."""
+    s, w = sk["shoulder_" + side][0], sk["wrist_" + side][0]
+    ahead, out = w[2] - s[2], abs(w[0]) - abs(s[0])
+    if w[1] > sk["head"][0][1] + HEAD_TOP:
+        return "raised above the head"
+    if w[1] > s[1] - 0.12:
+        return ("reaching forward at shoulder height" if ahead >= out
+                else "stretched out to the side")
+    if ahead > 0.15:
+        if bent:
+            return "bent, the hand in front of the %s" % (
+                "chest" if w[1] > (s[1] + hip_y) / 2 else "waist")
+        return "held forward" if ahead > 0.3 else "swinging forward"
+    if out > 0.18:
+        return "held out from the body"
+    if ahead < -0.15:
+        return "swinging back"
+    return "hanging relaxed at the side"
+
+
+def posture_words(obj):
+    """How a person stands, as phrases: the torso, the arms, the legs (unless
+    a named pose that says them - kneeling, sitting - is chosen), and the
+    head's nod and tilt (unless the look's Gaze says where they look).
+    Left and right are theirs, as a caption says "her right hand"."""
+    c = obj["pose"]["controls"]
+    look = obj.get("look") or {}
+    g = lambda k: float(c.get(k, 0) or 0)                 # noqa: E731
+    sk = skeleton(c, IDENTITY, body_shape(look))
+    out = []
+    bend = g("bend")
+    if bend >= 50:
+        out.append("bent well forward at the waist")
+    elif bend >= 18:
+        out.append("leaning forward")
+    elif bend <= -12:
+        out.append("leaning back")
+    if abs(g("lean")) >= 10:
+        out.append("leaning to their %s" % ("left" if g("lean") > 0 else "right"))
+    if abs(g("twist")) >= 20:
+        out.append("shoulders turned to their %s" % ("left" if g("twist") > 0 else "right"))
+    hip_y = sk["pelvis"][0][1]
+    arms = {side: _arm(sk, side, g("arm_%s_bend" % side) >= 60, hip_y) for side in "rl"}
+    if arms["r"] == arms["l"]:
+        out.append(BOTH_ARMS[arms["r"]])
+    else:
+        out += ["right arm " + arms["r"], "left arm " + arms["l"]]
+    if obj["pose"].get("preset") not in LEG_POSES:
+        sl, sr = g("leg_l_step"), g("leg_r_step")
+        bl, br = g("leg_l_bend"), g("leg_r_bend")
+        if abs(sl - sr) >= 25:
+            out.append("mid-stride, %s foot forward" % ("left" if sl > sr else "right"))
+        elif min(g("leg_l_out"), g("leg_r_out")) >= 12:
+            out.append("feet planted wide apart")
+        elif abs(bl - br) >= 12:
+            out.append("weight on the %s leg, the other knee relaxed"
+                       % ("right" if bl > br else "left"))
+    if not str(look.get("gaze") or "").strip():
+        if g("head_nod") >= 20:
+            out.append("looking down")
+        elif g("head_nod") <= -15:
+            out.append("looking up")
+    if abs(g("head_tilt")) >= 15:
+        out.append("head tilted")
+    return out
+
+
+def gaze_words(scene, obj):
+    """Where a person's head looks, as the picture shows it, when that is
+    not the way their body faces (a head turned back over the shoulder,
+    towards the camera): '' otherwise, or when the look's Gaze says it."""
+    if str((obj.get("look") or {}).get("gaze") or "").strip():
+        return ""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    rig = rigs(obj)[0]
+    hp, hm = rig[0]["head"]
+    at = add(mul(hp, rig[1]), rig[2])
+    body, _ = _way(cam, apply(euler(*obj["rotation"]), (0, 0, 1)), obj["position"])
+    head, side = _way(cam, column(hm, 2), at)
+    if abs(head - body) < 0.35:
+        return ""
+    if head > 0.7:
+        return "head turned towards the camera"
+    if head < -0.2:
+        return "head turned away from the camera"
+    return "looking towards frame %s" % side
+
+
+def framing_words(scene, obj):
+    """How much of a person the frame shows: 'whole figure in view', 'seen
+    from the knees up', ... - '' when none of them is in it."""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    sk, k, shift = rigs(obj)[0]
+
+    def seen(*joints):
+        for j in joints:
+            p = cam.project(add(mul(sk[j][0], k), shift))
+            if p is None or not (0 <= p[0] <= w and 0 <= p[1] <= h):
+                return False
+        return True
+    top = seen("head")
+    if seen("ankle_l", "ankle_r"):
+        return "whole figure in view" if top else "head out of the top of the frame"
+    if seen("knee_l") or seen("knee_r"):
+        return "seen from the knees up"
+    if seen("pelvis"):
+        return "seen from the waist up"
+    if seen("shoulder_l") or seen("shoulder_r"):
+        return "head and shoulders"
+    return ""
 
 
 def camera_words(scene):
@@ -2481,17 +2631,22 @@ def scene_text(scene):
             if c["activity"] != "mixed":
                 about.append({"standing": "standing about", "walking": "walking",
                               "cheering": "cheering, raising a glass"}[c["activity"]])
+        posture = ""
         if obj["asset"] == "person":
             about.append(facing(scene, obj))
+            about += [x for x in (gaze_words(scene, obj), framing_words(scene, obj)) if x]
             preset = obj["pose"].get("preset")
             if preset in POSE_NAMES and preset != "standing":
                 about.append(POSE_NAMES[preset].lower())
+            posture = ", ".join(posture_words(obj))
+            posture = posture[:1].upper() + posture[1:]
         line = "%s (%s)" % (obj["name"].strip() or ASSET[obj["asset"]]["label"],
                             ", ".join(about))
         desc = obj["description"].strip()
         look = look_text(obj) if obj["asset"] == "person" else ""
-        said = ". ".join(x for x in (look, desc) if x)
+        said = ". ".join(x for x in (look, posture, desc) if x)
         parts.append(line + (": " + said if said else ""))
+        said = look or desc
         if not said:
             out.notes.append("%s has no description; the picture has only its shape and "
                              "name to go on." % obj["name"])
