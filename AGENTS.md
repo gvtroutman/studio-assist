@@ -817,6 +817,20 @@ it by the box (nodes `s0`-`s3`). Live on 2026-09-26 a glasses fix changed
 `FIX_FIND_MAX` of the picture and boxes mostly inside a kept one of the same
 word ("bag" found the apron, so it is no longer asked for).
 
+A spot can be a **freehand outline** (a drag in the window; a click still
+makes a square). ComfyUI has no polygon mask node, so `outline_png` draws
+the outline as a mask picture at the crop's size, `run_fix` uploads it
+(`_outline_masks` -> crop `shape`), and both graphs load it as the noise
+and blend mask. **A spot with a photo** (click a marked spot) is not
+redrawn by the picture's model: `swap_graph` runs Qwen-Image-Edit 2509 on
+qwen_dress.json's loaders, the crop as picture 1 and the photo as picture
+2 (`SWAP_PROMPTS`, in the sentence shape Qwen follows), blended back
+through the outline, SAM3's word before and after, Find's box or the
+oval, in that order. It needs no FLUX, so it works on Z-Image pictures;
+its colours are deliberately not tone-matched. Photo spots run first; the
+other spots are then redrawn on that picture (loaded by its output name).
+The Change strength does not apply to a swap (Qwen draws at denoise 1).
+
 ### Try On: dressing a person from pictures
 
 **Retired from the form on 2026-09-25.** Gavin did not want the finished
