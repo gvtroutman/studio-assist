@@ -836,6 +836,50 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rec["graph"]["9"]["inputs"]["filename_prefix"],
                          "ImageStudio/flux_dev_baseline_" + jobs[0].id)
 
+    def fix_job(self, model="flux-dev", **fix):
+        self.face_studio()
+        src = os.path.join(self.dir, "made.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        w, h = ig.file_size_of(src)
+        s = self.studio.fix_base(dict(ig.default_settings(), model=model, scene="On a pier.",
+                                      backend="5090", face_detail=True, auto_refine=True))
+        s.update(mode="fix", seed=5, fix=dict({"image": src, "target": "hand",
+                                               "spots": [{"x": w // 2, "y": h // 2,
+                                                          "size": 64}]}, **fix))
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        return jobs[0], FaceClient.instances[-1], src
+
+    def test_a_fix_redraws_only_the_clicked_square(self):
+        job, client, src = self.fix_job(strength="strong", words="left hand holding a cup")
+        self.assertEqual(job.status, "complete", job.detail)
+        (g,) = client.graphs                      # one run: no new picture is made
+        self.assertNotIn("40", g)
+        self.assertIn(src, client.uploads)
+        self.assertEqual(g["fc1_4"]["inputs"]["denoise"], ig.FIX_STRENGTHS["strong"])
+        self.assertIn("fc1_3n", g)                 # the oval's noise mask
+        self.assertNotIn("fc1_h1", g)              # a hand is not blended as a head
+        self.assertIn("left hand holding a cup", g["f10"]["inputs"]["text"])
+        self.assertIn("five fingers", g["f10"]["inputs"]["text"])
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["fix"]["spots"][0]["size"], 64)
+        self.assertTrue(rec["prompt"].startswith("Fix left hand holding a cup"))
+        again = ig.again(rec)
+        self.assertEqual(again["mode"], "fix")    # Generate Again tries the fix again
+
+    def test_a_z_image_picture_can_be_fixed(self):
+        job, client, _ = self.fix_job(model="z-image-turbo")
+        self.assertEqual(job.status, "complete", job.detail)
+        g = client.graphs[0]
+        self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])   # Z-Image's own encoder
+        self.assertEqual(g["fc1_4"]["inputs"]["cfg"], 1.0)
+
+    def test_a_fix_without_spots_fails_in_words(self):
+        job, _, _ = self.fix_job(spots=[])
+        self.assertEqual(job.status, "failed")
+        self.assertIn("Click the part", job.detail)
+
     def face_studio(self):
         self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
                                 client_factory=FaceClient)
@@ -1123,6 +1167,23 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         settle(jobs)
         self.assertEqual(jobs[0].status, "failed")
         self.assertIn("Describe the scene", jobs[0].detail)
+
+
+class TestFixSpots(unittest.TestCase):
+    def test_squares_stay_inside_the_picture(self):
+        (c,) = ig.fix_crops(1000, 800, [{"x": 10, "y": 790, "size": 200}])
+        self.assertEqual((c["x"], c["y"], c["width"]), (0, 600, 200))
+        (c,) = ig.fix_crops(100, 80, [{"x": 50, "y": 40, "size": 500}])
+        self.assertEqual((c["x"], c["y"], c["width"], c["height"]), (10, 0, 80, 80))
+
+    def test_a_fix_is_made_safe(self):
+        f = ig.clean_fix({"target": "elbow", "strength": 9, "spots": [
+            {"x": "5", "y": 6, "size": 100}, {"x": 1, "y": 1, "size": 10}, {"x": None}]})
+        self.assertEqual(f["target"], "hand")
+        self.assertEqual(f["strength"], 1.0)
+        self.assertEqual(f["spots"], [{"x": 5, "y": 6, "size": 100}])
+        self.assertEqual(ig.clean_fix({"strength": "light"})["strength"], 0.45)
+        self.assertEqual(ig.fix_words({"spots": [{"x": 1, "y": 1, "size": 99}] * 2}), "2 hands")
 
 
 class TestErrors(unittest.TestCase):
@@ -1603,6 +1664,34 @@ class TestImageStudioTab(unittest.TestCase):
         s = self.app.sessions["image-studio"]
         self.assertIsNotNone(s.images)
         return s, s.images
+
+    def test_fix_a_spot_marks_squares_and_queues_a_fix(self):
+        import studio_images_ui as ui_mod
+        s, ui = self.tab()
+        src = os.path.join(self.dir, "fixme.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        sent = []
+        ui.host._spawn = lambda sid, fn, arg: sent.append(arg)
+        self.addCleanup(lambda: delattr(ui.host, "_spawn"))
+        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
+        self.pump(lambda: fw.img is not None)
+
+        class Ev:
+            def __init__(self, x, y, delta=0):
+                self.x, self.y, self.delta = x, y, delta
+        at = Ev(fw.ox + int(fw.w * fw.k / 2), fw.oy + int(fw.h * fw.k / 2))
+        fw._redraw()
+        self.assertEqual(sent, [])                # nothing marked: nothing sent
+        fw._add(at)
+        fw._wheel(Ev(at.x, at.y, 120))
+        fw._pick("strength", "light")
+        fw._redraw()
+        (job,) = sent
+        self.assertEqual(job["mode"], "fix")
+        self.assertEqual(job["fix"]["strength"], "light")
+        self.assertEqual(len(job["fix"]["spots"]), 1)
+        self.assertGreaterEqual(job["fix"]["spots"][0]["size"], ig.FIX_MIN)
 
     def test_the_tab_is_a_form_with_no_composer(self):
         s, ui = self.tab()
