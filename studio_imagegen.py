@@ -31,6 +31,7 @@ Stdlib only, like the rest of the app.
 import copy
 import hashlib
 import json
+import math
 import os
 import queue
 import random
@@ -1336,6 +1337,63 @@ def match_faces(width, height, boxes, people):
             out[i] = people[j]
             used.add(j)
     return out
+
+
+# A person's head shape goes into their face's redraw as a depth map from the
+# scene's camera (`_head_depths`) - only where the face was drawn turned about
+# as the mannequin is: within HEAD_AGREE degrees whole, within HEAD_ROUGH at
+# half strength, else not at all. The turn is read crudely, off where the nose
+# sits between the face's two sides (`studio_scene._facing`), which a depth
+# of NOSE_DEPTH before sides SIDE_HALF apart makes an angle.
+HEAD_DENOISE = 0.6             # a shaped face's redraw, deeper than the face pass's 0.4
+HEAD_AGREE = 15
+HEAD_ROUGH = 30
+FACE_SIDES_NOSE = (23, 39, 53)    # COCO-WholeBody: the jaw's two ends, the nose's tip
+FACE_POINT_SCORE = 0.3
+
+
+def facing_yaw(r):
+    """A `_facing` (0..1, 0.5 ahead) -> degrees of turn, + to the picture's
+    right; +-38 or so is as far as it reads, the nose past the sides."""
+    return math.degrees(math.atan((r - 0.5) * 1.6))
+
+
+def drawn_facing(people, box):
+    """The `_facing` of the face DWPose found inside `box` (x, y, w, h), or
+    None when it found none there sure enough."""
+    x, y, w, h = box
+    for p in people or []:
+        pts = p.get("points") or []
+        if len(pts) <= max(FACE_SIDES_NOSE):
+            continue
+        a, b, nose = (pts[k] for k in FACE_SIDES_NOSE)
+        if min(a[2], b[2], nose[2]) < FACE_POINT_SCORE:
+            continue
+        if not (x <= nose[0] <= x + w and y <= nose[1] <= y + h):
+            continue
+        lo, hi = sorted((a[0], b[0]))
+        if hi - lo < 1:
+            continue
+        return max(0.0, min(1.0, (nose[0] - lo) / (hi - lo)))
+    return None
+
+
+def head_gate(expected, drawn):
+    """-> (0, 0.5 or 1, why): how much of a head's depth a face gets, by how
+    far its drawn turn is from the mannequin's."""
+    if expected is None:
+        return 0.0, "is turned from the camera"
+    if drawn is None:
+        return 0.5, "could not be read for its turn"
+    edge = lambda r: -1 if r < 0.05 else (1 if r > 0.95 else 0)   # noqa: E731
+    if edge(expected) and edge(expected) == edge(drawn):
+        return 1.0, ""                         # both past what the measure reads
+    off = abs(facing_yaw(expected) - facing_yaw(drawn))
+    if off <= HEAD_AGREE:
+        return 1.0, ""
+    if off <= HEAD_ROUGH:
+        return 0.5, "was drawn turned about %d degrees from the mannequin's" % off
+    return 0.0, "was drawn turned about %d degrees from the mannequin's" % off
 
 
 # A face given a picture is redrawn with PuLID (lldacing's ComfyUI_PuLID_Flux_ll)
@@ -4084,6 +4142,54 @@ class Studio:
             "graph": job.dress["graphs"][-1], "face_graph": None, "dress": job.dress,
         }
 
+    def _head_depths(self, client, plan, layout, image, width, height, pairs, boxes, known,
+                     strength):
+        """{box index: {"depth", "depth_strength"}} for the faces in `pairs`
+        whose person has a head shape: their head's depth over the crop,
+        from the scene's camera, at `strength` as far as the drawn face
+        turns the way the mannequin's does (`head_gate`, read by DWPose off
+        the first run's `image`). A face turned otherwise is left to its
+        words: its head drawn the wrong way round is worse than none."""
+        import studio_scene as sc
+        scene, _ = sc.clean_scene(layout)
+        fw, fh = sc.frame_size(scene)
+        kx, ky = fw / float(width), fh / float(height)
+        drawn = []
+        try:
+            graph = {"1": {"class_type": "LoadImage", "inputs": {"image": image}},
+                     "2": {"class_type": POSE_NODE, "inputs": {"image": ["1", 0]}}}
+            got = client.listen_for_progress(client.queue_workflow(graph), lambda *a: None,
+                                             timeout=180)
+            text = ((got or {}).get("outputs") or {}).get("2", {}).get("text") or []
+            drawn = json.loads(text[0]).get("people") or [] if text else []
+        except (ComfyError, ValueError, IndexError, TypeError) as e:
+            plan.notes.append("Head shape: the drawn faces' turn could not be read (%s)." % e)
+        out = {}
+        for i, crop in pairs:
+            person = known[i]
+            gate, why = head_gate(person.get("facing"), drawn_facing(drawn, boxes[i]))
+            if gate <= 0:
+                plan.notes.append("Head shape: %s's face %s, so their head shape was not "
+                                  "used." % (person["name"], why))
+                continue
+            region = (crop["x"] * kx, crop["y"] * ky, crop["width"] * kx, crop["height"] * ky)
+            data = sc.depth_crop_png(scene, region, (FACE_EDIT, FACE_EDIT), person.get("id"))
+            if not data:
+                continue
+            path = sc._write(data, "head", os.path.join(self.lib.root, "scenes", "renders"))
+            try:
+                out[i] = {"depth": client.upload_image(path),
+                          "depth_strength": round(strength * gate, 3),
+                          "head_denoise": HEAD_DENOISE}
+            except (ComfyError, OSError) as e:
+                plan.warnings.append("%s's head shape could not be sent (%s)."
+                                     % (person["name"], e))
+                continue
+            if gate < 1:
+                plan.notes.append("Head shape: %s's face %s, so their head shape is used at "
+                                  "half strength." % (person["name"], why))
+        return out
+
     def _face_pass(self, job, client, plan, values, entry, files, say):
         """The second run of the face pass, on the lane's thread. -> (files,
         graph): the redrawn picture's files and the graph that made them, or
@@ -4113,8 +4219,19 @@ class Studio:
         if why:
             plan.warnings.append(why)
         likeness = {i for i, p in known.items() if p.get("face") and pulid}
-        pairs = indexed_crops(width, height, boxes, keep=likeness)
+        layout = job.settings.get("scene_layout")
+        head_k = scene.get("head_depth", 0) or 0
+        shaped = ({i for i, p in known.items() if p.get("head")}
+                  if layout and head_k > 0 and (values.get("controlnet") or (
+                      plan.workflow.get("defaults") or {}).get("controlnet")) else set())
+        pairs = indexed_crops(width, height, boxes, keep=likeness | shaped)
         crops = [c for _, c in pairs]
+        f = files[0]
+        image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                f["filename"], f.get("type") or "output")
+        heads = self._head_depths(client, plan, layout, image, width, height,
+                                  [(i, c) for i, c in pairs if i in shaped], boxes, known,
+                                  head_k) if shaped & {i for i, _ in pairs} else {}
         faces = []
         try:
             for i, _ in pairs:
@@ -4124,9 +4241,15 @@ class Studio:
                     continue
                 image = client.upload_image(person["face"]) if i in likeness else None
                 words = " ".join(x for x in (person.get("words"), style) if x)
-                faces.append({"words": words, "image": image,
-                              "denoise": scene.get("likeness") if image else None,
-                              "name": person["name"]})
+                face = dict({"words": words, "image": image,
+                             "denoise": scene.get("likeness") if image else None,
+                             "name": person["name"]}, **heads.get(i, {}))
+                # A head shape needs the redraw deep enough to move the jaw.
+                deep = face.pop("head_denoise", None)
+                if deep:
+                    face["denoise"] = max(face["denoise"] or 0, deep,
+                                          values.get("face_denoise") or 0)
+                faces.append(face)
         except (ComfyError, OSError) as e:
             plan.warnings.append("A face picture could not be sent (%s); the faces are "
                                  "redrawn from the words alone." % e)
@@ -4136,14 +4259,13 @@ class Studio:
                     "denoise": values.get("face_denoise"),
                     "people": [f["name"] for f in faces if f],
                     "likeness": [f["name"] for f in faces if f and f.get("image")],
-                    "likeness_denoise": scene.get("likeness")}
+                    "likeness_denoise": scene.get("likeness"),
+                    "head_depth": {f["name"]: f["depth_strength"] for f in faces
+                                   if f and f.get("depth")}}
         if not crops:
             plan.notes.append("Face pass: %s" % ("no face found" if not boxes else
                                                  "every face was already drawn at full size"))
             return files, None
-        f = files[0]
-        image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
-                                f["filename"], f.get("type") or "output")
         oval = os.path.join(self.lib.root, "face_oval.png")
         try:
             if not os.path.isfile(oval):

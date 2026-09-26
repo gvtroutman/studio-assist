@@ -589,6 +589,8 @@ class SceneBuilder:
                      put_scene("frame_keep"), 0.0, sc.FRAME_KEEP_MAX, 0.05)
         self._slider(p, "face_likeness", "Face likeness", lambda: s["face_likeness"],
                      put_scene("face_likeness"), *sc.FACE_LIKENESS_RANGE, 0.05)
+        self._slider(p, "head_depth", "Head shape (face)", lambda: s["head_depth"],
+                     put_scene("head_depth"), *sc.HEAD_DEPTH_RANGE, 0.05)
         real = tk.BooleanVar(value=s["real_faces"])
 
         def flip():

@@ -101,6 +101,17 @@ FACE_LIKENESS = 0.6            # how far a face given a picture is redrawn at th
 REAL_FACES = True              # then their own face pasted over it, where a photo's angle fits
 FACE_LIKENESS_RANGE = (0.3, 0.95)
 DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet scales it
+# A person's head shape (`mq.HEAD_SHAPE`) reaches the picture in the face
+# pass, as their head's depth over the face's crop: at FACE_EDIT the jaw is
+# hundreds of pixels. Its own strength, not the frame's depth: in a close-up
+# the whole frame's depth strong enough to carry a jaw also drew the
+# mannequin's egg head and ringed neck (2026-09-26).
+HEAD_DEPTH = 0.35
+HEAD_DEPTH_RANGE = (0.0, 0.8)
+# How much of the pose and depth strengths a shot gets, by how tall the
+# biggest face is in the frame (head, neck to crown, over the frame's
+# height): a close-up gets little, the face pass carries its head.
+FRAMING = [(0.22, "close-up", 0.45), (0.1, "medium shot", 0.75), (0.0, "wide shot", 1.0)]
 DEPTH_RELIEF = 3.0             # each body's own depth stretched this much in the depth map
 DEPTH_CLIP = (0.02, 0.995)     # the depth map's grey spans these shares of what is seen
 
@@ -1808,6 +1819,7 @@ def new_scene(details=""):
     return {"version": VERSION, "details": details, "frame": "portrait",
             "pose_strength": POSE_STRENGTH, "depth_strength": DEPTH_STRENGTH,
             "frame_keep": FRAME_KEEP, "face_likeness": FACE_LIKENESS,
+            "head_depth": HEAD_DEPTH,
             "real_faces": REAL_FACES,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
@@ -1981,6 +1993,7 @@ def clean_scene(d):
     s["depth_strength"] = _num(d.get("depth_strength"), DEPTH_STRENGTH, 0.0, 1.0)
     s["frame_keep"] = _num(d.get("frame_keep"), FRAME_KEEP, 0.0, FRAME_KEEP_MAX)
     s["face_likeness"] = _num(d.get("face_likeness"), FACE_LIKENESS, *FACE_LIKENESS_RANGE)
+    s["head_depth"] = _num(d.get("head_depth"), HEAD_DEPTH, *HEAD_DEPTH_RANGE)
     s["real_faces"] = bool(d.get("real_faces", REAL_FACES))
     cam = d.get("camera") if isinstance(d.get("camera"), dict) else {}
     c = s["camera"]
@@ -3013,28 +3026,47 @@ def depth_png(scene, edge=DEPTH_EDGE):
     return rgb_png(bytes(rgb), dw, dh)
 
 
-HEAD_REACH = 0.35              # m behind the nearest point a face crop's depth map spans
+HEAD_REACH = 0.25              # m behind the nearest point a face crop's depth map spans
 
 
-def depth_crop_png(scene, region, size):
+def depth_crop_png(scene, region, size, oid=None):
     """The depth map of one part of the frame, `region` (x, y, w, h) in the
     frame's pixels, drawn at `size` (w, h): a face crop for the face pass.
-    Its grey spans only HEAD_REACH behind the nearest point, so the face's
-    own relief - jaw, cheek, chin - fills it, as Depth Anything would make
-    of a close-up; what is further is black."""
+    Its grey spans only HEAD_REACH behind the nearest point - of the head of
+    person `oid` when given, the shoulders in front of it white - so the
+    face's own relief, jaw, cheek, chin, fills it, as Depth Anything would
+    make of a close-up; what is further is black."""
     dw, dh = size
     zb = depth_values(scene, dw, dh, window=region)
     seen = [q for q in zb if q > 0]
     if not seen:
         return None
     hi = max(seen)
+    obj = next((o for o in scene["objects"] if o["id"] == oid), None) if oid else None
+    if obj is not None:
+        cam = Camera(scene["camera"], *frame_size(scene))
+        zs = [cam.to_camera(p)[2] for part, faces, _ in painted_pieces(obj) if part == "head"
+              for f in faces for p in f]
+        zs = [z for z in zs if z > NEAR]
+        if zs:
+            hi = 1.0 / min(zs)
     lo = 1.0 / (1.0 / hi + HEAD_REACH)
     span = (hi - lo) or 1.0
-    grey = bytes(0 if q <= lo else int(round(255 * (q - lo) / span)) for q in zb)
+    grey = bytes(0 if q <= lo else min(255, int(round(255 * (q - lo) / span))) for q in zb)
     rgb = bytearray(dw * dh * 3)
     for i in range(3):
         rgb[i::3] = grey
     return rgb_png(bytes(rgb), dw, dh)
+
+
+def framing(scene):
+    """-> (name, factor): the shot by its biggest face (FRAMING), and how
+    much of the pose and depth strengths it gets."""
+    tall = max((t["tall"] for t in face_targets(scene)), default=0.0)
+    for least, name, factor in FRAMING:
+        if tall >= least:
+            return name, factor
+    return FRAMING[-1][1:]
 
 
 def head_box(scene, obj):
@@ -3434,10 +3466,29 @@ def face_photos(obj, characters=None, identities=None):
     return out
 
 
+FACE_SIDE = (0.08, 0.06, 0.0)  # the head's side at the ears, in its frame
+NOSE_TIP = (0.0, 0.05, 0.1)
+
+
+def _facing(a, b, nose):
+    """Where the nose is between the face's two sides as the picture shows
+    them, 0 at the left one, 1 at the right, 0.5 facing the camera; None
+    when a point is behind it. DWPose's face points give the same measure
+    of a drawn face (`studio_imagegen.drawn_facing`), so the two compare."""
+    if not (a and b and nose):
+        return None
+    lo, hi = sorted((a[0], b[0]))
+    if hi - lo < 1e-6:
+        return 0.5
+    return round(max(0.0, min(1.0, (nose[0] - lo) / (hi - lo))), 3)
+
+
 def face_targets(scene, characters=None, identities=None):
     """Every person whose face is in the frame: {"id", "name", "at": [x, y]
     (the face's middle, as fractions of the frame), "region": [x0, y0, x1,
-    y1] (their head and hair, the same way), "words" (what they look
+    y1] (their head and hair, the same way), "facing" (`_facing`), "head"
+    (their head shape, {} for the mannequin's own), "tall" (the head, neck to
+    crown, over the frame's height), "words" (what they look
     like, their own description, the scene's details), "face" (a picture's
     path or ''), "from", "photos" (every photo of their face, `face_photos`)}. Crowds are left out: their faces are background."""
     w, h = frame_size(scene)
@@ -3464,7 +3515,11 @@ def face_targets(scene, characters=None, identities=None):
         said = [x.strip().rstrip(".") for x in (look_text(obj), obj["description"], details)
                 if x and x.strip()]
         face, source = face_picture(obj, characters, identities)
-        out.append({"id": obj["id"], "name": obj["name"],
+        seen = lambda v: cam.project(add(mul(add(hp, apply(hm, v)), k), shift))  # noqa: E731
+        facing = _facing(seen(FACE_SIDE), seen((-FACE_SIDE[0],) + FACE_SIDE[1:]),
+                         seen(NOSE_TIP))
+        out.append({"id": obj["id"], "name": obj["name"], "facing": facing,
+                    "head": mq.clean_head(obj.get("head")), "tall": round(head / h, 4),
                     "at": [round(p[0] / w, 4), round(p[1] / h, 4)],
                     "region": [round(x, 4) for x in region],
                     "words": ". ".join(said) + ("." if said else ""),
@@ -3501,10 +3556,14 @@ def generation(scene, maps, characters=None, identities=None):
     s, _ = clean_scene(scene)
     extra = {"width": w, "height": h, "scene_layout": copy.deepcopy(s),
              "references": dict(maps), "pose": None, "composition": None}
+    shot, factor = framing(s)
+    if factor < 1 and ("pose" in maps or "composition" in maps):
+        words.notes.append("A %s: pose and layout at %d%% of their strength, so the "
+                           "mannequin is not drawn." % (shot, round(factor * 100)))
     if "pose" in maps:
-        extra["pose"] = {"strength": round(s["pose_strength"], 3)}
+        extra["pose"] = {"strength": round(s["pose_strength"] * factor, 3)}
     if "composition" in maps:
-        extra["composition"] = {"strength": round(s["depth_strength"], 3)}
+        extra["composition"] = {"strength": round(s["depth_strength"] * factor, 3)}
     if "source" in maps:
         keep = s["frame_keep"]
         if "pose" not in maps and "composition" not in maps:
@@ -3524,6 +3583,7 @@ def generation(scene, maps, characters=None, identities=None):
         extra["scene_identities"] = idents
         extra["face_detail"] = True
         extra["scene_faces"] = {"likeness": round(s["face_likeness"], 3),
+                                "head_depth": round(s["head_depth"], 3),
                                 "real": s["real_faces"],
                                 "people": face_targets(s, characters, identities)}
     return words, extra
