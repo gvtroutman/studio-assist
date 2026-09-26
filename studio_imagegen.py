@@ -1220,24 +1220,55 @@ FIX_TARGETS = {"hand": "a natural human hand with five fingers, clear knuckles a
                "face": "a natural face with clear eyes and teeth",
                "other": ""}
 FIX_STRENGTHS = {"light": 0.45, "medium": 0.65, "strong": 0.85}
-FIX_PROMPT = "Close-up detail of %s, sharp and natural, matching the light and colour " \
-             "around it. Part of this picture: %s"
+# Only the thing fixed: the whole picture's prompt ("a woman, whole figure
+# in view, dancing") redrew a glasses crop as a tiny dancer (2026-09-26).
+FIX_PROMPT = "Close-up photo detail of %s, sharp and natural, matching the light and " \
+             "colour around it."
+FIX_AREA_GROW = 0.2                   # of its size Find's box grows, as the part redrawn
+FIX_AREA_SOFT = (15, 5.0)             # ImageBlur radius and sigma of its edge, at FACE_EDIT
 FIX_MIN = 64                          # px: a smaller square is not worth redrawing
+FIX_MAX_SPOTS = 8
+# One-click Find: what SAM3 is asked for each kind, and how far round what it
+# finds the square reaches. An accessory is not one thing to SAM3, so it is
+# asked for each; a face square is padded like the face pass's.
+FIX_FIND = {"hand": ["hand:8"], "face": ["face:8"],
+            "other": ["glasses:4", "hat:4", "necklace:4", "earring:8", "bracelet:4",
+                      "watch:4", "bag:4"]}
+FIX_FIND_PAD = {"hand": 1.5, "face": FACE_PAD, "other": 1.4}
+FIX_FACE_MASK = "face"                # SAM3's word for a face fix's true blend mask
+FIX_CONTEXT = 1.5                     # the crop redrawn is this x the spot: the photo round it
+FIX_TONE = 0.85                       # how far the redraw's colour curves go to the original's
+TONE_NODE = "StudioMatchTone"         # comfy_nodes/studio_matchtone
 
 
-def clean_fix(fix):
-    """The fix a job carries, made safe: {"image", "target", "words",
-    "strength", "spots": [{"x", "y", "size"}]} - the spots' centres and
-    sides in the picture's own pixels."""
-    fix = fix if isinstance(fix, dict) else {}
-    spots = []
-    for sp in fix.get("spots") or []:
+def _spots(items, limit):
+    out = []
+    for sp in items or []:
         try:
             x, y, size = int(sp["x"]), int(sp["y"]), int(sp["size"])
         except (KeyError, TypeError, ValueError):
             continue
-        if size >= FIX_MIN:
-            spots.append({"x": x, "y": y, "size": size})
+        if size < FIX_MIN:
+            continue
+        spot = {"x": x, "y": y, "size": size}
+        try:                          # what Find found inside it (x, y, w, h)
+            spot["box"] = [int(v) for v in sp["box"]][:4]
+            if len(spot["box"]) != 4:
+                del spot["box"]
+        except (KeyError, TypeError, ValueError):
+            pass
+        out.append(spot)
+    return out[:limit]
+
+
+def clean_fix(fix):
+    """The fix a job carries, made safe: {"image", "target", "words",
+    "strength", "spots", "locks"} - spots are [{"x", "y", "size", "box"?}],
+    centres and sides in the picture's own pixels (`box` what Find found in
+    it); locks are squares of the same shape the fix may not change."""
+    fix = fix if isinstance(fix, dict) else {}
+    spots = _spots(fix.get("spots"), FIX_MAX_SPOTS)
+    locks = _spots(fix.get("locks"), 16)
     target = fix.get("target") if fix.get("target") in FIX_TARGETS else "hand"
     strength = fix.get("strength")
     if strength in FIX_STRENGTHS:
@@ -1246,8 +1277,13 @@ def clean_fix(fix):
         strength = min(1.0, max(0.2, float(strength)))
     except (TypeError, ValueError):
         strength = FIX_STRENGTHS["medium"]
-    return {"image": _str(fix.get("image")), "target": target,
-            "words": _str(fix.get("words")), "strength": strength, "spots": spots[:8]}
+    try:
+        tone = min(1.0, max(0.0, float(fix.get("tone", FIX_TONE))))
+    except (TypeError, ValueError):
+        tone = FIX_TONE
+    return {"image": _str(fix.get("image")), "target": target, "tone": tone,
+            "words": _str(fix.get("words")), "strength": strength, "spots": spots,
+            "locks": locks}
 
 
 def fix_words(fix):
@@ -1260,22 +1296,100 @@ def fix_words(fix):
     return "%d %s%s" % (n, noun, "" if n == 1 else "s")
 
 
-def fix_crops(width, height, spots):
-    """Each spot -> the square face_graph redraws, kept inside the picture."""
+def fix_crops(width, height, spots, head=False):
+    """Each spot -> the square face_graph redraws, kept inside the picture.
+    `head` (a face fix with SAM3) blends back through the face's true mask."""
     crops = []
     for sp in spots:
         side = min(sp["size"], width, height)
         x = min(max(0, sp["x"] - side // 2), width - side)
         y = min(max(0, sp["y"] - side // 2), height - side)
-        crops.append({"x": x, "y": y, "width": side, "height": side, "head": False})
+        crops.append({"x": x, "y": y, "width": side, "height": side, "head": head})
     return crops
+
+
+def fix_areas(crops, spots):
+    """Into each crop whose spot Find made: `area`, the found box grown by
+    FIX_AREA_GROW in the crop's pixels (x0, y0, x1, y1) - the only part
+    redrawn and blended back. A face with SAM3 (`head`) keeps its own
+    mask; a clicked square keeps the oval."""
+    for crop, sp in zip(crops, spots):
+        if crop.get("head") or not sp.get("box"):
+            continue
+        bx, by, bw, bh = sp["box"]
+        gx, gy = bw * FIX_AREA_GROW, bh * FIX_AREA_GROW
+        x0, y0 = max(0, int(bx - gx - crop["x"])), max(0, int(by - gy - crop["y"]))
+        x1 = min(crop["width"], int(bx + bw + gx - crop["x"]))
+        y1 = min(crop["height"], int(by + bh + gy - crop["y"]))
+        if x1 - x0 >= 8 and y1 - y0 >= 8:
+            crop["area"] = (x0, y0, x1, y1)
+    return crops
+
+
+def lock_regions(width, height, locks):
+    """Each lock square -> the region of the original laid back last."""
+    return [{k: c[k] for k in ("x", "y", "width", "height")}
+            for c in fix_crops(width, height, locks)]
+
+
+def found_spots(width, height, boxes, kind):
+    """What Find found (x, y, w, h) -> spots: a square round each, padded by
+    FIX_FIND_PAD, at least FIX_MIN, largest first, at most FIX_MAX_SPOTS."""
+    pad = FIX_FIND_PAD.get(kind, 1.5)
+    out = []
+    for bx, by, bw, bh in sorted(boxes, key=lambda b: -b[2] * b[3]):
+        side = int(min(max(FIX_MIN, max(bw, bh) * pad), width, height))
+        out.append({"x": int(bx + bw / 2.0), "y": int(by + bh / 2.0), "size": side,
+                    "box": [int(bx), int(by), int(bw), int(bh)]})
+    return out[:FIX_MAX_SPOTS]
+
+
+def parts_graph(image, sam3, prompts):
+    """SAM3 asked for each of `prompts` in `image` (a LoadImage name), with
+    the picture's size, as PreviewAny text for `parts_found`."""
+    g = {"1": {"class_type": "LoadImage", "inputs": {"image": image}},
+         "2": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
+         "6": {"class_type": "GetImageSize", "inputs": {"image": ["1", 0]}},
+         "7": {"class_type": "PreviewAny", "inputs": {"source": ["6", 0]}},
+         "8": {"class_type": "PreviewAny", "inputs": {"source": ["6", 1]}}}
+    for i, p in enumerate(prompts):
+        g["p%dt" % i] = {"class_type": "CLIPTextEncode", "inputs": {"text": p,
+                                                                   "clip": ["2", 1]}}
+        g["p%dd" % i] = {"class_type": "SAM3_Detect", "inputs": {
+            "model": ["2", 0], "image": ["1", 0], "conditioning": ["p%dt" % i, 0],
+            "threshold": 0.3, "refine_iterations": 0, "individual_masks": True}}
+        g["p%dv" % i] = {"class_type": "PreviewAny", "inputs": {"source": ["p%dd" % i, 1]}}
+    return g
+
+
+def parts_found(entry, n):
+    """What parts_graph said about its `n` prompts -> (width, height,
+    [(x, y, w, h)]), or None when it said nothing."""
+    out = entry.get("outputs") or {}
+
+    def text(node):
+        t = (out.get(node) or {}).get("text") or []
+        return json.loads(t[0]) if t else None
+    try:
+        width, height = text("7"), text("8")
+        said = [text("p%dv" % i) for i in range(n)]
+    except ValueError:
+        return None
+    if width is None or height is None:
+        return None
+    boxes = []
+    for b in said:
+        b = b[0] if b and isinstance(b[0], list) else b or []
+        boxes += [(x["x"], x["y"], x["width"], x["height"]) for x in b
+                  if max(x["width"], x["height"]) >= 12]
+    return int(width), int(height), boxes
 
 
 def fix_prompt(fix, prompt):
     """The close-up prompt a fix's squares are redrawn from."""
     f = clean_fix(fix)
     what = ", ".join(x for x in (f["words"], FIX_TARGETS[f["target"]]) if x) or "this detail"
-    return FIX_PROMPT % (what, prompt)
+    return FIX_PROMPT % what
 
 
 def png_size(raw):
@@ -1579,7 +1693,7 @@ def paste_report(entry):
 
 
 def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_file=None,
-               boxes=None):
+               boxes=None, locks=(), mask_word="head"):
     """The second run: `image` (a LoadImage name) with each crop redrawn and
     blended back through `oval`, saved under `prefix`. The model, VAE and
     conditioning come from the template's `face_detail` section, filled like
@@ -1597,7 +1711,11 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
     `studio_scene.depth_crop_png`) is drawn to that shape through the
     workflow's ControlNet. `boxes`, beside
     `crops`, are the faces the finder found (x, y, w, h): each is blended
-    back whole, whatever SAM3 makes of the head around it."""
+    back whole, whatever SAM3 makes of the head around it.
+
+    `locks` (regions of the picture) are laid back from `image` last, so
+    nothing inside them changes. `mask_word` is what SAM3 is asked for as
+    a head crop's blend mask ("face" for Fix a spot's face)."""
     fd = wf["face_detail"]
     values = dict(wf.get("defaults") or {}, **{k: x for k, x in values.items() if x is not None})
     extra = dict(fd.get("nodes") or {})
@@ -1622,7 +1740,7 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
     # alone put a disc of redrawn background round every face (2026-09-25).
     if values.get("sam3"):
         g["fh1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": values["sam3"]}}
-        g["fh2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "head",
+        g["fh2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": mask_word,
                                                                "clip": ["fh1", 1]}}
         g["fh3"] = {"class_type": "ImageScale", "inputs": {
             "image": ["fo", 0], "upscale_method": "bilinear", "width": FACE_EDIT,
@@ -1665,7 +1783,24 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
         # back, fading out before that edge.
         # The whole-picture pass (`mask` False) is redrawn everywhere.
         latent = [n + "3", 0]
-        if crop.get("mask") is not False:
+        area = crop.get("area")
+        if area:
+            # Only what Find found (Fix a spot): a hard box redrawn, its
+            # softened copy blended back - not the oval's whole reach.
+            kx, ky = ew / float(side), eh / float(tall)
+            ax0, ay0 = int(area[0] * kx), int(area[1] * ky)
+            aw, ah = max(1, int(area[2] * kx) - ax0), max(1, int(area[3] * ky) - ay0)
+            g[n + "a0"] = {"class_type": "SolidMask", "inputs": {
+                "value": 0.0, "width": ew, "height": eh}}
+            g[n + "a1"] = {"class_type": "SolidMask", "inputs": {
+                "value": 1.0, "width": aw, "height": ah}}
+            g[n + "a2"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": [n + "a0", 0], "source": [n + "a1", 0], "x": ax0, "y": ay0,
+                "operation": "or"}}
+            g[n + "3n"] = {"class_type": "SetLatentNoiseMask", "inputs": {
+                "samples": latent, "mask": [n + "a2", 0]}}
+            latent = [n + "3n", 0]
+        elif crop.get("mask") is not False:
             g[n + "3m"] = {"class_type": "ImageScale", "inputs": {
                 "image": ["fo", 0], "upscale_method": "bilinear", "width": ew,
                 "height": eh, "crop": "disabled"}}
@@ -1698,8 +1833,17 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             "latent_image": latent}}
         g[n + "5"] = {"class_type": "VAEDecode", "inputs": {"samples": [n + "4", 0],
                                                             "vae": links["vae"]}}
+        drawn = [n + "5", 0]
+        redrawn = n + ("a2" if area else "3h")
+        if values.get("match_tone") and redrawn in g:
+            # The redraw's colours and tone curves moved to the original's
+            # over the part redrawn: a hand keeps the picture's grade.
+            g[n + "t"] = {"class_type": TONE_NODE, "inputs": {
+                "image": drawn, "reference": [n + "2", 0], "mask": [redrawn, 0],
+                "amount": float(values["match_tone"])}}
+            drawn = [n + "t", 0]
         g[n + "6"] = {"class_type": "ImageScale", "inputs": {
-            "image": [n + "5", 0], "upscale_method": "lanczos", "width": side,
+            "image": drawn, "upscale_method": "lanczos", "width": side,
             "height": tall, "crop": "disabled"}}
         if crop.get("mask") is False:
             g[n + "9"] = {"class_type": "ImageCompositeMasked", "inputs": {
@@ -1708,7 +1852,13 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             last = [n + "9", 0]
             continue
         blend = ["fo", 0]
-        if values.get("sam3") and crop.get("head", True):
+        if area:
+            g[n + "a3"] = {"class_type": "MaskToImage", "inputs": {"mask": [n + "a2", 0]}}
+            g[n + "a4"] = {"class_type": "ImageBlur", "inputs": {
+                "image": [n + "a3", 0], "blur_radius": FIX_AREA_SOFT[0],
+                "sigma": FIX_AREA_SOFT[1]}}
+            blend = [n + "a4", 0]
+        elif values.get("sam3") and crop.get("head", True):
             for k, src in (("h1", [n + "5", 0]), ("h2", [n + "2", 0])):
                 g[n + k] = {"class_type": "SAM3_Detect", "inputs": {
                     "model": ["fh1", 0], "image": src, "conditioning": ["fh2", 0],
@@ -1757,6 +1907,13 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             "destination": last, "source": [n + "6", 0], "x": crop["x"], "y": crop["y"],
             "resize_source": False, "mask": [n + "8", 0]}}
         last = [n + "9", 0]
+    for i, region in enumerate(locks or ()):
+        g["fl%d_1" % i] = {"class_type": "ImageCropV2", "inputs": {"image": ["fi", 0],
+                                                                  "crop_region": dict(region)}}
+        g["fl%d_2" % i] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": last, "source": ["fl%d_1" % i, 0], "x": region["x"],
+            "y": region["y"], "resize_source": False}}
+        last = ["fl%d_2" % i, 0]
     g["fs"] = {"class_type": "SaveImage", "inputs": {"images": last, "filename_prefix": prefix}}
     return g
 
@@ -3592,6 +3749,24 @@ class Studio:
         return {"backend": backend, "sam3": sam3, "image": name, "width": width,
                 "height": height, "boxes": boxes, "preview": c.fetch(pv) if pv else None}
 
+    def find_parts(self, path, kind):
+        """Fix a spot's one-click Find: the hands, faces or accessories
+        (FIX_FIND[kind]) in the picture at `path` -> spots (found_spots).
+        Network I/O: off the UI thread."""
+        found = self.sam3_backend()
+        if found is None:
+            raise ComfyError("No online ComfyUI has a SAM3 checkpoint (a file with sam3 "
+                             "in its name under checkpoints).")
+        backend, sam3 = found
+        c = self.client(backend)
+        prompts = FIX_FIND.get(kind) or FIX_FIND["hand"]
+        said = parts_found(self._run_quick(c, parts_graph(c.upload_image(path), sam3,
+                                                          prompts)), len(prompts))
+        if said is None:
+            raise ComfyError("SAM3 said nothing about the picture.")
+        width, height, boxes = said
+        return found_spots(width, height, boxes, kind)
+
     def cut_person(self, found, box):
         """The person in `box` of what find_people found, on white: PNG bytes."""
         c = self.client(found["backend"])
@@ -4001,17 +4176,38 @@ class Studio:
             for var, path in plan.images.items():
                 values[var] = client.upload_image(path)
             image = client.upload_image(src)
-            oval = os.path.join(self.lib.root, "face_oval.png")
-            if not os.path.isfile(oval):
-                os.makedirs(self.lib.root, exist_ok=True)
-                with open(oval, "wb") as fh:
-                    fh.write(oval_png())
-            crops = fix_crops(size[0], size[1], fix["spots"])
+            # The crop reaches FIX_CONTEXT times past the spot, so the model
+            # redraws it seeing the photo round it; the oval is shrunk to
+            # match, so only the spot changes.
+            oval = os.path.join(self.lib.root, "fix_oval.png")
+            os.makedirs(self.lib.root, exist_ok=True)
+            with open(oval, "wb") as fh:
+                fh.write(oval_png(scale=1.0 / FIX_CONTEXT, centre=0.5))
+            if fix["tone"] and TONE_NODE not in set(client.node_types()):
+                job.notes.append("%s's ComfyUI has no %s (comfy_nodes/studio_matchtone), so "
+                                 "the redraw's colours are not matched to the picture."
+                                 % (b["name"], TONE_NODE))
+            else:
+                values["match_tone"] = fix["tone"]
+            # A face is blended back through its true shape - SAM3's face in
+            # the picture and in the redraw, plus the box Find found - not
+            # the square's oval, so no redrawn skin or hair spills round it.
+            sam = self.sam3_on(b) if fix["target"] == "face" else None
+            values["sam3"] = sam
+            if fix["target"] == "face" and not sam:
+                job.notes.append("%s has no SAM3 checkpoint, so the face is blended back "
+                                 "through an oval, not its own shape." % b["name"])
+            crops = fix_crops(size[0], size[1], [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
+                                                 for sp in fix["spots"]], head=bool(sam))
+            fix_areas(crops, fix["spots"])
+            boxes = [sp.get("box") for sp in fix["spots"]] if sam else None
             values["face_prompt"] = fix_prompt(fix, plan.prompt)
             values["face_denoise"] = fix["strength"]
             values["filename_prefix"] = "ImageStudio/fix_%s" % job.id
             graph = face_graph(plan.workflow, values, plan.loras, image, crops,
-                               client.upload_image(oval), values["filename_prefix"])
+                               client.upload_image(oval), values["filename_prefix"],
+                               boxes=boxes, locks=lock_regions(size[0], size[1], fix["locks"]),
+                               mask_word=FIX_FACE_MASK)
         except (ComfyError, TemplateError, OSError) as e:
             return self.queue._finish(job, "failed", "Could not set up the fix on %s: %s"
                                       % (b["name"], e))

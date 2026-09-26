@@ -875,6 +875,37 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])   # Z-Image's own encoder
         self.assertEqual(g["fc1_4"]["inputs"]["cfg"], 1.0)
 
+    def test_a_face_fix_blends_through_the_face_and_locks_are_laid_back(self):
+        job, client, _ = self.fix_job(target="face", spots=[
+            {"x": 40, "y": 40, "size": 64, "box": [30, 30, 20, 20]}],
+            locks=[{"x": 10, "y": 10, "size": 64}])
+        self.assertEqual(job.status, "complete", job.detail)
+        g = client.graphs[0]
+        self.assertIn("fc1_h1", g)                 # the face's true shape, not the oval
+        self.assertEqual(g["fh2"]["inputs"]["text"], ig.FIX_FACE_MASK)
+        self.assertEqual(g["fl0_1"]["inputs"]["image"], ["fi", 0])   # the original
+        self.assertEqual(g["fs"]["inputs"]["images"], ["fl0_2", 0])  # laid back last
+        self.assertEqual(self.studio.history.list()[0]["fix"]["locks"][0]["size"], 64)
+
+    def test_a_fix_sees_the_photo_round_the_spot_and_takes_its_colours(self):
+        FaceClient.NODES = FaceClient.NODES | {ig.TONE_NODE}
+        self.addCleanup(setattr, FaceClient, "NODES", FaceClient.NODES - {ig.TONE_NODE})
+        job, client, _ = self.fix_job()
+        self.assertEqual(job.status, "complete", job.detail)
+        g = client.graphs[0]
+        t = g["fc1_t"]["inputs"]
+        self.assertEqual((g["fc1_t"]["class_type"], t["image"], t["reference"], t["mask"]),
+                         (ig.TONE_NODE, ["fc1_5", 0], ["fc1_2", 0], ["fc1_3h", 0]))
+        self.assertEqual(t["amount"], ig.FIX_TONE)
+        self.assertEqual(g["fc1_6"]["inputs"]["image"], ["fc1_t", 0])
+        self.assertIn("fix_oval", g["fo"]["inputs"]["image"])
+
+    def test_without_the_tone_node_a_fix_says_so(self):
+        job, client, _ = self.fix_job()
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertNotIn("fc1_t", client.graphs[0])
+        self.assertTrue(any(ig.TONE_NODE in n for n in job.notes))
+
     def test_a_fix_without_spots_fails_in_words(self):
         job, _, _ = self.fix_job(spots=[])
         self.assertEqual(job.status, "failed")
@@ -1175,6 +1206,53 @@ class TestFixSpots(unittest.TestCase):
         self.assertEqual((c["x"], c["y"], c["width"]), (0, 600, 200))
         (c,) = ig.fix_crops(100, 80, [{"x": 50, "y": 40, "size": 500}])
         self.assertEqual((c["x"], c["y"], c["width"], c["height"]), (10, 0, 80, 80))
+
+    def test_the_tone_node_moves_a_redraw_onto_the_originals_curves(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy is ComfyUI's, not the app's")
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "comfy_nodes"))
+        self.addCleanup(sys.path.pop, 0)
+        import studio_matchtone as mt
+        rng = np.random.default_rng(1)
+        ref = rng.uniform(0.2, 0.6, (64, 64, 3)).astype(np.float32)
+        drawn = np.clip(ref * 1.3 + 0.1, 0, 1)            # brighter, more contrast
+        mask = np.ones((64, 64), np.float32)
+        out = mt.match(drawn, ref, mask, 1.0)
+        self.assertLess(abs(out.mean() - ref.mean()), 0.01)
+        self.assertLess(abs(out.std() - ref.std()), 0.01)
+        half = mt.match(drawn, ref, mask, 0.5)
+        self.assertAlmostEqual(float(half.mean()), (drawn.mean() + out.mean()) / 2, places=2)
+        self.assertIs(mt.match(drawn, ref, mask * 0, 1.0), drawn)   # nothing to fit on
+
+    def test_a_found_accessory_is_redrawn_in_its_box_from_its_own_words(self):
+        # 2026-09-26: glasses redrawn from the whole picture's prompt over the
+        # oval of a head-sized crop came back as a tiny dancer.
+        self.assertNotIn("dancing", ig.fix_prompt({"target": "other", "words": "glasses"},
+                                                  "a woman dancing"))
+        spot = {"x": 589, "y": 250, "size": 207, "box": [541, 198, 96, 103]}
+        (crop,) = ig.fix_areas(ig.fix_crops(1024, 1024, [dict(spot, size=310)]), [spot])
+        self.assertEqual(crop["area"], (87, 82, 222, 226))
+        (face,) = ig.fix_areas(ig.fix_crops(1024, 1024, [spot], head=True), [spot])
+        self.assertNotIn("area", face)                # a face keeps SAM3's own mask
+
+    def test_what_find_finds_becomes_squares(self):
+        g = ig.parts_graph("p.png", "sam3.pt", ig.FIX_FIND["other"])
+        self.assertEqual(sum(n["class_type"] == "SAM3_Detect" for n in g.values()),
+                         len(ig.FIX_FIND["other"]))
+        said = {"outputs": {"7": {"text": ["1000"]}, "8": {"text": ["800"]},
+                            "p0v": {"text": [json.dumps([[{"x": 100, "y": 100, "width": 40,
+                                                           "height": 60}]])]},
+                            "p1v": {"text": [json.dumps([{"x": 5, "y": 5, "width": 4,
+                                                          "height": 4}])]}}}
+        width, height, boxes = ig.parts_found(said, 2)
+        self.assertEqual((width, height, boxes), (1000, 800, [(100, 100, 40, 60)]))
+        (sp,) = ig.found_spots(width, height, boxes, "hand")
+        self.assertEqual((sp["x"], sp["y"], sp["size"], sp["box"]), (120, 130, 90,
+                                                                      [100, 100, 40, 60]))
+        self.assertEqual(ig.lock_regions(1000, 800, [{"x": 0, "y": 0, "size": 100}]),
+                         [{"x": 0, "y": 0, "width": 100, "height": 100}])
 
     def test_a_fix_is_made_safe(self):
         f = ig.clean_fix({"target": "elbow", "strength": 9, "spots": [
@@ -1692,6 +1770,33 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(job["fix"]["strength"], "light")
         self.assertEqual(len(job["fix"]["spots"]), 1)
         self.assertGreaterEqual(job["fix"]["spots"][0]["size"], ig.FIX_MIN)
+
+    def test_fix_a_spot_finds_in_one_click_and_locks(self):
+        import studio_images_ui as ui_mod
+        s, ui = self.tab()
+        src = os.path.join(self.dir, "fixme.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        sent = []
+        ui.host._spawn = lambda sid, fn, *a: fn(*a) if not a else sent.append(a[0])
+        self.addCleanup(lambda: delattr(ui.host, "_spawn"))
+        ui._post = lambda what, fn: fn()
+        self.addCleanup(lambda: delattr(ui, "_post"))
+        ui.studio.find_parts = lambda path, kind: [{"x": 5, "y": 5, "size": 64,
+                                                    "box": [1, 1, 8, 8]}]
+        self.addCleanup(lambda: delattr(ui.studio, "find_parts"))
+        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
+        self.pump(lambda: fw.img is not None)
+        fw._find("face")
+        self.assertEqual((len(fw.spots), fw.target), (1, "face"))
+        fw._pick("mode", "lock")
+        fw._find("hand")
+        self.assertEqual(len(fw.locks), 1)
+        fw._redraw()
+        (job,) = sent
+        self.assertEqual(job["fix"]["target"], "face")
+        self.assertEqual(len(job["fix"]["locks"]), 1)
+        self.assertEqual(job["fix"]["spots"][0]["box"], [1, 1, 8, 8])
 
     def test_the_tab_is_a_form_with_no_composer(self):
         s, ui = self.tab()

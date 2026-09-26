@@ -787,6 +787,29 @@ a new history record with `fix`, and Generate Again / New seed retry the fix.
 Needs a template with a `face_detail` section: `flux_dev_baseline` and, since
 this, `zimage_hq` (which also lets the face pass run on Z-Image).
 
+One-click Find (hands / face / accessories) runs `parts_graph` (SAM3, one
+detect per `FIX_FIND` word: an accessory is asked for as glasses, hat,
+necklace... since SAM3 has no one concept for it) and `found_spots` squares
+each box. A face fix with a SAM3 checkpoint blends back through SAM3's
+"face" (`FIX_FACE_MASK`) in the original and the redraw, plus Find's box,
+not the oval. Lock mode marks squares (`fix["locks"]`) that `face_graph`
+lays back from the original after every crop, so nothing in them changes.
+
+Each fix crop is `FIX_CONTEXT` (1.5) times its spot, redrawn through
+`fix_oval.png` (`oval_png(scale=1/1.5, centre=0.5)`), so the model sees the
+photo round the spot and only the spot changes. Then ComfyUI's
+`StudioMatchTone` (`comfy_nodes/studio_matchtone`, numpy only; copy it into
+`custom_nodes` and restart) fits a per-channel curve from the redraw onto
+the original over the redrawn part and moves it `FIX_TONE` (0.85) of the
+way, so the patch keeps the picture's grade. Without the node the fix runs
+and a job note says the colours were not matched.
+
+The fix prompt is only the thing fixed (`FIX_PROMPT`), never the picture's
+prompt: glasses redrawn at 0.85 from "a woman, whole figure in view,
+dancing" came back as a tiny dancer in the head (2026-09-26). A spot Find
+made (not a face with SAM3) is redrawn and blended only in its box grown by
+`FIX_AREA_GROW` (`fix_areas` -> crop `area`), not the oval's whole reach.
+
 ### Try On: dressing a person from pictures
 
 **Retired from the form on 2026-09-25.** the user did not want the finished

@@ -1293,15 +1293,18 @@ SWAP_DENOISE = 0.3           # a swapped face is redrawn lightly: the likeness i
 FACE_OVAL = "studio_face_oval.png"
 
 
-def oval_png(size=256):
+def oval_png(size=256, scale=1.0, centre=0.53):
     """A soft white oval on black as a greyscale PNG: the face and hair of a
     head_square crop at full strength, fading out well inside the crop's
-    edge, so a neighbour's face near that edge is never blended over."""
+    edge, so a neighbour's face near that edge is never blended over.
+    `scale` shrinks it (Fix a spot's crop is wider than the spot, so the
+    model sees the photo round it); `centre` is its middle's height."""
     rows = []
     for y in range(size):
         row = bytearray([0])                       # PNG filter: none
         for x in range(size):
-            dx, dy = (x + 0.5) / size - 0.5, (y + 0.5) / size - 0.53
+            dx = ((x + 0.5) / size - 0.5) / scale
+            dy = ((y + 0.5) / size - centre) / scale
             inner = (dx / 0.30) ** 2 + (dy / 0.36) ** 2
             outer = (dx / 0.46) ** 2 + (dy / 0.47) ** 2
             if inner <= 1:
