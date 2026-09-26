@@ -2443,17 +2443,25 @@ class FixWindow:
     (or the next one), a right-click takes one away. Redraw queues a fix job
     (studio_imagegen `run_fix`): only the squares change, the rest of the
     picture is kept pixel for pixel, and the result is a new picture in the
-    history beside the old one."""
+    history beside the old one.
 
-    TARGETS = [("hand", "Hand"), ("face", "Face"), ("other", "Something else")]
+    Find hands / face / accessories asks SAM3 to mark them in one click. In
+    Lock mode a click (or Find) marks a square the fix may not change: the
+    original is laid back over it last."""
+
+    TARGETS = [("hand", "Hand"), ("face", "Face"), ("other", "Accessory / other")]
     STRENGTHS = [("light", "Light"), ("medium", "Medium"), ("strong", "Strong")]
+    MODES = [("redraw", "Redraw"), ("lock", "Lock (keep as is)")]
+    FINDS = [("hand", "Find hands"), ("face", "Find face"), ("other", "Find accessories")]
 
     def __init__(self, owner, path, settings):
         self.owner = o = owner
         host = owner.host
         self.path, self.settings = path, settings
         self.spots = []                   # [{"x", "y", "size"}] in the picture's pixels
-        self.target, self.strength = "hand", "medium"
+        self.locks = []                   # the same, kept as they are
+        self.target, self.strength, self.mode = "hand", "medium", "redraw"
+        self.finding = False
         self.hover = None
         self.img = None
         try:
@@ -2480,7 +2488,16 @@ class FixWindow:
         opts = o.frame(win)
         opts.pack(side="bottom", fill="x", padx=o.px(12), pady=(o.px(8), o.px(8)))
         self.pills = {}
-        for key, items, label in (("target", self.TARGETS, "Redraw"),
+        row = o.frame(opts)
+        row.pack(side="top", fill="x", pady=(0, o.px(4)))
+        o.label(row, "Find", "muted", width=10).pack(side="left")
+        self.find_btns = []
+        for kind, text in self.FINDS:
+            p = o.button(row, text, lambda k=kind: self._find(k), bg="card")
+            p.pack(side="left", padx=(0, o.px(4)))
+            self.find_btns.append(p)
+        for key, items, label in (("mode", self.MODES, "A click"),
+                                  ("target", self.TARGETS, "Redraw"),
                                   ("strength", self.STRENGTHS, "Change")):
             row = o.frame(opts)
             row.pack(side="top", fill="x", pady=(0, o.px(4)))
@@ -2534,10 +2551,15 @@ class FixWindow:
             return int(x), int(y)
         return None
 
-    def _under(self, at):
-        """The index of the square `at` (picture px) is inside, or None."""
-        for i in range(len(self.spots) - 1, -1, -1):
-            sp = self.spots[i]
+    def _marks(self):
+        return self.locks if self.mode == "lock" else self.spots
+
+    def _under(self, at, marks=None):
+        """The index of the square `at` (picture px) is inside, or None -
+        among the marks of the current mode unless `marks` is given."""
+        marks = self._marks() if marks is None else marks
+        for i in range(len(marks) - 1, -1, -1):
+            sp = marks[i]
             if abs(sp["x"] - at[0]) <= sp["size"] / 2 and abs(sp["y"] - at[1]) <= sp["size"] / 2:
                 return i
         return None
@@ -2555,6 +2577,11 @@ class FixWindow:
             x, y = self.ox + sp["x"] * self.k, self.oy + sp["y"] * self.k
             c.create_rectangle(x - half, y - half, x + half, y + half, **kw)
         c.create_image(self.ox, self.oy, image=self.img, anchor="nw")
+        for sp in self.locks:
+            square(sp, outline=C["ok"], width=max(2, self.owner.px(2)), dash=(6, 3))
+            c.create_text(self.ox + sp["x"] * self.k, self.oy + (sp["y"] - sp["size"] / 2)
+                          * self.k - self.owner.px(8), text="locked", fill=C["ok"],
+                          font=self.owner.host.f_small)
         for n, sp in enumerate(self.spots, 1):
             square(sp, outline=C["accent"], width=max(2, self.owner.px(2)))
             c.create_text(self.ox + sp["x"] * self.k, self.oy + (sp["y"] - sp["size"] / 2)
@@ -2562,26 +2589,30 @@ class FixWindow:
                           font=self.owner.host.f_small)
         if self.hover is not None and self._under(self.hover) is None:
             square({"x": self.hover[0], "y": self.hover[1], "size": self.size},
-                   outline=C["muted"], dash=(4, 3))
+                   outline=C["ok" if self.mode == "lock" else "muted"], dash=(4, 3))
 
     # --------------------------------------------------------------- mouse
     def _add(self, ev):
         at = self._to_pic(ev)
         if at is None or self._under(at) is not None:
             return
-        if len(self.spots) >= 8:
+        marks = self._marks()
+        if marks is self.spots and len(marks) >= ig.FIX_MAX_SPOTS:
             return self._status("Eight at a time; redraw these first.", "warn")
-        self.spots.append({"x": at[0], "y": at[1], "size": self.size})
+        marks.append({"x": at[0], "y": at[1], "size": self.size})
         self._draw()
         self._status()
 
     def _remove(self, ev):
         at = self._to_pic(ev)
-        i = self._under(at) if at else None
-        if i is not None:
-            del self.spots[i]
-            self._draw()
-            self._status()
+        if at is None:
+            return
+        for marks in (self.spots, self.locks):     # whichever is under it
+            i = self._under(at, marks)
+            if i is not None:
+                del marks[i]
+                self._draw()
+                return self._status()
 
     def _move(self, ev):
         self.hover = self._to_pic(ev) if ev is not None else None
@@ -2593,7 +2624,7 @@ class FixWindow:
         i = self._under(at) if at else None
         top = max(ig.FIX_MIN, min(self.w, self.h))
         if i is not None:
-            sp = self.spots[i]
+            sp = self._marks()[i]
             sp["size"] = int(min(top, max(ig.FIX_MIN, sp["size"] * grow)))
         else:
             self.size = int(min(top, max(ig.FIX_MIN, self.size * grow)))
@@ -2603,6 +2634,49 @@ class FixWindow:
     def _pick(self, key, value):
         setattr(self, key, value)
         self._paint_pills()
+        self._draw()
+
+    def _find(self, kind):
+        """One click: SAM3 marks every hand, face or accessory. In Redraw
+        mode they replace the squares and set what is redrawn; in Lock mode
+        they are locked."""
+        if self.finding:
+            return
+        self.finding = True
+        for p in self.find_btns:
+            p.set(state="disabled")
+        noun = dict(self.FINDS)[kind][5:]
+        self._status("Finding the %s%s" % (noun, ELLIPSIS))
+        owner, mode = self.owner, self.mode
+
+        def later(fn):
+            owner._post("call", lambda: self.win.winfo_exists() and fn())
+
+        def done(spots, err=None):
+            self.finding = False
+            for p in self.find_btns:
+                p.set(state="normal")
+            if err:
+                return self._status(err, "err")
+            if not spots:
+                return self._status("SAM3 found no %s in the picture." % noun, "warn")
+            if mode == "lock":
+                self.locks.extend(spots)
+            else:
+                self.spots = spots
+                self._pick("target", kind)
+            self._draw()
+            self._status("Found %d. %s" % (len(spots), "Locked." if mode == "lock" else
+                         "Right-click any you want left alone."))
+
+        def work():
+            try:
+                spots = owner.studio.find_parts(self.path, kind)
+            except (ig.ComfyError, OSError) as e:
+                msg = str(e)
+                return later(lambda: done(None, msg))
+            later(lambda: done(spots))
+        owner.host._spawn(owner.s.event_id, work)
 
     def _paint_pills(self):
         host = self.owner.host
@@ -2613,14 +2687,16 @@ class FixWindow:
     def _status(self, text=None, role="muted"):
         n = len(self.spots)
         if text is None:
-            text = ("Click each part to redraw. The wheel sizes the square; right-click "
-                    "removes one." if not n else
+            text = ("Click each part to redraw, or Find. The wheel sizes the square; "
+                    "right-click removes one." if not n else
                     "%d marked. Only inside the squares changes." % n)
+            if self.locks:
+                text += " %d locked." % len(self.locks)
         self.msg.config(text=text)
         self.owner.skin(self.msg, bg="bg", fg=role)
 
     def _clear(self):
-        self.spots = []
+        self.spots, self.locks = [], []
         self._draw()
         self._status()
 
@@ -2630,7 +2706,8 @@ class FixWindow:
         s = self.owner.studio.fix_base(self.settings)
         s.update(mode="fix", seed=-1, fix={
             "image": self.path, "target": self.target, "strength": self.strength,
-            "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots]})
+            "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots],
+            "locks": [dict(sp) for sp in self.locks]})
         self.owner.say("Fixing %s%s" % (ig.fix_words(s["fix"]), ELLIPSIS), "muted")
         self.owner.host._spawn(self.owner.s.event_id, self.owner._submit, s)
         self.win.destroy()
