@@ -72,43 +72,72 @@ def git(gitexe, *args, timeout=120):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
-def update():
-    """One pass. Returns True if the folder changed."""
+def check(fetch=True):
+    """What GitHub has that this folder does not, without changing anything.
+    A dict: `behind` and `ahead` (commit counts), `upstream`, `commits` (the
+    new commits' one-line subjects, newest first) and `problem` (why it could
+    not tell, else ""). The app's Update button asks this."""
+    st = {"behind": 0, "ahead": 0, "upstream": "", "commits": [], "problem": ""}
     gitexe = find_git()
     if not gitexe:
-        log("git was not found - install Git for Windows to get updates.")
-        return False
+        st["problem"] = "git was not found - install Git for Windows to get updates."
+        return st
+    st["git"] = gitexe
     code, _ = git(gitexe, "rev-parse", "--is-inside-work-tree")
     if code:
-        log(f"{HERE} is not a git checkout - nothing to update.")
-        return False
+        st["problem"] = f"{HERE} is not a git checkout - nothing to update."
+        return st
     code, upstream = git(gitexe, "rev-parse", "--abbrev-ref", "@{upstream}")
     if code:
-        log("The checked-out branch tracks no remote branch - nothing to pull from.")
-        return False
-    remote = upstream.split("/", 1)[0]
-    code, out = git(gitexe, "fetch", "--quiet", remote)
-    if code:
-        log(f"Fetching from {remote} failed: {out}")
-        return False
+        st["problem"] = "The checked-out branch tracks no remote branch - nothing to pull from."
+        return st
+    st["upstream"] = upstream
+    if fetch:
+        remote = upstream.split("/", 1)[0]
+        code, out = git(gitexe, "fetch", "--quiet", remote)
+        if code:
+            st["problem"] = f"Fetching from {remote} failed: {out}"
+            return st
     code, counts = git(gitexe, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
     if code:
-        log(f"Could not compare with {upstream}: {counts}")
-        return False
-    ahead, behind = (int(n) for n in counts.split())
+        st["problem"] = f"Could not compare with {upstream}: {counts}"
+        return st
+    st["ahead"], st["behind"] = (int(n) for n in counts.split())
+    if st["behind"]:
+        _, out = git(gitexe, "log", "--format=%s", "HEAD..@{upstream}")
+        st["commits"] = [line for line in out.splitlines() if line.strip()]
+    return st
+
+
+def pull():
+    """One pass: fetch, and fast-forward if behind. Returns (changed, what
+    happened in a sentence). Everything but "already up to date" is logged."""
+    st = check()
+    if st["problem"]:
+        log(st["problem"])
+        return False, st["problem"]
+    upstream, ahead, behind = st["upstream"], st["ahead"], st["behind"]
     if not behind:
-        return False
+        return False, f"Already up to date with {upstream}."
+    gitexe = st["git"]
     code, before = git(gitexe, "rev-parse", "--short", "HEAD")
     code, out = git(gitexe, "merge", "--ff-only", "@{upstream}")
     if code:
         why = (f"this PC has {ahead} commit(s) {upstream} does not" if ahead
                else "local edits would be overwritten")
-        log(f"{upstream} is {behind} commit(s) ahead, but not updating: {why}.\n    {out}")
-        return False
+        msg = f"{upstream} is {behind} commit(s) ahead, but not updating: {why}."
+        log(f"{msg}\n    {out}")
+        return False, msg
     _, after = git(gitexe, "rev-parse", "--short", "HEAD")
-    log(f"Updated {before} -> {after} from {upstream} ({behind} commit(s)). "
-        "Reopen Studio Assist to use it.")
-    return True
+    msg = (f"Updated {before} -> {after} from {upstream} ({behind} commit(s)). "
+           "Reopen Studio Assist to use it.")
+    log(msg)
+    return True, msg
+
+
+def update():
+    """One pass. Returns True if the folder changed."""
+    return pull()[0]
 
 
 # -------------------------------------------------------------- scheduling

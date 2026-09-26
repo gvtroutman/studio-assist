@@ -73,6 +73,8 @@ this PC's files and the web instead. Two moving parts:
   **`comfy_nodes/studio_dwpose`** (a photo's pose points) and **`comfy_nodes/studio_facepaste`**
   (a person's real face, pasted last) are its ComfyUI nodes, kept here and copied into a
   backend's `custom_nodes`; they are not stdlib-only, they run there.
+- **`studio_civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
+  for the Image Studio's LoRA library. No tkinter. See *The Image Studio*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -487,6 +489,21 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   **"Always on"** LoRA (`always` in the library): it joins every picture whose model it
   suits, at its library strength, and is skipped quietly for other families, because
   "suits" is the rule the user set. One added by hand keeps the form's strength.
+- **LoRAs come in from CivitAI** (`studio_civitai.py`, the LoRA library's *Import
+  from CivitAI…*). Paste links (a model page, `modelVersionId`, a download link, an
+  AIR, a bare version id) and/or pick `.safetensors` files. A link is read from
+  CivitAI's public API: primary file, trained words as the trigger, `baseModel` as
+  the family (`BASE_FAMILIES`), tags as the category, the description as notes, and
+  the tamest still image as the preview (`image-studio/lora-previews/`). A file is
+  read for its own header (`ss_*`, `modelspec.*`), hashed, and looked up by SHA-256
+  (`/model-versions/by-hash/`); offline or unknown, the header is the profile.
+  `Library.import_lora` matches by hash, then filename, and fills only *empty*
+  fields of an existing record, so re-importing never overwrites what the user
+  wrote. The file itself goes only into a backend's `lora_dir` that is on this PC
+  (a download for a link, streamed to `.part` and checked against CivitAI's hash;
+  a copy for a file), or nowhere. The API key (many downloads need one) is
+  `CIVITAI_API_KEY`, else `image-studio/civitai.json`. Tests: `test_civitai.py`,
+  against a table of canned answers.
 - **Identity and style are separate records.** An identity is a LoRA, a trigger, a
   strength and reference photos (copied under `image-studio/references/`). A style
   is a LoRA and/or prompt additions plus look defaults. The precedence is model
@@ -1598,6 +1615,15 @@ own commits, and an updater that "resolves" them destroys them silently. A refus
 goes to `studio_update.log`, and so does a successful update. A pass with nothing
 to do writes nothing. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
 console hangs forever and nobody sees it.
+
+The window has the same updater on a button. `Chat._update_tick` calls
+`studio_update.check()` (fetch and compare, never a change) 8 s after start and every
+15 minutes; when the branch's upstream is ahead, an **Update (N)** button appears in
+the header. It lists the new commits, runs `pull()` (the same fast-forward, refusals
+and log as the scheduled task) and offers a restart: `main()` releases the
+single-instance lock before `relaunch()` starts the new copy, or the new copy would
+find the old one's lock and say it is already running. *Help → Check for updates...*
+does the same on demand and also says "up to date" or why it could not tell.
 
 **The launchers must not name a Python by its install path.** `Studio Assist.cmd`
 pointed at `...\Programs\Python\Python312\pythonw.exe`, which is one Python upgrade

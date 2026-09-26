@@ -294,6 +294,8 @@ def clean_lora(d):
         "family": _str(d.get("family")),
         "preview": _str(d.get("preview")),
         "notes": _str(d.get("notes")),
+        "source": _str(d.get("source")),          # where it came from (a CivitAI page)
+        "sha256": _str(d.get("sha256")).lower(),  # the file's, which is how CivitAI names it
     }
 
 
@@ -573,6 +575,38 @@ class Library:
             if r["file"] == filename or filename in r["files"].values():
                 return r
         return None
+
+    def preview_dir(self):
+        return os.path.join(self.root, "lora-previews")
+
+    def import_lora(self, found):
+        """A LoRA profile from outside (`studio_civitai.profile`) into the
+        library, unsaved -> (record, added). The same file - by hash, else by
+        filename - is the same record: what the user already filled in stays,
+        and only empty fields are taken from the import. Keys starting with
+        "_" are the importer's own and are dropped."""
+        found = {k: v for k, v in found.items() if not k.startswith("_")}
+        fname = _str(found.get("file"))
+        if not found.get("category"):
+            found["category"] = guess_category(fname + " " + _str(found.get("name")))
+        if not found.get("family"):
+            found["family"] = guess_family(fname)
+        sha = _str(found.get("sha256")).lower()
+        rec = next((r for r in self.data["loras"] if sha and r.get("sha256") == sha),
+                   None) or (self.lora_by_file(fname) if fname else None)
+        if rec is not None:
+            for k, v in found.items():
+                if k in rec and v not in ("", None) and (
+                        rec[k] in ("", None) or (k == "category" and rec[k] == "Other")
+                        or (k == "name" and rec[k] == pretty(rec["file"]))):
+                    rec[k] = v
+            return rec, False
+        new = clean_lora(dict(found, id=found.get("name") or fname))
+        if new is None:
+            raise ValueError("a LoRA needs a filename")
+        new["id"] = unique_id(new["id"], {r["id"] for r in self.data["loras"]})
+        self.data["loras"].append(new)
+        return new, True
 
     def keep_reference(self, path, owner):
         """A copy of a reference picture under the studio folder, so a profile
