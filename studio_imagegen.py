@@ -290,6 +290,7 @@ def clean_lora(d):
         "category": cat if cat in CATEGORIES else "Other",
         "trigger": _str(d.get("trigger")),
         "strength": _num(d.get("strength", 0.8), float, 0.8, -2.0, 2.0),
+        "always": bool(d.get("always")),
         "family": _str(d.get("family")),
         "preview": _str(d.get("preview")),
         "notes": _str(d.get("notes")),
@@ -474,7 +475,8 @@ def _default_models():
                     "encoder": "qwen_3_4b.safetensors", "vae": "ae.safetensors"},
          "defaults": {"steps": 8, "guidance": 1.0, "sampler": "res_multistep",
                       "scheduler": "simple", "width": 1024, "height": 1024},
-         "notes": "Fast photographic model, installed on the 3090 today."},
+         "notes": "Fast photographic model and the default: the 5090 when it has the "
+                  "files, else the 3090."},
     ]
 
 
@@ -2067,7 +2069,7 @@ def missing_for(model, backend, inventory, nodes=None, workflow_loader=None):
 # ============================================================ composing a job
 
 def default_settings():
-    return {"preset": "standard", "model": "flux-dev", "backend": "auto",
+    return {"preset": "standard", "model": "z-image-turbo", "backend": "auto",
             "identities": [], "style": "none", "style_strength": None,
             "scene": "", "camera": "", "negative": "", "loras": [], "references": {},
             "character": "", "item_refs": {}, "anatomy": True,
@@ -2602,6 +2604,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if rec is None:
             continue
         stack.append((rec, sel.get("strength", rec["strength"]), "added"))
+    # "Always on" LoRAs join every picture from a model they suit, at their
+    # library strength, unless already in the stack. One for another family
+    # is skipped without a warning: that is what "suits" means here.
+    have_ids = {rec["id"] for rec, _, _ in stack}
+    for rec in lib.all("loras"):
+        if (rec.get("always") and rec["id"] not in have_ids
+                and compatibility(rec["family"], family) is not False):
+            stack.append((rec, rec["strength"], "always on"))
 
     if stack and not wf.get("lora_chain"):
         names = []

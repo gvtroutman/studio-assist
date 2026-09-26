@@ -393,6 +393,24 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertTrue(p.values["refine"])
         self.assertTrue(p.prompt.startswith("GAVINPERSON"), p.prompt)
 
+    def test_always_on_loras_join_every_picture_from_a_model_they_suit(self):
+        lib = self.studio.lib
+        recs = lib.all("loras")
+        for r in recs:
+            r["always"] = r["id"] in ("sx70", "xl")
+        lib.save("loras", recs)
+        self.assertTrue(lib.get("loras", "sx70")["always"])
+        p = self.plan(model="flux-dev", scene="x")
+        self.assertEqual(p.loras, [("sx70.safetensors", 0.55)])
+        self.assertEqual(p.lora_meta[0]["why"], "always on")
+        self.assertFalse(any("XL thing" in w for w in p.warnings), p.warnings)
+        # Already added by hand: that strength wins, and it is not doubled.
+        p = self.plan(model="flux-dev", scene="x", loras=[{"id": "sx70", "strength": 0.3}])
+        self.assertEqual(p.loras, [("sx70.safetensors", 0.3)])
+
+    def test_z_image_is_the_default_model(self):
+        self.assertEqual(ig.default_settings()["model"], "z-image-turbo")
+
     def test_the_face_pass_needs_sam3_and_says_so(self):
         p = self.plan(model="flux-dev", scene="x", preset="hq_final")
         self.assertFalse(p.values["face_detail"])

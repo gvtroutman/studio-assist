@@ -1871,12 +1871,14 @@ class ImageStudio:
             ("category", "Category", ("choice", [(c, c) for c in ig.CATEGORIES])),
             ("trigger", "Trigger phrase", "text"),
             ("strength", "Recommended strength", "number"),
+            ("always", "Always on (every picture from a model it suits)", "bool"),
             ("family", "Trained for", ("choice", [("", "unknown")] + list(ig.FAMILIES.items()))),
             ("preview", "Preview image", "path"),
             ("notes", "Notes", "long"),
         ], template={"file": "new_lora.safetensors", "category": "Other"},
             extra=("Scan backends", self._scan_loras),
-            label=lambda r: "%s — %s" % (r["category"], r["name"]))
+            label=lambda r: "%s — %s%s" % (r["category"], r["name"],
+                                            "  (always on)" if r.get("always") else ""))
 
     def _scan_loras(self, editor):
         editor.status("Scanning" + ELLIPSIS)
