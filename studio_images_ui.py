@@ -12,6 +12,8 @@ Worker threads never touch a widget: a job's changes arrive as ("images", sid,
 payload) events through the window's pump and land in `handle()`.
 """
 
+import colorsys
+import math
 import os
 import subprocess
 import sys
@@ -20,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 import studio_imagegen as ig
+import studio_pose as sp
 import studio_scene_ui
 
 THUMB = 72                    # px, before the display's scale
@@ -85,6 +88,154 @@ def photo_at(path, side, master):
     return img.subsample(b) if b > 1 else img
 
 
+class CameraAim:
+    """The Camera row's two diagrams. From above, the camera is dragged round
+    the person: which side of them it sees. From the side, it is dragged up
+    and down (how high it is) and in and out (how much of them is in the
+    frame). Both snap to studio_imagegen's VIEW_* steps. Not set until first
+    touched, since then the model frames the picture itself; `get()` is
+    settings["view"]."""
+    W, H = 380, 170           # before the display's scale
+    SPLIT = 168               # the side view starts here
+    TOP = (84, 92, 60)        # the view from above: centre x, y and the orbit's radius
+    # The view from the side: the person faces right at FIG_X, head at the top
+    # of FIG, feet at the bottom; the camera's row is its height, its
+    # distance from the person its shot.
+    FIG_X = SPLIT + 30
+    FIG = {"top": 48, "eye": 57, "neck": 66, "hip": 106, "knee": 133, "foot": 160}
+    ROWS = {"overhead": 12, "high": 32, "eye": 57, "low": 112, "ground": 156}
+    REACH = {"face": 42, "head": 66, "waist": 90, "knees": 114, "full": 138, "wide": 162}
+    SPAN = {"face": (47, 68), "head": (44, 82), "waist": (42, 110), "knees": (41, 138),
+            "full": (40, 164), "wide": (34, 168)}
+
+    def __init__(self, owner, parent, on_change):
+        self.o, self.on_change = owner, on_change
+        self.view = None
+        self.k = owner.px(100) / 100.0
+        self.cv = tk.Canvas(parent, width=int(self.W * self.k), height=int(self.H * self.k),
+                            highlightthickness=0, bd=0, cursor="hand2")
+        owner.skin(self.cv, bg="card")
+        self.cv.bind("<Button-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._drag)
+        self.dragging = None
+        owner.host._repaint_on_theme(self.cv, self.draw)
+        self.draw()
+
+    def get(self):
+        return dict(self.view) if self.view else None
+
+    def set(self, view):
+        self.view = ig.clean_view(view)
+        self.draw()
+
+    # ---------------------------------------------------------------- input
+    def _press(self, ev):
+        x = ev.x / self.k
+        self.dragging = "top" if x < self.SPLIT else "side"
+        self._drag(ev)
+
+    def _drag(self, ev):
+        x, y = ev.x / self.k, ev.y / self.k
+        v = dict(self.view or ig.VIEW_DEFAULT)
+        if self.dragging == "top":
+            cx, cy, _ = self.TOP
+            if math.hypot(x - cx, y - cy) < 6:
+                return
+            # 0 is in front (below the person), toward their left is toward +x
+            v["turn"] = math.degrees(math.atan2(x - cx, y - cy))
+        elif self.dragging == "side":
+            d = x - self.FIG_X
+            v["shot"] = min(self.REACH, key=lambda s: abs(self.REACH[s] - d))
+            v["height"] = min(self.ROWS, key=lambda h: abs(self.ROWS[h] - y))
+        else:
+            return
+        v = ig.clean_view(v)
+        if v != self.view:
+            self.view = v
+            self.draw()
+            self.on_change()
+
+    # ------------------------------------------------------------- drawing
+    def draw(self):
+        C, k, cv = self.o.host.C, self.k, self.cv
+        cv.delete("all")
+        on = self.view is not None
+        v = self.view or ig.VIEW_DEFAULT
+        ink, cam = C["muted"], C["accent"] if on else C["faint"]
+        font = self.o.host.f_small
+
+        def P(*xy):
+            return [n * k for n in xy]
+
+        cv.create_line(*P(self.SPLIT, 8, self.SPLIT, self.H - 8), fill=C["border"])
+        cv.create_text(*P(8, 8), text="FROM ABOVE", anchor="nw", fill=C["faint"], font=font)
+        cv.create_text(*P(self.SPLIT + 8, 8), text="FROM THE SIDE", anchor="nw",
+                       fill=C["faint"], font=font)
+
+        # From above: the orbit, the person (shoulders, head, nose toward the
+        # front), the camera on the orbit looking in.
+        cx, cy, r = self.TOP
+        cv.create_oval(*P(cx - r, cy - r, cx + r, cy + r), outline=C["border"], dash=(2, 3))
+        cv.create_text(*P(cx + 12, cy + r + 3), text="front", anchor="w", fill=C["faint"],
+                       font=font)
+        cv.create_oval(*P(cx - 22, cy - 7, cx + 22, cy + 7), fill=ink, outline=ink)
+        cv.create_oval(*P(cx - 27, cy - 4, cx - 19, cy + 4), fill=ink, outline=ink)
+        cv.create_oval(*P(cx + 19, cy - 4, cx + 27, cy + 4), fill=ink, outline=ink)
+        cv.create_oval(*P(cx - 7, cy - 7, cx + 7, cy + 7), fill=C["card"], outline=ink,
+                       width=2 * k)
+        cv.create_polygon(*P(cx - 4, cy + 6, cx + 4, cy + 6, cx, cy + 13), fill=ink)
+        a = math.radians(v["turn"])
+        px, py = cx + r * math.sin(a), cy + r * math.cos(a)
+        self._frustum(px, py, cx, cy, 14, cam)
+        self._camera(px, py, cx - px, cy - py, cam)
+
+        # From the side: the person in profile, facing right; what is in the
+        # frame marked beside their back; the camera where it was put.
+        F, fx = self.FIG, self.FIG_X
+        top, bot = self.SPAN[v["shot"]]
+        cv.create_line(*P(fx - 16, top, fx - 16, bot), fill=cam, width=3 * k)
+        cv.create_line(*P(fx - 20, top, fx - 12, top), fill=cam, width=2 * k)
+        cv.create_line(*P(fx - 20, bot, fx - 12, bot), fill=cam, width=2 * k)
+        cv.create_oval(*P(fx - 8, F["top"], fx + 8, F["top"] + 16), outline=ink,
+                       width=2 * k)
+        cv.create_line(*P(fx + 7, F["eye"] - 1, fx + 11, F["eye"] + 2, fx + 7, F["eye"] + 4),
+                       fill=ink, width=2 * k)
+        cv.create_line(*P(fx, F["top"] + 16, fx, F["hip"]), fill=ink, width=2 * k)
+        cv.create_line(*P(fx, F["neck"] + 4, fx + 5, F["hip"] - 14, fx + 3, F["hip"] + 4),
+                       fill=ink, width=2 * k)
+        cv.create_line(*P(fx, F["hip"], fx + 2, F["knee"], fx, F["foot"], fx + 9, F["foot"]),
+                       fill=ink, width=2 * k)
+        cv.create_line(*P(self.SPLIT + 6, F["foot"] + 1, self.W - 6, F["foot"] + 1),
+                       fill=C["border"])
+        sx, sy = fx + self.REACH[v["shot"]], self.ROWS[v["height"]]
+        self._frustum(sx, sy, fx + 6, (top + bot) / 2, (bot - top) / 2, cam, True)
+        self._camera(sx, sy, fx + 6 - sx, (top + bot) / 2 - sy, cam)
+
+    def _frustum(self, x, y, tx, ty, half, colour, upright=False):
+        """Two dashed lines from the lens to either edge of what it sees: `half`
+        either side of (tx, ty), square to the line of sight, or straight up
+        and down when `upright` (the side view frames a stretch of the body)."""
+        d = math.hypot(tx - x, ty - y) or 1
+        nx, ny = (0, 1) if upright else (-(ty - y) / d, (tx - x) / d)
+        for s in (-1, 1):
+            self.cv.create_line(x * self.k, y * self.k, (tx + s * nx * half) * self.k,
+                                (ty + s * ny * half) * self.k, fill=colour, dash=(3, 3))
+
+    def _camera(self, x, y, dx, dy, colour):
+        """A camera at (x, y) whose lens points along (dx, dy)."""
+        k, d = self.k, math.hypot(dx, dy) or 1
+        ux, uy = dx / d, dy / d                      # forward
+        vx, vy = -uy, ux                             # across
+
+        def at(f, s):
+            return [(x + ux * f + vx * s) * k, (y + uy * f + vy * s) * k]
+
+        body = at(-11, -6) + at(-11, 6) + at(1, 6) + at(1, -6)
+        lens = at(1, -3) + at(1, 3) + at(7, 5) + at(7, -5)
+        self.cv.create_polygon(*body, fill=colour, outline=colour)
+        self.cv.create_polygon(*lens, fill=colour, outline=colour)
+
+
 class ImageStudio:
     def __init__(self, host, session):
         self.host, self.s = host, session
@@ -93,6 +244,8 @@ class ImageStudio:
         self.idents = {}              # identity id -> (BooleanVar, DoubleVar, scale row)
         self.loras = []               # [{"id", "var", "row"}]
         self.refs = {}                # kind -> local path
+        self.pose = None              # the drawn stick figure (PoseEditor), or None
+        self.planned_size = (1024, 1024)   # the picture's size, as last composed
         self.adv = {}                 # setting -> StringVar
         self.text = {}                # look slot and camera setting -> StringVar
         self.sliders = {}             # weight, muscle, stature -> IntVar
@@ -341,13 +494,26 @@ class ImageStudio:
         self.label(f, "Every person: " + ig._and([pos for _, pos, _ in ig.ANATOMY]) + ".",
                    "faint", self.host.f_small, wraplength=self.px(380)).pack(
             side="top", fill="x", **pad)
+        self.label(f, "Pictures of the clothes, hair and accessories (Clothes, Hair and "
+                   "Accessories tabs) go into the picture itself: it is then made with "
+                   "FLUX Kontext, which draws from them.", "faint", self.host.f_small,
+                   wraplength=self.px(380)).pack(side="top", fill="x",
+                                                 pady=(self.px(6), 0), **pad)
 
         self.cap(f, "Camera").pack(**pad)
+        self.aim = CameraAim(self, f, self._aimed)
+        self.aim.cv.pack(side="top", anchor="w", **pad)
+        arow = self.frame(f)
+        arow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.aim_note = self.label(arow, "", "muted", self.host.f_small)
+        self.aim_note.pack(side="left", fill="x", expand=True)
+        self.aim_clear = self.button(arow, "Clear", lambda: self._aimed(None), kind="ghost")
+        self._aimed(recheck=False)
         self.text["camera"] = tk.StringVar()
         e = self.host._entry(f, self.text["camera"])
         e.master.pack(side="top", fill="x", **pad)
         e.bind("<KeyRelease>", lambda ev: self._recheck())
-        self.label(f, "Lens, angle, light, film: \u201c85mm, shallow depth of field, "
+        self.label(f, "Lens, light, film:\u201c85mm, shallow depth of field, "
                    "golden hour\u201d.", "faint", self.host.f_small,
                    wraplength=self.px(380)).pack(side="top", fill="x", **pad)
 
@@ -695,12 +861,64 @@ class ImageStudio:
             self.slider_rows(self.look_box, self.sliders, changed)
         relight[0] = self.look_rows(self.look_box, dict(ig.LOOKS)[section], self.text,
                                     changed)
-        pics = [x for x in self.item_refs if x.lower() in
-                {w.lower() for w in ig.items_worn(self.collect_looks())}]
-        if section in ("Clothes", "Accessories") and pics:
-            self.label(self.look_box, "Pictures from the character: " + ", ".join(pics),
-                       "faint", self.host.f_small, wraplength=self.px(360)).pack(
-                side="top", fill="x", pady=(self.px(4), 0))
+        if section in ("Clothes", "Accessories", "Hair"):
+            keys = [sl[0] for sl in dict(ig.LOOKS)[section]]
+            items = ([ig.HAIR_ITEM] if section == "Hair" else
+                     ig.items_worn({k: self.text[k].get() for k in keys}))
+            self.item_rows(self.look_box, items, self.item_refs, self._choose_item,
+                           self._set_item)
+
+    def item_rows(self, p, items, refs, choose, drop):
+        """A row per item worn - its picture, name and file, Picture… and ×:
+        what the glasses or the necklace actually look like. The form's look
+        tabs and the creator's both show these; Generate draws from them."""
+        o, host = self, self.host
+        o.label(p, "ITEM PICTURES", "faint", host.f_small).pack(
+            side="top", fill="x", pady=(o.px(12), o.px(2)))
+        if not items:
+            o.label(p, "Choose an item above to give it a picture.", "faint",
+                    host.f_small).pack(side="top", fill="x")
+            return
+        for item in items:
+            row = o.frame(p)
+            row.pack(side="top", fill="x", pady=(0, o.px(3)))
+            path = refs.get(item)
+            img = photo(path, o.px(40)) if path and os.path.isfile(path) else None
+            if img is not None:
+                o.keep.append(img)
+                tk.Label(row, image=img, bd=0).pack(side="left", padx=(0, o.px(6)))
+            o.label(row, item, "text", width=18).pack(side="left")
+            o.label(row, os.path.basename(path) if path else "no picture", "faint",
+                    host.f_small).pack(side="left", fill="x", expand=True)
+            if path:
+                o.button(row, "×", lambda i=item: drop(i, None), kind="ghost").pack(
+                    side="right")
+            o.button(row, "Picture…", lambda i=item: choose(i)).pack(
+                side="right", padx=(o.px(4), 0))
+
+    def _choose_item(self, item):
+        path = filedialog.askopenfilename(parent=self.host, title="A picture of the " + item,
+                                          filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"),
+                                                     ("All files", "*.*")])
+        if path:
+            self._set_item(item, path)
+
+    def _set_item(self, item, path):
+        """A picture for one item, on the form: copied under references/ as
+        the creator's are, so the history record's path stays good. Save as…
+        keeps it in a character."""
+        if path:
+            rec = self.studio.lib.get("characters", self.settings["character"])
+            try:
+                path = self.studio.lib.keep_reference(
+                    path, (rec["name"] if rec else "form") + " items")
+            except OSError as e:
+                return self.say("Could not copy %s: %s" % (path, e), "err")
+            self.item_refs[item] = path
+        else:
+            self.item_refs.pop(item, None)
+        self._show_looks(self.look_section)
+        self._recheck()
 
     def collect_looks(self):
         out = {k: v.get().strip() for k, v in self.text.items() if k in ig.SLOTS}
@@ -714,11 +932,14 @@ class ImageStudio:
             row = self.frame(self.ref_box)
             row.pack(side="top", fill="x", pady=(0, self.px(2)))
             self.label(row, label, "text", width=13).pack(side="left")
-            clear = self.button(row, "×", lambda k=kind: self._set_ref(k, None),
+            clear = self.button(row, "×", lambda k=kind: self._clear_ref(k),
                                 kind="ghost")
             clear.pack(side="right")
             self.button(row, "Choose…", lambda k=kind, a=about: self._pick_ref(k, a),
                         kind="quiet").pack(side="right", padx=(self.px(4), 0))
+            if kind == "pose":
+                self.button(row, "Draw…", self.edit_pose, kind="quiet").pack(
+                    side="right", padx=(self.px(4), 0))
             name = self.label(row, "—", "faint", self.host.f_small)
             name.pack(side="left", fill="x", expand=True)
             self.ref_labels[kind] = name
@@ -728,15 +949,56 @@ class ImageStudio:
             parent=self.host, title=about,
             filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
         if path:
+            if kind == "pose":
+                self.pose = None      # a picture of its own replaces the drawn one
             self._set_ref(kind, path)
+
+    def _clear_ref(self, kind):
+        if kind == "pose":
+            self.pose = None
+        self._set_ref(kind, None)
 
     def _set_ref(self, kind, path):
         if path:
             self.refs[kind] = path
         else:
             self.refs.pop(kind, None)
-        self.ref_labels[kind].config(text=os.path.basename(path) if path else "—")
+        text = os.path.basename(path) if path else "—"
+        if kind == "pose" and path and self.pose:
+            text = "drawn figure · strength %.2f" % self.pose.get("strength", 0.9)
+        self.ref_labels[kind].config(text=text)
         self._recheck()
+
+    # ------------------------------------------------------------------ pose
+    def edit_pose(self):
+        return PoseEditor(self)
+
+    def use_pose(self, pose):
+        """From the pose editor: this stick figure is the pose reference."""
+        self.pose = pose
+        self._fit_pose()
+
+    def _fit_pose(self):
+        """The drawn pose's picture at the size the job will be. A size
+        changed since it was drawn refits the figure (the same proportions,
+        scaled and centred) rather than stretching it with the frame."""
+        if not self.pose:
+            return
+        self._recheck()
+        w, h = self.planned_size
+        pw, ph = self.pose.get("width") or w, self.pose.get("height") or h
+        if (pw, ph) != (w, h):
+            self.pose = dict(self.pose, width=w, height=h,
+                             points=sp.refit(self.pose["points"], (pw, ph), (w, h)))
+        hidden = set(self.pose.get("hidden") or ())
+        points = [None if i in hidden else p for i, p in enumerate(self.pose["points"])]
+        folder = os.path.join(self.studio.lib.root, "poses")
+        try:
+            path = sp.save(points, w, h, folder, self.pose.get("hands"))
+        except OSError as e:
+            self.say("Could not write the pose picture in %s: %s" % (folder, e), "err")
+            return
+        self._set_ref("pose", path)
 
     # ----------------------------------------------------------------- LoRAs
     def _post_lora_menu(self):
@@ -865,6 +1127,8 @@ class ImageStudio:
         s["loras"] = [{"id": r["id"], "strength": round(r["var"].get(), 3)}
                       for r in self.loras]
         s["references"] = dict(self.refs)
+        s["pose"] = dict(self.pose) if self.pose and "pose" in self.refs else None
+        s["view"] = self.aim.get()
         s["refine"] = bool(self.refine.get())
         s["face_detail"] = bool(self.faces.get())
         for key, _, kind in ADVANCED:
@@ -904,6 +1168,10 @@ class ImageStudio:
         self.item_refs = ig.clean_item_refs(s.get("item_refs"))
         self.anatomy.set(s.get("anatomy") is not False)
         self.neg.set(s.get("negative") or "")
+        pose = s.get("pose") if isinstance(s.get("pose"), dict) else None
+        self.pose = dict(pose) if pose and sp.clean(pose.get("points")) else None
+        self.aim.set(s.get("view"))
+        self._aimed(recheck=False)
         for kind in ig.REFERENCE_NAMES:
             self._set_ref(kind, (s.get("references") or {}).get(kind))
         for key, _, _ in ADVANCED:
@@ -940,6 +1208,22 @@ class ImageStudio:
         self._recheck()
         self.say("Settings loaded from history. Change anything, then Generate.", "muted")
 
+    def _aimed(self, view=False, recheck=True):
+        """The Camera diagram changed (or is cleared, with view None): say
+        what it now asks for, and offer Clear while it asks for anything."""
+        if view is None:
+            self.aim.set(None)
+        text = ig.view_label(self.aim.get())
+        self.aim_note.config(text=text or "Not set: the model frames the picture. "
+                             "Drag the camera to aim it.")
+        self.skin(self.aim_note, bg="bg", fg="text" if text else "faint")
+        if text:
+            self.aim_clear.pack(side="right")
+        else:
+            self.aim_clear.pack_forget()
+        if recheck:
+            self._recheck()
+
     def _recheck(self):
         """Compose against the backend the job would go to, for the warnings
         and the defaults beside the advanced fields. No I/O."""
@@ -963,6 +1247,10 @@ class ImageStudio:
                                    + ("" if h else " Not checked yet: Check asks it."))
             self.skin(self.route_note, bg="bg", fg="err" if p.errors else "muted")
             v = p.values
+        try:
+            self.planned_size = (int(v.get("width") or 1024), int(v.get("height") or 1024))
+        except (TypeError, ValueError):
+            pass
         for key, _, _ in ADVANCED:
             val = v.get(key)
             if key == "seed":
@@ -980,6 +1268,7 @@ class ImageStudio:
         Builder's frame size, denoise and scene. `base` replaces the form
         altogether - the Scene Builder's floor and wall pictures, which want
         none of its person. True when it was sent on."""
+        self._fit_pose()
         s = dict(base) if base is not None else self.collect()
         s.update(extra or {})
         b, why = self.studio.plan_route(s)
@@ -1243,7 +1532,8 @@ class ImageStudio:
                    "stages": stages, "strip": strip,
                    "base": "%s · %s · %s · seed %s" % (
                        preset, model.get("label", s.get("model")), job.backend["name"],
-                       s.get("seed"))}
+                       s.get("seed")) if s.get("mode") != "dress" else
+                   "Try On · %s · seed %s" % (job.backend["name"], s.get("seed"))}
         for w in (row, right, thumb, thumb.img, status, meta, detail):
             w.bind("<Button-1>", lambda ev: self._select(("job", job)))
         self.rows[job.id] = widgets
@@ -1337,7 +1627,7 @@ class ImageStudio:
         btns.pack(side="top", fill="x")
         self.button(btns, "Again", lambda: self._again(rec), bg="card").pack(
             side="right", padx=(0, self.px(6)))
-        self.button(btns, "Reuse", lambda: self.apply(rec["settings"]), bg="card").pack(
+        self.button(btns, "Reuse", lambda: self.reuse(rec["settings"]), bg="card").pack(
             side="right", padx=(0, self.px(4)))
         self.label(btns, rec.get("created", "")[5:16].replace("T", " "), "muted",
                    self.host.f_small, bg="card").pack(side="left")
@@ -1457,7 +1747,16 @@ class ImageStudio:
     def _reuse_selected(self):
         s = self._selected_settings()
         if s:
-            self.apply(s)
+            self.reuse(s)
+
+    def reuse(self, settings):
+        """Reuse Settings: put them back on the form. A Try On, from before
+        item pictures went into the picture itself, has no form to go back
+        to; Generate Again still remakes it."""
+        if settings.get("mode") == "dress":
+            return self.say("That was a Try On, which the form no longer has; Generate "
+                            "Again remakes it.", "warn")
+        self.apply(settings)
 
     def _open_selected(self, select=False):
         path = self.pending_preview
@@ -1490,7 +1789,8 @@ class ImageStudio:
                      "roles": ["secondary"]})
 
     def edit_models(self):
-        wfs = [(w["id"], w.get("label", w["id"])) for w in ig.list_workflows()]
+        wfs = [(w["id"], w.get("label", w["id"])) for w in ig.list_workflows()
+               if not w.get("built_by")]      # a finish (Try On), not a model's workflow
         return RecordEditor(self, "models", "Models", [
             ("label", "Name", "text"),
             ("id", "Logical id (what history records)", "text"),
@@ -2095,35 +2395,15 @@ class CharacterCreator:
         self.relight = o.look_rows(p, slots, self.vars, self._changed, chips=True)
         if self.section in ("Clothes", "Accessories"):
             self._item_pictures(p, [sl[0] for sl in slots])
+        elif self.section == "Hair":
+            self._item_pictures(p, [], [ig.HAIR_ITEM])
         self._sheet()
 
-    def _item_pictures(self, p, keys):
-        """A picture for each item this section has the character wearing:
-        what the glasses or the necklace actually look like."""
-        o, host = self.owner, self.owner.host
-        items = ig.items_worn({k: self.vars[k].get() for k in keys})
-        o.label(p, "ITEM PICTURES", "faint", host.f_small).pack(
-            side="top", fill="x", pady=(o.px(12), o.px(2)))
-        if not items:
-            o.label(p, "Choose an item above to give it a picture.", "faint",
-                    host.f_small).pack(side="top", fill="x")
-            return
-        for item in items:
-            row = o.frame(p)
-            row.pack(side="top", fill="x", pady=(0, o.px(3)))
-            path = self.item_refs.get(item)
-            img = photo(path, o.px(40)) if path and os.path.isfile(path) else None
-            if img is not None:
-                o.keep.append(img)
-                tk.Label(row, image=img, bd=0).pack(side="left", padx=(0, o.px(6)))
-            o.label(row, item, "text", width=18).pack(side="left")
-            o.label(row, os.path.basename(path) if path else "no picture", "faint",
-                    host.f_small).pack(side="left", fill="x", expand=True)
-            if path:
-                o.button(row, "×", lambda i=item: self._set_item(i, None),
-                         kind="ghost").pack(side="right")
-            o.button(row, "Picture…", lambda i=item: self._choose_item(i)).pack(
-                side="right", padx=(o.px(4), 0))
+    def _item_pictures(self, p, keys, items=None):
+        """A picture for each item this section has the character wearing.
+        Hair has one picture of its own (`items` = ["hair"])."""
+        items = items or ig.items_worn({k: self.vars[k].get() for k in keys})
+        self.owner.item_rows(p, items, self.item_refs, self._choose_item, self._set_item)
 
     def _choose_item(self, item):
         path = filedialog.askopenfilename(parent=self.win, title="A picture of the " + item,
@@ -2219,3 +2499,471 @@ class CharacterCreator:
         self.owner._rebuild_choices()
         self.owner._set_character(cid)
         self.status("Saved, and on the form.", "ok")
+
+
+class PoseEditor:
+    """The pose, as a wooden artist's mannequin to drag: a torso, tapered
+    limbs on ball joints, a head that shows which way it faces, and hands
+    with fingers. Dragging a joint carries what hangs off it (an elbow
+    brings the forearm and hand), Shift moves the joint alone, dragging the
+    empty frame moves the whole figure and the wheel resizes it. A click on
+    a hand gives it its next shape (Relaxed, Open, Fist, ...), as do the menus
+    beside the frame, which also turn a hand palm or back to the viewer.
+    Right-click hides a joint the picture should not show - an arm behind
+    the back, the far ear in profile - or shows it again. The person's right
+    is drawn darker; facing the viewer, it is on the frame's left.
+
+    The mannequin is for the eye. What the ControlNet reads is the skeleton
+    `studio_pose.render` draws from the same points - OpenPose's body, DWPose's
+    face and hands - and "What the model sees" shows it. Use pose hands the
+    pose to the form (`use_pose`)."""
+
+    VIEW = 520                    # px on the frame's long edge, before the display's scale
+    REACH = 12                    # px from a joint that still picks it up
+    BG = "#1d1f23"
+    WOOD = {"right": "#a8784c", "left": "#d0a271", "torso": "#bf8f60", "head": "#c99a69"}
+    LINE = "#5c3d22"
+    # Limb radii as fractions of the torso's length (neck to hips): (start, end).
+    LIMB_R = {(2, 3): (0.11, 0.085), (3, 4): (0.085, 0.062), (5, 6): (0.11, 0.085),
+              (6, 7): (0.085, 0.062), (8, 9): (0.15, 0.11), (9, 10): (0.11, 0.075),
+              (11, 12): (0.15, 0.11), (12, 13): (0.11, 0.075)}
+
+    def __init__(self, owner):
+        self.owner = o = owner
+        host = owner.host
+        o._recheck()
+        self.size = w, h = owner.planned_size
+        pose = owner.pose
+        self.strength = tk.DoubleVar(value=(pose or {}).get("strength", 0.9))
+        self.hidden = set()
+        self.hands = sp.clean_hands((pose or {}).get("hands")) or \
+            sp.clean_hands(sp.DEFAULT_HANDS)
+        if pose and sp.clean(pose.get("points")):
+            pts = sp.refit(pose["points"], (pose.get("width") or w, pose.get("height") or h),
+                           (w, h))
+            self.hidden = set(pose.get("hidden") or ())
+            self.points = self._whole(pts)
+        else:
+            self._preset("standing", draw=False)
+        self.undo = []
+        self.drag = None
+        self.seeing = tk.StringVar(value="figure")
+        k = o.px(self.VIEW) / max(w, h)
+        self.vw, self.vh = int(w * k), int(h * k)
+
+        win = self.win = tk.Toplevel(host)
+        win.title("Pose")
+        win.transient(host)
+        host._skin(win, bg="bg")
+        win.resizable(False, False)
+        left = o.frame(win)
+        left.pack(side="left", padx=o.px(12), pady=o.px(12))
+        tabs = o.frame(left)
+        tabs.pack(side="top", fill="x", pady=(0, o.px(6)))
+        self.view_pills = {}
+        for key, label in (("figure", "Figure"), ("model", "What the model sees")):
+            pill = o.button(tabs, label, lambda k=key: self._see(k),
+                            kind="accent" if key == "figure" else "quiet")
+            pill.pack(side="left", padx=(0, o.px(4)))
+            self.view_pills[key] = pill
+        self.cv = tk.Canvas(left, width=self.vw, height=self.vh, bd=0,
+                            highlightthickness=1, cursor="hand2", bg=self.BG,
+                            highlightbackground="#3a3a3a")
+        self.cv.pack(side="top")
+        self.hover = o.label(left, "%d × %d picture" % (w, h), "faint", host.f_small)
+        self.hover.pack(side="top", fill="x", pady=(o.px(4), 0))
+
+        right = o.frame(win)
+        right.pack(side="left", fill="y", pady=o.px(12), padx=(0, o.px(12)))
+        o.cap(right, "Start from")
+        grid = o.frame(right)
+        grid.pack(side="top", fill="x")
+        for i, (key, label, _) in enumerate(sp.PRESETS):
+            o.button(grid, label, lambda k=key: self._preset(k)).grid(
+                row=i // 2, column=i % 2, sticky="we", padx=(0, o.px(4)), pady=(0, o.px(4)))
+        o.cap(right, "Hands")
+        self.hand_pills, self.back_pills = {}, {}
+        shapes = [(k, label) for k, label, _ in sp.HAND_SHAPES]
+        for side in ("right", "left"):
+            row = o.frame(right)
+            row.pack(side="top", fill="x", pady=(0, o.px(4)))
+            o.label(row, side.capitalize(), "muted", width=6).pack(side="left")
+            pill = o.choice(row, shapes, self.hands[side]["shape"],
+                            lambda v, s=side: self._shape(s, v))
+            pill.pack(side="left")
+            self.hand_pills[side] = pill
+            back = o.button(row, "", lambda s=side: self._flip(s), kind="ghost")
+            back.pack(side="left", padx=(o.px(4), 0))
+            self.back_pills[side] = back
+        self._label_hands()
+        o.cap(right, "Change")
+        row = o.frame(right)
+        row.pack(side="top", fill="x")
+        o.button(row, "Mirror", self._mirror).pack(side="left")
+        o.button(row, "Undo", self._undo, kind="ghost").pack(side="left", padx=(o.px(4), 0))
+        o.cap(right, "How closely to follow it")
+        o.slider(right, self.strength, 0.3, 1.2).pack(side="top", fill="x")
+        o.label(right, "0.9 follows the figure; lower lets the model move the person "
+                "more freely.", "faint", host.f_small, wraplength=o.px(240)).pack(
+            side="top", fill="x")
+        o.label(right, "Drag a joint to move it and what hangs off it; Shift-drag "
+                "moves it alone. Click a hand for its next shape. Drag the empty frame "
+                "to move the figure, scroll to resize it. Right-click a joint to hide "
+                "or show it. Ctrl+Z undoes. Right and left are the person's own.",
+                "muted", host.f_small, wraplength=o.px(240)).pack(
+            side="top", fill="x", pady=(o.px(12), 0))
+        foot = o.frame(right)
+        foot.pack(side="bottom", fill="x", pady=(o.px(12), 0))
+        o.button(foot, "Use pose", self._use, kind="accent").pack(side="right")
+        o.button(foot, "Cancel", win.destroy, kind="ghost").pack(side="right",
+                                                                 padx=(0, o.px(6)))
+
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._move)
+        self.cv.bind("<ButtonRelease-1>", self._release)
+        self.cv.bind("<Button-3>", self._toggle)
+        self.cv.bind("<Motion>", self._hover)
+        self.cv.bind("<MouseWheel>", self._wheel)
+        win.bind("<Control-z>", lambda ev: self._undo())
+        win.bind("<Escape>", lambda ev: win.destroy())
+        self._draw()
+
+    # ---------------------------------------------------------------- state
+    def _whole(self, pts):
+        """Points with a place for every joint: a joint a preset leaves out
+        is put beside its other side, hidden, so it can be shown again."""
+        out = [list(p) if p else None for p in pts]
+        for i, p in enumerate(out):
+            if p is None:
+                twin = out[sp.MIRROR.get(i, 1)] or [0.5, 0.5]
+                out[i] = [twin[0] + 0.01, twin[1]]
+                self.hidden.add(i)
+        return out
+
+    def _keep(self):
+        self.undo.append(([list(p) for p in self.points], set(self.hidden),
+                          {s: dict(h) for s, h in self.hands.items()}))
+        del self.undo[:-50]
+
+    def _preset(self, key, draw=True):
+        if draw:
+            self._keep()
+        self.hidden = set()
+        self.points = self._whole(sp.preset(key, *self.size))
+        if draw:
+            self._draw()
+
+    def _mirror(self):
+        self._keep()
+        self.hidden = {sp.MIRROR.get(i, i) for i in self.hidden}
+        self.points = sp.mirror(self.points)
+        self.hands = sp.mirror_hands(self.hands)
+        self._label_hands()
+        self._draw()
+
+    def _undo(self):
+        if self.undo:
+            self.points, self.hidden, self.hands = self.undo.pop()
+            self._label_hands()
+            self._draw()
+
+    def _shape(self, side, shape, keep=True):
+        if keep:
+            self._keep()
+        self.hands[side]["shape"] = shape
+        self._label_hands()
+        self._draw()
+
+    def _cycle(self, side):
+        names = sp.HAND_SHAPE_NAMES
+        now = self.hands[side]["shape"]
+        self._shape(side, names[(names.index(now) + 1) % len(names)], keep=False)
+
+    def _flip(self, side):
+        self._keep()
+        self.hands[side]["back"] = not self.hands[side]["back"]
+        self._label_hands()
+        self._draw()
+
+    def _label_hands(self):
+        names = dict((k, label) for k, label, _ in sp.HAND_SHAPES)
+        for side, pill in self.hand_pills.items():
+            pill.set(text=names[self.hands[side]["shape"]] + "  ▾")
+            self.back_pills[side].set(text="Back" if self.hands[side]["back"] else "Palm")
+
+    def _see(self, which):
+        self.seeing.set(which)
+        host = self.owner.host
+        for key, pill in self.view_pills.items():
+            pill.roles = host.PILL_ROLES["accent" if key == which else "quiet"]
+            pill.paint(host.C)
+        self._draw()
+
+    # ---------------------------------------------------------------- mouse
+    def _near(self, ev):
+        return sp.near(self.points, ev.x, ev.y, self.vw, self.vh, self.owner.px(self.REACH))
+
+    def _hand_at(self, ev):
+        """The side whose hand (fingers and palm) is under the pointer."""
+        best, dist = None, None
+        for side, pts in self._hand_points().items():
+            cx = sum(p[0] for p in pts) / len(pts) * self.vw
+            cy = sum(p[1] for p in pts) / len(pts) * self.vh
+            reach = max(math.hypot(p[0] * self.vw - cx, p[1] * self.vh - cy) for p in pts)
+            d = math.hypot(ev.x - cx, ev.y - cy)
+            if d <= reach * 0.9 + self.owner.px(4) and (dist is None or d < dist):
+                best, dist = side, d
+        return best
+
+    def _hand_points(self):
+        return sp.hand_points(self._seen(), self.vw, self.vh, self.hands)
+
+    def _seen(self):
+        return [None if i in self.hidden else p for i, p in enumerate(self.points)]
+
+    def _press(self, ev):
+        self._keep()
+        j = self._near(ev)
+        side = None
+        if j is None:
+            side = self._hand_at(ev)
+        if side:
+            moving = sp.carried(sp.HAND_OF[side][0])
+        elif j in (4, 7) and not ev.state & 0x0001:
+            side = "right" if j == 4 else "left"
+            moving = [j]
+        elif j is None:
+            moving = list(range(len(self.points)))
+        elif ev.state & 0x0001:                 # Shift: the joint alone
+            moving = [j]
+        else:
+            moving = sp.carried(j)
+        self.drag = (moving, ev.x, ev.y)
+        self.click = (side, ev.x, ev.y)
+
+    def _move(self, ev):
+        if not self.drag:
+            return
+        moving, x0, y0 = self.drag
+        dx, dy = (ev.x - x0) / self.vw, (ev.y - y0) / self.vh
+        for i in moving:
+            p = self.points[i]
+            p[0] = min(1.2, max(-0.2, p[0] + dx))
+            p[1] = min(1.2, max(-0.2, p[1] + dy))
+        self.drag = (moving, ev.x, ev.y)
+        self._draw()
+
+    def _release(self, ev):
+        """A click on a hand that did not move it: its next shape."""
+        side, x0, y0 = getattr(self, "click", (None, 0, 0))
+        self.drag, self.click = None, (None, 0, 0)
+        if side and math.hypot(ev.x - x0, ev.y - y0) < self.owner.px(3):
+            self._cycle(side)
+            self._hover(ev)
+
+    def _wheel(self, ev):
+        self._keep()
+        k = 1.05 ** (ev.delta / 120)
+        seen = [p for i, p in enumerate(self.points) if i not in self.hidden] or self.points
+        cx = sum(p[0] for p in seen) / len(seen)
+        cy = sum(p[1] for p in seen) / len(seen)
+        for p in self.points:
+            p[0], p[1] = cx + (p[0] - cx) * k, cy + (p[1] - cy) * k
+        self._draw()
+
+    def _toggle(self, ev):
+        j = self._near(ev)
+        if j is None:
+            return
+        self._keep()
+        self.hidden ^= {j}
+        if len(self.hidden) == len(self.points):
+            self.hidden.discard(j)
+        self._draw()
+        self._hover(ev)
+
+    def _hover(self, ev):
+        j = self._near(ev)
+        side = self._hand_at(ev) if j is None else ("right" if j == 4 else
+                                                    "left" if j == 7 else None)
+        w, h = self.size
+        if side:
+            names = dict((k, label) for k, label, _ in sp.HAND_SHAPES)
+            text = "%s hand: %s - click for the next shape" % (
+                side.capitalize(), names[self.hands[side]["shape"]])
+        elif j is not None:
+            text = sp.JOINTS[j] + (" (hidden)" if j in self.hidden else "")
+        else:
+            text = "%d × %d picture" % (w, h)
+        self.hover.config(text=text)
+
+    # ---------------------------------------------------------------- draw
+    def _draw(self):
+        self.cv.delete("all")
+        if self.seeing.get() == "model":
+            self.cv.config(bg="#000000")
+            self._draw_skeleton()
+        else:
+            self.cv.config(bg=self.BG)
+            self._draw_figure()
+        self._draw_handles()
+
+    def _limb(self, a, b, ra, rb, fill):
+        """A tapered limb from a to b (view px) with a ball at each end."""
+        cv = self.cv
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        n = math.hypot(dx, dy) or 1e-6
+        nx, ny = -dy / n, dx / n
+        cv.create_polygon(a[0] + nx * ra, a[1] + ny * ra, b[0] + nx * rb, b[1] + ny * rb,
+                          b[0] - nx * rb, b[1] - ny * rb, a[0] - nx * ra, a[1] - ny * ra,
+                          fill=fill, outline=self.LINE)
+        for (x, y), r in ((a, ra), (b, rb)):
+            cv.create_oval(x - r, y - r, x + r, y + r, fill=fill, outline=self.LINE)
+
+    def _draw_figure(self):
+        cv = self.cv
+        seen = self._seen()
+        at = [None if p is None else (p[0] * self.vw, p[1] * self.vh) for p in seen]
+        hips = [at[i] for i in (8, 11) if at[i]]
+        neck = at[1]
+        if neck and hips:
+            mid = (sum(p[0] for p in hips) / len(hips), sum(p[1] for p in hips) / len(hips))
+            torso = math.hypot(mid[0] - neck[0], mid[1] - neck[1])
+        else:
+            mid, torso = None, self.vh * 0.28
+        s = max(torso, self.owner.px(20))
+        wood = self.WOOD
+
+        def limb(a, b, side):
+            if at[a] and at[b]:
+                ra, rb = self.LIMB_R[(a, b)]
+                self._limb(at[a], at[b], ra * s, rb * s, wood[side])
+
+        limb(11, 12, "left")
+        limb(12, 13, "left")
+        limb(8, 9, "right")
+        limb(9, 10, "right")
+        # The torso: shoulders to hips, a little wider than the joints.
+        shoulders = [at[i] for i in (2, 5)]
+        if neck and all(shoulders) and len(hips) == 2:
+            (rx, ry), (lx, ly) = shoulders
+            cx = (rx + lx) / 2
+            out = 0.08 * s
+            pts = [rx - out if rx < cx else rx + out, ry, cx, (ry + ly) / 2 - 0.04 * s,
+                   lx + out if lx > cx else lx - out, ly, at[11][0], at[11][1] - 0.05 * s,
+                   at[11][0], at[11][1] + 0.1 * s, at[8][0], at[8][1] + 0.1 * s,
+                   at[8][0], at[8][1] - 0.05 * s]
+            cv.create_polygon(*pts, smooth=True, fill=wood["torso"], outline=self.LINE)
+        elif neck and mid:
+            self._limb(neck, mid, 0.24 * s, 0.2 * s, wood["torso"])
+        self._draw_head(at, s)
+        limb(5, 6, "left")
+        limb(6, 7, "left")
+        limb(2, 3, "right")
+        limb(3, 4, "right")
+        for side, pts in self._hand_points().items():
+            self._draw_hand([(x * self.vw, y * self.vh) for x, y in pts], s,
+                            wood[side], self.hands[side]["back"])
+
+    def _draw_head(self, at, s):
+        cv = self.cv
+        nose, neck = at[0], at[1]
+        eyes = [at[i] for i in (14, 15) if at[i]]
+        ears = [at[i] for i in (16, 17) if at[i]]
+        if not (nose or eyes):
+            return
+        centre = (eyes if eyes else [nose])
+        cx = sum(p[0] for p in centre) / len(centre)
+        cy = sum(p[1] for p in centre) / len(centre)
+        if len(ears) == 2:
+            rx = math.hypot(ears[0][0] - ears[1][0], ears[0][1] - ears[1][1]) / 2 * 1.15
+        else:
+            rx = 0.2 * s
+        rx = max(rx, 0.12 * s)
+        ry = rx * 1.3
+        # "Up" for the head is away from the neck.
+        ux, uy = (0.0, -1.0)
+        if neck:
+            d = math.hypot(cx - neck[0], cy - neck[1]) or 1e-6
+            ux, uy = (cx - neck[0]) / d, (cy - neck[1]) / d
+            self._limb(neck, (cx - ux * ry * 0.6, cy - uy * ry * 0.6), 0.08 * s, 0.08 * s,
+                       self.WOOD["torso"])
+        px_, py_ = -uy, ux
+        # The eye line sits a little under the middle of the head.
+        hx, hy = cx + ux * ry * 0.12, cy + uy * ry * 0.12
+        pts = []
+        for i in range(28):
+            t = 2 * math.pi * i / 28
+            pts += [hx + px_ * rx * math.cos(t) + ux * ry * math.sin(t),
+                    hy + py_ * rx * math.cos(t) + uy * ry * math.sin(t)]
+        cv.create_polygon(*pts, smooth=True, fill=self.WOOD["head"], outline=self.LINE)
+        dot = max(2, s * 0.025)
+        for x, y in eyes:
+            cv.create_oval(x - dot, y - dot, x + dot, y + dot, fill=self.LINE, outline="")
+        if nose:
+            cv.create_oval(nose[0] - dot * 1.3, nose[1] - dot * 1.3, nose[0] + dot * 1.3,
+                           nose[1] + dot * 1.3, fill="#8a5a33", outline=self.LINE)
+
+    def _draw_hand(self, pts, s, fill, back):
+        cv = self.cv
+        palm = [pts[i] for i in (0, 1, 5, 9, 13, 17)]
+        cv.create_polygon(*[c for p in palm for c in p], smooth=True, fill=fill,
+                          outline=self.LINE)
+        r = max(1.5, 0.028 * s)
+        for base in (1, 5, 9, 13, 17):
+            chain = [pts[0] if base == 1 else pts[base]] + [pts[base + k] for k in range(1, 4)]
+            if base == 1:
+                chain = [pts[1], pts[2], pts[3], pts[4]]
+            for (a, b) in zip(chain, chain[1:]):
+                self._limb(a, b, r * (1.15 if base == 1 else 1), r * 0.85, fill)
+        if back:                                  # knuckles, to tell the back from the palm
+            for i in (5, 9, 13, 17):
+                x, y = pts[i]
+                cv.create_line(x - r, y, x + r, y, fill=self.LINE)
+
+    def _draw_skeleton(self):
+        """What the ControlNet reads, drawn as studio_pose.render draws it."""
+        cv, px = self.cv, self.owner.px
+        seen = self._seen()
+        stick = max(3, px(5))
+        for n, (a, b) in enumerate(sp.LIMBS):
+            if seen[a] and seen[b]:
+                cv.create_line(seen[a][0] * self.vw, seen[a][1] * self.vh,
+                               seen[b][0] * self.vw, seen[b][1] * self.vh, width=stick,
+                               capstyle="round", fill="#%02x%02x%02x" % tuple(
+                                   int(c * 0.6) for c in sp.COLOURS[n]))
+        for i, p in enumerate(seen):
+            if p:
+                x, y, r = p[0] * self.vw, p[1] * self.vh, stick / 2 + 1
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="",
+                               fill="#%02x%02x%02x" % sp.COLOURS[i])
+        for x, y in sp.face_points(seen, self.vw, self.vh):
+            x, y = x * self.vw, y * self.vh
+            cv.create_oval(x - 1, y - 1, x + 1, y + 1, fill="#ffffff", outline="")
+        for pts in self._hand_points().values():
+            at = [(x * self.vw, y * self.vh) for x, y in pts]
+            for n, (a, b) in enumerate(sp.HAND_EDGES):
+                rgb = colorsys.hsv_to_rgb(n / len(sp.HAND_EDGES), 1, 1)
+                cv.create_line(*at[a], *at[b], width=2, fill="#%02x%02x%02x" % tuple(
+                    int(c * 255) for c in rgb))
+            for x, y in at:
+                cv.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#0000ff", outline="")
+
+    def _draw_handles(self):
+        """The joints you can grab, drawn over either view."""
+        cv, r = self.cv, max(3, self.owner.px(4))
+        for i, p in enumerate(self.points):
+            x, y = p[0] * self.vw, p[1] * self.vh
+            if i in self.hidden:
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="#8a8a8a", dash=(2, 2))
+            elif i not in (14, 15, 16, 17) or self.seeing.get() == "model":
+                cv.create_oval(x - r, y - r, x + r, y + r, outline="#f2f2f2")
+
+    # ---------------------------------------------------------------- done
+    def _use(self):
+        w, h = self.size
+        self.owner.use_pose({"points": [[round(p[0], 4), round(p[1], 4)] for p in self.points],
+                             "hidden": sorted(self.hidden), "width": w, "height": h,
+                             "hands": {s: dict(v) for s, v in self.hands.items()},
+                             "strength": round(self.strength.get(), 2)})
+        self.win.destroy()

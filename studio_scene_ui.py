@@ -539,13 +539,24 @@ class SceneBuilder:
         self._slider(p, "aim_y", "Aim height (m)", lambda: cam["target"][1], aim(1),
                      0, 3, 0.05)
 
-        o.cap(p, "Redraw strength")
-        self._slider(p, "redraw", "Denoise", lambda: s["redraw"],
-                     lambda x: s.__setitem__("redraw", x), 0.3, 0.95, 0.05)
-        o.label(p, "Lower keeps the blockout's layout and shapes; higher lets the "
-                "picture move further from them. 0.6 to 0.75 usually keeps the "
-                "composition.", "faint", self.host.f_small,
-                wraplength=o.px(310)).pack(side="top", fill="x")
+        o.cap(p, "What the picture follows")
+
+        def put_scene(key):
+            def write(x):
+                s[key] = x
+            return write
+        self._slider(p, "pose_strength", "Pose", lambda: s["pose_strength"],
+                     put_scene("pose_strength"), 0.0, 1.0, 0.05)
+        self._slider(p, "depth_strength", "Layout (depth)", lambda: s["depth_strength"],
+                     put_scene("depth_strength"), 0.0, 1.0, 0.05)
+        self._slider(p, "frame_keep", "Grey frame kept", lambda: s["frame_keep"],
+                     put_scene("frame_keep"), 0.0, sc.FRAME_KEEP_MAX, 0.05)
+        o.label(p, "Pose holds each body's joints; layout holds where everything is and "
+                "how far away. Both leave how things look to the words. The grey frame "
+                "is off by default: kept, the picture copies the mannequins' blocky "
+                "shapes - 0.1 to 0.25 pins props and framing. 0 turns any of them off. "
+                "A model with no ControlNet uses the frame alone, 0.3 kept at least.",
+                "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
         self._words_box()
 
     def _inspect_room(self):
@@ -1575,22 +1586,25 @@ class SceneBuilder:
         self.owner._recheck()
         self.check()
 
-    def takes_source(self, model_id):
-        """Whether `model_id`'s workflow, on any backend, has a source input."""
+    def takes(self, model_id):
+        """The scene's reference kinds (`sc.MAP_KINDS`) `model_id`'s workflows,
+        on any backend, have an input for: pose and composition are its
+        ControlNet, source image to image."""
         lib = self.owner.studio.lib
         model = lib.get("models", model_id)
         if model is None:
-            return False
+            return set()
         wids = {model["workflow"]} | {b.get("workflow") for b in
                                       (model.get("backends") or {}).values()
                                       if isinstance(b, dict) and b.get("workflow")}
+        out = set()
         for wid in wids:
             try:
-                if (self.owner.studio.workflow_loader(wid).get("references") or {}).get("source"):
-                    return True
+                refs = self.owner.studio.workflow_loader(wid).get("references") or {}
             except Exception:           # noqa - a broken template is compose()'s to name
                 continue
-        return False
+            out |= {k for k in sc.MAP_KINDS if refs.get(k)}
+        return out
 
     def check(self):
         """-> the reason Generate would not use the frame, or ''."""
@@ -1598,12 +1612,12 @@ class SceneBuilder:
         if not self.has_content():
             return ("Add a person, a prop, walls or a floor first: the frame is what the "
                     "picture is made from.")
-        if not self.takes_source(mid):
+        if not self.takes(mid):
             model = self.owner.studio.lib.get("models", mid)
             able = [m["label"] for m in self.owner.studio.lib.all("models")
-                    if self.takes_source(m["id"])]
-            why = ("%s's workflow takes no source picture, so the frame would not be "
-                   "used." % (model["label"] if model else mid))
+                    if self.takes(m["id"])]
+            why = ("%s's workflow takes no pose, depth or source picture, so the scene "
+                   "would not be used." % (model["label"] if model else mid))
             why += (" Choose %s under Model." % " or ".join(able) if able else
                     " No model in the library takes one yet (Models…).")
             self.status(why, "warn")
@@ -1618,14 +1632,20 @@ class SceneBuilder:
         if why:
             self.status(why, "err")
             return False
-        try:
-            ref = sc.write_reference(self.scene)
-        except OSError as e:
-            self.status("Could not write the frame: %s" % e, "err")
-            return False
         o = self.owner
+        try:
+            maps, notes = sc.scene_maps(self.scene, self.takes(o.settings["model"]))
+        except OSError as e:
+            self.status("Could not write the scene's pictures: %s" % e, "err")
+            return False
         chars = {c["id"]: c for c in o.studio.lib.all("characters")}
-        words, ref, extra = sc.generation(self.scene, ref, chars)
+        words, extra = sc.generation(self.scene, maps, chars)
+        # The scene's maps take the form's pose, composition and source
+        # slots for this job; its other references (a face, a style) stay.
+        refs = {k: x for k, x in (o.collect().get("references") or {}).items()
+                if k not in sc.MAP_KINDS}
+        refs.update(extra["references"])
+        extra["references"] = refs
         # A scene character's face is its identity's LoRA: add it to the
         # form's ticked identities for this job, at its own strength.
         idents = o.collect()["identities"]
@@ -1637,14 +1657,16 @@ class SceneBuilder:
         extra["identities"] = idents
         o.scene.delete("1.0", "end")
         o.scene.insert("1.0", words.text)
-        o._set_ref("source", ref)
         if self.path:
             extra["scene_file"] = self.path
         sent = o.generate(extra=extra)
         said = o.note.cget("text")
         if sent:
-            self.status("Sent to the Image Studio with the frame (%s). %s"
-                        % (os.path.basename(ref), " ".join(words.notes)), "ok")
+            sent_as = {"pose": "pose map", "composition": "depth map", "source": "frame"}
+            self.status("Sent to the Image Studio with the %s (%s). %s" % (
+                ", ".join(sent_as[k] for k in sc.MAP_KINDS if k in maps) or "words alone",
+                ", ".join(os.path.basename(maps[k]) for k in sc.MAP_KINDS if k in maps),
+                " ".join(words.notes + notes)), "ok")
         else:
             self.status(said or "Not sent.", "err")
         return sent

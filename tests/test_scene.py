@@ -364,6 +364,137 @@ class TestRender(unittest.TestCase):
         self.assertNotEqual(sc.write_reference(s, d), a)
 
 
+class TestMaps(unittest.TestCase):
+    """The pose and depth maps the FLUX ControlNet is given instead of the frame."""
+
+    def figure(self, yaw=0.0):
+        s = staged("person")
+        s["objects"][0]["rotation"][0] = yaw
+        figs = sc.pose_figures(s)
+        self.assertEqual(len(figs), 1)
+        return s, figs[0]
+
+    def test_a_person_facing_the_camera_has_every_point_and_a_face(self):
+        s, fig = self.figure()
+        pts = fig["points"]
+        self.assertTrue(all(pts), pts)
+        self.assertLess(pts[2][0], pts[5][0])      # their right is on the picture's left
+        self.assertEqual(pts[1], [(pts[2][0] + pts[5][0]) / 2, (pts[2][1] + pts[5][1]) / 2])
+        self.assertLess(pts[0][1], pts[1][1])      # the nose above the neck
+        self.assertLess(pts[1][1], pts[10][1])     # the neck above the ankles
+        self.assertEqual(len(fig["face"]), 68)
+        # Every point is on the mannequin as the frame shows it.
+        w, h = sc.frame_size(s)
+        cam = sc.Camera(s["camera"], w, h)
+        seen = [cam.project(p) for _, fs, _ in sc.painted_pieces(s["objects"][0])
+                for f in fs for p in f]
+        xs, ys = [p[0] / w for p in seen], [p[1] / h for p in seen]
+        for x, y in pts:
+            self.assertTrue(min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys), (x, y))
+
+    def test_turned_away_the_face_is_hidden_and_the_ears_are_not(self):
+        _, fig = self.figure(180)
+        pts = fig["points"]
+        self.assertEqual((pts[0], pts[14], pts[15]), (None, None, None))
+        self.assertTrue(pts[16] and pts[17])
+        self.assertEqual(fig["face"], [])
+        self.assertGreater(pts[2][0], pts[5][0])   # seen from behind, right is right
+
+    def test_in_profile_the_far_eye_and_ear_go_and_the_face_stays(self):
+        _, fig = self.figure(90)
+        pts = fig["points"]
+        self.assertEqual(sum(p is None for p in (pts[14], pts[15])), 1)
+        self.assertEqual(sum(p is None for p in (pts[16], pts[17])), 1)
+        self.assertEqual(len(fig["face"]), 68)
+
+    def test_a_crowd_is_a_figure_each_and_far_ones_come_first(self):
+        s = staged("person", "crowd")
+        s["objects"][0]["position"] = [-1.4, 0, 0]
+        s["objects"][1]["position"] = [0.9, 0, -4]
+        s["objects"][1]["crowd"].update(count=5, width=2, depth=1)
+        figs = sc.pose_figures(s)
+        self.assertEqual(len(figs), 6)
+        depths = [f["depth"] for f in figs]
+        self.assertEqual(depths, sorted(depths, reverse=True))
+
+    def test_what_stands_in_front_hides_the_joints_behind_it(self):
+        s = staged("person", "person")
+        s["objects"][1]["position"] = [0.25, 0, -2.5]      # half behind the first
+        figs = sc.pose_figures(s)
+        self.assertEqual(len(figs), 2)
+        far, near = figs
+        self.assertTrue(all(near["points"]))              # the one in front is whole
+        self.assertTrue(any(p is None for p in far["points"]))
+        self.assertTrue(any(far["points"]))               # the one behind is not gone
+        s["objects"][1]["position"] = [0, 0, -2.5]         # straight behind: the body goes
+        far = sc.pose_figures(s)[0]["points"]
+        self.assertEqual([far[i] for i in (1, 2, 5, 8, 11)], [None] * 5)
+
+    def test_someone_out_of_the_frame_is_left_out(self):
+        s = staged("person")
+        s["objects"][0]["position"] = [30, 0, 0]
+        self.assertEqual(sc.pose_figures(s), [])
+        self.assertIsNone(sc.pose_png(s))
+
+    def test_one_figure_draws_as_the_stick_figure_editor_does(self):
+        import studio_pose as sp
+        pts = sp.preset("standing", 512, 768)
+        self.assertEqual(sp.render(pts, 512, 768),
+                         sp.render_figures([{"points": pts}], 512, 768))
+
+    def test_the_depth_map_is_nearer_brighter_and_the_sky_black(self):
+        s = staged("person", "box")
+        s["objects"][1]["position"] = [0.8, 0, -4]
+        w, h = 90, 116
+        zb = sc.depth_values(s, w, h)
+        cam = sc.Camera(s["camera"], w, h)
+
+        def at(obj):
+            lo, hi = sc.bounds(obj)
+            x, y, _ = cam.project(((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2,
+                                   (lo[2] + hi[2]) / 2))
+            return zb[int(y) * w + int(x)]
+        person, box = (at(o) for o in s["objects"])
+        self.assertGreater(box, 0)
+        self.assertGreater(person, box)
+        self.assertEqual(zb[:w], [0.0] * w)                       # the top row is sky
+        self.assertEqual(png_size(sc.depth_png(s)), (398, 512))  # portrait, long edge 512
+
+    def test_scene_maps_follows_the_strengths_and_the_model(self):
+        d = tempfile.mkdtemp()
+        s = staged("person")
+        maps, notes = sc.scene_maps(s, set(sc.MAP_KINDS), d)
+        self.assertEqual((sorted(maps), notes), (["composition", "pose"], []))
+        self.assertTrue(os.path.basename(maps["pose"]).startswith("pose_"))
+        self.assertTrue(os.path.basename(maps["composition"]).startswith("depth_"))
+        with open(maps["pose"], "rb") as f:
+            self.assertEqual(png_size(f.read()), (796, 1024))
+        s["frame_keep"] = 0.2
+        self.assertIn("source", sc.scene_maps(s, set(sc.MAP_KINDS), d)[0])
+        s["frame_keep"] = 0.0
+        # A model with no ControlNet has only the frame.
+        self.assertEqual(list(sc.scene_maps(s, {"source"}, d)[0]), ["source"])
+        s["pose_strength"] = s["depth_strength"] = 0
+        maps, notes = sc.scene_maps(s, set(sc.MAP_KINDS), d)
+        self.assertEqual(maps, {})
+        self.assertTrue(any("only the words" in n for n in notes), notes)
+        s = staged("box")                          # props only: no pose map, and no fuss
+        self.assertEqual(sc.scene_maps(s, set(sc.MAP_KINDS), d), (
+            {"composition": sc.scene_maps(s, {"composition"}, d)[0]["composition"]}, []))
+        s = staged("person")
+        s["objects"][0]["position"] = [30, 0, 0]
+        maps, notes = sc.scene_maps(s, {"pose"}, d)
+        self.assertEqual(maps, {})
+        self.assertTrue(any("No one is in the frame" in n for n in notes), notes)
+
+    def test_an_old_scene_with_redraw_opens_with_the_maps(self):
+        s, problems = sc.clean_scene({"redraw": 0.55})
+        self.assertEqual(problems, [])
+        self.assertNotIn("redraw", s)
+        self.assertEqual((s["pose_strength"], s["depth_strength"], s["frame_keep"]),
+                         (sc.POSE_STRENGTH, sc.DEPTH_STRENGTH, sc.FRAME_KEEP))
+
+
 class TestLibraryAssets(unittest.TestCase):
     """Shapes, props and the background crowd."""
 
@@ -431,7 +562,7 @@ class TestLibraryAssets(unittest.TestCase):
         self.assertIn("cheering, raising a glass", text)
         self.assertIn("Oktoberfest revellers, laughing.", text)
         self.assertEqual(sc.people(s), [])
-        _, _, extra = sc.generation(s, "/x/ref.png")
+        _, extra = sc.generation(s, {})
         self.assertNotIn("subject", extra)                     # the form's person stays
 
     def test_each_person_in_a_crowd_casts_their_own_shadow(self):
@@ -628,7 +759,7 @@ class TestSceneFile(unittest.TestCase):
                                    "controls": sc.pose_controls("kneeling")}
         s["objects"][1].update(name="Workbench", scale=[1.8, 0.9, 0.8], colour="#8a6a4a")
         s["camera"].update(yaw=30.0, lens=50.0)
-        s["frame"], s["redraw"] = "landscape", 0.62
+        s["frame"], s["pose_strength"], s["frame_keep"] = "landscape", 0.62, 0.15
         path = os.path.join(tempfile.mkdtemp(), "shop.scene.json")
         sc.save(s, path)
         back, problems = sc.load(path)
@@ -639,13 +770,14 @@ class TestSceneFile(unittest.TestCase):
 
     def test_a_damaged_file_opens_with_what_can_be_read(self):
         s, problems = sc.clean_scene({
-            "frame": "huge", "redraw": "lots", "camera": {"lens": -5, "pitch": 400},
+            "frame": "huge", "pose_strength": "lots", "frame_keep": 5, "camera": {"lens": -5, "pitch": 400},
             "objects": [{"asset": "spaceship"}, "junk",
                         {"asset": "person", "id": "p", "position": [1, "x", 2],
                          "pose": {"preset": "flying", "controls": {"arm_l_raise": 999}}},
                         {"asset": "box", "id": "p", "colour": "red"}]})
         self.assertEqual(s["frame"], "portrait")
-        self.assertEqual(s["redraw"], sc.REDRAW)
+        self.assertEqual((s["pose_strength"], s["frame_keep"]),
+                         (sc.POSE_STRENGTH, sc.FRAME_KEEP_MAX))
         self.assertEqual((s["camera"]["lens"], s["camera"]["pitch"]), (10, 85))
         self.assertEqual(len(problems), 2)
         person, box = s["objects"]
@@ -665,7 +797,7 @@ class TestWords(unittest.TestCase):
         c["position"] = [-1.0, 0, 0]
         words = sc.scene_text(s)
         self.assertIn("A steel workshop, overcast light.", words.text)
-        self.assertIn(": Kneeling to weld; face shield DOWN, hi-vis vest, gloves.", words.text)
+        self.assertIn(". Kneeling to weld; face shield DOWN, hi-vis vest, gloves.", words.text)
         self.assertIn("Gas cylinder (left of frame): acetylene, valve open  (hose attached).",
                       words.text)
         self.assertIn("a person, centre of frame, facing the camera", words.text)
@@ -691,6 +823,64 @@ class TestWords(unittest.TestCase):
             p["rotation"][0] = yaw
             self.assertEqual(sc.facing(s, p), words, yaw)
 
+    def posed(self, preset="standing", **controls):
+        s = staged("person")
+        p = s["objects"][0]
+        p["pose"] = {"preset": preset, "controls": dict(sc.pose_controls(preset), **controls)}
+        return s, p
+
+    def test_the_posture_is_read_off_the_posed_body(self):
+        for preset, words in (
+                ("standing", ["arms relaxed at the sides"]),
+                ("reaching", ["right arm raised above the head",
+                              "left arm hanging relaxed at the side", "looking up"]),
+                ("pointing", ["right arm reaching forward at shoulder height",
+                              "left arm hanging relaxed at the side"]),
+                ("carrying", ["both arms bent, hands in front of the chest"]),
+                ("working", ["leaning forward", "both arms bent, hands in front of the waist",
+                             "looking down"])):
+            _, p = self.posed(preset)
+            self.assertEqual(sc.posture_words(p), words, preset)
+
+    def test_the_legs_are_said_unless_a_named_pose_says_them(self):
+        _, p = self.posed(leg_l_bend=25)
+        self.assertIn("weight on the right leg, the other knee relaxed", sc.posture_words(p))
+        _, p = self.posed(leg_r_step=30, leg_l_step=-10)
+        self.assertIn("mid-stride, right foot forward", sc.posture_words(p))
+        _, p = self.posed("kneeling")
+        self.assertFalse([w for w in sc.posture_words(p) if "leg" in w or "foot" in w])
+        _, p = self.posed(twist=30, lean=-15, arm_l_out=90)
+        words = sc.posture_words(p)
+        self.assertIn("shoulders turned to their left", words)
+        self.assertIn("leaning to their right", words)
+        self.assertIn("left arm stretched out to the side", words)
+
+    def test_the_looks_gaze_outranks_the_heads_words(self):
+        s, p = self.posed(head_nod=30)
+        self.assertIn("looking down", sc.posture_words(p))
+        p["rotation"][0] = 90
+        p["pose"]["controls"]["head_turn"] = -80        # over the shoulder, to the camera
+        self.assertEqual(sc.gaze_words(s, p), "head turned towards the camera")
+        p["look"] = {"gaze": "looking at the camera"}
+        self.assertNotIn("looking down", sc.posture_words(p))
+        self.assertEqual(sc.gaze_words(s, p), "")
+        p["look"] = {}
+        p["pose"]["controls"]["head_turn"] = 0
+        self.assertEqual(sc.gaze_words(s, p), "")        # the head goes the body's way
+
+    def test_how_much_of_the_person_the_frame_shows(self):
+        s, p = self.posed()
+        self.assertEqual(sc.framing_words(s, p), "whole figure in view")
+        for distance, aim, words in ((1.8, 1.2, "seen from the knees up"),
+                                     (1.0, 1.35, "seen from the waist up"),
+                                     (0.6, 1.6, "head and shoulders")):
+            s["camera"].update(distance=distance, target=[0, aim, 0])
+            self.assertEqual(sc.framing_words(s, p), words, distance)
+        # Framed this close the person's middle is below the frame; they are
+        # still in the words.
+        self.assertIn("Person (a person, centre of frame, facing the camera, "
+                      "head and shoulders)", sc.scene_text(s).text)
+
     def test_the_camera_in_words(self):
         s = staged()
         s["camera"].update(pitch=45, lens=24)
@@ -708,11 +898,12 @@ class TestWords(unittest.TestCase):
                        "hair_style": "in a ponytail"})
         box["position"] = [-0.9, 0, 0]
         text = sc.scene_text(s).text
-        self.assertIn("Welder (a person, centre of frame, facing the camera): a man, in their "
-                      "40s, tall, full beard, determined expression, wearing hi-vis vest. "
-                      "grinding a seam; face shield DOWN.", text)
+        self.assertIn("Welder (a person, centre of frame, facing the camera, whole figure in "
+                      "view): a man, in their 40s, tall, full beard, determined expression, "
+                      "wearing hi-vis vest. Arms relaxed at the sides. grinding a seam; face "
+                      "shield DOWN.", text)
         self.assertIn("Apprentice (a person, ", text)
-        self.assertIn("): a young woman, auburn hair in a ponytail.", text)
+        self.assertIn("): a young woman, auburn hair in a ponytail. Arms relaxed", text)
         self.assertNotIn("Apprentice has no description", " ".join(sc.scene_text(s).notes))
 
     def test_a_look_is_saved_and_cleaned(self):
@@ -782,19 +973,31 @@ class TestWords(unittest.TestCase):
         s = staged("person")
         s["objects"][0].update(character="ada", look={"subject": "a woman"})
         chars = {"ada": {"id": "ada", "identity": "ada-face", "item_refs": {"x": "/y.png"}}}
-        _, _, extra = sc.generation(s, "/x/ref.png", chars)
+        _, extra = sc.generation(s, {}, chars)
         self.assertEqual((extra["subject"], extra["hair"], extra["weight"],
                           extra["character"], extra["item_refs"]), ("", "", 0, "", {}))
         self.assertEqual(extra["scene_identities"], ["ada-face"])
-        _, _, props = sc.generation(staged("box"), "/x/ref.png")
+        _, props = sc.generation(staged("box"), {})
         self.assertNotIn("subject", props)                   # no people: the form's stays
         self.assertNotIn("scene_identities", props)
 
-    def test_generation_carries_size_strength_and_the_scene(self):
+    def test_generation_carries_size_strengths_and_the_scene(self):
         s = staged("person")
-        s["frame"], s["redraw"] = "landscape", 0.55
-        words, ref, extra = sc.generation(s, "/x/ref.png")
-        self.assertEqual((extra["width"], extra["height"], extra["denoise"]), (1344, 768, 0.55))
+        s["frame"], s["pose_strength"], s["depth_strength"] = "landscape", 0.7, 0.4
+        s["frame_keep"] = 0.2
+        maps = {"pose": "/x/p.png", "composition": "/x/d.png", "source": "/x/f.png"}
+        words, extra = sc.generation(s, maps)
+        self.assertEqual((extra["width"], extra["height"], extra["denoise"]), (1344, 768, 0.8))
+        self.assertEqual(extra["references"], maps)
+        self.assertEqual((extra["pose"], extra["composition"]),
+                         ({"strength": 0.7}, {"strength": 0.4}))
+        # The frame alone (a model with no ControlNet) keeps at least the old
+        # default, and the form's drawn pose is blanked.
+        _, extra = sc.generation(s, {"source": "/x/f.png"})
+        self.assertEqual((extra["denoise"], extra["pose"], extra["composition"]),
+                         (round(1 - sc.FALLBACK_KEEP, 3), None, None))
+        _, extra = sc.generation(s, {"pose": "/x/p.png"})
+        self.assertNotIn("denoise", extra)                     # nothing to denoise from
         self.assertEqual(extra["scene_layout"]["objects"][0]["id"], "person")
         s["objects"][0]["name"] = "changed"
         self.assertEqual(extra["scene_layout"]["objects"][0]["name"], "Person")
@@ -803,43 +1006,65 @@ class TestWords(unittest.TestCase):
 class TestIntoCompose(TempStudioMixin, unittest.TestCase):
     """The frame and the words through the Image Studio's own compose()."""
 
-    def settings(self, model):
+    def settings(self, model, takes, **scene):
         s = staged("person")
+        s.update(scene)
         s["objects"][0]["description"] = "checking a gauge, hard hat and hi-vis on"
-        ref = sc.write_reference(s, tempfile.mkdtemp())
-        words, ref, extra = sc.generation(s, ref)
-        st = dict(ig.default_settings(), model=model, scene=words.text,
-                  references={"source": ref}, **extra)
-        return st, ref
+        maps, _ = sc.scene_maps(s, takes, tempfile.mkdtemp())
+        words, extra = sc.generation(s, maps)
+        st = dict(ig.default_settings(), model=model, scene=words.text, **extra)
+        return st, maps
 
-    def test_a_workflow_with_a_source_input_takes_the_frame(self):
-        st, ref = self.settings("z-image-turbo")
+    def test_a_model_with_no_controlnet_takes_the_frame(self):
+        st, maps = self.settings("z-image-turbo", {"source"})
+        self.assertEqual(list(maps), ["source"])
         plan = ig.compose(st, self.studio.lib, self.backend("3090"), FLUX_FILES)
         self.assertEqual(plan.errors, [])
-        self.assertEqual(plan.references.get("source"), ref)
+        self.assertEqual(plan.references.get("source"), maps["source"])
         self.assertEqual((plan.values["width"], plan.values["height"]), (896, 1152))
-        self.assertEqual(plan.values["denoise"], sc.REDRAW)
+        self.assertEqual(plan.values["denoise"], round(1 - sc.FALLBACK_KEEP, 3))
         self.assertIn("checking a gauge, hard hat and hi-vis on", plan.prompt)
         self.assertIn(ig.anatomy_text(), plan.prompt)
 
     def test_the_forms_person_is_not_said_twice(self):
         s = staged("person")
         s["objects"][0]["look"] = {"subject": "an older man", "hair": "grey"}
-        ref = sc.write_reference(s, tempfile.mkdtemp())
-        words, ref, extra = sc.generation(s, ref)
+        maps, _ = sc.scene_maps(s, {"source"}, tempfile.mkdtemp())
+        words, extra = sc.generation(s, maps)
         st = dict(ig.default_settings(), model="z-image-turbo", scene=words.text,
-                  references={"source": ref}, subject="a woman", hair="auburn")
+                  subject="a woman", hair="auburn")
         st.update(extra)
         plan = ig.compose(st, self.studio.lib, self.backend("3090"), FLUX_FILES)
         self.assertIn("an older man, grey hair", plan.prompt)
         self.assertNotIn("a woman", plan.prompt)
         self.assertNotIn("auburn", plan.prompt)
 
-    def test_a_workflow_without_one_says_the_frame_goes_unused(self):
-        st, _ = self.settings("flux-dev")
+    def test_flux_takes_the_pose_and_depth_maps_and_no_frame(self):
+        cn = "FLUX.1-dev-ControlNet-Union-Pro-2.0.safetensors"
+        inv = dict(FLUX_FILES, controlnet={cn})
+        st, maps = self.settings("flux-dev", set(sc.MAP_KINDS), pose_strength=0.8,
+                                 depth_strength=0.45)
+        self.assertEqual(sorted(maps), ["composition", "pose"])
+        plan = ig.compose(st, self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual(plan.errors, [])
+        self.assertEqual(plan.images, {"pose_image": maps["pose"],
+                                       "composition_image": maps["composition"]})
+        self.assertEqual((plan.values["pose_strength"], plan.values["composition_strength"]),
+                         (0.8, 0.45))
+        g = ig.fill(plan.workflow, dict(plan.values, pose_image="p.png",
+                                        composition_image="d.png"))
+        self.assertEqual(g["40"]["inputs"]["denoise"], 1.0)     # from noise: no frame
+        self.assertEqual(g["40"]["inputs"]["latent_image"], ["20", 0])
+        # Some of the frame kept pins the props too, image to image on top.
+        st, maps = self.settings("flux-dev", set(sc.MAP_KINDS), frame_keep=0.2)
+        plan = ig.compose(st, self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual(plan.images["source_image"], maps["source"])
+        self.assertEqual(plan.values["denoise"], 0.8)
+        # Without the ControlNet file the backend says so and goes on in words.
+        st, _ = self.settings("flux-dev", set(sc.MAP_KINDS))
         plan = ig.compose(st, self.studio.lib, self.backend("5090"), FLUX_FILES)
-        self.assertNotIn("source", plan.references)
-        self.assertTrue(any("Source image" in w for w in plan.warnings), plan.warnings)
+        self.assertEqual(plan.images, {})
+        self.assertTrue(any("lacks" in w and cn in w for w in plan.warnings), plan.warnings)
 
     def test_a_floor_is_text_to_image_with_nothing_of_the_person(self):
         s = staged()
@@ -1366,11 +1591,12 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual([o["name"] for o in sb.scene["objects"]], ["Person", "Workbench"])
         self.assertEqual(sb.scene["objects"][0]["pose"]["preset"], "kneeling")
 
-        ui.settings["model"] = "flux-dev"                   # takes no source picture
-        self.assertIn("frame would not be used", sb.check())
-        self.assertFalse(sb.generate())
+        ui.settings["model"] = "flux-dev"                   # pose and depth maps
+        self.assertEqual(sb.takes("flux-dev"), set(sc.MAP_KINDS))
+        self.assertEqual(sb.check(), "")
+        self.assertEqual(sb.takes("no-such-model"), set())
 
-        sb._set_model("z-image-turbo")
+        sb._set_model("z-image-turbo")                      # the frame alone
         ui.random_seed.set(False)
         ui.adv["seed"].set("77")
         n = len(ui.jobs)
@@ -1382,7 +1608,9 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertTrue(os.path.isfile(st["references"]["source"]))
         with open(st["references"]["source"], "rb") as f:
             self.assertEqual(png_size(f.read()), (896, 1152))
-        self.assertEqual((st["width"], st["height"], st["denoise"]), (896, 1152, sc.REDRAW))
+        self.assertEqual((st["width"], st["height"], st["denoise"]),
+                         (896, 1152, round(1 - sc.FALLBACK_KEEP, 3)))
+        self.assertEqual((st["pose"], st["composition"]), (None, None))
         self.assertIn("welding a beam; helmet down, leather gloves", st["scene"])
         self.assertIn("Workbench (", st["scene"])
         self.assertEqual(st["scene_file"], path)
@@ -1394,6 +1622,22 @@ class TestSceneBuilderWindow(unittest.TestCase):
                          "kneeling")
         # A plain Generate from the form afterwards carries no scene.
         self.assertNotIn("scene_layout", ui.collect())
+        self.assertNotIn("source", ui.collect()["references"])   # the form is left alone
+
+        # On FLUX the maps take the form's pose and source slots for the job;
+        # its other references stay.
+        style = os.path.join(tempfile.mkdtemp(), "look.png")
+        two_tone(style, (200, 40, 40), (40, 40, 200))
+        ui._set_ref("style", style)
+        ui._set_ref("source", style)
+        sb._set_model("flux-dev")
+        n = len(ui.jobs)
+        self.assertTrue(sb.generate())
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status in ig.FINISHED)
+        refs = ui.jobs[0].settings["references"]
+        self.assertEqual(sorted(refs), ["composition", "pose", "style"])
+        self.assertEqual(refs["style"], style)
+        self.assertEqual(ui.jobs[0].settings["pose"], {"strength": sc.POSE_STRENGTH})
 
 
 if __name__ == "__main__":
