@@ -755,7 +755,14 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
 - **Good inventions are promoted, once.** A NEW_USEFUL_DETAIL at 0.75 or
   more, on a key the user did not set and not also called a mismatch, is set
   at its key (`merge_canonical`; "Hair colour" and "hair_color" are one key)
-  and goes into the next prompt.
+  and goes into the next prompt. **And into every later picture:** each
+  promotion is filed in `image-studio/critic_memory.json` (`remember`) -
+  a person's detail under the identity's id (only when the picture had
+  exactly one identity), a scene's under its words (`_key`'d). `compose`
+  appends what `recall` finds for this job's person and scene to every
+  prompt, auto-refine on or off, skipping any key the form sets, and
+  `_refine` seeds the canonical state with it (unlocked) so the critic
+  checks those details instead of inventing new ones.
 - **Two outputs from one compiler.** `build_refinement_instructions` writes
   the sectioned text (ORIGINAL USER INTENT, CANONICAL ..., PRESERVE,
   CORRECT) to the log; `generator_prompt` is the prose FLUX reads, with a
@@ -958,7 +965,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
     z-buffer of 1/z over every face, the floor and the inward walls (`_fill_depth`:
     1/z is linear across a flat face on screen), grey from farthest (black) to
     nearest (white), sky black - Depth Anything's convention, which Union Pro 2.0
-    learnt. 512 px on the long edge; the ControlNet scales it.
+    learnt. 512 px on the long edge; the ControlNet scales it. Each body (person,
+    crowd member, prop) has its own depth stretched `DEPTH_RELIEF` (3x) about its
+    middle, where it is on screen unchanged, and the grey spans `DEPTH_CLIP`'s
+    percentiles, not min to max: in true 1/z a person at 5 m is a flat cut-out,
+    where Depth Anything's maps give bodies rounded relief.
   - **Grey frame kept** (`frame_keep`, kind `source`, default 0 = not sent): 1 -
     denoise. 0.1-0.25 pins props and exact framing on top of the maps.
   A model with neither ControlNet input (Z-Image) gets the frame alone, at
