@@ -980,6 +980,32 @@ class TestWords(unittest.TestCase):
         self.assertEqual(sc.outfit({"accessories": "german hat"})["hat"][0], "alpine")
         self.assertEqual(sc.outfit({"accessories": "hat"})["hat"][0], "hat")
 
+    def test_a_hand_takes_what_it_holds_unless_posed_by_hand(self):
+        both = sc.outfit({"accessories": "beer stein, pretzel"})["held"]
+        self.assertEqual(both["pretzel"][0], ("l",))            # the hand the stein leaves
+        self.assertEqual(sc.outfit({"accessories": "pretzel"})["held"]["pretzel"][0], ("r",))
+        rest = sc.pose_controls("standing")
+        c = sc.gripped(rest, both)
+        self.assertEqual(c["fingers_r_curl"], sc.GRIPS["stein"][1])
+        self.assertEqual(c["thumb_l_curl"], sc.GRIPS["pretzel"][3])
+        self.assertEqual(sc.gripped(rest, {}), rest)                    # empty: untouched
+        own = dict(rest, fingers_r_curl=5.0)                            # posed: kept
+        self.assertEqual(sc.gripped(own, both)["thumb_r_curl"], 0)
+
+    def test_fingers_curl_toward_the_palm_and_the_wrist_bends(self):
+        def tips(**ctl):
+            o = staged("person")["objects"][0]
+            o["pose"]["controls"].update(ctl)
+            pts = [v for p, faces, _ in sc.painted_pieces(o) if p == "hand_l"
+                   for f in faces for v in f]
+            return tuple(round(sum(c) / len(pts), 4) for c in zip(*pts))
+        self.assertNotEqual(tips(), tips(fingers_l_curl=90))
+        self.assertNotEqual(tips(), tips(wrist_l_bend=60))
+        self.assertIn("accordion", sc.POSE_NAMES)
+        for k, v in sc.POSE_VALUES["accordion"].items():
+            lo, hi = sc.CONTROL_RANGE[k]
+            self.assertTrue(lo <= v <= hi, k)
+
     def test_costume_pieces_are_on_the_mannequin(self):
         plain = staged("person")["objects"][0]
         dressed = staged("person")["objects"][0]

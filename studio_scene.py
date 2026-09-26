@@ -393,6 +393,10 @@ for _side, _name in (("l", "left"), ("r", "right")):
         ("hand_" + _side, "arm_%s_raise" % _side, "Raise forward", -60, 180),
         ("hand_" + _side, "arm_%s_out" % _side, "Out to the side", -10, 100),
         ("hand_" + _side, "arm_%s_bend" % _side, "Bend elbow", 0, 150),
+        ("hand_" + _side, "wrist_%s_bend" % _side, "Bend wrist (to the palm +)", -70, 70),
+        ("hand_" + _side, "fingers_%s_curl" % _side, "Curl fingers", 0, 90),
+        ("hand_" + _side, "fingers_%s_spread" % _side, "Spread fingers", 0, 20),
+        ("hand_" + _side, "thumb_%s_curl" % _side, "Thumb across the palm", 0, 90),
         ("foot_" + _side, "leg_%s_step" % _side, "Step forward", -45, 120),
         ("foot_" + _side, "leg_%s_out" % _side, "Out to the side", -10, 50),
         ("foot_" + _side, "leg_%s_bend" % _side, "Bend knee", 0, 150),
@@ -411,6 +415,12 @@ POSES = [
     ("pointing", "Pointing", {"arm_r_raise": 85, "arm_l_out": 6, "arm_l_bend": 10}),
     ("carrying", "Carrying", {"arm_l_raise": 35, "arm_r_raise": 35, "arm_l_bend": 75,
                               "arm_r_bend": 75, "arm_l_out": 12, "arm_r_out": 12}),
+    # Right fingers on the keyboard, the left palm flat on the bass end.
+    ("accordion", "Playing the accordion", {
+        "arm_r_raise": 30, "arm_r_bend": 50, "wrist_r_bend": 70, "fingers_r_curl": 30,
+        "fingers_r_spread": 8, "thumb_r_curl": 15, "arm_l_raise": -20, "arm_l_out": 40,
+        "arm_l_bend": 120, "wrist_l_bend": -40, "fingers_l_curl": 12,
+        "fingers_l_spread": 4}),
     ("working", "Working at a bench", {"bend": 22, "head_nod": 30, "arm_l_raise": 45,
                                        "arm_r_raise": 50, "arm_l_bend": 65,
                                        "arm_r_bend": 60, "arm_l_out": 10,
@@ -451,6 +461,7 @@ def joint_rotations(c):
         rot["shoulder_" + side] = euler(0, -g("arm_%s_raise" % side),
                                         sign * g("arm_%s_out" % side))
         rot["elbow_" + side] = euler(0, -g("arm_%s_bend" % side), 0)
+        rot["wrist_" + side] = euler(0, -g("wrist_%s_bend" % side), 0)
         rot["hip_" + side] = euler(0, -g("leg_%s_step" % side),
                                    sign * g("leg_%s_out" % side))
         rot["knee_" + side] = euler(0, g("leg_%s_bend" % side), 0)
@@ -548,7 +559,8 @@ CLOTH_DEFAULT = {"top": "#8d97a3", "bottom": "#4c5566", "outerwear": "#5e564d",
                  "footwear": "#34302d", "hat": "#4a4540", "glasses": "#2e2a28",
                  "sunglasses": "#1c1c20", "goggles": "#b9c7cf", "alpine": "#4a5a3c",
                  "dirndl": "#7a2433", "apron": "#ecebe6", "blouse": "#ecebe6",
-                 "accordion": "#a3262a", "stein": "#d9d3c2"}
+                 "accordion": "#a3262a", "stein": "#d9d3c2",
+                 "pretzel": "#9a5a26"}
 # What the Shoes slot names, by shape: first match wins, anything else is a
 # plain shoe (loafers, oxfords, brogues) on a thin dark sole.
 SHOES = [
@@ -611,7 +623,29 @@ HELD = [
     ("stein", ("beer stein", "beer steins", "stein", "steins", "beer mug", "beer mugs",
                "tankard", "tankards", "masskrug", "maßkrug", "maß", "pint of beer",
                "glass of beer", "beer glass", "beer glasses")),
+    ("pretzel", ("pretzel", "pretzels", "brezel", "brezn", "breze")),
 ]
+# How a hand takes what it holds, while its wrist and finger controls are all
+# left at rest: the controls it gets, by their key less the side. The
+# accordion's own hands are the "Playing the accordion" pose; this is only
+# fingers ready for the keys (right) and flat for the bass end (left).
+GRIP_KEYS = ("wrist_%s_bend", "fingers_%s_curl", "fingers_%s_spread", "thumb_%s_curl")
+GRIPS = {"stein": (0, 55, 0, 60), "pretzel": (0, 35, 6, 70),
+         "accordion_r": (0, 30, 8, 15), "accordion_l": (0, 12, 4, 0)}
+
+
+def gripped(controls, held):
+    """`controls` with each hand that holds something and is left at rest
+    taking it (`GRIPS`); a hand posed by its own controls keeps them."""
+    out = dict(controls)
+    for side in "lr":
+        if any(float(out.get(k % side, 0) or 0) for k in GRIP_KEYS):
+            continue
+        kind = "accordion_" + side if "accordion" in held else next(
+            (k for k in ("stein", "pretzel") if side in held.get(k, ((),))[0]), None)
+        if kind:
+            out.update({k % side: float(v) for k, v in zip(GRIP_KEYS, GRIPS[kind])})
+    return out
 BOTH_HANDS = ("steins", "mugs", "tankards", "glasses", "two", "both hands", "pair", "each hand")
 TORSO = ("chest", "belly")
 SLEEVES = ("upper_arm", "forearm")
@@ -753,6 +787,9 @@ def outfit(look=None):
         kind = next((k for k, words in HELD if _said(item, *words)), None)
         if kind and kind not in held:
             sides = ("l", "r") if kind == "stein" and _said(item, *BOTH_HANDS) else ("r",)
+            if kind == "pretzel":         # the hand a stein leaves free
+                taken = set(held.get("stein", ((),))[0])
+                sides = ("l",) if "r" in taken else ("r",)
             held[kind] = (sides, cloth_colour(item if _has_colour(item) else "", kind))
             continue                      # "a red accordion" is not a red hat
         kind = next((k for k, words in HATS if _said(item, *words)), None)
@@ -906,6 +943,46 @@ def _jaw(p):
     return (x, y, z)
 
 
+# The fingers, index (by the thumb) to little: (across the palm, length, girth).
+FINGERS = ((0.03, 0.078, 0.0095), (0.01, 0.086, 0.01),
+           (-0.01, 0.08, 0.0095), (-0.029, 0.064, 0.0085))
+KNUCKLE_Y = -0.098                   # the palm's end, down from the wrist
+RELAXED = 10                         # each joint's curl at rest, degrees
+
+
+def _fingers(part, side, sign, grip, at, side_x, side_z):
+    """A hand's four fingers and thumb: [(part, "hand", faces)]. `grip` is
+    (curl, spread, thumb) in degrees, `at` the wrist's frame (down the hand
+    is -y, the palm faces +z)."""
+    curl, spread, thumb = grip
+    out = []
+    for i, (x, length, w) in enumerate(FINGERS):
+        # Each of three joints bends by the curl, toward the palm; a spread
+        # fans the fingers out from between the middle and ring fingers.
+        fan = math.radians(spread * (1.5 - i) / 1.5) * -sign
+        p, bend = (x * -sign, KNUCKLE_Y, 0.012), 0.0
+        girth = w
+        for frac in (0.45, 0.3, 0.25):
+            bend += math.radians(RELAXED + curl)
+            d = (math.sin(fan) * math.cos(bend), -math.cos(fan) * math.cos(bend),
+                 math.sin(bend))
+            q = add(p, mul(d, length * frac))
+            out.append((part, "hand", prism(at(p), at(q), side_x, (girth, girth * 0.9),
+                                            (girth * 0.9, girth * 0.85), 6)))
+            p, girth = q, girth * 0.88
+    # The thumb, its two joints swung from alongside the palm to across it.
+    t = thumb / 90.0
+    lerp = lambda a, b: tuple(u + (v - u) * t for u, v in zip(a, b))   # noqa: E731
+    base = (-sign * 0.03, -0.03, 0.012)
+    knuckle = lerp((-sign * 0.045, -0.08, 0.032), (-sign * 0.03, -0.075, 0.058))
+    tip = lerp((-sign * 0.045, -0.12, 0.04), (0.0, -0.1, 0.078))
+    out += [(part, "hand", prism(at(base), at(knuckle), side_z, (0.013, 0.012),
+                                 (0.011, 0.01), 6)),
+            (part, "hand", prism(at(knuckle), at(tip), side_z, (0.011, 0.01),
+                                 (0.008, 0.008), 6))]
+    return out
+
+
 def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     """The mannequin: [(part, faces, rgb or None)], pelvis at the origin,
     built to `shape` (`body_shape`) and wearing `dressed` (`outfit`); rgb
@@ -913,11 +990,15 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
     click on a hand selects the hand's controls."""
     shape = shape or REST_SHAPE
     dressed = dressed or {}
+    held = dressed.get("held") or {}
+    controls = gripped(controls, held)
     sk = skeleton(controls, root, shape)
     P = lambda j: sk[j][0]                                 # noqa: E731
     M = lambda j: sk[j][1]                                 # noqa: E731
     X = lambda j: column(M(j), 0)                          # noqa: E731
     at = lambda j, v: add(P(j), apply(M(j), v))            # noqa: E731
+    grip = lambda side: tuple(float(controls.get(k % side, 0) or 0)   # noqa: E731
+                              for k in GRIP_KEYS[1:])
     fat, mus = shape["fat"] - 1, shape["muscle"] - 1
     curve = shape["hips"] - 0.55 * fat               # the hips beyond their girth
     wear = dressed.get("regions") or {}
@@ -1098,27 +1179,11 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                         (0.043 * fore,) * 3, 12, 8)),
             (hand, "hand", ellipsoid(P("wrist_" + side), M("wrist_" + side),
                                      (0.032, 0.03, 0.026), 10, 6)),
-            (hand, "hand", prism(at("wrist_" + side, (-sign * 0.03, -0.03, 0.012)),
-                                 at("wrist_" + side, (-sign * 0.045, -0.08, 0.032)),
-                                 X("wrist_" + side), (0.013, 0.012), (0.011, 0.01), 6)),
-            (hand, "hand", prism(at("wrist_" + side, (-sign * 0.045, -0.08, 0.032)),
-                                 at("wrist_" + side, (-sign * 0.045, -0.12, 0.04)),
-                                 X("wrist_" + side), (0.011, 0.01), (0.008, 0.008), 6)),
             (foot, "shin", ellipsoid(P("knee_" + side), M("knee_" + side),
                                      (0.056 * shin, 0.058 * shin, 0.058 * shin), 12, 8)),
         ]
-        # Four fingers off the palm's end, index by the thumb to little
-        # finger, each in two joints curled a little forward.
-        for x, length, w in ((0.03, 0.078, 0.0095), (0.01, 0.086, 0.01),
-                             (-0.01, 0.08, 0.0095), (-0.029, 0.064, 0.0085)):
-            x *= -sign
-            base = at("wrist_" + side, (x, -0.098, 0.012))
-            knuckle = at("wrist_" + side, (x, -0.098 - length * 0.55, 0.018))
-            tip = at("wrist_" + side, (x, -0.098 - length, 0.03))
-            out += [(hand, "hand", prism(base, knuckle, X("wrist_" + side),
-                                         (w, w * 0.9), (w * 0.9, w * 0.85), 6)),
-                    (hand, "hand", prism(knuckle, tip, X("wrist_" + side),
-                                         (w * 0.9, w * 0.85), (w * 0.7, w * 0.65), 6))]
+        out += _fingers(hand, side, sign, grip(side), lambda v, s=side: at("wrist_" + s, v),
+                        X("wrist_" + side), column(M("wrist_" + side), 2))
         if shoes:
             out += [(foot, rgb, faces) for rgb, faces in _shoe(
                 shoes, lambda v, s=side: at("ankle_" + s, v))]
@@ -1136,7 +1201,6 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
         out.append(("body", rgb, prism(at("chest", (-0.09, 0.1, fz + 0.004)),
                                        at("chest", (0.09, 0.1, fz + 0.004)), (0, 1, 0),
                                        (0.025, 0.006), (0.025, 0.006), 4)))
-    held = dressed.get("held") or {}
     if "accordion" in held:
         # Across the chest, bellows between two ends; the Carrying pose puts
         # the hands on it.
@@ -1146,8 +1210,9 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                             for f in box(lo, hi)])
         out += [("body", rgb, chest_box((-0.23, -0.2, z - 0.1), (-0.15, 0.12, z + 0.1))),
                 ("body", rgb, chest_box((0.15, -0.2, z - 0.1), (0.23, 0.12, z + 0.1))),
-                ("body", (236, 235, 230), chest_box((0.155, -0.18, z + 0.1),
-                                                    (0.225, 0.1, z + 0.115)))]   # keys
+                ("body", (236, 235, 230), chest_box((-0.225, -0.18, z + 0.1),
+                                                    (-0.155, 0.1, z + 0.115)))]  # keys, at
+        # their right (-x), for the right hand
         for i in range(8):                # the bellows' pleats, dark and light
             x0 = -0.15 + 0.3 * i / 8
             deep = 0.085 if i % 2 else 0.07
@@ -1163,6 +1228,20 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None):
                                                    (0.045, 0.045), 10)))
             out.append(("hand_" + side, (246, 242, 230), prism(
                 hi, add(hi, (0, 0.022, 0)), (1, 0, 0), (0.046, 0.046), (0.04, 0.04), 10)))
+    if "pretzel" in held:
+        sides, rgb = held["pretzel"]
+        for side in sides:
+            # Pinched at its top between the thumb and the fingers, hanging
+            # in the plane of the palm: a loop and the two arms crossed in it.
+            w = lambda x, y, s=side: at("wrist_" + s, (x, -0.1 + y, 0.075))  # noqa: E731
+            loop = [(0.055 * math.sin(2 * math.pi * i / 14),
+                     -0.05 - 0.045 * math.cos(2 * math.pi * i / 14)) for i in range(14)]
+            strands = list(zip(loop, loop[1:] + loop[:1]))
+            strands += [((-0.03, -0.087), (0.028, -0.03)), ((0.03, -0.087), (-0.028, -0.03))]
+            for (x0, y0), (x1, y1) in strands:
+                out.append(("hand_" + side, rgb, prism(w(x0, y0), w(x1, y1),
+                                                       column(M("wrist_" + side), 2),
+                                                       (0.011, 0.011), (0.011, 0.011), 6)))
     if dressed.get("apron"):
         # A plate down the front of the skirt, from the waist to the knee.
         fwd = column(M("pelvis"), 2)
