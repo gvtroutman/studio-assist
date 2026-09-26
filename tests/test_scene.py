@@ -1006,6 +1006,23 @@ class TestWords(unittest.TestCase):
             lo, hi = sc.CONTROL_RANGE[k]
             self.assertTrue(lo <= v <= hi, k)
 
+    def test_the_pose_map_carries_the_hands_and_the_words_say_them(self):
+        s = staged("person")
+        o = s["objects"][0]
+        o["look"] = {"accessories": "beer stein"}
+        s["camera"] = {"target": [0, 1.0, 0], "yaw": 0.0, "pitch": 0.0, "distance": 3.0,
+                       "lens": 50}
+        fig = sc.pose_figures(s)[0]
+        right = fig["hand_points"]["right"]
+        self.assertEqual(len(right), 21)
+        self.assertEqual(right[0], fig["points"][4])          # it starts at the wrist
+        self.assertIn("right hand fingers wrapped round the beer stein",
+                      sc.posture_words(o))
+        o["pose"]["controls"]["fingers_l_curl"] = 80
+        o["pose"]["controls"]["thumb_l_curl"] = 60
+        self.assertIn("left hand clenched in a fist", sc.posture_words(o))
+        self.assertTrue(sc.pose_png(s).startswith(b"\x89PNG"))
+
     def test_costume_pieces_are_on_the_mannequin(self):
         plain = staged("person")["objects"][0]
         dressed = staged("person")["objects"][0]
