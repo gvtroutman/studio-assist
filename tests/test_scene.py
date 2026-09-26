@@ -492,6 +492,16 @@ class TestMaps(unittest.TestCase):
         self.assertEqual(zb[:w], [0.0] * w)                       # the top row is sky
         self.assertEqual(png_size(sc.depth_png(s)), (398, 512))  # portrait, long edge 512
 
+    def test_the_depth_map_stretches_each_body_and_not_the_floor(self):
+        s = staged("person")
+        w, h = 90, 116
+        flat, deep = sc.depth_values(s, w, h), sc.depth_values(s, w, h, 3.0)
+        body = [i for i in range(w * h) if flat[i] != deep[i]]
+        self.assertTrue(body)
+        spread = lambda zb: max(zb[i] for i in body) - min(zb[i] for i in body)
+        self.assertGreater(spread(deep), 2 * spread(flat))       # rounder
+        self.assertEqual(flat[-1], deep[-1])                     # the floor as it was
+
     def test_scene_maps_follows_the_strengths_and_the_model(self):
         d = tempfile.mkdtemp()
         s = staged("person")
