@@ -789,6 +789,22 @@ class TestErrors(unittest.TestCase):
         self.assertFalse(h["ok"])
         self.assertIn("not ComfyUI", h["detail"])
 
+    def test_a_server_too_busy_to_answer_once_is_not_offline(self):
+        """The 3090 finished five pictures and then read offline: its
+        /system_stats had stalled past 5 s while it wrapped up a job."""
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://10.0.0.9:8188"})
+        waits = []
+        def stats(path, timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise ig.Unreachable("Cannot reach X at http://10.0.0.9:8188. (timed out)")
+            return {"system": {"comfyui_version": "0.37"}, "devices": [{}]}
+        c.get_json = stats
+        c.get_queue = lambda: {}
+        h = c.health()
+        self.assertTrue(h["ok"], h["detail"])
+        self.assertEqual(waits, [5, 15])
+
     def test_nothing_listening_here_says_so_and_how_to_start_it(self):
         c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9",
                               "start": r"D:\ComfyUI\start.cmd"})
