@@ -915,6 +915,101 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["fc1_3n"]["inputs"]["mask"], ["fc1_s3", 0])    # only it redrawn
         self.assertEqual(g["fc1_a3"]["inputs"]["mask"], ["fc1_s3", 0])    # only it blended
 
+    def swap_job(self, spots, client=None, **fix):
+        """A fix whose spots may carry photos, on a 5090 with FLUX, Qwen and SAM3."""
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=client or SwapClient)
+        src = os.path.join(self.dir, "made.png")
+        with open(src, "wb") as f:
+            f.write(ig.oval_png(256))
+        hat = os.path.join(self.dir, "red hat.png")
+        with open(hat, "wb") as f:
+            f.write(PNG)
+        s = self.studio.fix_base(dict(ig.default_settings(), model="flux-dev",
+                                      scene="On a pier.", backend="5090"))
+        s.update(mode="fix", seed=5, fix=dict({"image": src, "target": "other", "spots": [
+            dict(sp, photo=hat) if sp.pop("hat", False) else sp for sp in spots]}, **fix))
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        sent = [c for c in (client or SwapClient).instances
+                if c.backend["id"] == "5090" and c.graphs]
+        return jobs[0], (sent[0].graphs if sent else []), hat
+
+    def test_a_spot_with_a_photo_is_swapped_by_qwen(self):
+        job, graphs, hat = self.swap_job([
+            {"x": 60, "y": 40, "size": 64, "box": [40, 20, 40, 30], "word": "hat", "hat": True}])
+        self.assertEqual(job.status, "complete", job.detail)
+        (g,) = graphs                             # one run: the swap alone
+        self.assertNotIn("fc1_4", g)              # not redrawn by FLUX
+        self.assertEqual(g["sw1_c"]["inputs"]["image"], ["fi", 0])
+        pos = g["sw1_pos"]["inputs"]
+        self.assertEqual(pos["image1"], ["sw1_in", 0])        # the crop is picture 1
+        self.assertEqual(g[pos["image2"][0]]["inputs"]["image"], "studio_red hat.png")
+        self.assertIn("wears the hat from picture 2", pos["prompt"])
+        self.assertEqual(g["sw1_m2"]["inputs"]["image"], ["sw1_out", 0])  # the new hat's outline
+        self.assertEqual(g["sw1_b4"]["inputs"]["source"], ["sw1_out", 0])
+        self.assertEqual(g["fs"]["inputs"]["images"], ["sw1_b4", 0])
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["fix"]["spots"][0]["photo"], hat)
+        self.assertIn("from a photo", rec["prompt"])
+
+    def test_photo_spots_are_swapped_first_and_the_rest_redrawn_on_that(self):
+        job, graphs, _ = self.swap_job([
+            {"x": 60, "y": 40, "size": 64, "hat": True},
+            {"x": 180, "y": 180, "size": 64}])
+        self.assertEqual(job.status, "complete", job.detail)
+        swap, redraw = graphs
+        self.assertIn("sw1_b4", swap)
+        self.assertNotIn("sw2_c", swap)
+        self.assertEqual(swap["sw1_b3"]["inputs"]["image"], ["sw1_b2", 0])
+        self.assertEqual(swap["sw1_b2"]["inputs"]["image"], ["fo", 0])   # a clicked square: the oval
+        self.assertEqual(redraw["fi"]["inputs"]["image"],
+                         "ImageStudio/fix_swap_00001_.png [output]")
+        self.assertIn("fc1_4", redraw)
+        self.assertNotIn("fc2_4", redraw)
+
+    def test_a_photo_spot_needs_qwen_on_the_machine(self):
+        job, _, _ = self.swap_job([{"x": 60, "y": 40, "size": 64, "hat": True}],
+                                  client=FaceClient)
+        self.assertEqual(job.status, "failed")
+        self.assertIn("Qwen-Image-Edit", job.detail)
+        self.assertIn("qwen_image_edit_2509", job.detail)
+
+    def test_a_freehand_outline_is_the_only_part_changed(self):
+        tri = [[40, 30], [100, 30], [70, 90]]
+        spot = ig.outline_spot(tri)
+        self.assertEqual((spot["x"], spot["y"]), (70, 60))
+        self.assertEqual(spot["size"], 75)
+        job, graphs, _ = self.swap_job([dict(spot), dict(ig.outline_spot(
+            [[150, 150], [220, 150], [220, 220], [150, 220]]), hat=True)])
+        self.assertEqual(job.status, "complete", job.detail)
+        swap, redraw = graphs
+        self.assertEqual(swap["sw1_b2"]["inputs"]["image"], ["sw1_b1", 0])
+        self.assertEqual(swap["sw1_b0"]["inputs"]["mask"], ["sw1_m1", 0])
+        shape = swap["sw1_m0"]["inputs"]["image"]
+        self.assertTrue(shape.startswith("studio_") and "swap" in shape)
+        self.assertEqual(redraw["fc1_a0"]["class_type"], "LoadImage")    # the drawn mask
+        self.assertEqual(redraw["fc1_3n"]["inputs"]["mask"], ["fc1_a2", 0])
+        self.assertEqual(redraw["fc1_a3"]["inputs"]["mask"], ["fc1_a2", 0])
+
+    def test_outline_png_fills_inside_the_outline(self):
+        import zlib
+        raw = ig.outline_png([(2, 2), (8, 2), (8, 8), (2, 8)], 10, 10)
+        self.assertEqual(ig.picture_size(raw), (10, 10))
+        data = zlib.decompress(raw[raw.index(b"IDAT") + 4:raw.index(b"IEND") - 8])
+        rows = [data[i * 11 + 1:(i + 1) * 11] for i in range(10)]
+        self.assertEqual(rows[5], b"\x00\x00" + b"\xff" * 6 + b"\x00\x00")
+        self.assertEqual(rows[0], b"\x00" * 10)
+        self.assertEqual(sum(r.count(b"\xff") for r in rows), 36)
+
+    def test_swap_prompts(self):
+        fix = {"target": "hand", "spots": [{"x": 1, "y": 1, "size": 64, "photo": "a.png"}]}
+        self.assertEqual(ig.clean_fix(fix)["spots"][0]["photo"], "a.png")
+        self.assertIn("like the hand in picture 2", ig.swap_prompt(fix, {}))
+        self.assertIn("the cowboy hat from picture 2", ig.swap_prompt(
+            dict(fix, target="other", words="cowboy hat"), {}))
+        self.assertEqual(ig.fix_words(fix), "1 hand (all from a photo)")
+
     def test_without_the_tone_node_a_fix_says_so(self):
         job, client, _ = self.fix_job()
         self.assertEqual(job.status, "complete", job.detail)
@@ -1452,6 +1547,21 @@ class DressClient(FakeClient):
         return {"status": {"completed": True}, "outputs": out}
 
 
+class SwapClient(DressClient):
+    """A ComfyUI with FLUX, Qwen and SAM3 that answers a fix run ("fs") with
+    its picture, named after the run's prefix."""
+
+    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        graph = self.graphs[int(pid[3:]) - 1]
+        if "fs" not in graph:
+            return super().listen_for_progress(pid, on_event, stop, timeout)
+        prefix = graph["fs"]["inputs"]["filename_prefix"]
+        name = os.path.basename(prefix).split("_")[0] + ("_swap" if prefix.endswith("_swap")
+                                                         else "")
+        return {"status": {"completed": True}, "outputs": {"fs": {"images": [
+            {"filename": name + "_00001_.png", "subfolder": "ImageStudio", "type": "output"}]}}}
+
+
 def ran(cls):
     """The graphs the 5090's client was sent (Studio makes one per backend)."""
     return next(c for c in cls.instances if c.backend["id"] == "5090" and c.graphs).graphs
@@ -1789,6 +1899,44 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(job["fix"]["strength"], "light")
         self.assertEqual(len(job["fix"]["spots"]), 1)
         self.assertGreaterEqual(job["fix"]["spots"][0]["size"], ig.FIX_MIN)
+
+    def test_fix_a_spot_lassos_a_part_and_gives_it_a_photo(self):
+        import studio_images_ui as ui_mod
+        s, ui = self.tab()
+        src = os.path.join(self.dir, "fixme.png")
+        with open(src, "wb") as f:
+            f.write(ig.oval_png(256))
+        sent = []
+        ui.host._spawn = lambda sid, fn, arg: sent.append(arg)
+        self.addCleanup(lambda: delattr(ui.host, "_spawn"))
+        hat = os.path.join(self.dir, "hat.png")
+        ui_mod.filedialog.askopenfilename = lambda **kw: hat
+        self.addCleanup(lambda: delattr(ui_mod.filedialog, "askopenfilename"))
+        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
+        self.pump(lambda: fw.img is not None)
+
+        class Ev:
+            def __init__(self, x, y):
+                self.x, self.y = x, y
+
+        def at(px, py):
+            return Ev(fw.ox + int(px * fw.k), fw.oy + int(py * fw.k))
+        fw._press(at(60, 60))
+        for p in ((200, 60), (200, 200), (60, 200), (62, 62)):
+            fw._drag(at(*p))
+        fw._release(at(62, 62))
+        (sp,) = fw.spots
+        self.assertGreaterEqual(len(sp["outline"]), 4)
+        self.assertAlmostEqual(sp["x"], 130, delta=4)
+        fw._press(at(130, 130))                   # a click on it: its photo
+        fw._release(at(130, 130))
+        self.assertEqual(fw.spots[0]["photo"], hat)
+        self.assertEqual(len(fw.spots), 1)
+        fw._redraw()
+        (job,) = sent
+        spot = ig.clean_fix(job["fix"])["spots"][0]
+        self.assertEqual(spot["photo"], hat)
+        self.assertGreaterEqual(len(spot["outline"]), 4)
 
     def test_fix_a_spot_finds_in_one_click_and_locks(self):
         import studio_images_ui as ui_mod

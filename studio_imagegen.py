@@ -1246,6 +1246,68 @@ FIX_FACE_MASK = "face"                # SAM3's word for a face fix's true blend 
 FIX_CONTEXT = 1.5                     # the crop redrawn is this x the spot: the photo round it
 FIX_TONE = 0.85                       # how far the redraw's colour curves go to the original's
 TONE_NODE = "StudioMatchTone"         # comfy_nodes/studio_matchtone
+# A spot with a photo is not redrawn by the picture's model but swapped by
+# Qwen-Image-Edit 2509 (qwen_dress.json's loaders): the crop as picture 1,
+# the photo as picture 2, in the sentence shape Qwen follows ("keep X the
+# same" clauses it ignores; see Try On). It works on a picture from any
+# model. Its colours are not matched to the picture's: that would turn the
+# photo's red hat into the old one's colour.
+SWAP_PROMPTS = {"hand": "The hand in picture 1 is posed and looks like the %s in picture 2.",
+                "face": "The person in picture 1 has the %s from picture 2.",
+                "other": "The person in picture 1 wears the %s from picture 2, in place of "
+                         "what is there."}
+SWAP_NOUNS = {"hand": "hand", "face": "face", "other": "item"}
+SWAP_GROW = 16                        # px the swapped thing's outline grows at the crop's size
+# A spot can be a freehand outline (the Fix a spot window's drag): only
+# inside it changes. ComfyUI has no polygon mask node, so the outline is
+# drawn here as a mask picture at the crop's size (`outline_png`) and
+# uploaded; its square (for the crop) is its bounding box, padded.
+FIX_OUTLINE_MAX = 400                 # points kept of an outline
+FIX_OUTLINE_PAD = 1.25                # the square round an outline, of its longer side
+
+
+def outline_png(points, width, height):
+    """A greyscale PNG of width x height: white inside the closed outline
+    `points` [(x, y)], black outside (even-odd, sampled at pixel centres)."""
+    import struct
+    import zlib
+    edges = [(points[i], points[(i + 1) % len(points)]) for i in range(len(points))]
+    edges = [(a, b) for a, b in edges if a[1] != b[1]]
+    rows = []
+    for yy in range(height):
+        yc = yy + 0.5
+        xs = sorted(a[0] + (yc - a[1]) * (b[0] - a[0]) / float(b[1] - a[1])
+                    for a, b in edges if min(a[1], b[1]) <= yc < max(a[1], b[1]))
+        row = bytearray(width + 1)            # the filter byte, then the pixels
+        for x0, x1 in zip(xs[0::2], xs[1::2]):
+            i0, i1 = max(0, int(x0 + 0.5)), min(width, int(x1 + 0.5))
+            if i1 > i0:
+                row[1 + i0:1 + i1] = b"\xff" * (i1 - i0)
+        rows.append(bytes(row))
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
+
+
+def outline_spot(points):
+    """A freehand outline (picture px) -> the spot it makes: the square round
+    its bounding box, padded by FIX_OUTLINE_PAD, at least FIX_MIN."""
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    side = int(max(FIX_MIN, max(max(xs) - min(xs), max(ys) - min(ys)) * FIX_OUTLINE_PAD))
+    return {"x": int((min(xs) + max(xs)) / 2.0), "y": int((min(ys) + max(ys)) / 2.0),
+            "size": side, "outline": [[int(x), int(y)] for x, y in points]}
+
+
+def swap_prompt(fix, spot):
+    """The Qwen sentence for a spot with a photo: its Find word, else the
+    fix's words, else the target's noun."""
+    f = clean_fix(fix)
+    what = spot.get("word") or f["words"] or SWAP_NOUNS[f["target"]]
+    return SWAP_PROMPTS[f["target"]] % what
 
 
 def _spots(items, limit):
@@ -1266,6 +1328,14 @@ def _spots(items, limit):
             pass
         if isinstance(sp.get("word"), str) and sp["word"].strip():
             spot["word"] = sp["word"].strip()[:40]
+        try:                          # a freehand outline: [[x, y], ...] in the picture
+            pts = [(int(p[0]), int(p[1])) for p in sp["outline"]][:FIX_OUTLINE_MAX]
+            if len(pts) >= 3:
+                spot["outline"] = [list(p) for p in pts]
+        except (KeyError, TypeError, ValueError, IndexError):
+            pass
+        if isinstance(sp.get("photo"), str) and sp["photo"].strip():
+            spot["photo"] = sp["photo"].strip()     # a picture of what goes there instead
         out.append(spot)
     return out[:limit]
 
@@ -1296,13 +1366,18 @@ def clean_fix(fix):
 
 
 def fix_words(fix):
-    """What a fix redraws, in words: "2 hands", "the collar"."""
+    """What a fix redraws, in words: "2 hands", "the collar", "1 spot from
+    a photo"."""
     f = clean_fix(fix)
     n = len(f["spots"])
     if f["words"]:
         return f["words"]
     noun = {"hand": "hand", "face": "face"}.get(f["target"], "spot")
-    return "%d %s%s" % (n, noun, "" if n == 1 else "s")
+    out = "%d %s%s" % (n, noun, "" if n == 1 else "s")
+    k = sum(1 for sp in f["spots"] if sp.get("photo"))
+    if k:
+        out += " (%s from a photo)" % ("all" if k == n else k)
+    return out
 
 
 def fix_crops(width, height, spots, head=False):
@@ -1323,6 +1398,15 @@ def fix_areas(crops, spots):
     redrawn and blended back. A face with SAM3 (`head`) keeps its own
     mask; a clicked square keeps the oval."""
     for crop, sp in zip(crops, spots):
+        if sp.get("outline"):
+            # Drawn by hand: only inside it changes, whatever the target.
+            pts = [(x - crop["x"], y - crop["y"]) for x, y in sp["outline"]]
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            x0, y0 = max(0, int(min(xs))), max(0, int(min(ys)))
+            x1, y1 = min(crop["width"], int(max(xs)) + 1), min(crop["height"], int(max(ys)) + 1)
+            if x1 - x0 >= 8 and y1 - y0 >= 8:
+                crop.update(area=(x0, y0, x1, y1), outline=pts)
+            continue
         if crop.get("head") or not sp.get("box"):
             continue
         bx, by, bw, bh = sp["box"]
@@ -1818,13 +1902,22 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             kx, ky = ew / float(side), eh / float(tall)
             ax0, ay0 = int(area[0] * kx), int(area[1] * ky)
             aw, ah = max(1, int(area[2] * kx) - ax0), max(1, int(area[3] * ky) - ay0)
-            g[n + "a0"] = {"class_type": "SolidMask", "inputs": {
-                "value": 0.0, "width": ew, "height": eh}}
-            g[n + "a1"] = {"class_type": "SolidMask", "inputs": {
-                "value": 1.0, "width": aw, "height": ah}}
-            g[n + "a2"] = {"class_type": "MaskComposite", "inputs": {
-                "destination": [n + "a0", 0], "source": [n + "a1", 0], "x": ax0, "y": ay0,
-                "operation": "or"}}
+            if crop.get("shape"):
+                # A freehand outline: its own mask picture, drawn at the crop's size.
+                g[n + "a0"] = {"class_type": "LoadImage", "inputs": {"image": crop["shape"]}}
+                g[n + "a1"] = {"class_type": "ImageScale", "inputs": {
+                    "image": [n + "a0", 0], "upscale_method": "bilinear", "width": ew,
+                    "height": eh, "crop": "disabled"}}
+                g[n + "a2"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "a1", 0],
+                                                                      "channel": "red"}}
+            else:
+                g[n + "a0"] = {"class_type": "SolidMask", "inputs": {
+                    "value": 0.0, "width": ew, "height": eh}}
+                g[n + "a1"] = {"class_type": "SolidMask", "inputs": {
+                    "value": 1.0, "width": aw, "height": ah}}
+                g[n + "a2"] = {"class_type": "MaskComposite", "inputs": {
+                    "destination": [n + "a0", 0], "source": [n + "a1", 0], "x": ax0,
+                    "y": ay0, "operation": "or"}}
             shape = n + "a2"
             if crop.get("word") and values.get("sam3"):
                 # The thing's own outline, found again in the crop, grown a
@@ -2368,6 +2461,96 @@ def dress_head_graph(wf, values, passes, image, work, crop, mask, size, pictures
         "destination": ["hi", 0], "source": last, "x": crop["x"], "y": crop["y"],
         "resize_source": False, "mask": blend}}
     return _dress_save(g, ["hb", 0], size, prefix)
+
+
+def swap_graph(wf, values, image, crops, pictures, prompts, oval, prefix, sam3=None,
+               locks=()):
+    """Fix a spot from photos: in `image` (a LoadImage name) each of `crops`
+    (fix_crops, each with its spot's "photo" path, and fix_areas' `area` and
+    `word` when Find made it) is cut out, swapped by Qwen-Image-Edit - the
+    crop as picture 1, the photo (`pictures` maps its path to a LoadImage
+    name) as picture 2, `prompts` beside `crops` - and blended back:
+
+    - through the thing's own outline when Find named it and `sam3` is
+      given: SAM3's word in the crop before and after (the new thing may be
+      bigger than the old), grown SWAP_GROW px and softened;
+    - else through Find's box grown by FIX_AREA_GROW, softened;
+    - else (a clicked square) through `oval`, which reaches the spot alone.
+
+    Qwen redraws the whole crop a shade off, so nothing outside the mask is
+    kept from it. `locks` are laid back from `image` last; the result is
+    saved under `prefix` by node "fs", like face_graph's."""
+    g, v = _dress_start(wf, values, [])
+    g["fi"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+    g["fo"] = {"class_type": "LoadImage", "inputs": {"image": oval}}
+    if sam3 and any(c.get("word") for c in crops):
+        g["sw_l"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}}
+    last = ["fi", 0]
+    for i, crop in enumerate(crops):
+        n, side, tall = "sw%d_" % (i + 1), crop["width"], crop["height"]
+        region = {k: crop[k] for k in ("x", "y", "width", "height")}
+        g[n + "c"] = {"class_type": "ImageCropV2", "inputs": {"image": last,
+                                                             "crop_region": region}}
+        ps = {"kind": "swap", "items": [{"path": crop["photo"]}], "prompt": prompts[i]}
+        drawn = _dress_pass(g, n, ps, [n + "c", 0], (side, tall), v, pictures,
+                            int(v["seed"]) + i)
+        area = crop.get("area")
+        if crop.get("shape"):                 # a freehand outline, drawn at the crop's size
+            g[n + "m0"] = {"class_type": "LoadImage", "inputs": {"image": crop["shape"]}}
+            g[n + "m1"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "m0", 0],
+                                                                  "channel": "red"}}
+            shape = [n + "m1", 0]
+        elif area and crop.get("word") and "sw_l" in g:
+            g[n + "t"] = {"class_type": "CLIPTextEncode", "inputs": {
+                "text": crop["word"], "clip": ["sw_l", 1]}}
+            for k, src in (("m1", [n + "c", 0]), ("m2", drawn)):
+                g[n + k] = {"class_type": "SAM3_Detect", "inputs": {
+                    "model": ["sw_l", 0], "image": src, "conditioning": [n + "t", 0],
+                    "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+            g[n + "m3"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": [n + "m1", 0], "source": [n + "m2", 0], "x": 0, "y": 0,
+                "operation": "or"}}
+            g[n + "m4"] = {"class_type": "GrowMask", "inputs": {
+                "mask": [n + "m3", 0], "expand": SWAP_GROW, "tapered_corners": True}}
+            shape = [n + "m4", 0]
+        elif area:
+            g[n + "m0"] = {"class_type": "SolidMask", "inputs": {
+                "value": 0.0, "width": side, "height": tall}}
+            g[n + "m1"] = {"class_type": "SolidMask", "inputs": {
+                "value": 1.0, "width": max(1, area[2] - area[0]),
+                "height": max(1, area[3] - area[1])}}
+            g[n + "m2"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": [n + "m0", 0], "source": [n + "m1", 0], "x": area[0],
+                "y": area[1], "operation": "or"}}
+            shape = [n + "m2", 0]
+        else:
+            shape = None
+        if shape:
+            g[n + "b0"] = {"class_type": "MaskToImage", "inputs": {"mask": shape}}
+            g[n + "b1"] = {"class_type": "ImageBlur", "inputs": {
+                "image": [n + "b0", 0], "blur_radius": FIX_AREA_SOFT[0],
+                "sigma": FIX_AREA_SOFT[1]}}
+            soft = [n + "b1", 0]
+        else:
+            soft = ["fo", 0]
+        g[n + "b2"] = {"class_type": "ImageScale", "inputs": {
+            "image": soft, "upscale_method": "bilinear", "width": side, "height": tall,
+            "crop": "disabled"}}
+        g[n + "b3"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "b2", 0],
+                                                              "channel": "red"}}
+        g[n + "b4"] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": last, "source": drawn, "x": crop["x"], "y": crop["y"],
+            "resize_source": False, "mask": [n + "b3", 0]}}
+        last = [n + "b4", 0]
+    for i, region in enumerate(locks or ()):
+        g["fl%d_1" % i] = {"class_type": "ImageCropV2", "inputs": {"image": ["fi", 0],
+                                                                  "crop_region": dict(region)}}
+        g["fl%d_2" % i] = {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": last, "source": ["fl%d_1" % i, 0], "x": region["x"],
+            "y": region["y"], "resize_source": False}}
+        last = ["fl%d_2" % i, 0]
+    g["fs"] = {"class_type": "SaveImage", "inputs": {"images": last, "filename_prefix": prefix}}
+    return g
 
 
 def dress_values(wf, backend, steps=None):
@@ -4191,31 +4374,65 @@ class Studio:
                  face_detail=False, auto_refine=False, batch=1)
         return s
 
+    def _outline_masks(self, job, client, crops, tag):
+        """Each crop with a freehand outline gets `shape`: the outline drawn
+        as a mask picture at the crop's size, uploaded to `client`."""
+        for i, crop in enumerate(crops):
+            if not crop.get("outline"):
+                continue
+            path = os.path.join(self.lib.root, "fix_shapes", "%s_%s_%d.png" % (job.id, tag, i))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(outline_png(crop["outline"], crop["width"], crop["height"]))
+            crop["shape"] = client.upload_image(path)
+
     def run_fix(self, job, client, say):
         """Fix a spot, on the lane's thread: the squares the user clicked on a
         finished picture redrawn with its own model, LoRAs and prompt, and
-        blended back. A new picture in the history; the old one is kept."""
+        blended back. Squares given a photo are swapped for what the photo
+        shows by Qwen-Image-Edit first (`swap_graph`), and the rest redrawn
+        on that. A new picture in the history; the old one is kept."""
         b, s = job.backend, job.settings
         fix = clean_fix(s.get("fix"))
         src = fix["image"]
+        swaps = [sp for sp in fix["spots"] if sp.get("photo")]
+        plain = [sp for sp in fix["spots"] if not sp.get("photo")]
         problem = ""
         if not src or not os.path.isfile(src):
             problem = "The picture to fix (%s) is not on this PC." % (src or "none")
         elif not fix["spots"]:
             problem = "Click the part of the picture to redraw."
+        else:
+            gone = [sp["photo"] for sp in swaps if not os.path.isfile(sp["photo"])]
+            if gone:
+                problem = "The photo %s is not on this PC." % gone[0]
         size = file_size_of(src) if not problem else None
         if size is None and not problem:
             problem = "Could not read the size of %s." % src
-        plan = None
+        plan = swap_wf = None
         if not problem:
             plan = compose(self.fix_base(s), self.lib, b, self.inventories.get(b["id"]),
                            self.workflow_loader, self.nodes.get(b["id"]))
             job.plan = plan
             if plan.errors:
                 problem = " ".join(plan.errors)
-            elif not plan.workflow.get("face_detail"):
+            elif plain and not plan.workflow.get("face_detail"):
                 problem = ("The %s workflow has no redraw section, so its pictures cannot "
                            "be fixed." % plan.workflow.get("label"))
+        if swaps and not problem:
+            try:
+                swap_wf = self.workflow_loader(DRESS_WORKFLOW)
+            except TemplateError as e:
+                problem = str(e)
+            else:
+                nodes = self.nodes.get(b["id"])
+                missing = dress_lacks(swap_wf, {"clothes": []}, self.inventories.get(b["id"]),
+                                      nodes)
+                if nodes is not None and "SolidMask" not in nodes:
+                    missing.append({"text": "the node SolidMask"})
+                if missing:
+                    problem = ("A spot with a photo is swapped by Qwen-Image-Edit, and %s "
+                               "lacks %s." % (b["name"], _and([m["text"] for m in missing])))
         if problem:
             return self.queue._finish(job, "failed", problem)
         values = dict(plan.values)
@@ -4231,52 +4448,89 @@ class Studio:
             os.makedirs(self.lib.root, exist_ok=True)
             with open(oval, "wb") as fh:
                 fh.write(oval_png(scale=1.0 / FIX_CONTEXT, centre=0.5))
-            if fix["tone"] and TONE_NODE not in set(client.node_types()):
-                job.notes.append("%s's ComfyUI has no %s (comfy_nodes/studio_matchtone), so "
-                                 "the redraw's colours are not matched to the picture."
-                                 % (b["name"], TONE_NODE))
-            else:
-                values["match_tone"] = fix["tone"]
-            # A face is blended back through its true shape - SAM3's face in
-            # the picture and in the redraw, plus the box Find found - not
-            # the square's oval, so no redrawn skin or hair spills round it.
-            sam = self.sam3_on(b) if fix["target"] == "face" else None
-            values["sam3"] = sam
-            if fix["target"] == "face" and not sam:
-                job.notes.append("%s has no SAM3 checkpoint, so the face is blended back "
-                                 "through an oval, not its own shape." % b["name"])
-            crops = fix_crops(size[0], size[1], [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
-                                                 for sp in fix["spots"]], head=bool(sam))
-            fix_areas(crops, fix["spots"])
-            if any(c.get("word") for c in crops):    # found things redrawn by their outline
-                values["sam3"] = self.sam3_on(b)
-            boxes = [sp.get("box") for sp in fix["spots"]] if sam else None
-            values["face_prompt"] = fix_prompt(fix, plan.prompt)
-            values["face_denoise"] = fix["strength"]
+            oval = client.upload_image(oval)
+            locks = lock_regions(size[0], size[1], fix["locks"])
             values["filename_prefix"] = "ImageStudio/fix_%s" % job.id
-            graph = face_graph(plan.workflow, values, plan.loras, image, crops,
-                               client.upload_image(oval), values["filename_prefix"],
-                               boxes=boxes, locks=lock_regions(size[0], size[1], fix["locks"]),
-                               mask_word=FIX_FACE_MASK)
+            graphs = []
+            if swaps:
+                crops = fix_crops(size[0], size[1], [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
+                                                     for sp in swaps])
+                fix_areas(crops, swaps)
+                self._outline_masks(job, client, crops, "swap")
+                pictures = {}
+                for crop, sp in zip(crops, swaps):
+                    crop["photo"] = sp["photo"]
+                    if sp["photo"] not in pictures:
+                        pictures[sp["photo"]] = client.upload_image(sp["photo"])
+                sam = self.sam3_on(b) if any(c.get("word") for c in crops) else None
+                sv = dict(dress_values(swap_wf, b), seed=values["seed"])
+                graphs.append(("Swapping %d spot%s from %s" % (
+                    len(swaps), "" if len(swaps) == 1 else "s",
+                    "a photo" if len(pictures) == 1 else "photos"),
+                    swap_graph(swap_wf, sv, image, crops, pictures,
+                               [swap_prompt(fix, sp) for sp in swaps], oval,
+                               values["filename_prefix"] + ("_swap" if plain else ""),
+                               sam3=sam, locks=locks)))
+            if plain:
+                if fix["tone"] and TONE_NODE not in set(client.node_types()):
+                    job.notes.append("%s's ComfyUI has no %s (comfy_nodes/studio_matchtone), "
+                                     "so the redraw's colours are not matched to the picture."
+                                     % (b["name"], TONE_NODE))
+                else:
+                    values["match_tone"] = fix["tone"]
+                # A face is blended back through its true shape - SAM3's face in
+                # the picture and in the redraw, plus the box Find found - not
+                # the square's oval, so no redrawn skin or hair spills round it.
+                sam = self.sam3_on(b) if fix["target"] == "face" else None
+                values["sam3"] = sam
+                if fix["target"] == "face" and not sam:
+                    job.notes.append("%s has no SAM3 checkpoint, so the face is blended back "
+                                     "through an oval, not its own shape." % b["name"])
+                crops = fix_crops(size[0], size[1], [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
+                                                     for sp in plain], head=bool(sam))
+                fix_areas(crops, plain)
+                self._outline_masks(job, client, crops, "redraw")
+                if any(c.get("word") for c in crops):    # found things redrawn by their outline
+                    values["sam3"] = self.sam3_on(b)
+                boxes = [sp.get("box") for sp in plain] if sam else None
+                values["face_prompt"] = fix_prompt(fix, plan.prompt)
+                values["face_denoise"] = fix["strength"]
+                # Built once the swap run (if any) has made the picture it starts from.
+                graphs.append(("Redrawing " + fix_words(dict(fix, spots=plain)),
+                               lambda picture: face_graph(
+                                   plan.workflow, values, plan.loras, picture, crops, oval,
+                                   values["filename_prefix"], boxes=boxes, locks=locks,
+                                   mask_word=FIX_FACE_MASK)))
         except (ComfyError, TemplateError, OSError) as e:
             return self.queue._finish(job, "failed", "Could not set up the fix on %s: %s"
                                       % (b["name"], e))
-        job.graph = graph
         if b.get("shares_llm_gpu") and self.make_room is not None:
             say(detail="clearing LM Studio off the GPU")
             try:
                 self.make_room(b)
             except Exception as e:
                 job.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
-        try:
-            files = self._run_pass(job, client, graph, say, "Redrawing " + fix_words(fix))
-        except ComfyError as e:
-            if job.cancel.is_set():
+        files = graph = None
+        for label, graph in graphs:
+            if callable(graph):
+                try:
+                    graph = graph(image)
+                except (TemplateError, ComfyError) as e:
+                    return self.queue._finish(job, "failed", "Could not set up the fix on "
+                                              "%s: %s" % (b["name"], e))
+            job.graph = graph
+            try:
+                files = self._run_pass(job, client, graph, say, label)
+            except ComfyError as e:
+                if job.cancel.is_set():
+                    return self.queue._finish(job, "cancelled")
+                return self.queue._finish(job, "failed", "The fix failed on %s: %s"
+                                          % (b["name"], e))
+            if files is None or job.cancel.is_set():
                 return self.queue._finish(job, "cancelled")
-            return self.queue._finish(job, "failed", "The fix failed on %s: %s"
-                                      % (b["name"], e))
-        if files is None or job.cancel.is_set():
-            return self.queue._finish(job, "cancelled")
+            f = files[0]              # the next run starts from this one's picture
+            image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                    f["filename"], f.get("type") or "output")
         say("decoding", "fetching the picture from %s" % b["name"], None)
         try:
             pictures = [(f["filename"], client.fetch(f)) for f in files]
@@ -4285,6 +4539,9 @@ class Studio:
                                       "fetched from %s: %s" % (b["name"], e))
         plan.notes.append("Fixed %s at denoise %s from %s." % (
             fix_words(fix), fix["strength"], os.path.basename(src)))
+        if swaps:
+            plan.notes.append("Swapped from %s by Qwen-Image-Edit." % _and(
+                sorted({os.path.basename(sp["photo"]) for sp in swaps})))
         rec = self.record_for(job, graph)
         rec["prompt"] = "Fix %s: %s" % (fix_words(fix), plan.prompt)
         rec["fix"] = fix
