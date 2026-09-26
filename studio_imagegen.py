@@ -2164,6 +2164,99 @@ def again(record, new_seed=False):
     return s
 
 
+# ======================================================= person cut-out
+# The Identities editor's "Pick person": SAM3 finds everyone in a reference
+# photo (`people_graph`), the user clicks one when there is more than one,
+# and a second run (`cutout_graph`) crops that person and puts them on white,
+# so the face reference is them and nobody beside them.
+PEOPLE_PROMPT = "person:8"
+CUTOUT_PAD = 0.04             # of the box's larger side, added around the person
+CUTOUT_BG = 0xFFFFFF
+
+
+def people_graph(image, sam3):
+    """Everyone SAM3 finds in `image` (a LoadImage name), the picture's size,
+    and a PNG of it for Tk to show (it reads no JPEG)."""
+    return {
+        "1": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "2": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
+        "3": {"class_type": "CLIPTextEncode", "inputs": {"text": PEOPLE_PROMPT,
+                                                         "clip": ["2", 1]}},
+        "4": {"class_type": "SAM3_Detect", "inputs": {
+            "model": ["2", 0], "image": ["1", 0], "conditioning": ["3", 0],
+            "threshold": 0.3, "refine_iterations": 0, "individual_masks": True}},
+        "5": {"class_type": "PreviewAny", "inputs": {"source": ["4", 1]}},
+        "6": {"class_type": "GetImageSize", "inputs": {"image": ["1", 0]}},
+        "7": {"class_type": "PreviewAny", "inputs": {"source": ["6", 0]}},
+        "8": {"class_type": "PreviewAny", "inputs": {"source": ["6", 1]}},
+        "9": {"class_type": "PreviewImage", "inputs": {"images": ["1", 0]}},
+    }
+
+
+def people_found(entry):
+    """What people_graph said -> (width, height, [(x, y, w, h)] largest first,
+    the preview's file dict or None). None when it said nothing."""
+    out = entry.get("outputs") or {}
+
+    def text(node):
+        t = (out.get(node) or {}).get("text") or []
+        return json.loads(t[0]) if t else None
+    try:
+        boxes, width, height = text("5"), text("7"), text("8")
+    except ValueError:
+        return None
+    if width is None or height is None:
+        return None
+    boxes = boxes[0] if boxes and isinstance(boxes[0], list) else boxes or []
+    boxes = sorted(((b["x"], b["y"], b["width"], b["height"]) for b in boxes),
+                   key=lambda b: -b[2] * b[3])
+    if boxes:                     # a head at the frame's edge is not a person to pick
+        big = boxes[0][2] * boxes[0][3]
+        boxes = [b for b in boxes if b[2] * b[3] >= big / 20]
+    imgs = (out.get("9") or {}).get("images") or []
+    return int(width), int(height), boxes, (imgs[0] if imgs else None)
+
+
+def pick_box(boxes, x, y):
+    """The box a click at (x, y) means: the smallest one holding it, else the
+    one whose centre is nearest."""
+    inside = [b for b in boxes if b[0] <= x <= b[0] + b[2] and b[1] <= y <= b[1] + b[3]]
+    if inside:
+        return min(inside, key=lambda b: b[2] * b[3])
+    return min(boxes, key=lambda b: (b[0] + b[2] / 2.0 - x) ** 2 + (b[1] + b[3] / 2.0 - y) ** 2)
+
+
+def cutout_region(box, width, height, pad=CUTOUT_PAD):
+    x, y, w, h = box
+    m = int(max(w, h) * pad)
+    x0, y0 = max(0, int(x) - m), max(0, int(y) - m)
+    x1, y1 = min(width, int(x + w) + m), min(height, int(y + h) + m)
+    return {"x": x0, "y": y0, "width": x1 - x0, "height": y1 - y0}
+
+
+def cutout_graph(image, sam3, region, prefix="studio_person"):
+    """`image` cropped to `region`, the main person in it masked by SAM3 and
+    laid on white, saved under `prefix`. A neighbour's shoulder inside the
+    crop is not the main person, so it goes white with the background."""
+    return {
+        "1": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "2": {"class_type": "ImageCropV2", "inputs": {"image": ["1", 0], "crop_region": region}},
+        "3": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": sam3}},
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "person:1", "clip": ["3", 1]}},
+        "5": {"class_type": "SAM3_Detect", "inputs": {
+            "model": ["3", 0], "image": ["2", 0], "conditioning": ["4", 0],
+            "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}},
+        "6": {"class_type": "EmptyImage", "inputs": {
+            "width": region["width"], "height": region["height"], "batch_size": 1,
+            "color": CUTOUT_BG}},
+        "7": {"class_type": "ImageCompositeMasked", "inputs": {
+            "destination": ["6", 0], "source": ["2", 0], "x": 0, "y": 0,
+            "resize_source": False, "mask": ["5", 0]}},
+        "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0],
+                                                    "filename_prefix": prefix}},
+    }
+
+
 # ================================================================ the studio
 
 class Studio:
@@ -2236,6 +2329,66 @@ class Studio:
                                           b.get("lora_dir", ""))
         self.lib.save("loras")
         return added
+
+    # ------------------------------------------------------ person cut-out
+    def sam3_backend(self):
+        """(backend, SAM3 checkpoint) on the first online backend that has
+        one; checks the backends first if none is known. None if none."""
+        for attempt in (0, 1):
+            for b in self.backends():
+                if not (self.health.get(b["id"]) or {}).get("ok"):
+                    continue
+                sam = sorted(c for c in (self.inventories.get(b["id"]) or {}).get(
+                    "checkpoints", ()) if SAM3 in c.lower())
+                if sam:
+                    return b, sam[0]
+            if not attempt:
+                self.check_all()
+        return None
+
+    def _run_quick(self, client, graph, timeout=300):
+        pid = client.queue_workflow(graph)
+        end = time.time() + timeout
+        while time.time() < end:
+            entry = client.get_history(pid)
+            if entry:                 # history holds a prompt once it has finished
+                status = entry.get("status") or {}
+                if status.get("status_str") == "error":
+                    raise ComfyError("%s: %s" % (client.backend["name"], "; ".join(
+                        str(m[1].get("exception_message", m[0])) for m in
+                        status.get("messages") or [] if m[0] == "execution_error")
+                        or "the run failed"))
+                return entry
+            time.sleep(0.5)
+        raise ComfyError("%s took over %d s" % (client.backend["name"], timeout))
+
+    def find_people(self, path):
+        """Everyone in the picture at `path`. -> dict with backend, sam3, the
+        uploaded name, width, height, boxes (largest first) and preview (the
+        picture as PNG bytes). Network I/O: off the UI thread."""
+        found = self.sam3_backend()
+        if found is None:
+            raise ComfyError("No online ComfyUI has a SAM3 checkpoint (a file with sam3 "
+                             "in its name under checkpoints).")
+        backend, sam3 = found
+        c = self.client(backend)
+        name = c.upload_image(path)
+        said = people_found(self._run_quick(c, people_graph(name, sam3)))
+        if said is None:
+            raise ComfyError("SAM3 said nothing about the picture.")
+        width, height, boxes, pv = said
+        return {"backend": backend, "sam3": sam3, "image": name, "width": width,
+                "height": height, "boxes": boxes, "preview": c.fetch(pv) if pv else None}
+
+    def cut_person(self, found, box):
+        """The person in `box` of what find_people found, on white: PNG bytes."""
+        c = self.client(found["backend"])
+        region = cutout_region(box, found["width"], found["height"])
+        entry = self._run_quick(c, cutout_graph(found["image"], found["sam3"], region))
+        imgs = ((entry.get("outputs") or {}).get("8") or {}).get("images") or []
+        if not imgs:
+            raise ComfyError("The cut-out came back empty.")
+        return c.fetch(imgs[0])
 
     def missing(self, model, backend):
         """missing_for() with what is known of `backend`; no I/O."""
