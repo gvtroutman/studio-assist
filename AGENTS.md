@@ -2197,17 +2197,24 @@ pruning**: not on a timer, not to keep the folder tidy. Deleting is a per-task b
 that asks first. (Nineteen saved tasks were examined when this was written; every one
 held a real request. An age or count based sweep would have deleted work.)
 
-**Auto-update only fast-forwards.** `studio_update.py` (a scheduled task under `pyw`,
-set up with `--install`) polls GitHub and runs `merge --ff-only`. It must never
-merge, stash, reset or check out over local work: the workstation sometimes carries its
-own commits, and an updater that "resolves" them destroys them silently. A refusal
-goes to `studio_update.log`, and so does a successful update. A pass with nothing
+**Auto-update only fast-forwards, and follows `main`.** `studio_update.py` (a
+scheduled task under `pyw`, set up with `--install`) polls GitHub and runs
+`merge --ff-only` against remote `main` (`BRANCH`). It used to follow whatever
+branch was checked out, and the workstation sat on a feature branch that had been
+merged: a merged branch never moves again, so updates silently stopped. A folder on
+another branch, including a merged branch or detached HEAD, now pauses updates and
+explains that the user can switch to `main` when ready. The updater never switches
+branches or changes tracking configuration. It uses main's configured remote, or
+origin/the sole remote if main has none. It must never merge, stash, reset or check
+out over local work: the workstation sometimes carries its own commits, and an
+updater that "resolves" them destroys them silently. A refusal goes to
+`studio_update.log`, and so does a successful update. A pass with nothing
 to do writes nothing. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
 console hangs forever and nobody sees it.
 
 The window has the same updater on a button. `Chat._update_tick` calls
 `studio_update.check()` (fetch and compare, never a change) 8 s after start and every
-15 minutes; when the branch's upstream is ahead, an **Update (N)** button appears in
+15 minutes; on `main`, when remote `main` is ahead, an **Update (N)** button appears in
 the header. It lists the new commits, runs `pull()` (the same fast-forward, refusals
 and log as the scheduled task) and offers a restart: `main()` releases the
 single-instance lock before `relaunch()` starts the new copy, or the new copy would
