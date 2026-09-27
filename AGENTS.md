@@ -1311,6 +1311,42 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 - **Everything stands on its floor.** An object's lowest point is put at its position's
   y (`object_pieces`), so a crouch drops the hips, a kneel puts the knee down and a
   tipped drum lies on the floor; y is the floor it stands on (a platform, a step).
+- **The floor can be shaped** (2026-09-26, the user: "an S curve to shape the floor",
+  then "a grid of dots 4x4 ... add in presets like a hill"). `room["grid"]` is 4 x 4
+  handle heights, rows back (-z) to front, columns left to right, spread over the
+  room's width x depth round the origin - walls or not, so resizing the room
+  stretches the shape and toggling walls does not change it. **Floor shape** under
+  Floor and walls is the floor from above, shaded by height: drag a dot up or down,
+  right-click it back to 0, "Shape like…" for a preset (`FLOOR_PRESETS`: hill, dip,
+  ridge, rise behind, bank left / right, bowl, rolling), Flatten; without walls it
+  also has the area's width and depth. `Ground` is the surface: a bicubic Bezier
+  patch of the 16 handles, each parameter run through smoothstep first. So a dot
+  pulls a broad area (the ask: not "one vertex only"), the surface stays inside the
+  handles' range, the middle four raised give a round hill (a 4 x 4 grid has no
+  middle dot; interpolating the dots gave a flat-topped mesa), and it meets the floor
+  past its edge level, with no crease. The dots are handles, not points on the
+  floor: the hill preset's 2.6 m handles make a 1.46 m hill. All 0 is cleaned to `[]`;
+  `[]` and a level grid draw pixel for pixel as the flat floor did (a test holds it).
+  What it touches: the floor is `Ground.faces` (`GRID_CELLS` cells each way over the
+  area, quads where planar, else two triangles; the level floor round it cut at
+  `GRID_OUTSIDE` only for the painter's sort), far to near by distance, each lit by
+  the smooth surface's slope at its middle (the face's own normal showed the
+  triangles), a picture laid on from straight above; walls stand on it, cut at the
+  same places; with walls and a floor that is not level the floor inside them is
+  drawn again after the walls, since a rise can stand in front of a wall's foot;
+  shadows lie on it, "touching" measured above the tangent plane under the object
+  (asking the patch at every mannequin vertex made a render 205 ms, the plane 59);
+  the grid lies on it and drops the far side of a rise; the depth map, `floor_point`
+  (Look at's Point) and the pose map follow. **Position y stays absolute**, so every
+  object function that takes only `obj` (`painted_pieces`, `rigs`, `bounds`, ...) is
+  unchanged and the maps cannot disagree: what moves an object re-stands it instead
+  (`stand`, keeping `above_floor`) - the viewport drag, the X and Z sliders, Add,
+  Enrich's `_place` - and `shape_floor` re-stands everything when the handles or the
+  room's width / depth change, one undo step named "Shape the floor". The Place
+  slider is "Above the floor". Not handled: an object stands by its middle, so on a
+  slope one corner floats and one sinks; a crowd stands at its middle's height, so
+  its people float or sink; and the room is still the backdrop, so a rise between the
+  camera and an object does not hide the object (the depth map's z-buffer does).
 - **What touches the floor leaves a shadow on it**, or the picture made from the frame
   draws the person hovering: the blockout was geometrically right (soles exactly at
   y 0) and still read as pasted on. `shadow_polys` adds, per object, soft nested rings

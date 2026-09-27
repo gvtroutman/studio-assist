@@ -737,6 +737,117 @@ class TestRoom(unittest.TestCase):
         self.assertEqual(len(sc.grid_lines(s, 896, 1152)), 10)
 
 
+class TestFloorShape(unittest.TestCase):
+    """The floor's shape: 4 x 4 dots pulling one smooth surface."""
+
+    HILL = sc.FLOOR_PRESET["hill"]
+
+    def room(self, grid, **kw):
+        return dict(sc.new_room(), grid=grid, **kw)
+
+    def test_a_hill_is_round_highest_in_the_middle_and_meets_the_floor_level(self):
+        g = sc.Ground(self.room(self.HILL))
+        top = g.at(0, 0)
+        self.assertAlmostEqual(top, 2.6 * 0.5625)            # the middle four, 3/8 + 3/8 each way
+        for x, z in ((1, 0), (0, -1), (1.5, 1.5), (-2, 0.5)):
+            self.assertLess(g.at(x, z), top)                 # round, not a flat top
+        self.assertEqual(g.at(4, 0), 0.0)                    # the edge
+        self.assertEqual(g.at(9, -9), 0.0)                   # and past it
+        self.assertLess(g.at(3.9, 0), 0.01)                  # arriving level: no crease
+        for i in range(41):                                  # never above the highest dot
+            self.assertLessEqual(g.at(-4 + i * 0.2, 0.3), 2.6)
+
+    def test_each_dot_pulls_a_wide_area_not_one_point(self):
+        grid = [[0.0] * 4 for _ in range(4)]
+        grid[1][1] = 2.0
+        g = sc.Ground(self.room(grid))
+        raised = sum(g.at(-4 + i * 0.5, -4 + j * 0.5) > 0.05
+                     for i in range(17) for j in range(17))
+        self.assertGreater(raised, 60)
+        self.assertGreater(g.at(-1.33, -1.33), g.at(1.33, 1.33))   # most round its own dot
+
+    def test_the_grid_is_cleaned(self):
+        self.assertEqual(sc.clean_grid([[0] * 4] * 4), [])          # all 0 is flat
+        self.assertEqual(sc.clean_grid([[1, 2, 3]] * 4), [])
+        self.assertEqual(sc.clean_grid("junk"), [])
+        self.assertEqual(sc.clean_grid([[99, -99, 0, "x"]] + [[0] * 4] * 3), [])
+        self.assertEqual(sc.clean_grid([[99, -99, 0, 1]] + [[0] * 4] * 3)[0],
+                         [sc.GRID_HEIGHT[1], sc.GRID_HEIGHT[0], 0.0, 1.0])
+        for key, _, rows in sc.FLOOR_PRESETS:
+            with self.subTest(preset=key):
+                self.assertEqual(sc.clean_grid(rows), [] if key == "flat" else rows)
+
+    def test_a_level_grid_draws_exactly_as_the_flat_floor(self):
+        s = staged("person")
+        s["room"].update(walls=True, depth=6.0)
+        flat = sc.png(s)
+        s["room"]["grid"] = [[0.0] * 3 + [0.0]] * 4               # cleaned to []
+        self.assertEqual(sc.png(s), flat)
+        self.assertEqual(len([p for p in sc.render(s) if p.part == "wall"]), 3)
+
+    def test_a_hill_is_drawn_lit_by_its_slopes_and_nearer_in_the_depth_map(self):
+        s = staged()
+        s["camera"].update(pitch=12, distance=7, target=[0.0, 1.0, 0.0])
+        w, h = sc.frame_size(s)
+        before = sc.depth_values(s, w // 4, h // 4)
+        s["room"]["grid"] = self.HILL
+        after = sc.depth_values(s, w // 4, h // 4)
+        self.assertTrue(all(b >= a - 1e-9 for a, b in zip(before, after)))
+        self.assertGreater(sum(b > a + 1e-6 for a, b in zip(before, after)), 50)
+        cam = sc.Camera(s["camera"], w, h)
+        hit = sc.floor_point(cam, s["room"], w / 2, h * 0.6)
+        self.assertAlmostEqual(hit[1], sc.floor_height(s["room"], hit[0], hit[2]), places=3)
+        self.assertGreater(hit[1], 0.05)                      # met the hill, not y = 0
+        floor = [p for p in sc.render(s) if p.owner is None and p.part is None]
+        self.assertGreater(len(floor), 100)
+        self.assertGreater(len({p.rgb for p in floor}), 5)
+
+    def test_walls_stand_on_the_floor_and_the_floor_is_drawn_over_their_feet(self):
+        room = self.room(sc.FLOOR_PRESET["bowl"], walls=True)
+        for quad, origin, along in sc.walls(room):
+            for x, y, z in quad:
+                f = sc.floor_height(room, x, z)
+                self.assertTrue(abs(y - f) < 1e-9 or abs(y - f - room["height"]) < 1e-9)
+        s = staged()
+        s["room"] = room
+        polys = sc.render(s)
+        last_wall = max(i for i, p in enumerate(polys) if p.part == "wall")
+        self.assertTrue(any(p.part is None for p in polys[last_wall:]))
+
+    def test_what_stands_on_the_floor_rides_it_when_it_is_shaped(self):
+        s = staged("person", "box")
+        man, box = s["objects"]
+        man["position"] = [0.0, 0.0, 0.0]
+        box["position"] = [1.0, 0.4, 0.5]                      # up on something
+        sc.shape_floor(s, self.HILL)
+        top = sc.floor_height(s["room"], 0, 0)
+        self.assertAlmostEqual(man["position"][1], top, places=3)
+        self.assertAlmostEqual(sc.bounds(man)[0][1], top, places=3)
+        self.assertAlmostEqual(sc.above_floor(s["room"], box), 0.4, places=3)
+        s["camera"].update(target=[0.0, 2.5, 0.0], distance=5)
+        self.assertTrue([p for p in sc.render(s) if p.dim])   # the man's shadow, on the hill
+        sc.shape_floor(s, width=16.0)                          # a wider hill: he stays on it
+        self.assertAlmostEqual(man["position"][1], sc.floor_height(s["room"], 0, 0), places=3)
+        sc.shape_floor(s, [])
+        self.assertEqual(man["position"][1], 0.0)
+        self.assertAlmostEqual(box["position"][1], 0.4)
+
+    def test_the_shape_saves_and_reshaping_is_one_named_step(self):
+        s = staged("box")
+        h = sc.History(s)
+        sc.shape_floor(s, self.HILL)
+        self.assertEqual(h.record(s), "Shape the floor")
+        path = os.path.join(tempfile.mkdtemp(), "f.scene.json")
+        sc.save(s, path)
+        self.assertEqual(sc.load(path)[0]["room"]["grid"], self.HILL)
+
+    def test_the_grid_lies_on_the_shaped_floor(self):
+        s = staged()
+        s["room"].update(walls=True, width=4.0, depth=4.0, grid=self.HILL)
+        lines = sc.grid_lines(s, 896, 1152)
+        self.assertGreater(len(lines), 10)                     # each line cut where the floor is
+
+
 class TestHistory(unittest.TestCase):
     """Undo and redo are whole-scene snapshots, each step named from what
     differs between it and the one before."""
@@ -2099,6 +2210,37 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertIn("The walls: whitewashed brick.", sb.words_label.cget("text"))
         sb._set_model("z-image-turbo")
         self.assertEqual(sb.check(), "")                        # a room alone is enough
+
+    def test_the_floor_is_shaped_by_dragging_its_grid_of_dots(self):
+        ui, sb = self.builder()
+        box = sb.add("box")
+        box["position"][0] = -1.3
+        box["position"][2] = -1.3
+        sb.remember()
+        sb.select(sc_room())
+        self.assertIsNotNone(sb.shape_canvas)
+        self.assertIn("area_width", sb.vars)                    # no walls: the area's size
+        _, dot_xy = sb._shape_frame()
+        x, y = dot_xy(1, 1)                                     # the dot back left of middle
+        sb._shape_press(Ev(x, y))
+        sb._shape_motion(Ev(x, y - sb.owner.px(sb.SHAPE_PX_PER_M) * 2))
+        sb._shape_release()
+        self.assertEqual(sb.scene["room"]["grid"][1][1], 2.0)
+        self.assertGreater(box["position"][1], 0.3)             # the crate rode up with it
+        self.assertEqual(sb.history.labels()[-1], "Shape the floor")
+        sb._shape_reset(Ev(x, y))                               # right-click: back to 0
+        self.assertEqual(sb.scene["room"]["grid"], [])
+        self.assertEqual(box["position"][1], 0.0)
+        sb.floor_preset("hill")
+        self.assertEqual(sb.scene["room"]["grid"], sc.FLOOR_PRESET["hill"])
+        sb._room_size("width", 12.0)
+        self.assertEqual(sb.scene["room"]["width"], 12.0)
+        self.assertAlmostEqual(box["position"][1],
+                               sc.floor_height(sb.scene["room"], -1.3, -1.3), places=3)
+        sb.floor_preset("flat")
+        self.assertEqual(sb.scene["room"]["grid"], [])
+        sb.undo()
+        self.assertEqual(sb.scene["room"]["grid"], sc.FLOOR_PRESET["hill"])
 
     def test_save_reopen_and_generate_through_the_image_studio(self):
         ui, sb = self.builder()
