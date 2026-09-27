@@ -62,38 +62,33 @@ INTERNAL_TOOLS = (TASK_TOOL, toolsmith.CREATE_TOOL, ASK_TOOL, lessons.REMEMBER_T
 QUALITY_RULES = """
 
 TASK QUALITY
-- studio_tool_create records a repeated sequence of this tab's own tools under
-  one name. It creates a tool; it neither runs one nor edits the project, and it
-  cannot reach a tool this tab was not given. One-off work goes to the bridge
-  tools directly. A tool you made is a shorthand, never evidence of a result.
-- For substantial edits use studio_task_update to record the plan, acceptance
-  checks, relevant object IDs, and unresolved issues. Preserve the user's exact
-  wording and constraints. Ask only about missing details that affect the result.
-- Inspect the target before editing. After editing, read the changed target and
-  compare it with the brief. A successful write alone is not verification.
-- For visual work request a preview when a suitable tool is exposed. You read
-  text: a returned picture reaches you as the "Visual review" appended to that
-  result, written by a model that looked at it. Treat that review as what is on
-  screen - fix what it names, and if it says the frame is not what was asked for,
-  it is not done. If a result says no review was made, say visual review is still
-  needed rather than claiming the result looks right. When you finish with an
-  edit nobody has looked at, this window may take the screenshot itself and hand
-  you its review as the next message: act on that review as you would your own.
-- Animation workflow: confirm copy, dimensions, frame rate and duration; construct
-  the design; animate; inspect timing and representative frames; refine defects.
-- Assembly workflow: identify source media; check frame rate and source ranges;
-  assemble; inspect track placement, gaps, overlaps and total duration.
-- Delivery workflow: inspect available formats and settings; confirm output path;
-  submit only the requested job; check actual completion before claiming export.
-- Before substantial changes to existing work, use a supported duplicate or backup
-  operation when available. Never invent backup tools or imply undo is guaranteed.
-- If blocked or only partly verified, explain the limitation instead of claiming
-  completion. A timeout may mean an edit happened: inspect, never blindly repeat.
-- studio_ask puts a question with clickable choices in front of the user; ask
-  it alone, then stop - the answer is their next message. studio_remember keeps
-  one reusable lesson for future tasks in this app: use it when the user
-  corrects you, tells you how they work, or when a call fails and you find what
-  works instead. Neither touches the project.
+- studio_tool_create records a repeated run of this tab's tools under one name. It
+  runs nothing, edits nothing, reaches no tool this tab lacks, and is never evidence
+  of a result. One-off work: call the bridge tools directly.
+- Substantial edits: studio_task_update with plan, acceptance checks, object IDs,
+  open issues. Keep the user's exact wording. Ask only about details that change
+  the result.
+- Inspect before editing; after, read the target back against the brief. A
+  successful write is not verification.
+- Visual work: request a preview when a tool allows. Pictures reach you as a
+  "Visual review" appended to the result - treat it as what is on screen and fix
+  what it names; if it says not as asked, it is not done. No review made? Say visual
+  review is still needed. The window may send its own review as the next message:
+  act on it.
+- Animation: confirm copy, size, rate, duration; design; animate; inspect timing
+  and frames; fix.
+- Assembly: identify sources; check rate and ranges; assemble; inspect placement,
+  gaps, overlaps, total duration.
+- Delivery: inspect formats; confirm output path; submit only the asked job; check
+  completion before claiming export.
+- Before big changes use a supported duplicate or backup if one exists. Never invent
+  backup tools or promise undo.
+- Blocked or partly verified? Say so; do not claim done. A timeout may mean the edit
+  happened: inspect, never blindly repeat.
+- studio_ask shows the user a question with choices; ask it alone, then stop.
+  studio_remember keeps one reusable lesson for this app: use it when corrected,
+  told how the user works, or when a failed call finds what works. Neither touches
+  the project.
 """
 
 # A reply that announces the next step instead of taking it: "Now I'll generate
@@ -347,7 +342,58 @@ def inference_tools(tools, library=None):
     if not tools:
         return []
     made = library.model_tools() if library is not None else []
-    return list(tools) + list(INTERNAL_TOOLS) + made
+    return offered_tools(tools) + list(INTERNAL_TOOLS) + made
+
+
+# Past this much schema JSON a tab's bridge tools are offered by reference: a
+# one-line index and two meta tools, with the full schema fetched on demand
+# into the history. The After Effects bridge is ~100k chars (~29k tokens) of
+# schema that would otherwise sit in every request's prefix and window.
+LAZY_CHARS = 16000
+SCHEMA_TOOL_NAME = "studio_tool_schema"
+CALL_TOOL_NAME = "studio_tool_call"
+
+
+def lazy(tools):
+    return len(json.dumps(tools or [])) > LAZY_CHARS
+
+
+def _gist(description):
+    """A description's first sentence, capped: enough to pick a tool by."""
+    text = " ".join((description or "").split())
+    cut = re.search(r"[.!?](\s|$)", text)
+    text = text[:cut.start() + 1] if cut else text
+    return text if len(text) <= 110 else text[:107].rstrip() + "..."
+
+
+def offered_tools(tools):
+    """The bridge tools as inference sees them: whole, or by reference.
+
+    Deterministic from the tool list, so the cached prefix stays one prefix."""
+    tools = list(tools)
+    if not lazy(tools):
+        return tools
+    index = "\n".join("- %s: %s" % (t["function"]["name"], _gist(t["function"].get("description")))
+                      for t in tools)
+    return [
+        {"type": "function", "function": {
+            "name": SCHEMA_TOOL_NAME,
+            "description": ("Fetch the full description and parameter schema of this app's "
+                            "tools, by name. Do this before a tool's first use in a "
+                            "conversation; the schema stays in the history after that. "
+                            "Reads nothing from the app."),
+            "parameters": {"type": "object", "additionalProperties": False,
+                           "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+                           "required": ["names"]}}},
+        {"type": "function", "function": {
+            "name": CALL_TOOL_NAME,
+            "description": ("Call one of this app's tools by name, with arguments matching its "
+                            "schema (get it with %s first). The tools:\n%s" % (SCHEMA_TOOL_NAME, index)),
+            "parameters": {"type": "object", "additionalProperties": False,
+                           "properties": {"name": {"type": "string"},
+                                          "arguments": {"type": "object"}},
+                           "required": ["name", "arguments"]}}},
+    ]
 
 
 class Executor:
@@ -488,13 +534,27 @@ class Executor:
         announced like the model's direct calls."""
         fn = call["function"]
         name, raw = fn["name"], fn.get("arguments") or "{}"
+        if name == CALL_TOOL_NAME:
+            # By-reference call: shown, journalled and validated as the tool
+            # it names, exactly as a direct call would be.
+            outer = json.loads(raw)
+            if not isinstance(outer, dict) or not isinstance(outer.get("name"), str):
+                raise ValueError("%s needs a tool `name` and its `arguments`" % CALL_TOOL_NAME)
+            name, raw = outer["name"], json.dumps(outer.get("arguments") or {})
         try:
             shown = json.loads(raw)
         except ValueError:
             shown = raw                   # not JSON; shown as the model wrote it
         self.emit("tool", {"name": name, "arguments": shown, "via": self.via})
         try:
-            text, wrote, read = self._dispatch(name, raw)
+            try:
+                text, wrote, read = self._dispatch(name, raw)
+            except ValueError as e:
+                # A deferred tool called wrong: hand back its schema with the
+                # refusal, so the correction costs one step, not two.
+                if lazy(self.bridge_tools) and name in self.allowed:
+                    raise ValueError("%s\n%s" % (e, self._schemas([name])))
+                raise
         except Exception as e:
             self.emit("tool_result", {"name": name, "text": "TOOL ERROR: " + str(e),
                                       "status": "error"})
@@ -503,10 +563,28 @@ class Executor:
                                   "status": "error" if text.startswith("TOOL ERROR") else "ok"})
         return text, wrote, read
 
+    def _schemas(self, names):
+        """Full schemas for deferred tools, as the model would have seen them."""
+        by_name = {t["function"]["name"]: t["function"] for t in self.bridge_tools}
+        out = []
+        for n in names:
+            fn = by_name.get(n)
+            if fn is None:
+                out.append("%s: no such tool in this tab." % n)
+            else:
+                out.append("%s: %s\nparameters: %s" % (n, fn.get("description", ""),
+                                                      json.dumps(fn["parameters"], separators=(",", ":"))))
+        return "\n\n".join(out)
+
     def _dispatch(self, name, raw):
         args = json.loads(raw)
         if not isinstance(args, dict):
             raise ValueError("tool arguments must be an object")
+        if name == SCHEMA_TOOL_NAME and lazy(self.bridge_tools):
+            names = args.get("names")
+            if not isinstance(names, list) or not names:
+                raise ValueError("names must be a non-empty list of tool names")
+            return self._schemas(names), False, False
         if name == "studio_task_update":
             validate(args, TASK_TOOL["function"]["parameters"])
             for key, value in args.items():

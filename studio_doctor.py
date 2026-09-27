@@ -13,6 +13,8 @@ facts from the same code rather than two drifting copies.
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import time
 
@@ -20,6 +22,7 @@ import studio_agent as eng
 
 ERROR_LOG = "studio_assistant_error.log"
 LOG_MAX_BYTES = 512 * 1024        # then it rolls over to a single `.1`
+ACTIVITY_LOG = "studio_activity.log"
 
 
 # ------------------------------------------------------------------- where
@@ -52,6 +55,8 @@ def log_error(text):
     log without end, and one generation back is as far as anyone has needed
     to look. Best-effort: a locked or read-only profile costs the entry,
     never the app. -> the path written, or None."""
+    logging.getLogger("studio").error("%s  (full trace in %s)",
+                                      (text.strip().splitlines() or [""])[0], ERROR_LOG)
     try:
         path = error_log_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -65,6 +70,32 @@ def log_error(text):
         return path
     except OSError:
         return None
+
+
+def activity_log_path():
+    return os.path.join(data_dir(), ACTIVITY_LOG)
+
+
+def start_activity_log():
+    """What the app did, not only what went wrong: every tool call and model
+    request with its duration, so a bug report is "read the log" rather than
+    a rerun of the test suite. Modules log to `logging.getLogger("studio")`;
+    until this runs (tests, the CLI) those records go nowhere. Same rollover
+    as the error log. Best-effort. -> the path, or None."""
+    try:
+        path = activity_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=1, encoding="utf-8")
+    except OSError:
+        return None
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(threadName)s %(name)s: %(message)s"))
+    logger = logging.getLogger("studio")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return path
 
 
 # ------------------------------------------------------------------ report
