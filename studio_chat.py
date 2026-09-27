@@ -46,6 +46,7 @@ import studio_files as files
 import studio_lessons as lessons
 import studio_milanote as milanote
 import studio_images_ui as images_ui
+import studio_nodes_ui as nodes_ui
 import studio_procs as procs
 import studio_ui as ui
 import studio_icons as icons
@@ -275,6 +276,7 @@ class Session:
         self.panel_host = None            # ...the frame it is held in
         self.panel_note = None            # ...and the line above it that speaks
         self.images = None                # the Image Studio's form (studio_images_ui)
+        self.nodes_view = None            # the ComfyUI tab's node editor (studio_nodes_ui)
         self._stream_open = False
         self._stream_buf = []
         self._asst_start = "1.0"
@@ -854,6 +856,19 @@ class Chat(tk.Tk):
         self._tags(s.view)
         self._build_hero(s)
         self._welcome(s)
+        if s.app.id == "comfyui":
+            s.nodes_view = nodes_ui.NodesView(self, s)
+
+    def _holds_window(self, s):
+        """The tab shows another program's window, not a conversation: a panel
+        tab, or the ComfyUI tab while its Nodes view is up. No composer then."""
+        return s.app.panel or (s.nodes_view is not None and s.nodes_view.on)
+
+    def open_nodes(self, steps, url, name):
+        """The Image Studio's Nodes: the ComfyUI tab, its Nodes view, and a
+        picture's graphs (`studio_comfy_view.graph_steps`) on its bar."""
+        self._add_tab("comfyui")
+        self.sessions["comfyui"].nodes_view.open(steps, url, name)
 
     def _build_hero(self, s):
         """What a tab shows before anything is said: the app's mark and name
@@ -1493,7 +1508,7 @@ class Chat(tk.Tk):
             self.empty.pack(side="top", fill="both", expand=True)
         else:
             self.sessions[sid].frame.pack(side="top", fill="both", expand=True)
-        panel = sid is not None and self.sessions[sid].app.panel
+        panel = sid is not None and self._holds_window(self.sessions[sid])
         if panel:
             self.composer.pack_forget()
         elif not self.composer.winfo_ismapped():
@@ -2854,9 +2869,10 @@ class Chat(tk.Tk):
             self.btn_fix.set(text="Connect")
         else:
             self.btn_fix.set(text=("Check %s" if s.app.remote else "Start %s") % s.app.name)
-        self._show_fix(fixable and not s.app.panel)
-        self.btn_new.set(state="disabled" if s.app.panel else "normal")
-        self.btn_hist.set(state="disabled" if s.busy or s.app.panel else "normal")
+        held = self._holds_window(s)
+        self._show_fix(fixable and not held)
+        self.btn_new.set(state="disabled" if held else "normal")
+        self.btn_hist.set(state="disabled" if s.busy or held else "normal")
         stopping = s.busy and s.cancel.is_set()
         self._ellipsis("send",
                        "Stopping" + ELLIPSIS if stopping else "Stop" if s.busy else SEND,
@@ -3147,6 +3163,10 @@ class Chat(tk.Tk):
             return
         if kind == "updated":
             self._updated(*payload)
+            return
+        if kind == "nodes":               # the ComfyUI tab's Nodes view, on the UI thread
+            if s.nodes_view is not None:
+                payload()
             return
 
         if kind == "diagnostics":

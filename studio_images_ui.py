@@ -292,11 +292,6 @@ class ImageStudio:
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
-        self.nodes = None             # ComfyUI's editor (comfy_view.ComfyBrowser), once opened
-        self.nodes_on = False         # the Nodes view is showing, not the picture
-        self.nodes_steps = []         # [(label, graph)] of the picture it was opened on
-        self.nodes_lock = threading.Lock()   # one start or load at a time
-        self.nodes_closed = False     # the tab is going; a window still coming is closed
         self._build(session.frame)
         for problem in self.studio.lib.problems:
             self.say(problem, "warn")
@@ -478,7 +473,6 @@ class ImageStudio:
         scroll.pack(side="top", fill="both", expand=True)
         right = self.frame(body)
         right.pack(side="left", fill="both", expand=True, padx=(self.px(14), 0))
-        self.left_side, self.right_side = left, right     # the Nodes view takes both
         self._build_form(self.form, actions)
         self._build_right(right)
 
@@ -1826,27 +1820,6 @@ class ImageStudio:
         outer.pack_propagate(False)
         outer.grid(row=2, column=0, sticky="nsew")
         self._show_list("queue")
-        self._build_nodes(right, (top, tabs, outer))
-
-    def _build_nodes(self, right, parts):
-        """The Nodes view: ComfyUI's own editor where the picture and the list
-        are, with the selected picture's graph in it (studio_comfy_view).
-        Built now, shown by `_show_nodes`; the window comes on first use."""
-        self.right_parts = parts
-        self.nodes_frame = self.frame(right)
-        bar = self.nodes_bar = self.frame(self.nodes_frame)
-        bar.pack(side="top", fill="x", pady=(0, self.px(8)))
-        self.button(bar, "← Picture", self._hide_nodes).pack(side="left")
-        self.nodes_pick = None
-        self.nodes_reload = self.button(bar, "Reload page", self._reload_nodes, kind="ghost")
-        self.nodes_reload.pack(side="left", padx=(self.px(6), 0))
-        self.nodes_note = self.label(bar, "", "muted")
-        self.nodes_note.pack(side="left", fill="x", expand=True, padx=(self.px(12), 0))
-        self.nodes_host = tk.Frame(self.nodes_frame, bd=0, highlightthickness=0)
-        self.skin(self.nodes_host, bg="card")
-        self.nodes_host.pack(side="top", fill="both", expand=True)
-        self.nodes_host.bind("<Configure>", lambda ev: self.nodes is not None
-                             and self.nodes.fit(ev.width, ev.height))
 
     def wrap(self, label, within, less):
         """Wrap `label` at the width `within` actually has, less `less` px -
@@ -2261,105 +2234,12 @@ class ImageStudio:
         return (steps, url, name) if steps and url else ([], None, None)
 
     def _show_nodes(self):
+        """The picture's graphs in ComfyUI's own editor: the ComfyUI tab's
+        Nodes view (studio_nodes_ui), where each step can be opened."""
         steps, url, name = self._selected_steps()
         if not steps:
             return self.say("This picture has no ComfyUI graph to show.", "warn")
-        self.nodes_steps, self.nodes_url, self.nodes_name = steps, url, name
-        if self.nodes_pick is not None:
-            self.nodes_pick.destroy()
-        first = next((i for i, (label, _g) in enumerate(steps) if label == "Picture"), 0)
-        self.nodes_pick = self.choice(self.nodes_bar,
-                                      [(i, label) for i, (label, _g) in enumerate(steps)],
-                                      first, self._load_step)
-        self.nodes_pick.pack(side="left", padx=(self.px(6), 0), before=self.nodes_reload)
-        for part in self.right_parts:
-            part.grid_remove()
-        # The whole width: a graph wants room, and the form is no use to it.
-        self.left_side.pack_forget()
-        self.right_side.pack_configure(padx=0)
-        self.nodes_frame.grid(row=0, column=0, rowspan=3, sticky="nsew")
-        self.nodes_on = True
-        self._load_step(first)
-
-    def _hide_nodes(self):
-        self.nodes_on = False
-        self.nodes_frame.grid_remove()
-        for part in self.right_parts:
-            part.grid()
-        self.left_side.pack(side="left", fill="y", before=self.right_side)
-        self.right_side.pack_configure(padx=(self.px(14), 0))
-
-    def _nodes_say(self, text, role="muted"):
-        self.nodes_note.config(text=text)
-        self.skin(self.nodes_note, bg="bg", fg=role)
-
-    def _load_step(self, i):
-        label, graph = self.nodes_steps[i]
-        self._nodes_say("Opening %s in ComfyUI%s" % (label, ELLIPSIS))
-        self.host._spawn(self.s.event_id, self._nodes_work, graph,
-                         "%s · %s" % (self.nodes_name, label), self.nodes_url)
-
-    def _nodes_work(self, graph, title, url):
-        """Off the UI thread: the window started if it is not running, then
-        the graph opened in it. What it says lands on the Nodes bar."""
-        def said(text, role="muted"):
-            self._post("call", lambda: self._nodes_say(text, role))
-        with self.nodes_lock:
-            b = self.nodes
-            if b is None or not b.running():
-                b = self.nodes = comfy_view.ComfyBrowser(url)
-                try:
-                    b.start()
-                except Exception as e:
-                    self.nodes = None
-                    b.close(0)
-                    return said(str(e)[:1].upper() + str(e)[1:], "err")
-                if self.nodes_closed:
-                    self.nodes = None
-                    return b.close()
-                self._post("call", lambda: self._nodes_adopt(b))
-            try:
-                n = b.show(graph, title, url)
-            except Exception as e:
-                return said(str(e)[:1].upper() + str(e)[1:], "err")
-        said("%s: %s nodes. Edit and Run here; what Run makes goes to ComfyUI's output "
-             "folder, not History." % (title, n))
-
-    def _nodes_adopt(self, b):
-        """On the UI thread: the new window into the Nodes frame. Measured
-        twice after, as the Milanote tab does, so its title bar is clipped."""
-        if self.nodes_closed or b is not self.nodes:
-            return
-        self.nodes_host.update_idletasks()
-        b.embed(self.nodes_host.winfo_id(), self.nodes_host.winfo_width(),
-                self.nodes_host.winfo_height())
-        if self.nodes_on:
-            b.focus()
-
-        def measure():
-            for wait in (1.0, 3.0):
-                time.sleep(wait)
-                if b is not self.nodes:
-                    return
-                try:
-                    before = b.inset
-                    if b.measure() != before:
-                        self._post("call", lambda: b.fit(*b.size))
-                except Exception:
-                    return            # it keeps its title bar; nothing else is wrong
-        self.host._spawn(self.s.event_id, measure)
-
-    def _reload_nodes(self):
-        b = self.nodes
-        if b is None or not b.running():
-            return self._nodes_say("ComfyUI is not open here yet.", "warn")
-
-        def work():
-            try:
-                b.reload()
-            except Exception as e:
-                self._post("call", lambda: self._nodes_say(str(e), "err"))
-        self.host._spawn(self.s.event_id, work)
+        self.host.open_nodes(steps, url, name)
 
     def _open_selected(self, select=False):
         path = self.pending_preview
@@ -2743,14 +2623,9 @@ class ImageStudio:
         except tk.TclError:
             pass
         self.scene_builder = None
-        self.nodes_closed = True
-        if self.nodes is not None:
-            self.nodes.release()      # out of the frame before it goes, like Milanote's
         return True
 
     def close(self):
-        if self.nodes is not None:
-            self.nodes.close()
         self.studio.close()
 
 
