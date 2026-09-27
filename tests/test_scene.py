@@ -1401,6 +1401,24 @@ class TestWords(unittest.TestCase):
         self.assertTrue(any("face picture" in p for p in problems), problems)
 
 
+    def test_a_characters_face_photos_come_before_its_identitys(self):
+        folder = tempfile.mkdtemp()
+        mine, ref = os.path.join(folder, "mine.jpg"), os.path.join(folder, "ref.jpg")
+        for path in (mine, ref):
+            with open(path, "wb") as f:
+                f.write(b"x")
+        s = staged("person")
+        obj = s["objects"][0]
+        obj["character"] = "lil"
+        chars = {"lil": {"id": "lil", "name": "Lil", "identity": "partner", "faces": [mine]}}
+        idents = {"partner": {"id": "partner", "name": "Partner", "references": [ref],
+                            "use_references": True}}
+        self.assertEqual(sc.face_picture(obj, chars, idents), (mine, "Lil's face photos"))
+        self.assertEqual(sc.face_photos(obj, chars, idents), [mine, ref])
+        _, extra = sc.generation(s, {"pose": "/x/p.png"}, chars, idents)
+        self.assertEqual(extra["face_photos"], [])     # the form's person is not in a scene
+
+
 class TestIntoCompose(TempStudioMixin, unittest.TestCase):
     """The frame and the words through the Image Studio's own compose()."""
 

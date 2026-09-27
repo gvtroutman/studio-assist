@@ -425,8 +425,24 @@ def clean_character(d):
         "identity": _str(d.get("identity")),
         "looks": kept,
         "item_refs": clean_item_refs(d.get("item_refs")),
+        "faces": _strs(d.get("faces")),
         "notes": _str(d.get("notes")),
     }
+
+
+def character_faces(rec, lib=None):
+    """Every photo of a character's face on this PC: its own face photos,
+    then (when it has none) its identity's reference photos. The first is
+    the one PuLID draws from; the real-face paste chooses among them all."""
+    if not rec:
+        return []
+    out = [p for p in rec.get("faces") or [] if os.path.isfile(p)]
+    if out or lib is None or not rec.get("identity"):
+        return out
+    ident = lib.get("identities", rec["identity"])
+    if ident and ident.get("use_references", True):
+        out = [p for p in ident.get("references") or [] if os.path.isfile(p)]
+    return out
 
 
 def clean_outfit(d):
@@ -464,6 +480,63 @@ def clean_preset(d):
         "loras": loras,
         "about": _str(d.get("about")),
     }
+
+
+# Thumbnails for pictures Tk cannot read (it reads PNG and GIF, and face
+# photos are mostly JPEG): one PowerShell run over them all, System.Drawing
+# turning each the way its EXIF says (phones store portraits on their side)
+# and saving a PNG beside it. Stdlib Python has no JPEG decoder.
+THUMB_SIDE = 96
+_THUMB_PS = r"""
+Add-Type -AssemblyName System.Drawing
+foreach ($pair in $input) {
+  $src, $dst = $pair -split '\|', 2
+  try {
+    $img = [System.Drawing.Image]::FromFile($src)
+    if ($img.PropertyIdList -contains 274) {
+      $o = [int]$img.GetPropertyItem(274).Value[0]
+      $turn = @{3='Rotate180FlipNone'; 6='Rotate90FlipNone'; 8='Rotate270FlipNone'}[$o]
+      if ($turn) { $img.RotateFlip($turn) }
+    }
+    $k = [Math]::Min(1.0, SIDE / [Math]::Max($img.Width, $img.Height))
+    $w = [Math]::Max(1, [int]($img.Width * $k)); $h = [Math]::Max(1, [int]($img.Height * $k))
+    $bmp = New-Object System.Drawing.Bitmap $w, $h
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.InterpolationMode = 'HighQualityBicubic'
+    $g.DrawImage($img, 0, 0, $w, $h)
+    $bmp.Save($dst, [System.Drawing.Imaging.ImageFormat]::Png)
+    $g.Dispose(); $bmp.Dispose(); $img.Dispose()
+  } catch { }
+}
+"""
+
+
+def thumb_path(path):
+    return os.path.splitext(path)[0] + ".thumb.png"
+
+
+def thumbnails(paths, side=THUMB_SIDE):
+    """{path: its PNG thumbnail, or None when none could be made}, making
+    the missing ones in one PowerShell run. Blocks for it (about a second):
+    call it off the UI thread."""
+    import subprocess
+    import studio_procs
+    todo = [p for p in paths if os.path.isfile(p) and not os.path.isfile(thumb_path(p))]
+    if todo and os.name == "nt":
+        try:
+            child = studio_procs.spawn(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                 _THUMB_PS.replace("SIDE", str(int(side)))],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=studio_procs.NO_WINDOW)
+            try:
+                child.proc.communicate("\n".join("%s|%s" % (p, thumb_path(p)) for p in todo)
+                                       .encode("utf-8"), timeout=60)
+            finally:
+                child.kill()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    return {p: (thumb_path(p) if os.path.isfile(thumb_path(p)) else None) for p in paths}
 
 
 def style_example(style):
@@ -2116,12 +2189,15 @@ FACE_MATCH_FRAME = 0.06
 
 def match_faces(width, height, boxes, people):
     """-> {box index: person} for the people (dicts with "at", as fractions
-    of the frame) whose face the finder found."""
+    of the frame) whose face the finder found. A person whose "at" is None
+    (the form's one person) is the biggest face left over."""
     pairs = []
     for i, (x, y, w, h) in enumerate(boxes):
         cx, cy = x + w / 2.0, y + h / 2.0
         reach = max(FACE_MATCH * max(w, h), FACE_MATCH_FRAME * max(width, height))
         for j, person in enumerate(people):
+            if person.get("at") is None:
+                continue
             px, py = person["at"][0] * width, person["at"][1] * height
             d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
             if d <= reach:
@@ -2131,6 +2207,11 @@ def match_faces(width, height, boxes, people):
         if i not in out and j not in used:
             out[i] = people[j]
             used.add(j)
+    left = sorted((i for i in range(len(boxes)) if i not in out),
+                  key=lambda i: -boxes[i][2] * boxes[i][3])
+    for person in people:
+        if person.get("at") is None and left:
+            out[left.pop(0)] = person
     return out
 
 
@@ -2191,6 +2272,31 @@ def head_gate(expected, drawn):
     return 0.0, "was drawn turned about %d degrees from the mannequin's" % off
 
 
+# A character's face on the plain form. The form has one person, so the
+# character's face photos are theirs: drawn into the whole frame (PuLID in
+# the picture itself), matched to the biggest face the finder finds, then
+# the face pass and the real-face paste as in a scene, at the Scene
+# Builder's defaults (studio_scene.FACE_LIKENESS, REAL_FACES). A scene's own
+# faces (`scene_faces`) win: it knows where each person stands.
+FORM_LIKENESS = 0.6
+FORM_REAL_FACES = True
+WHOLE_FRAME = [0.0, 0.0, 1.0, 1.0]
+
+
+def faces_of(settings):
+    """-> the job's faces as the face pass takes them ({"likeness", "real",
+    "people"}): the scene's, else the form's character's photos, else {}."""
+    if settings.get("scene_faces"):
+        return settings["scene_faces"]
+    photos = [p for p in _strs(settings.get("face_photos")) if os.path.isfile(p)]
+    if not photos:
+        return {}
+    return {"likeness": FORM_LIKENESS, "real": FORM_REAL_FACES,
+            "people": [{"id": "form", "name": settings.get("face_name") or "the person",
+                        "at": None, "region": list(WHOLE_FRAME), "words": "",
+                        "face": photos[0], "from": "their face photos", "photos": photos}]}
+
+
 # A face given a picture is redrawn with PuLID (lldacing's ComfyUI_PuLID_Flux_ll)
 # on the redraw's model: InsightFace reads the picture's face and FLUX draws
 # that face in the pose and light the crop already has. It needs the redraw to
@@ -2229,7 +2335,8 @@ def region_png(region, width, height):
 def add_pulid(graph, pulid_file, faces, weight=PULID_BASE_WEIGHT):
     """Into a filled graph: one ApplyPulidFlux per (face picture, region
     mask) - LoadImage names - chained on the model its samplers share, each
-    confined to its mask. Every KSampler on that model takes the chain."""
+    confined to its mask, or to nothing when the mask is None (the whole
+    frame). Every KSampler on that model takes the chain."""
     samplers = [n for n in graph.values() if n["class_type"] == "KSampler"]
     if not samplers or not faces:
         return graph
@@ -2241,13 +2348,15 @@ def add_pulid(graph, pulid_file, faces, weight=PULID_BASE_WEIGHT):
     for i, (face, mask) in enumerate(faces, 1):
         n = "pb_%d" % i
         graph[n + "f"] = {"class_type": "LoadImage", "inputs": {"image": face}}
-        graph[n + "m"] = {"class_type": "LoadImage", "inputs": {"image": mask}}
-        graph[n + "k"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "m", 0],
-                                                                  "channel": "red"}}
         graph[n] = {"class_type": "ApplyPulidFlux", "inputs": {
             "model": last, "pulid_flux": ["pb1", 0], "eva_clip": ["pb2", 0],
             "face_analysis": ["pb3", 0], "image": [n + "f", 0], "weight": weight,
-            "start_at": 0.0, "end_at": 1.0, "attn_mask": [n + "k", 0]}}
+            "start_at": 0.0, "end_at": 1.0}}
+        if mask is not None:
+            graph[n + "m"] = {"class_type": "LoadImage", "inputs": {"image": mask}}
+            graph[n + "k"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "m", 0],
+                                                                      "channel": "red"}}
+            graph[n]["inputs"]["attn_mask"] = [n + "k", 0]
         last = [n, 0]
     for node in samplers:
         if node["inputs"]["model"] == base:
@@ -3212,7 +3321,8 @@ def default_settings():
     return {"preset": "standard", "model": "z-image-turbo", "backend": "auto",
             "identities": [], "style": "none", "style_strength": None,
             "scene": "", "camera": "", "negative": "", "loras": [], "references": {},
-            "character": "", "item_refs": {}, "anatomy": True,
+            "character": "", "item_refs": {}, "face_photos": [], "face_name": "",
+            "anatomy": True,
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
@@ -4187,12 +4297,24 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     # checkpoint to find the faces and the stock nodes it is built from. It
     # is a finish, not the picture: without them the picture is made and the
     # pass is left out, said once.
+    form_face = not s.get("scene_faces") and not wf.get("multi_identity") and faces_of(s)
+    if form_face:
+        who = form_face["people"][0]
+        v["face_detail"] = True
+        if set(wf.get("families") or ()) & PULID_FAMILIES:
+            p.notes.append("Face: %s, from %d photo%s." % (
+                who["name"], len(who["photos"]), "" if len(who["photos"]) == 1 else "s"))
+        else:
+            p.warnings.append("Face: only a FLUX.1 model can draw %s's face from their "
+                              "photos; with %s the face comes from the words." % (
+                                  who["name"], wf.get("label", wid)))
     if wf.get("multi_identity"):
         v["face_detail"] = False
         p.notes.append("WithAnyone draws the identities together. Face redraw, photo paste "
                        "and automatic refinement are off for this recipe.")
     if v.get("face_detail"):
-        asked = s.get("face_detail") or preset["values"].get("face_detail")
+        asked = (s.get("face_detail") or preset["values"].get("face_detail")
+                 or bool(form_face))
         ckpts = (inventory or {}).get("checkpoints") if inventory is not None else None
         sam = sorted(c for c in ckpts or () if SAM3 in c.lower())
         why = ""
@@ -6115,7 +6237,7 @@ class Studio:
             plan.warnings.append("The face finder said nothing; the picture is as made.")
             return files, None
         width, height, boxes = found
-        scene = job.settings.get("scene_faces") or {}
+        scene = faces_of(job.settings)
         known = match_faces(width, height, boxes, scene.get("people") or [])
         # A person's own words stand for the whole prompt in their face's
         # redraw, so the style goes with them: without it an SX-70 picture
@@ -6514,7 +6636,7 @@ class Studio:
         each over its person's head. Said, never fatal: without PuLID the
         faces are still drawn to their pictures by the face pass, or from
         the words. -> False only when cancelled."""
-        people = [p for p in (job.settings.get("scene_faces") or {}).get("people") or []
+        people = [p for p in faces_of(job.settings).get("people") or []
                   if p.get("face") and p.get("region")]
         if not people:
             return True
@@ -6530,6 +6652,13 @@ class Studio:
             for person in people:
                 if job.cancel.is_set():
                     return False
+                if list(person["region"]) == WHOLE_FRAME:
+                    # No mask: one the size of the picture's tokens does not
+                    # fit when Kontext adds the item picture's (2026-09-26:
+                    # "tensor a (8022) must match ... (3952)"), and a mask of
+                    # everything masks nothing.
+                    faces.append((client.upload_image(person["face"]), None))
+                    continue
                 data = region_png(person["region"], w, h)
                 path = os.path.join(folder, hashlib.sha1(data).hexdigest()[:16] + ".png")
                 if not os.path.isfile(path):
