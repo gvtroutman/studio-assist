@@ -161,7 +161,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._real = (oc.WORKSPACE, oc.KEY_FILE, oc.POLL, oc.SETTLE, urllib.request.urlopen,
-                      oc.SERVER.client_caps)
+                      oc.SERVER.client_caps, oc.STATE_DIR)
+        oc.STATE_DIR = os.path.join(self.tmp, "state")
         oc.WORKSPACE = os.path.join(self.tmp, "ws")
         os.makedirs(oc.WORKSPACE)
         oc.KEY_FILE = os.path.join(self.tmp, "server.key")
@@ -173,7 +174,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         (oc.WORKSPACE, oc.KEY_FILE, oc.POLL, oc.SETTLE, urllib.request.urlopen,
-         oc.SERVER.client_caps) = self._real
+         oc.SERVER.client_caps, oc.STATE_DIR) = self._real
         oc.SERVER.sink = None
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -237,7 +238,7 @@ class TestContract(Base):
         app = eng.APPS_BY_ID["opencode"]
         self.assertEqual(app.workspace, eng.OPENCODE_WORKSPACE)
         self.assertEqual(self._real[1], app.key_path)
-        self.assertEqual(oc.STATE_DIR, app.state_dir)
+        self.assertEqual(self._real[-1], app.state_dir)   # setUp moved STATE_DIR to tmp
 
     def test_every_request_carries_the_password_when_there_is_one(self):
         oc.call_tool("opencode_list_sessions", {})
@@ -360,6 +361,26 @@ class TestApprovals(Base):
         self.assertIn("second answer", out)
         self.assertNotIn("done", out.replace("is done", ""))
         self.assertEqual(len(self.fake.sessions), 1)
+
+
+    def test_a_follow_up_continues_the_last_session_unless_told_otherwise(self):
+        # A local model often drops the session_id; OpenCode then started over
+        # knowing nothing of the work it had just done.
+        client = self.user()
+        client.call_tool("opencode_ask", {"prompt": "first"})
+        self.fake.script = [("say", "second answer")]
+        client.call_tool("opencode_ask", {"prompt": "second"})
+        self.assertEqual(len(self.fake.sessions), 1)
+        client.call_tool("opencode_ask", {"prompt": "unrelated", "new_session": True})
+        self.assertEqual(len(self.fake.sessions), 2)
+
+    def test_a_small_context_window_is_named_with_its_fix(self):
+        conf = eng.opencode_config("http://h:1/v1", "m1", ["m1"], 32768)
+        note = oc.context_note(conf)
+        self.assertIn("32768", note)
+        self.assertIn("Context Length", note)
+        self.assertEqual(oc.context_note(eng.opencode_config("http://h:1/v1", "m1", ["m1"], 131072)), "")
+        self.assertEqual(oc.context_note(eng.opencode_config("http://h:1/v1", "m1", ["m1"])), "")
 
 
 class TestOtherTools(Base):
