@@ -42,6 +42,7 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import studio_agent as eng
+import studio_appinfo as appinfo
 import studio_consoles as consoles
 import studio_doctor as doctor
 import studio_files as files
@@ -116,8 +117,18 @@ SHADES = 12                               # brightness steps a pulse is quantise
 # Events that put something at the end of a transcript, and so have to take the
 # thinking dots down before they do. Kept beside the handler that reads it.
 WRITES_TO_TRANSCRIPT = frozenset((
-    "sys", "tool", "tool_result", "preview", "ask", "elicit", "stream_start", "token",
-    "error", "ready"))
+    "sys", "roadmap", "tool", "tool_result", "preview", "ask", "elicit", "stream_start",
+    "token", "error", "ready"))
+
+
+def roadmap_text(payload):
+    """The model's roadmap as one transcript block: done, next, still to do."""
+    plan, done = payload.get("plan") or [], set(payload.get("done") or [])
+    nxt = next((i for i in range(1, len(plan) + 1) if i not in done), None)
+    lines = ["%s %d. %s" % ("✓" if i in done else "→" if i == nxt else "○", i, step)
+             for i, step in enumerate(plan, 1)]
+    return "Roadmap (%d of %d done)\n" % (len(done & set(range(1, len(plan) + 1))), len(plan)) + \
+        "\n".join("  " + line for line in lines)
 
 
 def makes_a_picture(name):
@@ -256,6 +267,7 @@ class Session:
         self.library = None               # tools the model made, set by Chat
         self.notebook = None              # lessons kept for this app, set by Chat
         self.studio = ""                  # the studio brief's text, set by Chat
+        self.about = ""                   # the app's profile (studio_appinfo), set by Chat
         self.sidecar = None               # the research bridge, in process
         self.sidecar_names = frozenset()  # its tools, riding beside the bridge's
         self.ask_buttons = []             # the question form waiting for a click
@@ -304,7 +316,7 @@ class Session:
         lesson kept for the app. Built at boot and on New chat, never mid-way -
         it is the head of the host's cached prefix."""
         kept = self.notebook.brief() if self.notebook is not None else ""
-        return self.app.chat_prompt(self.studio, kept)
+        return self.app.chat_prompt(self.studio, kept) + eng.about_section(self.about)
 
     def offered(self, wanted):
         """The tools this tab offers the model: the bridge's in `wanted`, then
@@ -450,8 +462,21 @@ class Chat(tk.Tk):
             s.notebook = lessons.for_app(app, self._data_dir())
             s.notebook.load()             # a problem is said at boot, in the tab
             self._publish_lessons(s)
+        if app.drivable:
+            s.about = appinfo.render(appinfo.load(app.id, self._data_dir()))
+            self._spawn(None, self._refresh_about, s)
         s.messages[0] = {"role": "system", "content": s.prompt()}
         return s
+
+    def _refresh_about(self, s):
+        """Re-read the app's release and, monthly, its Wikipedia overview. A
+        tab whose conversation has not started takes the change at once, the
+        rest on New chat - like the studio brief. Worker thread."""
+        about = appinfo.render(appinfo.refresh(s.app, self._data_dir()))
+        if about != s.about:
+            s.about = about
+            if not s.busy and len(s.messages) == 1:
+                s.messages[0] = {"role": "system", "content": s.prompt()}
 
     def _opening_tabs(self):
         """
@@ -3298,6 +3323,8 @@ class Chat(tk.Tk):
             self._sync_bridges()
         elif kind == "sys":
             self._write(s, payload + "\n", "sys")
+        elif kind == "roadmap":
+            self._write(s, roadmap_text(payload) + "\n", "sys")
         elif kind == "tool":
             self._show_call(s, payload)
         elif kind == "tool_result":

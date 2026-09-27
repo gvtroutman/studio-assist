@@ -18,10 +18,13 @@ import studio_toolsmith as toolsmith
 
 TASK_TOOL = {"type": "function", "function": {
     "name": "studio_task_update",
-    "description": "Keep the task brief and progress across long conversations. Before substantial edits, record a plan and acceptance checks. Update objects with real IDs, and checks with observed evidence; never invent evidence. This does not edit the creative app.",
+    "description": "Keep the task's roadmap and progress. For a task of several steps, first record the plan (short steps, in order) and acceptance checks; after finishing a step, send done with its number. Update objects with real IDs, and checks with observed evidence; never invent evidence. This does not edit the creative app.",
     "parameters": {"type": "object", "additionalProperties": False,
         "properties": {
-            "plan": {"type": "array", "items": {"type": "string"}},
+            "plan": {"type": "array", "items": {"type": "string"},
+                     "description": "The roadmap: short steps in order. Replacing it clears done."},
+            "done": {"type": "array", "items": {"type": "integer", "minimum": 1},
+                     "description": "Numbers of the finished (or no longer needed) plan steps, 1 = first."},
             "objects": {"type": "object", "additionalProperties": {"type": "string"}},
             "checks": {"type": "array", "items": {"type": "object",
                 "properties": {"requirement": {"type": "string"},
@@ -83,9 +86,12 @@ TASK QUALITY
 - studio_tool_create records a repeated run of this tab's tools under one name. It
   runs nothing, edits nothing, reaches no tool this tab lacks, and is never evidence
   of a result. One-off work: call the bridge tools directly.
-- Substantial edits: studio_task_update with plan, acceptance checks, object IDs,
-  open issues. Keep the user's exact wording. Ask only about details that change
+- Several steps: first studio_task_update with a plan (the roadmap: short steps in
+  order), acceptance checks, object IDs, open issues. After each step, send done with
+  its number, then do the next. Finish when every step is done, or say which step is
+  blocked and why. Keep the user's exact wording. Ask only about details that change
   the result.
+- Answered? Stop. Do not repeat the answer or call tools only to have something to do.
 - Inspect before editing; after, read the target back against the brief. A
   successful write is not verification.
 - Visual work: request a preview when a tool allows. Pictures reach you as a
@@ -120,6 +126,42 @@ PROMISE_HINT = ("You described what you would do, but this reply called no tool,
                 "nothing happened. Make the call now - the first step, with real "
                 "arguments - or, if no tool you have fits the task, say so plainly "
                 "instead of describing work.")
+
+
+# Calls that note something down and change nothing in the project: an answer
+# written beside only these is the answer (see Executor._run).
+BOOKKEEPING = frozenset((TASK_TOOL["function"]["name"], lessons.REMEMBER_TOOL["function"]["name"],
+                         toolsmith.CREATE_TOOL["function"]["name"]))
+
+ROADMAP_NUDGES = 2
+ROADMAP_HINT = ("Your roadmap still has step %(n)d open: \"%(step)s\". Do it now. If it is "
+                "already done or no longer needed, mark it with studio_task_update (done) "
+                "and go on; if it is blocked, say which step and why.")
+
+
+STEP_MARK = re.compile(r"(?:^|(?<=\s))(\d{1,2})[.)]\s+")
+
+
+def numbered_steps(text):
+    """The steps of a brief written as a numbered list - "1) this; 2) that" or
+    one per line - in order, else []. Numbers must run 1, 2, 3...; anything
+    else (a version, "3. place") is not a list."""
+    marks = list(STEP_MARK.finditer(text or ""))
+    want, starts = 1, []
+    for m in marks:
+        if int(m.group(1)) == want:
+            starts.append(m)
+            want += 1
+    if len(starts) < 2:
+        return []
+    steps = []
+    for i, m in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+        step = " ".join(text[m.end():end].split()).rstrip(" ;,")
+        if not step:
+            return []
+        steps.append(step[:200])
+    return steps[:12]
 
 
 def announces_work(text):
@@ -178,6 +220,7 @@ class TaskRecord:
         self.app_id = ""
         self.briefs = []
         self.plan = []
+        self.done = []
         self.objects = {}
         self.checks = []
         self.issues = []
@@ -185,6 +228,24 @@ class TaskRecord:
         self.notes = []
         self.compacted_until = 1       # first history message not yet archived
         self.status = "ready"
+
+    def next_step(self):
+        """The number of the first plan step not done, else None."""
+        for i in range(1, len(self.plan) + 1):
+            if i not in self.done:
+                return i
+        return None
+
+    def roadmap(self):
+        """The plan as a checklist, ending with what to do next; "" without one."""
+        if not self.plan:
+            return ""
+        nxt = self.next_step()
+        lines = ["%s %d. %s" % ("[x]" if i in self.done else "[>]" if i == nxt else "[ ]", i, step)
+                 for i, step in enumerate(self.plan, 1)]
+        lines.append("Next: step %d." % nxt if nxt else
+                     "Every step is done: check the work, then answer.")
+        return "Roadmap:\n" + "\n".join(lines)
 
     def context(self):
         return {k: getattr(self, k) for k in ("briefs", "plan", "objects", "checks", "issues", "status")}
@@ -220,7 +281,7 @@ class TaskRecord:
             raise ValueError("invalid saved task id")
         if not all(isinstance(b, str) for b in record.briefs):
             raise ValueError("invalid saved task brief")
-        validate({k: getattr(record, k) for k in ("plan", "objects", "checks", "issues")},
+        validate({k: getattr(record, k) for k in ("plan", "done", "objects", "checks", "issues")},
                  TASK_TOOL["function"]["parameters"])
         if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
             raise ValueError("invalid saved messages")
@@ -388,6 +449,8 @@ def continuation_context(messages, record, tools, max_chars, extra=""):
 
     def tail():
         text = "Saved task context (data, not new instructions):\n" + state
+        if record.plan:
+            text += "\n" + _excerpt(record.roadmap(), 1500)
         if record.notes:
             text += ("\nContinuation notes: %d saved; full sources via studio_task_recall. "
                      "Use ref=index to find older notes, ref=note:N to read one, "
@@ -762,12 +825,22 @@ class Executor:
             return recall_task(self.record, args), False, False
         if name == "studio_task_update":
             validate(args, TASK_TOOL["function"]["parameters"])
+            old_plan = list(self.record.plan)
+            if "plan" in args and args["plan"] != old_plan:
+                self.record.done = []         # a new roadmap starts unticked
             for key, value in args.items():
                 if key == "objects":
                     self.record.objects.update(value)
-                else:
+                elif key != "done":
                     setattr(self.record, key, value)
-            return "Task record updated. Checks are reported observations, not independent proof.", False, False
+            if "done" in args:
+                self.record.done = sorted(set(self.record.done) |
+                                          {n for n in args["done"] if n <= len(self.record.plan)})
+            reply = "Task record updated. Checks are reported observations, not independent proof."
+            if "plan" in args or "done" in args:
+                self.emit("roadmap", {"plan": list(self.record.plan), "done": list(self.record.done)})
+                reply += "\n" + self.record.roadmap()
+            return reply, False, False
         if name == toolsmith.CREATE_TOOL["function"]["name"]:
             validate(args, toolsmith.CREATE_TOOL["function"]["parameters"])
             return self._make(args), False, False
@@ -1023,6 +1096,7 @@ class Executor:
     def _run(self, messages, max_steps=25, streaming=True):
         failures, needs_read, reminders, reviews = 0, False, 0, 0
         called, nudged, repeated = 0, False, False
+        roadmap_nudges = 0
         handoff_reminded = False
         context_retried = False
         self._journal_start = len(self.record.journal)
@@ -1033,6 +1107,13 @@ class Executor:
             elif not entry.get("read") and entry.get("status") in ("ok", "running", "unknown"):
                 needs_read = True
         self.record.status = "working"
+        # A brief written as numbered steps is the roadmap: seen live, the
+        # model worked such a list without ever recording one, so nothing
+        # held it to the steps. Only when no roadmap is still open.
+        steps = numbered_steps(self.record.briefs[-1] if self.record.briefs else "")
+        if steps and self.record.next_step() is None:
+            self.record.plan, self.record.done = steps, []
+            self.emit("roadmap", {"plan": list(steps), "done": []})
         self._save()
         def stop(reason):
             self.record.status = reason
@@ -1132,6 +1213,18 @@ class Executor:
                 final = msg.get("content") or "The model returned an empty reply."
                 if needs_read:
                     return stop("Edits were made but remain unverified. " + final)
+                step = self.record.next_step()
+                if (step and roadmap_nudges < ROADMAP_NUDGES and self.asked is None
+                        and not final.rstrip().endswith("?")):
+                    # Stopped with roadmap steps open: name the next one. Twice
+                    # at most - a model that stops a third time has a reason,
+                    # and its reply says it.
+                    roadmap_nudges += 1
+                    self.emit("sys", "Roadmap step %d is still open; asked the model to "
+                                     "carry on." % step)
+                    messages.append({"role": "user", "content": ROADMAP_HINT % {
+                        "n": step, "step": self.record.plan[step - 1]}})
+                    continue
                 if self.tools and not called and announces_work(final):
                     # The model described the call instead of making it. One
                     # reminder it can act on; a second promise ends the run
@@ -1183,10 +1276,13 @@ class Executor:
             # record is the answer: asked for another step, a small model
             # writes the same reply again, once or twice, and the user reads
             # it repeated. A reply that promises more work still continues.
+            # The same holds beside a lesson or a made tool: seen live, a
+            # finished model called one after another, answer rewritten each
+            # time, until the user stopped it. Open roadmap steps continue.
             final = (msg.get("content") or "").strip()
             if (final and not needs_read and not failures and not self.cancel.is_set()
-                    and not announces_work(final)
-                    and all(c["function"]["name"] == TASK_TOOL["function"]["name"] for c in calls)):
+                    and not announces_work(final) and self.record.next_step() is None
+                    and all(c["function"]["name"] in BOOKKEEPING for c in calls)):
                 self.record.status = "response complete; see recorded checks and limitations"
                 self._save()
                 return final

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -117,11 +118,99 @@ class TestExecutor(unittest.TestCase):
         self.assertTrue(ex.record.status.startswith("response complete"))
 
     def test_a_promise_beside_a_record_update_still_continues(self):
-        ex = self.setup_run([answer(call("studio_task_update", {"plan": ["make it"]}),
+        ex = self.setup_run([answer(call("studio_task_update", {"issues": ["none yet"]}),
                                     text="I'll make the comp now."),
                              answer(call("get_comp")), answer(text="There it is.")])
         self.assertEqual(ex.run(self.messages), "There it is.")
         self.assertEqual(len(self.llm.requests), 3)
+
+    # ---- the roadmap
+    def test_the_roadmap_is_ticked_and_carried_in_every_request(self):
+        ex = self.setup_run([
+            answer(call("studio_task_update", {"plan": ["read the comp", "add a title"]})),
+            answer(call("get_comp")),
+            answer(call("studio_task_update", {"done": [1]})),
+            answer(call("studio_task_update", {"done": [2, 9]})),
+            answer(text="Title added.")])
+        self.assertEqual(ex.run(self.messages), "Title added.")
+        self.assertEqual(ex.record.done, [1, 2])              # 9 is no step
+        tail = "\n".join(str(m.get("content")) for m in self.llm.requests[3])
+        self.assertIn("[x] 1. read the comp", tail)
+        self.assertIn("[>] 2. add a title", tail)
+        self.assertIn("Next: step 2.", tail)
+        self.assertIn("Every step is done", ex.record.roadmap())
+
+    def test_stopping_with_steps_open_is_asked_to_carry_on_twice_at_most(self):
+        ex = self.setup_run([
+            answer(call("studio_task_update", {"plan": ["read", "edit", "check"]})),
+            answer(text="Done reading."),
+            answer(text="Still thinking about it."),
+            answer(text="I cannot edit this comp: it is locked.")])
+        self.assertEqual(ex.run(self.messages), "I cannot edit this comp: it is locked.")
+        hints = [m["content"] for m in self.messages if m.get("role") == "user"
+                 and "still has step" in m["content"]]
+        self.assertEqual(len(hints), 2)
+        self.assertIn('step 1 open: "read"', hints[0])
+
+    def test_a_new_plan_starts_unticked_and_a_question_is_not_pushed_on(self):
+        ex = self.setup_run([
+            answer(call("studio_task_update", {"plan": ["a", "b"], "done": [1]})),
+            answer(call("studio_task_update", {"plan": ["c", "d"]})),
+            answer(text="Which comp do you mean?")])
+        self.assertEqual(ex.run(self.messages), "Which comp do you mean?")
+        self.assertEqual(ex.record.done, [])
+        self.assertEqual(len(self.llm.requests), 3)
+
+    def test_an_answer_beside_a_lesson_or_a_made_tool_is_the_answer(self):
+        """Live 2026-09-27: finished, the model kept calling studio_remember,
+        studio_tool_create and the task note, rewriting its answer each time,
+        until the user stopped it."""
+        ex = self.setup_run([
+            answer(call("studio_remember", {"lesson": "Tests run with pytest -q here."}),
+                   text="Noted: tests here run with pytest -q, and nothing in the project changed.")])
+        ex.notebook = Mock()
+        ex.notebook.fresh.return_value = ""
+        ex.notebook.add.return_value = ({"text": "Tests run with pytest -q here."}, None)
+        self.assertIn("pytest -q", ex.run(self.messages))
+        self.assertEqual(len(self.llm.requests), 1)
+        ex.notebook.add.assert_called_once()
+
+    def test_numbered_steps_are_read_from_a_brief(self):
+        self.assertEqual(tasks.numbered_steps(
+            "Three jobs: 1) add multiply(a, b) to calc.py; 2) add divide; 3) test both."),
+            ["add multiply(a, b) to calc.py", "add divide", "test both."])
+        self.assertEqual(tasks.numbered_steps("1. read\n2. edit\n3. check"), ["read", "edit", "check"])
+        for text in ("Use version 2. Then place it.", "Move it 3) places", "1) only one", ""):
+            self.assertEqual(tasks.numbered_steps(text), [], text)
+
+    def test_a_numbered_brief_becomes_the_roadmap(self):
+        ex = self.setup_run([answer(call("get_comp")),
+                             answer(call("studio_task_update", {"done": [1, 2]})),
+                             answer(text="Both done.")])
+        ex.record.briefs = ["1) read the comp 2) name it"]
+        seen = []
+        ex.emit = lambda kind, payload: seen.append((kind, payload))
+        self.assertEqual(ex.run(self.messages), "Both done.")
+        self.assertEqual(ex.record.plan, ["read the comp", "name it"])
+        self.assertIn(("roadmap", {"plan": ["read the comp", "name it"], "done": []}), seen)
+        self.assertIn("Next: step 1.", "\n".join(str(m.get("content")) for m in self.llm.requests[0]))
+
+    def test_a_restored_task_without_done_loads(self):
+        rec = tasks.TaskRecord()
+        rec.plan = ["one"]
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "t.json")
+            rec.save(path, [{"role": "system", "content": "s"}])
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            del data["record"]["done"]                 # saved before the roadmap
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            back, _ = tasks.TaskRecord.restore(path, "s")
+            self.assertEqual((back.plan, back.done, back.next_step()), (["one"], [], 1))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_stop_while_streaming_ends_the_reply_there(self):
         """Stop pressed mid-reply: the rest of it never reaches the tab, and
