@@ -78,8 +78,8 @@ class ToolsmithTests(unittest.TestCase):
     def test_a_made_tool_is_offered_after_the_fixed_contract(self):
         ex = self.executor()
         before = [t["function"]["name"] for t in ex.tools]
-        self.assertEqual(before[-4:], ["studio_task_update", "studio_tool_create",
-                                       "studio_ask", "studio_remember"])
+        self.assertEqual(before[-5:], ["studio_task_update", "studio_tool_create",
+                                       "studio_ask", "studio_remember", "studio_task_recall"])
         text = self.make(ex)
         self.assertIn("retitle_card", text)
         names = [t["function"]["name"] for t in ex.tools]

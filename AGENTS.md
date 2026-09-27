@@ -1347,6 +1347,25 @@ picks the same session up. There is no tool that approves anything, and
 - **Attachments** from outside the folder are copied into `.studio-attachments/`
   in it (git-ignored); one inside is named by its path there.
 
+- **Delegate changes promptly.** The outer tab sends the user's request and
+  constraints to `opencode_ask`; OpenCode reads the project rules and locates the
+  implementation. It need not discover every function before handing off. After
+  three workspace reads without a handoff/session inspection in the current run,
+  the shared executor removes exploration tools from the request and refuses them
+  at dispatch until a successful handoff/session inspection. It can still answer,
+  ask a focused question, recall evidence, or delegate a review explicitly without
+  edits. The guard also covers calls hidden inside made tools; it never approves
+  an OpenCode permission request.
+- **Workspace reads fit the executor's result budget.** `opencode_read_file`
+  returns at most 6000 characters plus a header with the next `start` character
+  offset. `opencode_search_files` does bounded case-insensitive literal search,
+  returning line numbers and offsets for that reader. Search and listing report
+  partial results when bounded; normal listings/searches skip `.runtime`, `.work` and
+  `.studio-attachments` along with dependencies. Explicit paths still work.
+- **Stopping is not evidence of an edit.** A read-only journal says no
+  edit-capable tools ran. If any edit-capable operation was attempted, the stop
+  message says the project may have changed, including failed/unknown outcomes.
+
 Live-checked (2026-09-27, scratch project, qwen3-coder-30b): the edit's diff was
 asked and allowed, `python hello.py` was asked and refused with a note, OpenCode's
 reply quoted the note, the file changed, the server ended with `stop()`; an add-on
@@ -2644,6 +2663,27 @@ composer.
   are the inference representation only; preserve compound-tool descriptions.
 - `studio_task_update` is an internal tool exposed alongside bridge tools. Warm-up
   must use the same system prompt and tool list, including that internal tool.
+- **Continuation is automatic and referable.** With `studio_task_recall` exposed,
+  `context_messages` archives whole older exchanges as `record.notes` before they
+  leave the request. Notes contain bounded source excerpts and the complete source
+  messages, under stable `note:N` references; full live history is also retained.
+  The executor checkpoints new notes before asking the model again. No model call
+  is required to summarize, and excerpts are historical data, not instructions or
+  proof of an edit. A compacted request carries the original request note and recent
+  notes; `ref=index` searches their summaries, `ref=note:N` pages the source,
+  `ref=journal:N` pages full saved tool evidence, and `ref=state` pages all briefs,
+  plans, objects, checks and issues. Oversized state excerpts show the latest request
+  first and explicitly require retrieval of omitted constraints. Recall never
+  clears a restore guard or read-back obligation. Old task files restore with an
+  empty note list and compact normally on their next run.
+- **The input budget follows the loaded model.** Each executor run probes the
+  model's loaded context after settling GPU work, reserves up to 4096 output tokens,
+  and uses a conservative 2.5 input characters per remaining token, capped by the
+  caller's budget. This is an estimate, not exact tokenization. A host that does not
+  report its window uses a 32000-character fallback. Output reservation is sent as
+  `max_tokens` in both streaming and non-streaming requests. A context/length refusal
+  permits one retry with a smaller context; partial calls never execute. If the
+  fixed prompt and tool contract cannot fit, fail explicitly rather than clip them.
 - **The task record is the last message of every request, never the second.**
   `context_messages` appends it after the conversation. It changes every turn -
   `status` alone flips to "working" before each run - and LM Studio caches by
