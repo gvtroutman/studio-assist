@@ -1009,6 +1009,37 @@ class TestAppRegistry(unittest.TestCase):
         self.assertEqual(eng.opencode_config("http://h:1/v1", "m1", [])["provider"]["lmstudio"]
                          ["options"]["baseURL"], "http://h:1/v1")
 
+    def test_on_this_repo_opencode_gets_the_short_brief_not_agents_md(self):
+        # AGENTS.md is far larger than the model's window; loaded whole it
+        # pushed the task out of OpenCode's memory.
+        self.assertTrue(os.path.isfile(eng.OPENCODE_BRIEF))
+        with open(eng.OPENCODE_BRIEF, encoding="utf-8") as f:
+            self.assertLess(len(f.read()), 8000, "the brief must stay small")
+        self.assertTrue(eng.own_repo(eng.HERE))
+        cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"], brief=eng.OPENCODE_BRIEF)
+        self.assertEqual(cfg["instructions"], [eng.OPENCODE_BRIEF])
+        self.assertNotIn("OpenCode to read it", eng.OPENCODE_PROMPT)
+        oc = eng.APPS_BY_ID["opencode"]
+        tmp = tempfile.mkdtemp()
+        started = []
+        real = (eng.studio_procs.spawn, eng.opencode_exe, eng.probe_models,
+                eng.context_window, oc.workspace, oc.state_dir, oc.child)
+        eng.studio_procs.spawn = lambda args, **kw: started.append(kw) or type(
+            "C", (), {"stop": lambda self, g=0: None})()
+        eng.opencode_exe = lambda: "opencode.exe"
+        eng.probe_models = lambda host, timeout=8: (True, ["m1"], ["m1"], [], None)
+        eng.context_window = lambda host, model, timeout=5: (65536, 262144)
+        oc.workspace, oc.state_dir, oc.child = eng.HERE, tmp, None
+        try:
+            oc.launch(host="http://h:1/v1")
+            self.assertEqual(started[-1]["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"], "1")
+            with open(oc.config_path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["instructions"], [eng.OPENCODE_BRIEF])
+        finally:
+            (eng.studio_procs.spawn, eng.opencode_exe, eng.probe_models,
+             eng.context_window, oc.workspace, oc.state_dir, oc.child) = real
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_launch_starts_a_contained_server_with_a_fresh_password(self):
         oc = eng.APPS_BY_ID["opencode"]
         tmp = tempfile.mkdtemp()
@@ -1048,6 +1079,9 @@ class TestAppRegistry(unittest.TestCase):
             self.assertEqual(cfg["model"], "lmstudio/m1")
             self.assertEqual(cfg["permission"]["edit"], "ask")
             self.assertEqual(os.listdir(oc.workspace), [], "nothing is written into the repo")
+            # Another folder keeps its own AGENTS.md; only this repo's is swapped.
+            self.assertNotIn("instructions", cfg)
+            self.assertNotIn("OPENCODE_DISABLE_PROJECT_CONFIG", env)
             # A second start ends the first server and changes the password.
             oc.launch(host="http://100.127.17.38:1234/v1")
             self.assertTrue(first.stopped)

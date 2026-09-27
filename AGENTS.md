@@ -1295,6 +1295,20 @@ was never installed here, the tab never ran, and a sandbox cannot edit this repo
   permissions, never loosen one.
 - **The model gets the loaded window.** `context_window()` is passed as the model's
   `limit.context`, or OpenCode never compacts and overruns a 32k load.
+- **On this repo OpenCode reads `docs/OPENCODE.md`, never this file.** OpenCode puts
+  the workspace's AGENTS.md whole into every request; this one is ~60k tokens, more
+  than the loaded window, so the task and everything it read were compacted away and
+  it "forgot" what it was doing. When the workspace is this repo, `launch()` sets
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1` (stops the root AGENTS.md) and the config's
+  `instructions` names the brief (`OPENCODE_BRIEF`). Keep the brief short (a test
+  holds it under 8k chars); put new must-know rules there, detail here. Another
+  workspace keeps its own AGENTS.md. `OPENCODE_PROMPT` must not tell the model to have
+  OpenCode read AGENTS.md.
+- **A follow-up continues the last session.** `opencode_ask` without `session_id`
+  reuses the one in `OPENCODE_STATE/last_session` (a local model often drops the id,
+  and a fresh session knows nothing); `new_session: true` starts over.
+- **Under 64k of window it warns.** `context_note()` names LM Studio's Context Length
+  in `opencode_status` and after each ask.
 
 **How a step reaches the user.** `opencode_ask` sends the task with `prompt_async`
 and `run()` follows the session: each pass lists `/permission` and `/question`,

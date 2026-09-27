@@ -1636,9 +1636,8 @@ HOW THE WORK IS SHAPED
 - opencode_status says which folder OpenCode works in. Paths you pass to the file
   tools are relative to it: "studio_agent.py", "tests/test_mcp.py".
 - A session is one piece of work with its own history. opencode_ask sends a task to
-  a session and follows it to the end; with no session_id it starts a new one and
-  returns its id. Pass that id back to continue the same work, so OpenCode
-  remembers what it did. Start a new session for an unrelated job.
+  a session and follows it to the end; it continues the last session by itself, so
+  OpenCode remembers what it did. Pass new_session=true for an unrelated job.
 - While OpenCode works, every change it wants is shown to the user with its diff or
   command, and the user allows or refuses it. You are not asked and cannot answer
   for them; there is no tool that approves anything. The reply lists the user's
@@ -1652,9 +1651,13 @@ BRIEFING - what silently produces poor work
   and what finished looks like. "In studio_chat.py, make the Stop button also close
   an open approval form" works; "fix the approvals" does not. Put the user's exact
   wording, constraints and examples into the prompt.
-- This project has an AGENTS.md with its rules (stdlib only, how tests run). Tell
-  OpenCode to read it before changing code, and to keep changes small - the user
-  reviews each one.
+- Start the prompt with the user's request copied word for word, then add what you
+  know that helps (file names, earlier answers). Do not paraphrase their request or
+  drop details from it.
+- OpenCode already has this project's rules (docs/OPENCODE.md). Do NOT tell it to
+  read AGENTS.md - it is too long for the model and pushes the task out of memory.
+- Follow-ups continue the same session automatically; set new_session only when the
+  user starts an unrelated job.
 - Work takes real time: seconds for a question, minutes for a change, and however
   long the user takes to decide. If an ask hands back at its timeout, follow the
   same session with opencode_wait; do not send the task again.
@@ -2279,7 +2282,9 @@ class ServerSpec(AppSpec):
 
     def write_config(self, host, model, ids, context=None):
         os.makedirs(self.state_dir, exist_ok=True)
-        cfg = opencode_config(host, model, ids, context, addons=load_addons(self.state_dir))
+        brief = OPENCODE_BRIEF if own_repo(self.workspace) and os.path.isfile(OPENCODE_BRIEF) else None
+        cfg = opencode_config(host, model, ids, context, addons=load_addons(self.state_dir),
+                              brief=brief)
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
         return self.config_path
@@ -2313,6 +2318,8 @@ class ServerSpec(AppSpec):
         env = dict(os.environ, OPENCODE_CONFIG=self.config_path,
                    OPENCODE_SERVER_PASSWORD=key)
         env.pop("OPENCODE_CONFIG_CONTENT", None)
+        if own_repo(self.workspace):
+            env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"   # not the 60k-token AGENTS.md
         port = urllib.parse.urlsplit(OPENCODE_URL).port or 4096
         log_file = open(os.path.join(self.state_dir, "server.log"), "w",
                         encoding="utf-8", errors="replace")
@@ -2499,12 +2506,25 @@ def addons_config(addons):
     return studio_codeaddons.config(addons)
 
 
-def opencode_config(host, model, ids, context=None, addons=None):
+# OpenCode puts the workspace's AGENTS.md whole into every request. This
+# repo's is ~60k tokens - more than the model's window - so the task and
+# everything OpenCode read got compacted away. On this repo it gets this short
+# brief instead, and `launch()` sets OPENCODE_DISABLE_PROJECT_CONFIG so the
+# root AGENTS.md is not loaded too.
+OPENCODE_BRIEF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "OPENCODE.md")
+
+
+def own_repo(workspace):
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.normcase(os.path.abspath(workspace)) == os.path.normcase(here)
+
+
+def opencode_config(host, model, ids, context=None, addons=None, brief=None):
     """
     The opencode.json handed to `opencode serve` (by OPENCODE_CONFIG, so the
     workspace is not written to): the studio's LM Studio with the served
-    models declared and one chosen, the permissions above, and the add-ons
-    The user has turned on.
+    models declared and one chosen, the permissions above, the add-ons
+    The user has turned on, and `brief` (a file path) as its instructions.
     """
     base = host.rstrip("/")
     if not base.endswith("/v1"):
@@ -2525,6 +2545,8 @@ def opencode_config(host, model, ids, context=None, addons=None):
         "autoupdate": False,
         "share": "disabled",
     }
+    if brief:
+        cfg["instructions"] = [brief]
     extra = addons_config(addons or [])
     # An add-on's permissions only add to the ones above; none is loosened.
     for k, v in extra.pop("permission", {}).items():
@@ -2632,7 +2654,7 @@ APPS = [
         default_groups=["discover", "work"],
         system_prompt=OPENCODE_PROMPT,
         examples=[
-            "Have OpenCode read AGENTS.md and explain how a tab's bridge is started",
+            "Have OpenCode explain how a tab's bridge is started",
             "Add a Copy button to each folded tool-call row in studio_chat.py",
             "What has OpenCode changed that is not committed yet?",
             "Run the OpenCode bridge's tests and fix what fails",
