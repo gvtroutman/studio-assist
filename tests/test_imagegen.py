@@ -1608,6 +1608,34 @@ class TestErrors(unittest.TestCase):
         self.assertIn(r"Start it: D:\ComfyUI\start.cmd", h["detail"])
 
 
+class FakeWeb:
+    """urlopen for fetch_picture: url -> bytes or (bytes, content type);
+    gone.example is 404, private.example 403, anything else unreachable."""
+
+    def __init__(self, pages, asked=None):
+        self.pages, self.asked = pages, asked if asked is not None else []
+
+    def __call__(self, req, timeout=None):
+        import io
+        import urllib.error
+        url = req.full_url
+        self.asked.append(url)
+        for host, code in (("gone.example", 404), ("private.example", 403)):
+            if host in url:
+                raise urllib.error.HTTPError(url, code, "No", {}, None)
+        if url not in self.pages:
+            raise urllib.error.URLError("no such host")
+        body = self.pages[url]
+        body, ctype = body if isinstance(body, tuple) else (body, "image/whatever")
+
+        class Answer(io.BytesIO):
+            headers = {"Content-Type": ctype}
+
+            def geturl(self):
+                return url
+        return Answer(body)
+
+
 class TestLibrary(unittest.TestCase):
     def test_junk_on_disk_costs_the_record_not_the_list(self):
         d = tempfile.mkdtemp()
@@ -1653,6 +1681,63 @@ class TestLibrary(unittest.TestCase):
         kept = lib.keep_reference(src, "Sitter")
         self.assertTrue(kept.startswith(lib.root))
         self.assertEqual(kept, lib.keep_reference(src, "Sitter"))
+
+    def test_a_picture_from_a_link_is_kept_like_an_uploaded_one(self):
+        """A link's picture becomes a file under references/, named by its
+        bytes as an upload is, so the same picture by link or by file is one
+        file and a link that dies later breaks nothing."""
+        d = tempfile.mkdtemp()
+        src = os.path.join(d, "glasses.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        lib = ig.Library(os.path.join(d, "studio"))
+        asked = []
+        kept = lib.keep_link("example.com/glasses", "Ada items",
+                             opener=FakeWeb({"https://example.com/glasses": PNG}, asked))
+        self.assertEqual(asked, ["https://example.com/glasses"])
+        self.assertTrue(kept.startswith(os.path.join(lib.root, "references", "ada-items")))
+        self.assertTrue(kept.endswith(".png"))
+        self.assertEqual(kept, lib.keep_reference(src, "Ada items"))
+
+    def test_a_link_may_be_the_picture_a_page_a_search_result_or_data(self):
+        jpeg = b"\xff\xd8\xff\xe0" + b"\0" * 32
+        page = (b'<html><head><meta content="/img/dress.jpg?w=800&amp;q=1" '
+                b'property="og:image"><meta name="twitter:image" content="x.png">'
+                b'</head></html>')
+        web = FakeWeb({"https://shop.example/dress": (page, "text/html; charset=utf-8"),
+                       "https://shop.example/img/dress.jpg?w=800&q=1": jpeg,
+                       "https://cdn.example/a.webp": b"RIFF\0\0\0\0WEBPVP8 ",
+                       "https://blog.example/": (b"<html>nothing</html>", "text/html"),
+                       "https://docs.example/a.pdf": (b"%PDF-1.4", "application/pdf"),
+                       "https://phone.example/a": b"\0\0\0\x1cftypheic" + b"\0" * 8})
+        self.assertEqual(ig.fetch_picture("https://shop.example/dress", web), (jpeg, ".jpg"))
+        self.assertEqual(ig.fetch_picture(
+            "https://www.google.com/imgres?imgurl=https%3A%2F%2Fcdn.example%2Fa.webp"
+            "&imgrefurl=x", web)[1], ".webp")
+        self.assertEqual(ig.fetch_picture(
+            "data:image/png;base64," + base64.b64encode(PNG).decode(), web), (PNG, ".png"))
+        for url, says in [("https://blog.example/", "copy its image address"),
+                          ("https://docs.example/a.pdf", "application/pdf"),
+                          ("https://phone.example/a", "HEIC"),
+                          ("https://gone.example/a.png", "HTTP 404"),
+                          ("https://private.example/a.png", "upload it instead"),
+                          ("ftp://example.com/a.png", "Only http and https"),
+                          ("https://me:pw@example.com/a.png", "password"),
+                          ("   ", "Paste a link")]:
+            with self.assertRaises(ig.LinkError) as err:
+                ig.fetch_picture(url, web)
+            self.assertIn(says, str(err.exception), url)
+        self.assertEqual(ig.picture_ext(b"GIF89a..."), ".gif")
+        self.assertEqual(ig.picture_ext(b"<svg/>"), "")
+
+    def test_a_link_bigger_than_a_picture_is_refused(self):
+        from unittest import mock
+        big = b"\x89PNG\r\n\x1a\n" + b"\0" * 64
+        with mock.patch.object(ig, "PICTURE_BYTES", 32):
+            with self.assertRaises(ig.LinkError) as err:
+                ig.fetch_picture("https://example.com/big.png",
+                                 FakeWeb({"https://example.com/big.png": big}))
+        self.assertIn("over", str(err.exception))
 
     def test_every_default_style_has_its_example_picture(self):
         """The form shows styles as pictures; a default without one is a
@@ -2707,6 +2792,74 @@ class TestImageStudioTab(unittest.TestCase):
         ui.scene.insert("1.0", "Bea puts her glasses on.")
         self.assertEqual(ig.outfit_of(ui.collect())["accessories"],
                          [{"name": "glasses", "path": kept}])
+
+    def test_pictures_of_items_and_people_can_come_from_links(self):
+        """The user: "i want to use urls for images of items and people". A tag,
+        a form item and a profile photo each take a link: asked in a small
+        window (the clipboard's link already in it), downloaded off the UI
+        thread, kept under references/ as an upload is."""
+        s, ui = self.tab()
+        from unittest import mock
+        asked = []
+
+        def fetch(url, opener=None):
+            asked.append(url)
+            if "broken" in url:
+                raise ig.LinkError("example.com answered HTTP 404 (Not Found).")
+            return PNG, ".png"
+        patched = mock.patch.object(ig, "fetch_picture", fetch)
+        patched.start()
+        self.addCleanup(patched.stop)
+
+        ed = ui.edit_characters()
+        ed._new()
+        ed.name.set("Cy")
+        ed._show("Tags")
+        self.app.update()
+        self.assertIsNone(ed._add_tag_link())          # no word: no link asked
+        self.assertIn("Name the tag first", ed.msg.cget("text"))
+        ed.tag_name.set("earrings")
+        self.app.clipboard_clear()
+        self.app.clipboard_append("https://shop.example/hoops.jpg")
+        top = ed._add_tag_link()
+        self.assertEqual(top.var.get(), "https://shop.example/hoops.jpg")
+        top.var.set("https://example.com/broken.png")
+        top.ok()
+        self.pump(lambda: "No picture from that link" in ed.msg.cget("text"))
+        self.assertEqual(ed.item_refs, {})              # no picture, no tag
+        top = ed._add_tag_link()
+        top.var.set("https://shop.example/hoops.jpg")
+        top.ok()
+        self.pump(lambda: "earrings" in ed.item_refs)
+        kept = ed.item_refs["earrings"]
+        self.assertTrue(kept.startswith(os.path.join(ui.studio.lib.root, "references")))
+        self.assertTrue(os.path.isfile(kept))
+        self.assertEqual(ed.tag_name.get(), "")
+        self.assertIn("Tagged earrings", ed.msg.cget("text"))
+        ed.win.destroy()
+
+        ui._show_looks("Clothes")                       # an item on the form
+        ui.text["top"].set("denim jacket")
+        ui._show_looks("Clothes")
+        self.app.update()
+        top = ui._link_item("denim jacket")
+        top.var.set("https://shop.example/jacket")
+        top.ok()
+        self.pump(lambda: "denim jacket" in ui.item_refs)
+        self.assertTrue(os.path.isfile(ui.item_refs["denim jacket"]))
+
+        rd = ui.edit_identities()                       # a person's photo
+        rd._new()
+        self.app.update()
+        pics = rd.widgets["references"][1]
+        top = rd._add_link(pics)
+        top.var.set("https://example.com/me.jpg")
+        top.ok()
+        self.pump(lambda: len(pics["paths"]) == 1)
+        self.assertTrue(pics["paths"][0].startswith(
+            os.path.join(ui.studio.lib.root, "references")))
+        self.assertEqual(asked[-1], "https://example.com/me.jpg")
+        rd.win.destroy()
 
     def test_a_character_goes_from_the_creator_to_the_form_and_history(self):
         s, ui = self.tab()
