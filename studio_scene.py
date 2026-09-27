@@ -54,6 +54,7 @@ each object go into the prompt as written. The pieces:
 No tkinter here; `studio_scene_ui.py` is the window. Stdlib only.
 """
 
+import bisect
 import copy
 import hashlib
 import json
@@ -1810,9 +1811,168 @@ def new_room():
     """The floor, and walls around the origin (off until asked for). Each
     surface: the words its picture was asked for, the picture (a PNG path, ''
     for plain) and `size`, the metres one copy of the picture covers."""
-    return {"walls": False, "width": 8.0, "depth": 8.0, "height": 3.0,
+    return {"walls": False, "width": 8.0, "depth": 8.0, "height": 3.0, "grid": [],
             "floor": {"prompt": "", "image": "", "size": 2.0},
             "wall": {"prompt": "", "image": "", "size": 3.0}}
+
+
+# ==================================================================== ground
+# The floor can be shaped. `room["grid"]` is 4 x 4 handle heights, rows from
+# the back (-z) to the front (+z, where the camera starts), columns from left
+# (-x) to right, spread evenly over the room's width x depth round the origin
+# (with walls or without). They pull one smooth surface, as a Bezier patch's
+# control points do: every dot shapes a broad area, not one point, the
+# surface stays between the lowest and highest dot, and raising the middle
+# four makes a round hill. The patch runs through `smoothstep` first, so it
+# meets the level floor round it without a crease: past the edges the floor
+# carries the edge's height straight on. [] is the flat floor at 0, drawn as
+# it always was. An object's position y stays where its lowest point is, so
+# what stands on the floor is re-stood (`stand`) when it moves or the floor
+# is reshaped.
+GRID = 4                       # dots each way
+GRID_HEIGHT = (-4.0, 6.0)      # m a dot can go down and up
+GRID_CELLS = 12                # the shaped area is drawn as this many cells each way
+GRID_OUTSIDE = (2.0, 6.0, 14.0)  # m past its edge the level floor is cut, for sorting
+FLOOR_SHADE = 0.05             # a sloped face's brightness on a picture, in steps
+FLOOR_PRESETS = [              # (key, label, rows back to front)
+    ("flat", "Flat", [[0, 0, 0, 0]] * 4),
+    ("hill", "Hill", [[0, 0, 0, 0], [0, 2.6, 2.6, 0], [0, 2.6, 2.6, 0], [0, 0, 0, 0]]),
+    ("dip", "Dip", [[0, 0, 0, 0], [0, -2, -2, 0], [0, -2, -2, 0], [0, 0, 0, 0]]),
+    ("ridge", "Ridge", [[0, 2.2, 2.2, 0]] * 4),
+    ("rise", "Rise behind", [[2, 2, 2, 2], [2, 2, 2, 2], [0, 0, 0, 0], [0, 0, 0, 0]]),
+    ("left", "Bank left", [[2, 2, 0, 0]] * 4),
+    ("right", "Bank right", [[0, 0, 2, 2]] * 4),
+    ("bowl", "Bowl", [[2, 2, 2, 2], [2, 0, 0, 2], [2, 0, 0, 2], [2, 2, 2, 2]]),
+    ("rolling", "Rolling", [[0, 1.4, 0, 1.4], [1.4, 0, 1.4, 0], [0, 1.4, 0, 1.4],
+                            [1.4, 0, 1.4, 0]]),
+]
+FLOOR_PRESET = {k: rows for k, _, rows in FLOOR_PRESETS}
+
+
+def clean_grid(raw):
+    """Handle heights made safe: 4 rows of 4 numbers in range, or [] for a
+    flat floor (no such grid, or every dot at 0)."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != GRID:
+        return []
+    out = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)) or len(row) != GRID:
+            return []
+        clean = []
+        for v in row:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(v):
+                return []
+            clean.append(round(max(GRID_HEIGHT[0], min(GRID_HEIGHT[1], v)), 3))
+        out.append(clean)
+    return out if any(v for row in out for v in row) else []
+
+
+def _bernstein(t):
+    """The four cubic weights at `t` (0-1), eased so the surface leaves its
+    edge level."""
+    t = min(1.0, max(0.0, t))
+    s = t * t * (3 - 2 * t)
+    r = 1 - s
+    return (r * r * r, 3 * s * r * r, 3 * s * s * r, s * s * s)
+
+
+class Ground:
+    """The floor's height anywhere, from a room's grid (None: flat)."""
+
+    def __init__(self, room):
+        room = room or {}
+        self.grid = clean_grid(room.get("grid"))
+        self.w, self.d = float(room.get("width") or 8.0), float(room.get("depth") or 8.0)
+        self.level = len({v for row in self.grid for v in row}) <= 1
+
+    def at(self, x, z):
+        if not self.grid:
+            return 0.0
+        if self.level:
+            return self.grid[0][0]
+        u0, u1, u2, u3 = _bernstein(x / self.w + 0.5)
+        v0, v1, v2, v3 = _bernstein(z / self.d + 0.5)
+        r0, r1, r2, r3 = [u0 * a + u1 * b + u2 * c + u3 * d for a, b, c, d in self.grid]
+        return v0 * r0 + v1 * r1 + v2 * r2 + v3 * r3
+
+    def slope(self, x, z, e=0.01):
+        """The floor's upward normal at (x, z)."""
+        dx = (self.at(x + e, z) - self.at(x - e, z)) / (2 * e)
+        dz = (self.at(x, z + e) - self.at(x, z - e)) / (2 * e)
+        return norm((-dx, 1.0, -dz))
+
+    def cuts(self, lo, hi, half):
+        """Where the floor is cut between `lo` and `hi` along one axis whose
+        shaped area is -half..half: evenly across the area, and a few times
+        beyond it (level there across, so only for the painter's sort). A
+        level floor is its two ends."""
+        if self.level:
+            return [lo, hi]
+        at = {lo, hi}
+        at.update(-half + 2 * half * k / GRID_CELLS for k in range(GRID_CELLS + 1))
+        at.update(s * (half + g) for s in (-1, 1) for g in GRID_OUTSIDE)
+        return sorted(a for a in at if lo <= a <= hi)
+
+    def xs(self, lo, hi):
+        return self.cuts(lo, hi, self.w / 2)
+
+    def zs(self, lo, hi):
+        return self.cuts(lo, hi, self.d / 2)
+
+    def faces(self, x0, x1, z0, z1):
+        """The floor over x0..x1, z0..z1 as flat faces: [(points, normal)],
+        each normal pointing up. A cell whose corners lie in a plane is one
+        quad; any other is two triangles."""
+        xs, zs = self.xs(x0, x1), self.zs(z0, z1)
+        hs = [[self.at(x, z) for x in xs] for z in zs]
+        out = []
+        for j, (za, zb) in enumerate(zip(zs, zs[1:])):
+            for i, (xa, xb) in enumerate(zip(xs, xs[1:])):
+                a, b = (xa, hs[j][i], za), (xb, hs[j][i + 1], za)
+                c, d = (xb, hs[j + 1][i + 1], zb), (xa, hs[j + 1][i], zb)
+                if abs(a[1] + c[1] - b[1] - d[1]) < 1e-9:
+                    polys = [[a, b, c, d]]
+                else:
+                    polys = [[a, b, c], [a, c, d]]
+                for p in polys:
+                    n = norm(newell(p))
+                    out.append((p, n if n[1] > 0 else mul(n, -1)))
+        return out
+
+
+def floor_height(room, x, z):
+    return Ground(room).at(x, z)
+
+
+def above_floor(room, obj):
+    """How high an object stands above the floor under it (m)."""
+    x, y, z = obj["position"]
+    return y - floor_height(room, x, z)
+
+
+def stand(room, obj, lift=0.0):
+    """Put an object `lift` above the floor under where it is."""
+    x, _, z = obj["position"]
+    obj["position"][1] = round(floor_height(room, x, z) + round(lift, 3), 4)
+
+
+def shape_floor(scene, grid=None, **size):
+    """Give the floor new handle heights (`grid`, [] for flat, None to keep
+    them) and/or the room a new `width` / `depth`, which the shape spans;
+    everything on the floor stays as high above it as it was."""
+    room = scene["room"]
+    lifts = [above_floor(room, o) for o in scene["objects"]]
+    if grid is not None:
+        room["grid"] = clean_grid(grid)
+    for key, v in size.items():
+        lo, hi = ROOM_LIMITS[key]
+        room[key] = max(lo, min(hi, float(v)))
+    for obj, lift in zip(scene["objects"], lifts):
+        stand(room, obj, lift)
 
 
 def new_scene(details=""):
@@ -2007,6 +2167,7 @@ def clean_scene(d):
     r["walls"] = room.get("walls") is True
     for key, (lo, hi) in ROOM_LIMITS.items():
         r[key] = _num(room.get(key), r[key], lo, hi)
+    r["grid"] = clean_grid(room.get("grid"))
     for key, label, _ in SURFACES:
         given = room.get(key) if isinstance(room.get(key), dict) else {}
         r[key]["prompt"] = str(given.get("prompt") or "")
@@ -2087,7 +2248,10 @@ def change_label(before, after):
             ("Delete", gone) if gone and not added else ("Change", added + gone)
         return "%s %s" % (verb, some[0]["name"] if len(some) == 1 else
                           "%d objects" % len(some))
-    edited = [(was[i], o) for i, o in now.items() if o != was[i]]
+    # Reshaping the floor re-stands everything on it: one step, the floor's.
+    if (before.get("room") or {}).get("grid") != (after.get("room") or {}).get("grid"):
+        return "Shape the floor"
+    edited =[(was[i], o) for i, o in now.items() if o != was[i]]
     if len(edited) > 1:
         return "Change %d objects" % len(edited)
     if edited:
@@ -2290,18 +2454,30 @@ def texture_settings(scene, surface, model, backend="auto"):
 def walls(room):
     """The four walls, each (quad, origin, along): a quad facing into the
     room, its top-left corner as seen from inside, and the direction along
-    it. A picture's top row runs along the wall's top."""
+    it. A picture's top row runs along the wall's top. On a shaped floor a
+    wall stands on it, `height` tall wherever it is, as several quads cut
+    where the floor is (convex faces are all `rasterise` fills)."""
     hw, hd, h = room["width"] / 2, room["depth"] / 2, room["height"]
+    g = Ground(room)
     out = []
-    for origin, along, length in (((-hw, h, -hd), (1, 0, 0), 2 * hw),     # back
-                                  ((hw, h, -hd), (0, 0, 1), 2 * hd),      # right
-                                  ((hw, h, hd), (-1, 0, 0), 2 * hw),      # front
-                                  ((-hw, h, hd), (0, 0, -1), 2 * hd)):    # left
+    for (x, _, z), along, length in (((-hw, h, -hd), (1, 0, 0), 2 * hw),     # back
+                                     ((hw, h, -hd), (0, 0, 1), 2 * hd),      # right
+                                     ((hw, h, hd), (-1, 0, 0), 2 * hw),      # front
+                                     ((-hw, h, hd), (0, 0, -1), 2 * hd)):    # left
+        origin = (x, h + g.at(x, z), z)
         end = add(origin, mul(along, length))
-        quad = [origin, end, (end[0], 0.0, end[2]), (origin[0], 0.0, origin[2])]
-        if dot(newell(quad), (-origin[0], 0, -origin[2])) < 0:
-            quad = quad[::-1]
-        out.append((quad, origin, along))
+        if along[2]:
+            zs = g.zs(min(z, end[2]), max(z, end[2]))
+            cuts = [(x, c) for c in (zs if along[2] > 0 else zs[::-1])]
+        else:
+            xs = g.xs(min(x, end[0]), max(x, end[0]))
+            cuts = [(c, z) for c in (xs if along[0] > 0 else xs[::-1])]
+        for (xa, za), (xb, zb) in zip(cuts, cuts[1:]):
+            fa, fb = g.at(xa, za), g.at(xb, zb)
+            quad = [(xa, fa + h, za), (xb, fb + h, zb), (xb, fb, zb), (xa, fa, za)]
+            if dot(newell(quad), (-origin[0], 0, -origin[2])) < 0:
+                quad = quad[::-1]
+            out.append((quad, origin, along))
     return out
 
 
@@ -2354,6 +2530,28 @@ class Camera:
         if t <= 0:
             return None
         return add(self.eye, mul(d, t))
+
+
+def floor_point(cam, room, sx, sy, reach=2 * FLOOR_REACH, step=0.05):
+    """Where the ray through (sx, sy) first meets the floor, shaped or
+    flat, within `reach` m of the camera, or None."""
+    g = Ground(room)
+    if g.level:
+        return cam.on_floor(sx, sy, g.at(0.0, 0.0))
+    d, e = cam.ray(sx, sy), cam.eye
+    above = lambda t: e[1] + d[1] * t - g.at(e[0] + d[0] * t, e[2] + d[2] * t)  # noqa: E731
+    if above(0.0) <= 0:
+        return None
+    t = 0.0
+    while t < reach:
+        if above(t + step) <= 0:
+            lo, hi = t, t + step
+            for _ in range(24):
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if above(mid) > 0 else (lo, mid)
+            return add(e, mul(d, hi))
+        t += step
+    return None
 
 
 def clip_near(pts):
@@ -2451,8 +2649,10 @@ def render(scene, width=None, height=None):
         width, height = frame_size(scene)
     cam = Camera(scene["camera"], width, height)
     polys = room_polys(scene, cam)
-    tex = texture((scene.get("room") or new_room())["floor"]["image"])
+    room = scene.get("room") or new_room()
+    tex = texture(room["floor"]["image"])
     floor = tex.mean if tex else FLOOR
+    ground = Ground(room)
     faces = []
     for obj in scene["objects"]:
         pieces = painted_pieces(obj)
@@ -2461,9 +2661,9 @@ def render(scene, width=None, height=None):
             for piece in pieces:
                 members.setdefault(piece[0], []).append(piece)
             for group in members.values():
-                polys += shadow_polys(group, cam, floor)
+                polys += shadow_polys(group, cam, floor, ground)
         else:
-            polys += shadow_polys(pieces, cam, floor)
+            polys += shadow_polys(pieces, cam, floor, ground)
         for part, fs, rgb in pieces:
             for f in fs:
                 n = newell(f)
@@ -2514,25 +2714,38 @@ def grown(outline, r, sides=16):
     return hull([(x + dx, z + dz) for x, z in outline for dx, dz in ring])
 
 
-def shadow_polys(pieces, cam, floor=FLOOR):
+def shadow_polys(pieces, cam, floor=FLOOR, ground=None):
     """The soft shadow an object leaves on the floor, as `dim` polys: a
     dark contact ring under each part that touches (each foot, a knee, a
     box's base) and a faint one under the whole body. Only for an object on
-    the floor itself: one standing on a platform at y > 0 would have its
-    shadow drawn under the platform, since the room is drawn first."""
+    the floor itself: one standing on a platform above it would have its
+    shadow drawn under the platform, since the room is drawn first. On a
+    shaped floor (`ground`) heights are above the floor under each point,
+    and the rings lie on it."""
+    g = ground or Ground(None)
     pts = [p for _, faces, _ in pieces for f in faces for p in f]
-    if not pts or cam.eye[1] <= 0:
+    if not pts or cam.eye[1] <= g.at(cam.eye[0], cam.eye[2]):
         return []
-    low = min(p[1] for p in pts)
+    if g.grid:
+        # Under one object the floor is as good as a plane: the one touching
+        # it under the object's middle, which is quick to ask of every point.
+        mx = sum(p[0] for p in pts) / len(pts)
+        mz = sum(p[2] for p in pts) / len(pts)
+        h0, n = g.at(mx, mz), g.slope(mx, mz)
+        gx, gz = -n[0] / n[1], -n[2] / n[1]
+        up = lambda p: p[1] - h0 - gx * (p[0] - mx) - gz * (p[2] - mz)  # noqa: E731
+    else:
+        up = lambda p: p[1]  # noqa: E731
+    low = min(up(p) for p in pts)
     if low > 0.02:
         return []
     touching = {}
     for part, faces, _ in pieces:
         for f in faces:
             for p in f:
-                if p[1] <= low + CONTACT_REACH:
+                if up(p) <= low + CONTACT_REACH:
                     touching.setdefault(part, []).append((p[0], p[2]))
-    whole = hull([(p[0], p[2]) for p in pts if p[1] <= low + AMBIENT_REACH])
+    whole = hull([(p[0], p[2]) for p in pts if up(p) <= low + AMBIENT_REACH])
     rings = [(whole, AMBIENT_SHADOW)] if len(whole) >= 3 else []
     rings += [(hull(foot), CONTACT) for foot in touching.values()]
     out = []
@@ -2542,7 +2755,8 @@ def shadow_polys(pieces, cam, floor=FLOOR):
         seen = 1.0
         for r, k in steps:
             seen *= k
-            c = clip_near([cam.to_camera((x, 0.001, z)) for x, z in grown(outline, r)])
+            c = clip_near([cam.to_camera((x, g.at(x, z) + 0.001, z))
+                           for x, z in grown(outline, r)])
             if len(c) >= 3:
                 out.append(Poly([cam.to_screen(p) for p in c],
                                 tuple(int(v * seen) for v in floor), float("inf"),
@@ -2556,16 +2770,9 @@ def room_polys(scene, cam):
     into a doll's house. The room is the backdrop, never sorted in among the
     objects: everything in the scene stands in front of it."""
     room = scene.get("room") or new_room()
-    out = []
+    ground = Ground(room)
     r = FLOOR_REACH
-    floor = clip_near([cam.to_camera(p) for p in ((-r, 0, -r), (r, 0, -r), (r, 0, r),
-                                                  (-r, 0, r))])
-    if len(floor) >= 3 and cam.eye[1] > 0:
-        tex = texture(room["floor"]["image"])
-        m = (TexMap(cam, (0, 0, 0), (1, 0, 0), (0, 0, 1), (0, 1, 0),
-                    room["floor"]["size"], tex) if tex else None)
-        out.append(Poly([cam.to_screen(c) for c in floor], tex.mean if tex else FLOOR,
-                        float("inf"), None, None, m))
+    out = floor_polys(ground, cam, room["floor"], (-r, r, -r, r))
     if not room["walls"]:
         return out
     tex = texture(room["wall"]["image"])
@@ -2581,25 +2788,76 @@ def room_polys(scene, cam):
              if tex else None)
         rgb = tuple(min(255, int(v * k)) for v in (tex.mean if tex else WALL))
         out.append(Poly([cam.to_screen(p) for p in c], rgb, float("inf"), None, "wall", m))
+    if not ground.level:
+        # A rise in the floor can stand in front of a wall's foot, and the
+        # walls were drawn over it: the floor inside them again, on top.
+        hw, hd = room["width"] / 2, room["depth"] / 2
+        out += floor_polys(ground, cam, room["floor"], (-hw, hw, -hd, hd))
     return out
+
+
+def floor_polys(ground, cam, face, box):
+    """The floor over `box` (x0, x1, z0, z1) as faces towards the camera,
+    far to near, each lit by its slope (level is as bright as the flat floor
+    always was). A picture is laid on from straight above, x and z, so it
+    runs on unbroken from face to face."""
+    tex = texture(face["image"])
+    flat = AMBIENT + (1 - AMBIENT) * max(0.0, LIGHT_DIR[1])
+    out = []
+    for pts, n in ground.faces(*box):
+        if dot(n, sub(pts[0], cam.eye)) >= 0:
+            continue                             # seen from below
+        c = clip_near([cam.to_camera(p) for p in pts])
+        if len(c) < 3:
+            continue
+        mid = centroid(pts)
+        # Lit by the smooth surface's slope at its middle, not the face's
+        # own: the two triangles of a cell then shade alike, not faceted.
+        lit = ground.slope(mid[0], mid[2]) if ground.grid else n
+        k = (AMBIENT + (1 - AMBIENT) * max(0.0, dot(lit, LIGHT_DIR))) / flat
+        rgb = tuple(min(255, int(v * k)) for v in (tex.mean if tex else FLOOR))
+        m = None
+        if tex:
+            p0 = pts[0]                          # the face's plane over x = z = 0
+            origin = (0.0, p0[1] + (n[0] * p0[0] + n[2] * p0[2]) / n[1], 0.0)
+            m = TexMap(cam, origin, (1, 0, 0), (0, 0, 1), n, face["size"], tex,
+                       round(round(k / FLOOR_SHADE) * FLOOR_SHADE, 3))
+        far = dot(sub(mid, cam.eye), sub(mid, cam.eye))
+        out.append((-far, Poly([cam.to_screen(p) for p in c], rgb, float("inf"), None,
+                               None, m)))
+    out.sort(key=lambda t: t[0])
+    return [p for _, p in out]
 
 
 def grid_lines(scene, width, height, spacing=1.0, reach=10):
     """The floor's metre grid as screen segments, for the window only: the
     picture must not be told the floor is tiled. Inside the walls when there
-    are walls, since the grid is drawn over the whole room."""
+    are walls, since the grid is drawn over the whole room. On a shaped
+    floor it lies on it, each line in a segment per cut of the floor."""
     cam = Camera(scene["camera"], width, height)
     room = scene.get("room") or new_room()
+    g = Ground(room)
     if room["walls"]:
         hw, hd = room["width"] / 2, room["depth"] / 2
-        lines = [((x, 0, -hd), (x, 0, hd), x == 0)
-                 for x in range(int(math.ceil(-hw)), int(math.floor(hw)) + 1)]
-        lines += [((-hw, 0, z), (hw, 0, z), z == 0)
-                  for z in range(int(math.ceil(-hd)), int(math.floor(hd)) + 1)]
+        xs = [(x, x == 0) for x in range(int(math.ceil(-hw)), int(math.floor(hw)) + 1)]
+        zs = [(z, z == 0) for z in range(int(math.ceil(-hd)), int(math.floor(hd)) + 1)]
+        x0, x1, z0, z1 = -hw, hw, -hd, hd
     else:
-        lines = [(a, b, i == 0) for i in range(-reach, reach + 1)
-                 for a, b in (((i * spacing, 0, -reach), (i * spacing, 0, reach)),
-                              ((-reach, 0, i * spacing), (reach, 0, i * spacing)))]
+        xs = zs = [(i * spacing, i == 0) for i in range(-reach, reach + 1)]
+        x0, x1, z0, z1 = -reach, reach, -reach, reach
+
+    def seen(p, q):
+        """The floor between p and q faces the camera: the far side of a
+        rise is out of sight, and its lines with it."""
+        mid = mul(add(p, q), 0.5)
+        return dot(g.slope(mid[0], mid[2]), sub(mid, cam.eye)) < 0
+    lines = []
+    for x, axis in xs:
+        run = [(x, g.at(x, z), z) for z in g.zs(z0, z1)]
+        lines += [(p, q, axis) for p, q in zip(run, run[1:]) if seen(p, q)]
+    for z, axis in zs:
+        run = [(x, g.at(x, z), z) for x in g.xs(x0, x1)]
+        lines += [(p, q, axis) for p, q in zip(run, run[1:]) if seen(p, q)]
     out = []
     for a, b, axis in lines:
         ca, cb = cam.to_camera(a), cam.to_camera(b)
@@ -2970,10 +3228,9 @@ def depth_values(scene, width, height, relief=1.0, window=None):
         cam.to_screen = lambda c: ((full.to_screen(c)[0] - wx) * kx,     # noqa: E731
                                    (full.to_screen(c)[1] - wy) * ky)
     room = scene.get("room") or new_room()
-    groups = [[]]
-    if cam.eye[1] > 0:
-        r = FLOOR_REACH
-        groups[0].append([(-r, 0, -r), (r, 0, -r), (r, 0, r), (-r, 0, r)])
+    r = FLOOR_REACH
+    groups = [[pts for pts, n in Ground(room).faces(-r, r, -r, r)
+               if dot(n, sub(pts[0], cam.eye)) < 0]]
     if room["walls"]:
         groups[0] += [quad for quad, origin, _ in walls(room)
                       if dot(newell(quad), sub(origin, cam.eye)) < 0]
@@ -3888,6 +4145,7 @@ def _place(scene, sug):
                     a += 0.6 * nudge
                 pos = add(add(centre, mul(fwd, a)), mul(right, s))
                 obj["position"] = [round(pos[0], 2), lift, round(pos[2], 2)]
+                stand(scene.get("room"), obj, lift)
                 turn()
                 if not clear():
                     continue

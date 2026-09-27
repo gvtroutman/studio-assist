@@ -38,7 +38,11 @@ back onto that surface (`ImageStudio._job_changed` -> `texture_done`).
 Picture… puts a PNG from disk there instead. The viewport draws pictured
 surfaces in their mean colour at once and the pictures a moment later, baked
 at half size off the drag (`_bake`), since a per-pixel fill in Python is too
-slow for every mouse move.
+slow for every mouse move. Its Floor shape is the floor seen from above,
+4 x 4 dots over the room's width and depth: drag one up or down, right-click
+it back to 0, or start from a preset (a hill, a dip, a rise behind...). The
+dots pull one smooth surface (`studio_scene.Ground`), and everything on the
+floor stays standing on it.
 """
 
 import base64
@@ -106,6 +110,8 @@ class SceneBuilder:
         self.taken = set()            # ids of the finished picture jobs already used
         self.backdrop = (None, None)  # (key, PhotoImage): the room's pictures, baked
         self.bake_after = None
+        self.shape_canvas = None      # the floor's side view, while the room is inspected
+        self.shape_drag = None        # {"i": the dot, "dots": all of them} while one is dragged
         self.suggestion = None        # what Enrich offered (sc.new_suggestion), awaiting an answer
         self.enriching = False
 
@@ -404,6 +410,7 @@ class SceneBuilder:
         taken = len(self.scene["objects"])
         obj["position"] = [round(t[0] + (0.9 * taken if taken else 0), 2), 0.0,
                            round(t[2], 2)]
+        sc.stand(self.scene["room"], obj)
         self.scene["objects"].append(obj)
         self.select(obj["id"])
         self.changed(rebuild_list=True)
@@ -507,6 +514,7 @@ class SceneBuilder:
             w.destroy()
         self.vars = {}
         self.words_label = None
+        self.shape_canvas = None
 
     def _slider(self, parent, key, label, read, write, lo, hi, res=1.0):
         """A labelled slider over one number in the scene. `read` gets it,
@@ -777,7 +785,10 @@ class SceneBuilder:
 
         def put(key):
             def write(x):
-                room[key] = x
+                if key in ("width", "depth"):
+                    self._room_size(key, x)       # the floor's shape spans them
+                else:
+                    room[key] = x
             return write
         for key, label, _ in sc.SURFACES:
             o.cap(p, label)
@@ -792,6 +803,8 @@ class SceneBuilder:
                     self._slider(p, dim, what, lambda dim=dim: room[dim], put(dim),
                                  *sc.ROOM_LIMITS[dim], 0.25)
             self._surface(key)
+            if key == "floor":
+                self._floor_shape()
         o.label(p, "Write what the surface is - \"polished concrete with worn yellow "
                 "safety lines\", \"whitewashed brick\" - and Make: the Image Studio "
                 "makes a flat, repeating picture of it with the model chosen below, and "
@@ -831,6 +844,204 @@ class SceneBuilder:
             side="top", fill="x", pady=(o.px(2), o.px(2)))
         self._slider(p, key + "_size", "Pattern size (m)", lambda: face["size"],
                      lambda x: face.__setitem__("size", x), 0.25, 10, 0.25)
+
+    # ---------------------------------------------------------- floor shape
+    # The floor from above: the 4 x 4 dots (`room["grid"]`) over the room's
+    # width x depth, each dragged up or down, the floor shaded by height
+    # under them, front (where the camera starts) at the bottom. The camera
+    # and what stands on the floor are marked, so the view can be read.
+    SHAPE_SIDE, SHAPE_PAD = 300, 18        # px, before scaling
+    SHAPE_HIT = 11                          # px from a dot that grabs it
+    SHAPE_SNAP = 0.05                       # m a dot moves in
+    SHAPE_PX_PER_M = 40                     # px dragged for a metre, before scaling
+    SHAPE_CELLS = 18                        # the shading's cells each way
+    SHAPE_COLOURS = ((-2.0, (47, 75, 102)), (0.0, sc.FLOOR), (2.0, (217, 201, 163)),
+                     (4.0, (246, 234, 208)))
+
+    def _floor_shape(self):
+        o, p, room = self.owner, self.panel, self.scene["room"]
+        o.cap(p, "Floor shape")
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(0, o.px(4)))
+        o.choice(row, [(k, label) for k, label, _ in sc.FLOOR_PRESETS], "Shape like…",
+                 self.floor_preset).pack(side="left")
+        o.button(row, "Flatten", lambda: self.floor_preset("flat"), kind="ghost").pack(
+            side="left", padx=(o.px(4), 0))
+        side = o.px(self.SHAPE_SIDE)
+        c = tk.Canvas(p, width=side, height=side, highlightthickness=0, bd=0,
+                      cursor="sb_v_double_arrow")
+        o.skin(c, bg="card")
+        c.pack(side="top", anchor="w")
+        c.bind("<ButtonPress-1>", self._shape_press)
+        c.bind("<B1-Motion>", self._shape_motion)
+        c.bind("<ButtonRelease-1>", self._shape_release)
+        c.bind("<Button-3>", self._shape_reset)
+        self.shape_canvas, self.shape_drag = c, None
+        if room["walls"]:
+            o.label(p, "The shape spans the room's floor, inside the walls.", "faint",
+                    self.host.f_small).pack(side="top", anchor="w")
+        else:
+            for dim, what in (("width", "Area width (m)"), ("depth", "Area depth (m)")):
+                self._slider(p, "area_" + dim, what, lambda dim=dim: room[dim],
+                             lambda x, dim=dim: self._room_size(dim, x),
+                             *sc.ROOM_LIMITS[dim], 0.25)
+        o.label(p, "Drag a dot up to raise the floor round it, down to lower it; "
+                "right-click one to put it back to 0. Each dot pulls a wide, smooth area, "
+                "not one point. Front, at the bottom, is the side the camera starts on. "
+                "Everything on the floor stays standing on it.", "faint",
+                self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
+        self._draw_shape()
+
+    def _room_size(self, dim, x):
+        """The room's width or depth: the floor's shape stretches with it,
+        and what stands on the floor stays on it."""
+        sc.shape_floor(self.scene, **{dim: x})
+
+    def _shape_frame(self):
+        """-> (to canvas, the dot's canvas point): the shaped area fitted
+        in the square, left to right and back (top) to front (bottom)."""
+        room, o = self.scene["room"], self.owner
+        w, d, side = room["width"], room["depth"], o.px(self.SHAPE_SIDE)
+        k = (side - 2 * o.px(self.SHAPE_PAD)) / max(w, d)
+        x0, y0 = (side - w * k) / 2, (side - d * k) / 2
+        xy = lambda x, z: (x0 + (x + w / 2) * k, y0 + (z + d / 2) * k)  # noqa: E731
+        dot_xy = lambda r, c: xy(-w / 2 + w * c / (sc.GRID - 1),  # noqa: E731
+                                 -d / 2 + d * r / (sc.GRID - 1))
+        return xy, dot_xy
+
+    def _shape_grid(self):
+        """The dots' heights, rows back to front: a flat floor's are 0."""
+        grid = self.scene["room"].get("grid") or []
+        return [list(r) for r in grid] or [[0.0] * sc.GRID for _ in range(sc.GRID)]
+
+    def _height_colour(self, h):
+        stops = self.SHAPE_COLOURS
+        if h <= stops[0][0]:
+            return rgb_hex(stops[0][1])
+        for (ha, ca), (hb, cb) in zip(stops, stops[1:]):
+            if h <= hb:
+                t = (h - ha) / (hb - ha)
+                return rgb_hex(tuple(int(round(u + (v - u) * t)) for u, v in zip(ca, cb)))
+        return rgb_hex(stops[-1][1])
+
+    def _draw_shape(self):
+        c = self.shape_canvas
+        if c is None:
+            return
+        try:
+            c.delete("all")
+        except tk.TclError:
+            self.shape_canvas = None
+            return
+        o, C, small = self.owner, self.host.C, self.host.f_small
+        room = self.scene["room"]
+        side = o.px(self.SHAPE_SIDE)
+        xy, dot_xy = self._shape_frame()
+        g = sc.Ground(room)
+        w, d, n = room["width"], room["depth"], self.SHAPE_CELLS
+        for j in range(n):                            # the floor, shaded by height
+            for i in range(n):
+                xa, za = -w / 2 + w * i / n, -d / 2 + d * j / n
+                (ax, ay), (bx, by) = xy(xa, za), xy(xa + w / n, za + d / n)
+                c.create_rectangle(ax, ay, bx + 1, by + 1, outline="",
+                                   fill=self._height_colour(g.at(xa + w / n / 2,
+                                                                 za + d / n / 2)))
+        (ax, ay), (bx, by) = xy(-w / 2, -d / 2), xy(w / 2, d / 2)
+        c.create_rectangle(ax, ay, bx, by, outline=C["border"])
+        c.create_text(side / 2, ay - 2, text="back", anchor="s", fill=C["faint"], font=small)
+        c.create_text(side / 2, by + 2, text="front", anchor="n", fill=C["faint"],
+                      font=small)
+        for obj in self.scene["objects"]:             # what stands on it
+            x, y = xy(obj["position"][0], obj["position"][2])
+            if 0 <= x <= side and 0 <= y <= side:
+                chosen = obj["id"] == self.sel
+                c.create_rectangle(x - 3, y - 3, x + 3, y + 3, outline=C["card"],
+                                   fill=C["accent"] if chosen else C["text"])
+        grid, r = self._shape_grid(), o.px(6)
+        held = self.shape_drag and (self.shape_drag["r"], self.shape_drag["c"])
+        for row in range(sc.GRID):
+            for col in range(sc.GRID):
+                x, y = dot_xy(row, col)
+                big = r + 2 if held == (row, col) else r
+                c.create_oval(x - big, y - big, x + big, y + big, fill=C["accent"],
+                              outline=C["card"], width=2)
+                v = grid[row][col]
+                if v:
+                    c.create_text(x + r + 2, y - r, text="%+.2g" % v, anchor="sw",
+                                  fill=C["text"], font=small)
+        cam = sc.Camera(self.scene["camera"], 1, 1)   # last, on top: the camera, looking
+        x, y = xy(cam.eye[0], cam.eye[2])
+        x, y = max(6, min(side - 6, x)), max(6, min(side - 6, y))
+        f = sc.norm((cam.f[0], 0.0, cam.f[2])) if abs(cam.f[1]) < 0.999 else (0.0, 0.0, -1.0)
+        s = o.px(8)
+        tip = (x + f[0] * s, y + f[2] * s)
+        wing = (-f[2] * s * 0.6, f[0] * s * 0.6)
+        c.create_polygon(tip[0], tip[1], x - f[0] * s * 0.5 + wing[0],
+                         y - f[2] * s * 0.5 + wing[1], x - f[0] * s * 0.5 - wing[0],
+                         y - f[2] * s * 0.5 - wing[1], fill=C["text"], outline=C["card"])
+
+    def _shape_hit(self, x, y):
+        """The (row, column) of the dot under (x, y) on the editor, or None."""
+        _, dot_xy = self._shape_frame()
+        best = None
+        for row in range(sc.GRID):
+            for col in range(sc.GRID):
+                dx, dy = dot_xy(row, col)
+                d = math.hypot(x - dx, y - dy)
+                if d <= self.owner.px(self.SHAPE_HIT) and (best is None or d < best[0]):
+                    best = (d, row, col)
+        return None if best is None else best[1:]
+
+    def _shape_press(self, ev):
+        hit = self._shape_hit(ev.x, ev.y)
+        if hit is None:
+            return
+        r, c = hit
+        self.shape_drag = {"r": r, "c": c, "y": ev.y, "grid": self._shape_grid()}
+        self.shape_drag["start"] = self.shape_drag["grid"][r][c]
+        self._draw_shape()
+
+    def _shape_motion(self, ev):
+        d = self.shape_drag
+        if not d:
+            return
+        lo, hi = sc.GRID_HEIGHT
+        v = d["start"] + (d["y"] - ev.y) / float(self.owner.px(self.SHAPE_PX_PER_M))
+        v = max(lo, min(hi, round(round(v / self.SHAPE_SNAP) * self.SHAPE_SNAP, 2)))
+        if d["grid"][d["r"]][d["c"]] != v:
+            d["grid"][d["r"]][d["c"]] = v
+            self._shape_set(d["grid"])
+
+    def _shape_release(self, _ev=None):
+        if self.shape_drag:
+            self.shape_drag = None
+            self._draw_shape()
+            self.remember()
+
+    def _shape_reset(self, ev):
+        hit = self._shape_hit(ev.x, ev.y)
+        if hit is None:
+            return
+        grid = self._shape_grid()
+        grid[hit[0]][hit[1]] = 0.0
+        self._shape_set(grid)
+        self.remember()
+
+    def floor_preset(self, key):
+        self._shape_set(sc.FLOOR_PRESET[key])
+        self.remember()
+        label = dict((k, v) for k, v, _ in sc.FLOOR_PRESETS)[key]
+        self.status("The floor is flat again." if key == "flat" else
+                    "Floor: %s. Drag the dots to change it." % label.lower())
+
+    def _shape_set(self, grid):
+        """The floor takes these heights, and everything on it stays on it."""
+        before = self.scene["room"].get("grid") or []
+        sc.shape_floor(self.scene, grid)
+        if self.scene["room"]["grid"] != before:
+            self.changed()                # redraws the view, this one with it
+        else:
+            self._draw_shape()
 
     def _inspect_object(self, obj):
         o, p = self.owner, self.panel
@@ -901,11 +1112,21 @@ class SceneBuilder:
             def write(x):
                 vec[i] = x
             return write
-        self._slider(p, "x", "Left / right (m)", lambda: pos[0], at(pos, 0),
+        room = self.scene["room"]
+
+        def along(i):                 # on a shaped floor, it rides it
+            def write(x):
+                lift = sc.above_floor(room, obj)
+                pos[i] = x
+                sc.stand(room, obj, lift)
+            return write
+        self._slider(p, "x", "Left / right (m)", lambda: pos[0], along(0),
                      -REACH, REACH, 0.05)
-        self._slider(p, "z", "Back / front (m)", lambda: pos[2], at(pos, 2),
+        self._slider(p, "z", "Back / front (m)", lambda: pos[2], along(2),
                      -REACH, REACH, 0.05)
-        self._slider(p, "y", "Floor height (m)", lambda: pos[1], at(pos, 1), 0, 3, 0.05)
+        self._slider(p, "y", "Above the floor (m)",
+                     lambda: round(sc.above_floor(room, obj), 3),
+                     lambda x: sc.stand(room, obj, x), 0, 3, 0.05)
         self._slider(p, "yaw", "Turn", lambda: rot[0], at(rot, 0), -180, 180)
         if a["kind"] == "prop":
             self._slider(p, "pitch", "Tip forward", lambda: rot[1], at(rot, 1), -90, 90)
@@ -1612,6 +1833,7 @@ class SceneBuilder:
                       text="Frame %d x %d · %dmm" % (w, h, round(self.scene["camera"]["lens"])))
         if self.ring and self.obj(self.ring["oid"]) is not None:
             self._draw_ring()
+        self._draw_shape()
 
     def _backdrop_key(self, w, h, k, room_polys=None):
         """-> (the view and the room's pictures, the shadows on them)."""
@@ -1797,7 +2019,7 @@ class SceneBuilder:
                 depth = min(p.depth for p in under)
                 point = sc.add(cam.eye, sc.mul(ray, depth / max(1e-6, sc.dot(ray, cam.f))))
         if point is None:
-            point = cam.on_floor(fx, fy)
+            point = sc.floor_point(cam, self.scene["room"], fx, fy)
             if point is None or sc.dot(sc.sub(point, cam.eye), sc.sub(point, cam.eye)) > 900:
                 point = sc.add(cam.eye, sc.mul(ray, 30.0))
         obj["look_at"] = [round(v, 3) for v in point]
@@ -1840,9 +2062,10 @@ class SceneBuilder:
             cam = self.camera()
             metres = max(0.2, sc.dot(sc.sub(d["mid"], cam.eye), cam.f)) / (
                 cam.k * self.frame_rect[4])                  # per canvas pixel, there
+            room = self.scene["room"]
+            lift = sc.above_floor(room, start)
             if d["shift"] or ev.state & 0x0001:
-                obj["position"][1] = round(max(0.0, min(3.0, start["position"][1]
-                                                        - dy * metres)), 3)
+                sc.stand(room, obj, max(0.0, min(3.0, lift - dy * metres)))
             else:
                 fx, fy = self.to_frame(ev.x, ev.y)
                 now = cam.on_floor(fx, fy, d["mid"][1]) if d["grab"] else None
@@ -1856,6 +2079,7 @@ class SceneBuilder:
                 for i, j in ((0, 0), (2, 1)):
                     obj["position"][i] = round(max(-REACH, min(REACH, start["position"][i]
                                                                + step[j])), 3)
+                sc.stand(room, obj, lift)
         elif d["kind"] == "rotate":
             yaw = start["rotation"][0] + dx * 0.6
             obj["rotation"][0] = round((yaw + 180) % 360 - 180, 1)
