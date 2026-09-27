@@ -15,6 +15,7 @@ payload) events through the window's pump and land in `handle()`.
 import colorsys
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -868,11 +869,11 @@ class ImageStudio:
         self.say("Deleted preset %s; its LoRAs are still in the rows." % rec["name"],
                  "muted")
 
-    def _ask_name(self, title, label, value, then):
+    def _ask_name(self, title, label, value, then, parent=None, ok_text="Save"):
         """A small window asking for a name; `then(name)` on Save or Return."""
-        top = tk.Toplevel(self.host)
+        top = tk.Toplevel(parent or self.host)
         top.title(title)
-        top.transient(self.host)
+        top.transient(parent or self.host)
         self.skin(top, bg="bg")
         self.label(top, label, "text").pack(side="top", anchor="w", padx=self.px(12),
                                             pady=(self.px(10), self.px(4)))
@@ -887,7 +888,7 @@ class ImageStudio:
             if name:
                 top.destroy()
                 then(name)
-        self.button(row, "Save", ok, kind="accent").pack(side="right")
+        self.button(row, ok_text, ok, kind="accent").pack(side="right")
         self.button(row, "Cancel", top.destroy, kind="ghost").pack(
             side="right", padx=(0, self.px(6)))
         e.bind("<Return>", ok)
@@ -895,6 +896,39 @@ class ImageStudio:
         e.focus_set()
         top.var, top.ok = var, ok       # for the tests
         return top
+
+    def from_link(self, parent, what, owner, then, status):
+        """A picture of `what` from a link instead of a file: ask for the link
+        (the clipboard's, when it holds one), download it off the UI thread
+        into references/<owner> (`Library.keep_link`), then `then(path)` on
+        the UI thread while `parent` is still open. `status(text, role)` says
+        it is downloading, and why when nothing came."""
+        def got(url):
+            status("Downloading the picture of the %s%s" % (what, ELLIPSIS))
+
+            def work():
+                try:
+                    path = self.studio.lib.keep_link(url, owner)
+                except (ig.LinkError, OSError) as e:
+                    msg = "No picture from that link: %s" % e
+                    self._post("call", lambda: parent.winfo_exists() and status(msg, "err"))
+                    return
+
+                def done():
+                    if parent.winfo_exists():
+                        status("Downloaded the picture of the %s." % what, "ok")
+                        then(path)
+                self._post("call", done)
+            self.host._spawn(self.s.event_id, work)
+        try:
+            clip = parent.clipboard_get().strip()
+        except tk.TclError:
+            clip = ""
+        looks = ("\n" not in clip and len(clip) < 8192 and
+                 re.match(r"(?i)(https?://|data:image/)\S+$", clip))
+        return self._ask_name("A picture from a link", "Link to a picture of the %s "
+                              "(or to a page that shows it)" % what,
+                              clip if looks else "", got, parent=parent, ok_text="Download")
 
     def _build_style_tiles(self, styles):
         """The styles as a grid of pictures: each one the same photo in that
@@ -1146,14 +1180,14 @@ class ImageStudio:
             items = ([ig.HAIR_ITEM] if section == "Hair" else
                      ig.items_worn({k: self.text[k].get() for k in keys}))
             self.item_rows(self.look_box, items, self.item_refs, self._choose_item,
-                           self._set_item)
+                           self._set_item, link=self._link_item)
 
     def item_rows(self, p, items, refs, choose, drop, title="ITEM PICTURES",
-                  empty="Choose an item above to give it a picture."):
-        """A row per item worn - its picture, name and file, Picture… and ×:
-        what the glasses or the necklace actually look like. The form's look
-        tabs and the creator's both show these, and the creator's Tags tab
-        every one it has; Generate draws from them."""
+                  empty="Choose an item above to give it a picture.", link=None):
+        """A row per item worn - its picture, name and file, Picture…, Link…
+        and ×: what the glasses or the necklace actually look like. The form's
+        look tabs and the creator's both show these, and the creator's Tags
+        tab every one it has; Generate draws from them."""
         o, host = self, self.host
         o.label(p, title, "faint", host.f_small).pack(
             side="top", fill="x", pady=(o.px(12), o.px(2)))
@@ -1174,8 +1208,16 @@ class ImageStudio:
             if path:
                 o.button(row, "×", lambda i=item: drop(i, None), kind="ghost").pack(
                     side="right")
+            if link is not None:
+                o.button(row, "Link…", lambda i=item: link(i)).pack(
+                    side="right", padx=(o.px(4), 0))
             o.button(row, "Picture…", lambda i=item: choose(i)).pack(
                 side="right", padx=(o.px(4), 0))
+
+    def _link_item(self, item):
+        rec = self.studio.lib.get("characters", self.settings["character"])
+        return self.from_link(self.host, item, (rec["name"] if rec else "form") + " items",
+                              lambda path: self._set_item(item, path), self.say)
 
     def _choose_item(self, item):
         path = filedialog.askopenfilename(parent=self.host, title="A picture of the " + item,
@@ -2677,6 +2719,9 @@ class RecordEditor:
                 if kind == "path":
                     o.button(row, "Choose…", lambda v=var: self._choose(v)).pack(
                         side="right", padx=(o.px(6), 0))
+                    if self.kind == "identities":
+                        o.button(row, "Link…", lambda v=var: self._link_path(v)).pack(
+                            side="right", padx=(o.px(6), 0))
                 e = host._entry(row, var)
                 e.master.pack(side="left", fill="x", expand=True)
                 self.widgets[key] = (kind, var)
@@ -2727,6 +2772,9 @@ class RecordEditor:
                 row.pack(side="top", fill="x", pady=(o.px(4), 0))
                 o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
                     side="left")
+                if self.kind == "identities":
+                    o.button(row, "Add from link…", lambda p=pics: self._add_link(p)).pack(
+                        side="left", padx=(o.px(4), 0))
                 o.button(row, "Remove", lambda p=pics: self._remove_paths(p),
                          kind="ghost").pack(side="left", padx=(o.px(4), 0))
                 self.widgets[key] = ("paths", pics)
@@ -2821,6 +2869,25 @@ class RecordEditor:
                 continue
             pics["paths"].append(kept)
         self._draw_paths(pics)
+
+    def _add_link(self, pics):
+        """A photo of the person from a link, added to the list when it has
+        come, as `_add_paths` adds a file."""
+        rec = self.records[self.current]
+
+        def then(path):
+            if not pics["grid"].winfo_exists():     # another record's form now
+                return
+            if path not in pics["paths"]:
+                pics["paths"].append(path)
+            self._draw_paths(pics)
+        return self.owner.from_link(self.win, "person", rec.get("name") or "person", then,
+                                    self.status)
+
+    def _link_path(self, var):
+        rec = self.records[self.current]
+        return self.owner.from_link(self.win, "person", rec.get("name") or "person",
+                                    var.set, self.status)
 
     @staticmethod
     def _parse_kv(text):
@@ -3516,7 +3583,8 @@ class CharacterCreator:
         """A picture for each item this section has the character wearing.
         Hair has one picture of its own (`items` = ["hair"])."""
         items = items or ig.items_worn({k: self.vars[k].get() for k in keys})
-        self.owner.item_rows(p, items, self.item_refs, self._choose_item, self._set_item)
+        self.owner.item_rows(p, items, self.item_refs, self._choose_item, self._set_item,
+                             link=self._link_item)
 
     def _tags(self, p):
         """Every tag the character has, and a row to make one: a word and the
@@ -3535,6 +3603,8 @@ class CharacterCreator:
         e.bind("<Return>", lambda ev: self._add_tag())
         o.button(row, "Upload picture…", self._add_tag, kind="accent").pack(
             side="left", padx=(o.px(6), 0))
+        o.button(row, "From link…", self._add_tag_link).pack(side="left",
+                                                            padx=(o.px(4), 0))
         shared = self._library_tags()
         if shared:
             row = o.frame(p)
@@ -3545,22 +3615,37 @@ class CharacterCreator:
                      lambda i: self._take_tag(*shared[i][:2])).pack(side="left")
         o.item_rows(p, sorted(self.item_refs, key=str.lower), self.item_refs,
                     self._choose_item, self._set_item, title="TAGS",
-                    empty="No tags yet. Name one above and upload its picture.")
+                    empty="No tags yet. Name one above and upload its picture.",
+                    link=self._link_item)
 
     def _tag_key(self, name):
         """The key a tag is kept under: the one it already has, in any case."""
         return next((k for k in self.item_refs if k.lower() == name.lower()), name)
 
-    def _add_tag(self):
+    def _new_tag_name(self):
         name = " ".join(self.tag_name.get().replace(",", " ").split())
         if not name:
             self.status("Name the tag first: the word you will say, like glasses.", "warn")
-            return
-        self._choose_item(self._tag_key(name))
+        return name
+
+    def _tagged(self, name):
         if self._tag_key(name) in self.item_refs:
             self.tag_name.set("")
             self.status("Tagged %s. Say it in the scene and Generate uses the picture."
                         % name, "ok")
+
+    def _add_tag(self):
+        name = self._new_tag_name()
+        if name:
+            self._choose_item(self._tag_key(name))
+            self._tagged(name)
+
+    def _add_tag_link(self):
+        """A tag whose picture is on the web: the word, then its link. The
+        tag is made only once the picture has come."""
+        name = self._new_tag_name()
+        if name:
+            return self._link_item(self._tag_key(name), lambda: self._tagged(name))
 
     def _library_tags(self):
         """[(tag, picture, character)] the other characters in the library
@@ -3590,6 +3675,19 @@ class CharacterCreator:
                                                      ("All files", "*.*")])
         if path:
             self._set_item(item, path)
+
+    def _link_item(self, item, after=None):
+        """A picture for `item` from a link (`ImageStudio.from_link`)."""
+        at = self.current
+
+        def then(path):
+            if self.current != at:          # another character since: not theirs
+                return
+            self._set_item(item, path)
+            if after:
+                after()
+        return self.owner.from_link(self.win, item, (self.name.get() or "character")
+                                    + " items", then, self.status)
 
     def _set_item(self, item, path):
         if path:
