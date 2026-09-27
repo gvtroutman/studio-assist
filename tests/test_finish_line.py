@@ -113,30 +113,39 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(len(listed), 1)
         self.assertNotIn('finish', listed[0])
 
-    def finish_job(self, glasses):
-        """Generate with a face profile on a ComfyUI with SAM3, whose finder
-        after the swap sees one face and `glasses` [(x, y, w, h)]."""
-        self.profile()
+    def finish_job(self, glasses, hands=(), profile=True, tone=False, **settings):
+        """Generate (with a face profile, unless `profile` is False) on a
+        ComfyUI with SAM3, whose finder at the end sees one face, `glasses`
+        and `hands` [(x, y, w, h)]; `tone`, it has the tone-match node."""
+        if profile:
+            self.profile()
 
         class FinishClient(FaceClient):
+            def node_types(self):
+                return set(FaceClient.NODES) | ({ig.TONE_NODE} if tone else set())
+
             def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
                 graph = self.graphs[int(pid[3:]) - 1]
-                if "p0d" in graph:            # the finder after the swap
-                    return {"status": {"completed": True}, "outputs": {
-                        "7": {"text": ["1024"]}, "8": {"text": ["1024"]},
-                        "p0v": {"text": [json.dumps([[
-                            {"x": 450, "y": 250, "width": 80, "height": 90}]])]},
-                        "p1v": {"text": [json.dumps([[
+                if "p0d" in graph:            # the finder at the end
+                    said = {"face:8": [(450, 250, 80, 90)], "glasses:4": glasses,
+                            "hand:8": hands}
+                    outputs = {"7": {"text": ["1024"]}, "8": {"text": ["1024"]}}
+                    for k in (k for k in graph if k.endswith("t") and k.startswith("p")):
+                        outputs[k[:-1] + "v"] = {"text": [json.dumps([[
                             {"x": x, "y": y, "width": w, "height": h}
-                            for x, y, w, h in glasses]])]}}}
+                            for x, y, w, h in said[graph[k]["inputs"]["text"]]]])]}
+                    return {"status": {"completed": True}, "outputs": outputs}
                 return super().listen_for_progress(pid, on_event, stop, timeout)
         self.studio.client_factory = FinishClient
         self.studio.clients = {}
         order = []
+        s = dict(self.settings(), **settings)
+        if not profile:
+            s["identities"] = []
         with patch.object(ff, 'available', return_value=True), \
                 patch.object(ff, 'swap', side_effect=lambda *a, **k: (
                     order.append('swap') or (PNG, {'outside_mask_changed_pixels': 0}))):
-            jobs = self.studio.submit(self.settings())
+            jobs = self.studio.submit(s)
             settle(jobs)
         client = FakeClient.instances[-1]
         return jobs[0], client, order
@@ -173,6 +182,56 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertIn("p0d", client.graphs[-2])
         self.assertEqual(client.graphs[-1]["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
         self.assertIn("SAM3 found no glasses on the swapped face.", job.record["notes"])
+        self.assertIn("SAM3 found no hands, so no hands pass was made.", job.record["notes"])
+
+    def test_the_hands_are_redrawn_after_the_eyes_and_before_the_glasses(self):
+        job, client, _ = self.finish_job([(460, 272, 60, 22)],
+                                         hands=[(200, 600, 70, 80), (700, 620, 60, 70)])
+        self.assertEqual(job.status, 'complete', job.detail)
+        find, eyes, hands, glasses = client.graphs[-4:]
+        self.assertEqual([find["p%dt" % i]["inputs"]["text"] for i in range(3)],
+                         ig.FINISH_FIND + [ig.HAND_FIND])
+        self.assertEqual(eyes["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
+        # Both hands in one run, each its own crop, only SAM3's hand in it redrawn.
+        self.assertEqual([hands["fc%d_s0" % i]["inputs"]["text"] for i in (1, 2)],
+                         ["hand", "hand"])
+        self.assertNotIn("fc3_1", hands)
+        self.assertEqual(hands["fc1_4"]["inputs"]["denoise"], ig.HAND_DENOISE)
+        self.assertIn("four fingers and a thumb",
+                      hands[hands["fc1_4"]["inputs"]["positive"][0]]["inputs"]["text"])
+        self.assertEqual(hands["fi"]["inputs"]["image"], "ImageStudio/faces_00001_.png [output]")
+        self.assertNotIn("fc1_t", hands)            # no tone node on this ComfyUI
+        self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
+        self.assertIn("Hands pass: 2 hands redrawn, denoise %s." % ig.HAND_DENOISE,
+                      job.record["notes"])
+
+    def test_a_picture_without_a_face_swap_still_gets_the_hands_pass(self):
+        job, client, order = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)],
+                                             profile=False, tone=True)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(order, [])
+        find, hands = client.graphs[-2:]
+        # Only the hands are looked for: no eyes or glasses without a swap.
+        self.assertEqual(find["p0t"]["inputs"]["text"], ig.HAND_FIND)
+        self.assertNotIn("p1t", find)
+        self.assertEqual(hands["fc1_s0"]["inputs"]["text"], "hand")
+        self.assertEqual(hands["fc1_t"]["inputs"]["amount"], ig.FIX_TONE)   # keeps the grade
+        self.assertIn("Hands pass: 1 hand redrawn, denoise %s." % ig.HAND_DENOISE,
+                      job.record["notes"])
+
+    def test_the_hands_pass_can_be_turned_off(self):
+        job, client, _ = self.finish_job([], hands=[(200, 600, 70, 80)], profile=False,
+                                         hand_pass=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertFalse(any("p0d" in g for g in client.graphs))
+        self.assertFalse(any("hand" in n.lower() for n in job.record["notes"]),
+                         job.record["notes"])
+        # With a swap, the eyes and glasses are still done, and no hands.
+        job, client, _ = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)],
+                                         hand_pass=False)
+        find, eyes, glasses = client.graphs[-3:]
+        self.assertNotIn("p2t", find)
+        self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
 
     def test_without_sam3_the_swap_is_kept_as_it_is(self):
         self.profile()
@@ -182,7 +241,7 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
             settle(jobs)
         self.assertEqual(jobs[0].status, 'complete', jobs[0].detail)
         self.assertEqual(len(FakeClient.instances[-1].graphs), 1)
-        self.assertTrue(any(n.startswith("No eye or glasses pass after the face swap")
+        self.assertTrue(any(n.startswith("No eye, hands or glasses pass after the face swap")
                             for n in jobs[0].record["notes"]))
 
     def test_face_only_fix_never_checks_comfyui(self):
