@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -85,6 +86,98 @@ class UpdateTest(unittest.TestCase):
         self.assertFalse(upd.update())
         self.assertEqual(self.read("a.txt"), "edited here\n")
         self.assertIn("local edits", self.logged())
+
+    def branch(self):
+        return subprocess.run(["git", "-C", self.pc, "branch", "--show-current"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def merged_branch(self):
+        """The PC on a feature branch that GitHub then merges into main and
+        moves past - the state that stopped updates."""
+        run(self.pc, "checkout", "-q", "-b", "feature")
+        commit(self.pc, "f.txt", "feature\n")
+        run(self.pc, "push", "-q", "-u", "origin", "feature")
+        run(self.dev, "pull", "-q", "origin", "feature")
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q", "origin", "main")
+
+    def test_even_a_merged_branch_is_never_switched_or_updated(self):
+        self.merged_branch()
+        st = upd.check()
+        self.assertIn("Switch to main when ready", st["problem"])
+        self.assertEqual(self.logged(), "")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.branch(), "feature")
+        self.assertEqual((self.read("a.txt"), self.read("f.txt")), ("one\n", "feature\n"))
+        self.assertIn("will not switch branches", self.logged())
+
+    def test_stays_on_a_branch_with_commits_main_lacks(self):
+        self.merged_branch()
+        commit(self.pc, "b.txt", "mine\n")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.branch(), "feature")
+        self.assertEqual(self.read("b.txt"), "mine\n")
+        self.assertIn("on feature", self.logged())
+
+    def test_stays_on_a_branch_with_local_edits(self):
+        self.merged_branch()
+        with open(os.path.join(self.pc, "f.txt"), "w") as f:
+            f.write("edited here\n")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.branch(), "feature")
+        self.assertEqual(self.read("f.txt"), "edited here\n")
+        self.assertIn("on feature", self.logged())
+
+    def test_detached_head_is_left_alone(self):
+        run(self.pc, "checkout", "--detach", "-q")
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.branch(), "")
+        self.assertEqual(self.read("a.txt"), "one\n")
+        self.assertIn("detached HEAD", self.logged())
+
+    def test_main_follows_remote_main_even_if_tracking_a_feature(self):
+        run(self.dev, "checkout", "-q", "-b", "feature")
+        commit(self.dev, "feature.txt", "not released\n")
+        run(self.dev, "push", "-q", "-u", "origin", "feature")
+        run(self.pc, "fetch", "-q")
+        run(self.pc, "branch", "--set-upstream-to=origin/feature", "main")
+        run(self.dev, "checkout", "-q", "main")
+        commit(self.dev, "a.txt", "released\n")
+        run(self.dev, "push", "-q")
+        self.assertTrue(upd.update())
+        self.assertEqual(self.read("a.txt"), "released\n")
+        self.assertFalse(os.path.exists(os.path.join(self.pc, "feature.txt")))
+        _, upstream = upd.git(GIT, "rev-parse", "--abbrev-ref", "@{upstream}")
+        self.assertEqual(upstream, "origin/feature")
+
+    def test_main_without_tracking_can_use_the_only_named_remote(self):
+        run(self.pc, "remote", "rename", "origin", "studio")
+        run(self.pc, "branch", "--unset-upstream")
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q")
+        self.assertTrue(upd.update())
+        self.assertIn("studio/main", self.logged())
+
+    def test_missing_remote_main_is_reported(self):
+        run(self.dev, "push", "-q", "origin", "main:released")
+        origin = os.path.join(self.dir, "origin.git")
+        run(origin, "symbolic-ref", "HEAD", "refs/heads/released")
+        run(self.dev, "push", "-q", "origin", "--delete", "main")
+        self.assertIn("failed", upd.check()["problem"])
+        self.assertFalse(upd.update())
+        self.assertEqual(self.read("a.txt"), "one\n")
+
+    def test_switch_between_check_and_pull_is_refused(self):
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q")
+        st = upd.check()
+        run(self.pc, "checkout", "-q", "-b", "feature")
+        with mock.patch.object(upd, "check", return_value=st):
+            self.assertFalse(upd.pull()[0])
+        self.assertEqual(self.branch(), "feature")
+        self.assertEqual(self.read("a.txt"), "one\n")
 
 
     def test_check_lists_what_is_new_and_changes_nothing(self):

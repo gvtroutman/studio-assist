@@ -8,8 +8,9 @@
 
 GitHub cannot call into a workstation behind a router, so "pull whenever
 GitHub changes" is a poll: a scheduled task runs this under `pyw` (no console
-window flashing up every few minutes), it fetches, and it fast-forwards the
-checked-out branch when the remote is ahead.
+window flashing up every few minutes), it fetches, and it fast-forwards
+main when its remote is ahead. On another branch (or a detached HEAD),
+updates are paused with an explanation. The updater never switches branches.
 
 It only ever fast-forwards. Local commits the remote does not have, or an
 edit to a file the update would overwrite, make git refuse - and this leaves
@@ -32,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(HERE, "studio_update.log")
 LOG_MAX_BYTES = 256 * 1024
 TASK = "Studio Assist auto-update"
+BRANCH = "main"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # A scheduled task has no terminal to type a password into. Without these, a
@@ -87,26 +89,49 @@ def check(fetch=True):
     if code:
         st["problem"] = f"{HERE} is not a git checkout - nothing to update."
         return st
-    code, upstream = git(gitexe, "rev-parse", "--abbrev-ref", "@{upstream}")
-    if code:
-        st["problem"] = "The checked-out branch tracks no remote branch - nothing to pull from."
+    problem = branch_problem(gitexe)
+    if problem:
+        st["problem"] = problem
         return st
+    code, remote = git(gitexe, "config", "--get", f"branch.{BRANCH}.remote")
+    if code or not remote:
+        _, out = git(gitexe, "remote")
+        remotes = out.splitlines()
+        remote = "origin" if "origin" in remotes else remotes[0] if len(remotes) == 1 else ""
+    if not remote or remote == ".":
+        st["problem"] = f"No unambiguous remote for {BRANCH} - configure its remote to get updates."
+        return st
+    upstream = f"{remote}/{BRANCH}"
     st["upstream"] = upstream
     if fetch:
-        remote = upstream.split("/", 1)[0]
-        code, out = git(gitexe, "fetch", "--quiet", remote)
+        code, out = git(gitexe, "fetch", "--quiet", remote,
+                        f"+refs/heads/{BRANCH}:refs/remotes/{upstream}")
         if code:
             st["problem"] = f"Fetching from {remote} failed: {out}"
             return st
-    code, counts = git(gitexe, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+    code, target = git(gitexe, "rev-parse", "--verify", f"refs/remotes/{upstream}^{{commit}}")
+    if code:
+        st["problem"] = f"{remote} has no {BRANCH} branch - nothing to pull from."
+        return st
+    st["target"] = target
+    code, counts = git(gitexe, "rev-list", "--left-right", "--count", f"HEAD...{target}")
     if code:
         st["problem"] = f"Could not compare with {upstream}: {counts}"
         return st
     st["ahead"], st["behind"] = (int(n) for n in counts.split())
     if st["behind"]:
-        _, out = git(gitexe, "log", "--format=%s", "HEAD..@{upstream}")
+        _, out = git(gitexe, "log", "--format=%s", f"HEAD..{target}")
         st["commits"] = [line for line in out.splitlines() if line.strip()]
     return st
+
+
+def branch_problem(gitexe):
+    code, branch = git(gitexe, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if not code and branch == BRANCH:
+        return ""
+    here = branch if not code else "a detached HEAD"
+    return (f"Updates follow {BRANCH}, but this folder is on {here}. "
+            f"Switch to {BRANCH} when ready; the updater will not switch branches.")
 
 
 def pull():
@@ -120,8 +145,12 @@ def pull():
     if not behind:
         return False, f"Already up to date with {upstream}."
     gitexe = st["git"]
+    problem = branch_problem(gitexe)
+    if problem:
+        log(problem)
+        return False, problem
     code, before = git(gitexe, "rev-parse", "--short", "HEAD")
-    code, out = git(gitexe, "merge", "--ff-only", "@{upstream}")
+    code, out = git(gitexe, "merge", "--ff-only", st["target"])
     if code:
         why = (f"this PC has {ahead} commit(s) {upstream} does not" if ahead
                else "local edits would be overwritten")
