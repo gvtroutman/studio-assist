@@ -219,6 +219,17 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertIn("Hands pass: 1 hand redrawn, denoise %s." % ig.HAND_DENOISE,
                       job.record["notes"])
 
+    def test_each_pass_graph_is_kept_in_the_record_for_the_nodes_view(self):
+        import studio_comfy_view as comfy_view
+        job, client, _ = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)])
+        self.assertEqual(job.status, 'complete', job.detail)
+        eyes, hands, glasses = client.graphs[-3:]
+        self.assertEqual([p["label"] for p in job.record["passes"]],
+                         ["Eye pass", "Hands", "Glasses"])
+        self.assertEqual([p["graph"] for p in job.record["passes"]], [eyes, hands, glasses])
+        self.assertEqual([label for label, _g in comfy_view.graph_steps(job.record)],
+                         ["Picture", "Eye pass", "Hands", "Glasses"])
+
     def test_the_hands_pass_can_be_turned_off(self):
         job, client, _ = self.finish_job([], hands=[(200, 600, 70, 80)], profile=False,
                                          hand_pass=False)
