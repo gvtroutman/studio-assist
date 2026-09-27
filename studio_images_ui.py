@@ -22,7 +22,7 @@ import threading
 import time
 import webbrowser
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 import studio_catalog as catalog
 import studio_civitai as civitai
@@ -32,6 +32,7 @@ import studio_addons as addons
 import studio_comfy_view as comfy_view
 import studio_imagegen as ig
 import studio_facefusion as ff
+import studio_lora_train as lt
 import studio_pose as sp
 import studio_scene_ui
 
@@ -292,6 +293,7 @@ class ImageStudio:
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
+        self.lora_build = None        # the identity LoRA being trained (lt.Build)
         self._build(session.frame)
         for problem in self.studio.lib.problems:
             self.say(problem, "warn")
@@ -519,6 +521,8 @@ class ImageStudio:
         srow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
         self.button(srow, "Scene Builder…", self.build_scene).pack(
             side="top", fill="x")
+        self.button(srow, "Image library…", self.image_library).pack(
+            side="top", fill="x", pady=(self.px(4), 0))
         self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
         # One dropdown for the person, characters and profiles both
@@ -697,6 +701,9 @@ class ImageStudio:
                                        images=images, kind="quiet", anchor="w",
                                        font=self.host.f_title, pady=self.px(9))
         self.person_pill.pack(side="top", fill="x")
+        head_row = self.frame(self.person_box)
+        head_row.pack(side="top", fill="x")
+        self.button(head_row, "Choose head photo…", self.choose_head_photo).pack(side="left")
         self.identity_note = self.label(self.person_box, "", "muted", self.host.f_small)
         self.identity_note.pack(side="top", anchor="w", pady=(self.px(3), 0))
         self._show_identity()
@@ -764,6 +771,7 @@ class ImageStudio:
         self.settings["model"] = value
         self._refit_loras()
         self._build_presets()
+        self._show_identity()
         self._recheck()
 
     def _build_presets(self):
@@ -987,6 +995,39 @@ class ImageStudio:
         self._show_identity()
         self._recheck()
 
+    def choose_head_photo(self):
+        """Choose the source frame, then mark the head that must stay put."""
+        if getattr(self, "head_photo_busy", False):
+            return
+        path = filedialog.askopenfilename(parent=self.host, title="Choose a clear photo with one face",
+                   filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.gif *.bmp")])
+        if path:
+            self._import_head_photo(path)
+
+    def _import_head_photo(self, path):
+        self.head_photo_busy = True
+        self.say("Importing head photo…", "muted")
+        def work():
+            result = self.studio.lib.import_identity_photos([path], "head-photos")
+            source = next(iter(result["added"]), "")
+            if source and not source.lower().endswith(".png"):
+                try:
+                    size = ig.file_size_of(source)
+                    dest = source + ".png"
+                    if not size or not catalog.to_png([(source, dest)], side=max(size)):
+                        raise ValueError("Could not open this format. Save the photo as PNG and select it again.")
+                    source = dest
+                except (OSError, ValueError) as e:
+                    result["errors"].append(str(e))
+                    source = ""
+            def done():
+                self.head_photo_busy = False
+                if not source:
+                    return self.say("Could not import head photo: " + "; ".join(result["errors"]), "err")
+                FixWindow(self, source, self.collect(), around_head=True)
+            self._post("call", done)
+        self.host._spawn(self.s.event_id, work)
+
     def _pick_from_people(self, key):
         """The person dropdown: "c:<id>" a character (its look and its
         face), "i:<id>" a profile alone, "" no one."""
@@ -1018,8 +1059,13 @@ class ImageStudio:
         rec = self._character()
         names = rec["name"] if rec else ", ".join(i["name"] for i in chosen)
         self.person_pill.set(text=(names or "No one") + "  ▾")
-        count = sum(len(i["references"]) for i in chosen)
-        self.identity_note.config(text=("%d reference photos · face applied automatically" % count
+        count = sum(len(set(i["references"])) for i in chosen)
+        model = self.studio.lib.get("models", self.settings["model"])
+        action = ("WithAnyone uses the first photo" if model and model.get("workflow") == "withanyone"
+                  else "face applied automatically")
+        if model and model.get("workflow") == "withanyone" and any(i.get("pool_photos") for i in chosen):
+            action = "WithAnyone photo pooling enabled (experimental)"
+        self.identity_note.config(text=("%d reference photos · %s" % (count, action)
                                        if count else "Add photos in Image references." if chosen
                                        else "Choose a person for this picture."))
 
@@ -1266,6 +1312,8 @@ class ImageStudio:
             clear.pack(side="right")
             self.button(buttons, "Choose…", lambda k=kind, a=about: self._pick_ref(k, a),
                         kind="quiet").pack(side="left")
+            self.button(buttons, "Library…", lambda k=kind: self.image_library(k),
+                        kind="quiet").pack(side="left", padx=(self.px(4), 0))
             if kind == "pose":
                 self.button(buttons, "Draw pose…", self.edit_pose, kind="quiet").pack(
                     side="left", padx=(self.px(4), 0))
@@ -1279,6 +1327,22 @@ class ImageStudio:
             if kind == "pose":
                 self.pose = None      # a picture of its own replaces the drawn one
             self._set_ref(kind, path)
+
+    def image_library(self, kind="source"):
+        window = getattr(self, "_image_library", None)
+        if window is None or not window.win.winfo_exists():
+            window = self._image_library = ImageLibraryWindow(self, kind)
+        else:
+            window.role.set(dict((k, label) for k, label, _ in ig.REFERENCE_KINDS)[kind])
+            window.reload()
+            window.win.lift()
+        return window
+
+    def use_library_image(self, kind, path):
+        if kind == "pose":
+            self.pose = None
+        self._set_ref(kind, path)
+        self._show_section("References")
 
     def _clear_ref(self, kind):
         if kind == "pose":
@@ -1838,6 +1902,8 @@ class ImageStudio:
         if self._selected_steps()[0]:
             menu.add_command(label="Show nodes", command=self._show_nodes)
         menu.add_command(label="Show in folder", command=lambda: self._open_selected(True))
+        menu.add_command(label="Add to image library", command=lambda:
+                         self.image_library().import_paths([path]))
         menu.add_command(label="Copy path", command=lambda: (
             self.host.clipboard_clear(), self.host.clipboard_append(path)))
         menu.tk_popup(ev.x_root, ev.y_root)
@@ -2359,15 +2425,17 @@ class ImageStudio:
                                   for r in self.studio.lib.all("loras")]
         return RecordEditor(self, "identities", "Identities", [
             ("name", "Name", "text"),
-            ("references", "Reference photos — used to apply this person's face", "paths"),
+            ("description", "Identity description (used with the photos)", "long"),
+            ("references", "Reference photos — first photo is Primary", "paths"),
+            ("pool_photos", "Pool photos for WithAnyone (experimental)", "bool"),
             ("avatar", "Profile picture (optional; a generated picture is fine)", "path"),
-            ("face_swap", "Final face swap (needs FaceFusion on this PC)", "bool"),
+            ("face_swap", "Final FaceFusion swap (not used by WithAnyone)", "bool"),
             ("swap_strength", "Face swap strength (0.5 gentle, 1 strongest)", "number"),
             ("notes", "Notes", "long"),
             ("lora", "Identity LoRA", ("choice", loras)),
             ("trigger", "Trigger token", "text"),
             ("strength", "Default LoRA strength", "number"),
-            ("use_references", "Use the first photo as the face reference", "bool"),
+            ("use_references", "Use first photo as face reference (other models)", "bool"),
             ("reference_strength", "Face reference strength", "number"),
         ], template={"name": "New person", "strength": 0.85, "face_swap": True,
                       "swap_strength": 0.8},
@@ -2380,6 +2448,116 @@ class ImageStudio:
             return
         self._select_identity(editor.records[editor.current]["id"])
         editor.win.destroy()
+
+    # ------------------------------------------------------------ Build LoRA
+    def build_lora(self, editor):
+        """The person's saved photos -> their own FLUX LoRA
+        (`studio_lora_train`), trained by ai-toolkit on this PC's GPU in the
+        background. One build at a time; a second click offers to stop it.
+        When done, the file goes into this PC's LoRA folder, joins the
+        library, and becomes the person's Identity LoRA."""
+        run = self.lora_build
+        if run is not None:
+            n, total = run.step
+            if messagebox.askyesno("Build LoRA", "A LoRA for %s is being built (step %d of "
+                                   "%d). Stop it?" % (run.spec["person"], n, total),
+                                   parent=editor.win):
+                run.stop()
+            return
+        if editor.current is None:
+            return
+        w = editor.widgets.get("references")
+        count = len(lt.usable(w[1]["paths"])) if w else 0
+        if count < lt.MIN_PHOTOS:
+            return editor.status("A LoRA needs at least %d photos of the person; this "
+                                 "one has %d." % (lt.MIN_PHOTOS, count), "err")
+        problem = lt.problem()
+        if problem:
+            return editor.status(problem, "err")
+        folders = [b for b in self.studio.backends() if b.get("lora_dir")
+                   and os.path.isdir(b["lora_dir"])]
+        folders.sort(key=lambda b: not re.match(r"^https?://(127\.0\.0\.1|localhost)[:/]",
+                                                b.get("url", "")))
+        if not folders:
+            return editor.status("No backend has a LoRA folder on this PC.", "err")
+        if not editor._save():
+            return
+        ident = self.studio.lib.get("identities", editor.records[editor.current]["id"])
+        try:
+            spec = lt.plan(ident, folders[0]["lora_dir"])
+        except ValueError as e:
+            return editor.status(str(e), "err")
+        if not messagebox.askokcancel("Build LoRA", (
+                "Train a LoRA for %s from %d photos?\n\nIt takes about 1-2 hours and "
+                "uses the whole GPU: ComfyUI's models are unloaded first, and pictures "
+                "on %s should wait until it is done. Keep Studio Assist open; closing it "
+                "stops the training.\n\nWhen it finishes it becomes %s's Identity LoRA "
+                "(trigger word \"%s\"; FLUX models only).") % (
+                    spec["person"], len(spec["photos"]), folders[0]["name"],
+                    spec["person"], spec["trigger"]), parent=editor.win):
+            return
+        run = self.lora_build = lt.Build(spec)
+        backend = folders[0]
+        self.say("Building %s's LoRA: preparing %d photos" % (spec["person"],
+                                                              len(spec["photos"])) + ELLIPSIS)
+        editor.status("LoRA build started; progress shows under Generate.")
+
+        def progress(kind, value):
+            if kind == "step":
+                n, total = value
+                left = lt.eta(run.started, n, total) if run.started else ""
+                text = ("Building %s's LoRA: step %d of %d" % (spec["person"], n, total)
+                        + (" · " + left if left else ""))
+                self._post("said", (text, "muted"))
+
+        def finished(path, error):
+            self.lora_build = None
+            if error:
+                return self.say("LoRA for %s not built: %s" % (spec["person"], error),
+                                "muted" if run.stopped else "err")
+            self._attach_lora(spec, editor)
+            self.say("%s's LoRA is ready and set as their Identity LoRA (%s)."
+                     % (spec["person"], os.path.basename(path)), "ok")
+            self.refresh_backends()      # ComfyUI's LoRA list now has the file
+
+        def work():
+            try:
+                self.studio.client(backend).free()
+            except Exception:
+                pass                     # offline: nothing is holding the GPU
+            try:
+                path, error = run.run(progress), None
+            except (RuntimeError, OSError) as e:
+                path, error = None, str(e)
+            self._post("call", lambda: finished(path, error))
+        self.host._spawn(self.s.event_id, work)
+
+    def _attach_lora(self, spec, editor):
+        """A finished build into the library and onto its person - and onto
+        the open editor's copy of them, so its next Save keeps it."""
+        lib = self.studio.lib
+        rec, _ = lib.import_lora(lt.lora_record(spec))
+        lib.save("loras")
+        ident = lib.get("identities", spec["identity"])
+        if ident is not None:
+            ident["lora"], ident["trigger"] = rec["id"], spec["trigger"]
+            lib.save("identities")
+        if editor.win.winfo_exists():
+            choices = [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
+                                        for r in lib.all("loras")]
+            editor.fields = [(k, label, ("choice", choices) if k == "lora" else kind)
+                             for k, label, kind in editor.fields]
+            shown = (editor.current is not None and
+                     editor.records[editor.current].get("id") == spec["identity"])
+            if shown:
+                editor._store()
+            for r in editor.records:
+                if r.get("id") == spec["identity"]:
+                    r["lora"], r["trigger"] = rec["id"], spec["trigger"]
+            if shown:
+                editor._build_form()
+        self._saved("loras")
+        self._saved("identities")
 
     # ------------------------------------------------------- person cut-out
     def _pick_person(self, editor):
@@ -2629,6 +2807,163 @@ class ImageStudio:
         self.studio.close()
 
 
+class ImageLibraryWindow:
+    """Reusable pictures, with explicit roles in the existing generation plan."""
+
+    def __init__(self, owner, kind="source"):
+        self.owner, self.lib = owner, owner.studio.lib
+        self.busy = False
+        self.records = []
+        self.image = None
+        o = owner
+        self.win = win = tk.Toplevel(o.host)
+        win.title("Image library")
+        win.transient(o.host)
+        o.skin(win, bg="bg")
+        win.geometry("%dx%d" % (o.px(780), o.px(580)))
+        bar = o.frame(win)
+        bar.pack(fill="x", padx=o.px(12), pady=o.px(12))
+        o.button(bar, "Import images…", self.import_files).pack(side="left")
+        o.button(bar, "Remove from library", self.remove, kind="ghost").pack(side="right")
+        self.search = tk.StringVar(master=win)
+        entry = o.host._entry(bar, self.search)
+        entry.master.pack(side="left", fill="x", expand=True, padx=o.px(12))
+        self.search.trace_add("write", lambda *_: self.reload())
+        o.label(win, "Search by filename. Import several images at once; copies are kept in your library.",
+                "muted", o.host.f_small).pack(fill="x", padx=o.px(12))
+        body = o.frame(win)
+        body.pack(fill="both", expand=True, padx=o.px(12), pady=o.px(12))
+        left = o.frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        scroll = tk.Scrollbar(left)
+        scroll.pack(side="right", fill="y")
+        self.listbox = tk.Listbox(left, exportselection=False, bd=0, highlightthickness=0,
+                                 font=o.host.f_ui, yscrollcommand=scroll.set)
+        o.skin(self.listbox, bg="card", fg="text", selectbackground="sel", selectforeground="text")
+        self.listbox.pack(fill="both", expand=True)
+        scroll.config(command=self.listbox.yview)
+        self.listbox.bind("<<ListboxSelect>>", lambda _: self.preview())
+        right = o.frame(body)
+        right.pack(side="left", fill="both", padx=(o.px(12), 0))
+        self.picture = o.label(right, "Select an image", "muted", width=30)
+        self.picture.config(anchor="center")
+        self.picture.pack(fill="both", expand=True)
+        self.detail = o.label(right, "", "muted", o.host.f_small, wraplength=o.px(280))
+        self.detail.pack(fill="x", pady=o.px(8))
+        foot = o.frame(win)
+        foot.pack(fill="x", padx=o.px(12), pady=(0, o.px(12)))
+        o.label(foot, "Use as").pack(side="left")
+        labels = [label for _, label, _ in ig.REFERENCE_KINDS]
+        self.role = tk.StringVar(master=win, value=dict((k, l) for k, l, _ in ig.REFERENCE_KINDS)[kind])
+        menu = tk.OptionMenu(foot, self.role, *labels)
+        o.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
+        menu.pack(side="left", padx=o.px(8))
+        o.button(foot, "Use selected image", self.use, kind="accent").pack(side="right")
+        self.message = o.label(win, "", "muted", o.host.f_small, wraplength=o.px(730))
+        self.message.pack(fill="x", padx=o.px(12), pady=(0, o.px(12)))
+        self.reload()
+
+    def status(self, text, role="muted"):
+        self.message.config(text=text)
+        self.owner.skin(self.message, bg="bg", fg=role)
+
+    def selected(self):
+        sel = self.listbox.curselection()
+        return self.records[sel[0]] if sel else None
+
+    def reload(self, rid=None):
+        current = self.selected()
+        rid = rid or (current or {}).get("id")
+        query = self.search.get().strip().casefold()
+        self.records = [r for r in self.lib.all("images") if query in r["name"].casefold()]
+        self.listbox.delete(0, "end")
+        for r in self.records:
+            self.listbox.insert("end", r["name"] + ("" if os.path.isfile(r["path"]) else " (missing)"))
+        if self.records:
+            at = next((i for i, r in enumerate(self.records) if r["id"] == rid), 0)
+            self.listbox.selection_set(at)
+            self.listbox.see(at)
+        self.preview()
+
+    def preview(self):
+        rec = self.selected()
+        self.image = photo(rec["path"], self.owner.px(280), profile=True) if rec else None
+        self.picture.config(image=self.image or "", width=0 if self.image else 30,
+                            text="" if self.image else "Preview unavailable" if rec else "Import images to get started")
+        self.detail.config(text=rec["name"] if rec else "")
+
+    def import_files(self):
+        if self.busy:
+            return
+        paths = filedialog.askopenfilenames(parent=self.win, title="Import images into the library",
+                  filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.gif *.bmp")])
+        if paths:
+            self.import_paths(paths)
+
+    def import_paths(self, paths):
+        if self.busy:
+            return self.status("An import is already running.")
+        self.busy = True
+        self.status("Importing images…")
+        # Copy on a worker; publish records on Tk so simultaneous windows cannot
+        # overwrite an image list while another import is saving it.
+        def work():
+            kept, errors = [], []
+            for path in paths:
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    ext = ig.picture_ext(data)
+                    if not ext:
+                        raise ValueError("not a supported image")
+                    dest = self.lib.keep_bytes(data, ext, "image-library")
+                    kept.append((path, dest))
+                except (OSError, ValueError) as e:
+                    errors.append("%s: %s" % (os.path.basename(path), e))
+            if ff.PYTHON.is_file():
+                try:
+                    ff.prepare_previews([{"references": [dest for _, dest in kept]}])
+                except OSError:
+                    pass  # An unavailable thumbnail does not prevent using the image.
+            def done():
+                rid = None
+                for original, dest in kept:
+                    try:
+                        rec = self.lib.register_image(dest, os.path.basename(original))
+                        rid = rec["id"]
+                    except (OSError, ValueError) as e:
+                        errors.append("%s: %s" % (os.path.basename(original), e))
+                self.busy = False
+                if self.win.winfo_exists():
+                    self.search.set("")
+                    self.reload(rid)
+                    self.status("; ".join(errors) if errors else "Images saved. Select one and choose how to use it.",
+                                "err" if errors else "ok")
+            self.owner._post("call", done)
+        self.owner.host._spawn(self.owner.s.event_id, work)
+
+    def use(self):
+        rec = self.selected()
+        if rec is None:
+            return self.status("Select an image first.")
+        if not os.path.isfile(rec["path"]):
+            return self.status("This image is missing. Import it again before using it.", "err")
+        kind = next(k for k, label, _ in ig.REFERENCE_KINDS if label == self.role.get())
+        self.owner.use_library_image(kind, rec["path"])
+        self.status("Selected as %s. Check References, then Generate." % self.role.get(), "ok")
+
+    def remove(self):
+        rec = self.selected()
+        if rec is None or self.busy:
+            return
+        try:
+            self.lib.save_images([r for r in self.lib.all("images") if r["id"] != rec["id"]])
+        except (OSError, ValueError) as e:
+            return self.status("Could not save the library: %s" % e, "err")
+        self.reload()
+        self.status("Removed from the library. Existing references and saved generations keep their copy.")
+
+
 class RecordEditor:
     """One editor for every list the studio keeps: the records on the left,
     a form built from `fields` on the right. `fields` is (key, label, kind)
@@ -2767,7 +3102,7 @@ class RecordEditor:
                         tk.Label(parent, image=img, bd=0).pack(side="top", anchor="w",
                                                                   pady=o.px(4))
             elif kind == "long":
-                t = tk.Text(parent, height=3, wrap="word", bd=0, highlightthickness=0,
+                t = tk.Text(parent, height=8 if key == "description" else 3, wrap="word", bd=0, highlightthickness=0,
                             font=host.f_ui, padx=o.px(6), pady=o.px(4))
                 o.skin(t, bg="card", fg="text", insertbackground="accent")
                 t.insert("1.0", val or "")
@@ -2808,8 +3143,23 @@ class RecordEditor:
                 o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
                     side="left")
                 if self.kind == "identities":
+                    o.button(row, "Add folder…", lambda p=pics: self._add_folder(p)).pack(
+                        side="left", padx=(o.px(4), 0))
                     o.button(row, "Add from link…", lambda p=pics: self._add_link(p)).pack(
                         side="left", padx=(o.px(4), 0))
+                    actions = o.frame(parent)
+                    actions.pack(side="top", fill="x")
+                    o.button(actions, "Use as primary", lambda p=pics: self._primary_path(p)).pack(
+                        side="left")
+                    o.button(actions, "Build LoRA" + ELLIPSIS,
+                             lambda: self.owner.build_lora(self)).pack(
+                        side="left", padx=(o.px(4), 0))
+                    o.label(parent, "Use clear photos of the same person, one face per photo.\n"
+                            "Choose a clear front view as Primary. Enable pooling to let the "
+                            "other photos guide identity too. Build LoRA trains the "
+                            "person's own FLUX LoRA from %d or more photos." % lt.MIN_PHOTOS,
+                            "muted", host.f_small).pack(
+                                side="top", anchor="w")
                 o.button(row, "Remove", lambda p=pics: self._remove_paths(p),
                          kind="ghost").pack(side="left", padx=(o.px(4), 0))
                 self.widgets[key] = ("paths", pics)
@@ -2880,6 +3230,8 @@ class RecordEditor:
                                wraplength=side - o.px(8), width=12, height=6)
             o.skin(lbl, bg="card", fg="muted")
             lbl.pack()
+            if self.kind == "identities" and i == 0:
+                o.label(tile, "Primary", "accent", host.f_small).pack()
             for w in (tile, lbl):
                 w.bind("<Button-1>", lambda ev, i=i: self._toggle_path(pics, i))
 
@@ -2895,15 +3247,74 @@ class RecordEditor:
     def _add_paths(self, pics):
         paths = filedialog.askopenfilenames(parent=self.win, filetypes=[
             ("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
-        rec = self.records[self.current]
-        for p in paths:
-            try:
-                kept = self.owner.studio.lib.keep_reference(p, rec.get("name") or "person")
-            except OSError as e:
-                self.status("Could not copy %s: %s" % (p, e), "err")
-                continue
-            pics["paths"].append(kept)
+        self._import_paths(pics, paths)
+
+    def _primary_path(self, pics):
+        if len(pics["sel"]) != 1:
+            self.status("Select one photo to use as Primary.")
+            return
+        index = next(iter(pics["sel"]))
+        pics["paths"].insert(0, pics["paths"].pop(index))
+        pics["sel"] = {0}
         self._draw_paths(pics)
+
+    def _add_folder(self, pics):
+        folder = filedialog.askdirectory(parent=self.win, title="Photos of one person")
+        if folder:
+            self._import_paths(pics, folder=folder)
+
+    def _import_paths(self, pics, paths=(), folder=None):
+        if pics.get("importing") or (not paths and not folder):
+            return
+        rec = self.records[self.current]
+        owner = rec.get("name") or "person"
+        existing = list(pics["paths"])
+        pics["importing"] = True
+        self._imports = getattr(self, "_imports", 0) + 1
+        self.status("Importing reference photos" + ELLIPSIS)
+
+        def done(result):
+            pics["importing"] = False
+            self._imports -= 1
+            if not self.win.winfo_exists():
+                return
+            if not pics["grid"].winfo_exists():
+                if any(r is rec for r in self.records):
+                    refs = rec.setdefault("references", [])
+                    refs.extend(p for p in result["added"] if p not in refs)
+                    # The same record may have been opened again while copying.
+                    if self.current is not None and self.records[self.current] is rec:
+                        self._store()
+                        rec["references"] = list(dict.fromkeys(rec["references"] + refs))
+                        self._build_form()
+                    self.status("Import finished for %s: %d added, %d duplicates, %d unreadable."
+                                " Save to keep the changes." % (owner, len(result["added"]),
+                                result["duplicates"], len(result["errors"])))
+                return
+            for path in result["added"]:
+                if path not in pics["paths"]:
+                    pics["paths"].append(path)
+            self._draw_paths(pics)
+            message = "%d added · %d duplicates · %d unreadable" % (
+                len(result["added"]), result["duplicates"], len(result["errors"]))
+            if result["errors"]:
+                message += "\n" + "\n".join(result["errors"][:3])
+            self.status(message, "err" if result["errors"] else "muted")
+
+        def work():
+            try:
+                candidates = paths
+                if folder:
+                    with os.scandir(folder) as entries:
+                        candidates = sorted((e.path for e in entries if e.is_file()
+                            and os.path.splitext(e.name)[1].lower() in
+                            (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")),
+                            key=lambda p: (p.casefold(), p))
+                result = self.owner.studio.lib.import_identity_photos(candidates, owner, existing)
+            except OSError as exc:
+                result = {"added": [], "duplicates": 0, "errors": [str(exc)]}
+            self.owner._post("call", lambda: done(result))
+        self.owner.host._spawn(self.owner.s.event_id, work)
 
     def _add_link(self, pics):
         """A photo of the person from a link, added to the list when it has
@@ -3003,6 +3414,9 @@ class RecordEditor:
         self.status("Deleted - Save to keep it deleted.", "warn")
 
     def _save(self):
+        if getattr(self, "_imports", 0):
+            self.status("Wait for the photo import to finish before saving.")
+            return False
         self._store()
         try:
             self.owner.studio.lib.save(self.kind, self.records)
@@ -3040,13 +3454,16 @@ class FixWindow:
     MODES = [("redraw", "Redraw"), ("lock", "Lock (keep as is)")]
     FINDS = [("hand", "Find hands"), ("face", "Find face"), ("other", "Find accessories")]
 
-    def __init__(self, owner, path, settings):
+    def __init__(self, owner, path, settings, around_head=False):
         self.owner = o = owner
+        self.around_head = around_head
         host = owner.host
         self.path, self.settings = path, settings
         self.spots = []                   # [{"x", "y", "size"}] in the picture's pixels
         self.locks = []                   # the same, kept as they are
         self.target, self.strength, self.mode = "hand", "medium", "redraw"
+        if around_head:
+            self.target, self.strength, self.mode = "other", "strong", "lock"
         self.finding = False
         self.hover = None
         self.face_point = None
@@ -3059,14 +3476,15 @@ class FixWindow:
             self.w = self.h = 0
         self.size = max(ig.FIX_MIN, int(max(self.w, self.h) * 0.16))
         win = self.win = tk.Toplevel(host)
-        win.title("Fix a spot")
+        win.title("Generate around head" if around_head else "Fix a spot")
         win.transient(host)
         host._skin(win, bg="bg")
         win.geometry("%dx%d" % (host._px(860), host._px(820)))
 
         foot = o.frame(win)
         foot.pack(side="bottom", fill="x", padx=o.px(12), pady=(0, o.px(12)))
-        self.go = o.button(foot, "Redraw", self._redraw, kind="accent")
+        self.go = o.button(foot, "Generate around head" if around_head else "Redraw",
+                           self._redraw, kind="accent")
         self.go.pack(side="right")
         o.button(foot, "Clear", self._clear, kind="ghost").pack(side="right",
                                                                padx=(0, o.px(6)))
@@ -3084,6 +3502,8 @@ class FixWindow:
             p = o.button(row, text, lambda k=kind: self._find(k), bg="card")
             p.pack(side="left", padx=(0, o.px(4)))
             self.find_btns.append(p)
+        if around_head:
+            row.pack_forget()
         for key, items, label in (("mode", self.MODES, "A click"),
                                   ("target", self.TARGETS, "Redraw"),
                                   ("strength", self.STRENGTHS, "Change")):
@@ -3095,10 +3515,14 @@ class FixWindow:
                              kind="ghost")
                 p.pack(side="left", padx=(0, o.px(4)))
                 self.pills[(key, value)] = p
+            if around_head and key != "strength":
+                row.pack_forget()
         row = o.frame(opts)
         row.pack(side="top", fill="x")
         o.label(row, "Describe", "muted", width=10).pack(side="left")
         self.words = tk.StringVar()
+        if around_head:
+            self.words.set(settings.get("scene") or "")
         e = host._entry(row, self.words)
         e.master.pack(side="left", fill="x", expand=True)
         row = o.frame(opts)
@@ -3113,6 +3537,8 @@ class FixWindow:
         if not idents:
             o.label(row, "  No identities yet (Library > Identities).", "faint",
                     host.f_small).pack(side="left")
+        if around_head:
+            row.pack_forget()
 
         self.canvas = tk.Canvas(win, bd=0, highlightthickness=0, cursor="crosshair")
         host._skin(self.canvas, bg="card")
@@ -3175,6 +3601,12 @@ class FixWindow:
             return
 
         def square(sp, **kw):
+            if self.around_head:
+                r = ig.lock_regions(self.w, self.h, [sp])[0]
+                c.create_rectangle(self.ox + r["x"] * self.k, self.oy + r["y"] * self.k,
+                                   self.ox + (r["x"] + r["width"]) * self.k,
+                                   self.oy + (r["y"] + r["height"]) * self.k, **kw)
+                return
             half = sp["size"] * self.k / 2
             x, y = self.ox + sp["x"] * self.k, self.oy + sp["y"] * self.k
             c.create_rectangle(x - half, y - half, x + half, y + half, **kw)
@@ -3399,6 +3831,12 @@ class FixWindow:
 
     def _status(self, text=None, role="muted"):
         n = len(self.spots)
+        if text is None and self.around_head:
+            text = ("Click the head; scroll to cover the entire head and hair. "
+                    "Right-click removes a mark. Describe the new body and scene below."
+                    if not self.locks else
+                    "The marked square stays unchanged at this size and position. "
+                    "The surrounding image will be generated.")
         if text is None:
             text = ("Drag round each part to redraw (or click for a square), or Find. "
                     "Right-click removes one." if not n else
@@ -3415,7 +3853,9 @@ class FixWindow:
         self._status()
 
     def _redraw(self):
-        if not self.spots and not self.face:
+        if self.around_head and (not self.locks or not self.words.get().strip()):
+            return self._status("Mark the head to keep and describe the body and scene first.", "warn")
+        if not self.around_head and not self.spots and not self.face:
             return self._status("Click the part of the picture to redraw first, or "
                                 "choose whose face to swap in.", "warn")
         s = self.owner.studio.fix_base(self.settings)
@@ -3424,6 +3864,17 @@ class FixWindow:
             "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots],
             "locks": [dict(sp) for sp in self.locks], "face_swap": self.face,
             "face_point": self.face_point})
+        if self.around_head:
+            s.update(identities=[], character="", scene_faces={}, hand_pass=False)
+            s["fix"].update(around_head=True, tone=0)
+            model = self.owner.studio.lib.get("models", s.get("model"))
+            try:
+                wf = self.owner.studio.workflow_loader(model["workflow"]) if model else {}
+            except ig.TemplateError as e:
+                return self._status(str(e), "warn")
+            if not wf.get("face_detail"):
+                return self._status("Choose a redraw-capable model such as Z-Image HQ in the main form, "
+                                    "then reopen Choose head photo.", "warn")
         if ig.local_faces(s):
             problems = self.owner.studio.preview(s).errors
             if problems:

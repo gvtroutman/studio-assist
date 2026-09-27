@@ -1,7 +1,7 @@
 {
   "id": "withanyone",
   "label": "Family photo (WithAnyone)",
-  "about": "Generate one to four people from individual face photos. Scene Builder supplies face positions; poses, clothes and surroundings come from the words. No face redraw or photo paste follows this recipe.",
+  "about": "Generate one to four people using one clear library photo per person. Multi-photo blending is experimental and disabled by default after failing likeness review. Scene Builder supplies face positions; poses, clothes and surroundings come from the words. No face redraw or photo paste follows this recipe.",
   "families": ["flux1"],
   "multi_identity": {"sampler": "40", "max_people": 4},
   "defaults": {
