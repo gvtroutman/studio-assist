@@ -44,18 +44,16 @@ PROGRESS_CAP = 1800
 # here stays free for rendering. Same variable the bridge reads.
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://100.127.17.38:8188").rstrip("/")
 
-# OpenCode runs in a Docker container on this machine, never on its bare
-# filesystem. The port is published on loopback only; the workspace is the one
-# folder the container is given. studio_opencode_mcp.py reads the same two
-# variables in its own process - keep them agreeing.
+# OpenCode runs on this machine as a child of this window, in one folder - this
+# repository unless OPENCODE_WORKSPACE names another - and asks the user before
+# every edit, command and fetch. It listens on loopback with a password.
+# studio_opencode_mcp.py reads the same variables in its own process - keep
+# them agreeing.
 OPENCODE_URL = os.environ.get("OPENCODE_URL", "http://127.0.0.1:4096").rstrip("/")
-OPENCODE_WORKSPACE = os.environ.get(
-    "OPENCODE_WORKSPACE",
-    os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                 "StudioAssistant", "opencode-workspace"))
-OPENCODE_IMAGE = os.environ.get("OPENCODE_IMAGE", "studio-opencode")
-OPENCODE_CONTAINER = "studio-opencode"
-OPENCODE_HOME_VOLUME = "studio-opencode-home"    # its sessions survive a restart
+OPENCODE_WORKSPACE = (os.environ.get("OPENCODE_WORKSPACE")
+                      or os.path.dirname(os.path.abspath(__file__)))
+OPENCODE_STATE = os.environ.get("OPENCODE_STATE") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "StudioAssistant", "opencode")
 DEFAULT_MODEL = "qwen3-coder-30b-a3b-instruct"
 MAX_TOOL_RESULT_CHARS = 8000
 
@@ -84,6 +82,9 @@ class MCPClient:
     seen to be waiting.
     """
 
+    on_elicit = None                      # see __init__
+    _eliciting = 0
+
     def __init__(self, command, args, quiet=False):
         exe = shutil.which(command)
         if not exe and os.path.isfile(command):
@@ -100,6 +101,12 @@ class MCPClient:
         self.server_info = {}
         self.instructions = ""
         self.capabilities = {}
+        # The bridge asking the user something (MCP elicitation): set before
+        # initialize, it is called on a thread of its own with the request's
+        # params and returns the result - {"action", "content"}. Unset, the
+        # client does not claim it can ask, and a bridge must do without.
+        self.on_elicit = None
+        self._eliciting = 0               # questions open; no call times out under one
         # Contained: the bridge and everything it starts (npx's node, a COM
         # worker) end with close(), or with this process however it ends.
         self.child = studio_procs.spawn(
@@ -156,16 +163,25 @@ class MCPClient:
         deadline = time.monotonic() + timeout
         cap = time.monotonic() + max(timeout, PROGRESS_CAP)
         while True:
+            if self._eliciting:
+                # A person is deciding; the bridge is not hung. The clock
+                # starts again from their answer.
+                now = time.monotonic()
+                deadline = max(deadline, now + timeout)
+                cap = max(cap, now + timeout)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
-                msg = self._inbox.get(timeout=remaining)
+                msg = self._inbox.get(timeout=min(remaining, 1.0))
             except queue.Empty:
-                break
+                continue
             if msg.get("_closed"):
                 self._inbox.put(msg)
                 raise EOFError("The MCP bridge exited before returning a result.")
+            if msg.get("method") and msg.get("id") is not None:
+                self._server_request(msg)
+                continue
             if msg.get("id") == rid:
                 if "error" in msg:
                     raise RuntimeError("MCP error: " + studio_mcp.error_text(msg["error"]))
@@ -190,6 +206,40 @@ class MCPClient:
                            "no MCP reply to %s in %ss, though it reported progress"
                            % (method, int(max(timeout, PROGRESS_CAP))))
 
+    def _server_request(self, msg):
+        """A request from the bridge. ping is answered here; an elicitation is
+        handed to `on_elicit` on a thread, so this loop goes on reading the
+        call's progress while the user decides."""
+        rid, method = msg["id"], msg["method"]
+        if method == "ping":
+            self._send({"jsonrpc": "2.0", "id": rid, "result": {}})
+            return
+        if method != "elicitation/create" or self.on_elicit is None:
+            self._send({"jsonrpc": "2.0", "id": rid, "error": {
+                "code": studio_mcp.METHOD_NOT_FOUND, "message": "unknown method %s" % method}})
+            return
+        handler = self.on_elicit
+        with self._lock:
+            self._eliciting += 1
+
+        def answer():
+            try:
+                res = handler(msg.get("params") or {})
+                reply = {"jsonrpc": "2.0", "id": rid,
+                         "result": res if isinstance(res, dict) else {"action": "cancel"}}
+            except Exception as e:
+                reply = {"jsonrpc": "2.0", "id": rid, "error": {
+                    "code": studio_mcp.INTERNAL_ERROR, "message": "%s: %s" % (type(e).__name__, e)}}
+            finally:
+                with self._lock:
+                    self._eliciting -= 1
+            try:
+                self._send(reply)
+            except Exception:
+                pass                        # the bridge has gone; nobody to tell
+
+        threading.Thread(target=answer, daemon=True, name="mcp-elicit").start()
+
     def _notification(self, method, params):
         if method == "notifications/message":
             log("  [mcp %s] %s" % (params.get("level", "info"),
@@ -202,7 +252,7 @@ class MCPClient:
     def initialize(self, timeout=180):
         res = self.request("initialize", timeout=timeout, params={
             "protocolVersion": studio_mcp.LATEST,
-            "capabilities": {},
+            "capabilities": {"elicitation": {"form": {}}} if self.on_elicit else {},
             "clientInfo": {"name": "studio_agent", "version": "1.1"},
         })
         self.protocol_version = res.get("protocolVersion")
@@ -1577,46 +1627,47 @@ WHEN SOMETHING IS WRONG
 """ + BASE_RULES
 
 OPENCODE_PROMPT = """You are an agent delegating programming work to OpenCode through tools.
-OpenCode is a coding agent - it reads, writes and runs code on its own. It runs in a
-Docker container on this workstation whose ONLY folder is the workspace; it cannot see
-the rest of this PC, and nothing it does touches After Effects, Resolve or their
-projects. Your job is to brief it well, wait, and tell the user what came back.
+OpenCode is a coding agent running on this PC with the same local model you are. It
+works in ONE folder - by default the Studio Assist app's own source code - reads it
+freely, and asks the USER before every edit, every command and every web fetch. Your
+job is to brief it well, let it work, and tell the user what came back.
 
 HOW THE WORK IS SHAPED
-- The workspace is one folder, shared between this PC and the container. On this PC
-  it is where opencode_status says; inside the container it is /workspace. Every
-  path you pass to a tool here is relative to it: "src/main.py", not a drive letter.
-  There is nothing outside it to name.
+- opencode_status says which folder OpenCode works in. Paths you pass to the file
+  tools are relative to it: "studio_agent.py", "tests/test_mcp.py".
 - A session is one piece of work with its own history. opencode_ask sends a task to
-  a session and waits for OpenCode to finish; with no session_id it starts a new
-  one and returns its id. Pass that id back to continue the same work, so
-  OpenCode remembers what it built. Start a new session for an unrelated job.
-- OpenCode's reply comes back as prose plus one line per tool it ran and the files
-  it touched. That is what it SAYS it did; the files in the workspace are what it
-  actually did.
+  a session and follows it to the end; with no session_id it starts a new one and
+  returns its id. Pass that id back to continue the same work, so OpenCode
+  remembers what it did. Start a new session for an unrelated job.
+- While OpenCode works, every change it wants is shown to the user with its diff or
+  command, and the user allows or refuses it. You are not asked and cannot answer
+  for them; there is no tool that approves anything. The reply lists the user's
+  decisions, then what OpenCode said and did.
+- A refused step is the user's decision, often with a note saying what they want
+  instead. Do not send the same change again; brief OpenCode with the note, or ask
+  The user.
 
 BRIEFING - what silently produces poor work
-- Brief OpenCode like a programmer: what to build or change, in which files, in what
-  language, and what finished looks like. "Make a Python script that renames the
-  PNGs in frames/ to a 4-digit sequence" works; "fix the script" does not.
-  Put the user's exact wording, constraints and examples into the prompt.
-- Anything OpenCode needs from outside must be put into the workspace first with
-  opencode_put_file - it cannot be told a path on this PC. Tell the user the
-  workspace path when they should drop files in themselves.
-- Work takes real time: seconds for a question, minutes for a build. If an ask
-  reports OpenCode is still going, collect the result with opencode_get_session using
-  the same session id; do not send the same task again.
-- Read what came back before reporting it: opencode_list_files, then
-  opencode_read_file on what it says it changed. Report the files by their
-  workspace path, so the user can open them.
+- Brief OpenCode like a programmer: what to change, in which files and functions,
+  and what finished looks like. "In studio_chat.py, make the Stop button also close
+  an open approval form" works; "fix the approvals" does not. Put the user's exact
+  wording, constraints and examples into the prompt.
+- This project has an AGENTS.md with its rules (stdlib only, how tests run). Tell
+  OpenCode to read it before changing code, and to keep changes small - the user
+  reviews each one.
+- Work takes real time: seconds for a question, minutes for a change, and however
+  long the user takes to decide. If an ask hands back at its timeout, follow the
+  same session with opencode_wait; do not send the task again.
+- Check what came back before reporting it: opencode_changes lists what is
+  uncommitted, opencode_changes with a path shows that file's diff. Report files by
+  their path in the folder.
 
 WHEN SOMETHING IS WRONG
 - If a tool reports it cannot reach OpenCode, call opencode_status once. If that
-  fails too, say so plainly and stop: the container is started by the user with the
-  Start OpenCode button in this window. Do not retry in a loop.
-- opencode_abort stops a session that is running away. Files it has already
-  written stay in the workspace.
-- Ask before overwriting a file the user put in the workspace themselves.
+  fails too, say so plainly and stop: the user starts it with the Start OpenCode
+  button in this window. Do not retry in a loop.
+- If the user stopped OpenCode, say what it had done by then and wait for them.
+- opencode_abort stops a session that is running away. What it already changed stays.
 """ + BASE_RULES
 
 PS_PROMPT = """You are an agent operating a live Photoshop session through tools.
@@ -2002,8 +2053,9 @@ class AppSpec:
     # `bridged` instead - chat has one of those, in process.
     drivable = True
     bridged = True
-    # True only for ContainerSpec below: on this machine, but behind Docker.
-    container = False
+    # True only for ServerSpec below: on this machine, started by this window
+    # as a server with no window of its own.
+    served = False
     # True only for BridgeSpec below: a bridge the user entered by hand.
     custom = False
     # Every app tab gets the research sidecar - this PC's files and the web,
@@ -2185,84 +2237,101 @@ WORKING NOTES
 - Answer questions directly without calling tools when no tool is needed."""
 
 
-class ContainerSpec(AppSpec):
+class ServerSpec(AppSpec):
     """
-    An app that runs on this machine but inside a Docker container, so that it
-    can touch nothing here but the one folder it is given. OpenCode is the only
-    one: a coding agent that edits and runs whatever it is pointed at is not
-    something to loose on the workstation's own disk.
-
-    Not remote - it runs here and this window starts it - and not installed as
-    an .exe: `installed()` is whether Docker is here, `launch()` builds the
-    image once and runs the container, and the probe is the loopback port
-    that container publishes.
+    An app this window runs itself, as a local server with no window of its
+    own: OpenCode, a coding agent. `installed()` is whether its program is
+    here, `launch()` starts it as a contained child of this process - so it
+    ends when the window does, like a bridge - and the probe is its loopback
+    port. What keeps it in check is its config, not a sandbox: it works in
+    one folder, reads freely, and every edit, command and fetch waits for the
+    user (see `opencode_config`).
     """
 
-    container = True
+    served = True
 
-    def __init__(self, workspace, image, dockerfile, **kw):
+    def __init__(self, workspace, state_dir, **kw):
         AppSpec.__init__(self, exe_globs=[], **kw)
         self.workspace = workspace
-        self.image = image
-        self.dockerfile = dockerfile            # folder holding the Dockerfile
+        self.state_dir = state_dir            # config, password, log - never the workspace
+        self.child = None
 
     @property
     def remote(self):
         return False
 
     def exe(self):
-        return None                           # no .exe, so no icon to read
+        return None                           # no window, no icon to read
+
+    def program(self):
+        return opencode_exe()
 
     def installed(self):
-        return docker_exe() is not None
+        return self.program() is not None
 
-    def image_exists(self):
-        try:
-            return bool(docker("image", "inspect", "--format", "{{.Id}}", self.image,
-                               timeout=60).strip())
-        except RuntimeError as e:
-            if "No such" in str(e):
-                return False
-            raise
+    @property
+    def config_path(self):
+        return os.path.join(self.state_dir, "opencode.json")
 
-    def write_config(self, host, model, ids):
-        os.makedirs(self.workspace, exist_ok=True)
-        path = os.path.join(self.workspace, "opencode.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(opencode_config(host, model, ids), f, indent=2)
-        return path
+    @property
+    def key_path(self):
+        return os.path.join(self.state_dir, "server.key")
+
+    def write_config(self, host, model, ids, context=None):
+        os.makedirs(self.state_dir, exist_ok=True)
+        cfg = opencode_config(host, model, ids, context, addons=load_addons(self.state_dir))
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return self.config_path
 
     def launch(self, host=None, model=None):
         """
-        Build the image if this PC has never built it, write the workspace's
-        opencode.json, and run the container. Blocks through the build - the
-        caller is already on a worker thread - and returns once `docker run`
-        has; the caller then polls `running()` like any other app.
+        Write OpenCode's config and a fresh password, and start `opencode
+        serve` in the workspace. Returns once it is started; the caller polls
+        `running()` like any other app.
         """
-        if not self.installed():
-            raise RuntimeError("Docker Desktop is not installed, so %s has nowhere "
-                               "isolated to run. %s" % (self.name, self.launch_note))
+        exe = self.program()
+        if not exe:
+            raise RuntimeError("OpenCode is not installed on this PC. Install it once, in "
+                               "a terminal: npm install -g opencode-ai - then press "
+                               "Start OpenCode again.")
+        if not os.path.isdir(self.workspace):
+            raise RuntimeError("OpenCode's folder %s does not exist." % self.workspace)
         host = host or env_default("STUDIO_HOST", "AE_AGENT_HOST", fallback=DEFAULT_HOST)
         _, loaded, ids, _, _ = probe_models(host)
         shared = pick_model(loaded, ids, model or env_default("STUDIO_MODEL", "AE_AGENT_MODEL"))
         chosen, _ = self.model_for(ids, shared or model or DEFAULT_MODEL)
-        self.write_config(host, chosen, ids)
-        if not self.image_exists():
-            docker("build", "-t", self.image, self.dockerfile, timeout=1800)
-        # A container left over from a window that closed uncleanly holds the
-        # name and the port; --rm normally clears it, but be sure.
+        context = context_window(host, chosen)[0] if chosen else None
+        self.write_config(host, chosen, ids, context)
+        self.stop()
+        # A new password each start, readable by this user only: the bridge
+        # reads it from here, and nothing else on the PC - a web page in a
+        # browser least of all - can drive the server without it.
+        key = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii")
+        with open(self.key_path, "w", encoding="utf-8") as f:
+            f.write(key)
+        env = dict(os.environ, OPENCODE_CONFIG=self.config_path,
+                   OPENCODE_SERVER_PASSWORD=key)
+        env.pop("OPENCODE_CONFIG_CONTENT", None)
+        port = urllib.parse.urlsplit(OPENCODE_URL).port or 4096
+        log_file = open(os.path.join(self.state_dir, "server.log"), "w",
+                        encoding="utf-8", errors="replace")
         try:
-            docker("rm", "-f", OPENCODE_CONTAINER, timeout=60)
-        except RuntimeError:
-            pass
-        docker(*docker_run_args(self.workspace, self.image), timeout=120)
+            self.child = studio_procs.spawn(
+                [exe, "serve", "--hostname", "127.0.0.1", "--port", str(port)],
+                cwd=self.workspace, env=env, stdin=subprocess.DEVNULL,
+                stdout=log_file, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+        finally:
+            log_file.close()                  # the child holds its own handle
 
     def stop(self):
-        """Stop the container. --rm removes it; the workspace and home volume stay."""
-        try:
-            docker("stop", "-t", "5", OPENCODE_CONTAINER, timeout=60)
-        except RuntimeError:
-            pass
+        """End the server this window started, and everything it started."""
+        child, self.child = self.child, None
+        if child is not None:
+            try:
+                child.stop(3.0)
+            except Exception:
+                pass
 
 
 AE_GROUPS = {
@@ -2337,11 +2406,9 @@ COMFY_GROUPS = {
 
 OPENCODE_GROUPS = {
     "discover": ["opencode_status", "opencode_list_sessions", "opencode_get_session",
-                 "opencode_list_files", "opencode_read_file"],
-    "work": ["opencode_new_session", "opencode_ask", "opencode_abort"],
-    # The one way anything enters the sandbox. Confined to the workspace on this
-    # side too, so it is safe to expose by default.
-    "files": ["opencode_put_file"],
+                 "opencode_changes", "opencode_list_files", "opencode_read_file"],
+    # Nothing here edits by itself: OpenCode asks the user before each change.
+    "work": ["opencode_new_session", "opencode_ask", "opencode_wait", "opencode_abort"],
 }
 
 PS_GROUPS = {
@@ -2393,78 +2460,78 @@ RESOLVE_MCP = os.environ.get(
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def docker_exe():
-    """Docker's CLI, or None. Docker Desktop is not always on PATH for a window
-    launched from a shortcut, so its own install folder is tried too."""
-    found = shutil.which("docker")
-    if found:
-        return found
-    for p in (r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
-              os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
-                           "Docker", "Docker", "resources", "bin", "docker.exe")):
-        if os.path.isfile(p):
+def opencode_exe():
+    """OpenCode's program, or None. npm puts a native opencode.exe inside the
+    package and a .cmd shim on PATH; the .exe is started directly, so no
+    cmd.exe sits between this window and the server."""
+    roots = [os.environ.get("OPENCODE_BIN", "")]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.append(os.path.join(appdata, "npm", "node_modules", "opencode-ai", "bin",
+                                  "opencode.exe"))
+    roots.append(os.path.join(os.path.expanduser("~"), ".opencode", "bin", "opencode.exe"))
+    for p in roots:
+        if p and os.path.isfile(p):
             return p
-    return None
+    return shutil.which("opencode")
 
 
-def docker(*args, timeout=120):
-    """Run one docker command; stdout, or a RuntimeError carrying its stderr."""
-    exe = docker_exe()
-    if not exe:
-        raise RuntimeError("Docker Desktop is not installed, so OpenCode has nowhere "
-                           "isolated to run. Install it from docker.com and start it.")
-    try:
-        r = subprocess.run([exe] + list(args), capture_output=True, text=True,
-                           timeout=timeout, creationflags=NO_WINDOW)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("docker %s took longer than %ds" % (args[0], timeout))
-    if r.returncode:
-        err = (r.stderr or r.stdout or "").strip()
-        if "docker daemon" in err.lower() or "pipe" in err.lower():
-            err = "Docker Desktop is not running. Start it, then try again. (%s)" % err
-        raise RuntimeError("docker %s failed: %s" % (" ".join(args[:2]), err[:600]))
-    return r.stdout
+# What OpenCode may do without asking: read, search and plan. Everything that
+# changes something - an edit, a command, a fetch, a subagent's own edits -
+# asks, and the bridge puts each ask to the user. Outside its folder it is
+# refused outright. The user's "Always allow" on a step is OpenCode's own,
+# and lasts until the server restarts.
+OPENCODE_PERMISSIONS = {
+    "read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "lsp": "allow",
+    "todowrite": "allow", "question": "allow", "skill": "allow", "task": "allow",
+    "edit": "ask", "bash": "ask", "webfetch": "ask", "websearch": "ask",
+    "doom_loop": "ask", "external_directory": "deny",
+}
 
 
-def opencode_config(host, model, ids):
+def load_addons(state_dir):
+    import studio_codeaddons
+    return studio_codeaddons.load(state_dir)
+
+
+def addons_config(addons):
+    import studio_codeaddons
+    return studio_codeaddons.config(addons)
+
+
+def opencode_config(host, model, ids, context=None, addons=None):
     """
-    The opencode.json written into the workspace before the container starts:
-    it makes OpenCode use the studio's LM Studio, with the served models
-    declared and one chosen. A loopback host is rewritten to the name Docker
-    gives the machine, since 127.0.0.1 inside the container is the container.
+    The opencode.json handed to `opencode serve` (by OPENCODE_CONFIG, so the
+    workspace is not written to): the studio's LM Studio with the served
+    models declared and one chosen, the permissions above, and the add-ons
+    The user has turned on.
     """
     base = host.rstrip("/")
     if not base.endswith("/v1"):
         base += "/v1"
-    for lo in ("127.0.0.1", "localhost"):
-        base = base.replace("//%s:" % lo, "//host.docker.internal:")
     models = {m: {"name": m} for m in (ids or [model]) if m}
     if model and model not in models:
         models[model] = {"name": model}
-    return {
+    if model and context:
+        # OpenCode compacts the conversation before it outgrows the window
+        # only if it knows the window.
+        models[model]["limit"] = {"context": int(context), "output": min(8192, int(context) // 4)}
+    cfg = {
         "$schema": "https://opencode.ai/config.json",
         "provider": {"lmstudio": {"npm": "@ai-sdk/openai-compatible", "name": "LM Studio",
                                   "options": {"baseURL": base}, "models": models}},
         "model": "lmstudio/%s" % model if model else None,
+        "permission": dict(OPENCODE_PERMISSIONS),
+        "autoupdate": False,
+        "share": "disabled",
     }
+    extra = addons_config(addons or [])
+    # An add-on's permissions only add to the ones above; none is loosened.
+    for k, v in extra.pop("permission", {}).items():
+        cfg["permission"].setdefault(k, v)
+    cfg.update(extra)
+    return cfg
 
-
-def docker_run_args(workspace, image=None, port=None):
-    """
-    The `docker run` that isolates OpenCode. The workspace is the only bind
-    mount; the home volume keeps its session store between runs; the port is
-    published to loopback only; capabilities are dropped and privilege
-    escalation is off. Nothing here names another folder on this PC.
-    """
-    host_port = port or urllib.parse.urlsplit(OPENCODE_URL).port or 4096
-    return ["run", "-d", "--rm", "--name", OPENCODE_CONTAINER,
-            "-p", "127.0.0.1:%d:4096" % host_port,
-            "-v", "%s:/workspace" % workspace,
-            "-v", "%s:/home/node" % OPENCODE_HOME_VOLUME,
-            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-            "--memory", "4g", "--pids-limit", "512",
-            "-w", "/workspace",
-            image or OPENCODE_IMAGE]
 
 APPS = [
     AppSpec(
@@ -2550,29 +2617,28 @@ APPS = [
               ("ComfyUI workflow examples", "https://comfyanonymous.github.io/ComfyUI_examples/")],
         craft=CRAFT_IMAGES,
     ),
-    ContainerSpec(
+    ServerSpec(
         id="opencode",
         name="OpenCode",
         tab="OpenCode",
         code="Oc", fg="#F0F0F0", bg="#3B3B3B",
         workspace=OPENCODE_WORKSPACE,
-        image=OPENCODE_IMAGE,
-        dockerfile=os.path.join(HERE, "opencode"),
+        state_dir=OPENCODE_STATE,
         probe="port:%s" % (urllib.parse.urlsplit(OPENCODE_URL).port or 4096),
         command=sys.executable,
         args=[os.path.join(HERE, "studio_opencode_mcp.py")],
-        bridge_label="container on %s" % OPENCODE_URL.split("//", 1)[-1],
+        bridge_label="server on %s" % OPENCODE_URL.split("//", 1)[-1],
         groups=OPENCODE_GROUPS,
-        default_groups=["discover", "work", "files"],
+        default_groups=["discover", "work"],
         system_prompt=OPENCODE_PROMPT,
         examples=[
-            "Write a Python script that renames the PNGs in frames/ to a 4-digit sequence",
-            "Read the CSV in the workspace and make a script that plots each column",
-            "What did OpenCode change in the last session?",
-            "Add tests for the script it wrote, then run them",
+            "Have OpenCode read AGENTS.md and explain how a tab's bridge is started",
+            "Add a Copy button to each folded tool-call row in studio_chat.py",
+            "What has OpenCode changed that is not committed yet?",
+            "Run the OpenCode bridge's tests and fix what fails",
         ],
-        launch_note="OpenCode runs in a Docker container that can only see its workspace "
-                    "folder; the first start builds the image, which takes a few minutes.",
+        launch_note="It works in this app's own folder, reads freely, and asks you "
+                    "before every edit, command and fetch.",
         docs=[("OpenCode documentation", "https://opencode.ai/docs/")],
     ),
     AppSpec(
@@ -3090,12 +3156,12 @@ def detect_apps():
             found.append({"code": code, "name": name, "version": "", "fg": fg,
                           "bg": bg, "id": DRIVABLE.get(name), "exe": path,
                           "drivable": name in DRIVABLE, "remote": False})
-    # A container app is on this machine but has no .exe: the registry is the
-    # only evidence, and the row says "container" where a year would go. No
+    # A served app is on this machine but has no window .exe: the registry is
+    # the only evidence, and the row says "server" where a year would go. No
     # exe means no icon to read - the badge stays.
     for a in APPS:
-        if a.container:
-            found.append({"code": a.code, "name": a.name, "version": "container",
+        if a.served:
+            found.append({"code": a.code, "name": a.name, "version": "server",
                           "fg": a.fg, "bg": a.bg, "id": a.id, "exe": None,
                           "drivable": True, "remote": False})
     # A bridge the user entered by hand for something not detected above -
@@ -3132,6 +3198,60 @@ def ask_at_terminal(asked, answer=input):
         print()
         return ""
     return answer_text(asked, reply)
+
+
+def elicit_fields(schema):
+    """[(name, spec, choices)] of an elicitation's requestedSchema, in order.
+    `choices` is [(value, label)] for an enum field, else None."""
+    out = []
+    for name, spec in ((schema or {}).get("properties") or {}).items():
+        choices = None
+        if isinstance(spec.get("oneOf"), list):
+            choices = [(o.get("const"), o.get("title") or str(o.get("const")))
+                       for o in spec["oneOf"] if isinstance(o, dict) and "const" in o]
+        elif isinstance(spec.get("enum"), list):
+            names = spec.get("enumNames") or []
+            choices = [(v, names[i] if i < len(names) else str(v))
+                       for i, v in enumerate(spec["enum"])]
+        out.append((name, spec, choices))
+    return out
+
+
+def elicit_at_terminal(params, answer=input):
+    """A bridge asking the user something (MCP elicitation), at the console:
+    the message, any diff or command it carried, then each field. Enter on a
+    choice leaves it unanswered; "c" cancels the whole request."""
+    shown = ((params.get("_meta") or {}).get("studio/approval") or {})
+    print("\n" + (params.get("message") or "The bridge asks:"))
+    if shown.get("diff"):
+        print(shown["diff"].rstrip())
+    schema = params.get("requestedSchema") or {}
+    required = set(schema.get("required") or [])
+    content = {}
+    try:
+        for name, spec, choices in elicit_fields(schema):
+            title = spec.get("title") or name
+            if choices:
+                for n, (_, label) in enumerate(choices, 1):
+                    print("  %d. %s" % (n, label))
+                reply = answer("%s (number, or c to cancel)> " % title).strip()
+                if reply.lower() == "c":
+                    return {"action": "cancel"}
+                if reply.isdigit() and 1 <= int(reply) <= len(choices):
+                    content[name] = choices[int(reply) - 1][0]
+                elif name in required:
+                    return {"action": "decline"}
+            elif spec.get("type") == "boolean":
+                reply = answer("%s (y/n)> " % title).strip().lower()
+                content[name] = reply.startswith("y")
+            else:
+                reply = answer("%s> " % title).strip()
+                if reply:
+                    content[name] = reply
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return {"action": "cancel"}
+    return {"action": "accept", "content": content}
 
 
 def answer_text(asked, reply):
@@ -3389,6 +3509,7 @@ def main():
 
     log(". connecting to the %s bridge..." % app.name, a.quiet)
     mcp = app.connect(quiet=a.quiet)
+    mcp.on_elicit = elicit_at_terminal     # a bridge's questions come to this console
     try:
         info = mcp.initialize()
         srv = info.get("serverInfo", {})
