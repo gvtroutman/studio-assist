@@ -590,3 +590,122 @@ class TestSnapshots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------- elicitation
+
+ASKER = r'''
+import sys, os
+sys.path.insert(0, %r)
+import studio_mcp as mcp
+
+def ask(a):
+    if not mcp.can_elicit():
+        return mcp.result("nobody to ask")
+    res = mcp.elicit("Allow it?", {"type": "object", "properties": {
+        "decision": {"type": "string", "enum": ["yes", "no"]}}, "required": ["decision"]},
+        meta={"studio/approval": {"kind": "edit"}})
+    mcp.progress("after the answer")
+    return mcp.result("%%s %%s" %% (res.get("action"), (res.get("content") or {}).get("decision")))
+
+tools = [mcp.Tool("ask", ask, "Asks the user.", {"type": "object", "properties": {}})]
+sys.exit(mcp.main(mcp.Server("asker", "1", tools)))
+'''
+
+
+def asking_server():
+    def ask(a):
+        if not mcp.can_elicit():
+            return mcp.result("nobody to ask")
+        res = mcp.elicit("Allow it?", {"type": "object", "properties": {
+            "decision": {"type": "string", "enum": ["yes", "no"]}}})
+        return mcp.result("%s %s" % (res.get("action"), (res.get("content") or {}).get("decision")))
+    return mcp.Server("asker", "1", [mcp.Tool("ask", ask, "Asks.", {"type": "object",
+                                                                      "properties": {}})])
+
+
+class TestElicitation(unittest.TestCase):
+    """A bridge asking the user something mid-call (MCP elicitation). The
+    answer goes from the client's user to the tool - never through the
+    model - which is what OpenCode's approvals are built on."""
+
+    def test_a_tool_asks_and_gets_the_users_answer_in_process(self):
+        seen = []
+
+        def user(params):
+            seen.append(params)
+            return {"action": "accept", "content": {"decision": "yes"}}
+        client = mcp.Loopback(asking_server(), on_elicit=user)
+        client.initialize()
+        self.assertEqual(client.call_tool("ask", {})["content"][0]["text"], "accept yes")
+        self.assertEqual(seen[0]["message"], "Allow it?")
+        self.assertEqual(seen[0]["mode"], "form")
+
+    def test_a_client_that_did_not_offer_elicitation_is_not_asked(self):
+        client = mcp.Loopback(asking_server())           # no on_elicit: no capability
+        client.initialize()
+        self.assertEqual(client.call_tool("ask", {})["content"][0]["text"], "nobody to ask")
+        with self.assertRaises(mcp.Declined):
+            mcp.elicit("outside a call", {"type": "object", "properties": {}})
+
+    def test_a_cancelled_call_stops_waiting_for_the_answer(self):
+        server = asking_server()
+        server.client_caps = {"elicitation": {}}
+        server.sink = lambda msg: server.cancel(7)       # the client gives up instead
+        server._inflight.add(7)
+        mcp._ctx.server, mcp._ctx.rid = server, 7
+        try:
+            res = mcp.elicit("Allow it?", {"type": "object", "properties": {}})
+        finally:
+            mcp._ctx.server = mcp._ctx.rid = None
+        self.assertEqual(res, {"action": "cancel"})
+
+    def test_over_stdio_the_client_answers_and_does_not_time_out_while_the_user_decides(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        client = eng.MCPClient(sys.executable, ["-c", ASKER % here], quiet=True)
+        try:
+            def slow_user(params):
+                self.assertEqual(params["_meta"]["studio/approval"]["kind"], "edit")
+                time.sleep(2.5)                          # longer than the call's timeout
+                return {"action": "accept", "content": {"decision": "no"}}
+            client.on_elicit = slow_user
+            client.initialize(timeout=30)
+            res = client.request("tools/call", {"name": "ask", "arguments": {}}, timeout=1)
+            self.assertEqual(res["content"][0]["text"], "accept no")
+        finally:
+            client.close(grace=0.5)
+
+    def test_over_stdio_a_client_without_a_user_says_so(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        client = eng.MCPClient(sys.executable, ["-c", ASKER % here], quiet=True)
+        try:
+            client.initialize(timeout=30)
+            res = client.call_tool("ask", {})
+            self.assertEqual(res["content"][0]["text"], "nobody to ask")
+        finally:
+            client.close(grace=0.5)
+
+    def test_the_terminal_answers_an_approval(self):
+        params = {"message": "OpenCode wants to edit a.py.",
+                  "_meta": {"studio/approval": {"diff": "-a\n+b\n"}},
+                  "requestedSchema": {"type": "object", "properties": {
+                      "decision": {"type": "string", "enum": ["once", "always", "reject"],
+                                   "enumNames": ["Allow once", "Always", "Reject"]},
+                      "note": {"type": "string", "title": "Note"}}, "required": ["decision"]}}
+        replies = iter(["3", "use b2 instead"])
+        out = io.StringIO()
+        real = sys.stdout
+        sys.stdout = out
+        try:
+            res = eng.elicit_at_terminal(params, answer=lambda _p: next(replies))
+        finally:
+            sys.stdout = real
+        self.assertEqual(res, {"action": "accept",
+                               "content": {"decision": "reject", "note": "use b2 instead"}})
+        self.assertIn("+b", out.getvalue())
+        sys.stdout = io.StringIO()
+        try:
+            self.assertEqual(eng.elicit_at_terminal(params, answer=lambda _p: "c"),
+                             {"action": "cancel"})
+        finally:
+            sys.stdout = real
