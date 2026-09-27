@@ -53,7 +53,11 @@ REMEMBER_TOOL = {"type": "function", "function": {
     "parameters": {"type": "object", "additionalProperties": False,
                    "properties": {"lesson": {"type": "string", "minLength": 8,
                                              "maxLength": LESSON_CHARS,
-                                             "description": "The lesson, as one sentence."}},
+                                             "description": "The lesson, as one sentence."},
+                                  "scope": {"type": "string", "enum": ["here", "everywhere"],
+                                            "description": ("'everywhere' for a preference of "
+                                                            "the user's that holds in every app "
+                                                            "and folder; default 'here'.")}},
                    "required": ["lesson"]}}}
 
 CORRECTION = re.compile(
@@ -78,6 +82,20 @@ def explicit_lesson(text):
         return None
     rest = " ".join(m.group("rest").split()).strip(" .")
     return rest if len(rest) >= 8 else None
+
+
+EVERYWHERE = re.compile(
+    r"^(everywhere|globally|always everywhere|in (all|every) (apps?|tabs?|projects?|folders?))"
+    r"[:,\-]?\s*(that\s+|to\s+)?", re.I)
+
+
+def lesson_scope(text):
+    """("everywhere", rest) for a stated lesson that says it holds everywhere -
+    "remember everywhere: keep replies short" - else ("here", text)."""
+    m = EVERYWHERE.match(text or "")
+    if m and len(text[m.end():].strip()) >= 8:
+        return "everywhere", text[m.end():].strip()
+    return "here", text
 
 
 def normal(text):
@@ -240,6 +258,124 @@ class Notebook:
     def fresh(self):
         """Lessons added since brief(), for the tail of a request."""
         return self.render([l for l in self.ordered() if normal(l["text"]) not in self._carried])
+
+
+class Stack:
+    """Several notebooks read as one: everywhere (every tab), the app, and for
+    OpenCode the folder it works in - most general first. It answers the
+    Notebook interface the executor, the learner and the Lessons window use.
+
+    New lessons go to the most specific layer, except a lesson said to hold
+    everywhere (the global layer) and a refused call (the app layer - it is a
+    fact about the bridge, not the folder)."""
+
+    def __init__(self, layers):
+        self.layers = [(label, nb) for label, nb in layers if nb is not None]
+
+    @property
+    def lessons(self):
+        return [l for _, nb in self.layers for l in nb.lessons]
+
+    @property
+    def problem(self):
+        problems = [nb.problem for _, nb in self.layers if nb.problem]
+        return "; ".join(problems) or None
+
+    def load(self):
+        for _, nb in self.layers:
+            nb.load()
+        return self.problem
+
+    def layer(self, label):
+        for name, nb in self.layers:
+            if name == label:
+                return nb
+        return None
+
+    def target(self, source, scope=None):
+        if scope == "everywhere" and self.layer("everywhere") is not None:
+            return self.layer("everywhere")
+        if source == "error" and self.layer("app") is not None:
+            return self.layer("app")
+        return self.layers[-1][1]
+
+    def add(self, text, source="model", scope=None):
+        if scope is None and source == "user":
+            scope, text = lesson_scope(text)
+        # A lesson kept in another layer already is a repeat, not a new one.
+        for _, nb in self.layers:
+            if nb.find(clean(text)) is not None:
+                return nb.add(text, source)
+        return self.target(source, scope).add(text, source)
+
+    def find(self, text):
+        for _, nb in self.layers:
+            found = nb.find(text)
+            if found is not None:
+                return found
+        return None
+
+    def where(self, text):
+        """The label of the layer that keeps this lesson."""
+        for label, nb in self.layers:
+            if nb.find(text) is not None:
+                return label
+        return None
+
+    def remove(self, text):
+        return any(nb.remove(text) for _, nb in self.layers)
+
+    def learn_refusals(self, refusals):
+        return self.target("error").learn_refusals(refusals)
+
+    def ordered(self):
+        return [l for _, nb in self.layers for l in nb.ordered()]
+
+    def brief(self):
+        for _, nb in self.layers:
+            nb.brief()
+        return Notebook.render(self.ordered())
+
+    def fresh(self):
+        return Notebook.render([l for _, nb in self.layers for l in nb.ordered()
+                                if normal(l["text"]) not in nb._carried])
+
+
+def folder_notebook(folder, base=None):
+    """The notebook of one working folder: lessons/folders/<name>-<hash>.json."""
+    import hashlib
+    folder = os.path.normcase(os.path.abspath(folder))
+    tag = re.sub(r"[^\w\-]", "_", os.path.basename(folder.rstrip("\\/")) or "root")[:40]
+    key = "folders/%s-%s" % (tag, hashlib.sha1(folder.encode("utf-8")).hexdigest()[:10])
+    nb = Notebook.for_app(key, base)
+    nb.app_id = folder
+    return nb
+
+
+def for_app(app, base=None):
+    """What a tab learns into: everywhere, then the app, then - when the app
+    works in a folder, as OpenCode does - that folder."""
+    layers = [("everywhere", Notebook.for_app("_everywhere", base)),
+              ("app", Notebook.for_app(app.id, base))]
+    folder = getattr(app, "workspace", None)
+    if folder:
+        layers.append(("folder", folder_notebook(folder, base)))
+    return Stack(layers)
+
+
+def write_brief_file(notebook, path):
+    """The lessons as a markdown file OpenCode reads through its config's
+    `instructions` - so Direct mode, where no model of ours sits between the
+    user and OpenCode, still carries them. Best-effort; returns the path or None."""
+    try:
+        body = Notebook.render(notebook.ordered())
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# Lessons from earlier work\n\nThe user taught these; follow them.\n\n"
+                    + (body or "- (none yet)") + "\n")
+        return path
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ reflection
