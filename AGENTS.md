@@ -1849,6 +1849,25 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   not; it lands in the notes and `face_detail.real`. When anything was pasted the record's
   `images` are the pasted picture first and the PuLID one beside it; when nothing was, the
   PuLID one alone. A backend without the node says so in the notes and keeps PuLID's.
+
+
+- **A prop can be a picture of what it is.** Make picture (under a prop's *Looks
+  like*) sends its name and description, as written, through the same
+  `ImageStudio.generate(base=...)` path as the room, built by `picture_settings`:
+  text to image on plain white. `scene_picture` (the object's id) brings the job
+  back to `texture_done`. `import_cutout` shrinks it, `key_background` floods the
+  border's colour in from the edges to make it transparent and crops to what is
+  left, and the prop's `picture` then stands in for its mesh: one upright `card`,
+  as tall as the prop, as wide as the picture, always turned square to the camera,
+  sorted by depth among the other faces. `CutMap` skips transparent pixels, so the
+  frame keeps what is behind them. A picture with no plain border is kept whole
+  rather than cut to pieces. On the canvas a card is a PhotoImage scaled to its box
+  (a polygon cannot wear one), cached by size. There is no 3D generation here: no
+  backend has a mesh node (Hunyuan3D, TRELLIS), and a card is what a blockout for
+  image to image needs.
+  The depth map uses the same card and its transparent holes, including cropped
+  depth maps; it must not retain the original stand-in mesh. An imported PNG with
+  transparency keeps its existing cutout instead of being colour-keyed again.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
