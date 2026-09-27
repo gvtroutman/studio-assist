@@ -199,5 +199,51 @@ class UpdateTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertIn("Reopen Studio Assist", msg)
 
+    def remote_main(self):
+        return subprocess.run(["git", "-C", os.path.join(self.dir, "origin.git"), "rev-parse",
+                               "main"], capture_output=True, text=True).stdout.strip()
+
+    def local_main(self):
+        return subprocess.run(["git", "-C", self.pc, "rev-parse", "main"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_pushes_commits_github_lacks(self):
+        commit(self.pc, "b.txt", "mine\n")
+        self.assertFalse(upd.update())           # the folder itself did not change
+        self.assertEqual(self.remote_main(), self.local_main())
+        self.assertIn("Pushed 1 commit(s) to origin/main", self.logged())
+
+    def test_pulls_then_pushes_nothing_when_only_github_moved(self):
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q")
+        self.assertTrue(upd.update())
+        self.assertNotIn("Pushed", self.logged())
+
+    def test_never_pushes_when_both_sides_moved(self):
+        commit(self.dev, "a.txt", "two\n")
+        run(self.dev, "push", "-q")
+        theirs = self.remote_main()
+        commit(self.pc, "b.txt", "mine\n")
+        self.assertFalse(upd.update())
+        self.assertEqual(self.remote_main(), theirs)
+        self.assertNotIn("Pushed", self.logged())
+
+    def test_never_pushes_from_another_branch(self):
+        run(self.pc, "checkout", "-q", "-b", "feature")
+        commit(self.pc, "f.txt", "feature\n")
+        before = self.remote_main()
+        upd.update()
+        self.assertEqual(self.remote_main(), before)
+
+    def test_a_refused_push_is_logged(self):
+        commit(self.pc, "b.txt", "mine\n")
+        real = upd.git
+        fake = lambda exe, *a, **k: (1, "denied") if a[:1] == ("push",) else real(exe, *a, **k)
+        with mock.patch.object(upd, "git", side_effect=fake):
+            self.assertFalse(upd.push()[0])
+        self.assertNotEqual(self.remote_main(), self.local_main())
+        self.assertIn("failed: denied", self.logged())
+
+
 if __name__ == "__main__":
     unittest.main()
