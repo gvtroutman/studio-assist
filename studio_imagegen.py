@@ -4644,7 +4644,7 @@ class Studio:
             p.errors.extend(facefusion.profile_errors(profiles))
             if not profiles:
                 missing = clean_fix(settings.get("fix"))["face_swap"]
-                p.errors.append("The identity %s is missing. Choose an identity in Manage profiles."
+                p.errors.append("The identity %s is missing. Choose a person on the People tab."
                                 % (missing or "for this picture"))
             if not images or any(not os.path.isfile(path) for path in images):
                 p.errors.append("The source picture is missing. Choose an existing picture in History.")

@@ -78,13 +78,13 @@ def profile_errors(profiles):
     errors = []
     if profiles and not available():
         errors.append('FaceFusion is not installed. Set up the local FaceFusion runtime, '
-                      'or turn off the final face swap in Manage profiles.')
+                      'or turn off the final face swap in Image references on the People tab.')
     for profile in profiles:
         refs = profile.get('references') or []
         if not refs:
-            errors.append('%s has no reference picture. Open Manage profiles to add one.' % profile['name'])
+            errors.append('%s has no reference picture. Add one in Image references on the People tab.' % profile['name'])
         elif any(not os.path.isfile(p) for p in refs):
-            errors.append('%s needs existing reference photos. Open Manage profiles to update them.'
+            errors.append('%s needs existing reference photos. Update them in Image references on the People tab.'
                           % profile['name'])
         region = profile.get('target_region')
         if 'target_region' in profile and not valid_region(region):

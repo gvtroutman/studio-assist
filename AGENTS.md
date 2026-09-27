@@ -558,6 +558,12 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   (`item_refs`, copied under `references/`). Choosing one copies its look onto the
   form (blanking what it does not set) rather than linking to it, so history holds
   the whole look and Generate Again does not change when the character is edited.
+  The People tab (2026-09-26) has **one** person dropdown: characters, then
+  profiles (identities) alone, `"c:<id>"` / `"i:<id>"` (`_pick_from_people`); a
+  character brings its profile or none, and picking another profile clears the
+  character. Under it, **Editor** (the creator) and **Image references** (the
+  profiles). The form's look tabs are `FORM_LOOKS`: Body and Accessories are the
+  creator's alone, though a character's body and accessories still reach the prompt.
 - **Item pictures go into the picture itself, through FLUX Kontext**
   (2026-09-25; before, Try On redrew the finished picture, which the user did not
   want). They are chosen on the form's Clothes, Hair and Accessories tabs as in
