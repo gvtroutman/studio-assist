@@ -2581,6 +2581,43 @@ class TestImageStudioTab(unittest.TestCase):
         ui._select_identity("")
         self.assertFalse(any(v[0].get() for v in ui.idents.values()))
 
+    def test_the_people_tab_has_one_person_dropdown_and_no_body_or_accessories(self):
+        s, ui = self.tab()
+        ui.studio.lib.save("identities", [
+            {"id": "gav", "name": "Gav", "references": ["a.png"]},
+            {"id": "two", "name": "Two", "references": []}])
+        ui.studio.lib.save("characters", [
+            {"id": "mara", "name": "Mara", "identity": "gav", "looks": {"hair": "auburn"}},
+            {"id": "bare", "name": "Bare", "identity": "", "looks": {}}])
+        ui._rebuild_choices()
+        texts = lambda box: [w.cget("text") for w in box.winfo_children()
+                             if hasattr(w, "paint")]
+        self.assertEqual(texts(ui.person_box), ["No one  ▾"])     # the one dropdown
+        buttons = [t for w in ui.pc_box.winfo_children() for t in texts(w)]
+        self.assertIn("Editor", buttons)
+        self.assertIn("Image references", buttons)
+        self.assertNotIn("Creator…", buttons)
+        ticked = lambda: [i for i, v in ui.idents.items() if v[0].get()]
+        ui._pick_from_people("c:mara")               # a character brings its face
+        self.assertEqual((ui.settings["character"], ticked()), ("mara", ["gav"]))
+        self.assertEqual(ui.person_pill.cget("text"), "Mara  ▾")
+        self.assertEqual(ui.text["hair"].get(), "auburn")
+        ui._pick_from_people("i:two")                # a profile alone is not Mara
+        self.assertEqual((ui.settings["character"], ticked()), ("", ["two"]))
+        self.assertEqual(ui.person_pill.cget("text"), "Two  ▾")
+        ui._pick_from_people("c:bare")               # no face of its own: none
+        self.assertEqual((ui.settings["character"], ticked()), ("bare", []))
+        self.assertEqual(ui.person_pill.cget("text"), "Bare  ▾")
+        ui._pick_from_people("")
+        self.assertEqual((ui.settings["character"], ticked()), ("", []))
+        self.assertEqual(ui.person_pill.cget("text"), "No one  ▾")
+        tabs = texts(ui.look_tabs)
+        self.assertNotIn("Body", tabs)
+        self.assertNotIn("Accessories", tabs)
+        self.assertIn("Face", tabs)
+        ui._show_looks("Body")                       # hidden: the first shown instead
+        self.assertEqual(ui.look_section, "Face")
+
     def test_a_character_goes_from_the_creator_to_the_form_and_history(self):
         s, ui = self.tab()
         ed = ui.edit_characters()

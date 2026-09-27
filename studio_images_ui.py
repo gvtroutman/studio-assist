@@ -36,6 +36,10 @@ import studio_scene_ui
 THUMB = 72                    # px, before the display's scale
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
 HISTORY_PAGE = 40
+# The look sections the People tab shows. Body and Accessories are the
+# Editor's (CharacterCreator) alone: a character's still reach the prompt.
+FORM_LOOKS = [(name, slots) for name, slots in ig.LOOKS
+              if name not in ("Body", "Accessories")]
 ELLIPSIS = "…"          # the window's marker for "still happening": it animates
 ADVANCED = [                  # (setting, label, kind)
     ("seed", "Seed", "int"),
@@ -267,7 +271,7 @@ class ImageStudio:
         self.text = {}                # look slot and camera setting -> StringVar
         self.sliders = {}             # body slider keys -> IntVar
         self.item_refs = {}           # item -> picture, from the character
-        self.look_section = ig.LOOKS[0][0]
+        self.look_section = FORM_LOOKS[0][0]
         self.anatomy = tk.BooleanVar(value=True)
         self.hints = {}               # setting -> Label
         self.rows = {}                # job id -> row widgets
@@ -399,12 +403,14 @@ class ImageStudio:
         inner.canvas = canvas
         return outer, inner
 
-    def choice(self, parent, items, current, on_pick, bg="bg", width=None, images=None):
+    def choice(self, parent, items, current, on_pick, bg="bg", width=None, images=None,
+               kind="option", **kw):
         """A dropdown: a Pill that posts a menu of (value, label) pairs. The
-        window has no ttk and wants none (palette roles, Pills everywhere)."""
+        window has no ttk and wants none (palette roles, Pills everywhere).
+        `kw` goes to the Pill: anchor="w" for one as wide as its row."""
         labels = dict(items)
         pill = self.button(parent, labels.get(current, current or "Choose") + "  ▾",
-                           lambda: None, kind="option", bg=bg)
+                           lambda: None, kind=kind, bg=bg, **kw)
 
         def post():
             menu = tk.Menu(pill, tearoff=0)
@@ -513,22 +519,20 @@ class ImageStudio:
             side="top", fill="x")
         self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
-        crow = self.frame(pb)
-        crow.pack(side="top", fill="x", **pad)
-        self.char_row = self.frame(crow)
-        self.char_row.pack(side="left")
-        self.button(crow, "Creator…", lambda: self.edit_characters(), kind="ghost").pack(
-            side="left", padx=(self.px(6), 0))
-        self.button(crow, "Save as…", self.save_as_character, kind="ghost").pack(
-            side="left", padx=(self.px(4), 0))
+        # One dropdown for the person, characters and profiles both
+        # (_rebuild_choices fills it), and under it the two ways to edit them.
         self.person_box = self.frame(pb)
-        self.person_box.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.person_box.pack(side="top", fill="x", **pad)
+        prow = self.frame(pb)
+        prow.pack(side="top", fill="x", pady=(self.px(6), 0), **pad)
+        self.button(prow, "Editor", lambda: self.edit_characters()).pack(side="left")
+        self.button(prow, "Image references", self.edit_identities).pack(side="right")
         for key in ig.SLOTS:
             self.text[key] = tk.StringVar()
         for key in ig.SLIDER_KEYS:
             self.sliders[key] = tk.IntVar(value=0)
         self.look_tabs = self.frame(pb)
-        self.look_tabs.pack(side="top", fill="x", **pad)
+        self.look_tabs.pack(side="top", fill="x", pady=(self.px(10), 0), **pad)
         self.look_box = self.frame(pb)
         self.look_box.pack(side="top", fill="x", **pad)
         self._show_looks(self.look_section)
@@ -659,13 +663,9 @@ class ImageStudio:
         lib = self.studio.lib
         self._rebuild_models()
         self._build_presets()
-        for w in self.char_row.winfo_children():
-            w.destroy()
-        chars = [("", "No character")] + [(c["id"], c["name"]) for c in lib.all("characters")]
-        if self.settings["character"] not in dict(chars):
+        chars = lib.all("characters")
+        if self.settings["character"] not in {c["id"] for c in chars}:
             self.settings["character"] = ""
-        self.choice(self.char_row, chars, self.settings["character"],
-                    self._set_character).pack(side="left")
         for w in self.person_box.winfo_children():
             w.destroy()
         old = {k: (b.get(), s.get()) for k, (b, s, _) in self.idents.items()}
@@ -681,15 +681,22 @@ class ImageStudio:
             if img:
                 portraits[ident["id"]] = img
         self.identity_photos = portraits
-        selected = next((iid for iid, (bv, _, _) in self.idents.items() if bv.get()), "")
-        self.identity_pill = self.choice(self.person_box,
-            [("", "No identity")] + [(i["id"], i["name"]) for i in lib.all("identities")],
-            selected, self._select_identity, images=portraits)
-        self.identity_pill.pack(side="top", anchor="w")
+        # Characters first (a look and a face), then the profiles alone (a
+        # face); a character shows its profile's portrait.
+        people = [("", "No one")] + [("c:" + c["id"], c["name"]) for c in chars]
+        idents = lib.all("identities")
+        if chars and idents:
+            people.append((None, ""))
+        people += [("i:" + i["id"], i["name"]) for i in idents]
+        images = {"i:" + iid: img for iid, img in portraits.items()}
+        images.update({"c:" + c["id"]: portraits[c["identity"]] for c in chars
+                       if c.get("identity") in portraits})
+        self.person_pill = self.choice(self.person_box, people, "", self._pick_from_people,
+                                       images=images, kind="quiet", anchor="w",
+                                       font=self.host.f_title, pady=self.px(9))
+        self.person_pill.pack(side="top", fill="x")
         self.identity_note = self.label(self.person_box, "", "muted", self.host.f_small)
-        self.identity_note.pack(side="top", anchor="w")
-        self.button(self.person_box, "Manage profiles…", self.edit_identities,
-                    kind="ghost").pack(side="top", anchor="w", pady=(self.px(4), 0))
+        self.identity_note.pack(side="top", anchor="w", pady=(self.px(3), 0))
         self._show_identity()
 
         for w in self.style_box.winfo_children():
@@ -945,7 +952,26 @@ class ImageStudio:
         self._show_identity()
         self._recheck()
 
+    def _pick_from_people(self, key):
+        """The person dropdown: "c:<id>" a character (its look and its
+        face), "i:<id>" a profile alone, "" no one."""
+        if key.startswith("c:"):
+            return self._set_character(key[2:])
+        self.settings["character"] = ""
+        self._select_identity(key[2:])
+
+    def _character(self):
+        cid = self.settings["character"]
+        return self.studio.lib.get("characters", cid) if cid else None
+
+    def _face_of(self, rec):
+        """A character's profile, if it still exists."""
+        return rec["identity"] if rec and rec.get("identity") in self.idents else ""
+
     def _select_identity(self, iid):
+        # One dropdown shows one person: another face is not the character.
+        if self._character() is not None and self._face_of(self._character()) != iid:
+            self.settings["character"] = ""
         for key, (bv, _, _) in self.idents.items():
             bv.set(key == iid)
         self._show_identity()
@@ -954,11 +980,12 @@ class ImageStudio:
     def _show_identity(self):
         chosen = [self.studio.lib.get("identities", iid) for iid, (bv, _, _) in self.idents.items()
                   if bv.get()]
-        names = ", ".join(i["name"] for i in chosen)
-        self.identity_pill.set(text=(names or "No identity") + "  ▾")
+        rec = self._character()
+        names = rec["name"] if rec else ", ".join(i["name"] for i in chosen)
+        self.person_pill.set(text=(names or "No one") + "  ▾")
         count = sum(len(i["references"]) for i in chosen)
         self.identity_note.config(text=("%d reference photos · face applied automatically" % count
-                                       if count else "Add reference photos in Manage profiles." if chosen
+                                       if count else "Add photos in Image references." if chosen
                                        else "Choose a person for this picture."))
 
     def _prepare_profiles(self):
@@ -974,10 +1001,10 @@ class ImageStudio:
     def _set_character(self, cid):
         """Put a character's look on the form: every slot and slider it keeps
         (blank where it has none, so the last one's beard does not stay),
-        its item pictures, and its identity ticked. The expression is the
-        picture's, and stays."""
+        its item pictures, and its identity ticked (or none, when it has
+        none). The expression is the picture's, and stays."""
         self.settings["character"] = cid
-        rec = self.studio.lib.get("characters", cid) if cid else None
+        rec = self._character()
         if rec is not None:
             for key in ig.CHARACTER_KEYS:
                 if key in self.sliders:
@@ -985,9 +1012,9 @@ class ImageStudio:
                 else:
                     self.text[key].set(rec["looks"].get(key, ""))
             self.item_refs = dict(rec["item_refs"])
-            if rec["identity"] in self.idents:
-                self._select_identity(rec["identity"])
+            self._select_identity(self._face_of(rec))
             self._show_looks(self.look_section)
+        self._show_identity()
         self._recheck()
 
     def look_rows(self, parent, slots, vars_, changed, chips=False, bg="bg"):
@@ -1089,18 +1116,20 @@ class ImageStudio:
 
     def _show_looks(self, section):
         """One section of the look on the form at a time, as the creator's
-        tabs are."""
+        tabs are - the ones in FORM_LOOKS."""
+        if section not in dict(FORM_LOOKS):
+            section = FORM_LOOKS[0][0]
         self.look_section = section
         for box in (self.look_tabs, self.look_box):
             for w in box.winfo_children():
                 w.destroy()
-        for i, (name, _) in enumerate(ig.LOOKS):
+        for i, (name, _) in enumerate(FORM_LOOKS):
             self.button(self.look_tabs, name, lambda n=name: self._show_looks(n),
                         kind="accent" if name == section else "quiet",
                         font=self.host.f_small, padx=self.px(6), pady=self.px(2)).grid(
-                row=i // 3, column=i % 3, sticky="ew", padx=(0, self.px(3)),
+                row=0, column=i, sticky="ew", padx=(0, self.px(3)),
                 pady=(self.px(3), self.px(2)))
-        for col in range(3):
+        for col in range(len(FORM_LOOKS)):
             self.look_tabs.columnconfigure(col, weight=1)
         relight = [None]
 

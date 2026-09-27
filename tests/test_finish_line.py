@@ -262,7 +262,7 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         with patch.object(ff, 'available', return_value=False):
             errors = self.studio.preview(self.settings(), self.backend('5090')).errors
         self.assertTrue(any('FaceFusion' in e for e in errors))
-        self.assertTrue(any('Manage profiles' in e and 'reference' in e for e in errors))
+        self.assertTrue(any('Image references' in e and 'reference' in e for e in errors))
 
     def test_cancel_returns_while_backend_interrupt_is_blocked(self):
         entered, release, returned = threading.Event(), threading.Event(), threading.Event()
