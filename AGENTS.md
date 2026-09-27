@@ -61,6 +61,8 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_milanote.py`** — the Milanote tab, which holds a window and has no bridge: a
   Chrome/Edge `--app` window re-parented into the tab, and uploads dropped onto the board
   over DevTools. See *The tab that holds a window*.
+- **`studio_comfy_view.py`** — the Image Studio's Nodes view: the same kind of window on
+  a backend's ComfyUI, with a picture's graphs loaded into it. See *The Nodes view*.
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
@@ -1226,6 +1228,42 @@ Older servers without `/global/health` are read from `/doc` instead.
 
 The window does not stop the container when it closes, just as it does not close After
 Effects. `docker stop studio-opencode` does; the workspace and the session volume stay.
+
+### The Nodes view: a picture's graph in ComfyUI's own editor
+
+Gavin asked (2026-09-27) to see the pipeline's nodes and edit specifics "from the app",
+like the Milanote tab. **Nodes** (beside Fix a spot, and Show nodes on the picture's
+right-click menu) swaps the whole tab body, form and list included, for ComfyUI's page
+with the selected picture's graph loaded. **← Picture** puts the form back. The window
+stays open until the tab closes, so the second Nodes is instant. `studio_comfy_view.py`:
+
+- **The window is the Milanote one.** `ComfyBrowser` subclasses `studio_milanote.Browser`
+  (`name` for its sentences, `target()` for which page). It has its own profile,
+  `%LOCALAPPDATA%\StudioAssistant\comfyui-browser` (`STUDIO_COMFY_PROFILE`). Embedding,
+  clipping the caption with `measure()`/`fit()`, and `release()` before the frame goes
+  all work as *The tab that holds a window* says. A picture made on the other backend
+  navigates the same window there.
+- **A graph goes in through `app.loadApiJson(graph, name)`** over DevTools. It takes the
+  API-format graph exactly as queued and opens it as a workflow tab of its own, the
+  nodes in columns by their links. Loading queues nothing. Run in the page is the
+  user's, and what it makes goes to ComfyUI's output folder, not History. The bar says
+  so.
+- **Wait for the old session, not just for `app`.** The page reopens its last
+  session's workflow tabs about 0.2 s after `app.vueAppReady`, and that restore drew
+  over a graph loaded in between. We saw 10 nodes where 18 were loaded. `READY` also
+  waits for the title to name a workflow. `show()` compares the node count with the
+  graph's and loads once more if they differ.
+- **Fit the view by bounds, not by the Fit View command.** A loaded graph lands
+  wherever the view was, often on empty canvas. `Comfy.Canvas.FitView` animates by
+  frames, which a window out of sight never draws, so it did nothing. `LOAD` calls
+  `ds.fitToBounds` on the nodes' box, with 12% extra on the left for ComfyUI's toolbar.
+- **A record's steps are its graphs** (`graph_steps`), in the order they ran: Try On's
+  garments, then Picture (`graph`), Face pass, Real-face paste, then `passes`.
+  `passes` is new: `_run_pass` appends each `{"label", "graph"}` to `Job.passes`, and
+  `record_for` saves them. That covers eyes, hands, glasses, Fix a spot's spots and the
+  Visual Critic's redraws. Records from before this change have no `passes`, only
+  their other steps. Every PNG ComfyUI saved also carries its own graph in a `prompt`
+  text chunk. Dragging a picture onto any ComfyUI page opens that last step.
 
 ### The Scene Builder: a stage for the Image Studio
 
