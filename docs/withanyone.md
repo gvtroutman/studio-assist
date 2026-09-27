@@ -49,8 +49,19 @@ node, so repeat renders pay the model load cost.
 `comfy_nodes/studio_withanyone` wraps the port's FLUX pipeline with explicit
 photo selection, local model paths, CPU reference encoders, cancellation and
 GPU cleanup. The upstream license is copied alongside its code. The recipe uses
-25 steps, guidance 4, and the port's 0.8 SigLIP / 0.2 ArcFace weighting. All
-settings and uploaded-reference paths are saved in normal Image Studio History.
+25 steps, guidance 4, and SigLIP weight 1.0 (ArcFace `1 - siglip_weight`, so 0).
+All settings and uploaded-reference paths are saved in normal Image Studio History.
+
+The SigLIP weight is upstream's "Resemblance in Spirit <-> Resemblance in Form"
+slider. SigLIP carries the reference's face as it looks (shape, expression,
+makeup, glasses, hair); ArcFace carries only an identity vector and loses hair,
+skin, age and build unless the words say them. Upstream's demo defaults it to
+1.0 and says identity is also better kept that way. At the ComfyUI port's 0.8
+the likeness was weaker than the user wanted (2026-09-27: "not as strong as i'd
+like"), so the recipe now uses 1.0. Not yet measured on the 5090. Lower it in the workflow's `defaults` for
+more freedom (a stylised picture, a changed hairstyle). The node's own default
+changed with it; an older node copy on a backend still takes the workflow's
+value, so reinstalling is not needed for the change.
 
 `tools/try_withanyone.py` makes an isolated trial through the same job executor:
 pass one or more `--ref` paths, `--prompt`, and `--output`. It refuses to run

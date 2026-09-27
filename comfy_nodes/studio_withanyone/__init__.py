@@ -40,7 +40,7 @@ class StudioWithAnyone:
             "height": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 16}),
             "steps": ("INT", {"default": 25, "min": 1, "max": 100}),
             "guidance": ("FLOAT", {"default": 4.0, "min": 0, "max": 10}),
-            "siglip_weight": ("FLOAT", {"default": 0.8, "min": 0, "max": 1}),
+            "siglip_weight": ("FLOAT", {"default": 1.0, "min": 0, "max": 1}),
             "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
         }, "optional": {"face2": ("IMAGE",), "face3": ("IMAGE",), "face4": ("IMAGE",)}}
 
