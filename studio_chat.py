@@ -4946,6 +4946,9 @@ class Chat(tk.Tk):
             elif pictures:
                 emit("sys", "No vision model is served, so the model has only the names "
                             "and paths of the pictures - it cannot see what is in them.")
+            if self._remember_turn(s, emit):
+                checkpoint()
+                return
             if getattr(s, "direct", False) and getattr(s.app, "served", False):
                 self._direct_turn(s, emit)
                 checkpoint()
@@ -4969,6 +4972,7 @@ class Chat(tk.Tk):
             raise
         finally:
             self.q.put(("stream_end", sid, None))
+            self._publish_lessons(s)      # studio_remember, or a stopped run's lessons
             self._draft_check(s, s.llm or self.llm)
             if lost:
                 # The host went away mid-conversation: the row says so, the
@@ -4996,20 +5000,33 @@ class Chat(tk.Tk):
                     ("Direct is off: the model briefs OpenCode and reports back.\n"), "sys")
         self._apply_status()
 
+    def _remember_turn(self, s, emit):
+        """A message that only states a lesson ("remember ...", "from now on
+        ...") is kept as it stands and answered here, with no model and no
+        OpenCode: handed to the model, "remember X" read as a task and it
+        cycled making tools and plans until stopped (seen live 2026-09-27).
+        Returns True when the message was one."""
+        stated = lessons.explicit_lesson(s.messages[-1]["content"])
+        if not stated or s.notebook is None:
+            return False
+        try:
+            lesson, note = s.notebook.add(stated, "user")
+        except ValueError:
+            return False
+        reply = "Kept for %s: %s%s" % (self._layer_name(s, lesson["text"]), lesson["text"],
+                                       " (already kept)" if note == "already kept" else "")
+        self._publish_lessons(s)
+        emit("token", reply)
+        emit("stream_end", None)
+        s.messages.append({"role": "assistant", "content": reply})
+        s.record.status = "response complete"
+        return True
+
     def _direct_turn(self, s, emit):
         """One message straight to OpenCode: opencode_ask with the user's own
         words, its report as the reply. Every step it wants still comes up as
         an approval card - the bridge asks, whoever sent the task."""
         emit("status", ("OpenCode is working" + ELLIPSIS, "muted", True))
-        stated = lessons.explicit_lesson(s.messages[-1]["content"])
-        if stated and s.notebook is not None:
-            try:
-                lesson, note = s.notebook.add(stated, "user")
-                emit("sys", "Lesson kept (%s): %s" % (self._layer_name(s, lesson["text"]),
-                                                      lesson["text"]))
-                self._publish_lessons(s)
-            except ValueError:
-                pass
         res = s.mcp.call_tool("opencode_ask", {"prompt": s.messages[-1]["content"]})
         reply = eng.mcp_result_to_text(res).strip() or "(OpenCode said nothing)"
         emit("token", reply)
@@ -5150,16 +5167,16 @@ class Chat(tk.Tk):
                                "- start a message with \"remember\" or \"from now on\".\n",
                         "desc")
         else:
-            view.insert("end", "%d lesson%s, oldest first. Every tab for %s carries them.\n"
-                        % (len(kept), "" if len(kept) == 1 else "s", s.app.name), "group")
+            view.insert("end", "%d lesson%s: those for every tab, then %s's%s, each oldest "
+                               "first.\n" % (len(kept), "" if len(kept) == 1 else "s", s.app.name,
+                                             ", then this folder's"
+                                             if getattr(s.app, "workspace", None) else ""), "group")
             for lesson in kept:
                 view.insert("end", "\n")
                 view.window_create("end", window=self._forget_lesson_button(view, s, lesson["text"]))
                 view.insert("end", "  " + lesson["text"] + "\n", "name")
                 view.insert("end", "      %s%s%s\n" % (
-                    {"everywhere": "every tab  ·  ", "folder": "this folder  ·  "}.get(
-                        s.notebook.where(lesson["text"]) if isinstance(s.notebook, lessons.Stack)
-                        else None, ""),
+                    self._layer_name(s, lesson["text"]) + "  ·  ",
                     {"user": "you said so", "model": "the model kept it",
                      "review": "reflected after a task", "error": "a refused call"}[lesson["source"]],
                     "  ·  came up %d more time%s" % (lesson["hits"], "" if lesson["hits"] == 1 else "s")

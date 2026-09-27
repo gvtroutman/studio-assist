@@ -3405,6 +3405,30 @@ class TestGui(unittest.TestCase):
         finally:
             s.mcp, s.messages[:], s.record.status = saved[0], saved[1], saved[2]
 
+    def test_a_remember_message_is_kept_without_the_model(self):
+        """Live 2026-09-27: handed to the model, "remember run tests with pytest
+        -q" read as a task and it cycled making tools until stopped. A message
+        that only states a lesson is kept as said and answered at once."""
+        import studio_lessons as lessons
+        s = self.app.cur()
+        d = tempfile.mkdtemp()
+        emitted = []
+        saved = (s.notebook, list(s.messages), s.record.status)
+        s.notebook = lessons.Stack([("everywhere", lessons.Notebook("e", os.path.join(d, "e.json"))),
+                                    ("folder", lessons.Notebook("f", os.path.join(d, "f.json")))])
+        try:
+            s.messages.append({"role": "user", "content": "rename x to y"})
+            self.assertFalse(self.app._remember_turn(s, lambda *a: emitted.append(a)))
+            s.messages.append({"role": "user", "content": "remember run tests with pytest -q"})
+            self.assertTrue(self.app._remember_turn(s, lambda *a: emitted.append(a)))
+            self.assertEqual(s.notebook.where("run tests with pytest -q"), "folder")
+            self.assertEqual(s.notebook.find("run tests with pytest -q")["source"], "user")
+            self.assertEqual(s.messages[-1]["role"], "assistant")
+            self.assertIn("this folder", s.messages[-1]["content"])
+        finally:
+            s.notebook, s.messages[:], s.record.status = saved
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_a_stop_answers_an_open_approval_as_cancel(self):
         """The bridge's thread waits for the click; a Stop is the user's
         answer too, and the card says so."""
