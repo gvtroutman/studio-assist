@@ -953,6 +953,34 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])   # Z-Image's own encoder
         self.assertEqual(g["fc1_4"]["inputs"]["cfg"], 1.0)
 
+    def test_generate_around_head_keeps_source_position_and_retry(self):
+        lock = {"x": 40, "y": 40, "size": 64}
+        job, client, src = self.fix_job(model="z-image-turbo", around_head=True,
+            spots=[], locks=[lock], words="A woman in a blue coat in a garden")
+        self.assertEqual(job.status, "complete", job.detail)
+        (g,) = client.graphs
+        w, h = ig.file_size_of(src)
+        region = ig.lock_regions(w, h, [lock])[0]
+        self.assertEqual(g["fc1_1"]["inputs"]["crop_region"],
+                         {"x": 0, "y": 0, "width": w, "height": h})
+        self.assertEqual(g["fc1_4"]["inputs"]["latent_image"], ["head_latent", 0])
+        self.assertEqual(g["head_keep0_mask"]["inputs"]["operation"], "subtract")
+        self.assertEqual(g["fl0_1"]["inputs"], {"image": ["fi", 0], "crop_region": region})
+        self.assertEqual(g["fl0_2"]["inputs"]["x"], region["x"])
+        self.assertEqual(g["fl0_2"]["inputs"]["y"], region["y"])
+        self.assertFalse(g["fl0_2"]["inputs"]["resize_source"])
+        self.assertEqual(g["fs"]["inputs"]["images"], ["fl0_2", 0])
+        retry = ig.again(job.record)
+        self.assertTrue(retry["fix"]["around_head"])
+        self.assertEqual(retry["fix"]["locks"], [lock])
+        self.assertEqual(retry["fix"]["image"], src)
+
+    def test_generate_around_head_refuses_missing_head_mark(self):
+        job, client, _ = self.fix_job(around_head=True, spots=[], words="A garden")
+        self.assertEqual(job.status, "failed")
+        self.assertIn("Mark the head", job.detail)
+        self.assertEqual(client.graphs, [])
+
     def test_a_face_fix_blends_through_the_face_and_locks_are_laid_back(self):
         job, client, _ = self.fix_job(target="face", spots=[
             {"x": 40, "y": 40, "size": 64, "box": [30, 30, 20, 20]}],
@@ -1484,6 +1512,23 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
 
 
 class TestFixSpots(unittest.TestCase):
+    def test_head_off_centre_in_landscape_frame_is_not_repositioned(self):
+        wf = ig.load_workflow("flux_dev_baseline")
+        values = {"model": "m", "clip_l": "c", "t5": "t", "vae": "v",
+                  "prompt": "p", "seed": 1, "face_prompt": "A woman in a garden"}
+        region = {"x": 1160, "y": 220, "width": 140, "height": 140}
+        g = ig.around_head_graph(wf, values, [], "source.png", 1536, 1024,
+                                 [region], "oval.png", "test")
+        self.assertEqual(g["head_keep0_mask"]["inputs"]["x"], 942)
+        self.assertEqual(g["head_keep0_mask"]["inputs"]["y"], 178)
+        self.assertEqual(g["head_keep0"]["inputs"]["width"], 115)
+        self.assertEqual(g["head_keep0"]["inputs"]["height"], 115)
+        self.assertEqual(g["fl0_1"]["inputs"]["crop_region"], region)
+        self.assertEqual(g["fl0_2"]["inputs"]["x"], 1160)
+        self.assertEqual(g["fl0_2"]["inputs"]["y"], 220)
+        self.assertEqual(g["fc1_6"]["inputs"]["width"], 1536)
+        self.assertEqual(g["fc1_6"]["inputs"]["height"], 1024)
+
     def test_squares_stay_inside_the_picture(self):
         (c,) = ig.fix_crops(1000, 800, [{"x": 10, "y": 790, "size": 200}])
         self.assertEqual((c["x"], c["y"], c["width"]), (0, 600, 200))
@@ -1637,6 +1682,41 @@ class FakeWeb:
 
 
 class TestLibrary(unittest.TestCase):
+    def test_image_library_keeps_copies_deduplicates_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            src = os.path.join(folder, "reference.png")
+            with open(src, "wb") as f:
+                f.write(PNG)
+            lib = ig.Library(os.path.join(folder, "library"))
+            record = lib.import_image(src)
+            self.assertEqual(record, lib.import_image(src))
+            os.remove(src)
+            reopened = ig.Library(lib.root)
+            self.assertEqual(reopened.all("images"), [record])
+            self.assertEqual(record["name"], "reference.png")
+            with open(record["path"], "rb") as f:
+                self.assertEqual(f.read(), PNG)
+            reopened.save_images([])
+            self.assertEqual(ig.Library(lib.root).all("images"), [])
+            self.assertTrue(os.path.isfile(record["path"]))
+
+    def test_image_library_rejects_non_images_and_rolls_back_failed_save(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            src = os.path.join(folder, "reference.png")
+            lib = ig.Library(os.path.join(folder, "library"))
+            with open(src, "w") as f:
+                f.write("not an image")
+            with self.assertRaises(ValueError):
+                lib.import_image(src)
+            with open(src, "wb") as f:
+                f.write(PNG)
+            with patch.object(ig.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    lib.import_image(src)
+            self.assertEqual(lib.all("images"), [])
+            self.assertEqual(ig.Library(lib.root).all("images"), [])
+
     def test_junk_on_disk_costs_the_record_not_the_list(self):
         d = tempfile.mkdtemp()
         with open(os.path.join(d, "identities.json"), "w") as f:
@@ -2126,6 +2206,77 @@ def _headless():
 
 @unittest.skipIf(_headless(), "no display")
 class TestImageStudioTab(unittest.TestCase):
+    def test_head_photo_opens_position_lock_window_with_kept_source(self):
+        from unittest.mock import patch
+        import studio_images_ui as ui_mod
+        _, ui = self.tab()
+        src = os.path.join(self.dir, "head-choice.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        before = list(ui.studio.lib.all("identities"))
+        with patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()), \
+                patch.object(ui_mod, "FixWindow") as window:
+            ui._import_head_photo(src)
+            self.pump(lambda: not ui.head_photo_busy)
+        kept = window.call_args.args[1]
+        self.assertNotEqual(kept, src)
+        self.assertTrue(os.path.isfile(kept))
+        self.assertEqual(window.call_args.kwargs, {"around_head": True})
+        self.assertEqual(ui.studio.lib.all("identities"), before)
+
+    def test_head_window_requires_lock_and_queues_without_face_redraw(self):
+        from unittest.mock import patch
+        import studio_images_ui as ui_mod
+        _, ui = self.tab()
+        src = os.path.join(self.dir, "head-window.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        settings = dict(ig.default_settings(), model="flux-dev", scene="A woman in a garden")
+        window = ui_mod.FixWindow(ui, src, settings, around_head=True)
+        with patch.object(ui.host, "_spawn") as spawn:
+            window._redraw()
+            spawn.assert_not_called()
+            window.locks = [{"x": 50, "y": 50, "size": 64}]
+            window._redraw()
+        sent = spawn.call_args.args[2]
+        self.assertTrue(sent["fix"]["around_head"])
+        self.assertEqual(sent["fix"]["locks"], window.locks)
+        self.assertEqual(sent["fix"]["spots"], [])
+        self.assertEqual(sent["fix"]["face_swap"], "")
+        self.assertEqual(sent["identities"], [])
+        self.assertFalse(sent["auto_refine"])
+        self.assertFalse(sent["hand_pass"])
+
+    def test_image_library_import_search_and_use_reaches_generation_settings(self):
+        from unittest.mock import patch
+        import studio_images_ui as ui_mod
+        _, ui = self.tab()
+        before = ui.collect()
+        self.addCleanup(lambda: ui.apply(before))
+        src = os.path.join(self.dir, "library-reference.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        window = ui.image_library()
+        self.addCleanup(window.win.destroy)
+        with patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()), \
+                patch.object(ui_mod.ff, "prepare_previews"):
+            window.import_paths([src, src])
+        self.pump(lambda: not window.busy)
+        rec = window.selected()
+        self.assertEqual(rec["name"], "library-reference.png")
+        self.assertEqual(len(window.records), 1)
+        window.search.set("no-match")
+        self.assertIsNone(window.selected())
+        window.search.set("library-reference")
+        for kind, label, _ in ig.REFERENCE_KINDS:
+            window.role.set(label)
+            window.use()
+            self.assertEqual(ui.collect()["references"][kind], rec["path"])
+        self.assertIsNone(ui.pose)
+        window.remove()
+        self.assertTrue(os.path.isfile(rec["path"]))
+        self.assertIsNone(window.selected())
+
     @classmethod
     def setUpClass(cls):
         import studio_chat
@@ -2697,6 +2848,10 @@ class TestImageStudioTab(unittest.TestCase):
         ui._select_identity("one")
         self.assertTrue(ui.idents["one"][0].get())
         self.assertIn("2 reference photos", ui.identity_note.cget("text"))
+        ui._set_model("withanyone")
+        self.assertIn("WithAnyone uses the first photo", ui.identity_note.cget("text"))
+        ui._set_model("z-image-turbo")
+        self.assertNotIn("WithAnyone uses the first photo", ui.identity_note.cget("text"))
         ui._select_identity("two")
         self.assertFalse(ui.idents["one"][0].get())
         self.assertTrue(ui.idents["two"][0].get())

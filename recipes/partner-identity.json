@@ -1,0 +1,17 @@
+{
+  "name": "Partner",
+  "trigger": "parperson",
+  "description": "Broad softly rounded oval face, full cheeks, gently curved jaw and short rounded chin. Fair skin. Medium reddish brown hair swept back. Narrow rectangular glasses with softened corners and fine brown-burgundy rims. Preserve natural facial proportions.",
+  "backend": {"id": "local-5090", "name": "Local ComfyUI", "url": "http://127.0.0.1:8188", "enabled": true, "release_vram": true, "encoder_on_cpu": true, "shares_llm_gpu": false},
+  "seeds": [240927, 240928],
+  "candidates": [
+    {"id": "step-250", "file": "partner_identity_trial_step-250.safetensors", "strength": 1.0},
+    {"id": "step-500", "file": "partner_identity_trial_step-500.safetensors", "strength": 1.0}
+  ],
+  "portrait": "A head-and-shoulders photograph of parperson woman facing the camera with a relaxed expression, reddish brown hair swept back, narrow fine-rimmed rectangular glasses, coral top and cream cardigan, plain pale background, soft neutral light, natural skin texture.",
+  "scenes": [
+    "A head-and-shoulders photograph of parperson woman facing the camera with a broad smile, reddish brown hair swept back, narrow fine-rimmed rectangular glasses, coral top and cream cardigan, plain pale background, soft neutral light, natural skin texture.",
+    "A head-and-shoulders photograph of parperson woman facing the camera with a relaxed expression, reddish brown hair swept back, narrow fine-rimmed rectangular glasses, green dirndl over a white blouse, plain pale background, soft neutral light, natural skin texture.",
+    "A head-and-shoulders photograph of parperson woman facing the camera with a relaxed expression, reddish brown hair swept back, narrow fine-rimmed rectangular glasses, coral top and cream cardigan, meadow background, soft neutral light, natural skin texture."
+  ]
+}

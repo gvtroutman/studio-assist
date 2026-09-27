@@ -426,6 +426,12 @@ recipe; the wrong encoder type or latent gives noise, not an error.
 
 ### The Image Studio: a form over several ComfyUIs
 
+The **Image library…** button opens a reusable image collection (`images.json`).
+Imports copy images into `references/image-library` by content hash; removing an
+entry keeps the file so existing references and history remain usable. The library
+picker assigns a picture to an existing reference slot, so normal workflow support
+checks still apply. The preview menu can add generated images to the library.
+
 The ComfyUI tab is a conversation; the Image Studio (`IMAGE_STUDIO`, an `ImagesSpec`,
 a `PanelSpec` with `images = True`) is a form. It holds no other program's window,
 so `_ensure` just marks it ready and calls `ImageStudio.start()`, the first thing in
@@ -785,6 +791,68 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 
 ### Identity profiles and FaceFusion
 
+People's **Choose head photo…** copies one image on a worker and opens the
+**Generate around head** window. The user marks a square covering the head and
+describes the body and scene. `fix.around_head` runs a full-frame masked redraw
+through a workflow's `face_detail` section; its noise mask excludes the marked
+head. The original square is restored last at native size and coordinates.
+Output retains the source frame dimensions. No face swaps or finishing passes
+follow. Non-PNG sources are converted at full resolution before selection, so
+the preview and generation use the same coordinate system. Unsupported formats
+or workflows fail explicitly. This replaces the earlier likeness-only shortcut.
+
+Identity experiments follow `docs/identity-recipe.md`. The CLI
+`tools/identity_recipe.py` evaluates installed FLUX adapters in an isolated library:
+portrait baseline/checkpoints at multiple seeds first, then scene changes only for
+checkpoints with explicit passing reviews at every seed for the same recipe hash.
+Render completion never certifies likeness. `recipes/partner-identity.json` records
+the current pending trial. The ordinary Generate button is not gated by this tool.
+`tools/prepare_identity_lora.py` remains a Partner-specific preparation script;
+its captions/source ordering must not be reused for another person.
+
+**Build LoRA** (identity editor, beside Use as primary; Sitter 2026-09-27: "a
+simple build lora into the images of an identity. it needs at least 20 pics").
+`studio_lora_train` (stdlib) refuses fewer than `MIN_PHOTOS` (20) photos that
+exist on disk, saves the profile, and runs `tools/train_identity_lora.py` in
+ai-toolkit's venv (`D:\ai-toolkit`) as a `studio_procs` child, so closing the
+app stops it. The script copies each photo upright as RGB PNG (max 1536 px),
+captions it "a photo of <trigger>", and trains ai-toolkit's FLUX example
+settings (rank 16, lr 1e-4, 2000 steps, 512/768/1024) on the diffusers copy
+that `prepare_identity_lora.py` made in `models/flux-local-studio`; `problem()`
+names any missing part. Nothing is downloaded. ComfyUI's models are freed first.
+Progress (`STEP n total`, parsed from tqdm) shows in the tab's note. The file
+lands in the local backend's `lora_dir`, joins the library as an Identity
+LoRA (family flux1), and becomes the person's `lora` and `trigger` - in the
+open editor's copy too, so a later Save keeps it. It is a FLUX LoRA: Z-Image
+pictures park it. The trigger is the profile's own, else `trigger_for(name)`
+(`lilperson`). This assigns on completion, unlike the recipe tool; completion
+is still not a likeness review. Tests: `tests/test_lora_train.py`.
+
+Profiles' editable `description` is visual identity prose used alongside photos,
+not the private `notes`. `identity_description_text` binds it to selected people
+or Scene Builder's linked identities and positions; scene identities supersede
+stale form selections. Keep the scene's clothes, pose and expression separate.
+WithAnyone's optional `reference_mode="identity_consensus"` is an experimental
+node path: primary SigLIP patches, pooled normalized ArcFace directions restored
+to mean raw norm, one region per person. It is not the default and has not passed
+The user's likeness review. `tools/validate_identity_guidance.py` exercises repo
+code against installed vendor code without deployment; see docs/withanyone.md.
+Profiles can opt in with `pool_photos` (People → Image references). The planner
+uses `StudioWithAnyonePooled`, requires that node in preflight, keeps unpooled
+people's primary photo only, and pools each enabled person's own set.
+Scene-linked profiles carry the same setting. Never use the older repeated-token
+experiment as a substitute for this switch.
+
+The identity editor's **Add folder…** imports supported image files directly in
+that folder (not subfolders), in filename order, on a worker. It keeps local
+copies, deduplicates by image bytes against the existing set, and reports failed
+files without dropping successful ones. **Use as primary** moves one selected
+photo to the front; WithAnyone uses that photo, while FaceFusion uses the set.
+Choose clear photos of the same person with one face per photo. Import checks
+file signatures, not face quality or whether the photos show the same person.
+Saving waits for pending imports. `tests/test_identity_import.py` covers copying,
+duplicate handling, partial failures, primary ordering and the save boundary.
+
 Selecting a profile in Image Studio's identity menu applies its saved reference
 photos through FaceFusion after all generation and automatic refinement. The
 profile's optional `avatar` is display-only (generated pictures are allowed);
@@ -865,6 +933,19 @@ to right. A missing photo or invalid region is an error, not a stranger drawn in
 their place. The node refuses reference pictures containing multiple faces.
 `multi_identity` on the workflow adds optional face inputs in `fill`, bypasses
 PuLID injection, disables the face pass and skips the automatic critic redraw.
+It also bypasses FaceFusion validation/swapping and all finishing passes, even
+when selected identity profiles have `face_swap` enabled. A multi-photo experiment
+used all unique library photos (up to eight per person), including linked Scene Builder
+identities. The user rejected its result as not looking like Partner (2026-09-27).
+It is now disabled by default: the normal form uses the first photo and says so.
+Only `experimental_reference_groups` enables it for developer comparisons. Never
+present passing execution tests as likeness validation. The library is preserved.
+`StudioWithAnyoneReferences` groups extra images without resizing;
+`references.py` flattens each group with repeated target regions, so upstream's
+attention mask lets every view guide the same person. This is an experimental
+multi-reference extension, not upstream's default. Missing files and ambiguous
+source faces fail explicitly; History retains every photo. Install both node
+Python files and restart ComfyUI; old nodes fail grouped-job preflight.
 Scene Builder's `takes` includes `face_positions` for this workflow: no pose or
 depth map is sent, and the UI says that poses and props come from words.
 

@@ -354,6 +354,8 @@ def clean_identity(d):
     return {
         "id": slug(d.get("id") or d["name"]),
         "name": _str(d["name"]),
+        "description": _str(d.get("description")),
+        "pool_photos": d.get("pool_photos") is True,
         "lora": _str(d.get("lora")),
         "trigger": _str(d.get("trigger")),
         "strength": _num(d.get("strength", 0.85), float, 0.85, -2.0, 2.0),
@@ -475,7 +477,15 @@ def style_example(style):
     return None
 
 
-CLEAN = {"backends": clean_backend, "models": clean_model, "loras": clean_lora,
+def clean_image(d):
+    if not isinstance(d, dict) or not _str(d.get("path")):
+        return None
+    name = _str(d.get("name")) or os.path.basename(d["path"])
+    return {"id": slug(d.get("id") or name), "name": name,
+            "path": _str(d["path"])}
+
+
+CLEAN = {"images": clean_image, "backends": clean_backend, "models": clean_model, "loras": clean_lora,
          "identities": clean_identity, "styles": clean_style,
          "characters": clean_character, "outfits": clean_outfit, "presets": clean_preset}
 
@@ -557,7 +567,7 @@ def _default_models():
                     "t5": "t5xxl_fp16.safetensors", "vae": "ae.safetensors"},
          "backends": {"3090": None},
          "defaults": {"steps": 25, "guidance": 4.0, "width": 1024, "height": 1024},
-         "notes": "One to four people, one clear face photo each. Scene Builder supplies "
+         "notes": "One to four people, one clear reference photo each. Scene Builder supplies "
                   "face positions; words describe poses and clothes. Requires the "
                   "StudioWithAnyone node and weights; initially enabled for the 32 GB 5090."},
         {"id": "z-image-turbo", "label": "Z-Image Turbo", "family": "z-image",
@@ -596,7 +606,7 @@ def _default_styles():
     ]
 
 
-DEFAULTS = {"backends": _default_backends, "models": _default_models, "loras": list,
+DEFAULTS = {"images": list, "backends": _default_backends, "models": _default_models, "loras": list,
             "identities": list, "styles": _default_styles, "characters": list,
             "outfits": _default_outfits, "presets": list}
 
@@ -703,6 +713,68 @@ class Library:
         with open(path, "rb") as f:
             data = f.read()
         return self.keep_bytes(data, os.path.splitext(path)[1].lower(), owner)
+
+    def import_identity_photos(self, paths, owner, existing=()):
+        """Copy a curated set, counting duplicate bytes only once, in input order.
+
+        File failures are reported individually so one bad photo cannot hide the
+        rest. This performs disk IO and belongs on the editor's worker thread.
+        """
+        seen, added, errors = set(), [], []
+        duplicates = 0
+        for path in existing:
+            try:
+                with open(path, "rb") as f:
+                    seen.add(hashlib.sha256(f.read()).digest())
+            except OSError:
+                pass
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                ext = picture_ext(data)
+                if not ext:
+                    raise ValueError("Not a supported image (PNG, JPEG, WebP, GIF or BMP).")
+                digest = hashlib.sha256(data).digest()
+                if digest in seen:
+                    duplicates += 1
+                    continue
+                kept = self.keep_bytes(data, ext, owner)
+                seen.add(digest)
+                added.append(kept)
+            except (OSError, ValueError) as exc:
+                errors.append("%s: %s" % (os.path.basename(path), exc))
+        return {"added": added, "duplicates": duplicates, "errors": errors}
+
+    def import_image(self, path):
+        """Keep a reusable picture; deduplicate by content, preserving its name.
+        Only publish the new list in memory after it has been saved to disk.
+        """
+        with open(path, "rb") as f:
+            data = f.read()
+        ext = picture_ext(data)
+        if not ext:
+            raise ValueError("Choose a PNG, JPEG, WebP, GIF or BMP image.")
+        kept = self.keep_bytes(data, ext, "image-library")
+        return self.register_image(kept, os.path.basename(path))
+
+    def register_image(self, kept, name):
+        """Publish an already copied image (the UI copies on its worker)."""
+        existing = next((r for r in self.all("images") if r["path"] == kept), None)
+        if existing:
+            return existing
+        record = clean_image({"name": name, "path": kept})
+        record["id"] = unique_id(record["id"], {r["id"] for r in self.all("images")})
+        self.save_images(self.all("images") + [record])
+        return record
+
+    def save_images(self, records):
+        previous = self.data["images"]
+        try:
+            self.save("images", records)
+        except (OSError, ValueError):
+            self.data["images"] = previous
+            raise
 
     def keep_bytes(self, data, ext, owner):
         """A picture's bytes under references/<owner>, named by their hash, so
@@ -1350,11 +1422,25 @@ def fill(wf, values, loras=()):
     graph = copy.deepcopy(wf["graph"])
     if wf.get("multi_identity"):
         sampler = graph[wf["multi_identity"]["sampler"]]["inputs"]
+        if v.get("identity_pooling"):
+            graph[wf["multi_identity"]["sampler"]]["class_type"] = "StudioWithAnyonePooled"
         for index in range(2, wf["multi_identity"]["max_people"] + 1):
             key = "face%d" % index
             if v.get(key):
                 graph[key] = {"class_type": "LoadImage", "inputs": {"image": v[key]}}
                 sampler[key] = [key, 0]
+        for index, keys in enumerate(v.get("identity_reference_groups") or [], 1):
+            previous = None
+            for key in keys[1:]:
+                graph[key] = {"class_type": "LoadImage", "inputs": {"image": v[key]}}
+                nid = key + "_group"
+                inputs = {"image": [key, 0]}
+                if previous:
+                    inputs["previous"] = previous
+                graph[nid] = {"class_type": "StudioWithAnyoneReferences", "inputs": inputs}
+                previous = [nid, 0]
+            if previous:
+                sampler["references%d" % index] = previous
     chain = wf.get("lora_chain") or {}
     if chain:
         model, clip = chain.get("model"), chain.get("clip")
@@ -1654,6 +1740,7 @@ def clean_fix(fix):
             and all(isinstance(x, (int, float)) and math.isfinite(x) and 0 <= x <= 1 for x in point)):
         point = None
     return {"image": _str(fix.get("image")), "target": target, "tone": tone,
+            "around_head": fix.get("around_head") is True,
             "words": _str(fix.get("words")), "strength": strength, "spots": spots,
             "locks": locks, "face_swap": _str(fix.get("face_swap")), "face_point": point}
 
@@ -1663,6 +1750,8 @@ def fix_words(fix):
     a photo"."""
     f = clean_fix(fix)
     n = len(f["spots"])
+    if f["around_head"]:
+        return "generate around the locked head"
     if not n and f["face_swap"]:
         return "a face swap"
     if f["words"]:
@@ -1720,6 +1809,37 @@ def lock_regions(width, height, locks):
     """Each lock square -> the region of the original laid back last."""
     return [{k: c[k] for k in ("x", "y", "width", "height")}
             for c in fix_crops(width, height, locks)]
+
+
+def around_head_graph(wf, values, loras, image, width, height, locks, oval, prefix):
+    """Inpaint the original frame outside locked head squares, then restore
+    those squares at native resolution. No resize or later pass can move them.
+    """
+    if not locks:
+        raise ValueError("Mark the head to keep before generating around it.")
+    scale = min(1.0, (1.05e6 / float(width * height)) ** 0.5)
+    ew, eh = (max(64, int(v * scale) // 16 * 16) for v in (width, height))
+    crop = {"x": 0, "y": 0, "width": width, "height": height,
+            "mask": False, "edit": (ew, eh)}
+    g = face_graph(wf, values, loras, image, [crop], oval, prefix, locks=locks)
+    g["head_noise"] = {"class_type": "SolidMask", "inputs": {
+        "value": 1.0, "width": ew, "height": eh}}
+    mask = ["head_noise", 0]
+    for i, r in enumerate(locks):
+        x, y = int(r["x"] * ew / width), int(r["y"] * eh / height)
+        right = min(ew, math.ceil((r["x"] + r["width"]) * ew / width))
+        bottom = min(eh, math.ceil((r["y"] + r["height"]) * eh / height))
+        key = "head_keep%d" % i
+        g[key] = {"class_type": "SolidMask", "inputs": {
+            "value": 1.0, "width": right - x, "height": bottom - y}}
+        g[key + "_mask"] = {"class_type": "MaskComposite", "inputs": {
+            "destination": mask, "source": [key, 0], "x": x, "y": y,
+            "operation": "subtract"}}
+        mask = [key + "_mask", 0]
+    g["head_latent"] = {"class_type": "SetLatentNoiseMask", "inputs": {
+        "samples": ["fc1_3", 0], "mask": mask}}
+    g["fc1_4"]["inputs"]["latent_image"] = ["head_latent", 0]
+    return g
 
 
 def found_spots(width, height, boxes, kind):
@@ -3594,14 +3714,53 @@ def save_critic_memory(lib, memory):
         pass
 
 
-def plan_identities(p, settings, identities, values):
+def identity_description_text(settings, library, identities):
+    """Bind saved visual descriptions to the same people used for references.
+
+    Scene-linked identities take precedence over stale form selections. Notes
+    and avatars are deliberately not prompt inputs.
+    """
+    scene = settings.get("scene_faces")
+    if scene is not None:
+        people = [(library.get("identities", person.get("identity")), person.get("region"))
+                  for person in scene.get("people") or []]
+    else:
+        people = [(ident, None) for ident, _ in identities]
+    parts = []
+    for index, (ident, region) in enumerate(people, 1):
+        if not ident or not ident.get("description"):
+            continue
+        position = ""
+        if isinstance(region, (list, tuple)) and len(region) == 4:
+            try:
+                center = (float(region[0]) + float(region[2])) / 2
+                position = " on the left" if center < .4 else " on the right" if center > .6 else " in the center"
+            except (TypeError, ValueError):
+                pass
+        elif len(people) > 1:
+            position = " from the left"
+        parts.append("Person %d%s (%s), identifying appearance: %s" %
+                     (index, position, ident["name"], ident["description"]))
+    if parts:
+        parts.append("Keep these facial proportions and distinguishing features. "
+                     "Use the scene's requested clothing, pose and expression.")
+    return parts
+
+
+def plan_identities(p, settings, identities, values, library=None):
     """Keep each photo paired with its own position; never silently drop a person."""
     scene = settings.get("scene_faces")
     if scene is not None:
-        people = list(scene.get("people") or [])
+        people = []
+        for person in scene.get("people") or []:
+            ident = library.get("identities", person.get("identity")) if library else None
+            people.append(dict(person, photos=(ident.get("references") if ident else
+                                               person.get("photos")) or [],
+                               pool_photos=bool(ident and ident.get("pool_photos"))))
     else:
         people = [{"name": ident["name"],
-                   "face": (ident["references"] or [""])[0]}
+                   "face": (ident["references"] or [""])[0], "photos": ident["references"],
+                   "pool_photos": ident.get("pool_photos", False)}
                   for ident, _ in identities]
         if not people and (settings.get("references") or {}).get("face"):
             people = [{"name": "Person", "face": settings["references"]["face"]}]
@@ -3610,14 +3769,28 @@ def plan_identities(p, settings, identities, values):
         p.errors.append("WithAnyone needs one to %d people with individual face photos; "
                         "this request has %d." % (limit, len(people)))
         return
-    boxes = []
+    boxes, groups = [], []
+    pooling = any(person.get("pool_photos") for person in people)
+    values["identity_pooling"] = pooling
     width, height = int(values.get("width", 1024)), int(values.get("height", 1024))
     for index, person in enumerate(people, 1):
         name = person.get("name") or "Person %d" % index
-        path = person.get("face")
-        if not path or not os.path.isfile(path):
+        paths = list(dict.fromkeys([p for p in [person.get("face")] +
+                                              list(person.get("photos") or []) if p]))
+        if not paths or any(not os.path.isfile(path) for path in paths):
             p.errors.append("%s needs an existing face photo for WithAnyone. Set Face in "
                             "Scene Builder or add a photo to their identity profile." % name)
+            continue
+        use_set = person.get("pool_photos") or (
+            settings.get("experimental_reference_groups", False) and not pooling)
+        if len(paths) > 1 and not use_set:
+            p.notes.append("%s: using the first reference photo. Combining multiple views is "
+                           "experimental and failed likeness review; additional library photos "
+                           "are kept but not blended." % name)
+            paths = paths[:1]
+        if len(paths) > 8:
+            p.errors.append("%s has %d reference photos; WithAnyone supports up to 8 per person."
+                            % (name, len(paths)))
             continue
         box = person.get("region")
         if scene is None:
@@ -3636,12 +3809,24 @@ def plan_identities(p, settings, identities, values):
         if not valid:
             p.errors.append("%s needs a visible face position inside the frame for WithAnyone." % name)
             continue
-        key = "face%d" % index
-        p.images[key] = path
-        p.references[key] = path
+        keys = []
+        for photo_index, path in enumerate(paths, 1):
+            key = "face%d" % index + ("_ref%d" % photo_index if photo_index > 1 else "")
+            p.images[key] = path
+            p.references[key] = path
+            keys.append(key)
+        groups.append(keys)
         boxes.append(box)
-        p.notes.append("WithAnyone person %d: %s." % (index, name))
+        p.notes.append("WithAnyone person %d: %s, %d reference photo%s in one face region."
+                       % (index, name, len(paths), "s" if len(paths) != 1 else ""))
+        if len(paths) > 1:
+            if pooling:
+                p.notes.append("%s: primary photo supplies appearance; %d photos guide pooled identity."
+                               % (name, len(paths)))
+            p.warnings.append("Experimental %s for %s; likeness has not passed review." %
+                              ("photo pooling" if pooling else "multi-photo blending", name))
     values["identity_boxes"] = json.dumps(boxes)
+    values["identity_reference_groups"] = groups
     values["sampler"], values["scheduler"] = "WithAnyone", "flow matching"
     if width > 2048 or height > 2048:
         p.errors.append("WithAnyone supports at most 2048 pixels on either side.")
@@ -3821,6 +4006,10 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     parts = [x for x in (view_text(s.get("view"), posed),
                          ", ".join(x for x in (named, person) if x), scene,
                          _field(s, "camera")) if x]
+    descriptions = identity_description_text(s, lib, idents)
+    parts.extend(descriptions)
+    if descriptions:
+        p.notes.append("Included saved identity descriptions with the reference photos.")
     if posed and clean_view(s.get("view")):
         p.warnings.append("The drawn pose decides the framing and which way the person "
                           "faces; the Camera gives only its height. Zoom the figure "
@@ -3897,7 +4086,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     # ------------------------------------------------------- references
     refs = {k: x for k, x in (s["references"] or {}).items() if x}
     if wf.get("multi_identity"):
-        plan_identities(p, s, idents, v)
+        plan_identities(p, s, idents, v, lib)
+        if v.get("identity_pooling") and nodes is not None and "StudioWithAnyonePooled" not in nodes:
+            p.errors.append("Update the WithAnyone node on %s and restart ComfyUI to use photo pooling."
+                            % backend["name"])
+        if nodes is not None and any(len(g) > 1 for g in v.get("identity_reference_groups", [])):
+            if "StudioWithAnyoneReferences" not in nodes:
+                p.errors.append("Update the WithAnyone node on %s and restart ComfyUI to use "
+                                "multiple reference photos per person." % backend["name"])
         refs.pop("face", None)  # handled per person, never reduced to the first profile
     if "face" not in refs and not wf.get("multi_identity"):
         for ident, _ in idents:
@@ -4846,7 +5042,8 @@ class Studio:
             return None
         p = compose(settings, self.lib, b, self.inventories.get(b["id"]),
                     self.workflow_loader, self.nodes.get(b["id"]))
-        p.errors.extend(facefusion.profile_errors(facefusion.selected(self.lib, settings)))
+        if not (p.workflow or {}).get("multi_identity"):
+            p.errors.extend(facefusion.profile_errors(facefusion.selected(self.lib, settings)))
         return p
 
     def face_inputs(self, settings):
@@ -4958,7 +5155,8 @@ class Studio:
                        self.workflow_loader, self.nodes.get(b["id"]))
         job.plan = plan
         import studio_facefusion as facefusion
-        profiles = facefusion.selected(self.lib, job.settings)
+        profiles = ([] if (plan.workflow or {}).get("multi_identity") else
+                    facefusion.selected(self.lib, job.settings))
         plan.errors.extend(facefusion.profile_errors(profiles))
         if plan.errors:
             return self.queue._finish(job, "failed", " ".join(plan.errors))
@@ -5067,7 +5265,8 @@ class Studio:
             pictures = self.finish_profiles(job, graph, pictures, profiles, say)
             if pictures is None:
                 return
-        pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+        if not plan.workflow.get("multi_identity"):
+            pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
         self.save_result(job, self.record_for(job, graph), pictures)
         job.progress = 1.0
         self.queue._finish(job, "complete",
@@ -5335,6 +5534,7 @@ class Studio:
         b, s = job.backend, job.settings
         fix = clean_fix(s.get("fix"))
         src = fix["image"]
+        around = fix["around_head"]
         swaps = [sp for sp in fix["spots"] if sp.get("photo")]
         plain = [sp for sp in fix["spots"] if not sp.get("photo")]
         face, who, refs = "", None, []
@@ -5352,7 +5552,11 @@ class Studio:
             pass
         elif not src or not os.path.isfile(src):
             problem = "The picture to fix (%s) is not on this PC." % (src or "none")
-        elif not fix["spots"] and not face:
+        elif around and (not fix["locks"] or fix["spots"] or fix["face_swap"]):
+            problem = "Mark the head to keep; this mode cannot also redraw spots or swap faces."
+        elif around and not fix["words"]:
+            problem = "Describe the body and scene to generate around the head."
+        elif not around and not fix["spots"] and not face:
             problem = "Click the part of the picture to redraw."
         else:
             gone = [sp["photo"] for sp in swaps if not os.path.isfile(sp["photo"])]
@@ -5367,14 +5571,18 @@ class Studio:
             problem = "Could not read the size of %s." % src
         plan = swap_wf = None
         if not problem:
-            plan = compose(self.fix_base(s), self.lib, b, self.inventories.get(b["id"]),
+            base = self.fix_base(s)
+            if around:
+                base.update(identities=[], character="", scene_faces={}, hand_pass=False)
+            plan = compose(base, self.lib, b, self.inventories.get(b["id"]),
                            self.workflow_loader, self.nodes.get(b["id"]))
             job.plan = plan
             if plan.errors:
                 problem = " ".join(plan.errors)
-            elif plain and not plan.workflow.get("face_detail"):
+            elif (plain or around) and not plan.workflow.get("face_detail"):
                 problem = ("The %s workflow has no redraw section, so its pictures cannot "
-                           "be fixed." % plan.workflow.get("label"))
+                           "be fixed. Choose a redraw-capable model such as Z-Image HQ."
+                           % plan.workflow.get("label"))
         if face and not problem and not self.sam3_on(b):
             problem = ("The face swap finds the face with SAM3, and %s has no SAM3 "
                        "checkpoint." % b["name"])
@@ -5405,6 +5613,14 @@ class Studio:
             locks = lock_regions(size[0], size[1], fix["locks"])
             values["filename_prefix"] = "ImageStudio/fix_%s" % job.id
             graphs = []
+            if around:
+                values.update(width=size[0], height=size[1], face_prompt=fix["words"] +
+                              ". Keep the existing head in its original position and size; "
+                              "build the body and scene around it.",
+                              face_denoise=fix["strength"], sam3=None, match_tone=0)
+                graphs.append(("Generating around the locked head", around_head_graph(
+                    plan.workflow, values, plan.loras, image, size[0], size[1], locks,
+                    oval, values["filename_prefix"])))
             if swaps:
                 crops = fix_crops(size[0], size[1], [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
                                                      for sp in swaps])
@@ -6419,6 +6635,7 @@ class Studio:
             ident = self.lib.get("identities", sel.get("id") if isinstance(sel, dict) else sel)
             if ident:
                 idents.append({"id": ident["id"], "name": ident["name"],
+                               "description": ident.get("description", ""),
                                "trigger": ident["trigger"],
                                "strength": (sel.get("strength") if isinstance(sel, dict)
                                             and sel.get("strength") is not None
