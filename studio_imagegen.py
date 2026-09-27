@@ -28,8 +28,10 @@ driven and tested without a window. The pieces, each apart from the next:
 Stdlib only, like the rest of the app.
 """
 
+import base64
 import copy
 import hashlib
+import html
 import json
 import math
 import os
@@ -695,15 +697,28 @@ class Library:
     def keep_reference(self, path, owner):
         """A copy of a reference picture under the studio folder, so a profile
         does not break when the original is moved or deleted. -> the copy."""
-        import shutil
         with open(path, "rb") as f:
-            digest = hashlib.sha1(f.read()).hexdigest()[:16]
+            data = f.read()
+        return self.keep_bytes(data, os.path.splitext(path)[1].lower(), owner)
+
+    def keep_bytes(self, data, ext, owner):
+        """A picture's bytes under references/<owner>, named by their hash, so
+        the same picture twice is one file. -> its path."""
         folder = os.path.join(self.root, "references", slug(owner))
         os.makedirs(folder, exist_ok=True)
-        dest = os.path.join(folder, digest + os.path.splitext(path)[1].lower())
+        dest = os.path.join(folder, hashlib.sha1(data).hexdigest()[:16] + ext)
         if not os.path.exists(dest):
-            shutil.copyfile(path, dest)
+            with open(dest, "wb") as f:
+                f.write(data)
         return dest
+
+    def keep_link(self, url, owner, opener=None):
+        """A picture from the web kept as `keep_reference` keeps a file: the
+        link is downloaded (`fetch_picture`), and from then on the picture is
+        a file under references/, so a link that dies later breaks nothing.
+        -> its path; LinkError says in words why there is none."""
+        data, ext = fetch_picture(url, opener)
+        return self.keep_bytes(data, ext, owner)
 
     def merge_loras(self, backend_id, filenames, lora_dir=""):
         """Add every LoRA a backend has that the library does not know, with
@@ -725,6 +740,137 @@ class Library:
             self.data["loras"].append(rec)
             added += 1
         return added
+
+
+# ============================================================ pictures from links
+
+PICTURE_BYTES = 40 * 1024 * 1024      # a bigger "picture" is not one worth keeping
+PICTURE_TIMEOUT = 30
+# A browser's name: a share of image hosts and shops answer anything else with
+# 403 or a bot check (the research bridge's search found the same).
+PICTURE_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+# Where a page names its own picture, most telling first: a shop's product,
+# a profile's photo, an article's lead picture.
+PAGE_PICTURE = ("og:image:secure_url", "og:image:url", "og:image", "twitter:image",
+                "twitter:image:src")
+
+
+class LinkError(ValueError):
+    """A link that gave no picture, said in words."""
+
+
+def picture_ext(data):
+    """The extension a picture's own first bytes say it is, or "" for
+    anything that is not a picture ComfyUI will read."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:2] == b"BM":
+        return ".bmp"
+    return ""
+
+
+def picture_link(url):
+    """A pasted link made one to fetch: http(s) (https when none is said),
+    no credentials in it, and a Google Images result taken to the picture it
+    shows. A data: link is returned as it is. -> url, or LinkError."""
+    url = (url or "").strip().strip("<>\"'")
+    if not url:
+        raise LinkError("Paste a link to a picture first.")
+    if url[:5].lower() == "data:":
+        return url
+    if "://" not in url:
+        url = "https://" + url.lstrip("/")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https"):
+        raise LinkError("Only http and https links are downloaded, not %s." % parts.scheme)
+    if "@" in parts.netloc:
+        raise LinkError("A link with a name and password in it is not downloaded.")
+    if not parts.hostname:
+        raise LinkError("%s has no website in it." % url)
+    shown = urllib.parse.parse_qs(parts.query).get("imgurl")
+    if shown and "google." in parts.hostname and parts.path.endswith("/imgres"):
+        return picture_link(shown[0])
+    return url
+
+
+def page_picture(text, base):
+    """The picture a web page names as its own (`PAGE_PICTURE`, from its
+    <meta> tags), as a whole link, or "". A shop's or a profile's page link
+    is what most people copy, not the picture's."""
+    found = {}
+    for tag in re.findall(r"<meta\b[^>]*>", text, re.I):
+        attrs = {k.lower(): v for k, _, v in re.findall(
+            r"""([\w:-]+)\s*=\s*(["'])(.*?)\2""", tag, re.S)}
+        key = (attrs.get("property") or attrs.get("name") or "").lower()
+        if key in PAGE_PICTURE and attrs.get("content") and key not in found:
+            found[key] = attrs["content"]
+    for key in PAGE_PICTURE:
+        if key in found:
+            return urllib.parse.urljoin(base, html.unescape(found[key]).strip())
+    return ""
+
+
+def fetch_picture(url, opener=None, _page=True):
+    """A picture's bytes from a link -> (bytes, extension). The link may be
+    the picture's, a page that names one (`page_picture`, followed once), a
+    Google Images result or a data: link. What comes back must be a picture
+    by its own bytes (`picture_ext`), not by what the server says; anything
+    else is a LinkError that says what came instead."""
+    url = picture_link(url)
+    ctype, final, host = "", url, urllib.parse.urlsplit(url).hostname
+    if url[:5].lower() == "data:":
+        head, _, body = url.partition(",")
+        try:
+            data = (base64.b64decode(body) if head.lower().endswith(";base64")
+                    else urllib.parse.unquote_to_bytes(body))
+        except ValueError:
+            raise LinkError("That data: link is not a picture.")
+    else:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": PICTURE_AGENT, "Accept-Language": "en",
+            "Accept": "image/png,image/jpeg,image/webp,image/*;q=0.9,text/html;q=0.5,"
+                      "*/*;q=0.3"})
+        try:
+            with (opener or urllib.request.urlopen)(req, timeout=PICTURE_TIMEOUT) as r:
+                data = r.read(PICTURE_BYTES + 1)
+                final = r.geturl() if hasattr(r, "geturl") else url
+                ctype = (r.headers.get("Content-Type") or "") if hasattr(r, "headers") else ""
+        except urllib.error.HTTPError as e:
+            raise LinkError("%s answered HTTP %d (%s)%s." % (
+                host, e.code, e.reason,
+                "; the site may not let pictures be downloaded, so save the picture "
+                "and upload it instead" if e.code in (401, 403) else ""))
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, TimeoutError):
+                raise LinkError("%s did not answer within %d seconds."
+                                % (host, PICTURE_TIMEOUT))
+            raise LinkError("Could not reach %s: %s" % (host, reason))
+        if len(data) > PICTURE_BYTES:
+            raise LinkError("That link is over %d MB; it is not a picture to keep."
+                            % (PICTURE_BYTES // (1024 * 1024)))
+    ext = picture_ext(data)
+    if ext:
+        return data, ext
+    if _page and url[:5].lower() != "data:" and (
+            "html" in ctype.lower() or data.lstrip()[:1] == b"<"):
+        inner = page_picture(data.decode("utf-8", errors="replace"), final)
+        if inner:
+            return fetch_picture(inner, opener, _page=False)
+        raise LinkError("That link is a web page with no picture of its own named in "
+                        "it. Right-click the picture and copy its image address.")
+    if data[4:12] in (b"ftypavif", b"ftypheic", b"ftypmif1", b"ftypheix"):
+        raise LinkError("That picture is AVIF or HEIC, which ComfyUI cannot read. Save "
+                        "it as PNG or JPEG and upload that.")
+    raise LinkError("That link did not give a picture (PNG, JPEG, WebP, GIF or BMP)%s."
+                    % ("; it gave %s" % ctype.split(";")[0] if ctype else ""))
 
 
 def find_preview(lora_dir, filename):
