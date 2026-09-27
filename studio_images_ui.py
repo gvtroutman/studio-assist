@@ -1148,16 +1148,17 @@ class ImageStudio:
             self.item_rows(self.look_box, items, self.item_refs, self._choose_item,
                            self._set_item)
 
-    def item_rows(self, p, items, refs, choose, drop):
+    def item_rows(self, p, items, refs, choose, drop, title="ITEM PICTURES",
+                  empty="Choose an item above to give it a picture."):
         """A row per item worn - its picture, name and file, Picture… and ×:
         what the glasses or the necklace actually look like. The form's look
-        tabs and the creator's both show these; Generate draws from them."""
+        tabs and the creator's both show these, and the creator's Tags tab
+        every one it has; Generate draws from them."""
         o, host = self, self.host
-        o.label(p, "ITEM PICTURES", "faint", host.f_small).pack(
+        o.label(p, title, "faint", host.f_small).pack(
             side="top", fill="x", pady=(o.px(12), o.px(2)))
         if not items:
-            o.label(p, "Choose an item above to give it a picture.", "faint",
-                    host.f_small).pack(side="top", fill="x")
+            o.label(p, empty, "faint", host.f_small).pack(side="top", fill="x")
             return
         for item in items:
             row = o.frame(p)
@@ -3336,10 +3337,13 @@ class CharacterCreator:
     tabs - Body (with the sliders), Face, Hair, Clothes, Accessories - of
     picks to click, each slot also taking free text; a picture per item worn;
     Randomize; and the character sheet, the prompt text it makes, underneath.
-    The anatomy constants have a tab of their own, locked: every character
-    has them. Expressions are not here - they are the picture's, on the form."""
+    Tags are the things on the character - glasses, earrings, a dress, a
+    tattoo - each a word and its picture (`item_refs`), used whenever the
+    word is said (`ig.outfit_of`). The anatomy constants have a tab of their own, locked:
+    every character has them. Expressions are not here - they are the
+    picture's, on the form."""
 
-    SECTIONS = [name for name, _ in ig.LOOKS if name != "Expression"] + ["Constants"]
+    SECTIONS = [name for name, _ in ig.LOOKS if name != "Expression"] + ["Tags", "Constants"]
 
     def __init__(self, owner, looks=None):
         self.owner = o = owner
@@ -3353,11 +3357,12 @@ class CharacterCreator:
         self.name = tk.StringVar()
         self.identity = tk.StringVar()
         self.item_refs = {}
+        self.tag_name = tk.StringVar()
         win = self.win = tk.Toplevel(host)
         win.title("Character creator")
         win.transient(host)
         host._skin(win, bg="bg")
-        win.geometry("%dx%d" % (host._px(940), host._px(680)))
+        win.geometry("%dx%d" % (host._px(1020), host._px(680)))
 
         left = o.frame(win)
         left.pack(side="left", fill="y", padx=o.px(12), pady=o.px(12))
@@ -3493,6 +3498,10 @@ class CharacterCreator:
                 o.label(row, pos, "muted", bg="card").pack(side="left", fill="x")
             self._sheet()
             return
+        if self.section == "Tags":
+            self._tags(p)
+            self._sheet()
+            return
         if self.section == ig.SLIDER_SECTION:
             o.slider_rows(p, self.sl, self._changed)
         slots = [sl for sl in dict(ig.LOOKS)[self.section] if sl[0] in self.vars]
@@ -3508,6 +3517,72 @@ class CharacterCreator:
         Hair has one picture of its own (`items` = ["hair"])."""
         items = items or ig.items_worn({k: self.vars[k].get() for k in keys})
         self.owner.item_rows(p, items, self.item_refs, self._choose_item, self._set_item)
+
+    def _tags(self, p):
+        """Every tag the character has, and a row to make one: a word and the
+        picture it stands for, uploaded then (a tag without a picture is not
+        made) or taken from a tag another character in the library has."""
+        o, host = self.owner, self.owner.host
+        o.label(p, "A tag is something on the person - glasses, earrings, a dress, a "
+                "tattoo - and a picture of it. Say its word in the scene or the look "
+                "(\"glasses\") and Generate draws it from the picture.",
+                "muted", wraplength=o.px(560)).pack(side="top", fill="x", pady=(0, o.px(6)))
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(0, o.px(4)))
+        o.label(row, "New tag", "muted", width=12).pack(side="left")
+        e = host._entry(row, self.tag_name)
+        e.master.pack(side="left", fill="x", expand=True)
+        e.bind("<Return>", lambda ev: self._add_tag())
+        o.button(row, "Upload picture…", self._add_tag, kind="accent").pack(
+            side="left", padx=(o.px(6), 0))
+        shared = self._library_tags()
+        if shared:
+            row = o.frame(p)
+            row.pack(side="top", fill="x", pady=(0, o.px(4)))
+            o.label(row, "From library", "muted", width=12).pack(side="left")
+            o.choice(row, [(i, "%s (%s)" % (name, who))
+                           for i, (name, _, who) in enumerate(shared)], None,
+                     lambda i: self._take_tag(*shared[i][:2])).pack(side="left")
+        o.item_rows(p, sorted(self.item_refs, key=str.lower), self.item_refs,
+                    self._choose_item, self._set_item, title="TAGS",
+                    empty="No tags yet. Name one above and upload its picture.")
+
+    def _tag_key(self, name):
+        """The key a tag is kept under: the one it already has, in any case."""
+        return next((k for k in self.item_refs if k.lower() == name.lower()), name)
+
+    def _add_tag(self):
+        name = " ".join(self.tag_name.get().replace(",", " ").split())
+        if not name:
+            self.status("Name the tag first: the word you will say, like glasses.", "warn")
+            return
+        self._choose_item(self._tag_key(name))
+        if self._tag_key(name) in self.item_refs:
+            self.tag_name.set("")
+            self.status("Tagged %s. Say it in the scene and Generate uses the picture."
+                        % name, "ok")
+
+    def _library_tags(self):
+        """[(tag, picture, character)] the other characters in the library
+        have and this one does not, each picture once."""
+        mine = {k.lower() for k in self.item_refs}
+        out, seen = [], set()
+        for i, rec in enumerate(self.records):
+            if i == self.current:
+                continue
+            for name, path in sorted((rec.get("item_refs") or {}).items()):
+                if (name.lower() in mine or (name.lower(), path) in seen
+                        or not os.path.isfile(path)):
+                    continue
+                seen.add((name.lower(), path))
+                out.append((name, path, rec.get("name") or "(no name)"))
+        return out
+
+    def _take_tag(self, name, path):
+        """Another character's tag, its picture already under references/."""
+        self.item_refs[self._tag_key(name)] = path
+        self.status("Tagged %s, from the library." % name, "ok")
+        self._build()
 
     def _choose_item(self, item):
         path = filedialog.askopenfilename(parent=self.win, title="A picture of the " + item,
@@ -3551,8 +3626,9 @@ class CharacterCreator:
                                        "here, as the prompt will.")
 
     def _randomize(self):
-        """A roll of the dice for the tab shown (every look tab, from Constants)."""
-        tab = None if self.section == "Constants" else [self.section]
+        """A roll of the dice for the tab shown (every look tab, from Tags or
+        Constants)."""
+        tab = None if self.section in ("Tags", "Constants") else [self.section]
         for k, v in ig.random_looks(sections=tab).items():
             (self.sl if k in self.sl else self.vars)[k].set(v)
         self._build()

@@ -2395,18 +2395,57 @@ def clean_outfit(d):
             "accessories": [x for x in map(_item, d.get("accessories") or []) if x]}
 
 
+def _tag_re(tag):
+    words = r"\s+".join(re.escape(w) for w in (tag or "").split())
+    return re.compile(r"(?<![\w-])%s(?:e?s)?(?![\w-])" % words, re.I) if words else None
+
+
+def says(text, tag):
+    """Whether `text` names `tag` in words of its own, any case, a plural
+    allowed: "glasses" is said in "round glasses" and "Glasses on", not in
+    "sunglasses"."""
+    found = _tag_re(tag)
+    return found is not None and found.search(text or "") is not None
+
+
 def outfit_of(settings):
     """The outfit a Generate job is dressed in: the character's pictures of
     what the form has them wearing today - garments in the Clothes slots,
-    the rest as accessories - and the hair picture, when it has one."""
+    the rest as accessories - and the hair picture, when it has one.
+
+    Each picture is a tag (the creator's Tags tab): something on the person
+    - glasses, earrings, a dress, a tattoo - and its picture. A tag counts
+    when a slot holds it exactly, or when its word is said in a slot ("round
+    glasses" for glasses, Traits' "tattoos" for a tattoo) or in the scene
+    ("she pushes her glasses up"). Marks on the skin are accessories here. One said only in the scene is clothing when its word names
+    a garment the Clothes picks do ("red dress": a dress) and nothing worn on
+    the head ("top hat"), else an accessory."""
     refs = {k.lower(): (k, x) for k, x in clean_item_refs(settings.get("item_refs")).items()}
     out = {"clothes": [], "hair": None, "accessories": []}
-    for k in ITEM_SLOTS:
+    used = set()
+    for k in TAG_SLOTS:
         items = split_many(_field(settings, k)) if SLOTS[k][4] else [_field(settings, k)]
         for name in items:
-            if name and name.lower() in refs:
+            if name and name.lower() in refs and name.lower() not in used:
+                used.add(name.lower())
                 out["clothes" if k in CLOTHES_SLOTS else "accessories"].append(
                     {"name": refs[name.lower()][0], "path": refs[name.lower()][1]})
+    # The longer tag first, and what it said is spent: "a rose tattoo" is
+    # the rose tattoo's picture, not the plain tattoo's too.
+    said = {k: _field(settings, k) for k in TAG_SLOTS + ("scene",)}
+    garments = {x.split()[-1].lower() for k in CLOTHES_SLOTS for x in SLOTS[k][3]}
+    for low, (name, path) in sorted(refs.items(), key=lambda kv: -len(kv[0])):
+        if low == HAIR_ITEM or low in used:
+            continue
+        found = _tag_re(name)
+        slot = next((k for k in TAG_SLOTS if found and found.search(said[k])), None)
+        if found is None or slot is None and not found.search(said["scene"]):
+            continue
+        said = {k: found.sub(" ", v) for k, v in said.items()}
+        used.add(low)
+        clothes = (slot in CLOTHES_SLOTS if slot else
+                   not on_head(name) and any(says(name, g) for g in garments))
+        out["clothes" if clothes else "accessories"].append({"name": name, "path": path})
     if HAIR_ITEM in refs:
         out["hair"] = {"path": refs[HAIR_ITEM][1], "words": ""}
     return out
@@ -3042,6 +3081,9 @@ OUTFIT_KEYS = [k for name, slots in LOOKS if name in ("Clothes", "Accessories")
                for k, *_ in slots]
 # The slots a reference picture can show: each item worn or carried.
 ITEM_SLOTS = ("top", "bottom", "outerwear", "footwear", "accessories")
+# ...and where a tag can be said in the look: those, and the marks on the
+# skin (Traits: "tattoos", "nose piercing").
+TAG_SLOTS = ITEM_SLOTS + ("traits",)
 
 
 def _field(s, key):
