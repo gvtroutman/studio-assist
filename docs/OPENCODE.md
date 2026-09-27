@@ -6,6 +6,9 @@ a local LLM, one tab per app. The full guide is `AGENTS.md` (very long - do NOT 
 whole; use grep on it for the one topic you need). This page is what you must know.
 
 ## Where things live
+`docs/CODEMAP.md` maps every module and the functions to start at - read it before
+opening big files (`studio_chat.py`, `studio_agent.py`, `studio_imagegen.py` are 3-7k lines;
+read the one function you need, not the file).
 - `studio_agent.py` - engine: app registry (`APPS`, `AppSpec`), LLM client, MCP client,
   each app's `system_prompt`.
 - `studio_chat.py` - the Tkinter window. `studio_ui.py`, `studio_*_ui.py` - other windows.
