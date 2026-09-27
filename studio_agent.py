@@ -1678,6 +1678,16 @@ HOW THE WORK IS SHAPED
 - A refused step is the user's decision, often with a note saying what they want
   instead. Do not send the same change again; brief OpenCode with the note, or ask
   The user.
+- Each task works in its OWN COPY of the folder (a git worktree on a branch of its
+  own), started from the folder's last commit. Nothing reaches the user's folder until
+  The user merges it. After every ask the tests for the changed files run in the copy
+  and a checkpoint is saved; the reply says how the tests went.
+- When the user says the work is right, call opencode_merge: they see the diff and
+  decide. opencode_undo takes back the last ask (or reverts a merged task);
+  opencode_discard throws a task away. Each asks the user first - never call them on
+  your own initiative.
+- "Always allow" is kept per task. opencode_grants lists what runs without asking;
+  opencode_revoke takes grants back when the user asks.
 
 BRIEFING - what silently produces poor work
 - Brief OpenCode like a programmer: what to change, in which files and functions,
@@ -1694,16 +1704,20 @@ BRIEFING - what silently produces poor work
 - Work takes real time: seconds for a question, minutes for a change, and however
   long the user takes to decide. If an ask hands back at its timeout, follow the
   same session with opencode_wait; do not send the task again.
-- Check what came back before reporting it: opencode_changes lists what is
-  uncommitted, opencode_changes with a path shows that file's diff. Report files by
-  their path in the folder.
+- Check what came back before reporting it: opencode_changes lists what the task
+  changed, opencode_changes with a path shows that file's diff. Report files by their
+  path in the folder, and say whether the tests passed.
+- If the reply says the context is close to full or that OpenCode compacted the
+  session, tell the user; start a new session for the next unrelated job, and when
+  continuing, repeat the goal and files in the prompt.
 
 WHEN SOMETHING IS WRONG
 - If a tool reports it cannot reach OpenCode, call opencode_status once. If that
   fails too, say so plainly and stop: the user starts it with the Start OpenCode
   button in this window. Do not retry in a loop.
 - If the user stopped OpenCode, say what it had done by then and wait for them.
-- opencode_abort stops a session that is running away. What it already changed stays.
+- opencode_abort stops a session that is running away. What it already changed stays
+  in its copy until undone or discarded.
 """ + BASE_RULES
 
 PS_PROMPT = """You are an agent operating a live Photoshop session through tools.
@@ -2474,9 +2488,11 @@ COMFY_GROUPS = {
 
 OPENCODE_GROUPS = {
     "discover": ["opencode_status", "opencode_list_sessions", "opencode_get_session",
-                 "opencode_changes", "opencode_list_files", "opencode_read_file"],
+                 "opencode_changes", "opencode_list_files", "opencode_read_file",
+                 "opencode_grants"],
     # Nothing here edits by itself: OpenCode asks the user before each change.
-    "work": ["opencode_new_session", "opencode_ask", "opencode_wait", "opencode_abort"],
+    "work": ["opencode_new_session", "opencode_ask", "opencode_wait", "opencode_abort",
+             "opencode_merge", "opencode_undo", "opencode_discard", "opencode_revoke"],
 }
 
 PS_GROUPS = {

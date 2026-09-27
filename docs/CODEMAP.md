@@ -52,11 +52,16 @@ Chat tab (studio_chat)  --model briefs-->  studio_opencode_mcp (bridge, stdio)
   `OPENCODE_BRIEF` (= `docs/OPENCODE.md`), `own_repo`, `opencode_exe`,
   `OPENCODE_GROUPS`, the `id="opencode"` entry in `APPS`, `OPENCODE_PROMPT`.
   State (config, password, `last_session`, log) in `%LOCALAPPDATA%\StudioAssistant\opencode`.
-- **Bridge** - `studio_opencode_mcp.py`: `t_ask` -> `prompt` -> `run` (poll loop) ->
-  `settle` (permissions + questions of the session `Family`) -> `ask_permission` /
-  `ask_question` -> `studio_mcp.elicit`; `report` summarises. `ROUTES` is every
-  server route used. Read-only tools: status, sessions, changes, list/read file.
+- **Bridge** - `studio_opencode_mcp.py`: `t_ask` -> `start_task` (git worktree per
+  task, `tasks.json`) -> `prompt` -> `finish` -> `follow` (woken by `Events`, the
+  `/event` stream) -> `settle` (permissions + questions of the session `Family`;
+  `granted`/`add_grant` keep "always") -> `ask_permission` / `ask_question` ->
+  `studio_mcp.elicit`; `report` + `context_report` summarise; `after_ask` runs
+  `tests_for` and makes a `checkpoint`. `t_merge` / `t_undo` / `t_discard` ask through
+  `confirm`. Every session call passes `task_dir(sid)` as `?directory=`. `ROUTES` is
+  every server route used.
 - **Approval UI** - `studio_chat.py`: `_elicit`, `_show_elicit`, `_diff_box`, `_settle_elicit`.
+  Direct mode: `_toggle_direct`, `_direct_turn`.
 - **Add-ons** - `studio_codeaddons.py` (records, `config`, MCP registry / npm / skills
   search and install) and `studio_codeaddons_ui.py` (`AddonsWindow`).
 - **Tests** - `tests/test_opencode.py` (`FakeOpenCode` plays a server),

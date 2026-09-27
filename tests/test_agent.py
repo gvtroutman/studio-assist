@@ -28,12 +28,12 @@ import studio_agent as eng
 APPROVAL = {
     "mode": "form", "message": "OpenCode wants to edit hello.py.",
     "_meta": {"studio/approval": {
-        "kind": "edit", "file": "hello.py", "always_label": "every edit in this session",
+        "kind": "edit", "file": "hello.py", "always_label": "every edit for this task",
         "diff": "Index: C:/x/hello.py\n===\n--- C:/x/hello.py\n+++ C:/x/hello.py\n"
                 "@@ -1 +1 @@\n-print('hi')\n+print('hello')\n"}},
     "requestedSchema": {"type": "object", "properties": {
         "decision": {"type": "string", "enum": ["once", "always", "reject"],
-                     "enumNames": ["Allow once", "Always allow every edit in this session",
+                     "enumNames": ["Allow once", "Always allow every edit for this task",
                                    "Reject"]},
         "note": {"type": "string", "title": "Note for OpenCode"}},
         "required": ["decision"]}}
@@ -3351,7 +3351,7 @@ class TestGui(unittest.TestCase):
         form = s.elicits[-1]
         texts = [w for w in form["widgets"] if isinstance(w, self.mod.Pill)]
         labels = [w.cget("text") for w in texts]
-        self.assertEqual(labels[:3], ["Allow once", "Always allow every edit in this session",
+        self.assertEqual(labels[:3], ["Allow once", "Always allow every edit for this task",
                                       "Reject"])
         note = [w for w in form["widgets"] if isinstance(w, self.mod.tk.Entry)][0]
         note.insert(0, "keep the old name")
@@ -3374,6 +3374,29 @@ class TestGui(unittest.TestCase):
         walk(s.view)
         self.assertTrue(any("+print('hello')" in d and "Index:" not in d for d in diffs))
         self.app._clear_view(s)
+
+    def test_direct_sends_the_users_words_to_opencode_as_they_are(self):
+        """Direct mode: no model between the user and OpenCode - the message
+        is the prompt, OpenCode's report is the reply."""
+        s = self.app.cur()
+        calls, emitted = [], []
+
+        class Bridge:
+            def call_tool(self, name, args):
+                calls.append((name, args))
+                return {"content": [{"type": "text", "text": "Session ses_1 is done."}]}
+        saved = (s.mcp, list(s.messages), s.record.status)
+        s.mcp = Bridge()
+        s.messages.append({"role": "user", "content": "rename x to y in hello.py"})
+        try:
+            self.app._direct_turn(s, lambda kind, payload: emitted.append((kind, payload)))
+            self.assertEqual(calls, [("opencode_ask", {"prompt": "rename x to y in hello.py"})])
+            self.assertIn(("token", "Session ses_1 is done."), emitted)
+            self.assertEqual(s.messages[-1], {"role": "assistant",
+                                              "content": "Session ses_1 is done."})
+            self.assertTrue(s.record.status.startswith("response complete"))
+        finally:
+            s.mcp, s.messages[:], s.record.status = saved[0], saved[1], saved[2]
 
     def test_a_stop_answers_an_open_approval_as_cancel(self):
         """The bridge's thread waits for the click; a Stop is the user's

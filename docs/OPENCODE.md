@@ -27,6 +27,11 @@ read the one function you need, not the file).
 - **Do not shorten tool descriptions** or touch `sanitize_schema()` without a test.
 - Sizes in pixels go through `Chat._px()`.
 
+## Where you work
+You work in a private copy of the repo (a git worktree on its own branch). The user
+merges it when it is right. Do not commit, switch branches, merge or run other `git`
+commands that change history; a checkpoint is saved after each task for you.
+
 ## How to work
 1. Before editing, read the functions you will change and grep for their callers.
 2. Make the smallest change that does the task. The user approves every edit by
