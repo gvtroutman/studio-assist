@@ -1114,10 +1114,12 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rows[0], b"\x00" * 10)
         self.assertEqual(sum(r.count(b"\xff") for r in rows), 36)
 
-    def face_swap_job(self, spots, faces, refs=1, colour=True):
+    def face_swap_job(self, spots, faces, refs=1, colour=True, installed=True):
         """swap_job with Sitter's face (`refs` reference pictures), on a 5090
         whose SAM3 finds `faces` (x, y, w, h) in the fixed picture and one
-        face in each reference."""
+        face in each reference. FaceFusion counts as installed unless
+        `installed` is False, whatever this checkout's .runtime holds."""
+        from unittest.mock import patch
         class FaceFindClient(SwapClient):
             def node_types(self):
                 return set(SwapClient.NODES) | ({"ColorTransfer"} if colour else set())
@@ -1141,9 +1143,10 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             paths.append(os.path.join(self.dir, "me%d.png" % k))
             with open(paths[-1], "wb") as f:
                 f.write(PNG)
-        job, graphs, _ = self.swap_job(spots, client=FaceFindClient, face_swap="sitter",
-                                       identities=[{"id": "sitter", "name": "Sitter",
-                                                    "references": paths}])
+        with patch('studio_facefusion.available', return_value=installed):
+            job, graphs, _ = self.swap_job(spots, client=FaceFindClient, face_swap="sitter",
+                                           identities=[{"id": "sitter", "name": "Sitter",
+                                                        "references": paths}])
         return job, graphs, paths
 
     def test_a_fix_ends_with_a_face_swap_on_the_biggest_face(self):
@@ -1195,6 +1198,15 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             job, graphs, _ = self.face_swap_job([], [])
         self.assertEqual(job.status, 'failed')
         self.assertIn('no face', job.detail)
+        self.assertEqual(graphs, [])
+
+    def test_a_face_swap_fails_when_facefusion_is_not_installed(self):
+        from unittest.mock import patch
+        with patch('studio_facefusion.swap') as swap:
+            job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], installed=False)
+        self.assertEqual(job.status, 'failed')
+        self.assertIn('FaceFusion is not installed', job.detail)
+        swap.assert_not_called()
         self.assertEqual(graphs, [])
 
     def test_a_face_swap_needs_an_identity_with_a_reference(self):
