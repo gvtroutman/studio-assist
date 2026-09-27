@@ -12,3 +12,5 @@ studio-assistant-preview.png
 .work/
 .runtime/
 comfy_nodes/studio_withanyone/vendor/
+# files attached in the OpenCode tab from outside its folder (studio_files.ATTACH_DIR)
+.studio-attachments/

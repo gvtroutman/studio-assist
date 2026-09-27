@@ -32,10 +32,13 @@ this PC's files and the web instead. Two moving parts:
   one bridge written here rather than installed, because ComfyUI has no MCP server
   of its own and the stdlib-only rule bars the ones on PyPI. `--list-tools` prints
   its contract.
-- **`studio_opencode_mcp.py`** — our MCP stdio bridge to an OpenCode server, which
-  `ContainerSpec` runs in a Docker container built from `opencode/Dockerfile`. Its file
-  tools are confined to the workspace folder the container is given. `--list-tools`
-  prints its contract.
+- **`studio_opencode_mcp.py`** — our MCP stdio bridge to the OpenCode server that
+  `ServerSpec` starts on this PC. It follows each task to the end and puts every step
+  OpenCode asks permission for to the *user*, through MCP elicitation. `--list-tools`
+  prints its contract. See *The app this window serves*.
+- **`studio_codeaddons.py`** / **`studio_codeaddons_ui.py`** — OpenCode's Add-ons (MCP
+  servers, plugins, skills): the records and catalogs, and the window. See *OpenCode's
+  Add-ons*.
 - **`studio_com.py`** — the road into an Adobe app that registers COM automation: a
   PowerShell worker holding `Photoshop.Application` / `Illustrator.Application`, an
   ExtendScript prelude (JSON serializer, error folding, unit pinning), and `ComHost.run()`
@@ -122,12 +125,12 @@ this PC (the workstation)                       tailnet peer
 │   │                                │         └──────────────────────┘
 │   └ MCP stdio ─┐                   │
 │                ▼                   │
-│      studio_opencode_mcp.py        │
-│                │ HTTP 127.0.0.1:4096
+│      studio_opencode_mcp.py ◄──── elicitation: the user allows or refuses each step
+│                │ HTTP 127.0.0.1:4096, password
 │                ▼                   │
-│   ┌ Docker container ────────────┐ │
-│   │ opencode serve               │ │ ──────► LM Studio (same host as above)
-│   │ /workspace ◄─ one folder     │ │
+│   ┌ opencode serve (our child) ──┐ │
+│   │ works in one folder: this    │ │ ──────► LM Studio (same host as above)
+│   │ repo; edits/commands ask     │ │
 │   └──────────────────────────────┘ │
 └────────────────────────────────────┘
 ```
@@ -139,8 +142,8 @@ HTTP client.
 Only inference and image generation are remote, because the RTX 5090 here is reserved
 for AE/Resolve rendering and must not be occupied by a resident model. ComfyUI is
 therefore the one *app* that is not on this machine: the registry calls that
-`remote`, below. OpenCode is on this machine but *not on its disk*: it runs in a Docker
-container that is handed one folder, the registry calls that `container`, below.
+`remote`, below. OpenCode is on this machine with no window of its own: the window
+starts its server as a child, and the registry calls that `served`, below.
 
 ## The app registry
 
@@ -1179,53 +1182,92 @@ True (the user said so), `running()` is True with no probe (the bridge answering
 evidence), and `launch()` needs an exe or explains that it has none. `tests/test_agent.py`
 (`TestHandEnteredBridges`, and the GUI tests around `_save_bridge`) hold all of this.
 
-### The app in a box: `container`
+### The app this window serves: `served`
 
-OpenCode is a coding agent — it edits and runs whatever it is pointed at — and this is
-a production workstation. So `ContainerSpec` never runs it on the bare filesystem:
-`launch()` builds `opencode/Dockerfile` into the image `OPENCODE_IMAGE` (once; the
-first Start takes minutes), writes an `opencode.json` into the workspace that points
-OpenCode at the studio's LM Studio, and runs the container with `docker_run_args()`.
-Read that function before changing anything about isolation; it is the whole of it:
+OpenCode is a coding agent - it edits and runs whatever it is pointed at. The user asked
+(2026-09-27) to "use the local llm to make edits (with my input for each step)" on
+**this app's own code**, so it runs natively and what keeps it in check is that it asks,
+not a sandbox. (It used to run in a Docker container that saw one scratch folder; Docker
+was never installed here, the tab never ran, and a sandbox cannot edit this repo.)
 
-- **One bind mount.** `OPENCODE_WORKSPACE` (default
-  `%LOCALAPPDATA%\StudioAssistant\opencode-workspace`) at `/workspace`, and nothing
-  else from this PC. A named volume holds OpenCode's own session store so its history
-  survives a restart. `tests/test_agent.py` asserts the mount list is exactly that.
-- **Loopback only.** The port is published as `127.0.0.1:4096`, so nothing on the LAN
-  reaches the server. `--cap-drop ALL`, `no-new-privileges`, a memory cap and a pid cap.
-- **The bridge is confined the same way.** `opencode_put_file` / `read_file` /
-  `list_files` resolve every path under the workspace with `realpath` and refuse one
-  that lands outside it — `..`, an absolute path, a drive letter. A `/workspace/...`
-  path is accepted and mapped, because that is how OpenCode names files in its
-  replies. `tests/test_opencode.py` walks the escapes.
-- **Nothing here reaches the creative apps.** The tab has no AE or Resolve tools, and
-  the container cannot see their projects. The prompt says so, so the model does not
-  offer.
+- **`ServerSpec.launch()`** writes OpenCode's config to `OPENCODE_STATE`
+  (`%LOCALAPPDATA%\StudioAssistant\opencode`, never the workspace), writes a fresh
+  random password to `server.key` there, and starts `opencode serve --hostname
+  127.0.0.1` with `OPENCODE_CONFIG` and `OPENCODE_SERVER_PASSWORD` in its environment,
+  in the workspace (`OPENCODE_WORKSPACE`, default this repo), through
+  `studio_procs.spawn` - so it ends with the window, like a bridge. `opencode_exe()`
+  starts npm's native `opencode.exe` directly, not the `.cmd` shim. Install is `npm
+  install -g opencode-ai`; the Start button says so when it is missing.
+- **The password is not optional.** A coding agent's HTTP API on loopback is reachable
+  by any web page in a browser here; OpenCode answers 401 without HTTP Basic
+  `opencode:<key>`. The bridge reads the key file on every request, so a restart (new
+  key) needs nothing from it. A 401 says who restarts the server.
+- **`OPENCODE_PERMISSIONS`** in `opencode_config()`: read, search, list, todo, skills,
+  subagents and OpenCode's own questions are `allow`; `edit`, `bash`, `webfetch`,
+  `websearch` and `doom_loop` are `ask`; `external_directory` is `deny`. A key left
+  out falls back to OpenCode's default, which is allow - `test_opencode_config_asks_
+  before_every_change` holds the set. Each add-on MCP server adds `<name>_*: ask`,
+  because OpenCode runs MCP tools without asking otherwise; add-ons only add
+  permissions, never loosen one.
+- **The model gets the loaded window.** `context_window()` is passed as the model's
+  `limit.context`, or OpenCode never compacts and overruns a 32k load.
 
-In the registry it is a `ContainerSpec`: `exe_globs=[]` like a remote app, but
-`remote` is overridden to False and `container` is True, so the GUI's `Start <app>`
-button applies (`launch()` is what it calls), the sidebar lists it under **this PC**
-with `container` where a year would go, and `installed()` asks whether Docker is here —
-`docker_exe()` also looks in Docker Desktop's own folder, since a window launched from a
-shortcut does not always have it on PATH. Neither Docker nor OpenCode is needed to run
-the tests: `test_launch_builds_once_then_runs_the_container` swaps `eng.docker` for a
-recorder.
+**How a step reaches the user.** `opencode_ask` sends the task with `prompt_async`
+and `run()` follows the session: each pass lists `/permission` and `/question`,
+keeps those of this session or a subagent's (`Family`, by `parentID`), and puts each
+to the user with `studio_mcp.elicit()` - the MCP client's user, not the model. The
+reply goes to `/permission/{id}/reply` (`once` | `always` | `reject`, with the note as
+`message`, which OpenCode's model reads as the user's feedback) or
+`/question/{id}/reply`. The loop ends when `/session/status` has the session idle
+twice (`SETTLE` covers a task not yet marked busy); the result lists the user's
+decisions, then each assistant message's text, tools and files. Time the user spends
+deciding does not count against the call's `timeout`; past it, `opencode_wait`
+picks the same session up. There is no tool that approves anything, and
+`opencode_put_file` is gone - it wrote on the model's word alone.
 
-`OPENCODE_URL` is read once in the engine (probe, bridge label, published port) and
-again in `studio_opencode_mcp.py`; keep both reading the same variable, and the same
-for `OPENCODE_WORKSPACE`. A loopback LM Studio host is rewritten to
-`host.docker.internal` in the config, because `127.0.0.1` inside the container is the
-container.
+- **Cancel is a Stop.** An elicitation answered `cancel` - the card's Stop, the send
+  button's Stop, a closed tab - aborts the session. `decline` is a refusal. A client
+  that did not offer elicitation (a piped CLI, another MCP client) gets every step
+  refused and the session stopped: nothing changes on the model's word.
+- **Routes** live in `ROUTES`, checked against OpenCode's `/doc` by `opencode_status`
+  as before. Read off OpenCode 1.18.32; the shapes the tests fake are the ones the live
+  server returned (`permission`, `patterns`, `metadata.filepath`/`diff`/`command`,
+  `always`).
+- **Attachments** from outside the folder are copied into `.studio-attachments/`
+  in it (git-ignored); one inside is named by its path there.
 
-The server's routes live in one table, `ROUTES`, at the top of the bridge.
-`opencode_status` fetches the server's own OpenAPI document (`/doc`) and names any
-route in that table the document does not list, so an OpenCode release that renames
-one is a sentence in the transcript rather than a 404 the model improvises around.
-Older servers without `/global/health` are read from `/doc` instead.
+Live-checked (2026-09-27, scratch project, qwen3-coder-30b): the edit's diff was
+asked and allowed, `python hello.py` was asked and refused with a note, OpenCode's
+reply quoted the note, the file changed, the server ended with `stop()`; an add-on
+MCP server (`npx -y @modelcontextprotocol/server-sequential-thinking`) connected and
+its tool was asked before it ran.
 
-The window does not stop the container when it closes, just as it does not close After
-Effects. `docker stop studio-opencode` does; the workspace and the session volume stay.
+### OpenCode's Add-ons
+
+The **Add-ons** header button on the OpenCode tab: the user asked for "plugins like the
+image creator has, but for a coding agent". `AddonsWindow` mirrors the LoRA Add-ons: a
+pill per kind, Installed and Catalog tabs, Turn off, Remove on a second click.
+
+- **Kinds are OpenCode's own**: `mcp` (config `mcp`), `plugin` (npm packages, config
+  `plugin`), `skill` (SKILL.md folders, config `skills.paths`). Records are in
+  `OPENCODE_STATE/addons.json`; `config()` adds the enabled ones to the opencode.json
+  written at each start, so the window offers **Restart OpenCode** after a change. It
+  refuses while the tab is working.
+- **Catalogs**: the official MCP Registry (`/v0/servers`; only `isLatest` entries;
+  a way to run one is an npm or PyPI stdio package - `npx -y pkg@ver` / `uvx
+  pkg==ver`, which OpenCode starts fine on Windows - or a streamable-HTTP/SSE remote;
+  container images, .NET tools and packages needing a positional argument are not
+  offered), npm search `keywords:opencode-plugin`, and a GitHub repo's tree
+  (`anthropics/skills` by default; two API calls, then SKILL.md front matter from
+  raw.githubusercontent.com per card). A server's required environment variables and
+  header placeholders become fields before it is filed; secret ones are masked and
+  kept in the state folder, as OpenCode's config keeps them.
+- **Installed MCP servers say what OpenCode made of them**: `live_status()` reads
+  `GET /mcp` (connected / failed and why / not loaded yet).
+- **Remove**: a downloaded skill's folder goes to the Recycle Bin
+  (`studio_catalog.recycle`); a folder the user pointed at is left alone.
+- Threads post back with the window-level `("call", None, fn)` event, which `_handle`
+  runs before any tab lookup; a stale answer is dropped by `gen`.
 
 ### The Scene Builder: a stage for the Image Studio
 
@@ -1924,7 +1966,7 @@ orphan on the way out. `_quit` sets `closing` and cancels `drain_timer` and
 
 **The modules pulled out of `studio_chat`, and the rules that keep them out.**
 `studio_doctor` (where things are kept, the error log's one writer, the diagnostics
-report), `studio_files` (attachments: headers, folder listings, the container copy)
+report), `studio_files` (attachments: headers, folder listings, the copy into OpenCode's folder)
 and `studio_ui` (palette roles, `blend`/`rounded`/`clip`/`pretty_host`, `Pill`).
 `studio_chat` re-exports every name it used to define, so the rest of the app reaches
 for them where it always did — but edit them in their own module.
@@ -2117,7 +2159,7 @@ nothing. The header's job is to say what the tab you are looking at is doing, so
 status starts that row. A test asserts the name appears there no more. Four things deliberately keep the older spelling
 because they are identities rather than labels, and renaming them would orphan what is
 already written under them: `%LOCALAPPDATA%\StudioAssistant\` (settings, lessons, task
-records, the OpenCode workspace), `studio_assistant_error.log`, `studio-assistant.ico`,
+records, OpenCode's config), `studio_assistant_error.log`, `studio-assistant.ico`,
 and the CEP panel's `ExtensionBundleId`. The panel's *display* name did change, so
 `python studio_premiere_mcp.py --install-panel` has to be re-run for the entry under
 *Window > Extensions* to read "Studio Assist Bridge"; until then the app's instructions
@@ -2244,8 +2286,8 @@ before changing that; the short of it:
 - **Only what we started is touched.** Nothing is found or killed by name. The apps are
   not our children: `launch()` starts them detached with a plain `Popen`, on purpose,
   because After Effects must outlive the window; Photoshop and Illustrator are started
-  by COM's own service. Neither is ever in a job of ours. The OpenCode container is left
-  running on quit as documented under *The app in a box*.
+  by COM's own service. Neither is ever in a job of ours. OpenCode's server *is* ours
+  (`ServerSpec`): it is spawned into a job and ends with the window.
 - **Quitting is parallel and off-screen.** `_quit` withdraws the window, closes every
   tab's bridge at once with `QUIT_GRACE_S` between them, then `procs.stop_all(0)` for
   anything left. One tab at a time, each allowed seconds, was a frozen window. Ctrl+C,
@@ -2519,9 +2561,9 @@ composer.
   brief before the executor starts, so it survives resume. With no vision model
   the model has the path only, and both it and the user are told so. `ATTACH_LIMIT` applies to
   pictures alone, because theirs are the only bytes anything reads. A
-  `ContainerSpec` tab sees one folder: `attachment_note` copies the file (or the
-  folder, whole) into `<workspace>/attachments/` and names the `/workspace/...` path
-  the container will see.
+  served tab is refused anything outside its folder: `attachment_note` copies a file
+  (or a folder, whole) from elsewhere into `<workspace>/.studio-attachments/` and names
+  every attachment by its path in that folder.
 
 ## What the model learns, asks and looks up
 
@@ -2718,6 +2760,18 @@ folder are exactly that, and their `serve()` loops are gone.
   whatever the bridge answers on `protocol_version`, `server_info`, `instructions`
   and `capabilities`. Both installed bridges answer 2025-11-25 today. Add a revision
   to the tuple when a feature here needs one; never pin.
+- **A bridge can ask the user (elicitation).** `studio_mcp.elicit(message, schema,
+  meta)` from inside a tool sends `elicitation/create` and blocks until the client
+  answers; `serve()`'s reader routes the reply (`deliver`) while the main thread waits,
+  and a cancel of the tool call ends the wait as `cancel`. It raises `Declined` unless
+  the client declared `capabilities.elicitation` - `MCPClient` and `Loopback` do only
+  when `on_elicit` is set before `initialize`. `MCPClient` answers on a thread of its
+  own and stops the call's clock while a question is open, so a user who takes five
+  minutes is not a timeout. The GUI's `_elicit` shows `_show_elicit`'s card (diff box
+  from `_meta["studio/approval"]`, a button per enum value, entries for strings, Stop)
+  and treats `s.cancel` or a closed tab as `cancel`; the CLI's is
+  `elicit_at_terminal`. This is how a tool that must not act on the model's say-so
+  gets the user's.
 - **Two kinds of "no".** Unknown tool, arguments the schema refuses, a parse error, a
   JSON-RPC batch: protocol errors, with the JSON-RPC code the spec names, because a
   caller that sends them skipped the executor's own validation. A tool's own refusal
@@ -2807,7 +2861,7 @@ python studio_agent.py --app resolve --list-tools   # needs the Resolve venv
 python studio_agent.py --app comfyui --list-tools   # no ComfyUI needed for the list
 python studio_comfy_mcp.py --list-tools      # the bridge's own contract
 python studio_comfy_mcp.py --check           # ...held to the harness's checks
-python studio_opencode_mcp.py --list-tools   # likewise; no Docker needed for the list
+python studio_opencode_mcp.py --list-tools   # likewise; no OpenCode needed for the list
 python studio_photoshop_mcp.py --check       # the COM bridges; no app is touched by --check
 python studio_illustrator_mcp.py --list-tools
 python studio_premiere_mcp.py --check        # the CEP bridge; no app is touched by --check
@@ -2828,7 +2882,7 @@ python studio_chat.py --doctor               # no window, no lock: runs beside a
 python studio_doctor.py                      # the same report, on its own
 ```
 
-`tests/` never touches the network, the creative apps, Docker, or the model — the
+`tests/` never touches the network, the creative apps, OpenCode, or the model — the
 research bridge's `urlopen` is swapped for a fake with a table of pages,
 `test_lessons.py` drives the notebook, the reflection and the question form with the
 same fake inference `test_tasks.py` uses and a temp notebook directory,
@@ -2836,8 +2890,8 @@ the COM bridges are tested with `HOST.run` replaced, the one PowerShell worker a
 starts is given a ProgID nothing answers to, and the Premiere bridge talks to a fake
 panel on a random loopback port —
 `test_comfy.py` and `test_opencode.py` swap `urllib.request.urlopen` for an in-memory
-server that answers the routes the bridge uses, and the OpenCode one works in a temp
-workspace. `test_mcp.py` drives both bridges through `Loopback` — the real server
+server that answers the routes the bridge uses - the OpenCode one plays a session out
+step by step, stopping on permissions and questions - and works in a temp folder. `test_mcp.py` drives both bridges through `Loopback` — the real server
 objects, in process — and holds the installed bridges to `tests/contracts/`. Tests that would
 need a display skip themselves when there isn't one; the GUI tests stub
 `installed_apps` so tab behaviour doesn't depend on what this machine has, stub
