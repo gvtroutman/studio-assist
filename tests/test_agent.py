@@ -1062,6 +1062,8 @@ class TestAppRegistry(unittest.TestCase):
         self.assertTrue(os.path.isfile(eng.OPENCODE_BRIEF))
         with open(eng.OPENCODE_BRIEF, encoding="utf-8") as f:
             self.assertLess(len(f.read()), 8000, "the brief must stay small")
+        with open(eng.OPENCODE_BRIEF_ANY, encoding="utf-8") as f:
+            self.assertLess(len(f.read()), 4000, "the general brief must stay small")
         self.assertTrue(eng.own_repo(eng.HERE))
         cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"], brief=eng.OPENCODE_BRIEF)
         self.assertEqual(cfg["instructions"], [eng.OPENCODE_BRIEF])
@@ -1081,7 +1083,12 @@ class TestAppRegistry(unittest.TestCase):
             oc.launch(host="http://h:1/v1")
             self.assertEqual(started[-1]["env"]["OPENCODE_DISABLE_PROJECT_CONFIG"], "1")
             with open(oc.config_path, encoding="utf-8") as f:
-                self.assertEqual(json.load(f)["instructions"], [eng.OPENCODE_BRIEF])
+                self.assertEqual(json.load(f)["instructions"],
+                                 [eng.OPENCODE_BRIEF_ANY, eng.OPENCODE_BRIEF])
+            oc.workspace = tmp                # any other folder: the general brief alone
+            oc.launch(host="http://h:1/v1")
+            with open(oc.config_path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["instructions"], [eng.OPENCODE_BRIEF_ANY])
         finally:
             (eng.studio_procs.spawn, eng.opencode_exe, eng.probe_models,
              eng.context_window, oc.workspace, oc.state_dir, oc.child) = real
@@ -1126,8 +1133,8 @@ class TestAppRegistry(unittest.TestCase):
             self.assertEqual(cfg["model"], "lmstudio/m1")
             self.assertEqual(cfg["permission"]["edit"], "ask")
             self.assertEqual(os.listdir(oc.workspace), [], "nothing is written into the repo")
-            # Another folder keeps its own AGENTS.md; only this repo's is swapped.
-            self.assertNotIn("instructions", cfg)
+            # Another folder keeps its own AGENTS.md, with the general brief beside it.
+            self.assertEqual(cfg["instructions"], [eng.OPENCODE_BRIEF_ANY])
             self.assertNotIn("OPENCODE_DISABLE_PROJECT_CONFIG", env)
             # A second start ends the first server and changes the password.
             oc.launch(host="http://100.127.17.38:1234/v1")

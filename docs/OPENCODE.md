@@ -27,21 +27,7 @@ read the one function you need, not the file).
 - **Do not shorten tool descriptions** or touch `sanitize_schema()` without a test.
 - Sizes in pixels go through `Chat._px()`.
 
-## Where you work
-You work in a private copy of the repo (a git worktree on its own branch). The user
-merges it when it is right. Do not commit, switch branches, merge or run other `git`
-commands that change history; a checkpoint is saved after each task for you.
-
-## How to work
-1. Before editing, read the functions you will change and grep for their callers.
-2. Make the smallest change that does the task. The user approves every edit by
-   reading its diff, so several small edits beat one huge one.
-3. Match the surrounding code's style and comment density.
-4. Run the tests for the module you changed:
-   `python -m unittest tests.test_<module> -v`
-   (whole suite: `python -m unittest discover -s tests`; no network or apps needed).
-5. When finished, say in a few lines which files and functions you changed and what the
-   tests reported. If you could not finish, say exactly what is left.
-
-Keep a todo list for tasks with more than two steps, and tick items off as you go -
-your memory of earlier steps may be compacted away, the todo list is not.
+## Tests
+`python -m unittest tests.test_<module> -v` for the module you changed (whole suite:
+`python -m unittest discover -s tests`; no network or apps needed). The general rules
+- your copy, small edits, reporting - are in the other brief.

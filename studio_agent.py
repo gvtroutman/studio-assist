@@ -2362,7 +2362,9 @@ class ServerSpec(AppSpec):
 
     def write_config(self, host, model, ids, context=None):
         os.makedirs(self.state_dir, exist_ok=True)
-        brief = OPENCODE_BRIEF if own_repo(self.workspace) and os.path.isfile(OPENCODE_BRIEF) else None
+        # The general brief goes to every folder; this repo adds its own.
+        brief = [b for b in (OPENCODE_BRIEF_ANY, OPENCODE_BRIEF if own_repo(self.workspace) else None)
+                 if b and os.path.isfile(b)]
         cfg = opencode_config(host, model, ids, context, addons=load_addons(self.state_dir),
                               brief=brief)
         with open(self.config_path, "w", encoding="utf-8") as f:
@@ -2595,6 +2597,7 @@ def addons_config(addons):
 # root AGENTS.md is not loaded too.
 OPENCODE_CONTEXT = 65536   # the window OpenCode's model is loaded with, at least
 OPENCODE_BRIEF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "OPENCODE.md")
+OPENCODE_BRIEF_ANY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "OPENCODE_ANY.md")
 
 
 def own_repo(workspace):
@@ -2607,7 +2610,8 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
     The opencode.json handed to `opencode serve` (by OPENCODE_CONFIG, so the
     workspace is not written to): the studio's LM Studio with the served
     models declared and one chosen, the permissions above, the add-ons
-    The user has turned on, and `brief` (a file path) as its instructions.
+    The user has turned on, and `brief` (a file path, or a list of them) as
+    its instructions.
     """
     base = host.rstrip("/")
     if not base.endswith("/v1"):
@@ -2629,7 +2633,7 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
         "share": "disabled",
     }
     if brief:
-        cfg["instructions"] = [brief]
+        cfg["instructions"] = [brief] if isinstance(brief, str) else list(brief)
     extra = addons_config(addons or [])
     # An add-on's permissions only add to the ones above; none is loosened.
     for k, v in extra.pop("permission", {}).items():
