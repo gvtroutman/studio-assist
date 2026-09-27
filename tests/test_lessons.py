@@ -14,6 +14,76 @@ import studio_tasks as tasks
 from test_tasks import FakeLLM, answer, call, spec
 
 
+class TestStack(unittest.TestCase):
+    """Lessons in layers: every tab, the app, and OpenCode's folder."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.work = os.path.join(self.dir, "project")
+        os.makedirs(self.work)
+        self.app = Mock(id="opencode", workspace=self.work)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def stack(self):
+        s = lessons.for_app(self.app, self.dir)
+        self.assertIsNone(s.load())
+        return s
+
+    def test_a_lesson_goes_to_the_folder_unless_said_to_hold_everywhere(self):
+        s = self.stack()
+        s.add("run the tests with pytest -q", "user")
+        s.add(lessons.explicit_lesson("remember everywhere: keep replies short"), "user")
+        s.add("prefer small commits", "model", "everywhere")
+        again = self.stack()
+        self.assertEqual(again.where("run the tests with pytest -q"), "folder")
+        self.assertEqual(again.where("keep replies short"), "everywhere")
+        self.assertEqual(again.where("prefer small commits"), "everywhere")
+
+    def test_every_tab_shares_the_global_layer_and_folders_stay_apart(self):
+        self.stack().add("everywhere: answer in English", "user")
+        self.stack().add("this folder uses tabs", "user")
+        other = Mock(id="resolve", workspace=None)
+        s = lessons.for_app(other, self.dir)
+        s.load()
+        self.assertIn("answer in English", s.brief())
+        self.assertNotIn("tabs", s.brief())
+        self.app.workspace = os.path.join(self.dir, "elsewhere")
+        self.assertNotIn("tabs", self.stack().brief())
+
+    def test_a_refused_call_is_a_fact_about_the_app(self):
+        s = self.stack()
+        s.learn_refusals([("opencode_ask", "unknown key 'foo'")])
+        self.assertEqual(s.where(s.lessons[0]["text"]), "app")
+
+    def test_fresh_carries_only_what_came_after_the_brief(self):
+        s = self.stack()
+        s.add("old lesson here", "user")
+        s.brief()
+        s.add("everywhere: new lesson there", "user")
+        self.assertEqual(s.fresh(), "- new lesson there")
+
+    def test_a_repeat_in_another_layer_is_not_kept_twice(self):
+        s = self.stack()
+        s.add("everywhere: keep replies short", "user")
+        s.add("keep replies short", "model")
+        self.assertEqual(len(s.lessons), 1)
+
+    def test_forget_and_the_file_opencode_reads(self):
+        s = self.stack()
+        s.add("use the venv python", "user")
+        path = lessons.write_brief_file(s, os.path.join(self.dir, "oc", "lessons.md"))
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("- use the venv python", f.read())
+        self.assertTrue(s.remove("use the venv python"))
+        self.assertEqual(self.stack().lessons, [])
+
+    def test_studio_remember_takes_a_scope(self):
+        props = lessons.REMEMBER_TOOL["function"]["parameters"]["properties"]
+        self.assertEqual(props["scope"]["enum"], ["here", "everywhere"])
+
+
 class TestNotebook(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
