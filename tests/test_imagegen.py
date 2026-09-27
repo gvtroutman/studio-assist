@@ -1158,7 +1158,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], colour=False)
         self.assertEqual(job.status, 'complete', job.detail)
         self.assertEqual(graphs, [])
-        self.assertTrue(any('FaceFusion applied last' in n for n in job.notes))
+        self.assertTrue(any('FaceFusion applied;' in n for n in job.notes))
         with patch('studio_facefusion.swap', side_effect=RuntimeError('no face was found')):
             job, graphs, _ = self.face_swap_job([], [])
         self.assertEqual(job.status, 'failed')

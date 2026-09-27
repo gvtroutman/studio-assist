@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import studio_facefusion as ff
 import studio_imagegen as ig
 import studio_scene as sc
-from test_imagegen import TempStudioMixin, PNG, settle
+from test_imagegen import TempStudioMixin, PNG, settle, FakeClient, FaceClient
 
 
 class TestFaceTargets(unittest.TestCase):
@@ -46,6 +46,25 @@ class TestFaceTargets(unittest.TestCase):
             with self.subTest(options=options), self.assertRaisesRegex(RuntimeError, 'Choose face'):
                 ff.target_face(boxes, **options)
         self.assertEqual(ff.target_face(boxes, point=[.8, .3]), 2)
+
+    def test_the_finish_passes_redraw_the_face_facefusion_swapped(self):
+        small, big, right = (100, 100, 40, 40), (300, 100, 90, 100), (700, 100, 60, 60)
+        # One profile: FaceFusion's single face, or the biggest when SAM3 sees more.
+        self.assertEqual(ig.swapped_faces(1000, 1000, [big], [{}]), [big])
+        self.assertEqual(ig.swapped_faces(1000, 1000, [right, small, big], [{}]), [big])
+        # Two profiles: left to right, as FaceFusion's face_index/face_count.
+        self.assertEqual(ig.swapped_faces(1000, 1000, [right, big], [{}, {}]), [big, right])
+        # A scene's regions pick the face; a region with no face is skipped.
+        self.assertEqual(ig.swapped_faces(1000, 1000, [small, big, right],
+                                          [{"target_region": [.6, 0, 1, .5]},
+                                           {"target_region": [0, .8, 1, 1]}]), [right])
+        spot = ig.eye_spots([big])[0]
+        self.assertEqual(spot["word"], ig.EYE_WORD)
+        self.assertEqual(spot["size"], int(100 * ig.EYE_PAD))
+        self.assertEqual(spot["box"], [300, 115, 90, 45])       # the eye band only
+        self.assertEqual(ig.glasses_spots(1000, 1000, [(310, 125, 70, 20), (40, 900, 30, 10)],
+                                          [big])[0]["word"], "glasses")
+        self.assertEqual(len(ig.glasses_spots(1000, 1000, [(40, 900, 30, 10)], [big])), 0)
 
     def test_same_identity_can_appear_at_two_scene_positions(self):
         lib = SimpleNamespace(get=lambda *_: {"id": "a", "name": "A", "references": ["a.png"]})
@@ -93,6 +112,78 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         listed = self.studio.history.list()
         self.assertEqual(len(listed), 1)
         self.assertNotIn('finish', listed[0])
+
+    def finish_job(self, glasses):
+        """Generate with a face profile on a ComfyUI with SAM3, whose finder
+        after the swap sees one face and `glasses` [(x, y, w, h)]."""
+        self.profile()
+
+        class FinishClient(FaceClient):
+            def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                graph = self.graphs[int(pid[3:]) - 1]
+                if "p0d" in graph:            # the finder after the swap
+                    return {"status": {"completed": True}, "outputs": {
+                        "7": {"text": ["1024"]}, "8": {"text": ["1024"]},
+                        "p0v": {"text": [json.dumps([[
+                            {"x": 450, "y": 250, "width": 80, "height": 90}]])]},
+                        "p1v": {"text": [json.dumps([[
+                            {"x": x, "y": y, "width": w, "height": h}
+                            for x, y, w, h in glasses]])]}}}
+                return super().listen_for_progress(pid, on_event, stop, timeout)
+        self.studio.client_factory = FinishClient
+        self.studio.clients = {}
+        order = []
+        with patch.object(ff, 'available', return_value=True), \
+                patch.object(ff, 'swap', side_effect=lambda *a, **k: (
+                    order.append('swap') or (PNG, {'outside_mask_changed_pixels': 0}))):
+            jobs = self.studio.submit(self.settings())
+            settle(jobs)
+        client = FakeClient.instances[-1]
+        return jobs[0], client, order
+
+    def test_the_face_swap_is_followed_by_an_eye_pass_then_the_glasses(self):
+        job, client, order = self.finish_job([(460, 272, 60, 22), (40, 900, 30, 10)])
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(order, ['swap'])
+        find, eyes, glasses = client.graphs[-3:]
+        self.assertEqual([find["p0t"]["inputs"]["text"], find["p1t"]["inputs"]["text"]],
+                         ig.FINISH_FIND)
+        self.assertTrue(find["1"]["inputs"]["image"].startswith("studio_%s" % job.id))
+        # The eyes: the whole face cropped, only SAM3's eyes in its eye band redrawn.
+        region = eyes["fc1_1"]["inputs"]["crop_region"]
+        self.assertLessEqual(region["x"], 450)
+        self.assertGreaterEqual(region["x"] + region["width"], 530)
+        self.assertEqual(eyes["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
+        self.assertEqual(eyes["fc1_4"]["inputs"]["denoise"], ig.EYE_DENOISE)
+        self.assertNotIn("fc2_1", eyes)
+        self.assertIn("eyes", eyes[eyes["fc1_4"]["inputs"]["positive"][0]]["inputs"]["text"])
+        # The glasses last, on the eye pass's picture; the pair off the face is left.
+        self.assertEqual(glasses["fi"]["inputs"]["image"], "ImageStudio/faces_00001_.png [output]")
+        self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
+        self.assertEqual(glasses["fc1_4"]["inputs"]["denoise"], ig.GLASSES_DENOISE)
+        self.assertNotIn("fc2_1", glasses)
+        self.assertNotIn("fc1_t", glasses)          # no tone curves on a swapped face
+        notes = job.record["notes"]
+        self.assertTrue(any(n.startswith("Eye pass after the face swap") for n in notes), notes)
+        self.assertTrue(any(n.startswith("Glasses redrawn last: 1 pair") for n in notes), notes)
+
+    def test_without_glasses_only_the_eyes_are_redrawn(self):
+        job, client, _ = self.finish_job([])
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertIn("p0d", client.graphs[-2])
+        self.assertEqual(client.graphs[-1]["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
+        self.assertIn("SAM3 found no glasses on the swapped face.", job.record["notes"])
+
+    def test_without_sam3_the_swap_is_kept_as_it_is(self):
+        self.profile()
+        with patch.object(ff, 'available', return_value=True), \
+                patch.object(ff, 'swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})):
+            jobs = self.studio.submit(self.settings())
+            settle(jobs)
+        self.assertEqual(jobs[0].status, 'complete', jobs[0].detail)
+        self.assertEqual(len(FakeClient.instances[-1].graphs), 1)
+        self.assertTrue(any(n.startswith("No eye or glasses pass after the face swap")
+                            for n in jobs[0].record["notes"]))
 
     def test_face_only_fix_never_checks_comfyui(self):
         path = self.profile()
