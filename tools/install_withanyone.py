@@ -37,6 +37,7 @@ def main():
     target = args.comfy.resolve() / "custom_nodes" / "studio_withanyone"
     target.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "comfy_nodes" / "studio_withanyone" / "__init__.py", target)
+    shutil.copy2(ROOT / "comfy_nodes" / "studio_withanyone" / "references.py", target)
     upstream = checkout / "WithAnyone"
     vendor = target / "vendor"
     shutil.copytree(upstream / "withanyone", vendor / "withanyone", dirs_exist_ok=True)
