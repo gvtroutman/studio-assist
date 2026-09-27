@@ -276,6 +276,8 @@ class ImageStudio:
         self.sliders = {}             # body slider keys -> IntVar
         self.item_refs = {}           # item -> picture, from the character
         self.look_section = FORM_LOOKS[0][0]
+        self.face_photos = []         # the picked character's face photos (ig.character_faces)
+        self.face_name = ""
         self.anatomy = tk.BooleanVar(value=True)
         self.hints = {}               # setting -> Label
         self.rows = {}                # job id -> row widgets
@@ -1037,6 +1039,10 @@ class ImageStudio:
         if key.startswith("c:"):
             return self._set_character(key[2:])
         self.settings["character"] = ""
+        # A profile alone: its own reference photos are the face; no one, none.
+        ident = self.studio.lib.get("identities", key[2:]) if key else None
+        self.face_photos = ig.character_faces({"identity": key[2:]}, self.studio.lib) if ident else []
+        self.face_name = ident["name"] if ident and self.face_photos else ""
         self._select_identity(key[2:])
 
     def _character(self):
@@ -1097,7 +1103,13 @@ class ImageStudio:
                     self.text[key].set(rec["looks"].get(key, ""))
             self.item_refs = dict(rec["item_refs"])
             self._select_identity(self._face_of(rec))
+            # Their face photos go with the picture: the identity builder's
+            # reference photos (ig.character_faces). Nothing shows on the form.
+            self.face_photos = ig.character_faces(rec, self.studio.lib)
+            self.face_name = rec["name"]
             self._show_looks(self.look_section)
+        else:
+            self.face_photos, self.face_name = [], ""
         self._show_identity()
         self._recheck()
 
@@ -1580,6 +1592,8 @@ class ImageStudio:
         for key, var in self.sliders.items():
             s[key] = int(var.get())
         s["item_refs"] = dict(self.item_refs)
+        s["face_photos"] = list(self.face_photos)
+        s["face_name"] = self.face_name if s["face_photos"] else ""
         s["anatomy"] = bool(self.anatomy.get())
         s["negative"] = self.neg.get().strip()
         s["identities"] = [{"id": iid, "strength": round(sv.get(), 3)}
@@ -1632,6 +1646,8 @@ class ImageStudio:
         for key, var in self.sliders.items():
             var.set(int(s.get(key) or 0))
         self.item_refs = ig.clean_item_refs(s.get("item_refs"))
+        self.face_photos = ig._strs(s.get("face_photos"))
+        self.face_name = s.get("face_name") or ""
         self.anatomy.set(s.get("anatomy") is not False)
         self.neg.set(s.get("negative") or "")
         pose = s.get("pose") if isinstance(s.get("pose"), dict) else None

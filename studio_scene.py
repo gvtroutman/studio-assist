@@ -3916,11 +3916,14 @@ FACE_REGION = {"side": 1.1, "above": 0.5, "below": 0.6}
 
 def face_picture(obj, characters=None, identities=None):
     """-> (path, where it came from) of the face a person is drawn with, or
-    ('', ''): the person's own, else their character's identity's first
-    reference picture."""
+    ('', ''): the person's own, else their character's first face photo,
+    else their character's identity's first reference picture."""
     if obj.get("face") and os.path.isfile(obj["face"]):
         return obj["face"], "their own face picture"
     rec = (characters or {}).get(obj.get("character")) if obj.get("character") else None
+    for path in (rec or {}).get("faces") or []:
+        if os.path.isfile(path):
+            return path, "%s's face photos" % rec["name"]
     ident = (identities or {}).get(rec.get("identity")) if rec and rec.get("identity") else None
     if ident and ident.get("use_references", True):
         for path in ident.get("references") or []:
@@ -3931,12 +3934,14 @@ def face_picture(obj, characters=None, identities=None):
 
 def face_photos(obj, characters=None, identities=None):
     """Every photo of a person's face there is, their own face picture
-    first, then their character's identity's references: the real-face
-    paste picks the one whose head is turned most like the drawn one's."""
+    first, then their character's face photos, then its identity's
+    references: the real-face paste picks the one whose head is turned most
+    like the drawn one's."""
     out = []
     if obj.get("face") and os.path.isfile(obj["face"]):
         out.append(obj["face"])
     rec = (characters or {}).get(obj.get("character")) if obj.get("character") else None
+    out += [p for p in (rec or {}).get("faces") or [] if os.path.isfile(p) and p not in out]
     ident = (identities or {}).get(rec.get("identity")) if rec and rec.get("identity") else None
     if ident and ident.get("use_references", True):
         out += [p for p in ident.get("references") or [] if os.path.isfile(p) and p not in out]
@@ -4053,6 +4058,7 @@ def generation(scene, maps, characters=None, identities=None):
         extra.update({k: 0 for k in ig.SLIDER_KEYS})
         extra["character"] = ""
         extra["item_refs"] = {}
+        extra["face_photos"], extra["face_name"] = [], ""
         idents = []
         for o in folks:
             rec = (characters or {}).get(o["character"]) if o["character"] else None

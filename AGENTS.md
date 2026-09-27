@@ -642,6 +642,34 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   out right in every detail (lacing, apron, trim, lace hem) across scenes and
   poses. But her pendant came along, and without an identity LoRA the face
   drifted toward hers. Pictures of the item alone, on white, are best.
+- **A character is a profile: its face photos draw every picture of it**
+  (2026-09-26, the user: "profiles for people to face swap"). **The photos are
+  managed in the identity builder only** (Image references: "Reference
+  photos — first photo is Primary"). The user, 2026-09-27: "those controls should
+  only show in the identity builder. the drop down is the correct format". A
+  first version put a Face photos row in the Character creator and a strip
+  with a "Their face" tick on the form. Both were removed when the branch was
+  ported onto the People section's single person dropdown. The first photo is
+  PuLID's, and the real-face paste chooses among all of them. `character_faces`
+  reads a character's legacy `faces` if it has any, else its identity's
+  reference photos. The dropdown copies them onto the form without showing
+  anything (`face_photos`, `face_name`): a character ("c:") gives its
+  identity's photos, a profile alone ("i:") its own, and no one clears them.
+  History holds them, so Generate Again redraws the same face. The WithAnyone
+  recipe draws identities together and turns the face pass off; it wins over
+  the photos. `faces_of` turns them into the Scene Builder's `scene_faces`
+  shape - one person, `at` None (the biggest face the finder finds), the
+  whole frame as their region, `FORM_LIKENESS` 0.6, real faces on - and
+  forces the face pass; a scene's own `scene_faces` win, and a scene blanks
+  the form's. In the Scene Builder a person's own face picture comes first,
+  then their character's photos, then its identity's. **A whole-frame
+  PuLID gets no attention mask**: with Kontext's item picture the latent
+  has the reference's tokens too, and a mask the picture's size failed
+  ("tensor a (8022) must match ... (3952)"). Measured on the 5090, 832x1216,
+  Partner's 5 head crops: 42 s alone, 59 s with a dirndl picture through
+  Kontext, whose face no longer drifts to the garment model's. `thumbnails`
+  (PNGs made by System.Drawing, one PowerShell run; Tk reads no JPEG) stays in
+  studio_imagegen for any photo strip. Nothing on the form uses it now.
 - **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
   described, or named in the scene, `PEOPLE`) says outright that every person has
   two hands, each with four fingers and a thumb, two feet, two eyes and a
