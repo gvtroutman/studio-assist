@@ -25,6 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import studio_catalog as catalog
+import studio_hub as hub
 import studio_civitai as civitai
 import studio_model_sources as model_sources
 import studio_discovery as discovery
@@ -448,6 +449,8 @@ class ImageStudio:
         head.pack(side="top", fill="x", padx=self.px(18), pady=(0, self.px(6)))
         self.manage_pill = self.button(head, "Manage ▾", self._manage_menu)
         self.manage_pill.pack(side="right")
+        self.button(head, "App store", lambda: self.open_addons("catalog"),
+                    kind="accent").pack(side="right", padx=(0, self.px(6)))
         self.source_buttons = {}
         for source, (name, _domain, _env) in model_sources.SOURCES.items():
             button = self.button(head, name, lambda key=source: self.open_model_source(key))
@@ -5157,13 +5160,16 @@ class AddonsWindow:
     the tab's queue (`_post("call", ...)`), dropped if the window closed or
     a newer search replaced them (`gen`)."""
 
+    TABS = (("installed", "Installed"), ("catalog", "CivitAI"),
+            ("huggingface", "Hugging Face"), ("github", "GitHub plugins"))
     OTHER = "_other"              # the pill for LoRAs that fit none of the models
     CONFIRM_MS = 4000             # how long "Click again to uninstall" waits
 
     def __init__(self, owner, tab="installed", model=None):
         self.owner = o = owner
         host = owner.host
-        self.tab = tab if tab in ("installed", "catalog") else "installed"
+        self.tab = tab if tab in self.TABS else "installed"
+        self.page = 1                 # GitHub's next page
         self.model = model or owner.settings["model"]
         self.sort = civitai.SORTS[0]
         self.query = tk.StringVar()
@@ -5259,13 +5265,17 @@ class AddonsWindow:
             o.button(self.model_row, m["label"], lambda mid=m["id"]: self.pick_model(mid),
                      kind="accent" if m["id"] == self.model else "quiet").pack(
                 side="left", padx=(o.px(6), 0))
-        for key, text in (("installed", "Installed"), ("catalog", "Catalog")):
+        for key, text in self.TABS:
             o.button(self.tab_row, text, lambda k=key: self.pick_tab(k),
                      kind="accent" if key == self.tab else "ghost").pack(
                 side="left", padx=(0, o.px(6)))
         self.list.canvas.yview_moveto(0)
         if self.tab == "installed":
             self.show_installed()
+        elif self.tab == "huggingface":
+            self.show_hf()
+        elif self.tab == "github":
+            self.show_github()
         else:
             self.show_catalog()
 
@@ -5277,6 +5287,7 @@ class AddonsWindow:
     def pick_tab(self, key):
         self.tab = key
         self.gen += 1
+        self.query.set("")
         self.show()
 
     def heading(self, text, about=""):
@@ -5632,3 +5643,234 @@ class AddonsWindow:
 
     def civitai_key(self):
         return ModelSourceSettings(self.owner, "civitai")
+
+    # -------------------------------------------------------- Hugging Face
+    def search_row(self, run):
+        o = self.owner
+        e = o.host._entry(self.tools, self.query)
+        e.master.pack(side="left", fill="x", expand=True)
+        e.bind("<Return>", lambda ev: run())
+        o.button(self.tools, "Search", run, kind="accent").pack(side="left", padx=(o.px(6), 0))
+
+    def show_hf(self):
+        o = self.owner
+        model = self.model_rec() if self.model != self.OTHER else None
+        if model is None:
+            o.label(self.list, "Pick one of your models above to browse LoRAs made for it.",
+                    "muted").pack(side="top", anchor="w", pady=o.px(8))
+            return
+        repos = hub.repos_for(model)
+        if not repos:
+            o.label(self.list, "Hugging Face has no base repo on file for %s's model family "
+                    "(%s)." % (model["label"], model["family"] or "not set"), "muted",
+                    wraplength=o.px(740)).pack(side="top", anchor="w", pady=o.px(8))
+            return
+        self.search_row(self.search_hf)
+        self.heading("Hugging Face LoRAs for %s" % model["label"],
+                     "Adapters of %s, most downloaded first. Check a LoRA's page and "
+                     "license before installing." % ", ".join(repos))
+        self.box = o.frame(self.list)
+        self.box.pack(side="top", fill="x")
+        self.search_hf()
+
+    def hf_token(self):
+        return model_sources.load(self.owner.studio.lib.root, "huggingface")["token"]
+
+    def search_hf(self):
+        model = self.model_rec()
+        if model is None:
+            return
+        self.gen += 1
+        gen = self.gen
+        for w in self.box.winfo_children():
+            w.destroy()
+        self.status("Asking Hugging Face" + ELLIPSIS, "accent")
+        query, token = self.query.get(), self.hf_token()
+
+        def work():
+            try:
+                cards, error = hub.hf_search(model, query, token), ""
+            except hub.HubError as e:
+                cards, error = [], str(e)
+            self.call(lambda: self.hub_found(gen, cards, error, self.hf_card, 0))
+        self.spawn(work)
+
+    def hub_found(self, gen, cards, error, make, more):
+        if gen != self.gen:
+            return
+        o = self.owner
+        for w in self.box.winfo_children():
+            if getattr(w, "more", False):
+                w.destroy()
+        if error:
+            self.status(error, "err")
+            return
+        for c in cards:
+            make(c)
+        shown = len([w for w in self.box.winfo_children() if not getattr(w, "more", False)])
+        if not shown:
+            o.label(self.box, "Nothing found.", "muted").pack(side="top", anchor="w",
+                                                                pady=o.px(8))
+        self.page = more
+        if more:
+            b = o.button(self.box, "More", lambda: self.search_github(more=True), kind="ghost")
+            b.more = True
+            b.pack(side="top", pady=o.px(10))
+        self.status("%d found." % shown)
+
+    def hf_card(self, c):
+        o, host = self.owner, self.owner.host
+        card, pic, mid, right = self.card_frame()
+        pic.config(text="Hugging\nFace")
+        o.label(mid, c["name"], "text", host.f_bold, bg="card",
+                wraplength=o.px(440)).pack(side="top", fill="x")
+        bits = [x for x in ("by " + c["creator"], "↓ " + catalog.human_count(c["downloads"]),
+                            "♥ %d" % c["likes"], c["license"]) if x]
+        o.label(mid, " · ".join(bits), "muted", host.f_small, bg="card").pack(
+            side="top", fill="x")
+        have = any(r.get("source") == c["link"] for r in self.owner.studio.lib.all("loras"))
+        b = o.button(right, "Installed" if have else "Install", lambda: None,
+                     kind="option" if have else "accent", bg="card")
+        b.command = lambda c=c, b=b: self.install_hf(c, b)
+        if have:
+            b.set(state="disabled")
+        b.pack(side="top", fill="x")
+        o.button(right, "Page", lambda u=c["link"]: webbrowser.open(u), kind="option",
+                 bg="card").pack(side="top", fill="x", pady=(o.px(4), 0))
+
+    def install_hf(self, c, button):
+        where = self.install_folder()
+        if where is None:
+            self.status("No backend has a LoRA folder on this PC, so there is nowhere to put "
+                        "the file. Set one in Backends… (LoRA folder).", "err")
+            return
+        bid, folder = where
+        button.set(state="disabled", text="Installing" + ELLIPSIS)
+        lib, stop, token = self.owner.studio.lib, self.stop, self.hf_token()
+        model = self.model_rec()
+
+        def say(text):
+            self.call(lambda: self.status(" ".join(str(text).split()), "accent"))
+
+        def work():
+            try:
+                rec, _new = hub.hf_install(lib, c, folder, model["family"], token, say, stop)
+            except Exception as e:           # said; the window stays usable
+                why = str(e) if isinstance(e, (hub.HubError, civitai.CivitAIError)) else \
+                    "%s: %s" % (type(e).__name__, e)
+                self.call(lambda: self.installed(c, button, bid, None, why))
+                return
+            self.call(lambda: self.installed(c, button, bid, rec, ""))
+        self.spawn(work)
+
+    # -------------------------------------------------------------- GitHub
+    def show_github(self):
+        o = self.owner
+        self.search_row(self.search_github)
+        folder = hub.load_comfy_folder(self.owner.studio.lib.root)
+        row = o.frame(self.list)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        o.label(row, "ComfyUI folder: " + (folder or "not chosen yet"), "muted",
+                o.host.f_small, wraplength=o.px(560)).pack(side="left")
+        o.button(row, "Choose…", self.choose_comfy, kind="ghost").pack(side="right")
+        self.heading("ComfyUI plugins on GitHub",
+                     "Custom nodes tagged %s, most starred first. A plugin is someone "
+                     "else's code that ComfyUI runs: install only what you trust. Its "
+                     "Python requirements are not installed for you; restart ComfyUI "
+                     "after installing." % hub.GH_TOPIC)
+        self.box = o.frame(self.list)
+        self.box.pack(side="top", fill="x")
+        self.search_github()
+
+    def choose_comfy(self):
+        folder = filedialog.askdirectory(parent=self.win, mustexist=True,
+                                         title="Choose ComfyUI folder (contains main.py)")
+        if not folder:
+            return None
+        try:
+            hub.custom_nodes(folder)
+            hub.save_comfy_folder(self.owner.studio.lib.root, folder)
+        except (hub.HubError, OSError) as e:
+            self.status(str(e), "err")
+            return None
+        if self.tab == "github":
+            self.show()
+        return folder
+
+    def search_github(self, more=False):
+        self.gen += 1
+        gen, page = self.gen, (self.page or 1) if more else 1
+        if not more:
+            for w in self.box.winfo_children():
+                w.destroy()
+        self.status("Asking GitHub" + ELLIPSIS, "accent")
+        query = self.query.get()
+
+        def work():
+            try:
+                cards, nxt = hub.gh_search(query, page)
+                error = ""
+            except hub.HubError as e:
+                cards, nxt, error = [], 0, str(e)
+            self.call(lambda: self.hub_found(gen, cards, error, self.gh_card, nxt))
+        self.spawn(work)
+
+    def gh_card(self, c):
+        o, host = self.owner, self.owner.host
+        card, pic, mid, right = self.card_frame()
+        pic.config(text="GitHub")
+        o.label(mid, c["id"], "text", host.f_bold, bg="card",
+                wraplength=o.px(440)).pack(side="top", fill="x")
+        bits = [x for x in ("★ " + catalog.human_count(c["stars"]),
+                            "updated " + c["updated"] if c["updated"] else "",
+                            c["license"]) if x]
+        o.label(mid, " · ".join(bits), "muted", host.f_small, bg="card").pack(
+            side="top", fill="x")
+        if c["about"]:
+            o.label(mid, c["about"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x", pady=(o.px(2), 0))
+        have = hub.gh_installed(hub.load_comfy_folder(self.owner.studio.lib.root), c)
+        b = o.button(right, "Installed" if have else "Install", lambda: None,
+                     kind="option" if have else "accent", bg="card")
+        b.command = lambda c=c, b=b: self.install_github(c, b)
+        if have:
+            b.set(state="disabled")
+        b.pack(side="top", fill="x")
+        o.button(right, "Page", lambda u=c["link"]: webbrowser.open(u), kind="option",
+                 bg="card").pack(side="top", fill="x", pady=(o.px(4), 0))
+
+    def install_github(self, c, button):
+        folder = hub.load_comfy_folder(self.owner.studio.lib.root) or self.choose_comfy()
+        if not folder:
+            return
+        if not messagebox.askyesno(
+                "Install plugin", "Install %s into ComfyUI's custom_nodes?\n\nIt is "
+                "third-party code that ComfyUI will run when it next starts. Its Python "
+                "requirements are not installed." % c["id"], parent=self.win):
+            return
+        button.set(state="disabled", text="Installing" + ELLIPSIS)
+
+        def say(text):
+            self.call(lambda: self.status(text, "accent"))
+
+        def work():
+            try:
+                path, error = hub.gh_install(c, folder, say=say), ""
+            except Exception as e:           # said; the window stays usable
+                path = ""
+                error = str(e) if isinstance(e, hub.HubError) else "%s: %s" % (
+                    type(e).__name__, e)
+            self.call(lambda: done(path, error))
+
+        def done(path, error):
+            if button.winfo_exists():
+                button.set(state="normal" if error else "disabled",
+                           text="Install" if error else "Installed")
+            if error:
+                self.status("Could not install %s: %s" % (c["id"], error), "err")
+                return
+            reqs = os.path.isfile(os.path.join(path, "requirements.txt"))
+            self.status("Installed %s into %s. Restart ComfyUI to load it.%s" % (
+                c["id"], path, " It lists Python requirements (requirements.txt); install "
+                "them into ComfyUI's Python first." if reqs else ""), "ok")
+        self.spawn(work)
