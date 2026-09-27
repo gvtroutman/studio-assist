@@ -637,7 +637,7 @@ def context_note(conf):
     return ("Warning: the model is loaded with a %d-token context window. OpenCode needs "
             "at least %d to keep a task in mind: in LM Studio on the LLM PC, raise the "
             "model's Context Length (or `lms load <model> --context-length %d`), then "
-            "press Restart OpenCode." % (ctx, MIN_CONTEXT, MIN_CONTEXT))
+            "close and reopen Studio Assist." % (ctx, MIN_CONTEXT, MIN_CONTEXT))
 
 
 def t_status(a):

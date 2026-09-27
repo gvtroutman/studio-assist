@@ -1308,7 +1308,7 @@ was never installed here, the tab never ran, and a sandbox cannot edit this repo
   reuses the one in `OPENCODE_STATE/last_session` (a local model often drops the id,
   and a fresh session knows nothing); `new_session: true` starts over.
 - **Under 64k of window it warns.** `context_note()` names LM Studio's Context Length
-  in `opencode_status` and after each ask.
+  in `opencode_status` and after each ask. (Restart OpenCode is only in the Add-ons window; the note says to reopen the app.)
 
 **How a step reaches the user.** `opencode_ask` sends the task with `prompt_async`
 and `run()` follows the session: each pass lists `/permission` and `/question`,
