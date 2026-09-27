@@ -1,6 +1,8 @@
 """Identity ordering, refusal and the complete job path, without GPU or network."""
 import json
+import importlib.util
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -18,7 +20,7 @@ class WithAnyoneClient(FakeClient):
         return inv
 
     def node_types(self, **kwargs):
-        return super().node_types() | {"StudioWithAnyone"}
+        return super().node_types() | {"StudioWithAnyone", "StudioWithAnyoneReferences", "StudioWithAnyonePooled"}
 
 
 class WithAnyoneTests(unittest.TestCase):
@@ -34,6 +36,7 @@ class WithAnyoneTests(unittest.TestCase):
                 f.write(PNG)
             self.photos.append(path)
         self.settings = {"model": "withanyone", "scene": "Two people eating pretzels.",
+                         "experimental_reference_groups": True,
                          "face_detail": True, "auto_refine": True,
                          "scene_faces": {"real": True, "people": [
                              {"name": "Left", "face": self.photos[0], "region": [.1, .2, .4, .5]},
@@ -56,6 +59,29 @@ class WithAnyoneTests(unittest.TestCase):
         self.assertEqual(g["face2"]["inputs"]["image"], "uploaded-right")
         # Upstream's "resemblance in form" end: the reference face as it looks.
         self.assertEqual(g["40"]["inputs"]["siglip_weight"], 1.0)
+
+    def test_descriptions_follow_scene_identities_not_stale_form_selection(self):
+        self.lib.save('identities', [
+            {'name': 'Left', 'description': 'Broad cheeks and a rounded chin.', 'references': self.photos[:1]},
+            {'name': 'Other', 'description': 'A narrow jaw.', 'references': self.photos[1:]}])
+        self.settings['identities'] = ['other']
+        self.settings['scene_faces']['people'][0]['identity'] = 'left'
+        p = self.plan()
+        self.assertIn('Person 1 on the left (Left)', p.prompt)
+        self.assertIn('Broad cheeks and a rounded chin.', p.prompt)
+        self.assertNotIn('A narrow jaw.', p.prompt)
+
+    def test_description_survives_save_and_enters_form_prompt_without_notes(self):
+        self.settings.pop('scene_faces')
+        description = 'Rounded cheeks.\nFine rectangular glasses and reddish brown hair.'
+        self.lib.save('identities', [{'name': 'Left', 'description': description,
+            'notes': 'Private bookkeeping, not appearance.', 'references': self.photos[:1]}])
+        self.assertEqual(ig.Library(self.tmp.name).get('identities', 'left')['description'], description)
+        self.settings['identities'] = ['left']
+        p = self.plan()
+        self.assertIn(description, p.prompt)
+        self.assertNotIn('Private bookkeeping', p.prompt)
+        self.assertEqual(p.values['prompt'], p.prompt)
 
     def test_missing_photo_refuses_instead_of_using_a_stranger(self):
         self.settings["scene_faces"]["people"][1]["face"] = "missing.png"
@@ -117,6 +143,171 @@ class WithAnyoneTests(unittest.TestCase):
         self.assertEqual(studio.client(self.backend).uploads, self.photos)
         self.assertEqual(len(studio.client(self.backend).graphs), 1)
         self.assertEqual(job.record["references"]["face2"], self.photos[1])
+
+    def test_selected_profiles_do_not_require_or_run_facefusion(self):
+        import studio_facefusion as ff
+        self.settings.pop("scene_faces")
+        self.lib.save("identities", [{"id": "left", "name": "Left",
+                                      "references": self.photos, "face_swap": True}])
+        self.settings["identities"] = ["left"]
+        self.settings["hand_pass"] = True
+        studio = ig.Studio(root=self.tmp.name, client_factory=WithAnyoneClient)
+        self.addCleanup(studio.close)
+        job = ig.Job(self.settings, self.backend)
+        with patch.object(ff, "available", return_value=False), \
+             patch.object(ff, "swap", side_effect=AssertionError("FaceFusion")), \
+             patch.object(studio, "_finish_passes", side_effect=AssertionError("finishing")):
+            preview = studio.preview(self.settings, self.backend)
+            self.assertEqual(preview.errors, [])
+            studio.run_job(job, lambda j: None)
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(studio.client(self.backend).uploads, self.photos)
+        self.assertEqual(len(studio.client(self.backend).graphs), 1)
+        self.assertFalse(job.record.get("facefusion"))
+        graph = studio.client(self.backend).graphs[0]
+        self.assertEqual(graph["40"]["inputs"]["references1"], ["face1_ref2_group", 0])
+        self.assertNotIn("face2", graph["40"]["inputs"])
+        self.assertEqual(job.record["references"]["face1_ref2"], self.photos[1])
+
+    def test_two_profiles_keep_photo_groups_and_positions_separate(self):
+        self.settings.pop("scene_faces")
+        self.lib.save("identities", [
+            {"id": "left", "name": "Left", "references": self.photos + self.photos[:1]},
+            {"id": "right", "name": "Right", "references": self.photos[::-1]}])
+        self.settings["identities"] = ["left", "right"]
+        p = self.plan()
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.values["identity_reference_groups"],
+                         [["face1", "face1_ref2"], ["face2", "face2_ref2"]])
+        self.assertEqual(len(json.loads(p.values["identity_boxes"])), 2)
+        graph = ig.fill(p.workflow, dict(p.values, **p.images))
+        self.assertEqual(graph["40"]["inputs"]["references2"], ["face2_ref2_group", 0])
+        self.assertEqual(graph["face2_ref2"]["inputs"]["image"], self.photos[0])
+
+    def test_scene_uses_linked_library_even_when_legacy_references_disabled(self):
+        self.lib.save("identities", [{"id": "left", "name": "Left",
+            "references": self.photos, "use_references": False}])
+        self.settings["scene_faces"]["people"] = [dict(
+            self.settings["scene_faces"]["people"][0], identity="left", face="")]
+        p = self.plan()
+        self.assertEqual(p.errors, [])
+        self.assertEqual(list(p.images.values()), self.photos)
+        self.assertEqual(json.loads(p.values["identity_boxes"]), [[.1, .2, .4, .5]])
+
+    def test_missing_secondary_reference_is_not_silently_dropped(self):
+        self.settings["scene_faces"]["people"][0]["photos"] = ["missing.png"]
+        self.assertIn("Left needs", " ".join(self.plan().errors))
+
+    def test_old_backend_reports_required_node_update(self):
+        self.settings["scene_faces"]["people"][0]["photos"] = self.photos
+        client = WithAnyoneClient(self.backend)
+        p = ig.compose(self.settings, self.lib, self.backend, client.inventory(),
+                       nodes=client.node_types() - {"StudioWithAnyoneReferences"})
+        self.assertIn("restart ComfyUI", " ".join(p.errors))
+
+    def test_all_six_photos_feed_one_person(self):
+        photos = self.photos[:]
+        for i in range(4):
+            path = os.path.join(self.tmp.name, "extra%d.png" % i)
+            Path(path).write_bytes(PNG)
+            photos.append(path)
+        self.settings.pop("scene_faces")
+        self.lib.save("identities", [{"id": "left", "name": "Left", "references": photos}])
+        self.settings["identities"] = ["left"]
+        p = self.plan()
+        self.assertEqual(p.errors, [])
+        self.assertEqual(list(p.images.values()), photos)
+        self.assertEqual(len(json.loads(p.values["identity_boxes"])), 1)
+        graph = ig.fill(p.workflow, dict(p.values, **p.images))
+        self.assertEqual(graph["face1_ref6_group"]["inputs"]["previous"], ["face1_ref5_group", 0])
+        self.assertEqual(graph["40"]["inputs"]["references1"], ["face1_ref6_group", 0])
+
+    def test_rejected_multi_photo_blend_is_not_used_by_default(self):
+        self.settings.pop("experimental_reference_groups")
+        self.settings.pop("scene_faces")
+        self.lib.save("identities", [{"id": "left", "name": "Left", "references": self.photos}])
+        self.settings["identities"] = ["left"]
+        client = WithAnyoneClient(self.backend)
+        p = ig.compose(self.settings, self.lib, self.backend, client.inventory(),
+                       nodes=client.node_types() - {"StudioWithAnyoneReferences"})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(list(p.images.values()), self.photos[:1])
+        self.assertEqual(self.lib.get("identities", "left")["references"], self.photos)
+        self.assertIn("not blended", " ".join(p.notes))
+        graph = ig.fill(p.workflow, dict(p.values, **p.images))
+        self.assertNotIn("references1", graph["40"]["inputs"])
+
+    def test_profile_pooling_selects_new_node_and_keeps_other_person_primary_only(self):
+        self.settings.pop('scene_faces')
+        self.lib.save('identities', [
+            {'name': 'Left', 'references': self.photos, 'pool_photos': True},
+            {'name': 'Right', 'references': self.photos[::-1]}])
+        self.settings['identities'] = ['left', 'right']
+        p = self.plan()
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.values['identity_reference_groups'], [['face1', 'face1_ref2'], ['face2']])
+        graph = ig.fill(p.workflow, dict(p.values, **p.images))
+        self.assertEqual(graph['40']['class_type'], 'StudioWithAnyonePooled')
+        self.assertNotIn('references2', graph['40']['inputs'])
+        client = WithAnyoneClient(self.backend)
+        old = ig.compose(self.settings, self.lib, self.backend, client.inventory(),
+                         nodes=client.node_types() - {'StudioWithAnyonePooled'})
+        self.assertIn('restart ComfyUI to use photo pooling', ' '.join(old.errors))
+
+    def test_scene_linked_profile_pooling_works_without_experiment_flag(self):
+        self.settings.pop('experimental_reference_groups')
+        self.lib.save('identities', [{'name': 'Left', 'references': self.photos, 'pool_photos': True}])
+        self.settings['scene_faces']['people'][0]['identity'] = 'left'
+        p = self.plan()
+        self.assertEqual(p.errors, [])
+        self.assertTrue(p.values['identity_pooling'])
+        self.assertEqual(p.values['identity_reference_groups'][0], ['face1', 'face1_ref2'])
+
+
+class ReferenceGroupingTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[1] / "comfy_nodes/studio_withanyone/references.py"
+        spec = importlib.util.spec_from_file_location("withanyone_reference_groups", path)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def test_consensus_preserves_single_photo_and_raw_embedding_scale(self):
+        consensus = self.module.identity_consensus
+        self.assertEqual(consensus([[3, 4]]), [3, 4])
+        self.assertEqual(consensus([[3, 4], [3, 4]]), [3, 4])
+        # Magnitude must not bias the direction toward the second photo.
+        pooled = consensus([[2, 0], [0, 4]])
+        self.assertAlmostEqual(pooled[0], pooled[1])
+        self.assertAlmostEqual(sum(x*x for x in pooled), 9)
+        self.assertEqual(pooled, consensus([[0, 4], [2, 0]]))
+
+    def test_consensus_refuses_invalid_or_cancelling_vectors(self):
+        for rows in ([], [[]], [[0, 0]], [[1], [1, 2]],
+                     [[float('nan')]], [[float('inf')]], [[1, 0], [-1, 0]]):
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                self.module.identity_consensus(rows)
+
+    def test_different_sizes_share_person_region_without_averaging(self):
+        photos = [SimpleNamespace(shape=(1, 256, 256, 3)),
+                  SimpleNamespace(shape=(1, 1200, 800, 3)),
+                  SimpleNamespace(shape=(1, 640, 960, 3))]
+        boxes = [[.1, .2, .4, .5], [.6, .2, .9, .5]]
+        refs = self.module.grouped_references(
+            [photos[0], photos[2], None, None], [(photos[1],), None, None, None], boxes)
+        self.assertIs(refs[0][0], photos[0])
+        self.assertIs(refs[1][0], photos[1])
+        self.assertEqual([r[1] for r in refs], [boxes[0], boxes[0], boxes[1]])
+        self.assertEqual([r[2:] for r in refs], [(1, 1), (1, 2), (2, 1)])
+
+    def test_refuses_unassigned_photos_batches_and_excess_references(self):
+        photo = SimpleNamespace(shape=(1, 256, 256, 3))
+        with self.assertRaisesRegex(ValueError, "primary"):
+            self.module.grouped_references([photo, None], [None, (photo,)], [[0, 0, 1, 1]])
+        with self.assertRaisesRegex(ValueError, "more than"):
+            self.module.grouped_references([photo], [(photo,) * 8], [[0, 0, 1, 1]])
+        with self.assertRaisesRegex(ValueError, "still image"):
+            self.module.grouped_references([SimpleNamespace(shape=(2, 256, 256, 3))],
+                                           [None], [[0, 0, 1, 1]])
 
 
 if __name__ == "__main__":
