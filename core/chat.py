@@ -420,7 +420,7 @@ class Chat(tk.Tk):
         self.repaints = []                # (widget, draw) for shapes _theme must redraw
         self.closing = False              # set by _quit, so no timer outlives the window
         # Console windows opened outside the app, hidden and held in the
-        # Terminal tab (studio_consoles.py). Watched from the start, whether
+        # Terminal tab (core/consoles.py). Watched from the start, whether
         # that tab is open or not; `_watch_consoles` opens it when it takes one.
         self.holder = consoles.Holder()
 
@@ -3894,7 +3894,7 @@ class Chat(tk.Tk):
     def _build_panel(self, s):
         """A panel tab's body: a line of controls over the frame another
         program's window is held in. No transcript, no hero and no composer -
-        the window is the tab. See studio_milanote.py."""
+        the window is the tab. See apps/milanote/milanote.py."""
         s.frame = self._skin(tk.Frame(self.stack), bg="bg")
         bar = self._skin(tk.Frame(s.frame), bg="bg")
         bar.pack(side="top", fill="x", padx=18, pady=(0, 8))
@@ -3945,7 +3945,7 @@ class Chat(tk.Tk):
         """Off the UI thread, for the life of the window: hide each console
         window that opens on the desktop and hand it to the Terminal tab.
         First, whatever a copy of this app hid and never gave back because
-        it crashed or was killed. See studio_consoles.py."""
+        it crashed or was killed. See core/consoles.py."""
         taken = self.holder.recover()
         if not self.prefs.get("hold_consoles"):
             self.holder.release_all()

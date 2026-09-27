@@ -115,7 +115,7 @@ class CepHost:
                     "wait for it to finish loading, then try again." % self.name)
         if not self.panel_installed():
             return ("%s is running but its bridge panel is not installed. Quit %s, run "
-                    "`python studio_premiere_mcp.py --install-panel`, and open %s again."
+                    "`python apps/adobe/premiere.py --install-panel`, and open %s again."
                     % (self.name, self.name, self.name))
         missing = debug_mode_missing()
         if missing:

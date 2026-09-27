@@ -26,8 +26,8 @@ a browser on this PC should be able to reach.
 Stdlib only. The protocol - framing, negotiation, validation, annotations,
 progress, cancellation, elicitation - is studio_mcp's; this file is the tools.
 
-    python studio_opencode_mcp.py --list-tools
-    python studio_opencode_mcp.py --check
+    python apps/opencode/mcp.py --list-tools
+    python apps/opencode/mcp.py --check
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout
@@ -1655,7 +1655,7 @@ TOOLS = [
     ("opencode_read_file", t_read_file,
      "Read a page of text - from the current task's copy while it has one. Follow the "
      "next start offset to continue; search first to locate code.",
-     _obj({"path": _s("File path relative to the folder, e.g. studio_agent.py."),
+     _obj({"path": _s("File path relative to the folder, e.g. core/agent.py."),
            "start": _i("Character offset, starting at 0.", minimum=0, maximum=10000000),
            "limit": _i("Characters to return; default 6000.", minimum=1, maximum=6000),
            "session_id": SESSION}, ["path"])),

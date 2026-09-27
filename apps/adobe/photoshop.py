@@ -15,8 +15,8 @@ origin top-left; opacity is 0..100; colours are "#RRGGBB".
 
 Stdlib only. The protocol is studio_mcp's; this file is the tools.
 
-    python studio_photoshop_mcp.py --list-tools
-    python studio_photoshop_mcp.py --check
+    python apps/adobe/photoshop.py --list-tools
+    python apps/adobe/photoshop.py --check
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout

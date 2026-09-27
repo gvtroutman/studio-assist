@@ -17,8 +17,8 @@ Stdlib only. The protocol - framing, negotiation, validation, annotations,
 progress and cancellation - is studio_mcp's; this file is the tools. Run it by
 hand to see the tool list, or to check its own contract:
 
-    python studio_comfy_mcp.py --list-tools
-    python studio_comfy_mcp.py --check
+    python apps/comfyui/mcp.py --list-tools
+    python apps/comfyui/mcp.py --check
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout

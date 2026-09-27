@@ -3,7 +3,7 @@
 studio_imagegen - the Image Studio's engine: Person -> Style -> Scene ->
 Reference -> Generate, with the ComfyUI graph built underneath.
 
-No tkinter here; `studio_images_ui.py` is the tab, and this module can be
+No tkinter here; `apps/image_studio/ui.py` is the tab, and this module can be
 driven and tested without a window. The pieces, each apart from the next:
 
 - **Backends.** Any number of ComfyUI servers, each an independent worker - the
@@ -6817,7 +6817,7 @@ class Studio:
 
 
 def main(argv=None):
-    """`python studio_imagegen.py --probe`: every endpoint on every backend,
+    """`python apps/image_studio/imagegen.py --probe`: every endpoint on every backend,
     then what each model lacks where. Read-only: nothing is queued."""
     import argparse
     ap = argparse.ArgumentParser(description=main.__doc__)

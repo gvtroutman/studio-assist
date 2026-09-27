@@ -17,8 +17,8 @@ counts y upward; every helper here flips it, so the bridge speaks the same
 language as Photoshop and After Effects and a small model never has to
 remember which app is upside down.
 
-    python studio_illustrator_mcp.py --list-tools
-    python studio_illustrator_mcp.py --check
+    python apps/adobe/illustrator.py --list-tools
+    python apps/adobe/illustrator.py --check
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout

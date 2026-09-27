@@ -1005,7 +1005,7 @@ class TestAppRegistry(unittest.TestCase):
         self.assertIsNone(oc.exe())
         self.assertEqual(oc.installed(), eng.opencode_exe() is not None)
         self.assertEqual(oc.command, eng.sys.executable)
-        self.assertEqual(os.path.basename(oc.args[0]), "apps.opencode.mcp.py")
+        self.assertTrue(oc.args[0].endswith(os.path.join("apps", "opencode", "mcp.py")))
         self.assertTrue(os.path.isfile(oc.args[0]))
         if not os.environ.get("OPENCODE_WORKSPACE"):
             self.assertEqual(oc.workspace, eng.HERE)
@@ -1179,7 +1179,7 @@ class TestAppRegistry(unittest.TestCase):
         comfy = eng.APPS_BY_ID["comfyui"]
         self.assertEqual(comfy.command, eng.sys.executable)
         self.assertTrue(os.path.isfile(comfy.args[0]))
-        self.assertEqual(os.path.basename(comfy.args[0]), "apps.comfyui.mcp.py")
+        self.assertTrue(comfy.args[0].endswith(os.path.join("apps", "comfyui", "mcp.py")))
         self.assertIn(eng.COMFYUI_URL, comfy.probe)
 
     def test_chat_prompt_extends_the_cli_prompt(self):
@@ -1273,7 +1273,7 @@ class TestPlainChat(unittest.TestCase):
         for t in tools:
             self.assertIs(t["annotations"]["readOnlyHint"], True, t["name"])
         # the script is named too, so the harness can check it like any bridge here
-        self.assertTrue(eng.CHAT.args[0].endswith("apps.research.mcp.py"))
+        self.assertTrue(eng.CHAT.args[0].endswith(os.path.join("apps", "research", "mcp.py")))
         self.assertTrue(os.path.isfile(eng.CHAT.args[0]))
 
     def test_the_prompt_teaches_its_tools_and_no_app_rules(self):
@@ -1395,7 +1395,7 @@ class TestHandEnteredBridges(unittest.TestCase):
 
     def test_the_cli_takes_a_command_line(self):
         import subprocess
-        out = subprocess.run([sys.executable, "core.agent.py", "--help"], capture_output=True,
+        out = subprocess.run([sys.executable, os.path.join("core", "agent.py"), "--help"], capture_output=True,
                              text=True, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertIn("--mcp", out.stdout)
 
@@ -1423,11 +1423,11 @@ class TestComBridges(unittest.TestCase):
         host.running = lambda: running
 
     def test_registry_entries_point_at_the_scripts_beside_the_engine(self):
-        for app_id, script in (("photoshop", "apps.adobe.photoshop.py"),
-                               ("illustrator", "apps.adobe.illustrator.py")):
+        for app_id, script in (("photoshop", os.path.join("apps", "adobe", "photoshop.py")),
+                               ("illustrator", os.path.join("apps", "adobe", "illustrator.py"))):
             app = eng.APPS_BY_ID[app_id]
             self.assertEqual(app.command, eng.sys.executable)
-            self.assertEqual(os.path.basename(app.args[0]), script)
+            self.assertTrue(app.args[0].endswith(script))
             self.assertTrue(os.path.isfile(app.args[0]))
             self.assertTrue(app.probe.startswith("process:"))
 
@@ -4019,7 +4019,7 @@ class TestGui(unittest.TestCase):
         """The connect dialog's values go through _save_bridge; a bad set is a
         sentence back to the dialog, a good one is a new drivable row, an open
         tab and a record in the settings file. Forgetting undoes all three."""
-        script = os.path.join(os.path.dirname(eng.__file__), "apps", "comfyui", "mcp.py")
+        script = os.path.join(os.path.dirname(os.path.dirname(eng.__file__)), "apps", "comfyui", "mcp.py")
         line = '"%s" "%s"' % (sys.executable, script)
         self.assertIn("name", self.app._save_bridge({"name": " ", "command": line}))
         self.assertIn("command line", self.app._save_bridge({"name": "Blender", "command": ""}))

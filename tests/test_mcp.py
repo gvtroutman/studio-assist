@@ -564,7 +564,7 @@ class TestVerificationHints(unittest.TestCase):
 
 class TestSnapshots(unittest.TestCase):
     """Installed bridges are checked against what they actually expose, from a
-    recording `python studio_mcp.py snapshot --app <id> tests/contracts/<id>.json`
+    recording `python core/mcp.py snapshot --app <id> tests/contracts/<id>.json`
     makes. Record one when the bridge updates; the registry's groups and prompts
     are then held to the real contract without the app having to be open."""
 

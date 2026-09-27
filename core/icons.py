@@ -13,7 +13,7 @@ new year.
 The two-letter badges stay as the fallback: an app whose icon cannot be read -
 no resources, a packed exe, a path we cannot open - draws its mark instead.
 
-    python studio_icons.py "C:\\Program Files\\...\\AfterFX.exe" out.png 64
+    python core/icons.py "C:\\Program Files\\...\\AfterFX.exe" out.png 64
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout
@@ -485,7 +485,7 @@ def icon_png(exe, size=26):
 
 def main(argv):
     if len(argv) < 2:
-        return "usage: studio_icons.py <exe> [out.png] [size]"
+        return "usage: core/icons.py <exe> [out.png] [size]"
     data = icon_png(argv[1], int(argv[3]) if len(argv) > 3 else 64)
     if not data:
         return "no icon could be read from %s" % argv[1]

@@ -57,7 +57,7 @@ each object go into the prompt as written. The pieces:
   person's look. The description, verbatim", then the camera. An object outside the frame is
   left out and said so (`Words.notes`).
 
-No tkinter here; `studio_scene_ui.py` is the window. Stdlib only.
+No tkinter here; `apps/image_studio/scene/ui.py` is the window. Stdlib only.
 """
 
 import bisect

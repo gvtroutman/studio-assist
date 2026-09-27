@@ -37,11 +37,11 @@ name tools the bridge does not have, tools no group exposes, prompts that teach
 a tool the tab was never given. `check_live()` does that against a running
 bridge - ours or an installed one - and can call its harmless reads.
 
-    python studio_mcp.py check --app comfyui             # start the bridge, report
-    python studio_mcp.py check --app after_effects --call # ...and call its reads
-    python studio_mcp.py check --command npx --args -y some-mcp-server
-    python studio_mcp.py snapshot --app resolve tests/contracts/resolve.json
-    python studio_mcp.py check --app resolve --snapshot tests/contracts/resolve.json
+    python core/mcp.py check --app comfyui             # start the bridge, report
+    python core/mcp.py check --app after_effects --call # ...and call its reads
+    python core/mcp.py check --command npx --args -y some-mcp-server
+    python core/mcp.py snapshot --app resolve tests/contracts/resolve.json
+    python core/mcp.py check --app resolve --snapshot tests/contracts/resolve.json
 
 A bridge built on `Server` gets `main()` for free: `--list-tools` prints its
 contract, `--describe` dumps it as JSON, `--check` runs the checks on itself.

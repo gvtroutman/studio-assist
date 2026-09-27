@@ -1,7 +1,7 @@
 """The Terminal tab: console windows opened outside the app, hidden from the
 desktop and mirrored here, one at a time, with a line to type into them.
 
-`studio_consoles.py` finds, hides and reads the windows; the app's watcher
+`core/consoles.py` finds, hides and reads the windows; the app's watcher
 (`Chat._watch_consoles`) takes each new one about a second after it opens,
 whether or not this tab is open, and opens this tab for it. What is on screen
 here is a copy of the console's text, read twice a second while the tab is
