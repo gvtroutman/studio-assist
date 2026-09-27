@@ -373,6 +373,10 @@ class HostUnreachable(RuntimeError):
     GUI treats the two differently: this one gets a Connect button."""
 
 
+class ContextLimitError(RuntimeError):
+    """No complete model response exists; safe to compact and retry once."""
+
+
 class LLM:
     """One model on the OpenAI-compatible host, and the draft model that runs
     ahead of it.
@@ -438,7 +442,10 @@ class LLM:
                                        % (self.draft, self.model, e.code, detail.strip()))
                     self.draft = None
                     return resp
-            raise RuntimeError("inference host %s: HTTP %s - %s" % (self.url, e.code, detail))
+            kind = (ContextLimitError if e.code in (400, 413) and
+                    any(word in detail.lower() for word in ("context length", "context window", "context_length_exceeded"))
+                    else RuntimeError)
+            raise kind("inference host %s: HTTP %s - %s" % (self.url, e.code, detail))
         except urllib.error.URLError as e:
             raise HostUnreachable("cannot reach inference host %s (%s). Is the tailnet up "
                                   "and LM Studio serving?" % (self.url, e.reason))
@@ -459,9 +466,10 @@ class LLM:
         self._count(data.get("stats"))
         return data
 
-    def stream(self, messages, tools=None, on_text=None):
+    def stream(self, messages, tools=None, on_text=None, max_tokens=None):
         """Streamed completion. on_text(str) fires per token; returns the final message."""
-        resp = self._open(self._body(messages, tools, stream=True))
+        limits = {"max_tokens": max_tokens} if max_tokens else {}
+        resp = self._open(self._body(messages, tools, stream=True, **limits))
 
         content, calls = [], {}
         finish_reason, done = None, False
@@ -503,12 +511,13 @@ class LLM:
             # the context window it was loaded with (or a response-length
             # limit set in LM Studio). Nothing partial is executed; say what
             # the host would not.
-            raise RuntimeError(
+            raise ContextLimitError(
                 "Incomplete inference response (length): %s ran out of room before its reply "
                 "finished, and no tools from it were executed. The reply hit the context "
                 "window the model was loaded with - or LM Studio's response-length limit, if "
                 "one is set. On the LLM PC, reload %s with a larger context length (16384 or "
-                "more); if the conversation is long, New chat starts a shorter one."
+                "more) or increase its response limit. Saved task evidence can be continued "
+                "through continuation notes; no partial tool call should be replayed."
                 % (self.model, self.model))
         if not done or finish_reason not in ("stop", "tool_calls"):
             raise RuntimeError("Incomplete inference response (%s); no tools from this response were executed."
@@ -1648,10 +1657,19 @@ HOW THE WORK IS SHAPED
   The user.
 
 BRIEFING - what silently produces poor work
-- Brief OpenCode like a programmer: what to change, in which files and functions,
-  and what finished looks like. "In studio_chat.py, make the Stop button also close
-  an open approval form" works; "fix the approvals" does not. Put the user's exact
-  wording, constraints and examples into the prompt.
+- For a request to add, fix or change code, call opencode_ask promptly. Your job
+  is the handoff; OpenCode does the repository investigation and implementation.
+  Do not read AGENTS.md and a series of source files before delegating. Include
+  The user's exact wording, constraints and what finished looks like. Name files
+  or functions only when already known; tell OpenCode to locate them otherwise.
+  For "add restart for servers in the tabs", delegate that request, asking it to
+  inspect tab/server lifecycle code, implement restart and run relevant tests.
+- Direct file tools are for focused questions and checking returned changes.
+  Use opencode_search_files to locate text, then opencode_read_file with its start
+  offset. Follow the returned next-page offset, never repeat a clipped first page.
+  After three exploratory reads, these tools pause until you hand off or inspect
+  an existing session. Answer from the evidence, ask a focused question, or call
+  opencode_ask; for a review, explicitly tell it to inspect without editing.
 - This project has an AGENTS.md with its rules (stdlib only, how tests run). Tell
   OpenCode to read it before changing code, and to keep changes small - the user
   reviews each one.
@@ -2406,7 +2424,8 @@ COMFY_GROUPS = {
 
 OPENCODE_GROUPS = {
     "discover": ["opencode_status", "opencode_list_sessions", "opencode_get_session",
-                 "opencode_changes", "opencode_list_files", "opencode_read_file"],
+                 "opencode_changes", "opencode_list_files", "opencode_read_file",
+                 "opencode_search_files"],
     # Nothing here edits by itself: OpenCode asks the user before each change.
     "work": ["opencode_new_session", "opencode_ask", "opencode_wait", "opencode_abort"],
 }

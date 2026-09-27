@@ -210,7 +210,7 @@ class TestContract(Base):
     def test_read_only_tools_are_annotated_and_the_rest_are_not(self):
         hints = {t["name"]: t["annotations"]["readOnlyHint"] for t in oc.tool_list()}
         for name in ("opencode_status", "opencode_list_sessions", "opencode_get_session",
-                     "opencode_list_files", "opencode_read_file", "opencode_changes"):
+                     "opencode_list_files", "opencode_read_file", "opencode_search_files", "opencode_changes"):
             self.assertTrue(hints[name], name)
         for name in ("opencode_ask", "opencode_wait", "opencode_new_session", "opencode_abort"):
             self.assertFalse(hints[name], name)
@@ -226,7 +226,7 @@ class TestContract(Base):
     def test_prompt_relies_only_on_default_tools(self):
         app = eng.APPS_BY_ID["opencode"]
         for tool in ("opencode_status", "opencode_ask", "opencode_wait", "opencode_changes",
-                     "opencode_abort"):
+                     "opencode_abort", "opencode_search_files", "opencode_read_file"):
             self.assertIn(tool, app.tool_names())
             self.assertIn(tool, app.system_prompt)
         self.assertNotIn("opencode_put_file", app.system_prompt)
@@ -430,7 +430,7 @@ class TestOtherTools(Base):
         os.makedirs(os.path.join(oc.WORKSPACE, "src"))
         with open(os.path.join(oc.WORKSPACE, "src", "a.py"), "w") as f:
             f.write("x")
-        self.assertEqual(self.text(oc.call_tool("opencode_read_file", {"path": "src/a.py"})), "x")
+        self.assertEqual(self.text(oc.call_tool("opencode_read_file", {"path": "src/a.py"})), "End of file.\nx")
         self.assertIn("src/a.py  (1 bytes)", self.text(oc.call_tool("opencode_list_files", {})))
         outside = os.path.join(self.tmp, "secret.txt")
         with open(outside, "w") as f:
@@ -443,8 +443,10 @@ class TestOtherTools(Base):
                 self.assertIn("outside OpenCode's folder", self.text(res))
 
     def test_listing_skips_dependency_folders_and_is_bounded(self):
-        for d in ("node_modules/x", ".git", ".claude/worktrees", "src"):
+        for d in ("node_modules/x", ".git", ".claude/worktrees", ".runtime/facefusion", "src"):
             os.makedirs(os.path.join(oc.WORKSPACE, d))
+        with open(os.path.join(oc.WORKSPACE, ".runtime", "facefusion", "noise.py"), "w") as f:
+            f.write("needle")
         open(os.path.join(oc.WORKSPACE, "node_modules", "x", "big.js"), "w").close()
         open(os.path.join(oc.WORKSPACE, ".claude", "worktrees", "copy.py"), "w").close()
         open(os.path.join(oc.WORKSPACE, "src", "ok.py"), "w").close()
@@ -452,8 +454,50 @@ class TestOtherTools(Base):
         self.assertIn("src/ok.py", out)
         self.assertNotIn("big.js", out)
         self.assertNotIn("copy.py", out)
+        self.assertNotIn("noise.py", out)
+        self.assertNotIn("noise.py", self.text(oc.call_tool("opencode_search_files", {"query": "needle"})))
         rows, truncated = oc.list_files("", limit=1)
         self.assertTrue(truncated)
+
+    def test_read_pages_reassemble_unicode_and_windows_newlines(self):
+        content = ("café λ\r\n" * 1800) + "last"
+        with open(os.path.join(oc.WORKSPACE, "pages.txt"), "wb") as f:
+            f.write(content.encode("utf-8"))
+        expected = content.replace("\r\n", "\n")
+        pages = []
+        start = 0
+        while True:
+            text = self.text(oc.call_tool("opencode_read_file", {"path": "pages.txt", "start": start}))
+            self.assertLess(len(text), eng.MAX_TOOL_RESULT_CHARS)
+            header, body = text.split("\n", 1)
+            pages.append(body)
+            start += len(body)
+            if header == "End of file.":
+                break
+            self.assertIn("start=%d" % start, header)
+        self.assertEqual("".join(pages), expected)
+        for args in ({"start": -1}, {"limit": 6001}, {"start": 10000001}):
+            self.assertTrue(oc.call_tool("opencode_read_file", dict(path="pages.txt", **args))["isError"])
+
+    def test_search_locates_code_beyond_old_reader_limit(self):
+        prefix = "# café\r\n" * 4000
+        with open(os.path.join(oc.WORKSPACE, "large.py"), "wb") as f:
+            f.write((prefix + "def restart_server():\r\n    pass\r\n").encode("utf-8"))
+        out = self.text(oc.call_tool("opencode_search_files", {"query": "RESTART_SERVER"}))
+        start = len(prefix.replace("\r\n", "\n"))
+        self.assertIn("large.py:4001 start=%d" % start, out)
+        page = self.text(oc.call_tool("opencode_read_file", {"path": "large.py", "start": start}))
+        self.assertIn("def restart_server():", page)
+        self.assertTrue(oc.call_tool("opencode_search_files", {"query": "x", "path": "../"})["isError"])
+
+    def test_search_and_listing_fit_executor_budget_and_report_partial(self):
+        for i in range(150):
+            with open(os.path.join(oc.WORKSPACE, "%03d_%s.txt" % (i, "x" * 60)), "w") as f:
+                f.write("match\n" * 100)
+        for name, args in (("opencode_search_files", {"query": "match"}), ("opencode_list_files", {})):
+            out = self.text(oc.call_tool(name, args))
+            self.assertLess(len(out), eng.MAX_TOOL_RESULT_CHARS)
+            self.assertTrue("Partial" in out or "more; list a subfolder" in out)
 
     def test_unknown_tool_and_bad_arguments_are_errors_not_exceptions(self):
         self.assertTrue(oc.call_tool("opencode_nope", {})["isError"])

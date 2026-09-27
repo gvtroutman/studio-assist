@@ -172,7 +172,7 @@ class TestExecutorLearnsAndAsks(unittest.TestCase):
         ex = self.run_with([answer(text="hi")])
         names = [t["function"]["name"] for t in ex.tools]
         self.assertEqual(names, ["create_comp", "get_comp", "studio_task_update",
-                                 "studio_tool_create", "studio_ask", "studio_remember"])
+                                 "studio_tool_create", "studio_ask", "studio_remember", "studio_task_recall"])
 
     def test_a_question_ends_the_run_and_the_answer_continues_it(self):
         asked = {"question": "Which frame rate?", "options": [
