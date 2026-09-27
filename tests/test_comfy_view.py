@@ -7,8 +7,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_comfy_view as cv
-import studio_milanote as milanote
+import apps.comfyui.view as cv
+import apps.milanote.milanote as milanote
 
 G1 = {"1": {"class_type": "UNETLoader", "inputs": {}},
       "9": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}}
@@ -222,8 +222,8 @@ class NodesTabTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import tempfile
-        import studio_chat
-        import studio_nodes_ui
+        import core.chat as studio_chat
+        import apps.comfyui.nodes_ui as studio_nodes_ui
         cls.mod, cls.nodes_ui = studio_chat, studio_nodes_ui
         cls.dir = tempfile.mkdtemp()
         cls._real_settings = os.environ.get("STUDIO_SETTINGS")

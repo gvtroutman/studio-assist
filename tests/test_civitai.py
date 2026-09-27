@@ -17,8 +17,8 @@ import urllib.error
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import studio_civitai as civitai  # noqa: E402
-import studio_imagegen as ig  # noqa: E402
+import apps.image_studio.addons.civitai as civitai  # noqa: E402
+import apps.image_studio.imagegen as ig  # noqa: E402
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")

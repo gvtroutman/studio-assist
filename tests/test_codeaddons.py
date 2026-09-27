@@ -11,8 +11,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_agent as eng              # noqa: E402
-import studio_codeaddons as ca          # noqa: E402
+import core.agent as eng              # noqa: E402
+import apps.opencode.codeaddons as ca          # noqa: E402
 
 REGISTRY = {"servers": [
     {"server": {"name": "io.github.acme/notes-mcp", "title": "Notes", "version": "1.2.0",
@@ -214,7 +214,7 @@ class TestAddonsWindow(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.dir = tempfile.mkdtemp()
         os.environ["STUDIO_SETTINGS"] = os.path.join(cls.dir, "settings.json")
         cls.real = (eng.installed_apps, studio_chat.Chat._boot_host, studio_chat.Chat._ensure,
@@ -232,7 +232,7 @@ class TestAddonsWindow(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.app._quit()
         cls.spec.state_dir = cls.real_state
         (eng.installed_apps, studio_chat.Chat._boot_host, studio_chat.Chat._ensure,

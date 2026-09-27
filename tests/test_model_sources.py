@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import studio_civitai
-import studio_model_sources as sources
+import apps.image_studio.addons.civitai as studio_civitai
+import apps.image_studio.model_sources as sources
 
 
 class ModelSourcesTests(unittest.TestCase):

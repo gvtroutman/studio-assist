@@ -19,9 +19,9 @@ import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_agent as eng               # noqa: E402
-import studio_cep                        # noqa: E402
-import studio_premiere_mcp as ppro       # noqa: E402
+import core.agent as eng               # noqa: E402
+import apps.adobe.cep as studio_cep                        # noqa: E402
+import apps.adobe.premiere as ppro       # noqa: E402
 
 
 class FakePanel:
@@ -78,7 +78,7 @@ class TestRegistry(unittest.TestCase):
     def test_the_entry_points_at_the_script_and_probes_the_panel_port(self):
         app = eng.APPS_BY_ID["premiere"]
         self.assertEqual(app.command, eng.sys.executable)
-        self.assertEqual(os.path.basename(app.args[0]), "studio_premiere_mcp.py")
+        self.assertEqual(os.path.basename(app.args[0]), "apps.adobe.premiere.py")
         self.assertTrue(os.path.isfile(app.args[0]))
         self.assertEqual(app.probe, "port:" + eng.PREMIERE_PORT)
         self.assertIn(eng.PREMIERE_PORT, app.bridge_label)
@@ -442,7 +442,7 @@ class TestStdio(unittest.TestCase):
     """
 
     SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "studio_premiere_mcp.py")
+                          "apps.adobe.premiere.py")
 
     def spawn(self, env=None):
         p = subprocess.Popen([sys.executable, self.SCRIPT], stdin=subprocess.PIPE,

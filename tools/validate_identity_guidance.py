@@ -49,7 +49,7 @@ def main():
 
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root))
-    import studio_imagegen as ig
+    import apps.image_studio.imagegen as ig
     description = args.description.read_text(encoding='utf-8').strip() if args.description else ''
     profile['description'] = description
     prompt = ' '.join([args.prompt] + ig.identity_description_text({}, None, [(profile, 1)]))

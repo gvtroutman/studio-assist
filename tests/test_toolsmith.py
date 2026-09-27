@@ -12,9 +12,9 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-import studio_agent as eng
-import studio_tasks as tasks
-import studio_toolsmith as toolsmith
+import core.agent as eng
+import core.tasks as tasks
+import core.toolsmith as toolsmith
 
 
 SPECS = [

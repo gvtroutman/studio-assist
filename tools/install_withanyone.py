@@ -58,7 +58,7 @@ def main():
     if args.library:
         import sys
         sys.path.insert(0, str(ROOT))
-        import studio_imagegen as ig
+        import apps.image_studio.imagegen as ig
         library = ig.Library(str(args.library))
         if not library.get("models", "withanyone"):
             model = next(m for m in ig._default_models() if m["id"] == "withanyone")

@@ -5,7 +5,7 @@ import unittest
 import urllib.request
 from unittest.mock import patch
 
-import studio_discovery as discovery
+import apps.image_studio.addons.discovery as discovery
 
 
 class DiscoveryTests(unittest.TestCase):

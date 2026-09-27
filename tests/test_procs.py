@@ -11,8 +11,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_agent as eng
-import studio_procs as procs
+import core.agent as eng
+import core.procs as procs
 
 # A child that starts a grandchild, says both pids, and then waits on stdin
 # the way a bridge does. The grandchild only sleeps: it is the `node` under
@@ -109,7 +109,7 @@ class TestBridgeClients(unittest.TestCase):
     def test_a_com_host_makes_no_folder_until_it_is_used(self):
         """Every bridge module builds its host at import; the folder used to
         be made then, and one was left in %TEMP% per import."""
-        import studio_com
+        import apps.adobe.com as studio_com
         before = set(os.listdir(tempfile.gettempdir()))
         host = studio_com.ComHost("No.Such.ProgID", "Nothing", "Nothing.exe")
         self.assertIsNone(host.dir)
@@ -119,7 +119,7 @@ class TestBridgeClients(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "win32", "PowerShell worker")
     def test_a_used_com_host_removes_its_folder_and_worker_on_close(self):
-        import studio_com
+        import apps.adobe.com as studio_com
         host = studio_com.ComHost("Studio.NoSuchApp.Test", "Nothing", "Nothing.exe")
         try:
             host.run("return 1", timeout=20)

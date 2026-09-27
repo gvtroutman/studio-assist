@@ -8,8 +8,8 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-import studio_imagegen as ig
-from studio_images_ui import RecordEditor
+import apps.image_studio.imagegen as ig
+from apps.image_studio.ui import RecordEditor
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==')
 

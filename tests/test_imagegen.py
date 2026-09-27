@@ -15,7 +15,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import studio_imagegen as ig  # noqa: E402
+import apps.image_studio.imagegen as ig  # noqa: E402
 
 # A 1x1 PNG, for the pictures the fake ComfyUI "makes".
 PNG = base64.b64decode(
@@ -342,7 +342,7 @@ class TestFill(unittest.TestCase):
         self.assertEqual(ig.face_crops(2000, 2000, [(0, 0, 700, 700)]), [])
 
     def test_a_region_mask_is_white_over_its_region_at_the_frames_shape(self):
-        import studio_icons
+        import core.icons as studio_icons
         rgba, w, h = studio_icons.png_to_rgba(ig.region_png([0.5, 0.0, 1.0, 0.5], 800, 1600))
         self.assertEqual((w, h), (32, 64))
         at = lambda x, y: rgba[(y * w + x) * 4]
@@ -1143,7 +1143,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             paths.append(os.path.join(self.dir, "me%d.png" % k))
             with open(paths[-1], "wb") as f:
                 f.write(PNG)
-        with patch('studio_facefusion.available', return_value=installed):
+        with patch('apps.image_studio.facefusion.available', return_value=installed):
             job, graphs, _ = self.swap_job(spots, client=FaceFindClient, face_swap="sitter",
                                            identities=[{"id": "sitter", "name": "Sitter",
                                                         "references": paths}])
@@ -1180,7 +1180,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
 
     def test_a_face_swap_uses_every_reference_picture(self):
         from unittest.mock import patch
-        with patch('studio_facefusion.swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})) as swap:
+        with patch('apps.image_studio.facefusion.swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})) as swap:
             job, graphs, paths = self.face_swap_job([], [(40, 100, 50, 60)], refs=3)
         self.assertEqual(job.status, 'complete', job.detail)
         self.assertEqual(swap.call_args.args[1]['references'], paths)
@@ -1189,12 +1189,12 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
 
     def test_a_face_swap_alone_is_a_fix_and_needs_a_face(self):
         from unittest.mock import patch
-        with patch('studio_facefusion.swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})):
+        with patch('apps.image_studio.facefusion.swap', return_value=(PNG, {'outside_mask_changed_pixels': 0})):
             job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], colour=False)
         self.assertEqual(job.status, 'complete', job.detail)
         self.assertEqual(graphs, [])
         self.assertTrue(any('FaceFusion applied;' in n for n in job.notes))
-        with patch('studio_facefusion.swap', side_effect=RuntimeError('no face was found')):
+        with patch('apps.image_studio.facefusion.swap', side_effect=RuntimeError('no face was found')):
             job, graphs, _ = self.face_swap_job([], [])
         self.assertEqual(job.status, 'failed')
         self.assertIn('no face', job.detail)
@@ -1202,7 +1202,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
 
     def test_a_face_swap_fails_when_facefusion_is_not_installed(self):
         from unittest.mock import patch
-        with patch('studio_facefusion.swap') as swap:
+        with patch('apps.image_studio.facefusion.swap') as swap:
             job, graphs, _ = self.face_swap_job([], [(40, 100, 50, 60)], installed=False)
         self.assertEqual(job.status, 'failed')
         self.assertIn('FaceFusion is not installed', job.detail)
@@ -1279,7 +1279,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
              "from": ""}]}
 
     def test_a_head_shape_goes_into_its_face_redraw_as_far_as_the_turn_agrees(self):
-        import studio_scene as sc
+        import apps.image_studio.scene.scene as sc
         s = sc.new_scene("")
         p = sc.new_object("person")
         p["head"] = {"jaw_width": 0.9}
@@ -2276,7 +2276,7 @@ def _headless():
 class TestImageStudioTab(unittest.TestCase):
     def test_head_photo_opens_position_lock_window_with_kept_source(self):
         from unittest.mock import patch
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         _, ui = self.tab()
         src = os.path.join(self.dir, "head-choice.png")
         with open(src, "wb") as f:
@@ -2294,7 +2294,7 @@ class TestImageStudioTab(unittest.TestCase):
 
     def test_head_window_requires_lock_and_queues_without_face_redraw(self):
         from unittest.mock import patch
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         _, ui = self.tab()
         src = os.path.join(self.dir, "head-window.png")
         with open(src, "wb") as f:
@@ -2317,7 +2317,7 @@ class TestImageStudioTab(unittest.TestCase):
 
     def test_image_library_import_search_and_use_reaches_generation_settings(self):
         from unittest.mock import patch
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         _, ui = self.tab()
         before = ui.collect()
         self.addCleanup(lambda: ui.apply(before))
@@ -2347,7 +2347,7 @@ class TestImageStudioTab(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.mod = studio_chat
         cls.dir = tempfile.mkdtemp()
         cls._real_settings = os.environ.get("STUDIO_SETTINGS")
@@ -2429,7 +2429,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertTrue(ui.collect()["hand_pass"])     # an older picture: it was on
 
     def test_fix_a_spot_marks_squares_and_queues_a_fix(self):
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         s, ui = self.tab()
         src = os.path.join(self.dir, "fixme.png")
         with open(src, "wb") as f:
@@ -2457,7 +2457,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertGreaterEqual(job["fix"]["spots"][0]["size"], ig.FIX_MIN)
 
     def test_fix_a_spot_lassos_a_part_and_gives_it_a_photo(self):
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         s, ui = self.tab()
         src = os.path.join(self.dir, "fixme.png")
         with open(src, "wb") as f:
@@ -2496,7 +2496,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(job["fix"]["face_swap"], "")
 
     def test_fix_a_spot_can_end_with_a_face_swap_alone(self):
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         from unittest.mock import patch
         s, ui = self.tab()
         src = os.path.join(self.dir, "fixme.png")
@@ -2528,7 +2528,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(job["fix"]["spots"], [])
 
     def test_fix_a_spot_finds_in_one_click_and_locks(self):
-        import studio_images_ui as ui_mod
+        import apps.image_studio.ui as ui_mod
         s, ui = self.tab()
         src = os.path.join(self.dir, "fixme.png")
         with open(src, "wb") as f:
@@ -2680,7 +2680,7 @@ class TestImageStudioTab(unittest.TestCase):
             ui._set_model("z-image-turbo")
 
     def test_addons_window_lists_toggles_and_installs(self):
-        import studio_images_ui
+        import apps.image_studio.ui as studio_images_ui
         from unittest.mock import patch
         s, ui = self.tab()
         lib = ui.studio.lib
@@ -2973,7 +2973,7 @@ class TestImageStudioTab(unittest.TestCase):
         s, ui = self.tab()
         import tkinter as tk
         from unittest import mock
-        import studio_images_ui as siu
+        import apps.image_studio.ui as siu
         pic = os.path.join(tempfile.mkdtemp(), "glasses.png")
         tk.PhotoImage(master=self.app, width=4, height=4).write(pic, format="png")
         ed = ui.edit_characters()
@@ -3134,7 +3134,7 @@ class TestImageStudioTab(unittest.TestCase):
         ui.save_as_character().win.destroy()
 
     def test_model_source_open_fetches_reviewable_results_off_thread(self):
-        import studio_images_ui
+        import apps.image_studio.ui as studio_images_ui
         from unittest.mock import patch
         _, ui = self.tab()
         result = {"checked": time.time(), "errors": [], "items": [
@@ -3163,7 +3163,7 @@ class TestImageStudioTab(unittest.TestCase):
                     dlg.win.destroy()
 
     def test_supported_addon_button_installs_into_selected_comfy_folder(self):
-        import studio_images_ui
+        import apps.image_studio.ui as studio_images_ui
         from unittest.mock import patch
         _, ui = self.tab()
         with tempfile.TemporaryDirectory() as root:
@@ -3186,7 +3186,7 @@ class TestImageStudioTab(unittest.TestCase):
                 dlg.win.destroy()
 
     def test_model_source_buttons_save_and_reopen(self):
-        import studio_images_ui
+        import apps.image_studio.ui as studio_images_ui
         from unittest.mock import patch
         _, ui = self.tab()
         with patch.dict(os.environ, {}, clear=True):
@@ -3212,7 +3212,7 @@ class TestImageStudioTab(unittest.TestCase):
 
     def test_a_civitai_link_imports_into_the_lora_library(self):
         import urllib.request
-        import studio_images_ui
+        import apps.image_studio.ui as studio_images_ui
         sys.path.insert(0, HERE)
         from test_civitai import FakeCivitAI
         s, ui = self.tab()

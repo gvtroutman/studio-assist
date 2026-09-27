@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-import studio_agent as eng
-import studio_lessons as lessons
-import studio_tasks as tasks
+import core.agent as eng
+import core.lessons as lessons
+import core.tasks as tasks
 from test_tasks import FakeLLM, answer, call, spec
 
 
@@ -516,7 +516,7 @@ class TestGuiForms(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.mod = studio_chat
         cls.dir = tempfile.mkdtemp()
         cls._real_settings = os.environ.get("STUDIO_SETTINGS")

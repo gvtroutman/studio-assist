@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import studio_addons as addons
+import apps.image_studio.addons.nodes as addons
 
 
 class AddonTests(unittest.TestCase):

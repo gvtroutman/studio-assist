@@ -3,8 +3,8 @@ import os
 import unittest
 from unittest.mock import patch
 
-import studio_facefusion as ff
-import studio_imagegen as ig
+import apps.image_studio.facefusion as ff
+import apps.image_studio.imagegen as ig
 from test_imagegen import TempStudioMixin, PNG, settle
 
 

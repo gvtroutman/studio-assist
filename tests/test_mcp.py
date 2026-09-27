@@ -15,15 +15,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_mcp as mcp                    # noqa: E402
-import studio_agent as eng                  # noqa: E402
-import studio_tasks                         # noqa: E402
-import studio_comfy_mcp as comfy            # noqa: E402
-import studio_opencode_mcp as opencode      # noqa: E402
-import studio_photoshop_mcp as photoshop    # noqa: E402
-import studio_illustrator_mcp as illustrator  # noqa: E402
-import studio_premiere_mcp as premiere      # noqa: E402
-import studio_research_mcp as research      # noqa: E402
+import core.mcp as mcp                    # noqa: E402
+import core.agent as eng                  # noqa: E402
+import core.tasks as studio_tasks                         # noqa: E402
+import apps.comfyui.mcp as comfy            # noqa: E402
+import apps.opencode.mcp as opencode      # noqa: E402
+import apps.adobe.photoshop as photoshop    # noqa: E402
+import apps.adobe.illustrator as illustrator  # noqa: E402
+import apps.adobe.premiere as premiere      # noqa: E402
+import apps.research.mcp as research      # noqa: E402
 
 
 # ------------------------------------------------------------ a test bridge
@@ -597,7 +597,7 @@ if __name__ == "__main__":
 ASKER = r'''
 import sys, os
 sys.path.insert(0, %r)
-import studio_mcp as mcp
+import core.mcp as mcp
 
 def ask(a):
     if not mcp.can_elicit():

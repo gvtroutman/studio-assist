@@ -17,7 +17,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from studio_icons import png
+from core.icons import png
 
 SQUARE = (0xD9, 0x77, 0x57)   # ACCENT, the same orange as the Send button
 MARK = (0x16, 0x15, 0x0F)     # the button's foreground, near-black

@@ -29,7 +29,7 @@ import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import studio_comfy_mcp as comfy  # noqa: E402
+import apps.comfyui.mcp as comfy  # noqa: E402
 
 LIBRARY = Path(os.environ.get("APPDATA", "")) / "StudioAssistant" / "image-studio"
 INSIGHTFACE = "D:/ComfyUI/models/insightface"

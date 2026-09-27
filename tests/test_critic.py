@@ -13,8 +13,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
-import studio_critic as critic  # noqa: E402
-import studio_imagegen as ig  # noqa: E402
+import apps.image_studio.critic as critic  # noqa: E402
+import apps.image_studio.imagegen as ig  # noqa: E402
 from test_imagegen import FaceClient, TempStudioMixin, settle  # noqa: E402
 
 

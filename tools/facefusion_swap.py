@@ -96,7 +96,7 @@ def main():
 
     swapper.paste_back = observe_paste
     sys.path.insert(0, str(root))
-    from studio_facefusion import target_face
+    from apps.image_studio.facefusion import target_face
     from facefusion.face_creator import get_static_faces
     from facefusion.face_selector import sort_faces_by_order
     def select_target(reference, sources, targets):
