@@ -2395,18 +2395,48 @@ def clean_outfit(d):
             "accessories": [x for x in map(_item, d.get("accessories") or []) if x]}
 
 
+def says(text, tag):
+    """Whether `text` names `tag` in words of its own, any case, a plural
+    allowed: "glasses" is said in "round glasses" and "Glasses on", not in
+    "sunglasses"."""
+    words = r"\s+".join(re.escape(w) for w in (tag or "").split())
+    return bool(words) and re.search(r"(?<![\w-])%s(?:e?s)?(?![\w-])" % words,
+                                     text or "", re.I) is not None
+
+
 def outfit_of(settings):
     """The outfit a Generate job is dressed in: the character's pictures of
     what the form has them wearing today - garments in the Clothes slots,
-    the rest as accessories - and the hair picture, when it has one."""
+    the rest as accessories - and the hair picture, when it has one.
+
+    Each picture is a tag (a word and its picture, the creator's Tags tab):
+    a tag counts when a slot holds it exactly, or when its word is said in a
+    slot ("round glasses" for glasses) or in the scene ("she pushes her
+    glasses up"). One said only in the scene is clothing when its word names
+    a garment the Clothes picks do ("red dress": a dress) and nothing worn on
+    the head ("top hat"), else an accessory."""
     refs = {k.lower(): (k, x) for k, x in clean_item_refs(settings.get("item_refs")).items()}
     out = {"clothes": [], "hair": None, "accessories": []}
+    used = set()
     for k in ITEM_SLOTS:
         items = split_many(_field(settings, k)) if SLOTS[k][4] else [_field(settings, k)]
         for name in items:
-            if name and name.lower() in refs:
+            if name and name.lower() in refs and name.lower() not in used:
+                used.add(name.lower())
                 out["clothes" if k in CLOTHES_SLOTS else "accessories"].append(
                     {"name": refs[name.lower()][0], "path": refs[name.lower()][1]})
+    scene = _field(settings, "scene")
+    garments = {x.split()[-1].lower() for k in CLOTHES_SLOTS for x in SLOTS[k][3]}
+    for low, (name, path) in refs.items():
+        if low == HAIR_ITEM or low in used:
+            continue
+        slot = next((k for k in ITEM_SLOTS if says(_field(settings, k), name)), None)
+        if slot is None and not says(scene, name):
+            continue
+        used.add(low)
+        clothes = (slot in CLOTHES_SLOTS if slot else
+                   not on_head(name) and any(says(name, g) for g in garments))
+        out["clothes" if clothes else "accessories"].append({"name": name, "path": path})
     if HAIR_ITEM in refs:
         out["hair"] = {"path": refs[HAIR_ITEM][1], "words": ""}
     return out
