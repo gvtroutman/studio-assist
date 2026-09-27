@@ -1009,6 +1009,53 @@ class TestAppRegistry(unittest.TestCase):
         self.assertEqual(eng.opencode_config("http://h:1/v1", "m1", [])["provider"]["lmstudio"]
                          ["options"]["baseURL"], "http://h:1/v1")
 
+    def test_opencode_picks_the_best_coder_the_host_has(self):
+        self.assertEqual(eng.model_size_b("qwen3-coder-30b-a3b-instruct"), 30)
+        self.assertEqual(eng.model_size_b("qwen2.5-coder-14b-instruct"), 14)
+        self.assertIsNone(eng.model_size_b("gpt-oss"))
+        ids = ["qwen3.6-27b", "qwen2.5-coder-14b-instruct", "qwen3-coder-30b-a3b-instruct",
+               "qwen3-coder-480b-a35b-instruct", "text-embedding-nomic-coder",
+               "qwen2.5-vl-7b-instruct"]
+        # A dense 24B coder beats a 30B MoE; one too big for the card is skipped.
+        self.assertEqual(eng.best_coder(ids), "qwen3-coder-30b-a3b-instruct")
+        self.assertEqual(eng.best_coder(ids + ["devstral-small-2507-24b"]),
+                         "devstral-small-2507-24b")
+        self.assertIsNone(eng.best_coder(["qwen3.6-27b", "gpt-oss-20b"]))
+        oc = eng.APPS_BY_ID["opencode"]
+        model, note = oc.model_for(ids, "qwen3.6-27b")
+        self.assertEqual(model, "qwen3-coder-30b-a3b-instruct")
+        self.assertIn("coding", note)
+        self.assertEqual(oc.model_for(["qwen3.6-27b"], "qwen3.6-27b")[0], "qwen3.6-27b")
+        os.environ["STUDIO_MODEL_OPENCODE"] = "qwen3.6-27b"
+        try:
+            self.assertEqual(oc.model_for(ids, "gpt-oss-20b")[0], "qwen3.6-27b")
+        finally:
+            del os.environ["STUDIO_MODEL_OPENCODE"]
+
+    def test_opencodes_model_is_loaded_with_room_for_a_task(self):
+        oc = eng.APPS_BY_ID["opencode"]
+        calls = []
+        real = (eng.context_window, eng.loaded_instances, eng.unload_model, eng.load_model)
+        eng.loaded_instances = lambda host, m, timeout=5: [(m, 32768)]
+        eng.unload_model = lambda host, i, timeout=60: calls.append(("unload", i))
+        eng.load_model = lambda host, m, timeout=600, context_length=None: calls.append(
+            ("load", m, context_length))
+        try:
+            windows = iter([(32768, 262144), (65536, 262144)])
+            eng.context_window = lambda host, m, timeout=5: next(windows)
+            self.assertEqual(oc.fit_window("h", "c"), 65536)
+            self.assertEqual(calls, [("unload", "c"), ("load", "c", 65536)])
+            calls.clear()
+            eng.context_window = lambda host, m, timeout=5: (131072, 262144)
+            self.assertEqual(oc.fit_window("h", "c"), 131072)
+            self.assertEqual(calls, [], "a big enough window is left alone")
+            eng.context_window = lambda host, m, timeout=5: (16384, 32768)
+            eng.loaded_instances = lambda host, m, timeout=5: []
+            oc.fit_window("h", "c")
+            self.assertEqual(calls[-1], ("load", "c", 32768), "capped at the model's maximum")
+        finally:
+            (eng.context_window, eng.loaded_instances, eng.unload_model, eng.load_model) = real
+
     def test_on_this_repo_opencode_gets_the_short_brief_not_agents_md(self):
         # AGENTS.md is far larger than the model's window; loaded whole it
         # pushed the task out of OpenCode's memory.
@@ -1058,7 +1105,7 @@ class TestAppRegistry(unittest.TestCase):
         eng.studio_procs.spawn = FakeChild
         eng.opencode_exe = lambda: r"C:\oc\opencode.exe"
         eng.probe_models = lambda host, timeout=8: (True, ["m1"], ["m1", "m2"], [], None)
-        eng.context_window = lambda host, model, timeout=5: (32768, 262144)
+        eng.context_window = lambda host, model, timeout=5: (65536, 262144)
         oc.workspace = os.path.join(tmp, "repo")
         oc.state_dir = os.path.join(tmp, "state")
         oc.child = None

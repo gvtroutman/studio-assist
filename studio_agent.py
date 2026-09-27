@@ -601,6 +601,39 @@ PREFERRED_MODELS = [
 ]
 
 
+# What makes a model a coder, by name. The OpenCode tab takes the best of
+# these the host has (`best_coder`); a general model is its last resort.
+CODER_HINTS = ("coder", "devstral", "codestral", "deepcoder", "codegemma", "starcoder",
+               "codellama", "granite-code")
+# A coder bigger than this does not fit the LLM PC's 24 GB at a usable quant.
+CODER_MAX_B = 40
+
+
+def model_size_b(model_id):
+    """Total parameters in billions from a name ("qwen3-coder-30b-a3b" -> 30),
+    or None. The active-parameter part of an MoE name ("a3b") is not it."""
+    best = None
+    for m in re.finditer(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)b(?![a-z0-9])", model_id.lower()):
+        n = float(m.group(1))
+        best = n if best is None else max(best, n)
+    return best
+
+
+def best_coder(ids):
+    """The strongest coding model among `ids`, or None: a named coder that
+    fits, dense before MoE at similar size (every parameter works on every
+    token, which is what keeps a long task in mind), then larger first."""
+    def rank(mid):
+        low = mid.lower()
+        size = model_size_b(mid) or 0
+        moe = bool(re.search(r"-a\d+(?:\.\d+)?b", low))
+        return (size if not moe else size / 2, size)
+    coders = [m for m in ids if m and any(h in m.lower() for h in CODER_HINTS)
+              and not looks_vision(m) and "embed" not in m.lower()
+              and (model_size_b(m) or 0) <= CODER_MAX_B]
+    return max(coders, key=rank) if coders else None
+
+
 def api_root(base_url):
     root = base_url.rstrip("/")
     return root[:-3].rstrip("/") if root.endswith("/v1") else root
@@ -2269,6 +2302,34 @@ class ServerSpec(AppSpec):
     def program(self):
         return opencode_exe()
 
+    def fit_window(self, host, model):
+        """Make sure `model` is loaded with at least OPENCODE_CONTEXT tokens
+        (or its maximum) and return the window it has. Loaded smaller - or
+        not at all, when the coder is not the model in use - OpenCode
+        compacts its task away. Only this model is reloaded; the rest stay."""
+        loaded, maximum = context_window(host, model)
+        if loaded is None and maximum is None:
+            return None                       # a host that does not say
+        want = min(OPENCODE_CONTEXT, maximum) if isinstance(maximum, int) else OPENCODE_CONTEXT
+        if isinstance(loaded, int) and loaded >= want:
+            return loaded
+        for instance, _ in loaded_instances(host, model):
+            if unload_model(host, instance):
+                return loaded
+        if load_model(host, model, context_length=want):
+            return loaded
+        return context_window(host, model)[0] or want
+
+    def model_for(self, ids, shared):
+        """The best coder the host has (`best_coder`), for this tab's chat and
+        OpenCode alike; STUDIO_MODEL_OPENCODE still pins one."""
+        if os.environ.get("STUDIO_MODEL_" + self.id.upper()):
+            return AppSpec.model_for(self, ids, shared)
+        coder = best_coder(ids or [])
+        if not coder:
+            return shared, ""                 # no coder on the host: the shared model, silently
+        return coder, ("the best coding model on the host" if coder != shared else "")
+
     def installed(self):
         return self.program() is not None
 
@@ -2306,7 +2367,7 @@ class ServerSpec(AppSpec):
         _, loaded, ids, _, _ = probe_models(host)
         shared = pick_model(loaded, ids, model or env_default("STUDIO_MODEL", "AE_AGENT_MODEL"))
         chosen, _ = self.model_for(ids, shared or model or DEFAULT_MODEL)
-        context = context_window(host, chosen)[0] if chosen else None
+        context = self.fit_window(host, chosen) if chosen else None
         self.write_config(host, chosen, ids, context)
         self.stop()
         # A new password each start, readable by this user only: the bridge
@@ -2511,6 +2572,7 @@ def addons_config(addons):
 # everything OpenCode read got compacted away. On this repo it gets this short
 # brief instead, and `launch()` sets OPENCODE_DISABLE_PROJECT_CONFIG so the
 # root AGENTS.md is not loaded too.
+OPENCODE_CONTEXT = 65536   # the window OpenCode's model is loaded with, at least
 OPENCODE_BRIEF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "OPENCODE.md")
 
 
