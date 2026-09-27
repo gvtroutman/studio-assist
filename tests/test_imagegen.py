@@ -1877,6 +1877,33 @@ class TestTryOn(TempStudioMixin, unittest.TestCase):
         self.assertEqual((plain.items, plain.values["model"]), ([], "flux1-dev.safetensors"))
         self.assertNotIn("kontext_model", plain.values)
 
+    def test_a_tag_said_in_the_scene_brings_its_picture(self):
+        refs = {"glasses": self.pic("glasses"), "Red Dress": self.pic("dress"),
+                "top hat": self.pic("hat"), "necklace": self.pic("necklace")}
+        s = dict(ig.default_settings(), model="flux-dev", item_refs=refs,
+                 scene="She pushes her Glasses up, in a red dress and a top hat.")
+        o = ig.outfit_of(s)
+        self.assertEqual([c["name"] for c in o["clothes"]], ["Red Dress"])
+        self.assertEqual([a["name"] for a in o["accessories"]], ["glasses", "top hat"])
+        # A word inside another is not said, and an unsaid tag stays out.
+        self.assertFalse(ig.outfit_of(dict(s, scene="In sunglasses."))["accessories"])
+        self.assertTrue(ig.says("round glasses", "glasses"))
+        self.assertTrue(ig.says("two  top hats", "top hat"))
+        self.assertFalse(ig.says("sunglasses", "glasses"))
+        self.assertFalse(ig.says("anything", ""))
+        # A slot's words count too, and a slot's own pick is not taken twice.
+        worn = ig.outfit_of(dict(s, scene="", accessories="round glasses, necklace",
+                                 top="summer dress"))
+        self.assertEqual([a["name"] for a in worn["accessories"]], ["necklace", "glasses"])
+        self.assertEqual(worn["clothes"], [])
+        inv = dict(FLUX_FILES, **KONTEXT_FILES)
+        p = ig.compose(s, self.studio.lib, self.backend("5090"), inv)
+        self.assertEqual(p.errors, [])
+        self.assertEqual([n for n, _ in p.items], ["Red Dress", "glasses", "top hat"])
+        self.assertEqual(p.references["item: glasses"], refs["glasses"])
+        self.assertIn("The Red Dress, glasses and top hat look exactly as in the reference",
+                      p.prompt)
+
     def test_the_item_pictures_are_one_reference_on_the_prompt(self):
         wf = ig.load_workflow("flux_dev_baseline")
         g = ig.fill(wf, dict(wf["defaults"], model="m", clip_l="c", t5="t", vae="v",
@@ -2617,6 +2644,53 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("Face", tabs)
         ui._show_looks("Body")                       # hidden: the first shown instead
         self.assertEqual(ui.look_section, "Face")
+
+    def test_a_character_tag_is_a_word_and_an_uploaded_picture(self):
+        s, ui = self.tab()
+        import tkinter as tk
+        from unittest import mock
+        import studio_images_ui as siu
+        pic = os.path.join(tempfile.mkdtemp(), "glasses.png")
+        tk.PhotoImage(master=self.app, width=4, height=4).write(pic, format="png")
+        ed = ui.edit_characters()
+        ed._new()
+        ed.name.set("Ada")
+        ed._show("Tags")
+        self.app.update()
+        ed._add_tag()                                 # no word: nothing asked
+        self.assertIn("Name the tag first", ed.msg.cget("text"))
+        ed.tag_name.set("glasses")
+        with mock.patch.object(siu.filedialog, "askopenfilename", return_value=""):
+            ed._add_tag()                             # no picture: no tag
+        self.assertEqual(ed.item_refs, {})
+        with mock.patch.object(siu.filedialog, "askopenfilename", return_value=pic):
+            ed._add_tag()
+        kept = ed.item_refs["glasses"]
+        self.assertNotEqual(kept, pic)                # copied into the library
+        self.assertTrue(os.path.isfile(kept))
+        self.assertEqual(ed.tag_name.get(), "")
+        ed.tag_name.set("Glasses")                    # the same tag, a new picture
+        with mock.patch.object(siu.filedialog, "askopenfilename", return_value=pic):
+            ed._add_tag()
+        self.assertEqual(list(ed.item_refs), ["glasses"])
+        ed._randomize()                               # from Tags: every look tab
+        self.assertTrue(ed._save())
+        ed._new()                                     # another takes it from the library
+        ed.name.set("Bea")
+        ed._show("Tags")
+        self.app.update()
+        self.assertIn(("glasses", kept, "Ada"), ed._library_tags())
+        ed._take_tag("glasses", kept)
+        self.assertEqual(ed.item_refs, {"glasses": kept})
+        self.assertNotIn("glasses", [n for n, _, _ in ed._library_tags()])
+        ed._use()
+        ed.win.destroy()
+        self.assertEqual(ui.studio.lib.get("characters", "bea")["item_refs"],
+                         {"glasses": kept})
+        ui.scene.delete("1.0", "end")
+        ui.scene.insert("1.0", "Bea puts her glasses on.")
+        self.assertEqual(ig.outfit_of(ui.collect())["accessories"],
+                         [{"name": "glasses", "path": kept}])
 
     def test_a_character_goes_from_the_creator_to_the_form_and_history(self):
         s, ui = self.tab()
