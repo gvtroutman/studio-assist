@@ -1326,8 +1326,9 @@ was never installed here, the tab never ran, and a sandbox cannot edit this repo
 and `run()` follows the session: each pass lists `/permission` and `/question`,
 keeps those of this session or a subagent's (`Family`, by `parentID`), and puts each
 to the user with `studio_mcp.elicit()` - the MCP client's user, not the model. The
-reply goes to `/permission/{id}/reply` (`once` | `always` | `reject`, with the note as
-`message`, which OpenCode's model reads as the user's feedback) or
+reply goes to `/permission/{id}/reply` (`once` | `reject`, with the note as `message`,
+which OpenCode's model reads as the user's feedback - never `always`, see *grants*
+below) or
 `/question/{id}/reply`. The loop ends when `/session/status` has the session idle
 twice (`SETTLE` covers a task not yet marked busy); the result lists the user's
 decisions, then each assistant message's text, tools and files. Time the user spends
@@ -1351,6 +1352,52 @@ asked and allowed, `python hello.py` was asked and refused with a note, OpenCode
 reply quoted the note, the file changed, the server ended with `stop()`; an add-on
 MCP server (`npx -y @modelcontextprotocol/server-sequential-thinking`) connected and
 its tool was asked before it ran.
+
+### OpenCode's tasks: copies, checkpoints, tests, grants
+
+Added 2026-09-27 (bridge 3.0) because OpenCode edited the live checkout the app runs
+from, nothing could be taken back, nothing ran the tests, and "always allow" was
+OpenCode's to keep and invisible.
+
+- **Each task has its own copy.** When the workspace is the top of a git repository
+  with a commit, `start_task()` makes a git worktree under `OPENCODE_STATE/worktrees/`
+  on branch `opencode/<stamp>` from `HEAD`, and creates the session *in that folder*:
+  every session route takes `?directory=`, and OpenCode runs one instance per folder
+  (live-checked on 1.18.32: the session reported the worktree as its directory, and
+  `/permission`, `/session/status` and `/event` are per folder). `task_dir(sid)` is
+  that folder; `messages`, `prompt`, `abort`, `settle`, `follow` all pass it. The
+  record is `OPENCODE_STATE/tasks.json`. The copy starts from the last commit - the
+  user's uncommitted edits are not in it. A folder that is not a repo gets no copy and
+  works in place, as before (`isolated: false`).
+- **After each ask that ends idle** (`after_ask`): the changed files' tests run in the
+  copy - `tests_for` maps `studio_x.py`/`studio_x_mcp.py`/`studio_x_ui.py` to
+  `tests/test_x.py`, a changed test file to itself - with `TEST_TIMEOUT`; then a
+  checkpoint commit (identity `OpenCode <opencode@localhost>`) on the task's branch.
+  The report says passed/FAILED with the output's tail. These tests run code the user
+  approved edit by edit, in the copy, without another ask.
+- **Merge, undo, discard are the user's.** `opencode_merge` squashes the branch into
+  The user's current branch as one commit, after an elicitation showing the diff;
+  it refuses if the user has uncommitted edits in the same files, and a conflict is
+  `git reset --merge` and a sentence. `opencode_undo` resets the copy to the previous
+  checkpoint (and the next prompt tells OpenCode so), or for a merged task `git
+  revert`s the merge commit. `opencode_discard` removes the copy and branch. Each asks
+  through `confirm()`; no client to ask means no. The tool names avoid
+  `approve|allow|...` (`test_nothing_the_model_can_call_approves_or_writes`).
+- **Grants are the bridge's.** "Always allow" is stored on the task (`add_grant`,
+  OpenCode's `always` patterns) and OpenCode is answered `once` every time, so a grant
+  is visible (`opencode_grants`, `opencode_status`), revocable (`opencode_revoke`),
+  survives a server restart and ends with the task. `granted()` matches with
+  `fnmatch`, where `cmd *` also covers `cmd` alone. The card says "... for this task".
+- **Events, not a 1-second poll.** `Events` reads `/event` (SSE) on a thread and wakes
+  `follow()` on any event but the connect/heartbeat; with it up the loop looks every
+  `EVENT_WAIT` s, and it falls back to `POLL` when the stream fails or drops. The
+  stream never decides anything - the status and permission lists still do.
+- **Context is reported.** `context_report` adds to each report the last request's
+  tokens (`info.tokens`: input+output+cache) against the loaded window, warns at
+  `CONTEXT_HIGH` %, and counts compactions (a `summary` message or `compaction` part).
+- **Direct mode** (the tab's header "Direct" button, `Chat._direct_turn`): the user's
+  message is `opencode_ask`'s prompt as typed and the report is the reply - no model
+  briefs OpenCode, so one context on the GPU, not two. Approvals come up the same way.
 
 ### OpenCode's Add-ons
 

@@ -32,8 +32,12 @@ progress, cancellation, elicitation - is studio_mcp's; this file is the tools.
 
 import base64
 import json
+import fnmatch
 import os
+import re
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -58,6 +62,10 @@ DEFAULT_WORK = 600           # seconds OpenCode may work (not counting the user)
 MAX_WORK = 1800
 POLL = 1.0                   # seconds between looks at a working session
 SETTLE = 2.0                 # a task just handed over may not show as busy yet
+EVENT_WAIT = 5.0             # ... between looks while the event stream is up
+EVENT_TIMEOUT = 90           # a stream silent this long is taken as dropped
+CONTEXT_HIGH = 80            # % of the window at which the report warns
+TEST_TIMEOUT = 300           # seconds the tests of an ask's changes may run
 MAX_REPLY_CHARS = 6000       # what an ask hands back; the executor caps at 8000
 MAX_FILE_CHARS = 20000       # read_file cap; a model does not need a whole repo
 MAX_LIST = 400               # list_files cap
@@ -84,6 +92,7 @@ ROUTES = {
     "question_reply": "/question/{requestID}/reply",
     "question_reject": "/question/{requestID}/reject",
     "diff": "/vcs/diff",
+    "events": "/event",
 }
 
 
@@ -108,7 +117,11 @@ def password():
         return None
 
 
-def _request(path, data=None, method=None):
+def _request(path, data=None, method=None, directory=None):
+    # OpenCode serves any folder it is told of, one instance each: a task's
+    # sessions, permissions and status live in that task's own copy.
+    if directory:
+        path += ("&" if "?" in path else "?") + "directory=" + urllib.parse.quote(directory, safe="")
     headers = {"Accept": "application/json"}
     if data is not None:
         headers["Content-Type"] = "application/json"
@@ -162,12 +175,12 @@ def _read(resp):
     return json.loads(body) if body.strip() else {}
 
 
-def get_json(path, timeout=15):
-    return _read(_open(_request(path), timeout))
+def get_json(path, timeout=15, directory=None):
+    return _read(_open(_request(path, directory=directory), timeout))
 
 
-def post_json(path, payload, timeout=30):
-    return _read(_open(_request(path, payload), timeout))
+def post_json(path, payload, timeout=30, directory=None):
+    return _read(_open(_request(path, payload, directory=directory), timeout))
 
 
 def route(name, **ids):
@@ -197,10 +210,16 @@ def unknown_routes():
         doc = get_json(ROUTES["doc"], timeout=10)
     except OpenCodeError:
         return []
-    listed = set((doc.get("paths") or {}).keys())
+    # Compare with the parameter names blanked: a server that calls it {id}
+    # where we say {sessionID} still has the route.
+    listed = {_shape(p) for p in (doc.get("paths") or {})}
     if not listed:
         return []
-    return sorted(r for k, r in ROUTES.items() if k != "doc" and r not in listed)
+    return sorted(r for k, r in ROUTES.items() if k != "doc" and _shape(r) not in listed)
+
+
+def _shape(path):
+    return re.sub(r"\{[^}]*\}", "{}", path).rstrip("/")
 
 
 def _rows(data, key):
@@ -211,53 +230,59 @@ def sessions():
     return _rows(get_json(ROUTES["sessions"]), "sessions")
 
 
-def new_session(title=""):
-    s = post_json(ROUTES["sessions"], {"title": title} if title else {})
+def new_session(title="", directory=None):
+    s = post_json(ROUTES["sessions"], {"title": title} if title else {}, directory=directory)
     if not s.get("id"):
         raise OpenCodeError("OpenCode created a session with no id: %s" % json.dumps(s)[:300])
     return s
 
 
 def messages(session_id):
-    return _rows(get_json(route("message", sessionID=session_id), timeout=30), "messages")
+    return _rows(get_json(route("message", sessionID=session_id), timeout=30,
+                          directory=task_dir(session_id)), "messages")
 
 
-def statuses():
-    data = get_json(ROUTES["status"], timeout=10)
+def statuses(directory=None):
+    data = get_json(ROUTES["status"], timeout=10, directory=directory)
     return data if isinstance(data, dict) else {}
 
 
-def pending_permissions():
-    return _rows(get_json(ROUTES["permissions"], timeout=10), "permissions")
+def pending_permissions(directory=None):
+    return _rows(get_json(ROUTES["permissions"], timeout=10, directory=directory), "permissions")
 
 
-def pending_questions():
-    return _rows(get_json(ROUTES["questions"], timeout=10), "questions")
+def pending_questions(directory=None):
+    return _rows(get_json(ROUTES["questions"], timeout=10, directory=directory), "questions")
 
 
 def prompt(session_id, text):
     """Hand OpenCode a task and return at once; `run` follows it."""
     post_json(route("prompt", sessionID=session_id),
-              {"parts": [{"type": "text", "text": text}]}, timeout=30)
+              {"parts": [{"type": "text", "text": text}]}, timeout=30,
+              directory=task_dir(session_id))
 
 
 def abort(session_id):
-    post_json(route("abort", sessionID=session_id), {}, timeout=10)
+    post_json(route("abort", sessionID=session_id), {}, timeout=10,
+              directory=task_dir(session_id))
 
 
-def reply_permission(request_id, reply, message=""):
+def reply_permission(request_id, reply, message="", directory=None):
     payload = {"reply": reply}
     if message:
         payload["message"] = message
-    post_json(route("permission_reply", requestID=request_id), payload, timeout=15)
+    post_json(route("permission_reply", requestID=request_id), payload, timeout=15,
+              directory=directory)
 
 
-def reply_question(request_id, answers):
-    post_json(route("question_reply", requestID=request_id), {"answers": answers}, timeout=15)
+def reply_question(request_id, answers, directory=None):
+    post_json(route("question_reply", requestID=request_id), {"answers": answers}, timeout=15,
+              directory=directory)
 
 
-def reject_question(request_id):
-    post_json(route("question_reject", requestID=request_id), {}, timeout=15)
+def reject_question(request_id, directory=None):
+    post_json(route("question_reject", requestID=request_id), {}, timeout=15,
+              directory=directory)
 
 
 # ------------------------------------------------------- message summaries
@@ -308,16 +333,29 @@ def rel(path):
     if not isinstance(path, str):
         return str(path)
     try:
-        full = os.path.realpath(path)
         root = os.path.realpath(WORKSPACE)
+        # A relative path is OpenCode's, so relative to the workspace - not
+        # to wherever this bridge happened to be started.
+        full = os.path.realpath(os.path.join(root, path))
         if full == root or full.startswith(root + os.sep):
             return os.path.relpath(full, root).replace(os.sep, "/")
+        # A task's copy: <worktrees>/<task>/<path> is <path> to the user.
+        copies = os.path.realpath(worktrees_dir())
+        if full.startswith(copies + os.sep):
+            inner = os.path.relpath(full, copies).replace(os.sep, "/")
+            return inner.partition("/")[2] or inner
     except (OSError, ValueError):
         pass
     return path.replace("\\", "/")
 
 
-def workspace_note():
+def workspace_note(sid=None):
+    t = task(sid) if sid else None
+    if t and t.get("isolated"):
+        return ("This task works in its own copy of %s (branch %s), from its last commit. "
+                "Nothing reaches the user's folder until the user merges it: "
+                "opencode_merge. opencode_undo takes back the last ask; opencode_discard "
+                "drops the task." % (WORKSPACE, t.get("branch")))
     return "OpenCode works in %s." % WORKSPACE
 
 
@@ -365,8 +403,9 @@ def describe_permission(p):
         if details:
             shown["command"] = json.dumps(details, indent=1, ensure_ascii=False)[:1500]
     if always:
-        shown["always_label"] = ("every edit in this session" if always == ["*"] and kind == "edit"
-                                 else ", ".join(always))
+        # The bridge keeps the grant, not OpenCode (see `granted`): it lasts
+        # as long as the task, survives a restart and can be taken back.
+        shown["always_label"] = grant_label(kind, always) + " for this task"
     return headline, shown
 
 
@@ -445,10 +484,12 @@ def ask_question(req):
 
 class Family:
     """Whether a session is the one we are following or one it spawned (a
-    subagent's session asks in its own name)."""
+    subagent's session asks in its own name). All of them live in `directory`,
+    the task's folder."""
 
-    def __init__(self, root):
+    def __init__(self, root, directory=None):
         self.root = root
+        self.directory = directory
         self.parent = {}
 
     def __contains__(self, sid):
@@ -459,7 +500,8 @@ class Family:
             seen.add(sid)
             if sid not in self.parent:
                 try:
-                    info = get_json(route("session", sessionID=sid), timeout=10)
+                    info = get_json(route("session", sessionID=sid), timeout=10,
+                                    directory=self.directory)
                 except OpenCodeError:
                     info = {}
                 self.parent[sid] = info.get("parentID")
@@ -467,41 +509,152 @@ class Family:
         return False
 
 
+class Events:
+    """OpenCode's event stream for one folder. It wakes the follower the
+    moment anything happens - a step to approve, the session going idle - so
+    the follower looks every EVENT_WAIT seconds instead of every POLL. If the
+    stream cannot be opened, or drops, `alive` goes false and it polls as
+    before: the stream only makes it quicker, never decides anything."""
+
+    QUIET = ("server.connected", "server.heartbeat")
+
+    def __init__(self, directory=None):
+        self.flag = threading.Event()
+        self.alive = False
+        self.resp = None
+        try:
+            self.resp = _open(_request(ROUTES["events"], directory=directory), EVENT_TIMEOUT)
+            if "event-stream" not in (self.resp.headers.get("Content-Type") or ""):
+                raise OpenCodeError("not an event stream")
+        except (OpenCodeError, AttributeError):
+            self.close()
+            return
+        self.alive = True
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        try:
+            for raw in self.resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    kind = json.loads(line[5:]).get("type", "")
+                except (ValueError, AttributeError):
+                    kind = ""
+                if kind not in self.QUIET:
+                    self.flag.set()
+        except Exception:
+            pass
+        self.alive = False
+        self.flag.set()
+
+    def wait(self, seconds):
+        if seconds > 0:
+            self.flag.wait(seconds)
+        self.flag.clear()
+
+    def close(self):
+        resp, self.resp = self.resp, None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+# ------------------------------------------------------------- the grants
+# "Always allow" is kept here, per task, not given to OpenCode: OpenCode's
+# own grant lasts until the server restarts, cannot be seen and cannot be
+# taken back. The bridge answers OpenCode "once" every time and remembers
+# The user's word itself - in the task record, so it outlives a restart,
+# ends with the task, and opencode_grants / opencode_revoke show and drop it.
+
+def grant_label(kind, patterns):
+    patterns = [x for x in patterns or [] if isinstance(x, str)]
+    if not patterns or patterns == ["*"]:
+        return {"edit": "every edit", "bash": "every command"}.get(kind, "every %s" % kind)
+    return "%s %s" % ({"edit": "edits to", "bash": "commands matching"}.get(kind, kind),
+                      ", ".join(patterns))
+
+
+def _matches(value, pattern):
+    # OpenCode writes a command grant as "git status *": the command, then any
+    # arguments or none.
+    return (fnmatch.fnmatchcase(value, pattern)
+            or (pattern.endswith(" *") and value == pattern[:-2]))
+
+
+def granted(sid, p):
+    """The user's standing grant in task `sid` that covers request `p`, or None."""
+    kind = p.get("permission")
+    wanted = [x for x in (p.get("patterns") or []) if isinstance(x, str)] or ["*"]
+    for g in (task(sid) or {}).get("grants", []):
+        if g.get("kind") == kind and all(any(_matches(w, gp) for gp in g.get("patterns", []))
+                                         for w in wanted):
+            return g
+    return None
+
+
+def add_grant(sid, p):
+    kind = p.get("permission") or "?"
+    patterns = ([x for x in (p.get("always") or []) if isinstance(x, str)]
+                or [x for x in (p.get("patterns") or []) if isinstance(x, str)] or ["*"])
+    grants = [g for g in (task(sid) or {}).get("grants", [])
+              if not (g.get("kind") == kind and g.get("patterns") == patterns)]
+    grants.append({"kind": kind, "patterns": patterns, "label": grant_label(kind, patterns),
+                   "since": time.strftime("%Y-%m-%d %H:%M")})
+    update_task(sid, grants=grants)
+
+
 def settle(family, log):
-    """Put every pending request of this session's family to the user, and
-    return how many there were. Raises Stopped when the user stops."""
+    """Put every pending request of this session's family to the user - or
+    answer it from a grant the user gave - and return how many there were.
+    Raises Stopped when the user stops."""
     n = 0
-    for p in pending_permissions():
+    where = family.directory
+    for p in pending_permissions(where):
         if p.get("sessionID") not in family:
             continue
         n += 1
         headline = describe_permission(p)[0].split("\n")[0]
+        what = headline.replace("OpenCode wants to ", "").rstrip(".:")
+        g = granted(family.root, p)
+        if g:
+            reply_permission(p["id"], "once", "", where)
+            log.append("allowed by the user's standing grant (%s): %s" % (g.get("label"), what))
+            continue
         (decision, note), asked = ask_permission(p)
-        reply_permission(p["id"], decision, note)
+        if decision == "always":
+            add_grant(family.root, p)
+        reply_permission(p["id"], "reject" if decision == "reject" else "once", note, where)
         word = {"once": "allowed", "always": "allowed from now on", "reject": "refused"}[decision]
-        log.append("%s: %s%s" % (word, headline.replace("OpenCode wants to ", "")
-                                 .rstrip(".:"), (" - note: " + note) if note else ""))
+        log.append("%s: %s%s" % (word, what, (" - note: " + note) if note else ""))
         if not asked:
             raise Stopped("no one could approve: " + headline)
-    for q in pending_questions():
+    for q in pending_questions(where):
         if q.get("sessionID") not in family:
             continue
         n += 1
         answers = ask_question(q)
         if answers is None:
-            reject_question(q["id"])
+            reject_question(q["id"], where)
             log.append("declined to answer OpenCode's question")
         else:
-            reply_question(q["id"], answers)
+            reply_question(q["id"], answers, where)
             log.append("answered OpenCode: %s" % "; ".join(", ".join(a) for a in answers))
     return n
 
 
-def run(sid, seen, work_limit):
+def follow(sid, seen, work_limit):
     """Follow session `sid` until it is idle, putting each step it asks about
-    to the user. `seen` is the message ids that were there before; what came
-    after is summarized. Time the user spends deciding does not count."""
-    family = Family(sid)
+    to the user. Returns (state, report): state is "done", "stopped" or
+    "working" (the work limit ran out). `seen` is the message ids that were
+    there before; what came after is reported. Time the user spends deciding
+    does not count."""
+    directory = task_dir(sid)
+    family = Family(sid, directory)
+    events = Events(directory)
     log = []
     worked = 0.0
     started = time.monotonic()
@@ -516,7 +669,7 @@ def run(sid, seen, work_limit):
             if asked:
                 idle_polls = 0
                 continue                    # decided; look again before sleeping
-            state = (statuses().get(sid) or {}).get("type", "idle")
+            state = (statuses(directory).get(sid) or {}).get("type", "idle")
             if state == "idle":
                 idle_polls += 1
                 # A task just handed over may not be marked busy yet.
@@ -527,26 +680,44 @@ def run(sid, seen, work_limit):
             studio_mcp.progress("OpenCode is %s%s" % (
                 "working" if state != "idle" else "finishing",
                 "; %d step(s) decided" % len(log) if log else ""))
-            time.sleep(POLL)
+            events.wait(max(POLL, EVENT_WAIT) if events.alive else POLL)
             worked += time.monotonic() - tick
             if worked > work_limit:
-                return result(
-                    "OpenCode is still working on session %s after %d seconds of work. Do "
-                    "not send the task again: call opencode_wait with this session_id to "
-                    "keep following it, or opencode_abort to stop it.\n%s"
-                    % (sid, work_limit, report(sid, seen, log)), error=True)
+                return "working", report(sid, seen, log)
     except Stopped as e:
         stopped = str(e)
         try:
             abort(sid)
         except OpenCodeError:
             pass
+    finally:
+        events.close()
     text = report(sid, seen, log)
     if stopped:
-        return result("The user stopped OpenCode (%s). Session %s is halted; whatever it "
-                      "had already changed stays.\n%s" % (stopped.split("\n")[0], sid, text),
-                      error=True)
+        return "stopped", "(%s)\n%s" % (stopped.split("\n")[0], text)
+    return "done", text
+
+
+def outcome(sid, state, text, work_limit):
+    """A follow's (state, report) as the tool result the model reads."""
+    if state == "working":
+        return result(
+            "OpenCode is still working on session %s after %d seconds of work. Do "
+            "not send the task again: call opencode_wait with this session_id to "
+            "keep following it, or opencode_abort to stop it.\n%s"
+            % (sid, work_limit, text), error=True)
+    if state == "stopped":
+        why, _, rest = text.partition("\n")
+        return result("The user stopped OpenCode %s. Session %s is halted; what it had "
+                      "already changed stays until it is undone or discarded.\n%s"
+                      % (why, sid, rest), error=True)
     return result("Session %s is done.\n%s" % (sid, text))
+
+
+def run(sid, seen, work_limit):
+    """follow() as a tool result."""
+    state, text = follow(sid, seen, work_limit)
+    return outcome(sid, state, text, work_limit)
 
 
 def report(sid, seen, log):
@@ -554,10 +725,13 @@ def report(sid, seen, log):
     OpenCode said and did, newest last, within MAX_REPLY_CHARS."""
     out = []
     if log:
-        out.append("The user's decisions:\n" + "\n".join("- " + l for l in log))
-    chunks, error = [], None
+        shown = log if len(log) <= 30 else ["... %d earlier decision(s)" % (len(log) - 30)] + log[-30:]
+        decisions = "The user's decisions:\n" + "\n".join("- " + l for l in shown)
+        out.append(decisions[:MAX_REPLY_CHARS // 2])
+    chunks, error, msgs = [], None, []
     try:
-        for m in messages(sid):
+        msgs = messages(sid)
+        for m in msgs:
             if _info(m).get("id") in seen or _role(m) != "assistant":
                 continue
             text = summarize(m, 2500)
@@ -569,41 +743,89 @@ def report(sid, seen, log):
     except OpenCodeError as e:
         chunks.append("(could not read the session: %s)" % e)
     body = "\n".join(chunks) or "(OpenCode said nothing)"
-    room = MAX_REPLY_CHARS - sum(len(x) for x in out) - 200
+    room = max(1500, MAX_REPLY_CHARS - sum(len(x) for x in out) - 200)
     if len(body) > room:
         body = "... [earlier steps cut]\n" + body[-room:]
     out.append("OpenCode:\n" + body)
     if error:
         out.append("OpenCode reported an error: " + error)
-    out.append(workspace_note())
+    ctx = context_report(msgs)
+    if ctx:
+        out.append(ctx)
+    out.append(workspace_note(sid))
     return "\n\n".join(out)
+
+
+# ------------------------------------------------------------ the context
+
+def context_used(msgs):
+    """(tokens the last request filled, times OpenCode compacted) for a
+    session's messages. OpenCode records each answer's token counts; a
+    compaction leaves a summary message or a compaction part."""
+    used, compactions = None, 0
+    for m in msgs:
+        info = _info(m)
+        if info.get("summary") is True or any(p.get("type") == "compaction" for p in _parts(m)):
+            compactions += 1
+        t = info.get("tokens")
+        if info.get("role") == "assistant" and isinstance(t, dict):
+            cache = t.get("cache") if isinstance(t.get("cache"), dict) else {}
+            n = sum(x for x in (t.get("input"), t.get("output"), cache.get("read"),
+                                cache.get("write")) if isinstance(x, int))
+            if n:
+                used = n
+    return used, compactions
+
+
+def context_report(msgs):
+    """How full OpenCode's window is, and whether it has compacted - said,
+    because a compaction silently drops the details of the task."""
+    used, compactions = context_used(msgs)
+    window = loaded_window()
+    lines = []
+    if used:
+        if window:
+            pct = 100 * used // window
+            lines.append("Context: the last request filled about %d of %d tokens (%d%%)."
+                         % (used, window, pct))
+            if pct >= CONTEXT_HIGH:
+                lines.append("That is close to full: OpenCode will soon compact and lose "
+                             "details. Start a new session for the next unrelated step.")
+        else:
+            lines.append("Context: the last request filled about %d tokens." % used)
+    if compactions:
+        lines.append("OpenCode compacted this session %d time(s): its earlier history is a "
+                     "summary now, so it may have lost details of the task. Repeat the goal, "
+                     "the files and what is done when you continue it." % compactions)
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------- workspace
 
-def inside(relpath):
-    """The absolute path of `relpath` under the workspace, or an error if it
-    would leave it. OpenCode is refused anything outside; so is this tab."""
+def inside(relpath, base=None):
+    """The absolute path of `relpath` under the workspace - or `base`, a
+    task's copy - or an error if it would leave it. OpenCode is refused
+    anything outside; so is this tab."""
     if not isinstance(relpath, str):
         raise ValueError("path must be a string")
     r = relpath.replace("\\", "/").lstrip("/")
-    root = os.path.realpath(WORKSPACE)
+    root = os.path.realpath(base or WORKSPACE)
     full = os.path.realpath(os.path.join(root, r))
     if full != root and not full.startswith(root + os.sep):
         raise OpenCodeError("%r is outside OpenCode's folder, %s." % (relpath, WORKSPACE))
     return full
 
 
-def list_files(relpath="", limit=MAX_LIST):
-    root = inside(relpath)
+def list_files(relpath="", limit=MAX_LIST, base=None):
+    root = inside(relpath, base)
     if not os.path.isdir(root):
         raise OpenCodeError("%s is not a folder in the workspace." % (relpath or "/"))
     out = []
-    for base, dirs, files in os.walk(root):
+    for folder, dirs, files in os.walk(root):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
         for f in sorted(files):
-            p = os.path.join(base, f)
-            r = os.path.relpath(p, os.path.realpath(WORKSPACE)).replace(os.sep, "/")
+            p = os.path.join(folder, f)
+            r = os.path.relpath(p, os.path.realpath(base or WORKSPACE)).replace(os.sep, "/")
             try:
                 out.append("%s  (%d bytes)" % (r, os.path.getsize(p)))
             except OSError:
@@ -611,6 +833,376 @@ def list_files(relpath="", limit=MAX_LIST):
             if len(out) >= limit:
                 return out, True
     return out, False
+
+
+# ------------------------------------------------------------------ tasks
+# A session is a task, and a task in a git repository gets a copy of its
+# own: a git worktree on a branch of its own, under STATE_DIR. OpenCode
+# works there, so the user's folder - and the app running from it, when the
+# folder is this repo - is untouched until the user merges the task. Each
+# ask ends with the tests of what it changed run in that copy, then a
+# checkpoint commit on the task's branch, so the last ask can be undone.
+# A merge is one squashed commit, so a merged task can be reverted.
+# Merging, undoing and discarding each ask the user first, like every edit.
+# A folder that is not a git repository gets no copy: OpenCode works in it
+# directly, as before.
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+CHECKPOINT_ID = ("-c", "user.name=OpenCode", "-c", "user.email=opencode@localhost")
+
+
+def _git(*args, cwd=None, timeout=120, check=True):
+    try:
+        p = subprocess.run(("git",) + args, cwd=cwd or WORKSPACE, capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise OpenCodeError("git %s failed: %s" % (_verb(args), e))
+    out = p.stdout.decode("utf-8", "replace")
+    if not check:
+        return p.returncode, out
+    if p.returncode:
+        err = (p.stderr.decode("utf-8", "replace") or out).strip()
+        raise OpenCodeError("git %s failed: %s" % (_verb(args), err[:600]))
+    return out
+
+
+def _verb(args):
+    return next((a for a in args if a not in CHECKPOINT_ID), "?")
+
+
+def worktrees_dir():
+    return os.path.join(STATE_DIR, "worktrees")
+
+
+def _tasks_file():
+    return os.path.join(STATE_DIR, "tasks.json")
+
+
+def load_tasks():
+    try:
+        with open(_tasks_file(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_tasks(tasks):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = _tasks_file() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=1)
+    os.replace(tmp, _tasks_file())
+
+
+def task(sid):
+    return load_tasks().get(sid) if sid else None
+
+
+def update_task(sid, **fields):
+    tasks = load_tasks()
+    tasks.setdefault(sid, {}).update(fields)
+    save_tasks(tasks)
+    return tasks[sid]
+
+
+def task_dir(sid):
+    """The folder session `sid` works in, or None for the server's own."""
+    t = task(sid)
+    return t.get("dir") if t and t.get("isolated") else None
+
+
+def is_repo():
+    """Whether the workspace is the top of a git repository with a commit."""
+    code, top = _git("rev-parse", "--show-toplevel", check=False)
+    if code or not top.strip():
+        return False
+    if os.path.normcase(os.path.realpath(top.strip())) != os.path.normcase(
+            os.path.realpath(WORKSPACE)):
+        return False
+    return _git("rev-parse", "--verify", "-q", "HEAD", check=False)[0] == 0
+
+
+def start_task(title):
+    """A new session for a new task, in a copy of its own when it can have one."""
+    if not is_repo():
+        s = new_session(title)
+        update_task(s["id"], title=title, isolated=False, grants=[],
+                    created=time.strftime("%Y-%m-%d %H:%M"))
+        return s["id"]
+    name = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
+    copy = os.path.join(worktrees_dir(), name)
+    branch = "opencode/" + name
+    base = _git("rev-parse", "HEAD").strip()
+    os.makedirs(worktrees_dir(), exist_ok=True)
+    _git("worktree", "add", "-q", "-b", branch, copy, base)
+    try:
+        s = new_session(title, directory=copy)
+    except OpenCodeError:
+        _drop_copy(copy, branch)
+        raise
+    update_task(s["id"], title=title, isolated=True, dir=copy, branch=branch, base=base,
+                checkpoints=[], grants=[], created=time.strftime("%Y-%m-%d %H:%M"))
+    return s["id"]
+
+
+def _drop_copy(copy, branch):
+    _git("worktree", "remove", "--force", copy, check=False)
+    _git("worktree", "prune", check=False)
+    _git("branch", "-D", branch, check=False)
+
+
+def changed_files(copy):
+    """Paths changed in a task's copy since its last checkpoint."""
+    out = _git("status", "--porcelain", "-uall", cwd=copy)
+    files = []
+    for line in out.splitlines():
+        name = line[3:].strip()
+        if " -> " in name:
+            name = name.split(" -> ", 1)[1]
+        files.append(name.strip('"'))
+    return files
+
+
+def checkpoint(sid, label):
+    """Commit what the last ask changed on the task's branch; its sha, or None."""
+    t = task(sid)
+    if not t or not t.get("isolated"):
+        return None
+    copy = t["dir"]
+    _git("add", "-A", cwd=copy)
+    if _git("diff", "--cached", "--quiet", cwd=copy, check=False)[0] == 0:
+        return None
+    _git(*(CHECKPOINT_ID + ("commit", "-q", "-m", "checkpoint: " + label[:72])), cwd=copy)
+    sha = _git("rev-parse", "HEAD", cwd=copy).strip()
+    update_task(sid, checkpoints=t.get("checkpoints", []) + [{"sha": sha, "label": label[:120]}])
+    return sha
+
+
+def tests_for(root, files):
+    """The test modules that cover `files`: a changed test file itself, and
+    tests/test_<name>.py for a changed module (studio_ and _mcp/_ui dropped)."""
+    mods = []
+    for f in files:
+        if not f.endswith(".py"):
+            continue
+        name = os.path.basename(f)[:-3]
+        if name.startswith("test_"):
+            candidates = [name]
+        else:
+            stem = name[7:] if name.startswith("studio_") else name
+            candidates = ["test_" + stem, "test_" + re.sub(r"_(mcp|ui)$", "", stem)]
+        for c in candidates:
+            if os.path.isfile(os.path.join(root, "tests", c + ".py")):
+                if "tests." + c not in mods:
+                    mods.append("tests." + c)
+                break
+    return mods
+
+
+def run_tests(root, mods):
+    """Run `mods` in `root` and say how it went, in a few lines."""
+    try:
+        p = subprocess.run([sys.executable, "-m", "unittest"] + mods, cwd=root,
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=TEST_TIMEOUT,
+                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                           creationflags=NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return "Tests %s did not finish in %d seconds." % (", ".join(mods), TEST_TIMEOUT)
+    except OSError as e:
+        return "Tests could not be run: %s" % e
+    out = (p.stderr + p.stdout).decode("utf-8", "replace").strip()
+    ran = re.search(r"Ran (\d+) tests?", out)
+    count = ran.group(1) if ran else "?"
+    if p.returncode == 0:
+        return "Tests passed: %s (%s tests)." % (", ".join(mods), count)
+    return "Tests FAILED: %s (%s tests). Their output ends:\n%s" % (
+        ", ".join(mods), count, out[-2500:])
+
+
+def after_ask(sid, label):
+    """What follows a finished ask in a task's copy: the tests of what it
+    changed, then a checkpoint. Lines for the report."""
+    t = task(sid)
+    if not t or not t.get("isolated"):
+        return []
+    lines = []
+    try:
+        files = changed_files(t["dir"])
+        if files:
+            mods = tests_for(t["dir"], files)
+            if mods:
+                studio_mcp.progress("running the tests of what OpenCode changed")
+                lines.append(run_tests(t["dir"], mods))
+            else:
+                lines.append("No test module matches the changed files, so none were run.")
+            sha = checkpoint(sid, label)
+            if sha:
+                lines.append("Checkpoint %s saved on %s." % (sha[:8], t["branch"]))
+        if t.get("undone"):
+            update_task(sid, undone=False)
+    except OpenCodeError as e:
+        lines.append("Could not check the task's copy: %s" % e)
+    return lines
+
+
+def confirm(message, yes, detail=None, diff=None):
+    """The user's yes to a step that changes their folder or drops work.
+    False when they say no, or when no one can be asked."""
+    shown = {"kind": "confirm"}
+    if diff:
+        shown["diff"] = diff
+    elif detail:
+        shown["command"] = detail
+    schema = {"type": "object",
+              "properties": {"decision": {"type": "string", "title": "Decision",
+                                          "enum": ["yes", "no"], "enumNames": [yes, "Cancel"]}},
+              "required": ["decision"]}
+    try:
+        res = studio_mcp.elicit(message, schema, meta={"studio/approval": shown})
+    except studio_mcp.Declined:
+        return False
+    return (res.get("action") == "accept"
+            and (res.get("content") or {}).get("decision") == "yes")
+
+
+def _need_task(a):
+    sid = a.get("session_id") or last_session()
+    t = task(sid)
+    if not sid or not t:
+        raise OpenCodeError("No task to act on: give the session_id of one opencode_ask started.")
+    if not t.get("isolated"):
+        raise OpenCodeError("Session %s works in %s directly, not in a copy, so there is "
+                            "nothing to merge, undo or discard." % (sid, WORKSPACE))
+    return sid, t
+
+
+def _idle_or_refuse(sid, t):
+    if (statuses(t["dir"]).get(sid) or {}).get("type", "idle") != "idle":
+        raise OpenCodeError("Session %s is still working. opencode_wait for it, or "
+                            "opencode_abort it, first." % sid)
+
+
+def t_merge(a):
+    sid, t = _need_task(a)
+    if t.get("merged"):
+        return result("Session %s was already merged as %s." % (sid, t["merged"][:8]))
+    _idle_or_refuse(sid, t)
+    checkpoint(sid, "before merge")
+    stat = _git("diff", "--stat", t["base"], "HEAD", cwd=t["dir"]).strip()
+    if not stat:
+        return result("Session %s changed nothing, so there is nothing to merge." % sid)
+    files = [l.split("|")[0].strip() for l in stat.splitlines() if "|" in l]
+    dirty = _git("status", "--porcelain", "--", *files).strip() if files else ""
+    if dirty:
+        return result("The user's folder has uncommitted changes in files this task also "
+                      "changed, so it was not merged:\n%s\nThe user commits or sets those "
+                      "aside first." % dirty, error=True)
+    here = _git("rev-parse", "--abbrev-ref", "HEAD").strip()
+    diff = _git("diff", t["base"], "HEAD", cwd=t["dir"])
+    message = (a.get("message") or "OpenCode: %s" % (t.get("title") or sid)).strip()
+    if not confirm("Merge OpenCode's work on \"%s\" into %s of %s, as one commit?\n%s"
+                   % (t.get("title") or sid, here, WORKSPACE, stat),
+                   "Merge", diff=diff[:60000]):
+        return result("The user did not merge session %s; its work stays in its copy." % sid)
+    code, out = _git("merge", "--squash", t["branch"], check=False)
+    if code:
+        _git("reset", "--merge", check=False)
+        return result("The merge conflicted with work in %s, so nothing was changed:\n%s\n"
+                      "OpenCode can bring the task up to date, or the user merges by hand "
+                      "(branch %s)." % (here, out.strip()[-1500:], t["branch"]), error=True)
+    _git("commit", "-q", "-m", message)
+    sha = _git("rev-parse", "HEAD").strip()
+    _drop_copy(t["dir"], t["branch"])
+    update_task(sid, merged=sha, isolated=False, grants=[])
+    return result("Merged session %s into %s as %s (%s). Its copy is removed; "
+                  "opencode_undo reverts the merge." % (sid, here, sha[:8], message))
+
+
+def t_undo(a):
+    sid = a.get("session_id") or last_session()
+    t = task(sid)
+    if t and t.get("merged") and not t.get("isolated"):
+        sha = t["merged"]
+        stat = _git("show", "--stat", "--format=%s", sha).strip()
+        if not confirm("Revert the merged OpenCode task %s in %s?\n%s" % (sha[:8], WORKSPACE, stat),
+                       "Revert"):
+            return result("The user kept the merge.")
+        code, out = _git("revert", "--no-edit", sha, check=False)
+        if code:
+            _git("revert", "--abort", check=False)
+            return result("Reverting %s conflicts with later work, so nothing changed:\n%s"
+                          % (sha[:8], out.strip()[-1500:]), error=True)
+        update_task(sid, merged=None)
+        return result("Reverted the merge %s; the revert is commit %s."
+                      % (sha[:8], _git("rev-parse", "--short", "HEAD").strip()))
+    sid, t = _need_task(a)
+    _idle_or_refuse(sid, t)
+    checkpoint(sid, "last ask")
+    t = task(sid)
+    points = t.get("checkpoints", [])
+    if not points:
+        return result("Session %s has changed nothing yet; there is nothing to undo." % sid)
+    back_to = points[-2]["sha"] if len(points) > 1 else t["base"]
+    stat = _git("diff", "--stat", back_to, "HEAD", cwd=t["dir"]).strip()
+    if not confirm("Undo OpenCode's last change in this task (%s)?\n%s"
+                   % (points[-1]["label"], stat), "Undo"):
+        return result("The user kept the change.")
+    _git("reset", "-q", "--hard", back_to, cwd=t["dir"])
+    _git("clean", "-q", "-fd", cwd=t["dir"])
+    update_task(sid, checkpoints=points[:-1], undone=True)
+    return result("Undid the last change in session %s; its copy is back at %s. OpenCode is "
+                  "told on the next ask that it was undone." % (sid, back_to[:8]))
+
+
+def t_discard(a):
+    sid, t = _need_task(a)
+    stat = _git("diff", "--stat", t["base"], cwd=t["dir"], check=False)[1].strip()
+    if not confirm("Throw away OpenCode's task \"%s\" and its copy?%s"
+                   % (t.get("title") or sid, ("\n" + stat) if stat else " It changed nothing."),
+                   "Discard"):
+        return result("The user kept the task.")
+    try:
+        abort(sid)
+    except OpenCodeError:
+        pass
+    _drop_copy(t["dir"], t["branch"])
+    tasks = load_tasks()
+    tasks.pop(sid, None)
+    save_tasks(tasks)
+    if last_session() == sid:
+        remember_session("")
+    return result("Discarded session %s: its copy and branch are gone; the user's folder "
+                  "was never touched." % sid)
+
+
+def t_grants(a):
+    sid = a.get("session_id") or last_session()
+    grants = (task(sid) or {}).get("grants", [])
+    if not grants:
+        return result("Session %s has no standing grants: every step is asked." % (sid or "-"))
+    return result("Standing grants in session %s (allowed without asking):\n%s\n"
+                  "opencode_revoke takes one back." % (sid, "\n".join(
+                      "%d. %s (since %s)" % (i + 1, g.get("label"), g.get("since", "?"))
+                      for i, g in enumerate(grants))))
+
+
+def t_revoke(a):
+    sid = a.get("session_id") or last_session()
+    t = task(sid)
+    grants = (t or {}).get("grants", [])
+    if not grants:
+        return result("Session %s has no standing grants." % (sid or "-"))
+    n = a.get("number")
+    if n is None:
+        update_task(sid, grants=[])
+        return result("Took back all %d grant(s) in session %s; every step is asked again."
+                      % (len(grants), sid))
+    if not 1 <= int(n) <= len(grants):
+        raise ValueError("number must be 1 to %d" % len(grants))
+    gone = grants.pop(int(n) - 1)
+    update_task(sid, grants=grants)
+    return result("Took back \"%s\" in session %s." % (gone.get("label"), sid))
 
 
 # ----------------------------------------------------------------- the tools
@@ -625,14 +1217,32 @@ def result(text, error=False):
 MIN_CONTEXT = 65536
 
 
+def window_of(conf):
+    """The context window OpenCode's config declares for its model, or None."""
+    model = (conf.get("model") or "").split("/", 1)[-1]
+    models = conf.get("provider", {}).get("lmstudio", {}).get("models", {})
+    ctx = (models.get(model) or {}).get("limit", {}).get("context")
+    return ctx if isinstance(ctx, int) and ctx > 0 else None
+
+
+def _loaded_conf():
+    try:
+        with open(os.path.join(STATE_DIR, "opencode.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def loaded_window():
+    return window_of(_loaded_conf())
+
+
 def context_note(conf):
     """A warning when the model is loaded with too small a window to code in
     this repo, or "". OpenCode's own prompt and tools take ~10k tokens and one
     of our larger files as much again; below this it compacts away the task."""
-    model = (conf.get("model") or "").split("/", 1)[-1]
-    models = conf.get("provider", {}).get("lmstudio", {}).get("models", {})
-    ctx = (models.get(model) or {}).get("limit", {}).get("context")
-    if not isinstance(ctx, int) or ctx >= MIN_CONTEXT:
+    ctx = window_of(conf)
+    if not ctx or ctx >= MIN_CONTEXT:
         return ""
     return ("Warning: the model is loaded with a %d-token context window. OpenCode needs "
             "at least %d to keep a task in mind: in LM Studio on the LLM PC, raise the "
@@ -661,6 +1271,15 @@ def t_status(a):
     except OpenCodeError as e:
         lines.append(str(e))
     lines.append(workspace_note())
+    if is_repo():
+        lines.append("Each new task gets its own copy of the folder (a git worktree), from "
+                     "its last commit; the user merges it when it is right.")
+    sid = last_session()
+    if task(sid):
+        grants = task(sid).get("grants", [])
+        lines.append("The current task is session %s%s." % (
+            sid, "; standing grants: " + "; ".join(g.get("label", "?") for g in grants)
+            if grants else ""))
     cfg = os.path.join(STATE_DIR, "opencode.json")
     if os.path.isfile(cfg):
         try:
@@ -689,14 +1308,23 @@ def t_list_sessions(a):
         if isinstance(when, (int, float)):
             when = time.strftime("%Y-%m-%d %H:%M",
                                  time.localtime(when / 1000 if when > 1e11 else when))
-        lines.append("%s  %s  %s" % (s.get("id"), (s.get("title") or "(untitled)")[:60], when))
+        t = task(s.get("id"))
+        state = ""
+        if t:
+            state = ("  [merged %s]" % t["merged"][:8] if t.get("merged") else
+                     "  [in its copy, %d checkpoint(s), not merged]" % len(t.get("checkpoints", []))
+                     if t.get("isolated") else "")
+        lines.append("%s  %s  %s%s" % (s.get("id"), (s.get("title") or "(untitled)")[:60],
+                                       when, state))
     return result("\n".join(lines))
 
 
 def t_new_session(a):
-    s = new_session(a.get("title") or "")
-    return result("Session %s created%s. Send work to it with opencode_ask."
-                  % (s["id"], (" - " + s["title"]) if s.get("title") else ""))
+    title = a.get("title") or ""
+    sid = start_task(title)
+    remember_session(sid)
+    return result("Session %s created%s. Send work to it with opencode_ask.\n%s"
+                  % (sid, (" - " + title) if title else "", workspace_note(sid)))
 
 
 def _work_limit(a):
@@ -740,24 +1368,35 @@ def t_ask(a):
             if a.get("session_id"):
                 raise
             seen = None                        # the remembered one is gone
+    if seen is not None and (statuses(task_dir(sid)).get(sid) or {}).get("type", "idle") != "idle":
+        # A second task on a working session queues behind the first and the
+        # report mixes the two; the last ask most likely timed out.
+        return result("Session %s is still working on the last task. Do not send a new one: "
+                      "call opencode_wait with this session_id to follow it, or opencode_abort "
+                      "to stop it first." % sid, error=True)
     if seen is None:
-        sid = new_session(text.strip().splitlines()[0][:60])["id"]
+        sid = start_task(text.strip().splitlines()[0][:60])
         seen = set()
     remember_session(sid)
+    if (task(sid) or {}).get("undone"):
+        text = ("(The user undid your last change in this task: those files are back as "
+                "they were before it. Do not assume it is there.)\n\n" + text)
     prompt(sid, text)
-    out = run(sid, seen, _work_limit(a))
-    note = _loaded_context_note()
-    if note and isinstance(out, dict):
-        out.setdefault("content", []).append({"type": "text", "text": note})
+    return finish(sid, seen, _work_limit(a), a["prompt"].strip().splitlines()[0][:80])
+
+
+def finish(sid, seen, work_limit, label):
+    """Follow an ask to its end; when it ends done, test and checkpoint what
+    it changed. The result the model reads."""
+    state, text = follow(sid, seen, work_limit)
+    out = outcome(sid, state, text, work_limit)
+    extra = after_ask(sid, label) if state == "done" else []
+    note = context_note(_loaded_conf())
+    if note:
+        extra.append(note)
+    if extra:
+        out.setdefault("content", []).append({"type": "text", "text": "\n".join(extra)})
     return out
-
-
-def _loaded_context_note():
-    try:
-        with open(os.path.join(STATE_DIR, "opencode.json"), encoding="utf-8") as f:
-            return context_note(json.load(f))
-    except (OSError, ValueError):
-        return ""
 
 
 def t_wait(a):
@@ -767,7 +1406,7 @@ def t_wait(a):
     # ask returns the whole answer rather than only what came since.
     last_user = max((i for i, m in enumerate(msgs) if _role(m) == "user"), default=-1)
     seen = {_info(m).get("id") for m in msgs[:last_user + 1]}
-    return run(sid, seen, _work_limit(a))
+    return finish(sid, seen, _work_limit(a), "waited-for work")
 
 
 def t_get_session(a):
@@ -788,8 +1427,19 @@ def t_abort(a):
                   "stays." % a["session_id"])
 
 
+def _base(a):
+    """The folder the file tools look in: the current task's copy while it
+    has one, since that is where OpenCode's work is; else the workspace."""
+    return task_dir(a.get("session_id") or last_session())
+
+
 def t_changes(a):
-    """Uncommitted changes in the workspace, from git through OpenCode."""
+    """What the current task changed in its copy, or else the uncommitted
+    changes in the workspace, from git through OpenCode."""
+    sid = a.get("session_id") or last_session()
+    t = task(sid)
+    if t and t.get("isolated"):
+        return task_changes(sid, t, a.get("path"))
     rows = get_json(ROUTES["diff"] + "?mode=git", timeout=30)
     rows = rows if isinstance(rows, list) else []
     want = a.get("path")
@@ -810,8 +1460,30 @@ def t_changes(a):
     return result("Uncommitted changes (git):\n" + "\n".join(lines))
 
 
+def task_changes(sid, t, want=None):
+    copy = t["dir"]
+    _git("add", "-A", cwd=copy)
+    if want:
+        want = rel(inside(want, copy))
+        patch = _git("diff", "--cached", t["base"], "--", want, cwd=copy)
+        if not patch.strip():
+            return result("%s is unchanged in session %s." % (want, sid))
+        if len(patch) > MAX_DIFF_CHARS:
+            patch = patch[:MAX_DIFF_CHARS] + "\n... [diff cut at %d characters]" % MAX_DIFF_CHARS
+        return result(patch)
+    rows = _git("diff", "--cached", "--numstat", t["base"], cwd=copy).strip().splitlines()
+    if not rows:
+        return result("Session %s has changed nothing yet." % sid)
+    lines = []
+    for row in rows[:200]:
+        added, removed, name = (row.split("\t", 2) + ["", "", ""])[:3]
+        lines.append("%s  +%s -%s" % (name, added, removed))
+    return result("What session %s changed in its copy (not merged yet):\n%s"
+                  % (sid, "\n".join(lines)))
+
+
 def t_list_files(a):
-    rows, truncated = list_files(a.get("path") or "")
+    rows, truncated = list_files(a.get("path") or "", base=_base(a))
     if not rows:
         return result("The folder is empty. %s" % workspace_note())
     text = "\n".join(rows)
@@ -821,7 +1493,7 @@ def t_list_files(a):
 
 
 def t_read_file(a):
-    full = inside(a["path"])
+    full = inside(a["path"], _base(a))
     if not os.path.isfile(full):
         raise OpenCodeError("%s is not a file in the workspace." % a["path"])
     with open(full, encoding="utf-8", errors="replace") as f:
@@ -847,6 +1519,8 @@ def _i(desc, **kw):
     d.update(kw)
     return d
 
+
+SESSION = {"type": "string", "description": "The session id. Default: the current task."}
 
 TOOLS = [
     ("opencode_status", t_status,
@@ -899,13 +1573,40 @@ TOOLS = [
      "What is changed and not yet committed in OpenCode's folder, from git: each file "
      "with lines added and removed - or, given a path, that file's diff. Use it to check "
      "what an ask really changed before reporting.",
-     _obj({"path": _s("One file's diff, relative to the folder. Omit for the list.")})),
+     _obj({"path": _s("One file's diff, relative to the folder. Omit for the list."),
+           "session_id": SESSION})),
     ("opencode_list_files", t_list_files,
-     "The files in OpenCode's folder, or one subfolder of it, with sizes.",
-     _obj({"path": _s("Subfolder, relative to the folder. Default: all of it.")})),
+     "The files in OpenCode's folder - in the current task's copy while it has one - "
+     "or one subfolder of it, with sizes.",
+     _obj({"path": _s("Subfolder, relative to the folder. Default: all of it."),
+           "session_id": SESSION})),
     ("opencode_read_file", t_read_file,
-     "Read one file from OpenCode's folder, as text.",
-     _obj({"path": _s("File path relative to the folder, e.g. studio_agent.py.")}, ["path"])),
+     "Read one file from OpenCode's folder - from the current task's copy while it has "
+     "one - as text.",
+     _obj({"path": _s("File path relative to the folder, e.g. studio_agent.py."),
+           "session_id": SESSION}, ["path"])),
+    ("opencode_merge", t_merge,
+     "Bring a finished task's work from its copy into the user's folder, as one commit. "
+     "The user sees the diff and decides; you cannot merge for them. Call it when the "
+     "user says the work is right, not before.",
+     _obj({"session_id": SESSION,
+           "message": _s("The commit message. Default: 'OpenCode: <task title>'.")})),
+    ("opencode_undo", t_undo,
+     "Take back the last ask's change in a task's copy - or, for a merged task, revert "
+     "the merge commit. The user confirms first. OpenCode is told on the next ask.",
+     _obj({"session_id": SESSION})),
+    ("opencode_discard", t_discard,
+     "Throw a task away: its copy and branch are deleted and nothing is merged. The "
+     "user confirms first.",
+     _obj({"session_id": SESSION})),
+    ("opencode_grants", t_grants,
+     "The steps the user said to always allow in a task, which run without asking.",
+     _obj({"session_id": SESSION})),
+    ("opencode_revoke", t_revoke,
+     "Take back the user's standing grants in a task - one by its number from "
+     "opencode_grants, or all of them - so those steps are asked again.",
+     _obj({"session_id": SESSION,
+           "number": _i("Which grant, from opencode_grants. Omit for all.", minimum=1)})),
 ]
 
 TOOLS_BY_NAME = {name: (fn, desc, schema) for name, fn, desc, schema in TOOLS}
@@ -914,7 +1615,8 @@ TOOLS_BY_NAME = {name: (fn, desc, schema) for name, fn, desc, schema in TOOLS}
 # owe a read-back; opencode_ask is the edit, and its reply is not proof the code
 # works, so it is not listed - the model is expected to check what came back.
 READ_ONLY = {"opencode_status", "opencode_list_sessions", "opencode_get_session",
-             "opencode_list_files", "opencode_read_file", "opencode_changes"}
+             "opencode_list_files", "opencode_read_file", "opencode_changes",
+             "opencode_grants"}
 
 
 # Hints past read-only. opencode_ask and opencode_wait may lead to edits the
@@ -925,15 +1627,20 @@ HINTS = {
     "opencode_ask": {"destructive": True},
     "opencode_wait": {"destructive": True},
     "opencode_abort": {"destructive": True, "idempotent": True},
+    "opencode_merge": {"destructive": True},
+    "opencode_undo": {"destructive": True},
+    "opencode_discard": {"destructive": True},
+    "opencode_revoke": {"destructive": False, "idempotent": True},
 }
 
 SERVER = studio_mcp.Server(
-    "studio-opencode-mcp", "2.0",
+    "studio-opencode-mcp", "3.0",
     studio_mcp.tools_from_table(TOOLS, read_only=READ_ONLY, **HINTS),
     errors=(OpenCodeError, KeyError, TypeError, ValueError, OSError),
-    instructions="OpenCode codes in one folder with the local model. opencode_ask briefs "
-                 "it and follows it to the end; every edit, command and fetch it wants is "
-                 "put to the user through MCP elicitation, never to the model. Call "
+    instructions="OpenCode codes in one folder with the local model, each task in a copy "
+                 "of its own. opencode_ask briefs it and follows it to the end; every edit, "
+                 "command and fetch it wants, and every merge, undo or discard, is put to the "
+                 "user through MCP elicitation, never to the model. Call "
                  "opencode_status first if a tool reports it cannot reach OpenCode.")
 
 
