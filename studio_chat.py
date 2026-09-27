@@ -19,6 +19,7 @@ Python, and the engine is stdlib only.
 import base64
 import json
 import math
+import logging
 import os
 import queue
 import re
@@ -5309,6 +5310,8 @@ def main():
         return
     global _MAIN
     _MAIN = True
+    if doctor.start_activity_log():
+        logging.getLogger("studio").info("---- %s started (pid %d) ----", APP_NAME, os.getpid())
     try:
         app = Chat()
         # Ctrl+C / Ctrl+Break in a console, or a SIGTERM: the same orderly

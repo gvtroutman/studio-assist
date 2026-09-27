@@ -2102,7 +2102,17 @@ groups are the same set, so a tool added to one and not the other fails loudly.
 
 Length is not a per-message cost. The prompt is the head of every request's prefix, so
 LM Studio caches it after the first call and the warm-up pays for it against the exact
-prefix a real message uses — once per tab, not once per question.
+prefix a real message uses — once per tab, not once per question. It is a cost to the
+*window*, though, so the shared blocks are kept terse, with a REPLIES rule for the
+model's own prose.
+
+**Big tool sets go by reference** (`studio_tasks.offered_tools`). Past `LAZY_CHARS` of
+schema JSON, inference gets `studio_tool_call` (whose description is a one-line index
+of every bridge tool) and `studio_tool_schema` (full schemas on demand, into the
+history) instead of the schemas: After Effects' ~97k chars become ~7k, Resolve's ~32k
+become ~3k. `_call` unwraps a by-reference call to the tool it names, so validation,
+journal, repeat checks and the transcript are unchanged; a direct call by the real
+name still works, and a refusal carries the tool's schema.
 
 ## Hard-won constraints — read before editing
 

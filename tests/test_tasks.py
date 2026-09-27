@@ -326,6 +326,55 @@ class TestExecutor(unittest.TestCase):
         self.assertIn("remain unverified", ex.run(self.messages))
 
 
+class TestToolsByReference(unittest.TestCase):
+    """Past LAZY_CHARS of schema a tab's tools go by reference: an index and two
+    meta tools in the prefix, full schemas fetched into the history."""
+
+    setup_run = TestExecutor.setup_run
+
+    def big(self):
+        pad = "x" * (tasks.LAZY_CHARS // 2)
+        return [spec("create_comp", {"type": "object", "additionalProperties": False,
+                                     "properties": {"width": {"type": "integer"}}},
+                     description="Make a comp. " + pad),
+                spec("get_comp", description="Read a comp. " + pad)]
+
+    def test_small_tool_sets_are_offered_whole(self):
+        tools = eng.to_openai_tools([spec("create_comp"), spec("get_comp")])
+        self.assertEqual(tasks.offered_tools(tools), tools)
+
+    def test_big_tool_sets_are_an_index_and_two_meta_tools(self):
+        offered = tasks.offered_tools(eng.to_openai_tools(self.big()))
+        self.assertEqual([t["function"]["name"] for t in offered],
+                         [tasks.SCHEMA_TOOL_NAME, tasks.CALL_TOOL_NAME])
+        index = offered[1]["function"]["description"]
+        self.assertIn("- create_comp: Make a comp.", index)
+        self.assertNotIn("xxxx", index)
+        self.assertLess(len(json.dumps(offered)), tasks.LAZY_CHARS // 4)
+
+    def test_schema_fetch_then_call_by_reference_runs_as_the_tool(self):
+        ex = self.setup_run([answer(call(tasks.SCHEMA_TOOL_NAME, {"names": ["create_comp", "nope"]})),
+                             answer(call(tasks.CALL_TOOL_NAME, {"name": "create_comp",
+                                                                "arguments": {"width": 10}}, "c2")),
+                             answer(call("get_comp", ident="c3")), answer(text="Made")],
+                            specs=self.big())
+        self.assertEqual(ex.run(self.messages), "Made")
+        self.assertIn('"width"', self.messages[3]["content"])
+        self.assertIn("nope: no such tool", self.messages[3]["content"])
+        self.bridge.call_tool.assert_any_call("create_comp", {"width": 10})
+        self.assertEqual(ex.record.journal[0]["name"], "create_comp")
+        self.assertIn(("tool", {"name": "create_comp", "arguments": {"width": 10}, "via": None}),
+                      self.events)
+
+    def test_a_bad_call_by_reference_is_refused_with_its_schema(self):
+        ex = self.setup_run([answer(call(tasks.CALL_TOOL_NAME, {"name": "create_comp",
+                                                                "arguments": {"width": "wide"}})),
+                             answer(text="Cannot")], specs=self.big())
+        ex.run(self.messages)
+        self.bridge.call_tool.assert_not_called()
+        self.assertIn("parameters:", self.messages[3]["content"])
+
+
 class TestPromisedWork(unittest.TestCase):
     """A reply that announces the call instead of making it does not end the
     run looking finished: one reminder, then the emptiness is named."""
