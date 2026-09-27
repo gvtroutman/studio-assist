@@ -3337,9 +3337,9 @@ class CharacterCreator:
     tabs - Body (with the sliders), Face, Hair, Clothes, Accessories - of
     picks to click, each slot also taking free text; a picture per item worn;
     Randomize; and the character sheet, the prompt text it makes, underneath.
-    Tags are the character's words for its pictures (`item_refs`): "glasses"
-    and the picture of those glasses, used whenever the word is said
-    (`ig.outfit_of`). The anatomy constants have a tab of their own, locked:
+    Tags are the things on the character - glasses, earrings, a dress, a
+    tattoo - each a word and its picture (`item_refs`), used whenever the
+    word is said (`ig.outfit_of`). The anatomy constants have a tab of their own, locked:
     every character has them. Expressions are not here - they are the
     picture's, on the form."""
 
@@ -3523,8 +3523,9 @@ class CharacterCreator:
         picture it stands for, uploaded then (a tag without a picture is not
         made) or taken from a tag another character in the library has."""
         o, host = self.owner, self.owner.host
-        o.label(p, "A tag is a word and a picture of the thing. Say the word in the "
-                "scene or the look (\"glasses\") and Generate draws it from the picture.",
+        o.label(p, "A tag is something on the person - glasses, earrings, a dress, a "
+                "tattoo - and a picture of it. Say its word in the scene or the look "
+                "(\"glasses\") and Generate draws it from the picture.",
                 "muted", wraplength=o.px(560)).pack(side="top", fill="x", pady=(0, o.px(6)))
         row = o.frame(p)
         row.pack(side="top", fill="x", pady=(0, o.px(4)))
