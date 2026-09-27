@@ -521,6 +521,9 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rec["id"], "mara")
         self.assertEqual(rec["looks"], {"hair": "auburn", "weight": -1, "top": "hoodie"})
         self.assertEqual(rec["item_refs"], {"hoodie": "C:/h.png"})
+        self.assertEqual(rec["faces"], [])
+        self.assertEqual(ig.clean_character({"name": "M", "faces": ["C:/f.jpg", 3]})["faces"],
+                         ["C:/f.jpg"])
 
     def test_random_looks_fill_the_creator(self):
         import random
@@ -895,6 +898,54 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rec["face_detail"]["likeness"], ["Partner"])
         self.assertTrue(any("Sitter's face was not found" in n for n in rec["notes"]))
         self.assertTrue(any("Likeness: Partner" in n for n in rec["notes"]), rec["notes"])
+
+    def test_a_characters_face_photos_draw_the_forms_person(self):
+        """The plain form: the character's photos are its one person's face -
+        in the picture itself over the whole frame, on the biggest face in
+        the face pass, and to the real-face paste - with the pass forced on."""
+        photos = []
+        for name in ("partner.png", "partner_left.png"):
+            photos.append(os.path.join(self.dir, name))
+            with open(photos[-1], "wb") as f:
+                f.write(PNG)
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=PasteClient)
+        FaceClient.fail_pass = False
+        PasteClient.report = [{"name": "Partner", "pasted": True, "reference": "studio_partner.png",
+                               "difference": 2, "tolerance": 19}]
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                       backend="5090", seed=5, face_photos=photos,
+                                       face_name="Partner"))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        first, second, third = PasteClient.instances[-1].graphs
+        self.assertEqual(first["40"]["inputs"]["model"], ["pb_1", 0])
+        self.assertEqual(first["pb_1f"]["inputs"]["image"], "studio_partner.png")
+        self.assertNotIn("attn_mask", first["pb_1"]["inputs"])   # the whole frame: no mask
+        self.assertNotIn("pb_1m", first)
+        self.assertEqual(second["fc1_r"]["inputs"]["image"], "studio_partner.png")
+        self.assertEqual(second["fc1_4"]["inputs"]["denoise"], ig.FORM_LIKENESS)
+        self.assertEqual(json.loads(third["pp"]["inputs"]["faces"])[0]["references"],
+                         ["studio_partner.png", "studio_partner_left.png"])
+        rec = self.studio.history.list()[0]
+        self.assertTrue(any("Face: Partner, from 2 photos" in n for n in rec["notes"]),
+                        rec["notes"])
+        self.assertEqual(rec["settings"]["face_photos"], photos)     # Generate Again has them
+
+    def test_a_scene_face_wins_over_the_forms(self):
+        self.assertEqual(ig.faces_of({"scene_faces": {"people": []}, "face_photos": [__file__]}),
+                         {"people": []})
+        self.assertEqual(ig.faces_of({"face_photos": ["/no/such.png"]}), {})
+        who = ig.faces_of({"face_photos": [__file__]})["people"][0]
+        self.assertEqual((who["at"], who["face"], who["name"]), (None, __file__, "the person"))
+
+    def test_the_forms_person_is_the_biggest_face_left(self):
+        boxes = [(10, 10, 20, 20), (500, 500, 80, 90), (100, 100, 60, 60)]
+        scene = {"at": [0.02, 0.02], "name": "A"}
+        form = {"at": None, "name": "B"}
+        self.assertEqual(ig.match_faces(1000, 1000, boxes, [scene, form]),
+                         {0: scene, 1: form})
+        self.assertEqual(ig.match_faces(1000, 1000, [], [form]), {})
 
     def test_without_pulid_a_scene_face_is_redrawn_from_its_words_and_says_so(self):
         self.face_studio()
@@ -1725,6 +1776,42 @@ class TestImageStudioTab(unittest.TestCase):
             ui._show_looks(name)
             self.app.update()
         ui.save_as_character().win.destroy()
+
+    def test_a_characters_face_photos_go_from_the_creator_to_the_form(self):
+        from unittest import mock
+        import tkinter as tk
+        import studio_images_ui
+        s, ui = self.tab()
+        folder = tempfile.mkdtemp()
+        pics = [os.path.join(folder, n) for n in ("front.png", "left.png")]
+        for i, pic in enumerate(pics):
+            tk.PhotoImage(master=self.app, width=4 + i, height=4).write(pic, format="png")
+        ed = ui.edit_characters()
+        ed._new()
+        ed.name.set("Lil")
+        with mock.patch.object(studio_images_ui.filedialog, "askopenfilenames",
+                               return_value=pics):
+            ed._add_faces()
+        self.app.update()
+        self.assertEqual([os.path.dirname(p) for p in ed.faces],
+                         [os.path.join(ui.studio.lib.root, "references", "lil-face")] * 2)
+        left = ed.faces[1]
+        ed._main_face(1)
+        self.assertEqual(ed.faces[0], left)
+        ed._use()
+        ed.win.destroy()
+        rec = ui.studio.lib.get("characters", "lil")
+        self.assertEqual(rec["faces"][0], left)
+        s_ = ui.collect()
+        self.assertEqual((s_["face_photos"], s_["face_name"]), (rec["faces"], "Lil"))
+        self.assertTrue(ui.face_box.winfo_children())
+        ui.face_on.set(False)
+        self.assertEqual(ui.collect()["face_photos"], [])
+        ui.apply(s_)                                  # Reuse Settings brings them back
+        self.assertEqual(ui.collect()["face_photos"], rec["faces"])
+        ui._set_character("")
+        self.assertEqual(ui.collect()["face_photos"], [])
+        self.assertFalse(ui.face_box.winfo_children())
 
     def test_the_form_says_where_it_goes_and_refuses_what_cannot_run(self):
         s, ui = self.tab()

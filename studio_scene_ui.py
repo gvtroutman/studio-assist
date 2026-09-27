@@ -729,7 +729,7 @@ class SceneBuilder:
 
     def _face_controls(self, obj):
         """The face this person is drawn with, last of all: a picture of
-        theirs, else their character's identity's, else none (the face is
+        theirs, else their character's face photos or identity's, else none (the face is
         redrawn from the words)."""
         o, p = self.owner, self.panel
         o.cap(p, "Face")
