@@ -2917,6 +2917,21 @@ one place a run teaches; it never raises.
   tail (`extra=`) after the task record. Never rewrite `messages[0]` mid-way to add
   a lesson — the prefix cache, again. Every warm-up passes `s.messages[0]` itself,
   not a rebuilt prompt, for the same reason.
+- **Lessons come in layers** (added 2026-09-27, the user asked for OpenCode that
+  "becomes smarter every answer"). `studio_lessons.for_app(app)` is a `Stack`:
+  `everywhere` (`lessons/_everywhere.json`, every tab), `app` (`lessons/<app>.json`),
+  and, for an app with a `workspace` (OpenCode), `folder`
+  (`lessons/folders/<name>-<hash>.json`). New lessons go to the most specific layer.
+  The exceptions are "remember everywhere: …" and `studio_remember` with
+  `scope: "everywhere"`, which go to the global layer, and refused calls, which go
+  to the app layer. A lesson already kept in any layer counts as a repeat. `Stack`
+  answers the `Notebook` interface, so the executor and the learner never see layers.
+- **OpenCode reads the lessons too.** `Chat._publish_lessons` writes the stack to
+  `OPENCODE_STATE/lessons.md` (`ServerSpec.lessons_path`) at boot, after each
+  learned run and on each forget. `write_config` adds that file to `instructions`,
+  so Direct mode carries the lessons with no model of ours in between. Direct mode
+  also keeps a "remember…" message itself (`_direct_turn`). There is no
+  reflection in Direct mode, because no chat model runs there.
 - `studio_ask` and `studio_remember` are `INTERNAL_TOOLS` with the task-record and
   tool-maker tools, in that order, before the made tools; `toolsmith.reserved()`
   already refuses `studio_` names. The Lessons window (`File > Lessons for this

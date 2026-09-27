@@ -2357,13 +2357,20 @@ class ServerSpec(AppSpec):
         return os.path.join(self.state_dir, "opencode.json")
 
     @property
+    def lessons_path(self):
+        """What the tabs learned, as markdown OpenCode reads through `instructions`
+        (studio_lessons.write_brief_file) - Direct mode has no model of ours."""
+        return os.path.join(self.state_dir, "lessons.md")
+
+    @property
     def key_path(self):
         return os.path.join(self.state_dir, "server.key")
 
     def write_config(self, host, model, ids, context=None):
         os.makedirs(self.state_dir, exist_ok=True)
         # The general brief goes to every folder; this repo adds its own.
-        brief = [b for b in (OPENCODE_BRIEF_ANY, OPENCODE_BRIEF if own_repo(self.workspace) else None)
+        brief = [b for b in (OPENCODE_BRIEF_ANY, OPENCODE_BRIEF if own_repo(self.workspace) else None,
+                             self.lessons_path)
                  if b and os.path.isfile(b)]
         cfg = opencode_config(host, model, ids, context, addons=load_addons(self.state_dir),
                               brief=brief)
@@ -3461,7 +3468,7 @@ def converse(llm, mcp, tools, app, args, schemas=None):
     """
     import studio_toolsmith as toolsmith
     import studio_lessons
-    notebook = studio_lessons.Notebook.for_app(app.id)
+    notebook = studio_lessons.for_app(app)
     problem = notebook.load()
     if problem:
         log("  could not read this app's lessons - " + problem, args.quiet)
