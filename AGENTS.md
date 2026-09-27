@@ -580,6 +580,26 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   word names a Clothes pick's garment and nothing on the head, else an accessory.
   The pictures then go through Kontext as any item picture does. Scenes with people
   still blank `item_refs` (`studio_scene.generation`): tags are the form's person's.
+- **Item and person pictures can come from a link** (2026-09-27, Gavin: "i want to
+  use urls for images of items and people"). Beside every Picture… on an item row
+  (the form's and the creator's, Tags included) is **Link…**, the Tags tab has
+  **From link…**, and a profile's reference photos and profile picture have **Add
+  from link…** / **Link…** (identities only; a style tile or LoRA preview does not).
+  `ImageStudio.from_link` asks in `_ask_name`'s window, pre-filled from the
+  clipboard when it holds one link, and downloads on a worker thread
+  (`Library.keep_link`), posting the path back only while the window is open, and
+  only to the record it was asked for. The picture is then a file under
+  `references/`, named by its bytes as an upload is (`keep_bytes`), so the same
+  picture by link and by file is one file and a link that dies later breaks
+  nothing; history never holds a URL. `fetch_picture` takes the picture's own
+  link, a page that names one (`og:image`, `twitter:image`: a shop's or a
+  profile's page is what gets copied), a Google Images result (`imgurl`) or a
+  `data:` link, with a browser's user agent (`PICTURE_AGENT`, for the reason the
+  research bridge has one). What came must be a picture by its own first bytes
+  (`picture_ext`: PNG, JPEG, WebP, GIF, BMP), never by the server's Content-Type;
+  AVIF/HEIC, a page with no picture, a 403 and anything over `PICTURE_BYTES` are a
+  `LinkError` that says what to do instead. Tk shows only PNG and GIF, so a JPEG
+  from a link has no thumbnail, as a JPEG from disk has none.
 - **Item pictures go into the picture itself, through FLUX Kontext**
   (2026-09-25; before, Try On redrew the finished picture, which Gavin did not
   want). They are chosen on the form's Clothes, Hair and Accessories tabs as in
