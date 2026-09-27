@@ -61,8 +61,9 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_milanote.py`** — the Milanote tab, which holds a window and has no bridge: a
   Chrome/Edge `--app` window re-parented into the tab, and uploads dropped onto the board
   over DevTools. See *The tab that holds a window*.
-- **`studio_comfy_view.py`** — the Image Studio's Nodes view: the same kind of window on
-  a backend's ComfyUI, with a picture's graphs loaded into it. See *The Nodes view*.
+- **`studio_comfy_view.py`**, **`studio_nodes_ui.py`** — the ComfyUI tab's Nodes view:
+  the same kind of window on a backend's ComfyUI, held where the transcript is, with an
+  Image Studio picture's graphs loaded into it. See *The Nodes view*.
 - **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
@@ -1232,10 +1233,28 @@ Effects. `docker stop studio-opencode` does; the workspace and the session volum
 ### The Nodes view: a picture's graph in ComfyUI's own editor
 
 The user asked (2026-09-27) to see the pipeline's nodes and edit specifics "from the app",
-like the Milanote tab. **Nodes** (beside Fix a spot, and Show nodes on the picture's
-right-click menu) swaps the whole tab body, form and list included, for ComfyUI's page
-with the selected picture's graph loaded. **← Picture** puts the form back. The window
-stays open until the tab closes, so the second Nodes is instant. `studio_comfy_view.py`:
+like the Milanote tab, and then for it to live in the ComfyUI tab rather than a tab of
+its own. The ComfyUI tab has a **Chat | Nodes** switch above its transcript
+(`studio_nodes_ui.NodesView`, built only for the `comfyui` tab). Nodes puts ComfyUI's
+page where the transcript is, with a backend picker (the Image Studio's backends plus
+the tab's own `COMFYUI_URL`, shown first), a step picker and Reload. Chat puts the
+transcript back. The conversation and its bridge are untouched either way.
+
+- **While Nodes shows, the tab counts as a window.** `Chat._holds_window` (a panel tab,
+  or `nodes_view.on`) is what `_select` and `_apply_status` ask. It hides the composer,
+  focuses the window, and disables New chat and History, as on the Milanote tab.
+- **The window is the session's `browser`.** `_close_tab` releases it before the frame
+  goes and `Session.close` ends it, with no code of its own. Its workers come back as
+  `("nodes", sid, callable)`, which `_handle` runs on the UI thread.
+- **The Image Studio's Nodes** (beside Fix a spot, and Show nodes on the picture's
+  right-click menu) calls `Chat.open_nodes(steps, url, name)`. That opens or selects the
+  ComfyUI tab, switches it to Nodes, and loads the picture's Picture step on the
+  backend that made it. The picture's steps sit on the bar until another backend is
+  picked by hand (`_switch`), because they were made on the first one. The first
+  version took over the Image Studio's own body instead. It moved here because two
+  windows cannot share one profile.
+
+`studio_comfy_view.py` holds the window and the graphs:
 
 - **The window is the Milanote one.** `ComfyBrowser` subclasses `studio_milanote.Browser`
   (`name` for its sentences, `target()` for which page). It has its own profile,
@@ -1257,6 +1276,12 @@ stays open until the tab closes, so the second Nodes is instant. `studio_comfy_v
   wherever the view was, often on empty canvas. `Comfy.Canvas.FitView` animates by
   frames, which a window out of sight never draws, so it did nothing. `LOAD` calls
   `ds.fitToBounds` on the nodes' box, with 12% extra on the left for ComfyUI's toolbar.
+- **Leaving a page answers "Leave app?".** A loaded graph is an unsaved workflow, so
+  going to the other backend, or Reload, raises ComfyUI's beforeunload prompt, and
+  unanswered the navigation hung ("Opening ComfyUI…" for good). `leave()` sends
+  `Page.navigate`/`Page.reload` itself and accepts `Page.javascriptDialogOpening`.
+  Nothing is lost: ComfyUI keeps each open workflow as a draft in the profile and
+  reopens it on that page's next visit.
 - **A record's steps are its graphs** (`graph_steps`), in the order they ran: Try On's
   garments, then Picture (`graph`), Face pass, Real-face paste, then `passes`.
   `passes` is new: `_run_pass` appends each `{"label", "graph"}` to `Job.passes`, and
