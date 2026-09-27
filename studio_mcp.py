@@ -19,8 +19,9 @@ delimited JSON-RPC 2.0 on stdio, the transport `studio_agent.MCPClient` uses:
     tool's own failure is an `isError` result the model can read as prose;
   - carries every tool annotation the executor reads (`readOnlyHint` decides
     which calls owe a read-back), structured output with an `outputSchema`,
-    server->client logging, progress on the client's `progressToken`, and
-    cancellation a long tool can poll with `cancelled()`;
+    server->client logging, progress on the client's `progressToken`,
+    cancellation a long tool can poll with `cancelled()`, and `elicit()`, which
+    asks the client's user something mid-call and waits for the answer;
   - keeps stdout for the protocol: a stray `print` inside a tool lands on stderr,
     where the client logs it, instead of in the middle of a reply.
 
@@ -498,6 +499,38 @@ def log(level, data, logger=None):
         server.log(level, data, logger)
 
 
+class Declined(Exception):
+    """elicit() could not ask: no call in flight, or a client with no user."""
+
+
+def can_elicit():
+    """True when the client of the call in flight said it can ask its user."""
+    server = getattr(_ctx, "server", None)
+    return server is not None and server.can_elicit()
+
+
+def elicit(message, schema, meta=None):
+    """Ask the client's user something, from inside a tool, and wait.
+
+    MCP's `elicitation/create`: `message` is what the user reads and `schema`
+    a flat object of primitive fields - what they answer. Returns the client's
+    result, `{"action": "accept"|"decline"|"cancel", "content": {...}}`. The
+    answer goes from the user to this bridge without passing the model, which
+    is the point: a tool that must not act on the model's say-so asks here.
+
+    `meta` rides in `_meta` for a client that can show more than the message
+    (a diff, a command). Raises Declined when there is no one to ask; stops
+    waiting, with action "cancel", if the client cancels the call.
+    """
+    server, rid = getattr(_ctx, "server", None), getattr(_ctx, "rid", None)
+    if server is None or not server.can_elicit():
+        raise Declined("the client cannot ask its user")
+    params = {"mode": "form", "message": message, "requestedSchema": schema}
+    if meta:
+        params["_meta"] = meta
+    return server.request_client("elicitation/create", params, rid)
+
+
 # ------------------------------------------------------------------ server
 
 class Server:
@@ -523,17 +556,60 @@ class Server:
         self.logger = logger or name
         self.protocol = None                  # negotiated on initialize
         self.client = {}                      # the client's clientInfo
+        self.client_caps = {}                 # ...and the capabilities it declared
         self.initialized = False
         self.level = None                     # client's logging/setLevel; None: quiet
         self.sink = None                      # where notifications go, set by serve/Loopback
         self._inflight = set()                # request ids being handled right now
         self._cancelled = set()
+        self._asked = {}                      # our request id -> queue its reply lands in
+        self._ask_seq = 0
+        self._ask_lock = threading.Lock()
 
     # ------------------------------------------------------------ outgoing
 
     def notify(self, method, params=None):
         if self.sink is not None:
             self.sink({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def can_elicit(self):
+        return isinstance(self.client_caps.get("elicitation"), dict)
+
+    def request_client(self, method, params, rid=None):
+        """Send the client a request and wait for its reply, however long -
+        a person is usually on the other end. The reader thread routes the
+        reply here (`deliver`); a cancellation of the tool call `rid` this is
+        asked from ends the wait as the user cancelling."""
+        if self.sink is None:
+            raise Declined("no client connected")
+        with self._ask_lock:
+            self._ask_seq += 1
+            qid = "srv-%d" % self._ask_seq
+            box = self._asked[qid] = queue.Queue()
+        try:
+            self.sink({"jsonrpc": "2.0", "id": qid, "method": method, "params": params})
+            while True:
+                try:
+                    reply = box.get(timeout=0.5)
+                    break
+                except queue.Empty:
+                    if rid is not None and rid in self._cancelled:
+                        return {"action": "cancel"}
+                    if self.sink is None:
+                        return {"action": "cancel"}
+        finally:
+            self._asked.pop(qid, None)
+        if "error" in reply:
+            raise Declined("the client refused %s: %s" % (method, error_text(reply["error"])))
+        return reply.get("result") or {}
+
+    def deliver(self, msg):
+        """A reply to a request of ours. True when it was one we are waiting on."""
+        box = self._asked.get(msg.get("id")) if isinstance(msg, dict) else None
+        if box is None or msg.get("method") is not None:
+            return False
+        box.put(msg)
+        return True
 
     def log(self, level, data, logger=None):
         if level not in LOG_LEVELS:
@@ -667,6 +743,8 @@ class Server:
             asked = params.get("protocolVersion")
             self.protocol = asked if asked in PROTOCOL_VERSIONS else LATEST
             self.client = params.get("clientInfo") or {}
+            caps = params.get("capabilities")
+            self.client_caps = caps if isinstance(caps, dict) else {}
             return self.initialize_result()
         if self.protocol is None:
             raise JSONRPCError(INVALID_REQUEST, "initialize first")
@@ -740,6 +818,10 @@ class Server:
                     if isinstance(msg, dict) and msg.get("method") == "notifications/cancelled":
                         self.cancel((msg.get("params") or {}).get("requestId"))
                         continue
+                    # The client's answer to an elicit(): the tool asking it
+                    # is blocking the main thread, so it is routed from here.
+                    if self.deliver(msg):
+                        continue
                     inbox.put(("msg", msg))
             finally:
                 inbox.put(None)
@@ -763,18 +845,33 @@ class Loopback:
 
     The executor, the checks and the tests can run against a real bridge with
     no subprocess and no pipes. Notifications the server sends land in
-    `notifications`.
+    `notifications`. `on_elicit(params) -> result`, set before `initialize`,
+    answers a tool's elicit() the way MCPClient's does.
     """
 
-    def __init__(self, server):
+    def __init__(self, server, on_elicit=None):
         self.server = server
         self.notifications = []
-        self.server.sink = self.notifications.append
+        self.on_elicit = on_elicit
+        self.server.sink = self._sink
         self._id = 0
         self.protocol_version = None
         self.server_info = {}
         self.instructions = ""
         self.capabilities = {}
+
+    def _sink(self, msg):
+        if msg.get("id") is None:
+            self.notifications.append(msg)
+            return
+        if msg.get("method") == "elicitation/create" and self.on_elicit is not None:
+            reply = {"jsonrpc": "2.0", "id": msg["id"],
+                     "result": self.on_elicit(msg.get("params") or {})}
+        else:
+            reply = {"jsonrpc": "2.0", "id": msg["id"],
+                     "error": {"code": METHOD_NOT_FOUND,
+                               "message": "unknown method %s" % msg.get("method")}}
+        self.server.deliver(reply)
 
     def request(self, method, params=None, timeout=None):
         self._id += 1
@@ -787,7 +884,8 @@ class Loopback:
         return reply.get("result", {})
 
     def initialize(self, timeout=None):
-        res = self.request("initialize", {"protocolVersion": LATEST, "capabilities": {},
+        caps = {"elicitation": {"form": {}}} if self.on_elicit is not None else {}
+        res = self.request("initialize", {"protocolVersion": LATEST, "capabilities": caps,
                                           "clientInfo": {"name": "studio_mcp.Loopback",
                                                          "version": "1.0"}})
         self.server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
