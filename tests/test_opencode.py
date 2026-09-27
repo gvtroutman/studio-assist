@@ -374,6 +374,38 @@ class TestApprovals(Base):
         client.call_tool("opencode_ask", {"prompt": "unrelated", "new_session": True})
         self.assertEqual(len(self.fake.sessions), 2)
 
+    def test_a_task_is_not_piled_onto_a_session_still_working(self):
+        # After a timed-out ask, a second ask queued behind the first and the
+        # report mixed the two.
+        self.fake.forever = True
+        self.fake.script = []
+        sid = oc.new_session("x")["id"]
+        oc.remember_session(sid)
+        oc.prompt(sid, "go")
+        res = self.user().call_tool("opencode_ask", {"prompt": "again"})
+        self.assertTrue(res["isError"])
+        self.assertIn("opencode_wait", self.text(res))
+        self.assertEqual(len([p for p in self.fake.posts if p[0] == "ask"]), 1)
+
+    def test_many_decisions_do_not_crowd_out_what_opencode_said(self):
+        log = ["allowed: edit file_%d.py" % i for i in range(300)]
+        sid = oc.new_session("x")["id"]
+        self.fake.messages[sid].append({"info": {"role": "assistant", "id": "m"},
+                                        "parts": [{"type": "text", "text": "ALL DONE"}]})
+        out = oc.report(sid, set(), log)
+        self.assertIn("ALL DONE", out)
+        self.assertIn("270 earlier decision(s)", out)
+        self.assertLess(len(out), oc.MAX_REPLY_CHARS + 500)
+
+    def test_relative_paths_are_the_workspaces_whatever_the_cwd(self):
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            self.assertEqual(oc.rel("sub/a.py"), "sub/a.py")
+            self.assertEqual(oc.rel(os.path.join(oc.WORKSPACE, "b.py")), "b.py")
+        finally:
+            os.chdir(cwd)
+
     def test_a_small_context_window_is_named_with_its_fix(self):
         conf = eng.opencode_config("http://h:1/v1", "m1", ["m1"], 32768)
         note = oc.context_note(conf)
@@ -446,6 +478,9 @@ class TestOtherTools(Base):
             self.assertIn("/session/{sessionID}/stop", out)
         finally:
             oc.ROUTES["abort"] = real
+        # A server naming the parameter differently still has the route.
+        self.fake.documented = [r.replace("{sessionID}", "{id}") for r in self.fake.documented]
+        self.assertNotIn("does not list", self.text(oc.call_tool("opencode_status", {})))
 
     def test_file_tools_read_the_folder_only(self):
         os.makedirs(os.path.join(oc.WORKSPACE, "src"))

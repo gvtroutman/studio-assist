@@ -33,6 +33,7 @@ progress, cancellation, elicitation - is studio_mcp's; this file is the tools.
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -197,10 +198,16 @@ def unknown_routes():
         doc = get_json(ROUTES["doc"], timeout=10)
     except OpenCodeError:
         return []
-    listed = set((doc.get("paths") or {}).keys())
+    # Compare with the parameter names blanked: a server that calls it {id}
+    # where we say {sessionID} still has the route.
+    listed = {_shape(p) for p in (doc.get("paths") or {})}
     if not listed:
         return []
-    return sorted(r for k, r in ROUTES.items() if k != "doc" and r not in listed)
+    return sorted(r for k, r in ROUTES.items() if k != "doc" and _shape(r) not in listed)
+
+
+def _shape(path):
+    return re.sub(r"\{[^}]*\}", "{}", path).rstrip("/")
 
 
 def _rows(data, key):
@@ -308,8 +315,10 @@ def rel(path):
     if not isinstance(path, str):
         return str(path)
     try:
-        full = os.path.realpath(path)
         root = os.path.realpath(WORKSPACE)
+        # A relative path is OpenCode's, so relative to the workspace - not
+        # to wherever this bridge happened to be started.
+        full = os.path.realpath(os.path.join(root, path))
         if full == root or full.startswith(root + os.sep):
             return os.path.relpath(full, root).replace(os.sep, "/")
     except (OSError, ValueError):
@@ -554,7 +563,9 @@ def report(sid, seen, log):
     OpenCode said and did, newest last, within MAX_REPLY_CHARS."""
     out = []
     if log:
-        out.append("The user's decisions:\n" + "\n".join("- " + l for l in log))
+        shown = log if len(log) <= 30 else ["... %d earlier decision(s)" % (len(log) - 30)] + log[-30:]
+        decisions = "The user's decisions:\n" + "\n".join("- " + l for l in shown)
+        out.append(decisions[:MAX_REPLY_CHARS // 2])
     chunks, error = [], None
     try:
         for m in messages(sid):
@@ -569,7 +580,7 @@ def report(sid, seen, log):
     except OpenCodeError as e:
         chunks.append("(could not read the session: %s)" % e)
     body = "\n".join(chunks) or "(OpenCode said nothing)"
-    room = MAX_REPLY_CHARS - sum(len(x) for x in out) - 200
+    room = max(1500, MAX_REPLY_CHARS - sum(len(x) for x in out) - 200)
     if len(body) > room:
         body = "... [earlier steps cut]\n" + body[-room:]
     out.append("OpenCode:\n" + body)
@@ -740,6 +751,12 @@ def t_ask(a):
             if a.get("session_id"):
                 raise
             seen = None                        # the remembered one is gone
+    if seen is not None and (statuses().get(sid) or {}).get("type", "idle") != "idle":
+        # A second task on a working session queues behind the first and the
+        # report mixes the two; the last ask most likely timed out.
+        return result("Session %s is still working on the last task. Do not send a new one: "
+                      "call opencode_wait with this session_id to follow it, or opencode_abort "
+                      "to stop it first." % sid, error=True)
     if seen is None:
         sid = new_session(text.strip().splitlines()[0][:60])["id"]
         seen = set()
