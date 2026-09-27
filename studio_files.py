@@ -5,8 +5,8 @@ Split out of `studio_chat` because none of it is about the window: it reads
 headers, sizes and directory listings and returns sentences. **Nothing here
 imports tkinter**, so it can be exercised on a machine with no display, which
 is most of what these functions are worth testing for - `image_dims` reads
-five formats' headers by hand, and `attachment_note` copies files into a
-container's workspace.
+five formats' headers by hand, and `attachment_note` copies files into
+OpenCode's folder.
 """
 
 import os
@@ -18,6 +18,7 @@ ATTACH_TYPES = [("All files", "*.*"), ("Pictures", " ".join("*" + e for e in IMA
 PREVIEWABLE = (".png", ".gif")            # what Tk 8.6 can decode without PIL
 ATTACH_LIMIT = 200_000_000                # bytes; a picture, not a video
 LIST_LIMIT = 40                           # folder entries named in the brief
+ATTACH_DIR = ".studio-attachments"        # where OpenCode's folder gets outside files
 
 
 def is_picture(path):
@@ -95,26 +96,28 @@ def describe_attachment(path):
 
 def attachment_note(paths, app):
     """The paragraph appended to the brief when files or folders are attached.
-    Bridges on this PC take the path as it is; the OpenCode container sees
-    only its workspace, so attachments are copied in and named by the path
-    the container will see."""
+    Bridges on this PC take the path as it is. OpenCode is refused anything
+    outside its folder, so a file from elsewhere is copied into ATTACH_DIR
+    there, and every attachment is named by its path inside that folder."""
     if not paths:
         return ""
     lines = []
-    if getattr(app, "container", False):
-        folder = os.path.join(app.workspace, "attachments")
-        os.makedirs(folder, exist_ok=True)
+    if getattr(app, "served", False):
+        root = os.path.realpath(app.workspace)
         for p in paths:
-            name = os.path.basename(os.path.normpath(p))
-            dest = os.path.join(folder, name)
-            if os.path.abspath(dest) != os.path.abspath(p):
+            full = os.path.realpath(p)
+            if not (full == root or full.startswith(root + os.sep)):
+                name = os.path.basename(os.path.normpath(p))
+                full = os.path.join(root, ATTACH_DIR, name)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
                 if os.path.isdir(p):
-                    shutil.copytree(p, dest, dirs_exist_ok=True)
+                    shutil.copytree(p, full, dirs_exist_ok=True)
                 else:
-                    shutil.copy2(p, dest)
-            lines.append("- %s (copied into the workspace; the container sees it as "
-                         "/workspace/attachments/%s)" % (describe_attachment(dest), name))
-        head = "Attached files and folders, copied into the workspace:"
+                    shutil.copy2(p, full)
+            inside = os.path.relpath(full, root).replace(os.sep, "/")
+            lines.append("- %s (OpenCode reads it as %s)" % (describe_attachment(full), inside))
+        head = ("Attached files and folders, in OpenCode's folder (those from elsewhere "
+                "were copied into %s/):" % ATTACH_DIR)
     else:
         head = ("Attached files and folders - on this PC; tools that take a path "
                 "(import, place, upload, open, read_file) take these paths as written:")

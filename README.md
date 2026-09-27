@@ -70,8 +70,8 @@ seconds rather than a minute. A session that only touches After Effects never sp
 Resolve's server. If the app itself isn't running, a **Start <app>** button appears in
 the header — one click launches it and waits. ComfyUI is the exception: it runs on the
 LLM PC, so its button is **Check ComfyUI** and it tells you where to start it.
-**Start OpenCode** starts a Docker container rather than a program — the first time it
-also builds the image, which takes a few minutes.
+**Start OpenCode** starts OpenCode's server in the background; it has no window of its
+own, and it stops when Studio Assist closes.
 
 The left rail shows what's installed on **this machine** — named, so you know which
 one — with each app's own icon and a live status dot for the ones the agent can
@@ -177,7 +177,7 @@ on a host that cannot hold the diffusion model and the 30B together.
 | Illustrator | `studio_illustrator_mcp.py` (in this folder), the same way through `Illustrator.Application` | Illustrator installed. Nothing to install inside it |
 | DaVinci Resolve | `davinci-resolve-mcp` from `~/davinci-resolve-mcp` | Resolve Studio, with *External scripting using* set to **Local** |
 | ComfyUI | `studio_comfy_mcp.py` (in this folder), talking HTTP to ComfyUI on the LLM PC — `http://100.127.17.38:8188` unless `COMFYUI_URL` says otherwise | ComfyUI started on that machine with `--listen` (so it accepts connections from the workstation), and at least one checkpoint installed there |
-| OpenCode | `studio_opencode_mcp.py` (in this folder), talking HTTP to `opencode serve` inside a Docker container on `127.0.0.1:4096` (`OPENCODE_URL`) | Docker Desktop installed and running. The image is built from `opencode/Dockerfile` on first start |
+| OpenCode | `studio_opencode_mcp.py` (in this folder), talking HTTP to `opencode serve`, which the window starts on `127.0.0.1:4096` (`OPENCODE_URL`) with a password | OpenCode installed once: `npm install -g opencode-ai` |
 
 Photoshop and Illustrator need no bridge installed anywhere: on Windows both register
 COM automation, and its one method that matters runs ExtendScript inside the live app.
@@ -217,15 +217,25 @@ tabs can import it by path. Ask for a checkpoint list first — the tab is brief
 which sizes and step counts suit SDXL, SD 1.5 and turbo models, but it has to know
 which one it is driving.
 
-OpenCode is a coding agent — it writes and runs code on its own — so it never runs on
-this PC's own filesystem. **It lives in a container that can see exactly one folder**:
-the workspace, `%LOCALAPPDATA%\StudioAssistant\opencode-workspace` (or
-`OPENCODE_WORKSPACE`). Drop files there, or let the tab put them there, and ask; what
-it builds lands in that folder and nowhere else. Its port is published to loopback
-only, it runs as an unprivileged user with capabilities dropped, and it cannot reach
-After Effects, Resolve or their projects. It uses the same LM Studio host as the other
-tabs (`STUDIO_MODEL_OPENCODE` pins its model). The window does not stop the container
-when it closes; `docker stop studio-opencode` does, and the workspace stays.
+OpenCode is a coding agent: it reads, edits and runs code on its own, with the same
+local model as the other tabs (`STUDIO_MODEL_OPENCODE` pins its model). **It works on
+Studio Assist's own code** - this folder, or the one `OPENCODE_WORKSPACE` names - and
+**nothing changes without you**. It reads freely, but every edit, every command and
+every web fetch it wants appears in the tab as a card: the file's diff or the
+command, a note field, and **Allow once**, **Always allow** (for the rest of that
+server's run) or **Reject**. Your answer goes straight to OpenCode - a note with a
+Reject tells it what to do instead - and the model that briefed OpenCode never sees
+the question, so it cannot answer for you. **Stop** on a card, or the Stop button,
+halts OpenCode. Anything outside its folder is refused outright. Its config and
+password are kept in `%LOCALAPPDATA%\StudioAssistant\opencode`, not in the folder.
+
+**Add-ons** (in the header on the OpenCode tab) is the coding agent's plugin catalog,
+like the Image Studio's LoRA Add-ons: **MCP servers** from the official MCP Registry,
+**plugins** from npm, and **skills** from a GitHub repository (anthropics/skills by
+default), each with Installed and Catalog views, Turn off and Remove. An MCP server
+that needs a key asks for it when you install it, and each of its tools asks before it
+runs, like an edit. Add-ons take effect when OpenCode starts; the window offers
+**Restart OpenCode** after a change.
 
 **Milanote** is a tab with no model and no bridge: Milanote has no API, so the tab
 holds its web app instead. Open it from the **+** on the tab strip. It is a Chrome (or
@@ -311,8 +321,8 @@ name, dimensions and path, so "place this in my comp" or "turn this sketch into 
 painted version" can hand the file to the app's own import tool; the picture is shown
 in the transcript under your message. What the picture *looks like* reaches the
 model through the **vision model**: it describes each picture and that description
-goes into the brief. OpenCode sees only its workspace, so pictures attached there
-are copied into `attachments/` inside it.
+goes into the brief. OpenCode is refused anything outside its folder, so a file
+attached there from elsewhere is copied into `.studio-attachments/` inside it.
 
 The executing model reads text, and every app answers a screenshot with a picture,
 so a vision model is part of every tab, not an option. At start-up Studio Assist

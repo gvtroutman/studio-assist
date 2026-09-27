@@ -14,6 +14,8 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
+import time
 import tkinter as tk
 import unittest
 import urllib.error
@@ -21,6 +23,20 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import studio_agent as eng
+
+# An OpenCode edit as the bridge asks it (studio_opencode_mcp.ask_permission).
+APPROVAL = {
+    "mode": "form", "message": "OpenCode wants to edit hello.py.",
+    "_meta": {"studio/approval": {
+        "kind": "edit", "file": "hello.py", "always_label": "every edit in this session",
+        "diff": "Index: C:/x/hello.py\n===\n--- C:/x/hello.py\n+++ C:/x/hello.py\n"
+                "@@ -1 +1 @@\n-print('hi')\n+print('hello')\n"}},
+    "requestedSchema": {"type": "object", "properties": {
+        "decision": {"type": "string", "enum": ["once", "always", "reject"],
+                     "enumNames": ["Allow once", "Always allow every edit in this session",
+                                   "Reject"]},
+        "note": {"type": "string", "title": "Note for OpenCode"}},
+        "required": ["decision"]}}
 import studio_icons as icons
 
 
@@ -908,9 +924,9 @@ class TestAppRegistry(unittest.TestCase):
                 self.assertTrue(app.name and app.tab and app.code)
                 self.assertTrue(app.fg.startswith("#") and app.bg.startswith("#"))
                 self.assertTrue(app.command)
-                # A remote or container app has no .exe to find here, and must
+                # A remote or served app has no .exe to find here, and must
                 # say where it runs instead.
-                self.assertTrue(app.exe_globs or ((app.remote or app.container)
+                self.assertTrue(app.exe_globs or ((app.remote or app.served)
                                                   and app.launch_note))
                 self.assertTrue(app.examples)
                 self.assertTrue(app.system_prompt.strip())
@@ -954,87 +970,96 @@ class TestAppRegistry(unittest.TestCase):
             if app.exe_globs:
                 self.assertFalse(app.remote)
 
-    def test_container_app_runs_here_behind_docker(self):
-        """OpenCode is on this machine but never on its bare disk: no .exe, not
-        remote, 'installed' when Docker is, and started by this window as a
-        container that is handed the workspace folder and nothing else."""
+    def test_served_app_runs_here_as_this_windows_child(self):
+        """OpenCode runs on this machine with no window of its own: no .exe,
+        not remote, 'installed' when its program is here, started by this
+        window in one folder - this repository unless told otherwise."""
         oc = eng.APPS_BY_ID["opencode"]
-        self.assertTrue(oc.container)
+        self.assertTrue(oc.served)
         self.assertFalse(oc.remote)
         self.assertIsNone(oc.exe())
-        self.assertEqual(oc.installed(), eng.docker_exe() is not None)
+        self.assertEqual(oc.installed(), eng.opencode_exe() is not None)
         self.assertEqual(oc.command, eng.sys.executable)
         self.assertEqual(os.path.basename(oc.args[0]), "studio_opencode_mcp.py")
         self.assertTrue(os.path.isfile(oc.args[0]))
-        self.assertTrue(os.path.isfile(os.path.join(oc.dockerfile, "Dockerfile")))
+        if not os.environ.get("OPENCODE_WORKSPACE"):
+            self.assertEqual(oc.workspace, eng.HERE)
+        self.assertNotEqual(os.path.dirname(oc.config_path), oc.workspace,
+                            "its config and password are kept out of the repository")
         for app in eng.APPS:
-            self.assertFalse(app.remote and app.container, app.id)
+            self.assertFalse(app.remote and app.served, app.id)
 
-    def test_container_is_given_the_workspace_and_nothing_else(self):
-        args = eng.docker_run_args(r"C:\ws", image="img", port=4096)
-        mounts = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
-        binds = [m for m in mounts if ":" in m and not m.startswith(eng.OPENCODE_HOME_VOLUME)]
-        self.assertEqual(binds, [r"C:\ws:/workspace"], "only the workspace is bind-mounted")
-        self.assertIn("%s:/home/node" % eng.OPENCODE_HOME_VOLUME, mounts)
-        ports = [args[i + 1] for i, a in enumerate(args) if a == "-p"]
-        self.assertEqual(ports, ["127.0.0.1:4096:4096"], "loopback only")
-        self.assertIn("--cap-drop", args)
-        self.assertIn("no-new-privileges", args)
-        self.assertNotIn("--privileged", args)
-        self.assertEqual(args[-1], "img")
-        for a in args:
-            self.assertNotIn(r"C:\Users", a)
-
-    def test_opencode_config_points_at_the_studio_host(self):
-        cfg = eng.opencode_config("http://100.127.17.38:1234/v1", "m1", ["m1", "m2"])
+    def test_opencode_config_asks_before_every_change(self):
+        cfg = eng.opencode_config("http://100.127.17.38:1234/v1", "m1", ["m1", "m2"], 32768)
         prov = cfg["provider"]["lmstudio"]
         self.assertEqual(prov["options"]["baseURL"], "http://100.127.17.38:1234/v1")
         self.assertEqual(set(prov["models"]), {"m1", "m2"})
         self.assertEqual(cfg["model"], "lmstudio/m1")
-        # Loopback inside the container is the container: rewrite to the host.
-        cfg = eng.opencode_config("http://127.0.0.1:1234", "m1", [])
-        self.assertEqual(cfg["provider"]["lmstudio"]["options"]["baseURL"],
-                         "http://host.docker.internal:1234/v1")
-        self.assertIn("m1", cfg["provider"]["lmstudio"]["models"])
+        self.assertEqual(prov["models"]["m1"]["limit"]["context"], 32768)
+        perm = cfg["permission"]
+        for step in ("edit", "bash", "webfetch", "websearch"):
+            self.assertEqual(perm[step], "ask", step)
+        self.assertEqual(perm["external_directory"], "deny")
+        self.assertEqual(perm["read"], "allow")
+        self.assertFalse(cfg["autoupdate"])
+        # Every permission OpenCode knows that changes something is covered:
+        # a key left out falls back to OpenCode's own default, which is allow.
+        changes = {"edit", "bash", "webfetch", "websearch", "external_directory", "doom_loop"}
+        self.assertLessEqual(changes, set(perm))
+        self.assertEqual(eng.opencode_config("http://h:1/v1", "m1", [])["provider"]["lmstudio"]
+                         ["options"]["baseURL"], "http://h:1/v1")
 
-    def test_launch_builds_once_then_runs_the_container(self):
+    def test_launch_starts_a_contained_server_with_a_fresh_password(self):
         oc = eng.APPS_BY_ID["opencode"]
-        calls = []
-        images = {"present": False}
-
-        def fake_docker(*args, timeout=0):
-            calls.append(list(args))
-            if args[0] == "image":
-                if not images["present"]:
-                    raise RuntimeError("docker image inspect failed: No such image")
-                return "sha256:abc\n"
-            if args[0] == "build":
-                images["present"] = True
-            return ""
-
         tmp = tempfile.mkdtemp()
-        real = (eng.docker, eng.docker_exe, eng.probe_models, oc.workspace)
-        eng.docker, eng.docker_exe = fake_docker, lambda: "docker"
-        eng.probe_models = lambda host, timeout=8: (True, "m1", ["m1", "m2"], [], None)
-        oc.workspace = os.path.join(tmp, "ws")
+        started = []
+
+        class FakeChild:
+            def __init__(self, args, **kw):
+                self.args, self.kw, self.stopped = args, kw, False
+                started.append(self)
+
+            def stop(self, grace=0):
+                self.stopped = True
+
+        real = (eng.studio_procs.spawn, eng.opencode_exe, eng.probe_models,
+                eng.context_window, oc.workspace, oc.state_dir, oc.child)
+        eng.studio_procs.spawn = FakeChild
+        eng.opencode_exe = lambda: r"C:\oc\opencode.exe"
+        eng.probe_models = lambda host, timeout=8: (True, ["m1"], ["m1", "m2"], [], None)
+        eng.context_window = lambda host, model, timeout=5: (32768, 262144)
+        oc.workspace = os.path.join(tmp, "repo")
+        oc.state_dir = os.path.join(tmp, "state")
+        oc.child = None
+        os.makedirs(oc.workspace)
         try:
             oc.launch(host="http://100.127.17.38:1234/v1")
-            kinds = [c[0] for c in calls]
-            self.assertEqual(kinds, ["image", "build", "rm", "run"])
-            self.assertEqual(calls[1][-1], oc.dockerfile)
-            self.assertEqual(calls[-1], eng.docker_run_args(oc.workspace, oc.image))
-            with open(os.path.join(oc.workspace, "opencode.json"), encoding="utf-8") as f:
+            first = started[-1]
+            self.assertEqual(first.args, [r"C:\oc\opencode.exe", "serve", "--hostname",
+                                          "127.0.0.1", "--port", "4096"])
+            self.assertEqual(first.kw["cwd"], oc.workspace)
+            env = first.kw["env"]
+            self.assertEqual(env["OPENCODE_CONFIG"], oc.config_path)
+            with open(oc.key_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), env["OPENCODE_SERVER_PASSWORD"])
+            self.assertGreaterEqual(len(env["OPENCODE_SERVER_PASSWORD"]), 24)
+            with open(oc.config_path, encoding="utf-8") as f:
                 cfg = json.load(f)
             self.assertEqual(cfg["model"], "lmstudio/m1")
-            calls.clear()
+            self.assertEqual(cfg["permission"]["edit"], "ask")
+            self.assertEqual(os.listdir(oc.workspace), [], "nothing is written into the repo")
+            # A second start ends the first server and changes the password.
             oc.launch(host="http://100.127.17.38:1234/v1")
-            self.assertEqual([c[0] for c in calls], ["image", "rm", "run"], "built once")
-            eng.docker_exe = lambda: None
+            self.assertTrue(first.stopped)
+            self.assertNotEqual(started[-1].kw["env"]["OPENCODE_SERVER_PASSWORD"],
+                                env["OPENCODE_SERVER_PASSWORD"])
+            eng.opencode_exe = lambda: None
             with self.assertRaises(RuntimeError) as ctx:
                 oc.launch()
-            self.assertIn("Docker Desktop", str(ctx.exception))
+            self.assertIn("npm install -g opencode-ai", str(ctx.exception))
         finally:
-            eng.docker, eng.docker_exe, eng.probe_models, oc.workspace = real
+            (eng.studio_procs.spawn, eng.opencode_exe, eng.probe_models,
+             eng.context_window, oc.workspace, oc.state_dir, oc.child) = real
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_comfy_bridge_is_the_stdlib_server_beside_the_engine(self):
@@ -1174,7 +1199,7 @@ class TestHandEnteredBridges(unittest.TestCase):
     def test_it_joins_every_registry_view_and_leaves_them_all(self):
         before = ([a.id for a in eng.APPS], [a.id for a in eng.TABS], dict(eng.DRIVABLE))
         spec = eng.add_bridge(eng.BridgeSpec("Audition", "npx", ["-y", "x-mcp"]))
-        self.assertTrue(spec.custom and spec.drivable and not spec.remote and not spec.container)
+        self.assertTrue(spec.custom and spec.drivable and not spec.remote and not spec.served)
         self.assertIs(eng.APPS_BY_ID["audition"], spec)
         self.assertIs(eng.TABS_BY_ID["audition"], spec)
         self.assertIs(eng.TABS[-1], eng.CHAT, "chat stays the last tab")
@@ -1416,16 +1441,16 @@ class TestDetection(unittest.TestCase):
                     self.assertIsNone(rows[app.name]["exe"])
                     self.assertTrue(rows[app.name]["drivable"])
 
-    def test_container_apps_sit_with_this_pc_and_say_so(self):
-        """OpenCode runs here, in Docker: the row is in this PC's group, not the
-        LLM PC's, with 'container' where a version year would go."""
+    def test_served_apps_sit_with_this_pc_and_say_so(self):
+        """OpenCode runs here as a server: the row is in this PC's group, not
+        the LLM PC's, with 'server' where a version year would go."""
         rows = {a["name"]: a for a in eng.detect_apps()}
         for app in eng.APPS:
-            if app.container:
+            if app.served:
                 with self.subTest(app=app.name):
                     self.assertIn(app.name, rows)
                     self.assertFalse(rows[app.name]["remote"])
-                    self.assertEqual(rows[app.name]["version"], "container")
+                    self.assertEqual(rows[app.name]["version"], "server")
                     self.assertIsNone(rows[app.name]["exe"])
                     self.assertTrue(rows[app.name]["drivable"])
 
@@ -2233,27 +2258,27 @@ class TestGui(unittest.TestCase):
             self.assertIn("a test's own", f.read())
         self.assertFalse(os.path.exists(os.path.join(self.mod.HERE, "tests", self.mod.ERROR_LOG)))
 
-    def test_a_container_app_is_started_not_checked(self):
-        """OpenCode runs here, so its button starts it - and when Docker is
-        missing the reason reaches the transcript as prose, not a traceback."""
+    def test_a_served_app_is_started_not_checked(self):
+        """OpenCode runs here, so its button starts it - and when it is not
+        installed the reason reaches the transcript as prose, not a traceback."""
         s = self.app.sessions["opencode"]
         self.app._select(s.id)
         self.app.update()
         self.assertEqual(self.app.btn_fix.cget("text"), "Start OpenCode")
-        real_running, real_exe = eng.AppSpec.running, eng.docker_exe
+        real_running, real_exe = eng.AppSpec.running, eng.opencode_exe
         eng.AppSpec.running = lambda self: False
-        eng.docker_exe = lambda: None
+        eng.opencode_exe = lambda: None
         logged = []
         self.app._log = logged.append
         try:
             self.app._guard(s.event_id, self.app._fix, s)
             self.app._drain()
         finally:
-            eng.AppSpec.running, eng.docker_exe = real_running, real_exe
+            eng.AppSpec.running, eng.opencode_exe = real_running, real_exe
             del self.app._log
         body = s.view.get("1.0", "end")
         self.assertIn("Launching OpenCode", body)
-        self.assertIn("Docker Desktop is not installed", body)
+        self.assertIn("OpenCode is not installed", body)
         self.assertNotIn("RuntimeError", body)
         self.assertNotIn("Traceback", body)
         # A refusal is not a crash: nothing for the error log, and the header
@@ -3224,12 +3249,76 @@ class TestGui(unittest.TestCase):
                            "tool": {"name": "t", "arguments": {}, "via": None},
                            "tool_result": {"name": "t", "text": "r"},
                            "ask": {"question": "which?", "options": ["a", "b"]},
+                           "elicit": (APPROVAL, {"done": threading.Event()}),
                            "preview": {"data": ""}}[kind]
                 try:
                     self.app._handle(kind, s.id, payload)
                 except Exception:
                     pass          # a malformed payload is not what is on trial
                 self.assertIsNone(s.thinking, kind)
+        self.app._clear_view(s)
+
+    def test_an_approval_is_the_users_click_and_goes_back_as_it(self):
+        """OpenCode's edit, as the bridge asks it: the diff is on the card,
+        a click answers with the choice and the note, and the card greys and
+        says what was chosen - so nothing can answer twice."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        box = {"done": threading.Event()}
+        self.app._handle("elicit", s.id, (APPROVAL, box))
+        self.app.update()
+        form = s.elicits[-1]
+        texts = [w for w in form["widgets"] if isinstance(w, self.mod.Pill)]
+        labels = [w.cget("text") for w in texts]
+        self.assertEqual(labels[:3], ["Allow once", "Always allow every edit in this session",
+                                      "Reject"])
+        note = [w for w in form["widgets"] if isinstance(w, self.mod.tk.Entry)][0]
+        note.insert(0, "keep the old name")
+        texts[2].invoke()                                   # Reject
+        self.assertTrue(box["done"].is_set())
+        self.assertEqual(box["result"], {"action": "accept", "content": {
+            "decision": "reject", "note": "keep the old name"}})
+        self.assertEqual(form["status"].cget("text"), "Reject")
+        self.assertEqual(s.elicits, [])
+        texts[0].invoke()                                   # greyed: sends nothing
+        self.assertEqual(box["result"]["content"]["decision"], "reject")
+        # The diff is shown without OpenCode's long header lines.
+        diffs = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, self.mod.tk.Text):
+                    diffs.append(c.get("1.0", "end"))
+                walk(c)
+        walk(s.view)
+        self.assertTrue(any("+print('hello')" in d and "Index:" not in d for d in diffs))
+        self.app._clear_view(s)
+
+    def test_a_stop_answers_an_open_approval_as_cancel(self):
+        """The bridge's thread waits for the click; a Stop is the user's
+        answer too, and the card says so."""
+        s = self.app.cur()
+        self.app._clear_view(s)
+        got = {}
+        t = threading.Thread(target=lambda: got.setdefault("r", self.app._elicit(s, APPROVAL)))
+        t.start()
+        for _ in range(50):
+            self.app._drain()
+            self.app.update()
+            if s.elicits:
+                break
+            time.sleep(0.05)
+        self.assertTrue(s.elicits)
+        s.cancel.set()
+        t.join(5)
+        s.cancel.clear()
+        self.assertEqual(got["r"], {"action": "cancel"})
+        for _ in range(20):
+            self.app._drain()
+            if not s.elicits:
+                break
+            time.sleep(0.05)
+        self.assertEqual(s.elicits, [])
         self.app._clear_view(s)
 
     def test_clearing_a_transcript_stands_its_animations_down(self):
@@ -3605,32 +3694,40 @@ class TestGui(unittest.TestCase):
                     s.messages, s.record, s.ready = messages, record, ready
                     self.app._spawn = original
 
-    def test_a_container_tab_is_handed_a_copy_it_can_reach(self):
-        """OpenCode sees one folder. A picture from anywhere else is copied in,
-        and the brief names the path inside the container, not the one here."""
+    def test_opencode_is_handed_attachments_inside_its_folder(self):
+        """OpenCode is refused anything outside its folder. A file from
+        anywhere else is copied into ATTACH_DIR there; one already inside
+        stays put; the brief names each by its path inside the folder."""
         png = self._picture("sketch.png")
         spec = eng.APPS_BY_ID["opencode"]
         real = spec.workspace
         spec.workspace = os.path.join(self.dir, "ws")
+        os.makedirs(spec.workspace, exist_ok=True)
         try:
             note = self.mod.attachment_note([png], spec)
-            copy = os.path.join(spec.workspace, "attachments", "sketch.png")
+            copy = os.path.join(spec.workspace, self.mod.ATTACH_DIR, "sketch.png")
             self.assertTrue(os.path.exists(copy))
-            self.assertIn("/workspace/attachments/sketch.png", note)
-            self.assertIn(copy, note)
+            self.assertIn("OpenCode reads it as %s/sketch.png" % self.mod.ATTACH_DIR, note)
             self.assertNotIn(png + ")", note)
             self.assertEqual(self.mod.attachment_note([], spec), "")
             plain = self.mod.attachment_note([png], eng.APPS[0])
             self.assertIn(png, plain)
-            self.assertNotIn("/workspace", plain)
-            # A folder is copied whole, and named by its folder path inside.
+            self.assertNotIn("OpenCode", plain)
+            # Already inside: not copied, named where it is.
+            here = os.path.join(spec.workspace, "src", "a.py")
+            os.makedirs(os.path.dirname(here))
+            self._blob(here, b"x")
+            note = self.mod.attachment_note([here], spec)
+            self.assertIn("OpenCode reads it as src/a.py", note)
+            self.assertFalse(os.path.exists(os.path.join(spec.workspace, self.mod.ATTACH_DIR,
+                                                         "a.py")))
+            # A folder is copied whole.
             src = os.path.join(self.dir, "refs")
             os.makedirs(os.path.join(src, "inner"))
             self._blob(os.path.join(src, "inner", "a.txt"), b"a")
             note = self.mod.attachment_note([src + os.sep], spec)
-            self.assertTrue(os.path.exists(os.path.join(spec.workspace, "attachments",
+            self.assertTrue(os.path.exists(os.path.join(spec.workspace, self.mod.ATTACH_DIR,
                                                         "refs", "inner", "a.txt")))
-            self.assertIn("/workspace/attachments/refs)", note)
             self.assertIn("refs (folder, 0 files, 1 folders)", note)
         finally:
             spec.workspace = real
