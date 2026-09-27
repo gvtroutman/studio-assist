@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -429,6 +430,67 @@ class TestTools(unittest.TestCase):
         res = ppro.call_tool("ppro_run_jsx", {"code": "return {n: app.project.sequences.numSequences}"})
         self.assertEqual(json.loads(res["content"][0]["text"]), {"n": 3})
         self.assertIn("app.project.sequences.numSequences", self.calls[-1])
+
+
+class TestStdio(unittest.TestCase):
+    """The real script on real pipes: when its client closes stdin it exits.
+
+    On 2026-09-26 some 50 of these were found running, one per Claude Code
+    session. Each one's parent claude.exe was still alive, so stdin was still
+    open and the bridge was right to wait. These tests pin down the other half:
+    a closed stdin always ends the process, idle or mid-call.
+    """
+
+    SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "studio_premiere_mcp.py")
+
+    def spawn(self, env=None):
+        p = subprocess.Popen([sys.executable, self.SCRIPT], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=dict(os.environ, **(env or {})))
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(p.stderr.close)
+        return p
+
+    @staticmethod
+    def send(p, rid, method, params=None):
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}
+        p.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        p.stdin.flush()
+
+    def initialize(self, p):
+        self.send(p, 1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                       "clientInfo": {"name": "test", "version": "1"}})
+        self.assertEqual(json.loads(p.stdout.readline())["id"], 1)
+
+    def assert_exits(self, p, within):
+        try:
+            code = p.wait(within)
+        except subprocess.TimeoutExpired:
+            self.fail("the bridge was still running %d s after its stdin closed" % within)
+        self.assertEqual(code, 0, p.stderr.read().decode("utf-8", "replace"))
+
+    def test_the_bridge_exits_when_its_client_closes_stdin(self):
+        p = self.spawn()
+        self.initialize(p)
+        self.send(p, 2, "tools/list")
+        self.assertIn("ppro_status", p.stdout.readline().decode("utf-8"))
+        p.stdin.close()
+        self.assert_exits(p, 10)
+
+    def test_stdin_closing_mid_call_ends_the_bridge_once_the_call_returns(self):
+        panel = FakePanel(answer="1", delay=1.0)
+        self.addCleanup(panel.close)
+        p = self.spawn({"PREMIERE_URL": panel.url})
+        self.initialize(p)
+        self.send(p, 2, "tools/call", {"name": "ppro_run_jsx", "arguments": {"code": "return 1"}})
+        deadline = time.time() + 10
+        while not panel.scripts and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(panel.scripts, "the call never reached the fake panel")
+        p.stdin.close()
+        self.assert_exits(p, 10)
 
 
 if __name__ == "__main__":
