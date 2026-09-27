@@ -1304,11 +1304,17 @@ was never installed here, the tab never ran, and a sandbox cannot edit this repo
   holds it under 8k chars); put new must-know rules there, detail here. Another
   workspace keeps its own AGENTS.md. `OPENCODE_PROMPT` must not tell the model to have
   OpenCode read AGENTS.md.
+- **The tab codes on the best coder the host has.** `ServerSpec.model_for` takes
+  `best_coder(ids)`: names carrying a `CODER_HINTS` word, no bigger than `CODER_MAX_B`
+  (40B, the LLM PC's 24 GB), ranked dense before MoE (an `-aNb` MoE counts half its
+  total) then by size. No coder on the host: the shared model, silently.
+  `STUDIO_MODEL_OPENCODE` still pins one. `fit_window()` at launch loads that model
+  with at least `OPENCODE_CONTEXT` (64k, capped at its maximum), reloading only it.
 - **A follow-up continues the last session.** `opencode_ask` without `session_id`
   reuses the one in `OPENCODE_STATE/last_session` (a local model often drops the id,
   and a fresh session knows nothing); `new_session: true` starts over.
 - **Under 64k of window it warns.** `context_note()` names LM Studio's Context Length
-  in `opencode_status` and after each ask.
+  in `opencode_status` and after each ask. (Restart OpenCode is only in the Add-ons window; the note says to reopen the app.)
 
 **How a step reaches the user.** `opencode_ask` sends the task with `prompt_async`
 and `run()` follows the session: each pass lists `/permission` and `/question`,
