@@ -283,6 +283,7 @@ class ImageStudio:
         self.faces = tk.BooleanVar(value=False)
         self.faces_set = False        # likewise for the face pass
         self.auto_refine = tk.BooleanVar(value=False)   # the Visual Critic
+        self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
         self._build(session.frame)
@@ -602,6 +603,14 @@ class ImageStudio:
         # The Visual Critic (studio_critic): the vision model checks the
         # picture and the faults it finds are redrawn, up to three passes.
         b = tk.Checkbutton(setup, text="Automatic refinement", variable=self.auto_refine,
+                           anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
+                           wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
+        # The hands pass (Studio._finish_passes): every hand SAM3 finds is
+        # redrawn at the end of Generate, before the glasses.
+        b = tk.Checkbutton(setup, text="Natural hands pass", variable=self.hand_pass,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
@@ -1446,6 +1455,7 @@ class ImageStudio:
         s["refine"] = bool(self.refine.get())
         s["face_detail"] = bool(self.faces.get())
         s["auto_refine"] = bool(self.auto_refine.get())
+        s["hand_pass"] = bool(self.hand_pass.get())
         for key, _, kind in ADVANCED:
             raw = self.adv[key].get().strip()
             if not raw:
@@ -1502,6 +1512,7 @@ class ImageStudio:
         self.faces.set(bool(s.get("face_detail")))
         self.faces_set = True
         self.auto_refine.set(bool(s.get("auto_refine")))
+        self.hand_pass.set(s.get("hand_pass", True) is not False)
         for r in list(self.loras):
             r["row"].destroy()
         self.loras = []

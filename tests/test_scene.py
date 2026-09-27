@@ -1148,6 +1148,17 @@ class TestWords(unittest.TestCase):
             lo, hi = sc.CONTROL_RANGE[k]
             self.assertTrue(lo <= v <= hi, k)
 
+    def test_the_thumbs_are_on_the_outer_side_of_forward_facing_palms(self):
+        # At rest the palms face +z (the front), so each thumb is on the
+        # side away from the body and the little finger by the thigh.
+        sk = sc.skeleton(sc.pose_controls("standing"))
+        for side, sign in (("l", 1), ("r", -1)):
+            wp, wm = sk["wrist_" + side]
+            pts = [sc.add(wp, sc.apply(wm, v)) for v in sc.hand_joints(sign, (0, 0, 0))]
+            thumb, index, little = pts[2][0], pts[5][0], pts[17][0]
+            self.assertGreater(sign * thumb, sign * index, side)
+            self.assertGreater(sign * index, sign * little, side)
+
     def test_the_pose_map_carries_the_hands_and_the_words_say_them(self):
         s = staged("person")
         o = s["objects"][0]

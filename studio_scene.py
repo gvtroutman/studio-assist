@@ -978,18 +978,20 @@ def hand_joints(sign, grip):
     (curl, spread, thumb) in degrees. The mesh and the pose map both come
     from these, so what is drawn is what the ControlNet is told."""
     curl, spread, thumb = grip
+    # The palm faces +z, so the thumb is on the hand's outer side (+x on
+    # the left hand, -x on the right), away from the body at rest.
     # The thumb, its two joints swung from alongside the palm to across it.
     t = thumb / 90.0
     lerp = lambda a, b: tuple(u + (v - u) * t for u, v in zip(a, b))   # noqa: E731
-    base = (-sign * 0.03, -0.03, 0.012)
-    knuckle = lerp((-sign * 0.045, -0.08, 0.032), (-sign * 0.03, -0.075, 0.058))
-    tip = lerp((-sign * 0.045, -0.12, 0.04), (0.0, -0.1, 0.078))
+    base = (sign * 0.03, -0.03, 0.012)
+    knuckle = lerp((sign * 0.045, -0.08, 0.032), (sign * 0.03, -0.075, 0.058))
+    tip = lerp((sign * 0.045, -0.12, 0.04), (0.0, -0.1, 0.078))
     pts = [(0.0, 0.0, 0.0), base, knuckle, mul(add(knuckle, tip), 0.5), tip]
     for i, (x, length, _) in enumerate(FINGERS):
         # Each of three joints bends by the curl, toward the palm; a spread
         # fans the fingers out from between the middle and ring fingers.
-        fan = math.radians(spread * (1.5 - i) / 1.5) * -sign
-        p, bend = (x * -sign, KNUCKLE_Y, 0.012), 0.0
+        fan = math.radians(spread * (1.5 - i) / 1.5) * sign
+        p, bend = (x * sign, KNUCKLE_Y, 0.012), 0.0
         pts.append(p)
         for frac in (0.45, 0.3, 0.25):
             bend += math.radians(RELAXED + curl)
