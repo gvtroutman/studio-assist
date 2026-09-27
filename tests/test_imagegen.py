@@ -1201,7 +1201,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
 
     def test_the_face_pass_redraws_each_face_with_the_identity_lora(self):
         self.face_studio()
-        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", hand_pass=False,
                                        preset="identity", identities=["gavin"],
                                        scene="On a pier.", backend="5090", seed=5))
         settle(jobs)
@@ -1265,7 +1265,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
                                     client_factory=HeadClient)
             jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
-                                           backend="5090", seed=5, face_detail=True,
+                                           backend="5090", seed=5, face_detail=True, hand_pass=False,
                                            scene_layout=s, scene_faces=faces))
             settle(jobs)
             self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
@@ -1295,7 +1295,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         with open(face, "wb") as f:
             f.write(PNG)
         jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
-                                       backend="5090", seed=5, face_detail=True,
+                                       backend="5090", seed=5, face_detail=True, hand_pass=False,
                                        scene_faces=self.scene_faces(face)))
         settle(jobs)
         self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
@@ -1333,7 +1333,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         with open(face, "wb") as f:
             f.write(PNG)
         jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
-                                       backend="5090", seed=5, face_detail=True,
+                                       backend="5090", seed=5, face_detail=True, hand_pass=False,
                                        scene_faces=self.scene_faces(face)))
         settle(jobs)
         first, second = FaceClient.instances[-1].graphs
@@ -1358,7 +1358,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         faces["real"] = real
         faces["people"][0]["photos"] = photos
         jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
-                                       backend="5090", seed=5, face_detail=True,
+                                       backend="5090", seed=5, face_detail=True, hand_pass=False,
                                        scene_faces=faces))
         settle(jobs)
         self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
@@ -1405,7 +1405,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
     def test_a_failed_face_pass_keeps_the_picture(self):
         self.face_studio()
         FaceClient.fail_pass = True
-        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", hand_pass=False,
                                        preset="identity", identities=["gavin"],
                                        scene="x", backend="5090"))
         settle(jobs)
@@ -2072,6 +2072,14 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(ui.collect(), before)
         ui._toggle_advanced()
         ui._show_section("Image")
+
+    def test_the_hands_pass_is_on_unless_unticked_and_a_picture_brings_it_back(self):
+        _, ui = self.tab()
+        self.assertTrue(ui.collect()["hand_pass"])
+        ui.apply(dict(ui.collect(), hand_pass=False))
+        self.assertFalse(ui.collect()["hand_pass"])
+        ui.apply({k: v for k, v in ui.collect().items() if k != "hand_pass"})
+        self.assertTrue(ui.collect()["hand_pass"])     # an older picture: it was on
 
     def test_fix_a_spot_marks_squares_and_queues_a_fix(self):
         import studio_images_ui as ui_mod

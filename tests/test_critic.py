@@ -238,7 +238,7 @@ class LoopTest(TempStudioMixin, unittest.TestCase):
         jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
                                        scene="A man plays accordion in Munich.",
                                        facial_hair="brown beard", backend="5090", seed=5,
-                                       auto_refine=True, **extra))
+                                       auto_refine=True, hand_pass=False, **extra))
         settle(jobs)
         self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
         return jobs[0], FaceClient.instances[-1]

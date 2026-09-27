@@ -1388,6 +1388,14 @@ EYE_WHAT = ("clear, detailed eyes with round irises, dark pupils and lashes, bot
 GLASSES_DENOISE = 0.45
 GLASSES_WHAT = ("thin metal glasses frames with perfectly clear, transparent lenses and no "
                 "glare, the eyes sharp behind them")
+# Every Generate then has its hands redrawn (Gavin, 2026-09-26: "a pass with
+# natural hands"), before the glasses, which stay last. Only what SAM3 finds
+# as a hand in each crop changes. 0.6 is the Critic's LOCAL_INPAINT: it mends
+# the fingers without re-posing them; 0.85-0.9 left double hands.
+HAND_FIND = "hand:8"
+HAND_DENOISE = 0.6
+HAND_WHAT = ("a natural, relaxed human hand with four fingers and a thumb, each finger "
+             "separate and jointed, with clear knuckles and nails")
 # A spot can be a freehand outline (the Fix a spot window's drag): only
 # inside it changes. ComfyUI has no polygon mask node, so the outline is
 # drawn here as a mask picture at the crop's size (`outline_png`) and
@@ -2901,7 +2909,7 @@ def default_settings():
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
             "face_detail": None, "batch": 1, "pose": None, "composition": None,
-            "auto_refine": False, "refine_passes": 3,
+            "auto_refine": False, "refine_passes": 3, "hand_pass": True,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -4867,8 +4875,7 @@ class Studio:
             pictures = self.finish_profiles(job, graph, pictures, profiles, say)
             if pictures is None:
                 return
-            pictures = self._eyes_and_glasses(job, client, plan, values, pictures, profiles,
-                                              say)
+        pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
         self.save_result(job, self.record_for(job, graph), pictures)
         job.progress = 1.0
         self.queue._finish(job, "complete",
@@ -4984,30 +4991,47 @@ class Studio:
             fh.write(oval_png(scale=1.0 / FIX_CONTEXT, centre=0.5))
         return client.upload_image(oval)
 
-    def _eyes_and_glasses(self, job, client, plan, values, pictures, profiles, say):
-        """After FaceFusion, on the lane's thread: each swapped face's eyes
-        redrawn, then its glasses last (EYE_WHAT, GLASSES_WHAT), by the fix
-        machinery on the picture's own model. -> the pictures; FaceFusion's
-        own when a pass cannot run, fails or is cancelled - the swap is
-        never lost to its finish."""
+    def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
+        """The end of Generate, on the lane's thread, by the fix machinery on
+        the picture's own model: after FaceFusion (`profiles`) each swapped
+        face's eyes (EYE_WHAT); then every hand SAM3 finds (HAND_WHAT; the
+        hands pass, unless settings["hand_pass"] is off); then the swapped
+        faces' glasses last (GLASSES_WHAT), so nothing is drawn over them.
+        -> the pictures; those given when a pass cannot run, fails or is
+        cancelled - the picture is never lost to its finish."""
+        hands = job.settings.get("hand_pass", True) is not False
+        if not profiles and not hands:
+            return pictures
+        kinds = (["eye"] if profiles else []) + (["hands"] if hands else []) + (
+            ["glasses"] if profiles else [])
+        named = "%s pass%s" % (", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1
+                               else kinds[0], " after the face swap" if profiles else "")
         b = job.backend
         sam = self.sam3_on(b)
-        why = ""
+        why, types = "", set()
         if not plan.workflow.get("face_detail"):
             why = "the %s workflow has no redraw section" % plan.workflow.get("label")
         elif not sam:
             why = "%s has no SAM3 checkpoint" % b["name"]
         else:
             try:
-                lacks = FACE_NODES - set(client.node_types())
+                types = set(client.node_types())
+                lacks = FACE_NODES - types
             except ComfyError:
                 lacks = set()
             if lacks:
                 why = "%s's ComfyUI lacks %s" % (b["name"], ", ".join(sorted(lacks)))
         if why:
-            job.notes.append("No eye or glasses pass after the face swap: %s." % why)
+            job.notes.append("No %s: %s." % (named, why))
             return pictures
+        find = (FINISH_FIND if profiles else []) + ([HAND_FIND] if hands else [])
+        words = (FINISH_WORDS if profiles else []) + (["hand"] if hands else [])
+        looking = (["eyes"] if profiles else []) + (["hands"] if hands else []) + (
+            ["glasses"] if profiles else [])
         v = dict(values, sam3=sam, match_tone=None)
+        # A hand keeps the picture's grade; a swapped face gets no curves,
+        # which posterize its skin.
+        hand_tone = FIX_TONE if TONE_NODE in types else None
         folder = os.path.join(self.lib.root, "finish")
         out = []
         try:
@@ -5021,39 +5045,55 @@ class Studio:
                 with open(path, "wb") as fh:
                     fh.write(data)
                 image = client.upload_image(path)
-                say("refining", "Finding the eyes and glasses", None)
-                job.prompt_id = client.queue_workflow(parts_graph(image, sam, FINISH_FIND))
+                say("refining", "Finding the %s" % " and ".join(looking), None)
+                job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
                                                    stop=job.cancel.is_set)
-                said = parts_found(entry or {}, len(FINISH_FIND), FINISH_WORDS)
+                said = parts_found(entry or {}, len(find), words)
                 if said is None:
                     if not job.cancel.is_set():
-                        job.notes.append("SAM3 said nothing about the swapped picture, so "
-                                         "no eye or glasses pass was made.")
+                        job.notes.append("SAM3 said nothing about the picture, so no %s was "
+                                         "made." % named)
                     out.append((filename, data))
                     continue
                 width, height, boxes = said
-                faces = swapped_faces(width, height,
-                                      [x[:4] for x in boxes if x[4] == "face"], profiles)
-                if not faces:
-                    job.notes.append("SAM3 found no swapped face, so no eye or glasses "
-                                     "pass was made.")
-                    out.append((filename, data))
-                    continue
-                eyes = eye_spots(faces)
-                passes = [("Eye pass", fix_areas(fix_crops(width, height, eyes), eyes),
-                           EYE_DENOISE, EYE_WHAT, "_eyes")]
-                glasses = glasses_spots(width, height,
-                                        [x for x in boxes if x[4] == "glasses"], faces)
-                if glasses:
-                    crops = fix_crops(width, height, [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
-                                                      for sp in glasses])
-                    passes.append(("Glasses", fix_areas(crops, glasses), GLASSES_DENOISE,
-                                   GLASSES_WHAT, "_glasses"))
+                passes, faces, found_hands, glasses = [], [], [], []
+                if profiles:
+                    faces = swapped_faces(width, height,
+                                          [x[:4] for x in boxes if x[4] == "face"], profiles)
+                    if faces:
+                        eyes = eye_spots(faces)
+                        passes.append(("Eye pass", fix_areas(fix_crops(width, height, eyes),
+                                                             eyes),
+                                       EYE_DENOISE, EYE_WHAT, "_eyes", None))
+                    else:
+                        job.notes.append("SAM3 found no swapped face, so no eye or glasses "
+                                         "pass was made.")
+                if hands:
+                    found_hands = found_spots(width, height,
+                                              [x for x in boxes if x[4] == "hand"], "hand")
+                    if found_hands:
+                        crops = fix_crops(width, height, [
+                            dict(sp, size=int(sp["size"] * FIX_CONTEXT)) for sp in found_hands])
+                        passes.append(("Hands", fix_areas(crops, found_hands), HAND_DENOISE,
+                                       HAND_WHAT, "_hands", hand_tone))
+                    else:
+                        job.notes.append("SAM3 found no hands, so no hands pass was made.")
+                if faces:
+                    glasses = glasses_spots(width, height,
+                                            [x for x in boxes if x[4] == "glasses"], faces)
+                    if glasses:
+                        crops = fix_crops(width, height, [
+                            dict(sp, size=int(sp["size"] * FIX_CONTEXT)) for sp in glasses])
+                        passes.append(("Glasses", fix_areas(crops, glasses), GLASSES_DENOISE,
+                                       GLASSES_WHAT, "_glasses", None))
+                    else:
+                        job.notes.append("SAM3 found no glasses on the swapped face.")
                 done = None
-                for label, crops, denoise, what, tag in passes:
+                for label, crops, denoise, what, tag, tone in passes:
                     graph = face_graph(plan.workflow, dict(v, face_prompt=FIX_PROMPT % what,
-                                                           face_denoise=denoise),
+                                                           face_denoise=denoise,
+                                                           match_tone=tone),
                                        plan.loras, image, crops, oval,
                                        values["filename_prefix"] + tag)
                     files = self._run_pass(job, client, graph, say, label)
@@ -5062,20 +5102,20 @@ class Studio:
                     done = files[0]
                     image = "%s%s [%s]" % (done["subfolder"] + "/" if done.get("subfolder")
                                            else "", done["filename"], done.get("type") or "output")
-                    job.notes.append(
-                        "Eye pass after the face swap: %d face%s, denoise %s." % (
-                            len(faces), "" if len(faces) == 1 else "s", denoise)
-                        if tag == "_eyes" else
-                        "Glasses redrawn last: %d pair%s, denoise %s." % (
-                            len(glasses), "" if len(glasses) == 1 else "s", denoise))
+                    count, said = {
+                        "_eyes": (len(faces), "Eye pass after the face swap: %d face%s, "
+                                              "denoise %s."),
+                        "_hands": (len(found_hands), "Hands pass: %d hand%s redrawn, "
+                                                     "denoise %s."),
+                        "_glasses": (len(glasses), "Glasses redrawn last: %d pair%s, "
+                                                   "denoise %s.")}[tag]
+                    job.notes.append(said % (count, "" if count == 1 else "s", denoise))
                 if done is not None:
                     data = client.fetch(done)
-                if len(passes) == 1 and not job.cancel.is_set():
-                    job.notes.append("SAM3 found no glasses on the swapped face.")
                 out.append((filename, data))
         except (ComfyError, TemplateError, OSError) as e:
-            job.notes.append("The eye and glasses passes after the face swap failed (%s); "
-                             "the picture is FaceFusion's." % e)
+            job.notes.append("The %s failed (%s); the picture is kept as it was before it."
+                             % (named, e))
             return pictures
         return out
 

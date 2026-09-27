@@ -759,7 +759,7 @@ profile menu and editor. Lilya's live final-pass result matched the approved
 standalone HyperSwap result byte-for-byte.
 
 **The eyes and then the glasses are redrawn after the swap** (Generate only;
-`Studio._eyes_and_glasses`). FaceFusion pastes the new face over the frames,
+`Studio._finish_passes`). FaceFusion pastes the new face over the frames,
 so the eyes came back soft and the glasses faint. Gavin asked for "an eye pass
 and glasses last" (2026-09-26). The swapped picture goes back to the job's
 ComfyUI. One SAM3 run (`FINISH_FIND`: faces, glasses) finds the faces, and
@@ -776,6 +776,24 @@ through. Both runs take about 13 s on the 5090. Without SAM3 or a `face_detail`
 section, and on any failure or cancel, the picture stays FaceFusion's and a
 note says why. The local face-only swap (Fix a spot with no spots, Retry face
 swap) has no ComfyUI and gets neither pass.
+
+**Every Generate then has its hands redrawn** (the hands pass, same method).
+Gavin asked for "a pass with natural hands" to go with the glasses (2026-09-26).
+It runs with or without a face profile, unless "Natural hands pass" under
+Generate is unticked (`settings["hand_pass"]`, on by default and for pictures
+saved before it). `HAND_FIND` joins the same SAM3 run. Each hand it finds is a
+`found_spots` square grown by `FIX_CONTEXT`, and only SAM3's `hand` inside it is
+redrawn, all the hands in one `face_graph` run, at `HAND_DENOISE` 0.6 with
+`HAND_WHAT` ("four fingers and a thumb"). 0.6 is the Critic's `LOCAL_INPAINT`,
+which mends fingers without re-posing them. The reverted per-hand ControlNet pass
+of 2026-09-25 got double hands at 0.85-0.9. The order is eyes, hands, glasses:
+the glasses stay last. Hands tone-match (`FIX_TONE`) when the ComfyUI has
+`StudioMatchTone`; a swapped face does not. Live on the 5090 (Generate through
+`Studio.submit` by script, Lilya's meadow settings, 20260926-214549-06a88e):
+FaceFusion, eyes, 2 hands, glasses, 51 s in all. Both hands kept their pose and
+came back with sharper knuckles, creases and nails, and nothing else changed. But
+one nail on the lowered hand came out a pale lilac. With no hands found, a note
+says so and the picture is kept.
 
 ### Family photos with WithAnyone
 
@@ -1300,6 +1318,13 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   colour. The words are still sent as written; this only draws them. Every look edit
   in the inspector goes through `changed()`, so the viewport follows each keystroke
   and slider step.
+- **The thumb is on the outer side of the hand.** `hand_joints` is built with the
+  palm facing +z, the front at rest, so the thumb and index finger are toward
+  `sign` (+x on the left hand, -x on the right), away from the body. Until
+  2026-09-26 they were at `-sign`, a mirrored hand with the thumb by the thigh,
+  and the pose map sent DWPose that mirrored hand too. The mesh and the map
+  both come from `hand_joints`, so a fix there fixes both
+  (`test_the_thumbs_are_on_the_outer_side_of_forward_facing_palms`).
 - **With people in the scene, the form's person is blanked for the job.** `generation()`
   lays empty slots, zero sliders, no `character` and no `item_refs` over the form, or the
   picture gets the form's person as well (an extra person, or two blended). The first
