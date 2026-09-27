@@ -14,6 +14,12 @@ import studio_procs
 ROOT = Path(__file__).resolve().parent
 PYTHON = ROOT / '.runtime/facefusion-venv/Scripts/python.exe'
 SCRIPT = ROOT / 'tools/facefusion_swap.py'
+# FaceFusion's face swapper weight. 0.5 hands the model the reference face's
+# identity as it is; above it the identity is pushed away from the face being
+# replaced, so less of the generated person survives. The swap ran at 0.5
+# until 2026-09-27 (the user: "not as strong as i'd like"). A profile's own
+# `swap_strength` wins.
+SWAP_STRENGTH = 0.8
 _SWAP_LOCK = threading.Lock()  # FaceFusion's jobs/temp directories are shared across backend lanes.
 
 
@@ -120,6 +126,14 @@ def target_face(boxes, region=None, point=None, index=None, count=1):
     return hits[0]
 
 
+def strength(identity):
+    """The profile's face swap strength, on FaceFusion's 0-1 scale in its 0.05 steps."""
+    value = identity.get('swap_strength')
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        value = SWAP_STRENGTH
+    return round(min(1.0, max(0.0, value)) * 20) / 20
+
+
 def swap(data, identity, stop=None, face_index=None, face_count=1):
     while not _SWAP_LOCK.acquire(timeout=0.1):
         if stop and stop():
@@ -142,7 +156,8 @@ def _swap(data, identity, stop=None, face_index=None, face_count=1):
         target, output = Path(folder) / 'target.png', Path(folder) / 'result.png'
         target.write_bytes(data)
         args = [str(PYTHON), str(SCRIPT), '--identity', identity['id'], '--sources', *refs,
-                '--target', str(target), '--output', str(output)]
+                '--target', str(target), '--output', str(output),
+                '--weight', str(strength(identity))]
         if face_index is not None:
             args += ['--face-index', str(face_index), '--face-count', str(face_count)]
         if identity.get('target_region') is not None:
