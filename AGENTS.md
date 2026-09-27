@@ -2339,7 +2339,11 @@ origin/the sole remote if main has none. It must never merge, stash, reset or ch
 out over local work: the workstation sometimes carries its own commits, and an
 updater that "resolves" them destroys them silently. A refusal goes to
 `studio_update.log`, and so does a successful update. A pass with nothing
-to do writes nothing. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
+to do writes nothing. After pulling, the pass also **pushes** (`push()`): when local
+`main` has commits the remote lacks and the remote has none local lacks, `git push
+<remote> HEAD:refs/heads/main`, never forced, only from `main`. If both sides moved
+it pushes nothing (pull already logged why); a refused push is logged. The app's
+Update button runs `pull()` only. It sets `GIT_TERMINAL_PROMPT=0` because a credential prompt with no
 console hangs forever and nobody sees it.
 
 The window has the same updater on a button. `Chat._update_tick` calls

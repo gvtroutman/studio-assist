@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Keep this folder in step with GitHub.
+"""Keep this folder in step with GitHub, both ways.
 
-    python studio_update.py              # one pass: fetch, and fast-forward if behind
+    python studio_update.py              # one pass: fast-forward if behind, push if ahead
     python studio_update.py --install    # check every 5 minutes (a Windows scheduled task)
     python studio_update.py --install --every 15
     python studio_update.py --uninstall  # stop checking
@@ -11,6 +11,10 @@ GitHub changes" is a poll: a scheduled task runs this under `pyw` (no console
 window flashing up every few minutes), it fetches, and it fast-forwards
 main when its remote is ahead. On another branch (or a detached HEAD),
 updates are paused with an explanation. The updater never switches branches.
+
+Then it pushes: when main has commits the remote lacks and the remote has
+none main lacks, they are pushed (never forced). If both sides have moved,
+nothing is pushed or pulled; a person merges.
 
 It only ever fast-forwards. Local commits the remote does not have, or an
 edit to a file the update would overwrite, make git refuse - and this leaves
@@ -102,7 +106,7 @@ def check(fetch=True):
         st["problem"] = f"No unambiguous remote for {BRANCH} - configure its remote to get updates."
         return st
     upstream = f"{remote}/{BRANCH}"
-    st["upstream"] = upstream
+    st["upstream"], st["remote"] = upstream, remote
     if fetch:
         code, out = git(gitexe, "fetch", "--quiet", remote,
                         f"+refs/heads/{BRANCH}:refs/remotes/{upstream}")
@@ -164,9 +168,30 @@ def pull():
     return True, msg
 
 
+def push():
+    """Send main's commits to GitHub when GitHub has nothing this folder lacks.
+    Never forced: if both sides moved, pull() has already logged why nothing
+    happened, and a person merges. Returns (pushed, what happened)."""
+    st = check(fetch=False)                 # pull() fetched a moment ago
+    if st["problem"] or not st["ahead"] or st["behind"]:
+        return False, ""
+    upstream, ahead = st["upstream"], st["ahead"]
+    code, out = git(st["git"], "push", "--quiet", st["remote"],
+                    f"HEAD:refs/heads/{BRANCH}", timeout=300)
+    if code:
+        msg = f"Pushing {ahead} commit(s) to {upstream} failed: {out}"
+        log(msg)
+        return False, msg
+    msg = f"Pushed {ahead} commit(s) to {upstream}."
+    log(msg)
+    return True, msg
+
+
 def update():
-    """One pass. Returns True if the folder changed."""
-    return pull()[0]
+    """One pass: pull, then push. Returns True if the folder changed."""
+    changed = pull()[0]
+    push()
+    return changed
 
 
 # -------------------------------------------------------------- scheduling
