@@ -59,11 +59,11 @@ MAX_WORK = 1800
 POLL = 1.0                   # seconds between looks at a working session
 SETTLE = 2.0                 # a task just handed over may not show as busy yet
 MAX_REPLY_CHARS = 6000       # what an ask hands back; the executor caps at 8000
-MAX_FILE_CHARS = 20000       # read_file cap; a model does not need a whole repo
+MAX_FILE_CHARS = 6000        # leave room for headers under the executor's 8000 cap
 MAX_LIST = 400               # list_files cap
 MAX_DIFF_CHARS = 6000
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-             ".opencode", ".claude"}
+             ".opencode", ".claude", ".runtime", ".work", ".studio-attachments"}
 
 # Every server route this bridge uses, in one place. opencode_status checks
 # them against the server's own OpenAPI document (/doc) and says which ones a
@@ -599,8 +599,11 @@ def list_files(relpath="", limit=MAX_LIST):
     if not os.path.isdir(root):
         raise OpenCodeError("%s is not a folder in the workspace." % (relpath or "/"))
     out = []
+    deadline = time.monotonic() + 3
     for base, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        if time.monotonic() >= deadline:
+            return out, True
+        dirs[:] = sorted(d for d in dirs if d.casefold() not in SKIP_DIRS)
         for f in sorted(files):
             p = os.path.join(base, f)
             r = os.path.relpath(p, os.path.realpath(WORKSPACE)).replace(os.sep, "/")
@@ -748,8 +751,16 @@ def t_changes(a):
 def t_list_files(a):
     rows, truncated = list_files(a.get("path") or "")
     if not rows:
-        return result("The folder is empty. %s" % workspace_note())
-    text = "\n".join(rows)
+        return result("Listing stopped early; narrow the path." if truncated else
+                      "The folder is empty. %s" % workspace_note())
+    kept, size = [], 0
+    for row in rows:
+        if size + len(row) + 1 > MAX_FILE_CHARS:
+            truncated = True
+            break
+        kept.append(row)
+        size += len(row) + 1
+    text = "\n".join(kept)
     if truncated:
         text += "\n... more; list a subfolder."
     return result(text)
@@ -759,11 +770,67 @@ def t_read_file(a):
     full = inside(a["path"])
     if not os.path.isfile(full):
         raise OpenCodeError("%s is not a file in the workspace." % a["path"])
+    start, limit = a.get("start", 0), a.get("limit", MAX_FILE_CHARS)
     with open(full, encoding="utf-8", errors="replace") as f:
-        data = f.read(MAX_FILE_CHARS + 1)
-    if len(data) > MAX_FILE_CHARS:
-        data = data[:MAX_FILE_CHARS] + "\n... [truncated at %d characters]" % MAX_FILE_CHARS
-    return result(data or "(empty file)")
+        # Character offsets, not byte seeks: UTF-8 and Windows newlines must
+        # paginate exactly as they appear in the returned text.
+        remaining = start
+        while remaining:
+            chunk = f.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        data = f.read(limit + 1)
+    more = len(data) > limit
+    data = data[:limit]
+    header = ("Next page: opencode_read_file with the same path and start=%d.\n"
+              % (start + len(data)) if more else "End of file.\n")
+    return result(header + (data or "(empty page)"))
+
+
+def t_search_files(a):
+    """Bounded literal search. Offsets feed directly into the file reader."""
+    root = inside(a.get("path") or "")
+    if os.path.isfile(root):
+        paths, partial = [os.path.relpath(root, WORKSPACE)], False
+    else:
+        rows, partial = list_files(a.get("path") or "")
+        paths = [row.rsplit("  (", 1)[0] for row in rows]
+    needle = a["query"].casefold()
+    if not needle.strip():
+        raise ValueError("query must contain text")
+    out, size, scanned = [], 0, 0
+    deadline = time.monotonic() + 3
+    for path in paths:
+        if time.monotonic() >= deadline or scanned >= 8 * 1024 * 1024:
+            partial = True
+            break
+        try:
+            with open(inside(path), "rb") as f:
+                raw = f.read(1024 * 1024 + 1)
+            scanned += len(raw)
+            if b"\0" in raw:
+                continue
+            if len(raw) > 1024 * 1024:
+                partial = True
+                raw = raw[:1024 * 1024]
+            data = raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+        except OSError:
+            partial = True
+            continue
+        offset = 0
+        for line_no, line in enumerate(data.splitlines(keepends=True), 1):
+            if needle in line.casefold():
+                row = "%s:%d start=%d: %s" % (path, line_no, offset, line.strip()[:240])
+                if len(out) >= 40 or size + len(row) + 1 > MAX_FILE_CHARS:
+                    return result("Partial search; narrow path or query.\n" + "\n".join(out))
+                out.append(row)
+                size += len(row) + 1
+            offset += len(line)
+    hint = (" This is literal search, not regex; try one exact term such as transcript."
+            if not out and any(t in needle for t in (".*", ".+", "\\b", "\\s")) else "")
+    return result(("Partial search; narrow path or query.\n" if partial else "")
+                  + ("\n".join(out) or "No matches in the text searched." + hint))
 
 
 def _obj(props, required=()):
@@ -836,8 +903,15 @@ TOOLS = [
      "The files in OpenCode's folder, or one subfolder of it, with sizes.",
      _obj({"path": _s("Subfolder, relative to the folder. Default: all of it.")})),
     ("opencode_read_file", t_read_file,
-     "Read one file from OpenCode's folder, as text.",
-     _obj({"path": _s("File path relative to the folder, e.g. studio_agent.py.")}, ["path"])),
+     "Read a page of text. Follow the next start offset to continue; search first to locate code.",
+     _obj({"path": _s("File path relative to the folder, e.g. studio_agent.py."),
+           "start": _i("Character offset, starting at 0.", minimum=0, maximum=10000000),
+           "limit": _i("Characters to return; default 6000.", minimum=1, maximum=6000)}, ["path"])),
+    ("opencode_search_files", t_search_files,
+     "Find literal text (case insensitive) in workspace files. Returns paths, lines and start offsets "
+     "for opencode_read_file. Bounded search reports partial results; narrow path when needed.",
+     _obj({"query": _s("Literal text to find.", minLength=1, maxLength=200),
+           "path": _s("File or subfolder to search. Omit for workspace.")}, ["query"])),
 ]
 
 TOOLS_BY_NAME = {name: (fn, desc, schema) for name, fn, desc, schema in TOOLS}
@@ -846,7 +920,7 @@ TOOLS_BY_NAME = {name: (fn, desc, schema) for name, fn, desc, schema in TOOLS}
 # owe a read-back; opencode_ask is the edit, and its reply is not proof the code
 # works, so it is not listed - the model is expected to check what came back.
 READ_ONLY = {"opencode_status", "opencode_list_sessions", "opencode_get_session",
-             "opencode_list_files", "opencode_read_file", "opencode_changes"}
+             "opencode_list_files", "opencode_read_file", "opencode_search_files", "opencode_changes"}
 
 
 # Hints past read-only. opencode_ask and opencode_wait may lead to edits the

@@ -35,9 +35,11 @@ class FakeLLM:
     def __init__(self, responses):
         self.responses = iter(responses)
         self.requests = []
+        self.tool_requests = []
 
     def stream(self, messages, tools, on_text):
         self.requests.append(messages)
+        self.tool_requests.append(tools)
         msg = next(self.responses)
         if msg.get("content"):
             on_text(msg["content"])
@@ -136,10 +138,46 @@ class TestExecutor(unittest.TestCase):
         ex = self.setup_run([], cancel=cancel)
         ex.llm = Streaming([])
         self.assertIn("Stopped mid-reply", ex.run(self.messages))
+        self.assertIn("No edit-capable tools were run", ex.record.status)
         tokens = [p for k, p in self.events if k == "token"]
         self.assertEqual(tokens, ["First half"])
         self.bridge.call_tool.assert_not_called()
         self.assertEqual(self.messages[-1]["role"], "user")
+
+    def test_opencode_exploration_gets_one_handoff_reminder(self):
+        specs = [spec("opencode_ask"), spec("opencode_read_file", {
+            "type": "object", "properties": {"path": {"type": "string"}}},
+            annotations={"readOnlyHint": True}),
+            spec("opencode_changes", annotations={"readOnlyHint": True})]
+        ex = self.setup_run([
+            *(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in ("a", "b", "c")),
+            answer(call("opencode_ask")), answer(call("opencode_changes")), answer(text="Verified")], specs=specs)
+        self.assertEqual(ex.run(self.messages), "Verified")
+        hints = [m["content"] for m in self.messages if "without handing work" in (m.get("content") or "")]
+        self.assertEqual(len(hints), 1)
+        self.assertIn("only requested information or review", hints[0])
+        self.assertEqual(self.bridge.call_tool.call_args_list[3].args[0], "opencode_ask")
+
+    def test_opencode_read_only_review_is_not_forced_to_delegate(self):
+        specs = [spec("opencode_ask"), spec("opencode_read_file", {
+            "type": "object", "properties": {"path": {"type": "string"}}},
+            annotations={"readOnlyHint": True})]
+        ex = self.setup_run([
+            *(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in ("a", "b", "c", "d")),
+            answer(text="Here are the findings.")], specs=specs)
+        self.messages[-1]["content"] = "Review the server lifecycle. Do not edit."
+        self.assertEqual(ex.run(self.messages), "Here are the findings.")
+        self.assertTrue(all(c.args[0] == "opencode_read_file" for c in self.bridge.call_tool.call_args_list))
+
+    def test_cancel_after_attempted_write_does_not_claim_nothing_changed(self):
+        cancel = threading.Event()
+        cancel.set()
+        for status in ("ok", "running", "unknown", "error"):
+            with self.subTest(status=status):
+                record = tasks.TaskRecord()
+                record.journal.append({"name": "opencode_ask", "read": False, "status": status})
+                ex = self.setup_run([], record=record, cancel=cancel)
+                self.assertIn("may have changed", ex.run(self.messages))
 
     def test_stop_during_batch_skips_remaining_calls_and_repairs_history(self):
         cancel = threading.Event()
@@ -303,7 +341,8 @@ class TestExecutor(unittest.TestCase):
         self.assertIsNone(calls[0]["via"])
         self.assertEqual([(r["name"], r["status"]) for r in results],
                          [("run_jsx", "ok"), ("no_such_tool", "error")])
-        self.assertEqual(results[0]["text"], '{"id": 12}')
+        self.assertTrue(results[0]["text"].startswith('{"id": 12}'))
+        self.assertIn("journal:1", results[0]["text"])
         self.assertTrue(results[1]["text"].startswith("TOOL ERROR: tool is not enabled"))
 
     def test_a_call_the_executor_will_not_run_is_still_shown_as_one(self):
@@ -593,6 +632,180 @@ class TestMemory(unittest.TestCase):
         ex.run([{"role": "system", "content": "rules"}])
         bridge.call_tool.assert_not_called()
         self.assertEqual(record.objects["title"], "42")
+
+
+class TestContinuation(unittest.TestCase):
+    def test_long_history_becomes_stable_retrievable_notes(self):
+        record = tasks.TaskRecord()
+        record.briefs = ["Keep the existing behavior; add a dropdown."]
+        messages = [{"role": "system", "content": "rules"},
+                    {"role": "user", "content": record.briefs[0]}]
+        for i in range(12):
+            messages.extend([answer(call("get_comp", ident=str(i))),
+                             {"role": "tool", "tool_call_id": str(i), "content": "evidence %d " % i + "x" * 900}])
+        original = json.loads(json.dumps(messages))
+        tools = [tasks.RECALL_TOOL]
+        context = tasks.context_messages(messages, record, tools, 6500)
+        self.assertEqual(messages, original)
+        self.assertTrue(record.notes)
+        self.assertLess(len(json.dumps({"messages": context, "tools": tools})) + 512, 6501)
+        self.assertIn("Keep the existing behavior", tasks.recall_task(record, {"ref": "note:1"}))
+        frozen = json.loads(json.dumps(record.notes))
+        for i in range(12, 24):
+            messages.extend([answer(call("get_comp", ident=str(i))),
+                             {"role": "tool", "tool_call_id": str(i), "content": "y" * 900}])
+        context = tasks.context_messages(messages, record, tools, 6500)
+        self.assertEqual(record.notes[:len(frozen)], frozen)
+        pending = set()
+        for m in context:
+            if m["role"] == "assistant":
+                self.assertFalse(pending)
+                pending.update(c["id"] for c in m.get("tool_calls", []))
+            elif m["role"] == "tool":
+                self.assertIn(m["tool_call_id"], pending)
+                pending.remove(m["tool_call_id"])
+            else:
+                self.assertFalse(pending)
+        self.assertFalse(pending)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "task.json")
+            record.save(path, messages)
+            restored, history = tasks.TaskRecord.restore(path, "new rules")
+            self.assertEqual(restored.notes, record.notes)
+            self.assertEqual(restored.compacted_until, record.compacted_until)
+            self.assertIn("Keep the existing behavior", tasks.recall_task(restored, {"ref": "note:1"}))
+            tasks.context_messages(history, restored, tools, 6500)
+
+    def test_oversized_latest_exchange_is_archived_without_losing_evidence(self):
+        record = tasks.TaskRecord()
+        messages = [{"role": "system", "content": "rules"}, answer(call("get_comp")),
+                    {"role": "tool", "tool_call_id": "c1", "content": "start " + "a" * 20000 + " END"}]
+        context = tasks.context_messages(messages, record, [tasks.RECALL_TOOL], 6000)
+        self.assertLess(len(json.dumps(context)), 6000)
+        self.assertIn("END", json.dumps(record.notes))
+        self.assertEqual(len(record.notes), 1)
+        text = json.dumps(record.notes[0], ensure_ascii=False)
+        pages = []
+        for start in range(0, len(text), 1000):
+            pages.append(tasks.recall_task(record, {"ref": "note:1", "start": start, "limit": 1000}).split("\n", 1)[1])
+        self.assertEqual("".join(pages), text)
+
+    def test_large_state_keeps_latest_request_and_is_retrievable(self):
+        record = tasks.TaskRecord()
+        record.briefs = ["old " * 10000, "Now keep the blue buttons."]
+        context = tasks.context_messages([{"role": "system", "content": "rules"}], record,
+                                         [tasks.RECALL_TOOL], 6000)
+        self.assertIn("Now keep the blue buttons", context[-1]["content"])
+        self.assertIn("ref=state", context[-1]["content"])
+        self.assertIn("old old", tasks.recall_task(record, {"ref": "state"}))
+
+    def test_recall_neither_verifies_a_write_nor_clears_restore_guard(self):
+        record = tasks.TaskRecord()
+        record.status = "restored"
+        record.journal = [{"name": "create_comp", "read": False, "status": "unknown",
+                           "raw_result": {"content": [{"type": "text", "text": "full evidence"}]}}]
+        bridge = Mock()
+        ex = tasks.Executor(FakeLLM([]), bridge, [], record=record)
+        text, wrote, verified = ex._dispatch("studio_task_recall", '{"ref":"journal:1"}')
+        self.assertIn("full evidence", text)
+        self.assertFalse(wrote)
+        self.assertFalse(verified)
+        self.assertTrue(ex.must_inspect)
+        bridge.call_tool.assert_not_called()
+        with self.assertRaises(ValueError):
+            ex._dispatch("studio_task_recall", '{"ref":"journal:2"}')
+
+    def test_compaction_checkpoint_failure_prevents_inference(self):
+        record = tasks.TaskRecord()
+        messages = [{"role": "system", "content": "rules"},
+                    {"role": "user", "content": "x" * 30000}]
+        llm = FakeLLM([answer(text="unused")])
+        def checkpoint():
+            if record.notes:
+                raise OSError("disk full")
+        ex = tasks.Executor(llm, Mock(), eng.to_openai_tools([spec("get_comp")]),
+                            record=record, max_chars=12000, checkpoint=checkpoint)
+        with self.assertRaises(tasks.CheckpointError):
+            ex.run(messages)
+        self.assertFalse(llm.requests)
+
+    def test_loaded_window_budgets_request_and_output(self):
+        llm = eng.LLM("http://fake", "model")
+        ex = tasks.Executor(llm, Mock(), [])
+        with patch.object(eng, "context_window", return_value=(8192, 131072)) as window, \
+                patch.object(llm, "stream", return_value=answer(text="done")) as stream:
+            ex.run([{"role": "system", "content": "rules"}, {"role": "user", "content": "hi"}])
+        self.assertEqual(ex.max_chars, 15360)
+        self.assertEqual(stream.call_args.kwargs["max_tokens"], 2048)
+        window.assert_called_once()
+
+    def test_handoff_limit_blocks_calls_even_if_model_ignores_filtered_tools(self):
+        specs = [spec("opencode_read_file", {"type": "object", "properties": {"path": {"type": "string"}}},
+                      annotations={"readOnlyHint": True}), spec("opencode_ask"),
+                 spec("opencode_changes", annotations={"readOnlyHint": True})]
+        llm = FakeLLM([*(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in "abcd"),
+                       answer(call("opencode_ask")), answer(call("opencode_changes")), answer(text="done")])
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": "ok"}]}
+        ex = tasks.Executor(llm, bridge, eng.to_openai_tools(specs), schemas=specs)
+        messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "Make the dropdown"}]
+        ex.run(messages)
+        names = lambda ts: {t["function"]["name"] for t in ts}
+        self.assertNotIn("opencode_read_file", names(llm.tool_requests[3]))
+        self.assertIn("opencode_read_file", names(llm.tool_requests[5]))
+        self.assertEqual([c.args[0] for c in bridge.call_tool.call_args_list].count("opencode_read_file"), 3)
+        self.assertIn("three-read exploration budget", json.dumps(messages))
+
+    def test_context_refusal_compacts_and_retries_only_once(self):
+        for streaming in (True, False):
+            with self.subTest(streaming=streaming):
+                record = tasks.TaskRecord()
+                llm = FakeLLM([])
+                if streaming:
+                    llm.stream = Mock(side_effect=[eng.ContextLimitError("full"), answer(text="continued")])
+                else:
+                    llm.chat = Mock(side_effect=[
+                        {"choices": [{"finish_reason": "length", "message": answer(call("create_comp"))}]},
+                        {"choices": [{"finish_reason": "stop", "message": answer(text="continued")}]}])
+                bridge = Mock()
+                ex = tasks.Executor(llm, bridge, eng.to_openai_tools([spec("create_comp")]),
+                                    record=record, max_chars=50000)
+                messages = [{"role": "system", "content": "rules"},
+                            {"role": "user", "content": "Keep all constraints " + "x" * 38000}]
+                self.assertEqual(ex.run(messages, streaming=streaming), "continued")
+                self.assertTrue(record.notes)
+                bridge.call_tool.assert_not_called()
+                request = llm.stream if streaming else llm.chat
+                self.assertEqual(request.call_count, 2)
+                self.assertLess(len(json.dumps(request.call_args_list[1].args[0])),
+                                len(json.dumps(request.call_args_list[0].args[0])))
+        llm = FakeLLM([])
+        llm.stream = Mock(side_effect=eng.ContextLimitError("full"))
+        ex = tasks.Executor(llm, Mock(), [])
+        self.assertIn("still could not finish", ex.run([{"role": "system", "content": "rules"}]))
+        self.assertEqual(llm.stream.call_count, 2)
+
+    def test_unicode_notes_and_large_state_stay_inside_the_request_budget(self):
+        record = tasks.TaskRecord()
+        record.briefs = ["\U0001f642" * 8000, "Keep the caption in Japanese."]
+        messages = [{"role": "system", "content": "rules"},
+                    {"role": "user", "content": record.briefs[0]}]
+        context = tasks.context_messages(messages, record, [tasks.RECALL_TOOL], 10000)
+        self.assertLessEqual(len(json.dumps({"messages": context, "tools": [tasks.RECALL_TOOL]})) + 512, 10000)
+
+    def test_recall_can_retrieve_evidence_beyond_the_model_result_clip(self):
+        specs = [spec("get_comp", annotations={"readOnlyHint": True})]
+        bridge = Mock()
+        bridge.call_tool.return_value = {"content": [{"type": "text", "text": "x" * 12000 + "TAIL_EVIDENCE"}]}
+        ex = tasks.Executor(FakeLLM([]), bridge, eng.to_openai_tools(specs), schemas=specs)
+        clipped, _, _ = ex._dispatch("get_comp", "{}")
+        self.assertNotIn("TAIL_EVIDENCE", clipped)
+        self.assertIn("journal:1", clipped)
+        full = json.dumps(ex.record.journal[0], ensure_ascii=False)
+        tail, _, verified = ex._dispatch("studio_task_recall", json.dumps({
+            "ref": "journal:1", "start": full.index("TAIL_EVIDENCE") - 10, "limit": 100}))
+        self.assertIn("TAIL_EVIDENCE", tail)
+        self.assertFalse(verified)
 
 
 class TestTransport(unittest.TestCase):
