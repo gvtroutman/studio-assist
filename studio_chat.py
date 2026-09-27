@@ -807,6 +807,10 @@ class Chat(tk.Tk):
         # What OpenCode is given beyond its own tools; shown on its tab only.
         self.btn_addons = self._button(head, "Add-ons", self._open_code_addons, bg="head")
         self.code_addons = None
+        # Direct: the user's message goes to OpenCode as it is, with no model
+        # briefing it in between - one model's context on the GPU, not two,
+        # and nothing lost in the retelling. Also OpenCode's tab only.
+        self.btn_direct = self._button(head, "Direct: off", self._toggle_direct, bg="head")
         self.btn_fix = self._button(head, "Start app", self._on_fix, bg="head",
                                     kind="accent")
         # Shown only when GitHub has commits this folder does not (_show_update).
@@ -2914,8 +2918,12 @@ class Chat(tk.Tk):
         self._show_fix(fixable and not held)
         if getattr(s.app, "served", False):
             self.btn_addons.pack(side="right", padx=(6, 0), after=self.btn_hist)
+            self.btn_direct.pack(side="right", padx=(6, 0), after=self.btn_addons)
+            self.btn_direct.set(text="Direct: on" if getattr(s, "direct", False) else "Direct: off",
+                                state="disabled" if s.busy else "normal")
         else:
             self.btn_addons.pack_forget()
+            self.btn_direct.pack_forget()
         self.btn_new.set(state="disabled" if held else "normal")
         self.btn_hist.set(state="disabled" if s.busy or held else "normal")
         stopping = s.busy and s.cancel.is_set()
@@ -4937,6 +4945,10 @@ class Chat(tk.Tk):
             elif pictures:
                 emit("sys", "No vision model is served, so the model has only the names "
                             "and paths of the pictures - it cannot see what is in them.")
+            if getattr(s, "direct", False) and getattr(s.app, "served", False):
+                self._direct_turn(s, emit)
+                checkpoint()
+                return
             look = None
             if self.vision:
                 look = self.vision.check if s.app.makes_pictures else self.vision.review
@@ -4972,6 +4984,29 @@ class Chat(tk.Tk):
                 status = "stopped" if s.cancel.is_set() else "ready" if complete else "needs attention"
                 self.q.put(("status", sid, (status, "muted" if complete else "warn", False)))
             self.q.put(("idle", sid, None))
+
+    def _toggle_direct(self):
+        s = self.cur()
+        if s is None or s.busy or not getattr(s.app, "served", False):
+            return
+        s.direct = not getattr(s, "direct", False)
+        self._write(s, ("Direct: your messages go to OpenCode as you type them; its "
+                        "reply is shown as it gives it.\n") if s.direct else
+                    ("Direct is off: the model briefs OpenCode and reports back.\n"), "sys")
+        self._apply_status()
+
+    def _direct_turn(self, s, emit):
+        """One message straight to OpenCode: opencode_ask with the user's own
+        words, its report as the reply. Every step it wants still comes up as
+        an approval card - the bridge asks, whoever sent the task."""
+        emit("status", ("OpenCode is working" + ELLIPSIS, "muted", True))
+        res = s.mcp.call_tool("opencode_ask", {"prompt": s.messages[-1]["content"]})
+        reply = eng.mcp_result_to_text(res).strip() or "(OpenCode said nothing)"
+        emit("token", reply)
+        emit("stream_end", None)
+        s.messages.append({"role": "assistant", "content": reply})
+        s.record.status = ("response complete" if not (isinstance(res, dict) and res.get("isError"))
+                           else "needs attention: " + reply.split("\n")[0][:120])
 
     def _learn(self, s, executor, emit):
         """What the run leaves in the app's notebook, said in the tab. The
