@@ -78,6 +78,9 @@ this PC's files and the web instead. Two moving parts:
   handed to `studio_scene.loft`. No tkinter.
 - **`studio_civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
   for the Image Studio's LoRA library. No tkinter. See *The Image Studio*.
+- **`studio_catalog.py`** — the Image Studio's Add-ons: LoRAs sorted by the model they
+  work with, CivitAI's catalog per model, thumbnails Tk can show, uninstall to the
+  Recycle Bin. No tkinter (the window is `AddonsWindow`). See *Add-ons*.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
@@ -492,6 +495,9 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   **"Always on"** LoRA (`always` in the library): it joins every picture whose model it
   suits, at its library strength, and is skipped quietly for other families, because
   "suits" is the rule the user set. One added by hand keeps the form's strength.
+  Since Add-ons (2026-09-26) the *form* no longer offers an incompatible LoRA at all,
+  so these warnings are for what reaches `compose` another way: an identity's or a
+  style's LoRA, or a history record's settings.
 - **A LoRA mix is a preset.** "Save as preset…" under the form's LoRAs stores the
   rows and strengths (`presets.json`, `clean_preset`) on the built-in preset then
   chosen (`base`: refine, face pass, size, routing role). It is listed in the Preset
@@ -916,6 +922,61 @@ references cut to the face gave her glasses, face shape and mouth, in the
 picture's own pose. `StudioMatchTone` on a swapped face posterized it
 into cyan and green blotches: its per-channel curves are too steep on
 smooth skin. Use `ColorTransfer` there, not the curves.
+
+### Add-ons: LoRAs per model
+
+The user asked (2026-09-26) for "add ons for the current image editor. think jellyfin add
+ons but for my specific models. if something i have doesn't work with that model it
+isnt showed as a lora". So a LoRA's "server version" is the model:
+
+- **The form offers only what fits the chosen model** (`ImageStudio._offered`:
+  `enabled`, and `ig.lora_fits` is not False). `lora_fits` asks every family the model
+  runs as (`model_families`: its own and any a backend overrides it with), so a LoRA is
+  offered if it works wherever the model may run. Add LoRA lists only those, with a
+  "Model not set - may not work" submenu for LoRAs of unknown family (hiding those
+  could hide one that works) and "Find more for <model>…" into the catalog. Rows
+  already on the form that stop fitting when the model changes are **parked**
+  (`parked`, id -> strength), said in a faint line under the rows, and come back at
+  their strength when a fitting model is chosen again; `collect` never sends them.
+  A saved LoRA mix none of whose LoRAs fit is left out of the Preset row.
+- **`enabled`** on a LoRA record (default on) is Add-ons' Turn off: kept installed,
+  not offered on the form, and not added as Always on. A LoRA named explicitly
+  (history, identity, style) still applies, so Generate Again reproduces.
+- **`AddonsWindow`** (the LoRA row's "Add-ons…"): a pill per model plus "Other models"
+  (LoRAs whose family fits none of the library's models, like Qwen-Image-Edit's, which
+  no form model loads), and two tabs. *Installed* is the model's LoRAs (`sorted_for`:
+  fitting, then family not set) as cards: preview, category, strength, trigger, which
+  checked backends have the file (`where_installed`), a "Made for" menu, Turn off,
+  Always on, Page, Uninstall. *Catalog* is CivitAI's `/models` search with
+  `types=LORA`, `nsfw=false` and the model's own `baseModel` names
+  (`civitai.FAMILY_BASES`, checked against the live API: Z-Image is `ZImageTurbo` +
+  `ZImageBase`, FLUX.1 dev `Flux.1 D`), sorted by downloads, rating or date, with a
+  query and cursor paging ("More"). CivitAI lists a model under every base any version
+  was trained for, so a card (`card`) is the newest version whose base suits the model:
+  the Hands LoRA shows its F1D version under FLUX and its ZIB one under Z-Image. A card
+  already in the library (`installed_as`: hash, then `modelVersionId` in `source`, then
+  filename) says Installed. Install is the importer's `import_link` into the LoRA
+  folder of a backend on this PC that has the model ready (else any with a folder),
+  then Check connections, since `compose` leaves out a LoRA the backend's last-read
+  list lacks.
+- **Pictures are PNG because Tk reads no JPEG**, and CivitAI's image CDN serves JPEG
+  whatever is asked for (`Accept`, the URL's extension). `to_png` converts a batch in
+  one PowerShell run through Windows' own System.Drawing (script by
+  `-EncodedCommand`, pairs as JSON on stdin, a `studio_procs.spawn` child), resized to
+  `THUMB` px; cached in `image-studio/addon-thumbs/`. Installed previews that are not
+  PNG or GIF get a PNG copy there (`previews`). Only a picture CivitAI rates PG or
+  PG-13 (`nsfwLevel` 1 or 2) is shown (`safe_preview`, asked for at `width=320`);
+  without one the card says "no safe preview". Model-level `nsfwLevel` is a bitmask
+  of every image and flags nearly everything, so it is not used to hide cards.
+- **Uninstall is two clicks and the Recycle Bin**: `recycle` is `SHFileOperationW`
+  with `FOF_ALLOWUNDO`, never a hard delete, for every copy in a backend's LoRA folder
+  on this PC, then the record goes. The first click names what uses it
+  (`users_of`: identities, styles, saved mixes). A LoRA whose file is only on another
+  machine cannot be removed from here and is turned off instead: taking just its
+  record out would be undone by the next backend scan (`merge_loras`).
+
+Tests: `test_catalog.py` (engine, CivitAI canned; the PowerShell conversion runs for
+real on a BMP it writes) and `TestImageStudioTab` (offering, parking, the window).
 
 ### Try On: dressing a person from pictures
 

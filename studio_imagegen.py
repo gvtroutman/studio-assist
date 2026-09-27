@@ -218,6 +218,24 @@ def compatibility(lora_family, model_family):
     return model_family in COMPATIBLE.get(lora_family, {lora_family})
 
 
+def model_families(model):
+    """Every family a logical model runs as: its own, and any a backend's
+    entry overrides it with."""
+    fams = {model.get("family") or ""}
+    fams.update((over or {}).get("family") or "" for over in model.get("backends", {}).values())
+    return {f for f in fams if f}
+
+
+def lora_fits(lora, model):
+    """Does `lora` work with `model` wherever it runs? True, False, or None
+    when the LoRA's family is not known. What the form offers and the
+    Add-ons window files it under (AGENTS.md "Add-ons")."""
+    fams = model_families(model) if model else set()
+    if not lora.get("family") or not fams:
+        return None
+    return any(compatibility(lora["family"], f) for f in fams)
+
+
 # ================================================================= records
 # Everything on disk is re-validated on load: a hand-edited or wrecked file
 # costs the record, never the tab (the settings file's rule).
@@ -316,6 +334,8 @@ def clean_lora(d):
         "trigger": _str(d.get("trigger")),
         "strength": _num(d.get("strength", 0.8), float, 0.8, -2.0, 2.0),
         "always": bool(d.get("always")),
+        # Off in Add-ons: kept, but not offered on the form or added as Always on.
+        "enabled": d.get("enabled", True) is not False,
         "body_control": _str(d.get("body_control")) if d.get("body_control") in
                         ("chest_female", "chest_male") else "",
         "family": _str(d.get("family")),
@@ -3482,10 +3502,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         stack.append((rec, sel.get("strength", rec["strength"]), "added"))
     # "Always on" LoRAs join every picture from a model they suit, at their
     # library strength, unless already in the stack. One for another family
-    # is skipped without a warning: that is what "suits" means here.
+    # is skipped without a warning: that is what "suits" means here. So is one
+    # turned off in Add-ons.
     have_ids = {rec["id"] for rec, _, _ in stack}
     for rec in lib.all("loras"):
-        if (rec.get("always") and rec["id"] not in have_ids
+        if (rec.get("always") and rec.get("enabled", True) and rec["id"] not in have_ids
                 and compatibility(rec["family"], family) is not False):
             stack.append((rec, rec["strength"], "always on"))
 

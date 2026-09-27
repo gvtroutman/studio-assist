@@ -23,6 +23,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import filedialog
 
+import studio_catalog as catalog
 import studio_civitai as civitai
 import studio_model_sources as model_sources
 import studio_discovery as discovery
@@ -256,6 +257,9 @@ class ImageStudio:
         self.settings = ig.default_settings()
         self.idents = {}              # identity id -> (BooleanVar, DoubleVar, scale row)
         self.loras = []               # [{"id", "var", "row"}]
+        # LoRAs taken off the rows because they do not work with the chosen
+        # model (or are off in Add-ons): id -> strength, back when they fit.
+        self.parked = {}
         self.refs = {}                # kind -> local path
         self.pose = None              # the drawn stick figure (PoseEditor), or None
         self.planned_size = (1024, 1024)   # the picture's size, as last composed
@@ -568,11 +572,14 @@ class ImageStudio:
         self.cap(self.adv_box, "LoRAs").pack(**pad)
         self.lora_box = self.frame(self.adv_box)
         self.lora_box.pack(side="top", fill="x", **pad)
+        self.parked_note = self.label(self.adv_box, "", "faint", self.host.f_small,
+                                      wraplength=self.px(380))
         lrow = self.frame(self.adv_box)
         lrow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.lora_row = lrow
         self.add_lora_pill = self.button(lrow, "Add LoRA  ▾", self._post_lora_menu)
         self.add_lora_pill.pack(side="left")
-        self.button(lrow, "Library…", self.edit_loras, kind="ghost").pack(
+        self.button(lrow, "Add-ons…", self.open_addons, kind="ghost").pack(
             side="left", padx=(self.px(6), 0))
         self.button(lrow, "Save as preset…", self.save_preset, kind="ghost").pack(
             side="left", padx=(self.px(6), 0))
@@ -696,6 +703,7 @@ class ImageStudio:
         for lid, strength in kept:
             if lib.get("loras", lid):
                 self._add_lora(lid, strength, recheck=False)
+        self._refit_loras()
 
     def _rebuild_models(self):
         """The model and backend choosers. Each model says which online
@@ -719,7 +727,7 @@ class ImageStudio:
         if models and self.settings["model"] not in dict(models):
             self.settings["model"] = models[0][0]
         self.choice(self.model_row, models, self.settings["model"],
-                    lambda v: self._set("model", v)).pack(side="top", anchor="w")
+                    self._set_model).pack(side="top", anchor="w")
         backs = [("auto", "Auto (route by preset)")] + [(b["id"], b["name"])
                                                         for b in lib.all("backends")]
         if self.settings["backend"] not in dict(backs):
@@ -732,6 +740,14 @@ class ImageStudio:
         self.settings[key] = value
         self._recheck()
 
+    def _set_model(self, value):
+        """Another model: the LoRA rows and saved mixes that do not work with
+        it are set aside, and those set aside that do come back."""
+        self.settings["model"] = value
+        self._refit_loras()
+        self._build_presets()
+        self._recheck()
+
     def _build_presets(self):
         """The Preset row: the built-ins, then the saved LoRA mixes, and a
         Delete beside a saved one. Built again when a mix is saved or
@@ -739,7 +755,11 @@ class ImageStudio:
         for w in self.preset_row.winfo_children():
             w.destroy()
         lib = self.studio.lib
-        mixes = lib.all("presets")
+        # A saved mix none of whose LoRAs work with the model is not offered.
+        model = lib.get("models", self.settings["model"])
+        mixes = [m for m in lib.all("presets") if not m["loras"] or any(
+            ig.lora_fits(r, model) is not False for r in
+            filter(None, (lib.get("loras", x["id"]) for x in m["loras"])))]
         items = [(k, ig.PRESETS[k]["label"]) for k in ig.PRESET_ORDER]
         if mixes:
             items += [(None, "")] + [(m["id"], m["name"]) for m in mixes]
@@ -763,14 +783,18 @@ class ImageStudio:
         for r in [r for r in self.loras if r["id"] in self.preset_mix]:
             r["row"].destroy()
             self.loras.remove(r)
+        for lid in self.preset_mix:
+            self.parked.pop(lid, None)
         self.preset_mix = set()
         for sel in info["loras"]:
             if self.studio.lib.get("loras", sel["id"]):
                 for r in [r for r in self.loras if r["id"] == sel["id"]]:
                     r["row"].destroy()
                     self.loras.remove(r)
+                self.parked.pop(sel["id"], None)
                 self._add_lora(sel["id"], sel["strength"], recheck=False)
                 self.preset_mix.add(sel["id"])
+        self._show_parked()
         if info["loras"] and not self.adv_open:
             self._toggle_advanced()
         self._build_presets()
@@ -1222,32 +1246,97 @@ class ImageStudio:
         self._set_ref("pose", path)
 
     # ----------------------------------------------------------------- LoRAs
+    def _lora_model(self):
+        return self.studio.lib.get("models", self.settings["model"])
+
+    def _offered(self, rec):
+        """Is this LoRA offered with the chosen model? On in Add-ons, and not
+        made for another family (one with no family set is offered, marked)."""
+        return rec.get("enabled", True) and ig.lora_fits(rec, self._lora_model()) is not False
+
+    def lora_menu_items(self):
+        """What Add LoRA offers for the chosen model -> ({category: [record]},
+        [records with no family set]). LoRAs for other models are not in it."""
+        by_cat, unknown = {}, []
+        for r in self.studio.lib.all("loras"):
+            if not self._offered(r):
+                continue
+            if ig.lora_fits(r, self._lora_model()) is None:
+                unknown.append(r)
+            else:
+                by_cat.setdefault(r["category"], []).append(r)
+        return by_cat, unknown
+
     def _post_lora_menu(self):
         menu = tk.Menu(self.add_lora_pill, tearoff=0)
         self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
-        by_cat = {}
-        for r in self.studio.lib.all("loras"):
-            by_cat.setdefault(r["category"], []).append(r)
-        if not by_cat:
-            menu.add_command(label="The library is empty - open Library… and Scan",
-                             state="disabled")
-        for cat in ig.CATEGORIES:
-            if cat not in by_cat:
-                continue
+        by_cat, unknown = self.lora_menu_items()
+        model = self._lora_model()
+        label = model["label"] if model else "this model"
+
+        def submenu(title, recs):
             sub = tk.Menu(menu, tearoff=0)
             self.skin(sub, bg="card", fg="text", activebackground="sel",
                       activeforeground="text")
-            for r in sorted(by_cat[cat], key=lambda r: r["name"].lower()):
-                fam = ig.FAMILIES.get(r["family"], r["family"])
-                sub.add_command(label="%s%s" % (r["name"], "  (%s)" % fam if fam else ""),
-                                command=lambda i=r["id"]: self._add_lora(i))
-            menu.add_cascade(label=cat, menu=sub)
+            for r in sorted(recs, key=lambda r: r["name"].lower()):
+                sub.add_command(label=r["name"], command=lambda i=r["id"]: self._add_lora(i))
+            menu.add_cascade(label=title, menu=sub)
+        if not by_cat and not unknown:
+            menu.add_command(label="Nothing installed for %s yet" % label, state="disabled")
+        for cat in ig.CATEGORIES:
+            if cat in by_cat:
+                submenu(cat, by_cat[cat])
+        if unknown:
+            menu.add_separator()
+            submenu("Model not set - may not work", unknown)
+        menu.add_separator()
+        menu.add_command(label="Find more for %s%s" % (label, ELLIPSIS),
+                         command=lambda: self.open_addons("catalog"))
         p = self.add_lora_pill
         menu.tk_popup(p.winfo_rootx(), p.winfo_rooty() + p.winfo_height())
+
+    def open_addons(self, tab="installed"):
+        return AddonsWindow(self, tab)
+
+    def _refit_loras(self):
+        """Rows for LoRAs that do not suit the chosen model go to `parked`;
+        parked ones that suit it now come back, at their strength."""
+        lib = self.studio.lib
+        for r in list(self.loras):
+            rec = lib.get("loras", r["id"])
+            if rec is not None and not self._offered(rec):
+                self.parked[r["id"]] = r["var"].get()
+                r["row"].destroy()
+                self.loras.remove(r)
+        for lid, strength in list(self.parked.items()):
+            rec = lib.get("loras", lid)
+            if rec is None:
+                del self.parked[lid]
+            elif self._offered(rec):
+                del self.parked[lid]
+                self._add_lora(lid, strength, recheck=False)
+        self._show_parked()
+
+    def _show_parked(self):
+        lib = self.studio.lib
+        names = [lib.get("loras", lid)["name"] for lid in self.parked if lib.get("loras", lid)]
+        if not names:
+            self.parked_note.pack_forget()
+            return
+        model = self._lora_model()
+        self.parked_note.config(text="Set aside for %s (made for another model, or off in "
+                                "Add-ons): %s" % (model["label"] if model else "this model",
+                                                  ", ".join(names)))
+        self.parked_note.pack(side="top", fill="x", before=self.lora_row,
+                              padx=(self.px(6), self.px(10)))
 
     def _add_lora(self, lid, strength=None, recheck=True):
         rec = self.studio.lib.get("loras", lid)
         if rec is None or any(r["id"] == lid for r in self.loras):
+            return
+        if not self._offered(rec):
+            self.parked[lid] = rec["strength"] if strength is None else strength
+            self._show_parked()
             return
         var = tk.DoubleVar(value=rec["strength"] if strength is None else strength)
         row = self.frame(self.lora_box)
@@ -1416,6 +1505,7 @@ class ImageStudio:
         for r in list(self.loras):
             r["row"].destroy()
         self.loras = []
+        self.parked = {}
         self._rebuild_choices()
         for iid, (bv, sv, sc) in self.idents.items():
             bv.set(iid in chosen)
@@ -4347,3 +4437,497 @@ class LoraImport:
         role = "err" if failed and not (added or updated) else "warn" if failed else "ok"
         o._post("said", ("LoRA import: " + text, role))
         post(("images", ev, ("import-done", (self, self.editor, last, text, role))))
+
+
+class AddonsWindow:
+    """Add-ons: the LoRAs for the models the user has, like a media server's
+    plugin catalog where the "server version" is the model. A pill per model
+    (and one for LoRAs that fit none of them) above two tabs:
+
+    - **Installed** - the library's LoRAs that work with that model, then
+      those whose model is not set. Each can be turned off (kept, not
+      offered on the form), made Always on, told which model it is for, or
+      uninstalled (its file to the Recycle Bin: `studio_catalog.uninstall`).
+    - **Catalog** - CivitAI's LoRAs for that model's own base models, by
+      downloads, rating or date, with a search. Install downloads the file
+      into a LoRA folder on this PC and files it in the library.
+
+    Network and file work is on worker threads; results come back through
+    the tab's queue (`_post("call", ...)`), dropped if the window closed or
+    a newer search replaced them (`gen`)."""
+
+    OTHER = "_other"              # the pill for LoRAs that fit none of the models
+    CONFIRM_MS = 4000             # how long "Click again to uninstall" waits
+
+    def __init__(self, owner, tab="installed", model=None):
+        self.owner = o = owner
+        host = owner.host
+        self.tab = tab if tab in ("installed", "catalog") else "installed"
+        self.model = model or owner.settings["model"]
+        self.sort = civitai.SORTS[0]
+        self.query = tk.StringVar()
+        self.cursor = ""
+        self.gen = 0                  # bumped by each search; late answers are dropped
+        self.busy = False
+        self.stop = threading.Event()
+        self.images = {}              # key -> PhotoImage, kept or Tk drops them
+        self.pics = {}                # key -> the Label that shows it
+        self.cards = []               # the catalog cards shown, in order
+        self.armed = None             # the record id whose Uninstall was clicked once
+        win = self.win = tk.Toplevel(host)
+        win.title("Add-ons")
+        win.transient(host)
+        o.skin(win, bg="bg")
+        win.geometry("%dx%d" % (o.px(820), o.px(760)))
+        win.minsize(o.px(620), o.px(520))
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        head = o.frame(win)
+        head.pack(side="top", fill="x", padx=o.px(16), pady=(o.px(14), 0))
+        o.label(head, "Add-ons", font=host.f_title).pack(side="top", anchor="w")
+        o.label(head, "LoRAs for the models you have. The form only offers a LoRA with a "
+                "model it works with.", "muted", host.f_small,
+                wraplength=o.px(760)).pack(side="top", fill="x")
+        self.model_row = o.frame(win)
+        self.model_row.pack(side="top", fill="x", padx=o.px(16), pady=(o.px(10), 0))
+        self.tab_row = o.frame(win)
+        self.tab_row.pack(side="top", fill="x", padx=o.px(16), pady=(o.px(8), 0))
+        self.tools = o.frame(win)
+        self.tools.pack(side="top", fill="x", padx=o.px(16), pady=(o.px(8), 0))
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(16), pady=o.px(12))
+        o.button(foot, "Close", self.close, kind="ghost").pack(side="right")
+        o.button(foot, "CivitAI key…", self.civitai_key, kind="ghost").pack(
+            side="right", padx=(0, o.px(6)))
+        o.button(foot, "Library…", owner.edit_loras, kind="ghost").pack(
+            side="right", padx=(0, o.px(6)))
+        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(470))
+        self.msg.pack(side="left", fill="x", expand=True)
+        scroll, self.list = o.scrolled(win)
+        scroll.pack(side="top", fill="both", expand=True, padx=o.px(16), pady=(o.px(8), 0))
+        self.show()
+
+    # ------------------------------------------------------------ plumbing
+    def alive(self):
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        self.stop.set()
+        self.win.destroy()
+
+    def status(self, text, role="muted"):
+        if self.alive():
+            self.msg.config(text=text)
+            self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def call(self, fn):
+        """From a worker: run `fn` on the UI thread if the window is open."""
+        self.owner._post("call", lambda: fn() if self.alive() else None)
+
+    def spawn(self, fn, *args):
+        self.owner.host._spawn(self.owner.s.event_id, fn, *args)
+
+    def client(self):
+        return civitai.Client(civitai.load_token(self.owner.studio.lib.root))
+
+    def thumbs_dir(self):
+        return os.path.join(self.owner.studio.lib.root, "addon-thumbs")
+
+    def model_rec(self):
+        return self.owner.studio.lib.get("models", self.model)
+
+    def library_changed(self):
+        """The form rebuilds from the library (rows, menus, presets)."""
+        self.owner._post("library")
+
+    # -------------------------------------------------------------- layout
+    def show(self):
+        o, lib = self.owner, self.owner.studio.lib
+        models = lib.all("models")
+        if self.model != self.OTHER and not lib.get("models", self.model):
+            self.model = models[0]["id"] if models else self.OTHER
+        for w in self.model_row.winfo_children() + self.tab_row.winfo_children() + \
+                self.tools.winfo_children() + self.list.winfo_children():
+            w.destroy()
+        self.images, self.pics, self.cards, self.armed = {}, {}, [], None
+        self.box = self.list          # where cards go
+        o.label(self.model_row, "For", "muted", o.host.f_small).pack(side="left")
+        for m in models + [{"id": self.OTHER, "label": "Other models"}]:
+            o.button(self.model_row, m["label"], lambda mid=m["id"]: self.pick_model(mid),
+                     kind="accent" if m["id"] == self.model else "quiet").pack(
+                side="left", padx=(o.px(6), 0))
+        for key, text in (("installed", "Installed"), ("catalog", "Catalog")):
+            o.button(self.tab_row, text, lambda k=key: self.pick_tab(k),
+                     kind="accent" if key == self.tab else "ghost").pack(
+                side="left", padx=(0, o.px(6)))
+        self.list.canvas.yview_moveto(0)
+        if self.tab == "installed":
+            self.show_installed()
+        else:
+            self.show_catalog()
+
+    def pick_model(self, mid):
+        self.model = mid
+        self.gen += 1
+        self.show()
+
+    def pick_tab(self, key):
+        self.tab = key
+        self.gen += 1
+        self.show()
+
+    def heading(self, text, about=""):
+        o = self.owner
+        o.cap(self.list, text)
+        if about:
+            o.label(self.list, about, "faint", o.host.f_small,
+                    wraplength=o.px(740)).pack(side="top", fill="x")
+
+    def card_frame(self):
+        """A card: picture on the left, words in the middle, buttons right."""
+        o = self.owner
+        card = o.frame(self.box, bg="card")
+        card.pack(side="top", fill="x", pady=(o.px(6), 0))
+        holder = o.frame(card, bg="card")      # a fixed square, whatever the picture's shape
+        holder.config(width=o.px(92), height=o.px(92))
+        holder.pack_propagate(False)
+        holder.pack(side="left", padx=o.px(8), pady=o.px(8), anchor="n")
+        pic = o.label(holder, "", "faint", o.host.f_small, bg="card")
+        pic.config(anchor="center", justify="center")
+        pic.pack(fill="both", expand=True)
+        right = o.frame(card, bg="card")
+        right.pack(side="right", padx=o.px(8), pady=o.px(8), anchor="n")
+        mid = o.frame(card, bg="card")
+        mid.pack(side="left", fill="x", expand=True, pady=o.px(8))
+        return card, pic, mid, right
+
+    def set_pictures(self, paths):
+        """{key: PNG path} into the cards' picture labels."""
+        side = self.owner.px(84)
+        for key, path in paths.items():
+            lbl = self.pics.get(key)
+            if lbl is None or not lbl.winfo_exists():
+                continue
+            img = photo_at(path, side, self.win)
+            if img is not None:
+                self.images[key] = img
+                lbl.config(image=img, text="")
+
+    # ----------------------------------------------------------- installed
+    def show_installed(self):
+        o, lib = self.owner, self.owner.studio.lib
+        if self.model == self.OTHER:
+            recs = catalog.fits_none(lib)
+            self.heading("Fits none of your models (%d)" % len(recs),
+                         "Made for a model you do not generate with, so the form never offers "
+                         "them. Uninstall to free the space, or set the model if it is wrong.")
+            for rec in recs:
+                self.installed_card(rec)
+            if not recs:
+                o.label(self.list, "None.", "muted").pack(side="top", anchor="w")
+        else:
+            model = self.model_rec()
+            fits, unknown = catalog.sorted_for(lib, model)
+            fam = ig.FAMILIES.get(model["family"], model["family"])
+            self.heading("Works with %s (%d)" % (model["label"], len(fits)),
+                         "Made for %s. Turned off, a LoRA stays installed but is not offered "
+                         "on the form." % fam)
+            for rec in fits:
+                self.installed_card(rec)
+            if not fits:
+                row = o.frame(self.list)
+                row.pack(side="top", fill="x", pady=o.px(6))
+                o.label(row, "Nothing installed for %s yet." % model["label"], "muted").pack(
+                    side="left")
+                o.button(row, "Browse the catalog", lambda: self.pick_tab("catalog"),
+                         kind="accent").pack(side="left", padx=o.px(8))
+            if unknown:
+                self.heading("Model not set (%d)" % len(unknown),
+                             "Offered with every model, marked “may not work”, until "
+                             "you say which model each was made for.")
+                for rec in unknown:
+                    self.installed_card(rec)
+        shown = [r for r in lib.all("loras") if r["id"] in self.pics]
+        folder = self.thumbs_dir()
+
+        def work():
+            pics = catalog.previews(shown, folder)
+            self.call(lambda: self.set_pictures(pics))
+        self.spawn(work)
+
+    def installed_card(self, rec):
+        o, host, studio = self.owner, self.owner.host, self.owner.studio
+        card, pic, mid, right = self.card_frame()
+        self.pics[rec["id"]] = pic
+        on = rec.get("enabled", True)
+        o.label(mid, rec["name"], "text" if on else "faint", host.f_bold, bg="card",
+                wraplength=o.px(440)).pack(side="top", fill="x")
+        bits = [rec["category"], "strength %.2g" % rec["strength"]]
+        if rec.get("always"):
+            bits.append("always on")
+        if not on:
+            bits.insert(0, "off")
+        o.label(mid, " · ".join(bits), "muted", host.f_small, bg="card").pack(
+            side="top", fill="x")
+        if rec.get("trigger"):
+            o.label(mid, "Trigger: " + rec["trigger"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x")
+        where_on, where_off = catalog.where_installed(rec, studio.backends(),
+                                                      studio.inventories)
+        if where_on or where_off:
+            text = ("On " + ", ".join(where_on) if where_on else "") + (
+                ("; " if where_on else "") + "not on " + ", ".join(where_off)
+                if where_off else "")
+            o.label(mid, text, "muted" if where_on else "warn", host.f_small,
+                    bg="card").pack(side="top", fill="x")
+        fams = [("", "Model not set")] + list(ig.FAMILIES.items())
+        o.choice(mid, [(k, "Made for " + v if k else v) for k, v in fams], rec["family"],
+                 lambda v, r=rec: self.set_family(r, v), bg="card").pack(
+            side="top", anchor="w", pady=(o.px(4), 0))
+        o.button(right, "Turn off" if on else "Turn on",
+                 lambda r=rec: self.flip(r, "enabled"), bg="card",
+                 kind="option" if on else "accent").pack(side="top", fill="x")
+        o.button(right, "Always on ✓" if rec.get("always") else "Always on",
+                 lambda r=rec: self.flip(r, "always"), kind="option", bg="card").pack(
+            side="top", fill="x", pady=(o.px(4), 0))
+        if rec.get("source", "").startswith("https://civitai.com/"):
+            o.button(right, "Page", lambda u=rec["source"]: webbrowser.open(u),
+                     kind="option", bg="card").pack(side="top", fill="x", pady=(o.px(4), 0))
+        b = o.button(right, "Uninstall", lambda: None, kind="option", bg="card")
+        b.command = lambda r=rec, b=b: self.uninstall(r, b)
+        b.pack(side="top", fill="x", pady=(o.px(4), 0))
+        return card
+
+    def save_library(self, what):
+        try:
+            self.owner.studio.lib.save("loras")
+        except OSError as e:
+            self.status("Could not save the library: %s" % e, "err")
+            return False
+        self.library_changed()
+        self.status(what, "ok")
+        return True
+
+    def flip(self, rec, key):
+        rec[key] = not rec.get(key, key == "enabled")
+        if key == "enabled":
+            what = "%s is %s." % (rec["name"], "on" if rec[key] else
+                                  "off: installed, but not offered on the form")
+        else:
+            what = "%s is %s." % (rec["name"], "always on for the models it suits"
+                                  if rec[key] else "no longer always on")
+        if self.save_library(what):
+            self.show()
+
+    def set_family(self, rec, fam):
+        rec["family"] = fam
+        what = "%s: made for %s." % (rec["name"], ig.FAMILIES.get(fam, "no model set"))
+        if self.save_library(what):
+            self.show()
+
+    def uninstall(self, rec, button):
+        """First click arms it; the second, within CONFIRM_MS, uninstalls. A
+        LoRA with no file on this PC is turned off instead."""
+        studio = self.owner.studio
+        if self.armed != rec["id"]:
+            self.armed = rec["id"]
+            button.set(text="Click again")
+            used = catalog.users_of(studio.lib, rec)
+            self.status("Uninstall %s? Its file goes to the Recycle Bin.%s" % (
+                rec["name"], " Used by " + ", ".join(used) + "." if used else ""), "warn")
+            self.win.after(self.CONFIRM_MS, lambda: self.disarm(rec["id"], button))
+            return
+        self.armed = None
+        try:
+            paths = catalog.uninstall(studio.lib, rec, studio.backends())
+        except ValueError:
+            rec["enabled"] = False
+            if self.save_library("%s's file is not on this PC (only on another machine), "
+                                 "so it is turned off instead." % rec["name"]):
+                self.show()
+            return
+        except OSError as e:
+            self.status("Could not uninstall %s: %s" % (rec["name"], e), "err")
+            return
+        self.library_changed()
+        self.owner.refresh_backends()
+        self.status("Uninstalled %s: %s in the Recycle Bin." % (
+            rec["name"], ", ".join(os.path.basename(p) for p in paths)), "ok")
+        self.show()
+
+    def disarm(self, rid, button):
+        if self.armed == rid and self.alive() and button.winfo_exists():
+            self.armed = None
+            button.set(text="Uninstall")
+            self.status("")
+
+    # ------------------------------------------------------------- catalog
+    def show_catalog(self):
+        o = self.owner
+        model = self.model_rec() if self.model != self.OTHER else None
+        if model is None:
+            o.label(self.list, "Pick one of your models above to browse LoRAs made for it.",
+                    "muted").pack(side="top", anchor="w", pady=o.px(8))
+            return
+        bases = catalog.bases_for(model)
+        if not bases:
+            o.label(self.list, "CivitAI files no LoRAs under %s's model family (%s)." % (
+                model["label"], model["family"] or "not set"), "muted",
+                wraplength=o.px(740)).pack(side="top", anchor="w", pady=o.px(8))
+            return
+        e = o.host._entry(self.tools, self.query)
+        e.master.pack(side="left", fill="x", expand=True)
+        e.bind("<Return>", lambda ev: self.search())
+        o.choice(self.tools, [(s, s) for s in civitai.SORTS], self.sort, self.set_sort).pack(
+            side="left", padx=(o.px(6), 0))
+        o.button(self.tools, "Search", self.search, kind="accent").pack(
+            side="left", padx=(o.px(6), 0))
+        self.heading("CivitAI LoRAs for %s" % model["label"],
+                     "Listed under %s. Only pictures CivitAI rates PG or PG-13 are shown; "
+                     "check a LoRA's page before installing." % ", ".join(bases))
+        self.box = o.frame(self.list)
+        self.box.pack(side="top", fill="x")
+        self.search()
+
+    def set_sort(self, value):
+        self.sort = value
+        self.search()
+
+    def search(self, more=False):
+        """A page of the catalog, on a worker. `more` appends the next page."""
+        model = self.model_rec()
+        if model is None:
+            return
+        self.gen += 1
+        gen, cursor = self.gen, self.cursor if more else ""
+        if not more:
+            self.cursor = ""
+            for w in self.box.winfo_children():
+                w.destroy()
+            self.cards = []
+        self.busy = True
+        self.status("Asking CivitAI" + ELLIPSIS, "accent")
+        client, query, sort = self.client(), self.query.get(), self.sort
+        folder, stop = self.thumbs_dir(), self.stop
+
+        def work():
+            try:
+                cards, nxt = catalog.search(client, model, query, sort, cursor)
+            except civitai.CivitAIError as e:
+                self.call(lambda: self.searched(gen, [], "", str(e)))
+                return
+            self.call(lambda: self.searched(gen, cards, nxt, ""))
+            pics = catalog.thumbnails(client, {c["version_id"]: c["preview_url"]
+                                               for c in cards}, folder, stop)
+            self.call(lambda: gen == self.gen and self.set_pictures(pics))
+        self.spawn(work)
+
+    def searched(self, gen, cards, nxt, error):
+        if gen != self.gen:
+            return
+        self.busy = False
+        o = self.owner
+        for w in self.box.winfo_children():
+            if getattr(w, "more", False):
+                w.destroy()
+        if error:
+            self.status(error, "err")
+            return
+        self.cursor = nxt
+        self.cards += cards
+        for c in cards:
+            self.catalog_card(c)
+        if not self.cards:
+            o.label(self.box, "Nothing found.", "muted").pack(side="top", anchor="w",
+                                                                pady=o.px(8))
+        if nxt:
+            b = o.button(self.box, "More", lambda: self.search(more=True), kind="ghost")
+            b.more = True
+            b.pack(side="top", pady=o.px(10))
+        self.status("%d LoRAs for %s." % (len(self.cards), self.model_rec()["label"]))
+
+    def catalog_card(self, c):
+        o, host = self.owner, self.owner.host
+        card, pic, mid, right = self.card_frame()
+        pic.config(text="no safe\npreview" if not c["preview_url"] else "")
+        self.pics[c["version_id"]] = pic
+        name = c["name"] + (" · " + c["version"] if c["version"] else "")
+        o.label(mid, name, "text", host.f_bold, bg="card",
+                wraplength=o.px(440)).pack(side="top", fill="x")
+        bits = [x for x in ("by " + c["creator"] if c["creator"] else "",
+                            "↓ " + catalog.human_count(c["downloads"]),
+                            c["base_model"], c["category"],
+                            "%.0f MB" % (c["size"] / 1048576.0) if c["size"] else "") if x]
+        o.label(mid, " · ".join(bits), "muted", host.f_small, bg="card").pack(
+            side="top", fill="x")
+        if c["about"]:
+            o.label(mid, c["about"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x", pady=(o.px(2), 0))
+        if c["trigger"]:
+            o.label(mid, "Trigger: " + c["trigger"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x")
+        have = catalog.installed_as(self.owner.studio.lib, c)
+        b = o.button(right, "Installed" if have else "Install", lambda: None,
+                     kind="option" if have else "accent", bg="card")
+        b.command = lambda c=c, b=b: self.install(c, b)
+        if have:
+            b.set(state="disabled")
+        b.pack(side="top", fill="x")
+        o.button(right, "Page", lambda u=c["link"]: webbrowser.open(u), kind="option",
+                 bg="card").pack(side="top", fill="x", pady=(o.px(4), 0))
+        return card
+
+    def install_folder(self):
+        """(backend id, LoRA folder on this PC) to install into: a backend
+        that has this model ready first, else any with a folder here."""
+        studio = self.owner.studio
+        folders = [bid for bid, _ in self.owner.lora_folders()]
+        if not folders:
+            return None
+        ready = studio.readiness(self.model_rec()) if self.model_rec() else {}
+        bid = next((b for b in folders if ready.get(b, ("",))[0] == "ready"), folders[0])
+        return bid, studio.backend(bid)["lora_dir"]
+
+    def install(self, c, button):
+        where = self.install_folder()
+        if where is None:
+            self.status("No backend has a LoRA folder on this PC, so there is nowhere to put "
+                        "the file. Set one in Backends… (LoRA folder).", "err")
+            return
+        bid, folder = where
+        button.set(state="disabled", text="Installing" + ELLIPSIS)
+        lib, client, stop = self.owner.studio.lib, self.client(), self.stop
+
+        def say(text):
+            self.call(lambda: self.status(" ".join(str(text).split()), "accent"))
+
+        def work():
+            try:
+                rec, _new = catalog.install(lib, client, c, folder, say, stop)
+            except Exception as e:           # said; the window stays usable
+                why = str(e) if isinstance(e, civitai.CivitAIError) else "%s: %s" % (
+                    type(e).__name__, e)
+                self.call(lambda: self.installed(c, button, bid, None, why))
+                return
+            self.call(lambda: self.installed(c, button, bid, rec, ""))
+        self.spawn(work)
+
+    def installed(self, c, button, bid, rec, error):
+        if button.winfo_exists():
+            button.set(state="normal" if error else "disabled",
+                       text="Install" if error else "Installed")
+        if error:
+            key = "API key" in error or "401" in error or "403" in error
+            self.status("Could not install %s: %s%s" % (
+                c["name"], error, " Paste one under CivitAI key…" if key else ""), "err")
+            return
+        self.library_changed()
+        self.owner.refresh_backends()     # so the form knows the file is there
+        self.status("Installed %s into %s. It is on the form's Add LoRA menu for %s." % (
+            rec["name"], self.owner.studio.backend(bid)["name"],
+            self.model_rec()["label"]), "ok")
+
+    def civitai_key(self):
+        return ModelSourceSettings(self.owner, "civitai")

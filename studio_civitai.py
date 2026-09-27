@@ -56,6 +56,20 @@ BASE_FAMILIES = [
     ("sd 1.5", "sd15"), ("sd1.5", "sd15"), ("sd 1.4", "sd15"),
 ]
 
+# The other way: the `baseModel` names CivitAI files a family's LoRAs under,
+# which its search takes verbatim (checked against the live API 2026-09-26).
+# Z-Image Base LoRAs are listed with Turbo's: they run on Turbo.
+FAMILY_BASES = {
+    "z-image": ("ZImageTurbo", "ZImageBase"),
+    "flux1": ("Flux.1 D",),
+    "flux1-kontext": ("Flux.1 Kontext",),
+    "qwen-image": ("Qwen",),
+    "krea2": ("Krea 2",),
+    "sdxl": ("SDXL 1.0", "Pony", "Illustrious"),
+    "sd15": ("SD 1.5",),
+}
+SORTS = ("Most Downloaded", "Highest Rated", "Newest")
+
 # What trainers write into the header about the base model.
 HEADER_FAMILIES = [
     ("kontext", "flux1-kontext"), ("flux-2", "flux2"), ("flux2", "flux2"),
@@ -186,6 +200,22 @@ class Client:
             if isinstance(e.__cause__, urllib.error.HTTPError) and e.__cause__.code == 404:
                 return None
             raise
+
+    def search(self, bases, query="", sort=SORTS[0], cursor="", limit=24):
+        """One page of LoRAs filed under any of `bases` (CivitAI's own
+        `baseModel` names, FAMILY_BASES) -> (models, next cursor or "").
+        Always cursor paging: CivitAI refuses page numbers with a query.
+        `nsfw=false` leaves out models their creators marked as adult."""
+        params = [("types", "LORA"), ("sort", sort if sort in SORTS else SORTS[0]),
+                  ("limit", str(int(limit))), ("nsfw", "false")]
+        params += [("baseModels", b) for b in bases]
+        if query.strip():
+            params.append(("query", query.strip()))
+        if cursor:
+            params.append(("cursor", cursor))
+        data = self.get("/models?" + urllib.parse.urlencode(params))
+        items = [m for m in data.get("items") or [] if isinstance(m, dict)]
+        return items, str((data.get("metadata") or {}).get("nextCursor") or "")
 
     def lookup(self, link):
         """(version, model) for a parsed link. A model link with no version

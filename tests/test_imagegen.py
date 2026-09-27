@@ -2236,10 +2236,171 @@ class TestImageStudioTab(unittest.TestCase):
         ui.studio.lib.save("loras", [{"id": "xl", "file": "xl_thing.safetensors",
                                       "name": "XL thing", "family": "sdxl"}])
         ui._rebuild_choices()
+        # A LoRA for another model never reaches the rows: it is set aside
+        # and said, not applied and warned about (Add-ons).
         ui._add_lora("xl")
-        self.assertIn("left out", ui.warn.cget("text"))
-        ui._drop_lora(ui.loras[0])
+        self.assertEqual(ui.loras, [])
+        self.assertIn("XL thing", ui.parked_note.cget("text"))
         self.assertNotIn("left out", ui.warn.cget("text"))
+        ui.studio.lib.save("loras", [])
+        ui._rebuild_choices()
+        self.assertEqual(ui.parked, {})
+
+    def test_only_loras_for_the_chosen_model_are_offered(self):
+        s, ui = self.tab()
+        lib = ui.studio.lib
+        lib.save("loras", [
+            {"id": "skin", "file": "skin.safetensors", "name": "Skin", "family": "z-image",
+             "category": "Detail / Enhancement"},
+            {"id": "grain", "file": "grain.safetensors", "name": "Grain", "family": "flux1",
+             "category": "Style"},
+            {"id": "edit", "file": "edit.safetensors", "name": "Edit", "family": "qwen-image"},
+            {"id": "old", "file": "old.safetensors", "name": "Old", "family": "z-image",
+             "enabled": False},
+            {"id": "mystery", "file": "mystery.safetensors", "name": "Mystery"}])
+        lib.save("presets", [{"id": "zmix", "name": "Z mix", "base": "standard",
+                              "loras": [{"id": "skin", "strength": 0.5}]}])
+        for r in list(ui.loras):
+            ui._drop_lora(r)
+        ui._set_model("z-image-turbo")
+        ui._rebuild_choices()
+
+        def offered():
+            by_cat, unknown = ui.lora_menu_items()
+            return ({c: [r["id"] for r in v] for c, v in by_cat.items()},
+                    [r["id"] for r in unknown])
+        self.assertEqual(offered(), ({"Detail / Enhancement": ["skin"]}, ["mystery"]))
+        ui._add_lora("skin", 0.7)
+        ui._add_lora("mystery", 0.3)
+        # FLUX: the Z-Image row is set aside, the unknown one stays, the
+        # Z-Image-only saved mix is not offered.
+        ui._set_model("flux-dev")
+        self.assertEqual(offered(), ({"Style": ["grain"]}, ["mystery"]))
+        self.assertEqual([r["id"] for r in ui.loras], ["mystery"])
+        self.assertEqual(ui.parked, {"skin": 0.7})
+        self.assertTrue(ui.parked_note.winfo_manager())
+        self.assertEqual(ui.collect()["loras"], [{"id": "mystery", "strength": 0.3}])
+        # Back to Z-Image: it returns at its strength, and the note goes.
+        ui._set_model("z-image-turbo")
+        self.assertEqual(sorted((r["id"], r["var"].get()) for r in ui.loras),
+                         [("mystery", 0.3), ("skin", 0.7)])
+        self.assertEqual(ui.parked, {})
+        self.assertFalse(ui.parked_note.winfo_manager())
+        # Turned off in Add-ons: set aside too, back when turned on.
+        lib.get("loras", "skin")["enabled"] = False
+        ui._rebuild_choices()
+        self.assertEqual([r["id"] for r in ui.loras], ["mystery"])
+        lib.get("loras", "skin")["enabled"] = True
+        ui._rebuild_choices()
+        self.assertIn("skin", [r["id"] for r in ui.loras])
+        for r in list(ui.loras):
+            ui._drop_lora(r)
+        lib.save("presets", [])
+        lib.save("loras", [])
+        ui._rebuild_choices()
+
+    def test_saved_mixes_for_another_model_are_not_offered(self):
+        s, ui = self.tab()
+        lib = ui.studio.lib
+        lib.save("loras", [{"id": "skin", "file": "skin.safetensors", "family": "z-image"}])
+        lib.save("presets", [{"id": "zmix", "name": "Z mix", "base": "standard",
+                              "loras": [{"id": "skin", "strength": 0.5}]}])
+        seen = {}
+        real = ui.choice
+
+        def spy(parent, items, current, on_pick, **kw):
+            if parent is ui.preset_row:
+                seen["items"] = [v for v, _ in items if v]
+            return real(parent, items, current, on_pick, **kw)
+        ui.choice = spy
+        try:
+            ui._set_model("z-image-turbo")
+            self.assertIn("zmix", seen["items"])
+            ui._set_model("flux-dev")
+            self.assertNotIn("zmix", seen["items"])
+        finally:
+            ui.choice = real
+            lib.save("presets", [])
+            lib.save("loras", [])
+            ui._set_model("z-image-turbo")
+
+    def test_addons_window_lists_toggles_and_installs(self):
+        import studio_images_ui
+        from unittest.mock import patch
+        s, ui = self.tab()
+        lib = ui.studio.lib
+        lib.save("loras", [
+            {"id": "skin", "file": "skin.safetensors", "name": "Skin", "family": "z-image"},
+            {"id": "grain", "file": "grain.safetensors", "name": "Grain", "family": "flux1"},
+            {"id": "edit", "file": "edit.safetensors", "name": "Edit", "family": "qwen-image"},
+            {"id": "mystery", "file": "mystery.safetensors", "name": "Mystery"}])
+        ui.settings["model"] = "z-image-turbo"
+        win = ui.open_addons()
+        try:
+            names = lambda: [k for k in win.pics]
+            self.assertEqual(names(), ["skin", "mystery"])
+            win.flip(lib.get("loras", "skin"), "enabled")
+            self.assertFalse(ig.Library(lib.root).get("loras", "skin")["enabled"])
+            self.assertIn("not offered", win.msg.cget("text"))
+            win.flip(lib.get("loras", "skin"), "enabled")
+            win.set_family(lib.get("loras", "mystery"), "flux1")
+            self.assertEqual(names(), ["skin"])
+            win.pick_model(win.OTHER)
+            self.assertEqual(names(), ["edit"])
+            win.pick_model("flux-dev")
+            self.assertEqual(sorted(names()), ["grain", "mystery"])
+            # Uninstall asks twice; a file only on another machine is turned off.
+            rec = lib.get("loras", "grain")
+            b = type("B", (), {"set": lambda self, **k: None,
+                               "winfo_exists": lambda self: True})()
+            win.uninstall(rec, b)
+            self.assertIn("Recycle Bin", win.msg.cget("text"))
+            self.assertEqual(win.armed, "grain")
+            win.uninstall(rec, b)
+            self.assertFalse(lib.get("loras", "grain")["enabled"])
+            self.assertIn("turned off instead", win.msg.cget("text"))
+            # The catalog: CivitAI's cards for the model, Install files it.
+            card = {"model_id": 42, "version_id": 7, "name": "Film", "version": "v2",
+                    "creator": "me", "base_model": "Flux.1 D", "family": "flux1",
+                    "downloads": 1200, "category": "Style", "about": "grain",
+                    "trigger": "film", "file": "film.safetensors", "size": 0,
+                    "sha256": "ab" * 32, "preview_url": "",
+                    "link": "https://civitai.com/models/42?modelVersionId=7"}
+            calls = []
+
+            def search(client, model, query="", sort="", cursor=""):
+                calls.append((model["id"], query, sort, cursor))
+                return [card], ""
+
+            def install(lib_, client, c, folder, say=None, stop=None):
+                return lib_.import_lora({"file": c["file"], "family": "flux1",
+                                         "sha256": c["sha256"], "name": c["name"]})
+            with patch.object(studio_images_ui.catalog, "search", side_effect=search), \
+                    patch.object(studio_images_ui.catalog, "thumbnails", return_value={}), \
+                    patch.object(studio_images_ui.catalog, "install", side_effect=install), \
+                    patch.object(ui, "lora_folders", return_value=[("5090", "5090 - D:/l")]), \
+                    patch.object(ui, "refresh_backends"):
+                win.pick_tab("catalog")
+                self.pump(lambda: win.cards)
+                self.assertEqual(calls, [("flux-dev", "", "Most Downloaded", "")])
+                self.assertEqual([c["version_id"] for c in win.cards], [7])
+                (row,) = [w for w in win.box.winfo_children()]
+                button = row.winfo_children()[1].winfo_children()[0]
+                self.assertEqual(button.cget("text"), "Install")
+                with patch.object(ui.studio, "backend",
+                                  return_value={"id": "5090", "name": "5090",
+                                                "lora_dir": "D:/l"}):
+                    button.invoke()
+                    self.pump(lambda: button.cget("text") == "Installed")
+                self.assertIn("Installed Film", win.msg.cget("text"))
+                self.assertIsNotNone(lib.lora_by_file("film.safetensors"))
+                win.search()                           # shown as installed now
+                self.pump(lambda: win.cards and not win.busy)
+                self.assertEqual(calls[-1][0], "flux-dev")
+        finally:
+            win.close()
+            lib.save("loras", [])
+            self.pump(lambda: not self.app.q.qsize())
 
     def test_loras_saved_as_a_preset_come_back_when_it_is_picked(self):
         s, ui = self.tab()
