@@ -798,7 +798,23 @@ Fix uses this same route. Reports are kept in history's `facefusion` field.
 Reference previews are normalized off the Tk thread by `facefusion_previews.py`.
 Tests in `test_facefusion_profiles.py` mock inference; the GUI tests exercise the
 profile menu and editor. Lilya's live final-pass result matched the approved
-standalone HyperSwap result byte-for-byte.
+standalone HyperSwap result byte-for-byte (before the two changes below).
+
+**The swap is pushed past neutral, and drawn at the face's own size**
+(2026-09-27, Gavin: the face swap "isn't as strong as i'd like"). Two FaceFusion
+settings had been left at their defaults. `--face-swapper-weight` (FaceFusion 3.4+)
+was 0.5, which hands HyperSwap the references' identity as it is; above 0.5 the
+identity is extrapolated away from the face being replaced, so less of the
+generated person survives. `studio_facefusion.SWAP_STRENGTH` is 0.8, and a
+profile's own **Face swap strength** (`swap_strength`, 0-1, shown beside the Final
+face swap switch) wins; FaceFusion only takes multiples of 0.05, so `strength()`
+rounds. And `--face-swapper-pixel-boost` was 256: HyperSwap draws at 256 px, so a
+bigger face came back as a soft 256 px face scaled up. `select_target` now sets
+the boost to the smallest size at least 1.5x the chosen face's box (its warped
+crop is about that), up to 1024; the report records `weight` and `pixel_boost`.
+Neither has been measured live yet. The eye pass that follows (0.5) redraws the
+eyes from words on the picture's model, and eyes carry much of a likeness: if a
+swap looks right before the finish passes and weaker after, that is the place.
 
 **The eyes and then the glasses are redrawn after the swap** (Generate only;
 `Studio._finish_passes`). FaceFusion pastes the new face over the frames,
@@ -854,7 +870,10 @@ The node wraps pinned upstream WithAnyone code installed by
 wrapper owns the diffusion model for one call, checks cancellation at each step,
 and releases the model in `finally`; ComfyUI's `/free` cannot free upstream
 models that bypass its model patcher. T5, SigLIP and face detection run on CPU;
-VAE decoding is tiled. Initially only the 32 GB 5090 is enabled. SigLIP folder
+VAE decoding is tiled. The likeness is `siglip_weight` (1.0; ArcFace gets
+`1 - siglip_weight`): upstream's "Resemblance in Spirit <-> Form" slider, whose
+demo default is 1.0. The port's 0.8 was weaker than Gavin wanted (2026-09-27);
+see `docs/withanyone.md` before lowering it. Initially only the 32 GB 5090 is enabled. SigLIP folder
 readiness comes from the node's `/object_info` choices because `/models` lists
 files, not those directories. See `docs/withanyone.md` and
 `tests/test_withanyone.py`; `tools/try_withanyone.py` exercises the real job path.

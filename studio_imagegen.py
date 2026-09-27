@@ -360,6 +360,9 @@ def clean_identity(d):
         "references": _strs(d.get("references")),
         "avatar": _str(d.get("avatar")),
         "face_swap": d.get("face_swap", True) is not False,
+        # FaceFusion's swapper weight (studio_facefusion.SWAP_STRENGTH): 0.5 is
+        # neutral, 1 strongest.
+        "swap_strength": _num(d.get("swap_strength", 0.8), float, 0.8, 0.0, 1.0),
         "reference_strength": _num(d.get("reference_strength", 0.6), float, 0.6, 0.0, 2.0),
         "use_references": d.get("use_references", True) is not False,
         "notes": _str(d.get("notes")),
