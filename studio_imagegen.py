@@ -4112,6 +4112,7 @@ class Job:
         self.graph = None             # the graph as submitted
         self.face_graph = None        # the face pass's graph, when it ran
         self.paste_graph = None       # the real-face paste's graph, when it ran
+        self.passes = []              # [{"label", "graph"}] each `_run_pass`, in order
         self.facefusion = []          # verified final swaps, after all redraws
         self.real_faces = None        # [{"name", "box", "photos"}] for the paste, from the face pass
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
@@ -6212,6 +6213,7 @@ class Studio:
     def _run_pass(self, job, client, graph, say, label):
         """Run one refinement graph to its end. -> files, or None if cancelled.
         Raises ComfyError when it ends without a picture."""
+        job.passes.append({"label": label, "graph": graph})
         job.prompt_id = client.queue_workflow(graph)
 
         def on_event(kind, data):
@@ -6455,6 +6457,7 @@ class Studio:
             "face_graph": job.face_graph,
             "refinement": job.refinement,
             "paste_graph": job.paste_graph,
+            "passes": list(job.passes),
             "facefusion": job.facefusion,
             "dress": job.dress,
         }

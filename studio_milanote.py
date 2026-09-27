@@ -309,7 +309,11 @@ def drop_files(devtools, paths, x, y):
 
 class Browser:
     """The Milanote window: started, found, adopted into a frame, sized with
-    it, and closed. Every method but start() is safe before start()."""
+    it, and closed. Every method but start() is safe before start().
+    `studio_comfy_view.ComfyBrowser` is the same window on another site:
+    `name` is what the sentences call it and `target()` finds its page."""
+
+    name = "Milanote"
 
     def __init__(self, exe=None, profile=None, url=MILANOTE_URL):
         self.exe = exe or browser_exe()
@@ -328,9 +332,10 @@ class Browser:
         """Start the browser and return its window handle. Blocks; call it
         off the UI thread. Raises RuntimeError with a sentence for the user."""
         if not self.exe:
-            raise RuntimeError("Milanote opens in Chrome or Edge, and neither is "
+            raise RuntimeError("%s opens in Chrome or Edge, and neither is "
                                "installed where this app looks. Install Chrome, or "
-                               "set STUDIO_MILANOTE_BROWSER to a Chromium browser.")
+                               "set STUDIO_MILANOTE_BROWSER to a Chromium browser."
+                               % self.name)
         os.makedirs(self.profile, exist_ok=True)
         try:
             os.remove(os.path.join(self.profile, "DevToolsActivePort"))
@@ -341,16 +346,16 @@ class Browser:
         while time.monotonic() < deadline:
             if self.child.proc.poll() is not None:
                 raise RuntimeError(
-                    "the browser for Milanote closed as it opened. Another copy of it "
+                    "the browser for %s closed as it opened. Another copy of it "
                     "may already be using the profile at %s - close that and try again."
-                    % self.profile)
+                    % (self.name, self.profile))
             found = top_windows(self.child.pid)
             if found:
                 self.hwnd = found[0]
                 return self.hwnd
             time.sleep(0.15)
-        raise RuntimeError("the browser started, but its Milanote window did not "
-                           "appear within %d seconds" % WINDOW_WAIT)
+        raise RuntimeError("the browser started, but its %s window did not "
+                           "appear within %d seconds" % (self.name, WINDOW_WAIT))
 
     def embed(self, parent, width, height):
         if self.hwnd and WINDOWS:
@@ -398,12 +403,16 @@ class Browser:
     def page(self):
         """A DevTools session on the page the window shows. Close it."""
         if not self.running():
-            raise RuntimeError("Milanote is not open in this tab")
+            raise RuntimeError("%s is not open in this tab" % self.name)
         port = self.port()
         if not port:
-            raise RuntimeError("the Milanote window is not answering on DevTools; "
-                               "close the tab and open it again")
-        return DevTools(milanote_page(port)["webSocketDebuggerUrl"])
+            raise RuntimeError("the %s window is not answering on DevTools; "
+                               "close the tab and open it again" % self.name)
+        return DevTools(self.target(port)["webSocketDebuggerUrl"])
+
+    def target(self, port):
+        """The DevTools page target this window shows."""
+        return milanote_page(port)
 
     def reload(self):
         dt = self.page()

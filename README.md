@@ -403,6 +403,7 @@ out badly.
 | `studio_agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
 | `studio_mcp.py` | The MCP harness: the server our bridges run on, an in-process client, and `check` — holds any bridge to what the executor and the model need |
 | `studio_milanote.py` | The Milanote tab: its web app in a browser window held in the tab, and uploads dropped onto the board |
+| `studio_comfy_view.py` | The Image Studio's Nodes view: a picture's ComfyUI graph, each step of it, opened in ComfyUI's own editor inside the tab |
 | `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
 | `Studio Assist.cmd` | Console-free launcher used by the shortcuts |
 | `studio_update.py` | Keeps this folder in step with GitHub: `--install` checks every 5 minutes and fast-forwards |
