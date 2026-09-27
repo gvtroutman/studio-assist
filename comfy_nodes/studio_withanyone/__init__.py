@@ -18,6 +18,26 @@ from transformers import AutoProcessor, SiglipVisionModel
 
 import comfy.model_management as mm
 from comfy.utils import ProgressBar
+from .references import MAX_PHOTOS, grouped_references, identity_consensus
+
+
+class StudioWithAnyoneReferences:
+    """Keep differently sized photos intact while building one person's group."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image": ("IMAGE",)},
+                "optional": {"previous": ("STUDIO_FACE_REFERENCES",)}}
+
+    RETURN_TYPES = ("STUDIO_FACE_REFERENCES",)
+    FUNCTION = "append"
+    CATEGORY = "Studio Assist"
+
+    def append(self, image, previous=None):
+        photos = tuple(previous or ()) + (image,)
+        if len(photos) >= MAX_PHOTOS:
+            raise ValueError("WithAnyone supports up to %d photos per person including the primary photo."
+                             % MAX_PHOTOS)
+        return (photos,)
 
 
 def siglip_models():
@@ -42,7 +62,9 @@ class StudioWithAnyone:
             "guidance": ("FLOAT", {"default": 4.0, "min": 0, "max": 10}),
             "siglip_weight": ("FLOAT", {"default": 1.0, "min": 0, "max": 1}),
             "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-        }, "optional": {"face2": ("IMAGE",), "face3": ("IMAGE",), "face4": ("IMAGE",)}}
+        }, "optional": {"face2": ("IMAGE",), "face3": ("IMAGE",), "face4": ("IMAGE",),
+                         "reference_mode": (["separate_tokens", "identity_consensus"],),
+                         **{"references%d" % i: ("STUDIO_FACE_REFERENCES",) for i in range(1, 5)}}}
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "generate"
@@ -50,14 +72,15 @@ class StudioWithAnyone:
 
     def generate(self, conditioning, model, identity_model, siglip, face1, boxes,
                  width, height, steps, guidance, siglip_weight, seed,
-                 face2=None, face3=None, face4=None):
+                 face2=None, face3=None, face4=None,
+                 references1=None, references2=None, references3=None, references4=None,
+                 reference_mode="separate_tokens"):
         from .vendor.withanyone.flux.pipeline import WithAnyonePipeline
         from .vendor.util import extract_moref
 
-        refs = [x for x in (face1, face2, face3, face4) if x is not None]
         regions = json.loads(boxes)
-        if len(regions) != len(refs):
-            raise ValueError("WithAnyone needs one face position for each reference.")
+        refs = grouped_references((face1, face2, face3, face4),
+                                  (references1, references2, references3, references4), regions)
         for box in regions:
             if (len(box) != 4 or not all(np.isfinite(v) and 0 <= v <= 1 for v in box)
                     or (box[2] - box[0]) * width < 4 or (box[3] - box[1]) * height < 4):
@@ -84,18 +107,34 @@ class StudioWithAnyone:
                                     providers=["CPUExecutionProvider"])
             analyser.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.4)
             crops, embeddings = [], []
-            for index, ref in enumerate(refs, 1):
+            for ref, region, person_index, photo_index in refs:
                 mm.throw_exception_if_processing_interrupted()
                 picture = Image.fromarray((ref[0].cpu().numpy().clip(0, 1) * 255).astype(np.uint8))
                 found = analyser.get(cv2.cvtColor(np.array(picture), cv2.COLOR_RGB2BGR))
                 if len(found) != 1:
-                    raise ValueError("Reference %d has %d detected faces. Crop it to show only that person." % (index, len(found)))
+                    raise ValueError("Person %d reference %d has %d detected faces. Crop it to show only that person."
+                                     % (person_index, photo_index, len(found)))
                 crops.append(extract_moref(picture, {"bboxes": [found[0].bbox]}, 1)[0])
                 embeddings.append(torch.from_numpy(found[0].embedding.copy()))
+            if reference_mode == "identity_consensus":
+                # Preserve a single spatial SigLIP feature map from the primary
+                # view. Average only identity directions, never image patches.
+                primary, pooled = [], []
+                for person_index in range(1, len(regions) + 1):
+                    indices = [i for i, ref in enumerate(refs) if ref[2] == person_index]
+                    primary.append(indices[0])
+                    pooled.append(torch.tensor(identity_consensus(
+                        [embeddings[i].tolist() for i in indices]), dtype=embeddings[0].dtype))
+                crops = [crops[i] for i in primary]
+                refs = [refs[i] for i in primary]
+                embeddings = pooled
+            elif reference_mode != "separate_tokens":
+                raise ValueError("Unknown WithAnyone reference mode: %s" % reference_mode)
             processor = AutoProcessor.from_pretrained(siglip_path, local_files_only=True)
             vision = SiglipVisionModel.from_pretrained(siglip_path, local_files_only=True)
             pixels = processor(images=crops, return_tensors="pt").pixel_values
-            siglip_embeddings = vision(pixels).last_hidden_state.unsqueeze(1)
+            with torch.inference_mode():
+                siglip_embeddings = vision(pixels).last_hidden_state.unsqueeze(1)
             del vision
             vision = None
             device = mm.get_torch_device()
@@ -120,7 +159,7 @@ class StudioWithAnyone:
                 ref_imgs=crops, arcface_embeddings=torch.stack(embeddings),
                 siglip_embeddings=siglip_embeddings,
                 bboxes=[[[int(b[0]*width), int(b[1]*height), int(b[2]*width), int(b[3]*height)]
-                         for b in regions]],
+                         for _, b, _, _ in refs]],
                 id_weight=1.0-siglip_weight, siglip_weight=siglip_weight, pbar=Progress())
             return ({"samples": result.cpu()},)
         finally:
@@ -133,5 +172,16 @@ class StudioWithAnyone:
             mm.soft_empty_cache()
 
 
-NODE_CLASS_MAPPINGS = {"StudioWithAnyone": StudioWithAnyone}
-NODE_DISPLAY_NAME_MAPPINGS = {"StudioWithAnyone": "Family photo (WithAnyone)"}
+class StudioWithAnyonePooled(StudioWithAnyone):
+    """A distinct node id lets clients refuse backends without pooling support."""
+    def generate(self, *args, **kwargs):
+        kwargs['reference_mode'] = 'identity_consensus'
+        return super().generate(*args, **kwargs)
+
+
+NODE_CLASS_MAPPINGS = {"StudioWithAnyone": StudioWithAnyone,
+                       "StudioWithAnyonePooled": StudioWithAnyonePooled,
+                       "StudioWithAnyoneReferences": StudioWithAnyoneReferences}
+NODE_DISPLAY_NAME_MAPPINGS = {"StudioWithAnyone": "Family photo (WithAnyone)",
+                             "StudioWithAnyonePooled": "WithAnyone pooled identity (experimental)",
+                             "StudioWithAnyoneReferences": "WithAnyone reference photos"}
