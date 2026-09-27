@@ -13,6 +13,7 @@ Update this page when you add, split or rename a module.
 | `studio_mcp.py` | 1.2k | MCP harness every bridge is built on | `Server`, `tools_from_table`, `elicit`, `Declined`, `progress`, `cancelled`, `Loopback` |
 | `studio_tasks.py` | 0.9k | Task execution and recoverable task records | |
 | `studio_lessons.py` | 0.3k | What the model learns after each task, per app | |
+| `studio_appinfo.py` | 0.2k | Each app tab's profile for its prompt: name, installed release, Wikipedia overview (cached in `appinfo/`) | `refresh`, `render`, `WIKI` |
 | `studio_toolsmith.py` | 0.4k | Tools the model writes for itself from its own bridge tools | |
 | `studio_ui.py` | 0.3k | Palette roles and drawing primitives | |
 | `studio_procs.py` | 0.3k | Child processes that die with the parent | |
