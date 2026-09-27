@@ -79,6 +79,29 @@ class TestStack(unittest.TestCase):
         self.assertTrue(s.remove("use the venv python"))
         self.assertEqual(self.stack().lessons, [])
 
+    def test_tabs_share_one_notebook_and_see_each_others_lessons(self):
+        """Live 2026-09-27: a lesson kept 'everywhere' in the OpenCode tab never
+        reached the Chat tab, whose own copy of the file would have saved over it."""
+        oc, chat = self.stack(), lessons.for_app(Mock(id="chat", workspace=None), self.dir)
+        chat.load()
+        chat.brief()
+        oc.add("everywhere: keep replies short", "user")
+        self.assertEqual(chat.fresh(), "- keep replies short")     # mid-conversation
+        chat.add("chat only lesson here", "user")                  # a save from the other tab
+        again = lessons.Notebook.for_app("_everywhere", self.dir)
+        again.load()
+        self.assertEqual([l["text"] for l in again.lessons], ["keep replies short"])
+        self.assertIn("keep replies short", chat.brief())          # New chat
+
+    def test_what_a_prompt_carried_is_kept_per_tab(self):
+        a = self.stack()
+        b = lessons.for_app(Mock(id="resolve", workspace=None), self.dir)
+        a.brief()
+        a.add("everywhere: new lesson for all", "user")
+        b.brief()                                   # b boots after the lesson
+        self.assertEqual(a.fresh(), "- new lesson for all")
+        self.assertEqual(b.fresh(), "")
+
     def test_studio_remember_takes_a_scope(self):
         props = lessons.REMEMBER_TOOL["function"]["parameters"]["properties"]
         self.assertEqual(props["scope"]["enum"], ["here", "everywhere"])
@@ -631,6 +654,42 @@ class TestGuiForms(unittest.TestCase):
         self.assertEqual(self.s.notebook.lessons, [])
         self.assertIn("Nothing kept yet", self.app.lessons_view.get("1.0", "end"))
         self.app.windows[("lessons", "after-effects")].destroy()
+
+    def test_the_lessons_window_names_every_layer_and_forget_reaches_opencodes_file(self):
+        """Live 2026-09-27: an app-layer lesson showed no layer, and the header
+        still said every tab carried every lesson."""
+        d = tempfile.mkdtemp()
+        md = os.path.join(d, "oc", "lessons.md")
+        saved = self.s.notebook
+        self.s.notebook = lessons.Stack([
+            ("everywhere", lessons.Notebook("e", os.path.join(d, "e.json"))),
+            ("app", lessons.Notebook("a", os.path.join(d, "a.json"))),
+            ("folder", lessons.Notebook("f", os.path.join(d, "f.json")))])
+        self.s.app.lessons_path = md
+        try:
+            self.s.notebook.add("everywhere: keep replies short", "user")
+            self.s.notebook.learn_refusals([("ae_tool", "unknown key 'foo'")])
+            self.s.notebook.add("this folder uses tabs", "user")
+            self.app._publish_lessons(self.s)
+            self.app._lessons_window()
+            text = self.app.lessons_view.get("1.0", "end")
+            self.assertNotIn("Every tab for", text)
+            self.assertIn("keep replies short\n      every tab  ·  you said so", text)
+            self.assertIn("unknown key 'foo'\n      %s  ·  a refused call" % self.s.app.name, text)
+            self.assertIn("uses tabs\n      this folder  ·  you said so", text)
+            buttons = [w for w in self.app.lessons_view.winfo_children()
+                       if isinstance(w, (self.mod.tk.Button, self.mod.Pill))]
+            buttons[0].invoke()                       # the global one
+            with open(md, encoding="utf-8") as f:
+                self.assertNotIn("keep replies short", f.read())
+            again = lessons.Notebook("e", os.path.join(d, "e.json"))
+            again.load()
+            self.assertEqual(again.lessons, [])
+        finally:
+            self.s.notebook = saved
+            del self.s.app.lessons_path
+            self.app.windows[("lessons", "after-effects")].destroy()
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

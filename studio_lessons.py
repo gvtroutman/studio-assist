@@ -32,6 +32,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 
 MAX_LESSONS = 40          # per app; the oldest low-value ones go first
@@ -271,6 +272,9 @@ class Stack:
 
     def __init__(self, layers):
         self.layers = [(label, nb) for label, nb in layers if nb is not None]
+        # Per tab, not per notebook: the notebooks are shared between tabs,
+        # and each tab's prompt carries what it carried at its own boot.
+        self._carried = set()
 
     @property
     def lessons(self):
@@ -302,11 +306,12 @@ class Stack:
     def add(self, text, source="model", scope=None):
         if scope is None and source == "user":
             scope, text = lesson_scope(text)
-        # A lesson kept in another layer already is a repeat, not a new one.
-        for _, nb in self.layers:
-            if nb.find(clean(text)) is not None:
-                return nb.add(text, source)
-        return self.target(source, scope).add(text, source)
+        with _LOCK:           # tabs' workers share these notebooks
+            # A lesson kept in another layer already is a repeat, not a new one.
+            for _, nb in self.layers:
+                if nb.find(clean(text)) is not None:
+                    return nb.add(text, source)
+            return self.target(source, scope).add(text, source)
 
     def find(self, text):
         for _, nb in self.layers:
@@ -323,22 +328,24 @@ class Stack:
         return None
 
     def remove(self, text):
-        return any(nb.remove(text) for _, nb in self.layers)
+        with _LOCK:
+            return any(nb.remove(text) for _, nb in self.layers)
 
     def learn_refusals(self, refusals):
-        return self.target("error").learn_refusals(refusals)
+        with _LOCK:
+            return self.target("error").learn_refusals(refusals)
 
     def ordered(self):
         return [l for _, nb in self.layers for l in nb.ordered()]
 
     def brief(self):
-        for _, nb in self.layers:
-            nb.brief()
-        return Notebook.render(self.ordered())
+        lessons = self.ordered()
+        self._carried = {normal(l["text"]) for l in lessons}
+        return Notebook.render(lessons)
 
     def fresh(self):
-        return Notebook.render([l for _, nb in self.layers for l in nb.ordered()
-                                if normal(l["text"]) not in nb._carried])
+        return Notebook.render([l for l in self.ordered()
+                                if normal(l["text"]) not in self._carried])
 
 
 def folder_notebook(folder, base=None):
@@ -347,16 +354,28 @@ def folder_notebook(folder, base=None):
     folder = os.path.normcase(os.path.abspath(folder))
     tag = re.sub(r"[^\w\-]", "_", os.path.basename(folder.rstrip("\\/")) or "root")[:40]
     key = "folders/%s-%s" % (tag, hashlib.sha1(folder.encode("utf-8")).hexdigest()[:10])
+    return shared(key, base)
+
+
+_LOCK = threading.RLock()
+_SHARED = {}
+
+
+def shared(key, base=None):
+    """One Notebook per file in this process. Two tabs holding their own
+    copies of the global notebook never saw each other's lessons, and the
+    one that saved last wrote the other's away (seen live 2026-09-27)."""
     nb = Notebook.for_app(key, base)
-    nb.app_id = folder
-    return nb
+    with _LOCK:
+        return _SHARED.setdefault(os.path.normcase(os.path.abspath(nb.path)), nb)
 
 
 def for_app(app, base=None):
     """What a tab learns into: everywhere, then the app, then - when the app
-    works in a folder, as OpenCode does - that folder."""
-    layers = [("everywhere", Notebook.for_app("_everywhere", base)),
-              ("app", Notebook.for_app(app.id, base))]
+    works in a folder, as OpenCode does - that folder. The notebooks are
+    shared by every tab in the process (`shared`)."""
+    layers = [("everywhere", shared("_everywhere", base)),
+              ("app", shared(app.id, base))]
     folder = getattr(app, "workspace", None)
     if folder:
         layers.append(("folder", folder_notebook(folder, base)))

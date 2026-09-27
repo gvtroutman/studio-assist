@@ -2926,12 +2926,34 @@ one place a run teaches; it never raises.
   `scope: "everywhere"`, which go to the global layer, and refused calls, which go
   to the app layer. A lesson already kept in any layer counts as a repeat. `Stack`
   answers the `Notebook` interface, so the executor and the learner never see layers.
+- **One notebook per file per process** (`studio_lessons.shared`). Tabs share the
+  `Notebook` objects; the record of what a prompt already carried lives on each tab's
+  `Stack` (`_carried`), not on the notebook. When each tab loaded its own copy (seen
+  live), a lesson kept "everywhere" in the OpenCode tab never reached the Chat tab,
+  not even on New chat, and whichever tab saved last would have overwritten the other.
+  Additions and forgets hold `_LOCK`, because the tabs' workers share the notebooks.
+- **A message that only states a lesson is not a task.** `Chat._remember_turn` runs
+  before Direct and before the executor. It keeps "remember …" / "from now on …" in the
+  user's words and answers "Kept for <layer>: …" with no model and no OpenCode call.
+  Seen live: when the model got "remember run tests with pytest -q", it made a tool,
+  called studio_remember with a paraphrase and cycled on plans until the user stopped it.
+  The stop then skipped `_learn`, so the user's own lesson was never kept.
 - **OpenCode reads the lessons too.** `Chat._publish_lessons` writes the stack to
-  `OPENCODE_STATE/lessons.md` (`ServerSpec.lessons_path`) at boot, after each
-  learned run and on each forget. `write_config` adds that file to `instructions`,
-  so Direct mode carries the lessons with no model of ours in between. Direct mode
-  also keeps a "remember…" message itself (`_direct_turn`). There is no
-  reflection in Direct mode, because no chat model runs there.
+  `OPENCODE_STATE/lessons.md` (`ServerSpec.lessons_path`). It is written at tab boot,
+  at the end of every turn (`_turn`'s `finally`, which also covers studio_remember
+  and stopped runs), on a remembered message, and on each forget. `write_config`
+  adds the file to `instructions`. **OpenCode 1.18.32 re-reads `instructions` on
+  every prompt, not only at startup.** This was tested live with canary words that
+  reached OpenCode only through that file: one was learned after the server started
+  and was answered from a new session with no restart; the other was added between
+  two prompts of the *same* session and was answered on the second prompt. A
+  forgotten lesson is gone from the next prompt. No restart is needed for a lesson
+  to reach OpenCode. There is no reflection in Direct mode, because no chat model
+  runs there.
+- **Seen live, the refused-call path needs a model that sends bad arguments.**
+  qwen3-coder-30b fixed a bad `limit` and an unknown key on its own, then claimed the
+  call had been "rejected", which it hadn't been. The live check of that path used
+  one scripted bad call; the validation, the learning and the routing were real.
 - `studio_ask` and `studio_remember` are `INTERNAL_TOOLS` with the task-record and
   tool-maker tools, in that order, before the made tools; `toolsmith.reserved()`
   already refuses `studio_` names. The Lessons window (`File > Lessons for this
