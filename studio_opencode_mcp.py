@@ -622,6 +622,24 @@ def result(text, error=False):
     return res
 
 
+MIN_CONTEXT = 65536
+
+
+def context_note(conf):
+    """A warning when the model is loaded with too small a window to code in
+    this repo, or "". OpenCode's own prompt and tools take ~10k tokens and one
+    of our larger files as much again; below this it compacts away the task."""
+    model = (conf.get("model") or "").split("/", 1)[-1]
+    models = conf.get("provider", {}).get("lmstudio", {}).get("models", {})
+    ctx = (models.get(model) or {}).get("limit", {}).get("context")
+    if not isinstance(ctx, int) or ctx >= MIN_CONTEXT:
+        return ""
+    return ("Warning: the model is loaded with a %d-token context window. OpenCode needs "
+            "at least %d to keep a task in mind: in LM Studio on the LLM PC, raise the "
+            "model's Context Length (or `lms load <model> --context-length %d`), then "
+            "press Restart OpenCode." % (ctx, MIN_CONTEXT, MIN_CONTEXT))
+
+
 def t_status(a):
     lines = []
     try:
@@ -647,9 +665,13 @@ def t_status(a):
     if os.path.isfile(cfg):
         try:
             with open(cfg, encoding="utf-8") as f:
-                model = json.load(f).get("model")
+                conf = json.load(f)
+            model = conf.get("model")
             if model:
                 lines.append("It codes with the model %s." % model)
+            note = context_note(conf)
+            if note:
+                lines.append(note)
         except (OSError, ValueError):
             pass
     lines.append("It reads freely; every edit, command and fetch waits for the user's "
@@ -681,18 +703,61 @@ def _work_limit(a):
     return max(10, min(int(a.get("timeout") or DEFAULT_WORK), MAX_WORK))
 
 
+def _last_path():
+    return os.path.join(STATE_DIR, "last_session")
+
+
+def last_session():
+    """The session the last ask used, or "". Kept on disk so a follow-up
+    continues the work even when the model forgets to pass the id back -
+    a local model often does, and OpenCode then starts over knowing nothing."""
+    try:
+        with open(_last_path(), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def remember_session(sid):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(_last_path(), "w", encoding="utf-8") as f:
+            f.write(sid)
+    except OSError:
+        pass
+
+
 def t_ask(a):
     text = a["prompt"]
     if not isinstance(text, str) or not text.strip():
         raise ValueError("prompt must be a non-empty string")
-    sid = a.get("session_id")
+    sid = a.get("session_id") or ("" if a.get("new_session") else last_session())
+    seen = None
     if sid:
-        seen = {_info(m).get("id") for m in messages(sid)}
-    else:
+        try:
+            seen = {_info(m).get("id") for m in messages(sid)}
+        except OpenCodeError:
+            if a.get("session_id"):
+                raise
+            seen = None                        # the remembered one is gone
+    if seen is None:
         sid = new_session(text.strip().splitlines()[0][:60])["id"]
         seen = set()
+    remember_session(sid)
     prompt(sid, text)
-    return run(sid, seen, _work_limit(a))
+    out = run(sid, seen, _work_limit(a))
+    note = _loaded_context_note()
+    if note and isinstance(out, dict):
+        out.setdefault("content", []).append({"type": "text", "text": note})
+    return out
+
+
+def _loaded_context_note():
+    try:
+        with open(os.path.join(STATE_DIR, "opencode.json"), encoding="utf-8") as f:
+            return context_note(json.load(f))
+    except (OSError, ValueError):
+        return ""
 
 
 def t_wait(a):
@@ -801,11 +866,14 @@ TOOLS = [
      "Give OpenCode a coding task in plain words and follow it to the end. It reads "
      "the code on its own; each edit, command or fetch it wants is shown to the user, "
      "who allows or refuses it - you are not asked and cannot answer for them. Returns "
-     "the user's decisions and what OpenCode said and did. Continue a piece of work by "
-     "passing the session_id an earlier call returned; omit it to start a new session.",
+     "the user's decisions and what OpenCode said and did. By "
+     "default: it continues the last session, so OpenCode remembers earlier work. Set "
+     "new_session for an unrelated job.",
      _obj({"prompt": _s("The task, as you would brief a programmer: what to build or "
                         "change, in which files, and what done looks like."),
-           "session_id": _s("Session to continue. Omit for a new one."),
+           "session_id": _s("Session to continue. Omit to continue the last one."),
+           "new_session": {"type": "boolean",
+                           "description": "Start a fresh session - only for an unrelated job."},
            "timeout": _i("Seconds OpenCode may work before this hands back, not counting "
                          "time the user spends deciding. Default %d." % DEFAULT_WORK,
                          minimum=10, maximum=MAX_WORK)},
