@@ -250,6 +250,9 @@ class ImageStudio:
         self.text = {}                # look slot and camera setting -> StringVar
         self.sliders = {}             # weight, muscle, stature -> IntVar
         self.item_refs = {}           # item -> picture, from the character
+        self.face_photos = []         # the character's face photos, copied on pick
+        self.face_name = ""
+        self.face_on = tk.BooleanVar(value=True)
         self.look_section = ig.LOOKS[0][0]
         self.anatomy = tk.BooleanVar(value=True)
         self.hints = {}               # setting -> Label
@@ -470,6 +473,8 @@ class ImageStudio:
             side="left", padx=(self.px(6), 0))
         self.button(crow, "Save as…", self.save_as_character, kind="ghost").pack(
             side="left", padx=(self.px(4), 0))
+        self.face_box = self.frame(f)
+        self.face_box.pack(side="top", fill="x", **pad)
         self.person_box = self.frame(f)
         self.person_box.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
         self.label(f, "Who, and what they look like. Any of these can stay blank; a "
@@ -734,13 +739,45 @@ class ImageStudio:
                 else:
                     self.text[key].set(rec["looks"].get(key, ""))
             self.item_refs = dict(rec["item_refs"])
+            self.face_photos = ig.character_faces(rec, self.studio.lib)
+            self.face_name = rec["name"]
+            self.face_on.set(True)
             if rec["identity"] in self.idents:
                 bvar = self.idents[rec["identity"]][0]
                 if not bvar.get():
                     bvar.set(True)
                     self._toggle_ident(rec["identity"])
             self._show_looks(self.look_section)
+        else:
+            self.face_photos, self.face_name = [], ""
+        self._show_face()
         self._recheck()
+
+    def _show_face(self):
+        """The character's face photos, a strip under the character: the
+        face every picture of them is drawn with (PuLID, then their real
+        face where a photo's angle fits), unless unticked."""
+        for w in self.face_box.winfo_children():
+            w.destroy()
+        if not self.face_photos:
+            return
+        row = self.frame(self.face_box)
+        row.pack(side="top", fill="x", pady=(self.px(4), 0))
+        b = tk.Checkbutton(row, text="Their face", variable=self.face_on, anchor="w",
+                           font=self.host.f_ui, bd=0, highlightthickness=0,
+                           command=self._recheck)
+        self.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="left")
+        self.face_imgs = []           # not self.keep: the queue/history switch prunes that
+        for path, thumb in list(ig.thumbnails(self.face_photos[:6]).items()):
+            img = photo(thumb, self.px(28)) if thumb else None
+            if img is not None:
+                self.face_imgs.append(img)
+                tk.Label(row, image=img, bd=0).pack(side="left", padx=(self.px(3), 0))
+        n = len(self.face_photos)
+        self.label(row, "%d photo%s" % (n, "" if n == 1 else "s"), "faint",
+                   self.host.f_small).pack(side="left", padx=(self.px(6), 0))
 
     def look_rows(self, parent, slots, vars_, changed, chips=False, bg="bg"):
         """Rows for look slots: a label, the field, and the picks - a menu on
@@ -1117,6 +1154,8 @@ class ImageStudio:
         for key, var in self.sliders.items():
             s[key] = int(var.get())
         s["item_refs"] = dict(self.item_refs)
+        s["face_photos"] = list(self.face_photos) if self.face_on.get() else []
+        s["face_name"] = self.face_name if s["face_photos"] else ""
         s["anatomy"] = bool(self.anatomy.get())
         s["negative"] = self.neg.get().strip()
         s["identities"] = [{"id": iid, "strength": round(sv.get(), 3)}
@@ -1166,6 +1205,10 @@ class ImageStudio:
         for key, var in self.sliders.items():
             var.set(int(s.get(key) or 0))
         self.item_refs = ig.clean_item_refs(s.get("item_refs"))
+        self.face_photos = ig._strs(s.get("face_photos"))
+        self.face_name = s.get("face_name") or ""
+        self.face_on.set(True)
+        self._show_face()
         self.anatomy.set(s.get("anatomy") is not False)
         self.neg.set(s.get("negative") or "")
         pose = s.get("pose") if isinstance(s.get("pose"), dict) else None
@@ -1874,7 +1917,8 @@ class ImageStudio:
         return CharacterCreator(self, looks)
 
     def save_as_character(self):
-        return self.edit_characters(dict(self.collect_looks(), item_refs=self.item_refs))
+        return self.edit_characters(dict(self.collect_looks(), item_refs=self.item_refs,
+                                         faces=list(self.face_photos)))
 
     def edit_styles(self):
         loras = [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
@@ -2228,7 +2272,8 @@ class RecordEditor:
 
 class CharacterCreator:
     """The character creator, laid out like a video game's: the characters on
-    the left; on the right a name, the identity that carries the face, and
+    the left; on the right a name, the photos of their face (every picture
+    of them is drawn with it), the identity LoRA that can carry it too, and
     tabs - Body (with the sliders), Face, Hair, Clothes, Accessories - of
     picks to click, each slot also taking free text; a picture per item worn;
     Randomize; and the character sheet, the prompt text it makes, underneath.
@@ -2249,6 +2294,8 @@ class CharacterCreator:
         self.name = tk.StringVar()
         self.identity = tk.StringVar()
         self.item_refs = {}
+        self.faces = []
+        self.face_imgs = []
         win = self.win = tk.Toplevel(host)
         win.title("Character creator")
         win.transient(host)
@@ -2292,6 +2339,8 @@ class CharacterCreator:
         e = host._entry(top, self.name)
         e.master.pack(side="left", fill="x", expand=True)
         e.bind("<KeyRelease>", lambda ev: self._changed())
+        self.face_row = o.frame(right)
+        self.face_row.pack(side="top", fill="x", pady=(o.px(6), 0))
         self.ident_row = o.frame(right)
         self.ident_row.pack(side="top", fill="x", pady=(o.px(6), 0))
         self.tabs = o.frame(right)
@@ -2301,8 +2350,9 @@ class CharacterCreator:
 
         if looks is not None:
             refs = looks.pop("item_refs", {}) if isinstance(looks, dict) else {}
+            faces = looks.pop("faces", []) if isinstance(looks, dict) else []
             self.records.append({"name": "New character", "looks": looks,
-                                 "item_refs": dict(refs)})
+                                 "item_refs": dict(refs), "faces": list(faces)})
         self._reload_list(len(self.records) - 1 if self.records else None)
 
     # ---------------------------------------------------------------- state
@@ -2320,7 +2370,8 @@ class CharacterCreator:
             return
         rec = self.records[self.current]
         rec.update(name=self.name.get().strip(), identity=self.identity.get(),
-                   looks=self.looks(), item_refs=dict(self.item_refs))
+                   looks=self.looks(), item_refs=dict(self.item_refs),
+                   faces=list(self.faces))
 
     def _load(self, rec):
         looks = rec.get("looks") or {}
@@ -2331,6 +2382,7 @@ class CharacterCreator:
         self.name.set(rec.get("name") or "")
         self.identity.set(rec.get("identity") or "")
         self.item_refs = dict(rec.get("item_refs") or {})
+        self.faces = list(rec.get("faces") or [])
 
     def _reload_list(self, select):
         self.lb.delete(0, "end")
@@ -2356,7 +2408,7 @@ class CharacterCreator:
     def _build(self):
         o, host = self.owner, self.owner.host
         self.relight = None           # the last tab's chips are about to go
-        for box in (self.ident_row, self.tabs, self.panel):
+        for box in (self.face_row, self.ident_row, self.tabs, self.panel):
             for w in box.winfo_children():
                 w.destroy()
         if self.current is None:
@@ -2364,8 +2416,9 @@ class CharacterCreator:
                 side="top", anchor="w")
             self.sheet.config(text="")
             return
-        o.label(self.ident_row, "Face (identity)", "muted", width=12).pack(side="left")
-        idents = [("", "none: the words alone")] + [(i["id"], i["name"])
+        self._face_photos()
+        o.label(self.ident_row, "Identity LoRA", "muted", width=12).pack(side="left")
+        idents = [("", "none")] + [(i["id"], i["name"])
                                                     for i in self.lib.all("identities")]
         o.choice(self.ident_row, idents, self.identity.get(), self.identity.set).pack(
             side="left")
@@ -2398,6 +2451,63 @@ class CharacterCreator:
         elif self.section == "Hair":
             self._item_pictures(p, [], [ig.HAIR_ITEM])
         self._sheet()
+
+    def _face_photos(self):
+        """Their face photos: every picture of them is drawn with the first
+        (PuLID), and their real face is pasted from whichever is turned most
+        like the drawn head. A click on one makes it the first; × drops it.
+        Several angles (front, three-quarter each way) paste best."""
+        o, host, row = self.owner, self.owner.host, self.face_row
+        o.label(row, "Face photos", "muted", width=12).pack(side="left", anchor="n")
+        strip = o.frame(row)
+        strip.pack(side="left", fill="x", expand=True)
+        self.face_imgs = []
+        thumbs = ig.thumbnails(self.faces)
+        for i, path in enumerate(self.faces):
+            cell = o.frame(strip, "card" if i == 0 else "bg")
+            cell.pack(side="left", padx=(0, o.px(4)))
+            img = photo(thumbs.get(path), o.px(56)) if thumbs.get(path) else None
+            if img is not None:
+                self.face_imgs.append(img)
+                pic = tk.Label(cell, image=img, bd=0, cursor="hand2")
+            else:
+                pic = o.label(cell, os.path.basename(path)[:10], "faint", host.f_small)
+            pic.pack(side="top", padx=o.px(2), pady=(o.px(2), 0))
+            pic.bind("<Button-1>", lambda ev, k=i: self._main_face(k))
+            o.button(cell, "×", lambda k=i: self._drop_face(k), kind="ghost").pack(side="top")
+        side = o.frame(strip)
+        side.pack(side="left", anchor="n")
+        o.button(side, "Add photos…", self._add_faces).pack(side="top", anchor="w")
+        o.label(side, ("The highlighted one draws the face; click another to use it. "
+                       "Front and three-quarter views both help.") if self.faces else
+                "Photos of their face, alone in the picture. Every picture of them is "
+                "drawn with it.", "faint", host.f_small, wraplength=o.px(260)).pack(
+            side="top", anchor="w")
+
+    def _add_faces(self):
+        paths = filedialog.askopenfilenames(
+            parent=self.win, title="Photos of %s's face" % (self.name.get() or "their"),
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
+        for path in paths or ():
+            try:
+                path = self.lib.keep_reference(path, (self.name.get() or "character")
+                                               + " face")
+            except OSError as e:
+                self.status("Could not copy %s: %s" % (path, e), "err")
+                continue
+            if path not in self.faces:
+                self.faces.append(path)
+        if paths:
+            self.status("Save to keep the new photos.", "warn")
+            self._build()
+
+    def _main_face(self, i):
+        self.faces.insert(0, self.faces.pop(i))
+        self._build()
+
+    def _drop_face(self, i):
+        del self.faces[i]
+        self._build()
 
     def _item_pictures(self, p, keys, items=None):
         """A picture for each item this section has the character wearing.

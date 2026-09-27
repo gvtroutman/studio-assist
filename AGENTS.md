@@ -528,6 +528,29 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   out right in every detail (lacing, apron, trim, lace hem) across scenes and
   poses. But her pendant came along, and without an identity LoRA the face
   drifted toward hers. Pictures of the item alone, on white, are best.
+- **A character is a profile: its face photos draw every picture of it**
+  (2026-09-26, the user: "profiles for people to face swap"). The creator's
+  Face photos row keeps `faces` on the character (picked, copied under
+  `references/<name>-face/`, never a folder he manages: his choice); the
+  highlighted first one is PuLID's, and the real-face paste chooses among
+  all of them. A character with none falls back to its identity's
+  reference photos (`character_faces`). Picking a character copies them
+  onto the form (`face_photos`, `face_name`, shown as a strip with a
+  "Their face" tick), so history holds them and Generate Again redraws the
+  same face. `faces_of` turns them into the Scene Builder's `scene_faces`
+  shape - one person, `at` None (the biggest face the finder finds), the
+  whole frame as their region, `FORM_LIKENESS` 0.6, real faces on - and
+  forces the face pass; a scene's own `scene_faces` win, and a scene blanks
+  the form's. In the Scene Builder a person's own face picture comes first,
+  then their character's photos, then its identity's. **A whole-frame
+  PuLID gets no attention mask**: with Kontext's item picture the latent
+  has the reference's tokens too, and a mask the picture's size failed
+  ("tensor a (8022) must match ... (3952)"). Measured on the 5090, 832x1216,
+  Partner's 5 head crops: 42 s alone, 59 s with a dirndl picture through
+  Kontext, whose face no longer drifts to the garment model's. The strip's
+  thumbnails are PNGs System.Drawing makes beside each photo (`thumbnails`,
+  one PowerShell run; Tk reads no JPEG); it cannot read WEBP, which shows
+  as its name.
 - **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
   described, or named in the scene, `PEOPLE`) says outright that every person has
   two hands, each with four fingers and a thumb, two feet, two eyes and a
