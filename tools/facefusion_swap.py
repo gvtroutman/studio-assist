@@ -27,6 +27,9 @@ def main():
     parser.add_argument('--output', help='Defaults to a new PNG in .work/facefusion.')
     parser.add_argument('--open-result', action='store_true')
     parser.add_argument('--model', default='hyperswap_1a_256')
+    parser.add_argument('--weight', type=float, default=0.5,
+                        help='FaceFusion\'s face swapper weight: 0.5 is the reference face as it '
+                             'is, higher pushes it further from the face it replaces.')
     parser.add_argument('--reference', type=int, help='Use just this reference (1-based).')
     parser.add_argument('--provider', default='cpu')
     args = parser.parse_args()
@@ -71,7 +74,8 @@ def main():
     import cv2
     import numpy as np
     from PIL import Image
-    from facefusion import conda, core, face_helper
+    from facefusion import conda, core, face_helper, state_manager
+    from facefusion.processors.modules.face_swapper import choices as swapper_choices
     from facefusion.processors.modules.face_swapper import core as swapper
 
     original_pil = Image.open(target)
@@ -102,6 +106,16 @@ def main():
                   for i, v in enumerate(face.bounding_box)] for face in faces]
         index = target_face(boxes, region=args.target_region, point=args.target_point,
                             index=args.face_index, count=args.face_count)
+        # The model draws at 256 px. A face bigger than that came back as a
+        # soft, generic 256 px face scaled up; pixel boost swaps it in tiles
+        # at the size the face really is (its warped crop is ~1.5x its box).
+        box = faces[index].bounding_box
+        side = 1.5 * max(box[2] - box[0], box[3] - box[1])
+        sizes = swapper_choices.face_swapper_set.get(args.model) or []
+        boost = next((s for s in sizes if int(s.split('x')[0]) >= side), sizes[-1] if sizes else None)
+        if boost:
+            state_manager.set_item('face_swapper_pixel_boost', boost)
+            captured['pixel_boost'] = boost
         return [faces[index]]
     swapper.select_faces = select_target
     raw_output = output.with_name(output.stem + '-facefusion.png')
@@ -109,6 +123,7 @@ def main():
                 '--source-paths', *refs, '--target-path', str(target),
                 '--output-path', str(raw_output), '--processors', 'face_swapper',
                 '--face-swapper-model', args.model, '--face-selector-mode', 'one',
+                '--face-swapper-weight', str(round(round(args.weight * 20) / 20, 2)),
                 '--face-mask-types', 'box', 'region',
                 '--execution-providers', args.provider, '--execution-thread-count', '4',
                 '--output-image-quality', '100', '--output-image-scale', '1.0',
@@ -141,6 +156,8 @@ def main():
     Image.fromarray(mask.astype('uint8') * 255).save(output.with_name(output.stem + '-mask.png'))
     report = {'target': str(target), 'output': str(output), 'identity': args.identity,
               'references': refs, 'model': args.model, 'faces_swapped': captured['count'],
+              'weight': round(round(args.weight * 20) / 20, 2),
+              'pixel_boost': captured.get('pixel_boost'),
               'mask_pixels': int(mask.sum()), 'outside_mask_changed_pixels': outside_changes,
               'changed_pixels': int(np.any(check != original, axis=2).sum()),
               'dimensions': list(original_pil.size)}
