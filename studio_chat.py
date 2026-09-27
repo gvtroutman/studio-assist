@@ -41,12 +41,14 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import studio_agent as eng
+import studio_consoles as consoles
 import studio_doctor as doctor
 import studio_files as files
 import studio_lessons as lessons
 import studio_milanote as milanote
 import studio_images_ui as images_ui
 import studio_nodes_ui as nodes_ui
+import studio_terminals_ui as terminals_ui
 import studio_procs as procs
 import studio_ui as ui
 import studio_icons as icons
@@ -132,6 +134,7 @@ APP_NAME_CHARS = 16                       # sidebar rows, before the ellipsis
 DRAIN_MS = 40                             # the pump, while events flow
 DRAIN_IDLE_MS = 160                       # ...and while nothing is happening
 QUIT_GRACE_S = 3.0                        # every bridge's time to exit, together
+CONSOLE_SWEEP_S = 1.0                     # how soon a console opened outside is hidden
 HOST_RETRY_MS = 30000                     # between probes while the host is down
 UPDATE_FIRST_MS = 8000                    # the first look at GitHub, after start-up settles
 UPDATE_EVERY_MS = 15 * 60 * 1000          # ...and again while the window is open
@@ -176,7 +179,8 @@ class Prefs:
     read-only or locked-down profile costs you the preference, never the app.
     """
 
-    DEFAULTS = {"theme": "dark", "tabs": None, "pinned": [], "hidden": [], "bridges": []}
+    DEFAULTS = {"theme": "dark", "tabs": None, "pinned": [], "hidden": [], "bridges": [],
+                "hold_consoles": True}
 
     def __init__(self, path=None):
         self.path = path or settings_path()
@@ -198,6 +202,8 @@ class Prefs:
             # "nope" would otherwise hide four apps called n, o, p and e.
             self.data[key] = ([x for x in got if isinstance(x, str)]
                               if isinstance(got, list) else [])
+        if not isinstance(self.data.get("hold_consoles"), bool):
+            self.data["hold_consoles"] = True
         tabs = self.data.get("tabs")
         self.data["tabs"] = ([x for x in tabs if isinstance(x, str)]
                              if isinstance(tabs, list) else None)
@@ -277,6 +283,7 @@ class Session:
         self.panel_note = None            # ...and the line above it that speaks
         self.images = None                # the Image Studio's form (studio_images_ui)
         self.nodes_view = None            # the ComfyUI tab's node editor (studio_nodes_ui)
+        self.terminals = None             # the Terminal tab's mirror (studio_terminals_ui)
         self._stream_open = False
         self._stream_buf = []
         self._asst_start = "1.0"
@@ -328,6 +335,9 @@ class Session:
         images, self.images = self.images, None
         if images is not None:
             images.close()                # cancels its jobs on the backends
+        terminals, self.terminals = self.terminals, None
+        if terminals is not None:
+            terminals.close()
         if self.mcp:
             try:
                 self.mcp.close()
@@ -389,6 +399,10 @@ class Chat(tk.Tk):
         self.row_role = {}                # rail row canvas -> the role it is drawn in
         self.repaints = []                # (widget, draw) for shapes _theme must redraw
         self.closing = False              # set by _quit, so no timer outlives the window
+        # Console windows opened outside the app, hidden and held in the
+        # Terminal tab (studio_consoles.py). Watched from the start, whether
+        # that tab is open or not; `_watch_consoles` opens it when it takes one.
+        self.holder = consoles.Holder()
 
         # What the user wrote about the studio: File > About this studio...
         self.studio = eng.read_studio_brief(self._studio_path())
@@ -413,6 +427,10 @@ class Chat(tk.Tk):
         self.update_timer = self.after(UPDATE_FIRST_MS, self._update_tick)
         self._spawn(None, self._read_icons)
         self._spawn(None, self._boot_host)
+        if _MAIN:
+            # Only the app started by main(), which holds the single-instance
+            # lock: a test's window must not take the real desktop's consoles.
+            self._spawn(None, self._watch_consoles)
         self._select(self.active)
         self.protocol("WM_DELETE_WINDOW", self._quit)
 
@@ -622,6 +640,10 @@ class Chat(tk.Tk):
         m_view.add_separator()
         m_view.add_command(label="Next app", accelerator="Ctrl+Tab",
                            command=self._on_next_tab)
+        m_view.add_separator()
+        self.hold_var = tk.BooleanVar(value=self.prefs.get("hold_consoles"))
+        m_view.add_checkbutton(label="Hold outside consoles in the Terminal tab",
+                               variable=self.hold_var, command=self._toggle_hold)
         bar.add_cascade(label="View", menu=m_view)
 
         # Rebuilt each time it opens: a bridge connected by hand is a new entry.
@@ -836,6 +858,11 @@ class Chat(tk.Tk):
         self.empty_msg.pack(pady=(4, 0))
 
     def _build_transcript(self, s):
+        if s.app.terminals:
+            s.frame = self._skin(tk.Frame(self.stack), bg="bg")
+            s.terminals = terminals_ui.TerminalsView(self, s)
+            s.panel_note = s.terminals.note
+            return
         if s.app.images:
             self._build_images(s)
             return
@@ -1454,16 +1481,21 @@ class Chat(tk.Tk):
     def _tab_menu(self, widget=None):
         self._popup(self._menu_tabs(), widget or self.btn_add)
 
-    def _add_tab(self, app_id):
+    def _add_tab(self, app_id, select=True):
         if app_id in self.sessions:
-            self._select(app_id)
+            if select:
+                self._select(app_id)
             return
         s = self._session(eng.TABS_BY_ID[app_id])
         self.sessions[app_id] = s
         self.order.append(app_id)
         self._build_transcript(s)
         self._make_tab(app_id)
-        self._select(app_id)
+        if select or self.active is None:
+            self._select(app_id)
+        else:                             # opened beside the tab being looked at
+            self._paint_tab(app_id)
+            self._fit_tabs()
         self._remember_tabs()
         self._sync_bridges()
 
@@ -1484,6 +1516,8 @@ class Chat(tk.Tk):
             s.browser.release()           # out of the frame before it goes
         if s.images is not None:
             s.images.release(confirmed=True)  # checked before removing the tab
+        if s.terminals is not None:
+            s.terminals.release()         # every console back on the desktop
         s.frame.destroy()
         self._fit_tabs()
         # Shutting an MCP subprocess down can block for a moment; a turn still
@@ -3169,6 +3203,12 @@ class Chat(tk.Tk):
                 payload()
             return
 
+        if kind == "consoles":
+            # The watcher's, and like "diagnostics" the window's rather than a
+            # tab's: it may be what opens the Terminal tab.
+            self._consoles_taken(*payload)
+            return
+
         if kind == "diagnostics":
             # Like "icon", this belongs to the window rather than to a tab:
             # the report is about the whole installation, and it must still
@@ -3596,6 +3636,11 @@ class Chat(tk.Tk):
         if s.ready or s.booting:
             return
         s.booting = True
+        if s.app.terminals:
+            s.booting, s.ready = False, True   # the watcher runs from startup
+            s.terminals.start()
+            self._consoles_changed()
+            return
         if s.app.images:
             s.booting, s.ready = False, True   # nothing to start: the form is ours
             s.status = ("Image Studio ready", "muted", False)
@@ -3817,6 +3862,72 @@ class Chat(tk.Tk):
     def _focus_panel(self, s):
         if s.browser is not None:
             s.browser.focus()
+        if s.terminals is not None:
+            s.terminals.focus()
+
+    def _watch_consoles(self):
+        """Off the UI thread, for the life of the window: hide each console
+        window that opens on the desktop and hand it to the Terminal tab.
+        First, whatever a copy of this app hid and never gave back because
+        it crashed or was killed. See studio_consoles.py."""
+        taken = self.holder.recover()
+        if not self.prefs.get("hold_consoles"):
+            self.holder.release_all()
+            taken = []
+        if taken:
+            self.q.put(("consoles", None, (taken, [])))
+        while not self.closing:
+            time.sleep(CONSOLE_SWEEP_S)
+            if self.closing or not self.prefs.get("hold_consoles"):
+                continue
+            taken, gone = self.holder.sweep()
+            if taken or gone:
+                self.q.put(("consoles", None, (taken, gone)))
+
+    def _consoles_taken(self, taken, gone):
+        """The watcher took or lost console windows. Taking one opens the
+        Terminal tab beside the one being looked at, not in front of it."""
+        tid = eng.TERMINALS.id
+        if tid not in self.sessions:
+            if not self.holder.held:
+                return
+            self._add_tab(tid, select=False)
+        s = self.sessions[tid]
+        if s.terminals is not None:
+            s.terminals.refresh(gone)
+            if taken:
+                s.terminals.say("Took %s off the desktop. It keeps running; Show window "
+                                "puts it back." % ", ".join(
+                                    terminals_ui.clip(t["title"]) for t in taken))
+        self._consoles_changed()
+
+    def _consoles_changed(self):
+        s = self.sessions.get(eng.TERMINALS.id)
+        if s is None:
+            return
+        n = len(self.holder.held)
+        s.status = ("%d console%s held" % (n, "" if n == 1 else "s") if n
+                    else "no consoles held", "muted", False)
+        s.bridge = ("ok" if n else "faint", "%s\n%d held" % (s.app.bridge_label, n))
+        self._paint_app_dot(s)
+        if s.id in self.tab_ui:
+            self._paint_tab(s.id)
+        if s.id == self.active:
+            self._apply_status()
+
+    def _toggle_hold(self):
+        """View > Hold outside consoles. Off gives every held window back;
+        on takes every console on the desktop, the given-back ones too."""
+        on = bool(self.hold_var.get())
+        self.prefs.set(hold_consoles=on)
+        if on:
+            self.holder.released.clear()
+            return                        # the watcher's next sweep takes them
+        self.holder.release_all()
+        s = self.sessions.get(eng.TERMINALS.id)
+        if s is not None and s.terminals is not None:
+            s.terminals.refresh()
+        self._consoles_changed()
 
     def _panel_say(self, s, text, role="muted"):
         if s.panel_note is not None:
@@ -3887,6 +3998,9 @@ class Chat(tk.Tk):
         elif kind == "images":
             if s.images is not None:
                 s.images.handle(payload)
+        elif kind == "terminals":
+            if s.terminals is not None:
+                s.terminals.handle(payload)
         elif kind in ("error", "sys"):
             self._panel_say(s, payload, "err" if kind == "error" else "muted")
         elif kind == "trace":
@@ -4887,6 +5001,7 @@ class Chat(tk.Tk):
         for s in self.sessions.values():
             if s.images is not None:
                 s.images.release(confirmed=True)
+        self.holder.stop()                # every held console back on the desktop
         self.anim.clear()
         for timer in ("drain_timer", "host_timer", "anim_timer", "update_timer"):
             self._stand_down(timer)
@@ -4909,6 +5024,7 @@ class Chat(tk.Tk):
 
 
 _LOCK = None
+_MAIN = False                             # set by main(): this is the app, not a test's window
 
 
 def claim_single_instance(port=57733):
@@ -4972,6 +5088,8 @@ def main():
                                       "Look for its window on the taskbar." % APP_NAME)
         root.destroy()
         return
+    global _MAIN
+    _MAIN = True
     try:
         app = Chat()
         # Ctrl+C / Ctrl+Break in a console, or a SIGTERM: the same orderly

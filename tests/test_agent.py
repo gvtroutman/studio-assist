@@ -3866,11 +3866,19 @@ class TestGui(unittest.TestCase):
         self.app._select(target)
         self.app.update()
         self.assertTrue(self.app.tab_ui[target]["label"].winfo_ismapped())
+        # Every tab labelled needs more than a 1900 px window, which is as
+        # wide as a 150% display lets it be; one closed, the rest fit. It is
+        # put back where it was: other tests close `order[-1]`.
+        at = self.app.order.index("terminals")
+        self.app._close_tab("terminals")
         self.app.geometry("%dx%d" % (self.app._px(1900), self.app._px(820)))
         self.app.update()
         self.app._fit_tabs()
         self.app.update()
         self.assertFalse([sid for sid, ui in self.app.tab_ui.items() if ui["compact"]])
+        self.app._add_tab("terminals", select=False)
+        self.app.order.remove("terminals")
+        self.app.order.insert(at, "terminals")
         self.app.geometry("%dx%d" % (self.app._px(1180), self.app._px(820)))
         self.app.update()
 

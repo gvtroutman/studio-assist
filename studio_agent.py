@@ -2016,6 +2016,9 @@ class AppSpec:
     # True only for IMAGE_STUDIO below: a panel tab whose body is our own
     # form (studio_images_ui.py) rather than another program's window.
     images = False
+    # True only for TERMINALS below: a panel tab that mirrors console windows
+    # opened outside the app (studio_terminals_ui.py).
+    terminals = False
 
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
                  args, bridge_label, groups, default_groups, system_prompt,
@@ -2801,9 +2804,25 @@ IMAGE_STUDIO = ImagesSpec(
     fg="#ffffff", bg="#5b3cc4", url="",
     note="The Image Studio sends its work to the ComfyUI backends listed under Backends.")
 
+class TerminalSpec(PanelSpec):
+    """Console windows opened outside the app - ComfyUI's, a cmd started by
+    hand - hidden from the desktop and mirrored here (studio_consoles.py,
+    studio_terminals_ui.py). The app opens this tab itself when it takes one."""
+    terminals = True
+
+    def __init__(self, **kw):
+        PanelSpec.__init__(self, **kw)
+        self.bridge_label = "consoles"
+
+
+TERMINALS = TerminalSpec(
+    id="terminals", name="Terminal", tab="Terminal", code=">_",
+    fg="#ecebe8", bg="#232321", url="",
+    note="Console windows opened outside the app are held in the Terminal tab.")
+
 # Everything that can be a tab, apps first. APPS stays the registry of drivable
 # apps; TABS is what the tab strip and the new-tab menu offer.
-TABS = APPS + [MILANOTE, IMAGE_STUDIO, CHAT]
+TABS = APPS + [MILANOTE, IMAGE_STUDIO, TERMINALS, CHAT]
 TABS_BY_ID = {a.id: a for a in TABS}
 
 
