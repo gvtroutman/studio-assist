@@ -1904,6 +1904,22 @@ class TestTryOn(TempStudioMixin, unittest.TestCase):
         self.assertIn("The Red Dress, glasses and top hat look exactly as in the reference",
                       p.prompt)
 
+    def test_tags_are_the_things_on_the_person(self):
+        refs = {k: self.pic(k.replace(" ", "_")) for k in
+                ("glasses", "earring", "dress", "rose tattoo", "tattoo")}
+        s = dict(ig.default_settings(), item_refs=refs, traits="freckles, tattoos",
+                 accessories="hoop earrings", scene="She wears her dress and glasses.")
+        o = ig.outfit_of(s)
+        self.assertEqual([c["name"] for c in o["clothes"]], ["dress"])
+        self.assertEqual(sorted(a["name"] for a in o["accessories"]),
+                         ["earring", "glasses", "tattoo"])
+        # Said on the skin by its own words, in the Traits slot or the scene.
+        o = ig.outfit_of(dict(s, traits="a rose tattoo on the wrist", scene=""))
+        self.assertEqual(sorted(a["name"] for a in o["accessories"]),
+                         ["earring", "rose tattoo"])      # the longer tag, not both
+        o = ig.outfit_of(dict(s, traits="a rose tattoo and a tattoo", scene=""))
+        self.assertIn("tattoo", [a["name"] for a in o["accessories"]])
+
     def test_the_item_pictures_are_one_reference_on_the_prompt(self):
         wf = ig.load_workflow("flux_dev_baseline")
         g = ig.fill(wf, dict(wf["defaults"], model="m", clip_l="c", t5="t", vae="v",
