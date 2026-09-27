@@ -447,6 +447,7 @@ class TestSpeculativeRequests(unittest.TestCase):
         self.calls = []
         self.refuse = None        # (status, text) for a request carrying a draft
         self.refuse_all = False   # ...or for every request
+        self.stream_refuse = None # message of a streamed refusal (200 + event: error)
         self.stats = None
         self.cut = False          # the host stops the reply with "length"
         real = urllib.request.urlopen
@@ -459,6 +460,10 @@ class TestSpeculativeRequests(unittest.TestCase):
                           {"choices": [{"delta": {}, "finish_reason": "length"}]}]
                 lines = ["data: " + json.dumps(c) for c in chunks] + ["data: [DONE]"]
                 return self.Resp("\n".join(lines).encode("utf-8"))
+            if self.stream_refuse and body.get("stream") and (self.refuse_all or body.get("draft_model")):
+                # LM Studio's streamed refusal: 200 OK and an error event.
+                err = {"error": {"message": self.stream_refuse}, "message": self.stream_refuse}
+                return self.Resp(("event: error\ndata: " + json.dumps(err) + "\n\n").encode("utf-8"))
             if self.refuse and (self.refuse_all or body.get("draft_model")):
                 code, text = self.refuse
                 raise urllib.error.HTTPError(req.full_url, code, "bad", {},
@@ -506,6 +511,26 @@ class TestSpeculativeRequests(unittest.TestCase):
         self.llm.stream(self.messages, on_text=lambda _: None)
         self.assertEqual(len(self.calls), 3)
         self.assertNotIn("draft_model", self.calls[2])
+
+    def test_a_streamed_refusal_of_the_draft_is_dropped_and_explained(self):
+        """Live 2026-09-27: LM Studio refuses a request-time draft on a stream
+        with 200 OK and `event: error`, which read as "connection ended" on
+        every reply of the tab."""
+        self.stream_refuse = "speculative decoding must be configured at load time"
+        seen = []
+        msg = self.llm.stream(self.messages, on_text=seen.append)
+        self.assertEqual((msg["content"], seen), ("ok", ["ok"]))
+        self.assertEqual([c.get("draft_model") for c in self.calls], ["tiny-0.6b", None])
+        self.assertIsNone(self.llm.draft)
+        self.assertIn("load time", self.llm.draft_note)
+
+    def test_a_streamed_refusal_that_is_not_the_drafts_is_said_plainly(self):
+        self.stream_refuse, self.refuse_all = "model is not loaded", True
+        self.llm.draft = None
+        with self.assertRaises(RuntimeError) as cm:
+            self.llm.stream(self.messages, on_text=lambda _: None)
+        self.assertIn("model is not loaded", str(cm.exception))
+        self.assertNotIn("connection ended", str(cm.exception))
 
     def test_an_error_that_is_not_the_drafts_keeps_the_draft_and_the_error(self):
         self.refuse, self.refuse_all = (400, "Unrecognized schema: false"), True
@@ -3332,7 +3357,8 @@ class TestGui(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.app._clear_view(s)
                 self.app._begin_thinking(s)
-                payload = {"sys": "note", "error": "bad", "token": "x",
+                payload = {"sys": "note", "roadmap": {"plan": ["a", "b"], "done": [1]},
+                           "error": "bad", "token": "x",
                            "ready": None, "stream_start": None,
                            "tool": {"name": "t", "arguments": {}, "via": None},
                            "tool_result": {"name": "t", "text": "r"},

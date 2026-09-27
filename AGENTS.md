@@ -2732,6 +2732,24 @@ composer.
   every call in a step is the record update, it succeeded, the reply is non-empty,
   does not `announces_work()` and no read-back is owed, the run ends there with
   "response complete". A plan plus "I'll make the comp" still continues.
+  Since 2026-09-27 `studio_remember` and `studio_tool_create` count too
+  (`BOOKKEEPING`). Seen live, a finished model called one after another, rewriting
+  its answer each time, until the user stopped it. The texts were paraphrases (0.06-0.29
+  similar), so comparing answers would not have caught it. Open roadmap steps still
+  continue.
+- **The roadmap** (added 2026-09-27; the user: "it needs a roadmap of tasks to finish
+  the prompted task"). `TaskRecord.plan` is a list of steps and `TaskRecord.done`
+  holds their numbers (`studio_task_update` takes `done`; a new plan clears it).
+  `roadmap()` renders a checklist ending in "Next: step N." It is in the tail of
+  every request (`context_messages`) and in the reply to each update. The GUI shows
+  a `roadmap` event as a ✓ / → / ○ block. **The executor makes the roadmap itself
+  from a brief written as numbered steps** (`numbered_steps`: 1, 2, 3… in order,
+  two or more). Seen live: qwen3-coder never recorded a plan even when the prompt
+  asked, though it worked such a list in order. With the roadmap seeded, it ticked
+  the steps and finished at 3 of 3. When the model stops with a step open (not a
+  question, no `studio_ask`), `ROADMAP_HINT` names the step, at most `ROADMAP_NUDGES`
+  (2) times a run. A third stop ends the run on the model's own words. A saved task
+  from before `done` existed loads with `done = []`.
 - **Stop interrupts the reply being streamed.** Cancellation used to be checked
   only between steps, so the rest of a reply kept arriving after Stop. The
   executor's token callback raises `Cancelled` once `cancel` is set; it unwinds
@@ -2808,7 +2826,14 @@ composer.
   cost the tab:** `LLM._open` retries an HTTP error once without the draft, and only
   when that succeeds drops the draft for good and sets `draft_note`; the retry failing
   too means the error was not the draft's, and the original is raised with the draft
-  kept. `_draft_check` says the note once, in the tab the request was made from, after
+  kept. **A streamed request is refused differently:** LM Studio answers `200 OK`
+  with an `event: error` line whose data is `{"error": …}` and has no `choices`, so
+  `_open` never sees an HTTP error. `LLM.stream` reads that line. When it comes before
+  any content and a draft is set, the draft is dropped with the same note and the
+  request is retried once. Otherwise it raises the host's message. Before this was
+  fixed (2026-09-27, `qwen3-1.7b` refused as needing "load time"), every reply in the
+  tab read "Incomplete inference response (connection ended)".
+  `_draft_check` says the note once, in the tab the request was made from, after
   each warm-up and turn. The Inference row names the draft and, when the host reports
   `accepted_draft_tokens_count`, the share kept (`LLM.drafted`, `_host_line`) —
   speculative decoding backfires when the draft is mostly wrong, and that is how to

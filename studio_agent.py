@@ -489,7 +489,7 @@ class LLM:
         resp = self._open(self._body(messages, tools, stream=True, **limits))
 
         content, calls = [], {}
-        finish_reason, done = None, False
+        finish_reason, done, refused = None, False, None
         with resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
@@ -503,6 +503,14 @@ class LLM:
                     chunk = json.loads(data)
                 except json.JSONDecodeError as e:
                     raise RuntimeError("Malformed inference stream; no tools from this response were executed.") from e
+                if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                    # LM Studio refuses a streamed request with 200 OK and an
+                    # `event: error` line - not an HTTP error, so `_open`'s
+                    # draft retry never saw it and every reply read as
+                    # "connection ended" (seen live 2026-09-27, draft refused).
+                    err = chunk["error"]
+                    refused = (err.get("message") if isinstance(err, dict) else str(err)) or "error"
+                    break
                 self._count(chunk.get("stats"))
                 choice = (chunk.get("choices") or [{}])[0]
                 finish_reason = choice.get("finish_reason") or finish_reason
@@ -523,6 +531,14 @@ class LLM:
                     if fn.get("arguments"):
                         slot["args"] += fn["arguments"]
 
+        if refused is not None:
+            if self.draft and not content and not calls:
+                self.draft_note = ("The host refused %s as a draft model for %s (%s); "
+                                   "speculative decoding is off for this model."
+                                   % (self.draft, self.model, refused.strip()[:300]))
+                self.draft = None
+                return self.stream(messages, tools, on_text, max_tokens)
+            raise RuntimeError("inference host %s refused the request: %s" % (self.url, refused))
         if finish_reason == "length":
             # The host stopped the model, not the model itself: the reply hit
             # the context window it was loaded with (or a response-length
@@ -2041,6 +2057,13 @@ def studio_section(text):
             "for and how they work. Follow it.\n" + text)
 
 
+def about_section(text):
+    """The app's profile (studio_appinfo.render): which app and tab, the
+    release installed, what the app is."""
+    text = (text or "").strip()
+    return "\n\nABOUT THE APP THIS TAB DRIVES\n" + text if text else ""
+
+
 def lessons_section(text):
     text = (text or "").strip()
     if not text:
@@ -3475,6 +3498,10 @@ def converse(llm, mcp, tools, app, args, schemas=None):
     elif notebook.lessons:
         log("  %d lesson(s) from earlier work" % len(notebook.lessons), args.quiet)
     system_prompt = app.cli_prompt(read_studio_brief(), notebook.brief())
+    if app.drivable:
+        import studio_appinfo
+        base = os.path.dirname(studio_brief_path())
+        system_prompt += about_section(studio_appinfo.render(studio_appinfo.refresh(app, base)))
     library = None
     if tools:
         library = toolsmith.Library.for_app(app.id)
