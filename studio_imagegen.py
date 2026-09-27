@@ -1368,6 +1368,26 @@ FACE_SWAP_REF_PAD = 1.8
 FACE_SWAP_PROMPT = ("The person in picture 1 has the face of the person in %s: the same "
                     "eyes, nose, mouth, face shape, eyebrows and skin, turned and lit as "
                     "the face in picture 1.")
+# After FaceFusion (Generate with a face profile) the swapped face's eyes
+# come back soft and its glasses faint: the swap paints the new face over
+# the frames. So two redraws follow it, on the picture's own model, each
+# only where SAM3 finds the thing in the crop: the eyes, inside the face's
+# eye band, then the glasses last, so nothing is drawn over them (Gavin,
+# 2026-09-26: "it needs to do an eye pass and glasses last").
+FINISH_FIND = ["face:8", "glasses:4"]
+FINISH_WORDS = ["face", "glasses"]
+EYE_WORD = "eye:2"
+EYE_PAD = 1.6                         # the eye crop, of the face's longer side: the whole face
+EYE_BAND = (0.15, 0.6)                # the eyes' rows, of the face box's height
+EYE_DENOISE = 0.5
+EYE_WHAT = ("clear, detailed eyes with round irises, dark pupils and lashes, both looking "
+            "the same way")
+# Live on Lilya (2026-09-26): at 0.6, "glasses with ... clear lenses" came
+# back with crisp frames but milky lenses over the eyes just drawn; 0.45
+# and the lenses said to be glare-free kept the eyes seen through them.
+GLASSES_DENOISE = 0.45
+GLASSES_WHAT = ("thin metal glasses frames with perfectly clear, transparent lenses and no "
+                "glare, the eyes sharp behind them")
 # A spot can be a freehand outline (the Fix a spot window's drag): only
 # inside it changes. ComfyUI has no polygon mask node, so the outline is
 # drawn here as a mask picture at the crop's size (`outline_png`) and
@@ -1571,6 +1591,51 @@ def found_spots(width, height, boxes, kind):
             sp["word"] = str(b[4])        # what SAM3 was asked: it finds the outline again
         out.append(sp)
     return out[:FIX_MAX_SPOTS]
+
+
+def swapped_faces(width, height, boxes, profiles):
+    """The faces (x, y, w, h) FaceFusion swapped for `profiles`, chosen as
+    it chooses them (studio_facefusion.target_face over the faces left to
+    right). One profile falls back to the biggest face when SAM3 sees more
+    faces than FaceFusion did."""
+    import studio_facefusion as facefusion
+    order = sorted(boxes, key=lambda b: b[0])
+    norm = [[x / float(width), y / float(height), (x + w) / float(width), (y + h) / float(height)]
+            for x, y, w, h in order]
+    out = []
+    for i, p in enumerate(profiles):
+        try:
+            k = facefusion.target_face(norm, region=p.get("target_region"),
+                                       point=p.get("target_point"),
+                                       index=i if len(profiles) > 1 else None,
+                                       count=len(profiles))
+        except RuntimeError:
+            if len(profiles) != 1 or not order:
+                continue
+            k = order.index(max(order, key=lambda b: b[2] * b[3]))
+        if order[k] not in out:
+            out.append(order[k])
+    return out
+
+
+def eye_spots(faces):
+    """Each face -> the eye pass's spot: a square round the whole face,
+    its box the face's eye band, redrawn only where SAM3 finds the eyes."""
+    top, bottom = EYE_BAND
+    return [{"x": int(x + w / 2.0), "y": int(y + h / 2.0),
+             "size": int(max(FIX_MIN, max(w, h) * EYE_PAD)),
+             "box": [int(x), int(y + h * top), int(w), max(1, int(round(h * (bottom - top))))],
+             "word": EYE_WORD} for x, y, w, h in faces]
+
+
+def glasses_spots(width, height, glasses, faces):
+    """What SAM3 found as glasses (x, y, w, h), those centred on one of
+    `faces` -> spots, squared as Find squares them."""
+    def on(g, f):
+        cx, cy = g[0] + g[2] / 2.0, g[1] + g[3] / 2.0
+        return f[0] <= cx <= f[0] + f[2] and f[1] <= cy <= f[1] + f[3]
+    return found_spots(width, height, [tuple(g[:4]) + ("glasses",) for g in glasses
+                                       if any(on(g, f) for f in faces)], "other")
 
 
 def parts_graph(image, sam3, prompts):
@@ -4802,6 +4867,8 @@ class Studio:
             pictures = self.finish_profiles(job, graph, pictures, profiles, say)
             if pictures is None:
                 return
+            pictures = self._eyes_and_glasses(job, client, plan, values, pictures, profiles,
+                                              say)
         self.save_result(job, self.record_for(job, graph), pictures)
         job.progress = 1.0
         self.queue._finish(job, "complete",
@@ -4859,7 +4926,7 @@ class Studio:
                            if len(profiles) > 1 else {})
                 data, report = facefusion.swap(data, profile, stop=job.cancel.is_set, **options)
                 job.facefusion.append(report)
-                job.notes.append("%s: FaceFusion applied last; zero pixels changed outside the face mask."
+                job.notes.append("%s: FaceFusion applied; zero pixels changed outside the face mask."
                                  % profile["name"])
             result.append((os.path.splitext(filename)[0] + ".png", data))
         return result
@@ -4906,6 +4973,111 @@ class Studio:
         s.update(references={}, item_refs={}, pose=None, composition=None,
                  face_detail=False, auto_refine=False, batch=1)
         return s
+
+    def _fix_oval(self, client):
+        """The fix oval, uploaded to `client`. The crop reaches FIX_CONTEXT
+        times past the spot, so the model redraws it seeing the photo round
+        it; the oval is shrunk to match, so only the spot changes."""
+        oval = os.path.join(self.lib.root, "fix_oval.png")
+        os.makedirs(self.lib.root, exist_ok=True)
+        with open(oval, "wb") as fh:
+            fh.write(oval_png(scale=1.0 / FIX_CONTEXT, centre=0.5))
+        return client.upload_image(oval)
+
+    def _eyes_and_glasses(self, job, client, plan, values, pictures, profiles, say):
+        """After FaceFusion, on the lane's thread: each swapped face's eyes
+        redrawn, then its glasses last (EYE_WHAT, GLASSES_WHAT), by the fix
+        machinery on the picture's own model. -> the pictures; FaceFusion's
+        own when a pass cannot run, fails or is cancelled - the swap is
+        never lost to its finish."""
+        b = job.backend
+        sam = self.sam3_on(b)
+        why = ""
+        if not plan.workflow.get("face_detail"):
+            why = "the %s workflow has no redraw section" % plan.workflow.get("label")
+        elif not sam:
+            why = "%s has no SAM3 checkpoint" % b["name"]
+        else:
+            try:
+                lacks = FACE_NODES - set(client.node_types())
+            except ComfyError:
+                lacks = set()
+            if lacks:
+                why = "%s's ComfyUI lacks %s" % (b["name"], ", ".join(sorted(lacks)))
+        if why:
+            job.notes.append("No eye or glasses pass after the face swap: %s." % why)
+            return pictures
+        v = dict(values, sam3=sam, match_tone=None)
+        folder = os.path.join(self.lib.root, "finish")
+        out = []
+        try:
+            os.makedirs(folder, exist_ok=True)
+            oval = self._fix_oval(client)
+            for n, (filename, data) in enumerate(pictures):
+                if job.cancel.is_set():
+                    out.append((filename, data))
+                    continue
+                path = os.path.join(folder, "%s_%d.png" % (job.id, n))
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                image = client.upload_image(path)
+                say("refining", "Finding the eyes and glasses", None)
+                job.prompt_id = client.queue_workflow(parts_graph(image, sam, FINISH_FIND))
+                entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
+                                                   stop=job.cancel.is_set)
+                said = parts_found(entry or {}, len(FINISH_FIND), FINISH_WORDS)
+                if said is None:
+                    if not job.cancel.is_set():
+                        job.notes.append("SAM3 said nothing about the swapped picture, so "
+                                         "no eye or glasses pass was made.")
+                    out.append((filename, data))
+                    continue
+                width, height, boxes = said
+                faces = swapped_faces(width, height,
+                                      [x[:4] for x in boxes if x[4] == "face"], profiles)
+                if not faces:
+                    job.notes.append("SAM3 found no swapped face, so no eye or glasses "
+                                     "pass was made.")
+                    out.append((filename, data))
+                    continue
+                eyes = eye_spots(faces)
+                passes = [("Eye pass", fix_areas(fix_crops(width, height, eyes), eyes),
+                           EYE_DENOISE, EYE_WHAT, "_eyes")]
+                glasses = glasses_spots(width, height,
+                                        [x for x in boxes if x[4] == "glasses"], faces)
+                if glasses:
+                    crops = fix_crops(width, height, [dict(sp, size=int(sp["size"] * FIX_CONTEXT))
+                                                      for sp in glasses])
+                    passes.append(("Glasses", fix_areas(crops, glasses), GLASSES_DENOISE,
+                                   GLASSES_WHAT, "_glasses"))
+                done = None
+                for label, crops, denoise, what, tag in passes:
+                    graph = face_graph(plan.workflow, dict(v, face_prompt=FIX_PROMPT % what,
+                                                           face_denoise=denoise),
+                                       plan.loras, image, crops, oval,
+                                       values["filename_prefix"] + tag)
+                    files = self._run_pass(job, client, graph, say, label)
+                    if files is None:     # cancelled: keep what is finished
+                        break
+                    done = files[0]
+                    image = "%s%s [%s]" % (done["subfolder"] + "/" if done.get("subfolder")
+                                           else "", done["filename"], done.get("type") or "output")
+                    job.notes.append(
+                        "Eye pass after the face swap: %d face%s, denoise %s." % (
+                            len(faces), "" if len(faces) == 1 else "s", denoise)
+                        if tag == "_eyes" else
+                        "Glasses redrawn last: %d pair%s, denoise %s." % (
+                            len(glasses), "" if len(glasses) == 1 else "s", denoise))
+                if done is not None:
+                    data = client.fetch(done)
+                if len(passes) == 1 and not job.cancel.is_set():
+                    job.notes.append("SAM3 found no glasses on the swapped face.")
+                out.append((filename, data))
+        except (ComfyError, TemplateError, OSError) as e:
+            job.notes.append("The eye and glasses passes after the face swap failed (%s); "
+                             "the picture is FaceFusion's." % e)
+            return pictures
+        return out
 
     def _outline_masks(self, job, client, crops, tag):
         """Each crop with a freehand outline gets `shape`: the outline drawn
@@ -4997,14 +5169,7 @@ class Studio:
             for var, path in plan.images.items():
                 values[var] = client.upload_image(path)
             image = client.upload_image(src)
-            # The crop reaches FIX_CONTEXT times past the spot, so the model
-            # redraws it seeing the photo round it; the oval is shrunk to
-            # match, so only the spot changes.
-            oval = os.path.join(self.lib.root, "fix_oval.png")
-            os.makedirs(self.lib.root, exist_ok=True)
-            with open(oval, "wb") as fh:
-                fh.write(oval_png(scale=1.0 / FIX_CONTEXT, centre=0.5))
-            oval = client.upload_image(oval)
+            oval = self._fix_oval(client)
             locks = lock_regions(size[0], size[1], fix["locks"])
             values["filename_prefix"] = "ImageStudio/fix_%s" % job.id
             graphs = []

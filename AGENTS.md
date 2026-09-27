@@ -758,6 +758,25 @@ Tests in `test_facefusion_profiles.py` mock inference; the GUI tests exercise th
 profile menu and editor. Lilya's live final-pass result matched the approved
 standalone HyperSwap result byte-for-byte.
 
+**The eyes and then the glasses are redrawn after the swap** (Generate only;
+`Studio._eyes_and_glasses`). FaceFusion pastes the new face over the frames,
+so the eyes came back soft and the glasses faint. Gavin asked for "an eye pass
+and glasses last" (2026-09-26). The swapped picture goes back to the job's
+ComfyUI. One SAM3 run (`FINISH_FIND`: faces, glasses) finds the faces, and
+`swapped_faces` picks the ones FaceFusion swapped, by its own `target_face`
+rule over the faces left to right. With one profile it falls back to the
+biggest face. Two fix-machinery runs of `face_graph` follow, on the picture's
+own model. First the **eyes**: the whole face is cropped and only SAM3's
+`eye:2` inside the face's eye band is redrawn (`eye_spots`, 0.5). Then the
+**glasses** on that face, last, so nothing is drawn over them (`glasses_spots`,
+0.45). Neither pass tone-matches, because the curves posterize swapped skin.
+Live on Lilya: at 0.6 the frames came back crisp but the lenses went milky
+over the new eyes. At 0.45, with glare-free lenses in the prompt, the eyes show
+through. Both runs take about 13 s on the 5090. Without SAM3 or a `face_detail`
+section, and on any failure or cancel, the picture stays FaceFusion's and a
+note says why. The local face-only swap (Fix a spot with no spots, Retry face
+swap) has no ComfyUI and gets neither pass.
+
 ### Family photos with WithAnyone
 
 `comfy_workflows/withanyone.json` and `comfy_nodes/studio_withanyone` draw one to
