@@ -52,6 +52,28 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
         self.assertEqual(ff.selected(self.studio.lib, {'identities': []}), [])
         self.assertEqual(len(ff.selected(self.studio.lib, {'identities': ['lilya', 'lilya']})), 1)
 
+    def test_swap_strength_defaults_strong_and_follows_the_profile(self):
+        profile = self.profile()
+        self.assertEqual(profile['swap_strength'], ff.SWAP_STRENGTH)
+        self.assertGreater(ff.strength(profile), 0.5)   # 0.5 is FaceFusion's neutral
+        self.assertEqual(ff.strength(dict(profile, swap_strength=0.62)), 0.6)
+        self.assertEqual(ff.strength(dict(profile, swap_strength=7)), 1.0)
+        self.assertEqual(ff.strength({'swap_strength': 'lots'}), ff.SWAP_STRENGTH)
+        self.assertEqual(ig.clean_identity({'name': 'X', 'swap_strength': 3})['swap_strength'], 1.0)
+
+    def test_swap_hands_facefusion_the_profile_strength(self):
+        profile = dict(self.profile(), swap_strength=0.95)
+        seen = []
+        def spawn(args, **kw):
+            seen.append(args)
+            raise RuntimeError('stop here')
+        with patch.object(ff, 'available', return_value=True), \
+                patch.object(ff.studio_procs, 'spawn', side_effect=spawn):
+            with self.assertRaisesRegex(RuntimeError, 'stop here'):
+                ff.swap(PNG, profile)
+        args = seen[0]
+        self.assertEqual(args[args.index('--weight') + 1], '0.95')
+
 
 if __name__ == '__main__':
     unittest.main()

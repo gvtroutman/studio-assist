@@ -54,6 +54,8 @@ class WithAnyoneTests(unittest.TestCase):
         g = ig.fill(p.workflow, dict(p.values, face1="uploaded-left", face2="uploaded-right"))
         self.assertEqual(g["40"]["inputs"]["face2"], ["face2", 0])
         self.assertEqual(g["face2"]["inputs"]["image"], "uploaded-right")
+        # Upstream's "resemblance in form" end: the reference face as it looks.
+        self.assertEqual(g["40"]["inputs"]["siglip_weight"], 1.0)
 
     def test_missing_photo_refuses_instead_of_using_a_stranger(self):
         self.settings["scene_faces"]["people"][1]["face"] = "missing.png"

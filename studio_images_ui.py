@@ -2329,13 +2329,15 @@ class ImageStudio:
             ("references", "Reference photos — used to apply this person's face", "paths"),
             ("avatar", "Profile picture (optional; a generated picture is fine)", "path"),
             ("face_swap", "Final face swap (needs FaceFusion on this PC)", "bool"),
+            ("swap_strength", "Face swap strength (0.5 gentle, 1 strongest)", "number"),
             ("notes", "Notes", "long"),
             ("lora", "Identity LoRA", ("choice", loras)),
             ("trigger", "Trigger token", "text"),
             ("strength", "Default LoRA strength", "number"),
             ("use_references", "Use the first photo as the face reference", "bool"),
             ("reference_strength", "Face reference strength", "number"),
-        ], template={"name": "New person", "strength": 0.85, "face_swap": True},
+        ], template={"name": "New person", "strength": 0.85, "face_swap": True,
+                      "swap_strength": 0.8},
             extra=[("Use this person", self._use_profile), ("Pick person…", self._pick_person)])
 
     def _use_profile(self, editor):

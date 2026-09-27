@@ -5,7 +5,7 @@
   "families": ["flux1"],
   "multi_identity": {"sampler": "40", "max_people": 4},
   "defaults": {
-    "steps": 25, "guidance": 4.0, "siglip_weight": 0.8,
+    "steps": 25, "guidance": 4.0, "siglip_weight": 1.0,
     "width": 1024, "height": 1024, "encoder_device": "cpu",
     "filename_prefix": "ImageStudio/withanyone"
   },
