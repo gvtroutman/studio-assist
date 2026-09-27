@@ -87,6 +87,12 @@ this PC's files and the web instead. Two moving parts:
 - **`studio_catalog.py`** — the Image Studio's Add-ons: LoRAs sorted by the model they
   work with, CivitAI's catalog per model, thumbnails Tk can show, uninstall to the
   Recycle Bin. No tkinter (the window is `AddonsWindow`). See *Add-ons*.
+- **`studio_hub.py`** — the Image Studio's Add-ons beyond CivitAI: Hugging Face LoRAs
+  for a model (adapters of its base repos, `FAMILY_REPOS`) and ComfyUI custom-node
+  plugins from GitHub (topic `comfyui-nodes`), unpacked confined into
+  `<ComfyUI>/custom_nodes/<repo>`, never overwriting and never running anything. No
+  tkinter; the tabs are `AddonsWindow`'s "Hugging Face" and "GitHub plugins", and the
+  Image Studio header's "App store" opens that window.
 - **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
