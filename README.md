@@ -115,15 +115,15 @@ apps. Preferences, pinned and hidden apps and open tabs are remembered in
 ### From a terminal
 
 ```bash
-python studio_chat.py                                     # the GUI
-python studio_agent.py "what comps are in this project"   # one-shot, After Effects
-python studio_agent.py --app resolve "what's on the timeline"
-python studio_agent.py --app resolve                      # interactive REPL
-python studio_agent.py --app chat "how long is 240 frames at 23.976"
-python studio_agent.py --list-groups                      # tool families, per app
-python studio_agent.py --app resolve --list-tools
-python studio_agent.py --app photoshop "what layers are in this document"
-python studio_agent.py --mcp "npx -y some-mcp-server" --name Blender "what's in the scene"
+python core/chat.py                                     # the GUI
+python core/agent.py "what comps are in this project"   # one-shot, After Effects
+python core/agent.py --app resolve "what's on the timeline"
+python core/agent.py --app resolve                      # interactive REPL
+python core/agent.py --app chat "how long is 240 frames at 23.976"
+python core/agent.py --list-groups                      # tool families, per app
+python core/agent.py --app resolve --list-tools
+python core/agent.py --app photoshop "what layers are in this document"
+python core/agent.py --mcp "npx -y some-mcp-server" --name Blender "what's in the scene"
 ```
 
 Useful flags: `--app`, `--groups` (which tool families to expose), `--all-tools`,
@@ -172,12 +172,12 @@ on a host that cannot hold the diffusion model and the 30B together.
 | App | Bridge | Needs |
 |---|---|---|
 | After Effects | `@engine-room/after-effects-mcp` over `npx`, talking to the CEP panel on `127.0.0.1:7777` | Node / `npx` on PATH, and the panel installed (`setup_panel`, with AE closed) |
-| Premiere Pro (Beta) | `studio_premiere_mcp.py` (in this folder), posting ExtendScript to the **Studio Assist Bridge** panel inside Premiere on `127.0.0.1:7787` (`STUDIO_PREMIERE_PORT`) | The panel installed: `python studio_premiere_mcp.py --install-panel` with Premiere closed, then open it once from *Window > Extensions*. CEP's `PlayerDebugMode` must be on (the installer says if it is not) |
-| Photoshop | `studio_photoshop_mcp.py` (in this folder), running ExtendScript inside Photoshop through its Windows COM automation (`Photoshop.Application`) | Photoshop installed. Nothing to install inside it — no panel, no plugin |
-| Illustrator | `studio_illustrator_mcp.py` (in this folder), the same way through `Illustrator.Application` | Illustrator installed. Nothing to install inside it |
+| Premiere Pro (Beta) | `apps/adobe/premiere.py` (in this folder), posting ExtendScript to the **Studio Assist Bridge** panel inside Premiere on `127.0.0.1:7787` (`STUDIO_PREMIERE_PORT`) | The panel installed: `python apps/adobe/premiere.py --install-panel` with Premiere closed, then open it once from *Window > Extensions*. CEP's `PlayerDebugMode` must be on (the installer says if it is not) |
+| Photoshop | `apps/adobe/photoshop.py` (in this folder), running ExtendScript inside Photoshop through its Windows COM automation (`Photoshop.Application`) | Photoshop installed. Nothing to install inside it — no panel, no plugin |
+| Illustrator | `apps/adobe/illustrator.py` (in this folder), the same way through `Illustrator.Application` | Illustrator installed. Nothing to install inside it |
 | DaVinci Resolve | `davinci-resolve-mcp` from `~/davinci-resolve-mcp` | Resolve Studio, with *External scripting using* set to **Local** |
-| ComfyUI | `studio_comfy_mcp.py` (in this folder), talking HTTP to ComfyUI on the LLM PC — `http://100.127.17.38:8188` unless `COMFYUI_URL` says otherwise | ComfyUI started on that machine with `--listen` (so it accepts connections from the workstation), and at least one checkpoint installed there |
-| OpenCode | `studio_opencode_mcp.py` (in this folder), talking HTTP to `opencode serve`, which the window starts on `127.0.0.1:4096` (`OPENCODE_URL`) with a password | OpenCode installed once: `npm install -g opencode-ai` |
+| ComfyUI | `apps/comfyui/mcp.py` (in this folder), talking HTTP to ComfyUI on the LLM PC — `http://100.127.17.38:8188` unless `COMFYUI_URL` says otherwise | ComfyUI started on that machine with `--listen` (so it accepts connections from the workstation), and at least one checkpoint installed there |
+| OpenCode | `apps/opencode/mcp.py` (in this folder), talking HTTP to `opencode serve`, which the window starts on `127.0.0.1:4096` (`OPENCODE_URL`) with a password | OpenCode installed once: `npm install -g opencode-ai` |
 
 Photoshop and Illustrator need no bridge installed anywhere: on Windows both register
 COM automation, and its one method that matters runs ExtendScript inside the live app.
@@ -256,7 +256,7 @@ comp."* The shape briefing covers geometry plus fill/stroke, grouping, and comp
 coordinates; creating an empty shape layer alone is not a completed drawing.
 Restart Studio Assist after updating so its tabs load the new tools and prompt.
 
-Adding an app for good is a registry entry in `studio_agent.py`, not a code change —
+Adding an app for good is a registry entry in `core/agent.py`, not a code change —
 `AGENTS.md` says what an entry has to supply, the briefing included. Connecting one
 for now is the dialog above.
 
@@ -406,16 +406,16 @@ out badly.
 
 | Path | What |
 |---|---|
-| `studio_chat.py` | The Tkinter GUI: tab strip, one `Session` per app, plus the app-less Chat tab |
-| `studio_tasks.py` | Shared executor, argument checks, task records, context budgeting and recovery |
-| `studio_toolsmith.py` | Tools the model makes for itself: named sequences of the tools it already has |
-| `studio_lessons.py` | What the model learns per app: the notebook, `studio_remember`, the end-of-task reflection |
-| `studio_agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
-| `studio_mcp.py` | The MCP harness: the server our bridges run on, an in-process client, and `check` — holds any bridge to what the executor and the model need |
-| `studio_milanote.py` | The Milanote tab: its web app in a browser window held in the tab, and uploads dropped onto the board |
-| `studio_comfy_view.py` | ComfyUI's own editor in a window of ours, and a picture's graphs (each step of it) loaded into it |
-| `studio_nodes_ui.py` | The ComfyUI tab's Chat \| Nodes switch: that editor where the transcript is; the Image Studio's Nodes button opens pictures there |
-| `studio_icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
+| `core/chat.py` | The Tkinter GUI: tab strip, one `Session` per app, plus the app-less Chat tab |
+| `core/tasks.py` | Shared executor, argument checks, task records, context budgeting and recovery |
+| `core/toolsmith.py` | Tools the model makes for itself: named sequences of the tools it already has |
+| `core/lessons.py` | What the model learns per app: the notebook, `studio_remember`, the end-of-task reflection |
+| `core/agent.py` | Engine: app registry, MCP client, LLM client, schema sanitizing, probes. Also a CLI |
+| `core/mcp.py` | The MCP harness: the server our bridges run on, an in-process client, and `check` — holds any bridge to what the executor and the model need |
+| `apps/milanote/milanote.py` | The Milanote tab: its web app in a browser window held in the tab, and uploads dropped onto the board |
+| `apps/comfyui/view.py` | ComfyUI's own editor in a window of ours, and a picture's graphs (each step of it) loaded into it |
+| `apps/comfyui/nodes_ui.py` | The ComfyUI tab's Chat \| Nodes switch: that editor where the transcript is; the Image Studio's Nodes button opens pictures there |
+| `core/icons.py` | Reads an app's icon out of its own `.exe`, and writes PNGs. No dependencies, nothing shipped |
 | `Studio Assist.cmd` | Console-free launcher used by the shortcuts |
 | `studio_update.py` | Keeps this folder in step with GitHub: `--install` checks every 5 minutes and fast-forwards |
 | `make_icon.py` | Regenerates `studio-assistant.ico`, the shortcut and taskbar mark |
@@ -446,7 +446,7 @@ Every bridge - the four written here and the two installed ones - can be held to
 the executor and the model actually need, without opening the app:
 
 ```bash
-python studio_mcp.py check --app after-effects
+python core/mcp.py check --app after-effects
 ```
 
 It starts the bridge, negotiates the protocol, lists the tools, and reports what will

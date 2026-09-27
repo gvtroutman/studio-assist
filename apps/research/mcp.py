@@ -22,8 +22,8 @@ studio_mcp's; this file is the tools. The GUI runs it in process through
 studio_mcp.Loopback, so there is no subprocess to start and nothing to fail;
 run it by hand to see the tool list or check its own contract:
 
-    python studio_research_mcp.py --list-tools
-    python studio_research_mcp.py --check
+    python apps/research/mcp.py --list-tools
+    python apps/research/mcp.py --check
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout

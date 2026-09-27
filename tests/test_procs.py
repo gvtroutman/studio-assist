@@ -65,7 +65,7 @@ class TestContainment(unittest.TestCase):
         parent_code = (
             "import subprocess, sys\n"
             "sys.path.insert(0, %r)\n"
-            "import studio_procs\n"
+            "import core.procs as studio_procs\n"
             "c = studio_procs.spawn([sys.executable, '-c', %r], stdin=subprocess.PIPE,\n"
             "                       stdout=subprocess.PIPE, text=True)\n"
             "import json\n"

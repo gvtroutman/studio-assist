@@ -1,5 +1,5 @@
 """
-The Premiere Pro bridge: a CEP panel that evaluates what studio_premiere_mcp.py
+The Premiere Pro bridge: a CEP panel that evaluates what apps/adobe/premiere.py
 posts to it. Nothing here reaches Premiere: the host's `run` is replaced and
 the tool bodies are checked as text, and the one HTTP server a test starts is a
 fake panel on loopback that answers what the test tells it to.
@@ -78,7 +78,7 @@ class TestRegistry(unittest.TestCase):
     def test_the_entry_points_at_the_script_and_probes_the_panel_port(self):
         app = eng.APPS_BY_ID["premiere"]
         self.assertEqual(app.command, eng.sys.executable)
-        self.assertEqual(os.path.basename(app.args[0]), "apps.adobe.premiere.py")
+        self.assertTrue(app.args[0].endswith(os.path.join("apps", "adobe", "premiere.py")))
         self.assertTrue(os.path.isfile(app.args[0]))
         self.assertEqual(app.probe, "port:" + eng.PREMIERE_PORT)
         self.assertIn(eng.PREMIERE_PORT, app.bridge_label)
@@ -442,7 +442,7 @@ class TestStdio(unittest.TestCase):
     """
 
     SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "apps.adobe.premiere.py")
+                          "apps", "adobe", "premiere.py")
 
     def spawn(self, env=None):
         p = subprocess.Popen([sys.executable, self.SCRIPT], stdin=subprocess.PIPE,

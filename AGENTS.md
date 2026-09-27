@@ -8,92 +8,92 @@ A chat app that drives creative apps with a **local LLM**, one tab per app — p
 a **Chat** tab with no app behind it, for the questions that need no app: it reads
 this PC's files and the web instead. Two moving parts:
 
-- **`studio_agent.py`** — the engine. The **app registry**, an MCP stdio client, an
+- **`core/agent.py`** — the engine. The **app registry**, an MCP stdio client, an
   OpenAI-compatible LLM client (streaming and not), JSON-Schema sanitizing, and
-  environment probes. Also a working CLI: `python studio_agent.py --app resolve
+  environment probes. Also a working CLI: `python core/agent.py --app resolve
   "what's on the timeline"`, or bare for a REPL.
-- **`studio_chat.py`** — the Tkinter GUI, and the way the app is actually used.
+- **`core/chat.py`** — the Tkinter GUI, and the way the app is actually used.
   Launched with no console via `Studio Assist.cmd` and the Desktop / Start Menu
   shortcuts.
-- **`studio_tasks.py`** — shared GUI/CLI execution, original-schema validation,
+- **`core/tasks.py`** — shared GUI/CLI execution, original-schema validation,
   bounded request context, cancellation, execution journals and task recovery.
-- **`studio_toolsmith.py`** — tools the model makes for itself, and the per-app
+- **`core/toolsmith.py`** — tools the model makes for itself, and the per-app
   library they are kept in.
-- **`studio_lessons.py`** — what the model learns per app: the `Notebook` of one-line
+- **`core/lessons.py`** — what the model learns per app: the `Notebook` of one-line
   lessons, the `studio_remember` tool, the reading of the user's corrections and the
   end-of-task reflection. See *What the model learns, asks and looks up*.
-- **`studio_mcp.py`** — the MCP harness. `Server` is the protocol every bridge written
+- **`core/mcp.py`** — the MCP harness. `Server` is the protocol every bridge written
   here runs on (framing, revision negotiation, validation, annotations, logging,
   progress, cancellation); `Loopback` is `MCPClient`'s interface over a `Server` in
   this process; `check_tools()` / `check_live()` hold any bridge — ours or installed —
-  to what the executor and the inference host need. `python studio_mcp.py check --app
+  to what the executor and the inference host need. `python core/mcp.py check --app
   <id>` is the command; see *The MCP harness* below.
-- **`studio_comfy_mcp.py`** — our own MCP stdio bridge to ComfyUI's HTTP API. The
+- **`apps/comfyui/mcp.py`** — our own MCP stdio bridge to ComfyUI's HTTP API. The
   one bridge written here rather than installed, because ComfyUI has no MCP server
   of its own and the stdlib-only rule bars the ones on PyPI. `--list-tools` prints
   its contract.
-- **`studio_opencode_mcp.py`** — our MCP stdio bridge to the OpenCode server that
+- **`apps/opencode/mcp.py`** — our MCP stdio bridge to the OpenCode server that
   `ServerSpec` starts on this PC. It follows each task to the end and puts every step
   OpenCode asks permission for to the *user*, through MCP elicitation. `--list-tools`
   prints its contract. See *The app this window serves*.
-- **`studio_codeaddons.py`** / **`studio_codeaddons_ui.py`** — OpenCode's Add-ons (MCP
+- **`apps/opencode/codeaddons.py`** / **`apps/opencode/codeaddons_ui.py`** — OpenCode's Add-ons (MCP
   servers, plugins, skills): the records and catalogs, and the window. See *OpenCode's
   Add-ons*.
-- **`studio_com.py`** — the road into an Adobe app that registers COM automation: a
+- **`apps/adobe/com.py`** — the road into an Adobe app that registers COM automation: a
   PowerShell worker holding `Photoshop.Application` / `Illustrator.Application`, an
   ExtendScript prelude (JSON serializer, error folding, unit pinning), and `ComHost.run()`
   which turns a script body into a decoded value or a `ComError`. See *The COM bridges*.
-- **`studio_photoshop_mcp.py`**, **`studio_illustrator_mcp.py`** — our bridges to the
+- **`apps/adobe/photoshop.py`**, **`apps/adobe/illustrator.py`** — our bridges to the
   Photoshop and Illustrator on this machine, each a table of tools whose bodies are
-  ExtendScript run through `studio_com`. Nothing is installed inside either app.
-- **`studio_cep.py`** — the road into an Adobe app that registers no COM: a CEP panel
+  ExtendScript run through `apps.adobe.com`. Nothing is installed inside either app.
+- **`apps/adobe/cep.py`** — the road into an Adobe app that registers no COM: a CEP panel
   inside the app running a loopback HTTP server. `CepHost.run()` wraps a script body
-  exactly as `studio_com` does and posts it; `install_panel()` copies a panel folder
+  exactly as `apps.adobe.com` does and posts it; `install_panel()` copies a panel folder
   under `%APPDATA%\Adobe\CEP\extensions`; `explain_unreachable()` says the one
   thing to do when nothing answers. See *The CEP bridge*.
-- **`studio_premiere_mcp.py`**, **`premiere_panel/`** — our bridge to Premiere Pro (the
+- **`apps/adobe/premiere.py`**, **`premiere_panel/`** — our bridge to Premiere Pro (the
   Beta this studio cuts in): a table of tools whose bodies are ExtendScript run through
-  `studio_cep`, and the panel that evaluates them. `--install-panel` installs the panel.
-- **`studio_research_mcp.py`** — the Chat tab's bridge: this PC's files and the web,
+  `apps.adobe.cep`, and the panel that evaluates them. `--install-panel` installs the panel.
+- **`apps/research/mcp.py`** — the Chat tab's bridge: this PC's files and the web,
   read-only (`list_folder`, `find_files`, `read_file`, `search_web`, `fetch_page`). The
-  one bridge the GUI runs *in process*, through `studio_mcp.Loopback`. See *The tab
+  one bridge the GUI runs *in process*, through `core.mcp.Loopback`. See *The tab
   with no app*.
-- **`studio_procs.py`** — every child process the app starts, contained: each in its
+- **`core/procs.py`** — every child process the app starts, contained: each in its
   own kill-on-close Windows job object, so it and everything it starts end with the tab,
   the app, or the app's crash. See *Processes: nothing outlives the app*.
-- **`studio_milanote.py`** — the Milanote tab, which holds a window and has no bridge: a
+- **`apps/milanote/milanote.py`** — the Milanote tab, which holds a window and has no bridge: a
   Chrome/Edge `--app` window re-parented into the tab, and uploads dropped onto the board
   over DevTools. See *The tab that holds a window*.
-- **`studio_comfy_view.py`**, **`studio_nodes_ui.py`** — the ComfyUI tab's Nodes view:
+- **`apps/comfyui/view.py`**, **`apps/comfyui/nodes_ui.py`** — the ComfyUI tab's Nodes view:
   the same kind of window on a backend's ComfyUI, held where the transcript is, with an
   Image Studio picture's graphs loaded into it. See *The Nodes view*.
-- **`studio_imagegen.py`**, **`studio_images_ui.py`**, **`comfy_workflows/`** — the
+- **`apps/image_studio/imagegen.py`**, **`apps/image_studio/ui.py`**, **`comfy_workflows/`** — the
   Image Studio tab: a form (character, style, scene, references, generate) over any number
   of ComfyUI backends, with no model in the loop. See *The Image Studio*.
-  **`studio_pose.py`** is its pose: OpenPose stick figures and the picture drawn from
+  **`apps/image_studio/scene/pose.py`** is its pose: OpenPose stick figures and the picture drawn from
   one, no tkinter (the editor is `PoseEditor` in the tab's module).
-- **`studio_scene.py`**, **`studio_scene_ui.py`** — the Image Studio's Scene Builder: a
+- **`apps/image_studio/scene/scene.py`**, **`apps/image_studio/scene/ui.py`** — the Image Studio's Scene Builder: a
   posable mannequin and simple props on a floor (and walls, each wearing a picture
   made from words), one camera, and the frame it sees, drawn as the pose and depth
   maps (and, when asked, the grey frame) the Image Studio makes the picture from. See *The Scene Builder*.
   **`comfy_nodes/studio_dwpose`** (a photo's pose points) and **`comfy_nodes/studio_facepaste`**
   (a person's real face, pasted last) are its ComfyUI nodes, kept here and copied into a
   backend's `custom_nodes`; they are not stdlib-only, they run there.
-- **`studio_mannequin.py`** — the sections the Scene Builder's person is sculpted from
+- **`apps/image_studio/scene/mannequin.py`** — the sections the Scene Builder's person is sculpted from
   (chest with pecs, waist, seat, mitten hands): functions of the angle round a bone,
-  handed to `studio_scene.loft`. No tkinter.
-- **`studio_civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
+  handed to `apps.image_studio.scene.scene.loft`. No tkinter.
+- **`apps/image_studio/addons/civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
   for the Image Studio's LoRA library. No tkinter. See *The Image Studio*.
-- **`studio_catalog.py`** — the Image Studio's Add-ons: LoRAs sorted by the model they
+- **`apps/image_studio/addons/catalog.py`** — the Image Studio's Add-ons: LoRAs sorted by the model they
   work with, CivitAI's catalog per model, thumbnails Tk can show, uninstall to the
   Recycle Bin. No tkinter (the window is `AddonsWindow`). See *Add-ons*.
-- **`studio_hub.py`** — the Image Studio's Add-ons beyond CivitAI: Hugging Face LoRAs
+- **`apps/image_studio/addons/hub.py`** — the Image Studio's Add-ons beyond CivitAI: Hugging Face LoRAs
   for a model (adapters of its base repos, `FAMILY_REPOS`) and ComfyUI custom-node
   plugins from GitHub (topic `comfyui-nodes`), unpacked confined into
   `<ComfyUI>/custom_nodes/<repo>`, never overwriting and never running anything. No
   tkinter; the tabs are `AddonsWindow`'s "Hugging Face" and "GitHub plugins", and the
   Image Studio header's "App store" opens that window.
-- **`studio_icons.py`** — reads an app's own icon out of its `.exe` (PE resource
+- **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
 
@@ -104,7 +104,7 @@ Inference is **remote**; tools are **local**. That split is not negotiable:
 ```
 this PC (the workstation)                       tailnet peer
 ┌────────────────────────────────────┐         ┌──────────────────────┐
-│ studio_chat.py / studio_agent.py   │  HTTP   │ LM Studio            │
+│ core/chat.py / core/agent.py   │  HTTP   │ LM Studio            │
 │   ├ MCP stdio ─┐                   │ ──────► │ 100.127.17.38:1234   │
 │   │            ▼                   │         │ OpenAI-compatible    │
 │   │  @engine-room/after-effects-mcp│         └──────────────────────┘
@@ -118,23 +118,23 @@ this PC (the workstation)                       tailnet peer
 │   │                                │
 │   ├ MCP stdio ─┐                   │
 │   │            ▼                   │
-│   │  studio_photoshop_mcp.py ── powershell.exe ── COM ──► Photoshop
-│   │  studio_illustrator_mcp.py ─ powershell.exe ── COM ──► Illustrator
+│   │  apps/adobe/photoshop.py ── powershell.exe ── COM ──► Photoshop
+│   │  apps/adobe/illustrator.py ─ powershell.exe ── COM ──► Illustrator
 │   │                                │
 │   ├ MCP stdio ─┐                   │
 │   │            ▼                   │
-│   │  studio_premiere_mcp.py        │
+│   │  apps/adobe/premiere.py        │
 │   │            │ http 127.0.0.1:7787
 │   │            ▼                   │
 │   │  premiere_panel (CEP) inside Premiere Pro
 │   │                                │
 │   ├ MCP stdio ─┐                   │         ┌──────────────────────┐
 │   │            ▼                   │  HTTP   │ ComfyUI              │
-│   │  studio_comfy_mcp.py           │ ──────► │ 100.127.17.38:8188   │
+│   │  apps/comfyui/mcp.py           │ ──────► │ 100.127.17.38:8188   │
 │   │                                │         └──────────────────────┘
 │   └ MCP stdio ─┐                   │
 │                ▼                   │
-│      studio_opencode_mcp.py ◄──── elicitation: the user allows or refuses each step
+│      apps/opencode/mcp.py ◄──── elicitation: the user allows or refuses each step
 │                │ HTTP 127.0.0.1:4096, password
 │                ▼                   │
 │   ┌ opencode serve (our child) ──┐ │
@@ -167,7 +167,7 @@ one.
 
 `CHAT` is an `AppSpec` subclass with the *application* emptied out — no `exe_globs`,
 no `probe`, `drivable = False` — but not the bridge. Its tools are
-`studio_research_mcp.py`'s: list and search folders on this PC, read a text document
+`apps/research/mcp.py`'s: list and search folders on this PC, read a text document
 (plain text, code, JSON, a `.docx`'s paragraphs), search the web, read a page as text.
 Every one is a read. It duck-types the rest of `AppSpec`, so `Session`, the tab strip,
 the transcript and the executor need no special case for it. The rules that keep it
@@ -187,9 +187,9 @@ honest:
   chat tab and asserts it has them.
 - **Its bridge runs in this process.** `AppSpec.connect()` is where a tab's bridge
   comes from — an `MCPClient` subprocess for every app — and `ChatSpec.connect()`
-  returns a `studio_mcp.Loopback` over `studio_research_mcp.SERVER` instead: nothing to
+  returns a `core.mcp.Loopback` over `apps.research.mcp.SERVER` instead: nothing to
   spawn, nothing to fail, no pipe to lose. `command`/`args` still name the script, so
-  `python studio_mcp.py check --app chat --in-process` and `--call` work on it like any
+  `python core/mcp.py check --app chat --in-process` and `--call` work on it like any
   bridge written here, and `tests/test_mcp.py` walks it with the others.
 - **The bridge is read-only by construction, and says no to two things.** Files that
   exist to hold secrets (`.ssh`, `.aws`, `.gnupg`, `*.pem`, `*.key`, `*.kdbx`, …) are
@@ -227,7 +227,7 @@ Two things stay derived, never hand-maintained:
 
 An entry with **no `exe_globs`** is remote. ComfyUI is the only one: it lives on the
 LLM PC, so there is no `.exe` here to find, no icon to read (its logo is drawn instead,
-by `studio_icons.comfy_png`, keyed by app id in `DRAWN`), and
+by `core.icons.comfy_png`, keyed by app id in `DRAWN`), and
 nothing to launch. `installed()` is True for it — the tab is always worth offering —
 `running()` probes its `url:`, and `launch()` raises with the `launch_note`, which for a
 remote app has to say *where* to start it. The GUI asks `app.remote` before it offers
@@ -238,13 +238,13 @@ instead of launching, and the status reads "not reachable" rather than "not runn
 In the sidebar a remote app is a row like any other, but in its own group:
 `detect_apps()` appends every remote registry entry with `"remote": True` and no
 `exe`, and `_build_apps()` draws those last under a second heading, **ON LLM PC**
-(`LLM_PC` in `studio_chat.py`), after the rows for this machine. Pinning orders a row
+(`LLM_PC` in `core/chat.py`), after the rows for this machine. Pinning orders a row
 within its group rather than across them - a pinned ComfyUI is still on the other
 PC, and the heading has to stay true. The heading appears and disappears with its
 rows, so hiding ComfyUI hides the group.
 
 The URL is `COMFYUI_URL` (default `http://100.127.17.38:8188`), read once in the
-engine for the probe and the bridge label, and again by `studio_comfy_mcp.py` in its
+engine for the probe and the bridge label, and again by `apps/comfyui/mcp.py` in its
 own process — keep both reading the same variable. ComfyUI must be started with
 `--listen` on that machine or it binds to its own loopback and the probe fails.
 
@@ -445,8 +445,8 @@ The ComfyUI tab is a conversation; the Image Studio (`IMAGE_STUDIO`, an `ImagesS
 a `PanelSpec` with `images = True`) is a form. It holds no other program's window,
 so `_ensure` just marks it ready and calls `ImageStudio.start()`, the first thing in
 it that touches the network (a tab is built before it is looked at, and the GUI
-tests build every tab). `studio_imagegen.py` is the engine, with no tkinter;
-`studio_images_ui.py` is the tab, a collaborator the window lends `_skin`, `_button`,
+tests build every tab). `apps/image_studio/imagegen.py` is the engine, with no tkinter;
+`apps/image_studio/ui.py` is the tab, a collaborator the window lends `_skin`, `_button`,
 `_entry`, `_spawn`, `q` and `_animate`. Worker threads post `("images", sid, ...)`
 events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
 
@@ -460,7 +460,7 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   models by a filename that backend has. The defaults are the 5090 on this PC
   (`IMAGE_STUDIO_5090_URL`) and the 3090 (`COMFYUI_URL`).
 - **Every ComfyUI call is in `ComfyUIClient`**, one per backend. Progress comes over
-  the WebSocket (`studio_milanote.WebSocket`, read on a thread of its own so a timeout
+  the WebSocket (`apps.milanote.milanote.WebSocket`, read on a thread of its own so a timeout
   never cuts a frame). The *end* of a job is read from `/history` every two seconds
   regardless, so a socket that never opens costs the step counter, nothing else.
   `cancel_job` interrupts only its own prompt (`/interrupt` with `prompt_id`, or
@@ -491,7 +491,7 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `ComfyUI/models/<folder>`, plus every node class it lacks. The model menu
   ("ready on 5090 Workstation"), the Models window's status panel, routing
   (`has_model`) and `compose`'s errors all ask that one function.
-  `python studio_imagegen.py --probe` checks `/system_stats`, `/object_info`,
+  `python apps/image_studio/imagegen.py --probe` checks `/system_stats`, `/object_info`,
   `/prompt` (an empty graph, which ComfyUI refuses without running anything),
   `/history` and the WebSocket on every backend, then prints each model's
   readiness.
@@ -527,7 +527,7 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   Stacked LoRAs add up: on Z-Image Turbo (8 steps) keep the total near 1.0-1.5.
   An added row's whole `trigger` goes into the prompt, so a CivitAI "trained words"
   list of alternatives (an expressions LoRA's) must be cleared, not kept.
-- **LoRAs come in from CivitAI** (`studio_civitai.py`, the LoRA library's *Import
+- **LoRAs come in from CivitAI** (`apps/image_studio/addons/civitai.py`, the LoRA library's *Import
   from CivitAI…*). Paste links (a model page, `modelVersionId`, a download link, an
   AIR, a bare version id) and/or pick `.safetensors` files. A link is read from
   CivitAI's public API: primary file, trained words as the trigger, `baseModel` as
@@ -597,7 +597,7 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   "tattoo" tag's as well. A tag said only in the scene is clothing when its
   word names a Clothes pick's garment and nothing on the head, else an accessory.
   The pictures then go through Kontext as any item picture does. Scenes with people
-  still blank `item_refs` (`studio_scene.generation`): tags are the form's person's.
+  still blank `item_refs` (`apps.image_studio.scene.scene.generation`): tags are the form's person's.
 - **Item and person pictures can come from a link** (2026-09-27, the user: "i want to
   use urls for images of items and people"). Beside every Picture… on an item row
   (the form's and the creator's, Tags included) is **Link…**, the Tags tab has
@@ -705,7 +705,7 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   ControlNet. The free-text Camera field stays, for lens, light and film.
 - **The pose is a stick figure the user drags** (`PoseEditor`, the Pose row's
   Draw…). It is OpenPose's 18 body joints in its colours on black, because that
-  is the picture pose ControlNets were trained on; `studio_pose.render` draws it
+  is the picture pose ControlNets were trained on; `apps.image_studio.scene.pose.render` draws it
   the way OpenPose's own preprocessor does (limbs at 60%, joints full), with
   `struct` and `zlib`, in ~30 ms. Dragging a joint carries what hangs off it
   (`CHILDREN`), Shift moves it alone, the empty frame moves the figure, the wheel
@@ -800,7 +800,7 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   tests keep covered through a `flux-hq` model of their own. A denoise below 1
   with no source picture is put back to 1 by compose and said: over an empty
   latent it only leaves noise in the picture.
-- **The face pass** is the chat bridge's face detail (`studio_comfy_mcp.
+- **The face pass** is the chat bridge's face detail (`apps.comfyui.mcp.
   face_detail`) for a template with a `face_detail` section. The run that
   makes the picture also runs SAM3 on it (`add_face_finder`, nodes `fd*`);
   a second run (`face_graph`) loads the saved picture, crops each face
@@ -849,9 +849,9 @@ its captions/source ordering must not be reused for another person.
 
 **Build LoRA** (identity editor, beside Use as primary; Sitter 2026-09-27: "a
 simple build lora into the images of an identity. it needs at least 20 pics").
-`studio_lora_train` (stdlib) refuses fewer than `MIN_PHOTOS` (20) photos that
+`apps.image_studio.lora_train` (stdlib) refuses fewer than `MIN_PHOTOS` (20) photos that
 exist on disk, saves the profile, and runs `tools/train_identity_lora.py` in
-ai-toolkit's venv (`D:\ai-toolkit`) as a `studio_procs` child, so closing the
+ai-toolkit's venv (`D:\ai-toolkit`) as a `core.procs` child, so closing the
 app stops it. The script copies each photo upright as RGB PNG (max 1536 px),
 captions it "a photo of <trigger>", and trains ai-toolkit's FLUX example
 settings (rank 16, lr 1e-4, 2000 steps, 512/768/1024) on the diffusers copy
@@ -897,8 +897,8 @@ it never becomes a face reference. `face_swap` defaults to true independently
 of the older `use_references` switch. Profiles without photos retain their LoRA
 behavior. The profile editor keeps technical fields under Advanced settings.
 
-`studio_facefusion.py` is a stdlib adapter to the isolated environment in
-`.runtime/facefusion-venv`; it uses `studio_procs` for cancellation and process
+`apps/image_studio/facefusion.py` is a stdlib adapter to the isolated environment in
+`.runtime/facefusion-venv`; it uses `core.procs` for cancellation and process
 containment. `tools/facefusion_swap.py` runs the official pipeline, captures its
 mask, restores original pixels outside that mask, and checks the saved PNG.
 Failure is explicit, never a silently substituted generated face. A face-only
@@ -913,7 +913,7 @@ standalone HyperSwap result byte-for-byte (before the two changes below).
 settings had been left at their defaults. `--face-swapper-weight` (FaceFusion 3.4+)
 was 0.5, which hands HyperSwap the references' identity as it is; above 0.5 the
 identity is extrapolated away from the face being replaced, so less of the
-generated person survives. `studio_facefusion.SWAP_STRENGTH` is 0.8, and a
+generated person survives. `apps.image_studio.facefusion.SWAP_STRENGTH` is 0.8, and a
 profile's own **Face swap strength** (`swap_strength`, 0-1, shown beside the Final
 face swap switch) wins; FaceFusion only takes multiples of 0.05, so `strength()`
 rounds. And `--face-swapper-pixel-boost` was 256: HyperSwap draws at 256 px, so a
@@ -1005,7 +1005,7 @@ files, not those directories. See `docs/withanyone.md` and
 `Studio._refine` on the lane's thread after the picture and its face pass:
 the host's vision model (`Chat.vision`, handed to `Studio` as `vision`) looks
 at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
-`studio_critic.py` is the logic, no tkinter and no I/O of its own. The rules:
+`apps/image_studio/critic.py` is the logic, no tkinter and no I/O of its own. The rules:
 
 - **Three states, kept apart.** The *intent* (`intent_from`: the composed
   prompt and the form's words) is a read-only mapping; nothing writes into
@@ -1181,7 +1181,7 @@ isnt showed as a lora". So a LoRA's "server version" is the model:
 - **Pictures are PNG because Tk reads no JPEG**, and CivitAI's image CDN serves JPEG
   whatever is asked for (`Accept`, the URL's extension). `to_png` converts a batch in
   one PowerShell run through Windows' own System.Drawing (script by
-  `-EncodedCommand`, pairs as JSON on stdin, a `studio_procs.spawn` child), resized to
+  `-EncodedCommand`, pairs as JSON on stdin, a `core.procs.spawn` child), resized to
   `THUMB` px; cached in `image-studio/addon-thumbs/`. Installed previews that are not
   PNG or GIF get a PNG copy there (`previews`). Only a picture CivitAI rates PG or
   PG-13 (`nsfwLevel` 1 or 2) is shown (`safe_preview`, asked for at `width=320`);
@@ -1313,7 +1313,7 @@ was never installed here, the tab never ran, and a sandbox cannot edit this repo
   random password to `server.key` there, and starts `opencode serve --hostname
   127.0.0.1` with `OPENCODE_CONFIG` and `OPENCODE_SERVER_PASSWORD` in its environment,
   in the workspace (`OPENCODE_WORKSPACE`, default this repo), through
-  `studio_procs.spawn` - so it ends with the window, like a bridge. `opencode_exe()`
+  `core.procs.spawn` - so it ends with the window, like a bridge. `opencode_exe()`
   starts npm's native `opencode.exe` directly, not the `.cmd` shim. Install is `npm
   install -g opencode-ai`; the Start button says so when it is missing.
 - **The password is not optional.** A coding agent's HTTP API on loopback is reachable
@@ -1353,7 +1353,7 @@ was never installed here, the tab never ran, and a sandbox cannot edit this repo
 **How a step reaches the user.** `opencode_ask` sends the task with `prompt_async`
 and `run()` follows the session: each pass lists `/permission` and `/question`,
 keeps those of this session or a subagent's (`Family`, by `parentID`), and puts each
-to the user with `studio_mcp.elicit()` - the MCP client's user, not the model. The
+to the user with `core.mcp.elicit()` - the MCP client's user, not the model. The
 reply goes to `/permission/{id}/reply` (`once` | `reject`, with the note as `message`,
 which OpenCode's model reads as the user's feedback - never `always`, see *grants*
 below) or
@@ -1469,7 +1469,7 @@ pill per kind, Installed and Catalog tabs, Turn off, Remove on a second click.
 - **Installed MCP servers say what OpenCode made of them**: `live_status()` reads
   `GET /mcp` (connected / failed and why / not loaded yet).
 - **Remove**: a downloaded skill's folder goes to the Recycle Bin
-  (`studio_catalog.recycle`); a folder the user pointed at is left alone.
+  (`apps.image_studio.addons.catalog.recycle`); a folder the user pointed at is left alone.
 - Threads post back with the window-level `("call", None, fn)` event, which `_handle`
   runs before any tab lookup; a stale answer is dropped by `gen`.
 
@@ -1478,7 +1478,7 @@ pill per kind, Installed and Catalog tabs, Turn off, Remove on a second click.
 The user asked (2026-09-27) to see the pipeline's nodes and edit specifics "from the app",
 like the Milanote tab, and then for it to live in the ComfyUI tab rather than a tab of
 its own. The ComfyUI tab has a **Chat | Nodes** switch above its transcript
-(`studio_nodes_ui.NodesView`, built only for the `comfyui` tab). Nodes puts ComfyUI's
+(`apps.comfyui.nodes_ui.NodesView`, built only for the `comfyui` tab). Nodes puts ComfyUI's
 page where the transcript is, with a backend picker (the Image Studio's backends plus
 the tab's own `COMFYUI_URL`, shown first), a step picker and Reload. Chat puts the
 transcript back. The conversation and its bridge are untouched either way.
@@ -1497,9 +1497,9 @@ transcript back. The conversation and its bridge are untouched either way.
   version took over the Image Studio's own body instead. It moved here because two
   windows cannot share one profile.
 
-`studio_comfy_view.py` holds the window and the graphs:
+`apps/comfyui/view.py` holds the window and the graphs:
 
-- **The window is the Milanote one.** `ComfyBrowser` subclasses `studio_milanote.Browser`
+- **The window is the Milanote one.** `ComfyBrowser` subclasses `apps.milanote.milanote.Browser`
   (`name` for its sentences, `target()` for which page). It has its own profile,
   `%LOCALAPPDATA%\StudioAssistant\comfyui-browser` (`STUDIO_COMFY_PROFILE`). Embedding,
   clipping the caption with `measure()`/`fit()`, and `release()` before the frame goes
@@ -1544,8 +1544,8 @@ inspector sections; clicking a body part opens Pose. Image Studio has Image / Pe
 References / Settings sections, keeps Generate outside the scrolling form, and puts
 LoRAs inside Advanced in Settings. Section changes retain settings and reset scrolling.
 Generate inside the builder includes its arrangement; a plain Generate in the form does
-not. It blocks out a picture; it is not a 3D package. `studio_scene.py` is the engine
-(no tkinter, tested headless), `studio_scene_ui.SceneBuilder` the window, a collaborator
+not. It blocks out a picture; it is not a 3D package. `apps/image_studio/scene/scene.py` is the engine
+(no tkinter, tested headless), `apps.image_studio.scene.ui.SceneBuilder` the window, a collaborator
 of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 
 - **Generate goes through the Image Studio, never beside it.** The builder draws the
@@ -1567,9 +1567,9 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   - **Pose** (`pose_png`, reference kind `pose`, default 0.85): every person
     and crowd member's skeleton (`rigs`: the same placement `painted_pieces`
     gives their faces) projected through the camera as OpenPose, drawn by
-    `studio_pose.render_figures`, far to near. Head points are dropped as
+    `apps.image_studio.scene.pose.render_figures`, far to near. Head points are dropped as
     DWPose would miss them - nose and eyes on the side facing the camera, the
-    far ear in profile - and the 68 face dots are `studio_pose.FACE` turned
+    far ear in profile - and the 68 face dots are `apps.image_studio.scene.pose.FACE` turned
     with the head in 3D (`FACE_UNIT` is half the eye gap), drawn whenever the
     nose is seen, profile included, or the person comes back seen from behind.
     A joint with something more than `HIDDEN_BEHIND` (0.3 m) nearer at its pixel
@@ -1992,7 +1992,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
   and is drawn over a person at its far end; a test holds that case), and the PNG is a
-  scanline fill written by `studio_icons.png`. Blender can make better assets offline;
+  scanline fill written by `core.icons.png`. Blender can make better assets offline;
   nothing here needs it to stage a picture.
 
 ### The tab that holds a window: `PanelSpec`
@@ -2000,7 +2000,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
 Milanote is a web app with no public API and no MCP server, so its tab has no model,
 no bridge, no transcript and no composer. `PanelSpec` (`panel = True`, `drivable`,
 `bridged` and `research` all False) is in `TABS` but, like chat, not in `APPS`.
-`studio_milanote.py` does the work:
+`apps/milanote/milanote.py` does the work:
 
 - **The window is a browser we start, re-parented into the tab.** `Browser.start()`
   runs Chrome (else Edge; `STUDIO_MILANOTE_BROWSER` overrides) with `--app=` and a
@@ -2042,12 +2042,12 @@ no bridge, no transcript and no composer. `PanelSpec` (`panel = True`, `drivable
 Both apps register out-of-process COM servers on Windows whose `DoJavaScript` runs
 ExtendScript inside the live app and returns the last expression as a string. That is
 the entire bridge; no CEP panel, no UXP plugin, nothing to keep in step with an app
-update. Python's stdlib has no COM client, so `studio_com.ComHost` keeps one
+update. Python's stdlib has no COM client, so `apps.adobe.com.ComHost` keeps one
 `powershell.exe -Sta` worker per app holding the COM object, and sends it one request
 per line: the script file to run and the file to write the answer to. Things to know
 before changing either bridge:
 
-- **A tool is a script body.** `HOST.run(body)` wraps it in `studio_com.PRELUDE` (a JSON
+- **A tool is a script body.** `HOST.run(body)` wraps it in `apps.adobe.com.PRELUDE` (a JSON
   serializer — ExtendScript is ES3 and has none — plus `__px`, `__round`, `__fail`), each
   bridge's `HELPERS` (`__doc`, `__layer` / `__item`, `__info`, `__color`) and a
   `SETUP`/`TEARDOWN` pair, and decodes the JSON that comes back. `return` a plain value.
@@ -2103,7 +2103,7 @@ it returned. Every tool body, helper and the JSON serializer stay in Python, so 
 never changes when a tool does, and `tests/test_premiere.py` can read the bodies as
 text. Things to know before changing it:
 
-- **The same wrapper as the COM bridges.** `CepHost.run()` calls `studio_com.script()`,
+- **The same wrapper as the COM bridges.** `CepHost.run()` calls `apps.adobe.com.script()`,
   so a body `return`s a plain value, `__fail()` is a sentence, and a thrown error comes
   back as `CepError`. `UnitValue` is core ExtendScript, so the prelude runs unchanged.
   Premiere's `Time` objects never reach the serializer: `__sec()` reads them as rounded
@@ -2160,7 +2160,7 @@ text. Things to know before changing it:
   transport — the wrapper, the decode, a silent panel becoming a "dialog may be open"
   sentence, nothing listening becoming "not running" — and a temp `%APPDATA%` to prove
   the install; nothing in it touches Premiere. The live smoke — every tool against the
-  real app — is done by hand with `python studio_mcp.py check --app premiere --call`.
+  real app — is done by hand with `python core/mcp.py check --app premiere --call`.
 
 ### What a `system_prompt` has to carry
 
@@ -2200,7 +2200,7 @@ prefix a real message uses — once per tab, not once per question. It is a cost
 *window*, though, so the shared blocks are kept terse, with a REPLIES rule for the
 model's own prose.
 
-**Big tool sets go by reference** (`studio_tasks.offered_tools`). Past `LAZY_CHARS` of
+**Big tool sets go by reference** (`core.tasks.offered_tools`). Past `LAZY_CHARS` of
 schema JSON, inference gets `studio_tool_call` (whose description is a one-line index
 of every bridge tool) and `studio_tool_schema` (full schemas on demand, into the
 history) instead of the schemas: After Effects' ~97k chars become ~7k, Resolve's ~32k
@@ -2257,20 +2257,20 @@ orphan on the way out. `_quit` sets `closing` and cancels `drain_timer` and
 `host_timer` through `_stand_down`; the GUI tests tear down with `_quit()`, not
 `destroy()`.
 
-**The modules pulled out of `studio_chat`, and the rules that keep them out.**
-`studio_doctor` (where things are kept, the error log's one writer, the diagnostics
-report), `studio_files` (attachments: headers, folder listings, the copy into OpenCode's folder)
-and `studio_ui` (palette roles, `blend`/`rounded`/`clip`/`pretty_host`, `Pill`).
-`studio_chat` re-exports every name it used to define, so the rest of the app reaches
+**The modules pulled out of `core.chat`, and the rules that keep them out.**
+`core.doctor` (where things are kept, the error log's one writer, the diagnostics
+report), `core.files` (attachments: headers, folder listings, the copy into OpenCode's folder)
+and `core.ui` (palette roles, `blend`/`rounded`/`clip`/`pretty_host`, `Pill`).
+`core.chat` re-exports every name it used to define, so the rest of the app reaches
 for them where it always did — but edit them in their own module.
 `tests/test_doctor.py::ModuleBoundaryTest` enforces the two rules worth having: the
 headless pair must import with tkinter entirely unavailable (tested by blocking it on
 `sys.meta_path`, not by reading the source — a *guarded* probe inside a function is
 fine and wanted, since `python_rows` reports a missing tkinter on purpose), and none
-of the three may import `studio_chat` back. `studio_ui` is exempt from the first:
+of the three may import `core.chat` back. `core.ui` is exempt from the first:
 `Pill` is a Canvas.
 
-**What is left of `studio_chat` is one class, and that is the real shape of it.**
+**What is left of `core.chat` is one class, and that is the real shape of it.**
 `Chat` is ~220 methods over ~3,700 lines. A mixin carve-up — `class Chat(SidebarMixin,
 TranscriptMixin, …)` — would scatter the text across files while every piece still
 reached into `self` state defined somewhere else, and would cost the one thing the
@@ -2281,15 +2281,15 @@ animation engine (`_animate`/`_arm_anim`/`_anim_tick` over `anim`/`anim_timer`/
 `anim_frame`) is the cleanest candidate and would make an `Animator` that takes a
 widget to schedule on and a `report` callback for failures.
 
-**`studio_doctor.py` must not import tkinter.** It holds the layout of
+**`core/doctor.py` must not import tkinter.** It holds the layout of
 `%APPDATA%\StudioAssistant` (`settings_path`, `data_dir`, `error_log_path`,
 `tasks_dir`), the one error-log writer, and the diagnostics report — and the whole
-point of `python studio_chat.py --doctor` is that it answers "I clicked the shortcut
+point of `python core/chat.py --doctor` is that it answers "I clicked the shortcut
 and nothing happened", which includes a Python whose tkinter is broken or missing.
 Importing the GUI to ask what is wrong would fail for the reason being asked about.
-`studio_chat` re-exports `settings_path`, `error_log_path` and `log_error`, so the
+`core.chat` re-exports `settings_path`, `error_log_path` and `log_error`, so the
 rest of the app still reaches for them where it always did; edit them in
-`studio_doctor`. `--doctor` is handled before the DPI call and before
+`core.doctor`. `--doctor` is handled before the DPI call and before
 `claim_single_instance`, so it runs beside a copy that is already up, and its exit
 code is `worst()`: 0 fine, 1 worth a look, 2 broken.
 
@@ -2461,7 +2461,7 @@ because they are identities rather than labels, and renaming them would orphan w
 already written under them: `%LOCALAPPDATA%\StudioAssistant\` (settings, lessons, task
 records, OpenCode's config), `studio_assistant_error.log`, `studio-assistant.ico`,
 and the CEP panel's `ExtensionBundleId`. The panel's *display* name did change, so
-`python studio_premiere_mcp.py --install-panel` has to be re-run for the entry under
+`python apps/adobe/premiere.py --install-panel` has to be re-run for the entry under
 *Window > Extensions* to read "Studio Assist Bridge"; until then the app's instructions
 name a menu item the installed panel does not have. The launcher is `Studio Assist.cmd`
 now, so a shortcut pointing at the old filename needs re-pointing.
@@ -2569,7 +2569,7 @@ state changes and then settles.
 ## Processes: nothing outlives the app
 
 Every subprocess the app keeps — an MCP bridge, a COM bridge's PowerShell worker — is
-started with `studio_procs.spawn()`, never a bare `Popen`. Read the module docstring
+started with `core.procs.spawn()`, never a bare `Popen`. Read the module docstring
 before changing that; the short of it:
 
 - **Windows does not kill a dead parent's children, and `Popen.kill()` ends one process,
@@ -2685,7 +2685,7 @@ composer.
 
 ## Task execution and recovery
 
-- GUI and CLI use `studio_tasks.Executor`; do not add another tool loop. That
+- GUI and CLI use `core.tasks.Executor`; do not add another tool loop. That
   includes the chat tab: same executor, same journal, an empty tool list.
 - Keep original MCP schemas in `Session.schemas` for validation. Sanitized schemas
   are the inference representation only; preserve compound-tool descriptions.
@@ -2881,7 +2881,7 @@ composer.
   model is on (never before it: see *A model loads onto an empty card*), the CLI
   just in time on the first picture; a host without that endpoint
   loads just-in-time on the first chat call, so a load failure is a line in the
-  tab, never a stop. Pictures go through `studio_icons.flatten_png` first: a vision
+  tab, never a stop. Pictures go through `core.icons.flatten_png` first: a vision
   model sees alpha as black, so a black glyph on a transparent PNG - most logos,
   and an Illustrator artboard exported without a background - was being described
   as "entirely black"; it is composited onto white, opaque PNGs pass through
@@ -2919,7 +2919,7 @@ this bridge's failures, or what the user said last time.
 
 ### The research sidecar: files and the web on every tab
 
-`studio_research_mcp.SERVER` — the Chat tab's bridge — is offered to every app tab
+`apps.research.mcp.SERVER` — the Chat tab's bridge — is offered to every app tab
 beside its own bridge. `AppSpec.research` is True for every entry (`ChatSpec` says
 False: its bridge *is* the server); `_boot_bridge` and the CLI's `main()` make a
 `Loopback` over it (`eng.research_client()`), append its tools after the bridge's
@@ -2948,7 +2948,7 @@ still sees one client. Things that follow:
 
 ### The notebook: lessons per app
 
-`studio_lessons.Notebook` is `lessons/<app>.json` beside the settings, loaded by
+`core.lessons.Notebook` is `lessons/<app>.json` beside the settings, loaded by
 `Chat._session()` and by the CLI, and best-effort in both directions like the tool
 library. Four sources, marked on each lesson and ranked when the notebook is full:
 `user` (a message that begins "remember" / "from now on", kept in the user's words
@@ -2971,7 +2971,7 @@ one place a run teaches; it never raises.
   a lesson — the prefix cache, again. Every warm-up passes `s.messages[0]` itself,
   not a rebuilt prompt, for the same reason.
 - **Lessons come in layers** (added 2026-09-27, the user asked for OpenCode that
-  "becomes smarter every answer"). `studio_lessons.for_app(app)` is a `Stack`:
+  "becomes smarter every answer"). `core.lessons.for_app(app)` is a `Stack`:
   `everywhere` (`lessons/_everywhere.json`, every tab), `app` (`lessons/<app>.json`),
   and, for an app with a `workspace` (OpenCode), `folder`
   (`lessons/folders/<name>-<hash>.json`). New lessons go to the most specific layer.
@@ -2979,7 +2979,7 @@ one place a run teaches; it never raises.
   `scope: "everywhere"`, which go to the global layer, and refused calls, which go
   to the app layer. A lesson already kept in any layer counts as a repeat. `Stack`
   answers the `Notebook` interface, so the executor and the learner never see layers.
-- **One notebook per file per process** (`studio_lessons.shared`). Tabs share the
+- **One notebook per file per process** (`core.lessons.shared`). Tabs share the
   `Notebook` objects; the record of what a prompt already carried lives on each tab's
   `Stack` (`_carried`), not on the notebook. When each tab loaded its own copy (seen
   live), a lesson kept "everywhere" in the OpenCode tab never reached the Chat tab,
@@ -3097,7 +3097,7 @@ click the call as the model made it - every argument whole, so a `run_jsx` /
 ## Tools the model makes for itself
 
 `studio_tool_create` lets the model name a run of calls it keeps repeating.
-`studio_toolsmith.py` holds the definition, the per-app library and the checks.
+`core/toolsmith.py` holds the definition, the per-app library and the checks.
 
 - **A made tool is data, never code.** It names tools already exposed to the tab and
   fills their arguments from its own declared inputs; `{input}` on its own keeps the
@@ -3129,7 +3129,7 @@ click the call as the model made it - every argument whole, so a `run_jsx` /
 
 ## The MCP harness
 
-`studio_mcp.py` is the one place the protocol lives. A bridge written here is a table
+`core/mcp.py` is the one place the protocol lives. A bridge written here is a table
 of `(name, fn, description, schema)` rows and a `Server`; the two bridges in this
 folder are exactly that, and their `serve()` loops are gone.
 
@@ -3143,7 +3143,7 @@ folder are exactly that, and their `serve()` loops are gone.
   whatever the bridge answers on `protocol_version`, `server_info`, `instructions`
   and `capabilities`. Both installed bridges answer 2025-11-25 today. Add a revision
   to the tuple when a feature here needs one; never pin.
-- **A bridge can ask the user (elicitation).** `studio_mcp.elicit(message, schema,
+- **A bridge can ask the user (elicitation).** `core.mcp.elicit(message, schema,
   meta)` from inside a tool sends `elicitation/create` and blocks until the client
   answers; `serve()`'s reader routes the reply (`deliver`) while the main thread waits,
   and a cancel of the tool call ends the wait as `cancel`. It raises `Declined` unless
@@ -3163,8 +3163,8 @@ folder are exactly that, and their `serve()` loops are gone.
   result naming it with the traceback on stderr. The server keeps serving through
   all of it. The bridges' Python-level `call_tool()` folds the first kind into a
   result too, for callers that are not on the wire.
-- **The validator is shared.** `studio_mcp.validate` is what the executor runs
-  before a call and what a `Server` runs on arrival; `studio_tasks.validate` is the
+- **The validator is shared.** `core.mcp.validate` is what the executor runs
+  before a call and what a `Server` runs on arrival; `core.tasks.validate` is the
   same function. One validator, so the two sides cannot disagree about a schema. It
   caught a test calling `comfy_generate` with a `timeout` under the schema's minimum
   the day it went in. **Its refusals teach**: an unknown key names the keys the
@@ -3174,7 +3174,7 @@ folder are exactly that, and their `serve()` loops are gone.
   check so a misspelling is reported as one. The reader is a 3B model with one more
   try; `is not allowed` on its own sent it guessing again, and the guess landed in
   `failed_calls`. Keep every new refusal in that shape.
-- **A path from the model goes through `studio_mcp.local_path()` before the
+- **A path from the model goes through `core.mcp.local_path()` before the
   filesystem sees it.** A small model writes `"C:\\\\Users\\\\x"` in its arguments
   JSON for a path it was given as `C:\Users\x`; decoded, that is two backslashes and
   nothing at it, the tool errors, and the notebook learned a platitude from the error.
@@ -3192,9 +3192,9 @@ folder are exactly that, and their `serve()` loops are gone.
   around the handler, so a `print` inside a tool reaches the client's log rather than
   the middle of a reply. Both stdio streams are reconfigured to UTF-8 with `\n`
   newlines before serving; the console default on this workstation is cp1252.
-- **Progress and cancellation are opt-in per tool.** `studio_mcp.progress()` sends
+- **Progress and cancellation are opt-in per tool.** `core.mcp.progress()` sends
   `notifications/progress` on the client's `progressToken` and does nothing without
-  one; `studio_mcp.cancelled()` is True once the client sent `notifications/cancelled`
+  one; `core.mcp.cancelled()` is True once the client sent `notifications/cancelled`
   for the call in flight. The reader thread acts on cancels while the main thread is
   inside a tool, which is the only reason it is a thread. `comfy_wait` polls both.
   `MCPClient` sends a cancel when it gives up waiting; a bridge built here then
@@ -3208,7 +3208,7 @@ folder are exactly that, and their `serve()` loops are gone.
   brief plus contract off `REQUEST_CHARS`, the rest for conversation. Pass the
   engine's `sanitize_schema` and `readonly` in; the module does not import the
   engine, so a bridge process can check itself with `--check`.
-- **Installed bridges are held to recordings.** `python studio_mcp.py snapshot --app
+- **Installed bridges are held to recordings.** `python core/mcp.py snapshot --app
   <id> tests/contracts/<id>.json` writes what the bridge exposes, and
   `tests/test_mcp.py` checks every recording against the registry's groups and
   prompts — offline, with the app closed. Re-record when a bridge updates; a
@@ -3239,30 +3239,30 @@ folder are exactly that, and their `serve()` loops are gone.
 
 ```bash
 python -m unittest discover -s tests -v      # no network, no apps needed
-python studio_agent.py --list-groups         # registry sanity, no bridge started
-python studio_agent.py --app resolve --list-tools   # needs the Resolve venv
-python studio_agent.py --app comfyui --list-tools   # no ComfyUI needed for the list
-python studio_comfy_mcp.py --list-tools      # the bridge's own contract
-python studio_comfy_mcp.py --check           # ...held to the harness's checks
-python studio_opencode_mcp.py --list-tools   # likewise; no OpenCode needed for the list
-python studio_photoshop_mcp.py --check       # the COM bridges; no app is touched by --check
-python studio_illustrator_mcp.py --list-tools
-python studio_premiere_mcp.py --check        # the CEP bridge; no app is touched by --check
-python studio_premiere_mcp.py --install-panel   # copy premiere_panel/ under CEP/extensions (Premiere closed)
-python studio_research_mcp.py --check        # the Chat tab's bridge; reads nothing by itself
-python studio_mcp.py check --app chat --in-process --call   # ...and list_folder on the home folder
-python studio_agent.py --app chat "find the brief in my Documents folder"   # the chat tab from the CLI
-python studio_agent.py --app resolve "look up the ProRes flavours and say which to deliver in"   # the sidecar in an app tab
-python studio_mcp.py check --app premiere --in-process
-python studio_mcp.py check --app photoshop --in-process   # against the registry entry
-python studio_agent.py --mcp "npx -y some-mcp" --name Blender --list-tools  # any bridge
-python studio_mcp.py check --app comfyui     # start a registry bridge, report on it
-python studio_mcp.py check --app after-effects --call   # ...and call its harmless reads
-python studio_mcp.py check --app resolve --snapshot tests/contracts/resolve.json
-python studio_mcp.py snapshot --app resolve tests/contracts/resolve.json  # re-record
-python studio_chat.py                        # the real app (console attached)
-python studio_chat.py --doctor               # no window, no lock: runs beside a live copy
-python studio_doctor.py                      # the same report, on its own
+python core/agent.py --list-groups         # registry sanity, no bridge started
+python core/agent.py --app resolve --list-tools   # needs the Resolve venv
+python core/agent.py --app comfyui --list-tools   # no ComfyUI needed for the list
+python apps/comfyui/mcp.py --list-tools      # the bridge's own contract
+python apps/comfyui/mcp.py --check           # ...held to the harness's checks
+python apps/opencode/mcp.py --list-tools   # likewise; no OpenCode needed for the list
+python apps/adobe/photoshop.py --check       # the COM bridges; no app is touched by --check
+python apps/adobe/illustrator.py --list-tools
+python apps/adobe/premiere.py --check        # the CEP bridge; no app is touched by --check
+python apps/adobe/premiere.py --install-panel   # copy premiere_panel/ under CEP/extensions (Premiere closed)
+python apps/research/mcp.py --check        # the Chat tab's bridge; reads nothing by itself
+python core/mcp.py check --app chat --in-process --call   # ...and list_folder on the home folder
+python core/agent.py --app chat "find the brief in my Documents folder"   # the chat tab from the CLI
+python core/agent.py --app resolve "look up the ProRes flavours and say which to deliver in"   # the sidecar in an app tab
+python core/mcp.py check --app premiere --in-process
+python core/mcp.py check --app photoshop --in-process   # against the registry entry
+python core/agent.py --mcp "npx -y some-mcp" --name Blender --list-tools  # any bridge
+python core/mcp.py check --app comfyui     # start a registry bridge, report on it
+python core/mcp.py check --app after-effects --call   # ...and call its harmless reads
+python core/mcp.py check --app resolve --snapshot tests/contracts/resolve.json
+python core/mcp.py snapshot --app resolve tests/contracts/resolve.json  # re-record
+python core/chat.py                        # the real app (console attached)
+python core/chat.py --doctor               # no window, no lock: runs beside a live copy
+python core/doctor.py                      # the same report, on its own
 ```
 
 `tests/` never touches the network, the creative apps, OpenCode, or the model — the
@@ -3302,7 +3302,7 @@ them rather than guessing.
   works; closing the user's Resolve mid-session costs unsaved work. A test asserts the
   prohibition is still in the prompt.
 - App marks are the app's **own icon, read live out of its `.exe`** by
-  `studio_icons.py`, with the drawn two-letter badge as the fallback whenever that
+  `core/icons.py`, with the drawn two-letter badge as the fallback whenever that
   fails — no resources, a packed exe, a path we cannot open. Nothing is shipped or
   cached on disk, so a new Adobe year needs no new art. Reading them is done on a
   worker thread (`_read_icons`): a cold read of a 500MB Photoshop binary is not

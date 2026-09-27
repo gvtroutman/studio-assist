@@ -4,7 +4,7 @@ A shell started by hand - ComfyUI's `Start ComfyUI (Image Studio).cmd`, a
 `cmd` or `powershell` from the Start menu - is a classic console window on the
 desktop. This module finds those windows, hides them, and reads what they show,
 so the Terminal tab can mirror each one and type into it. The GUI half is
-`studio_terminals_ui.py`.
+`core/terminals_ui.py`.
 
 It is a mirror, not the real window re-parented into the tab the way the
 Milanote tab holds Chrome. A cross-process child window dies with its parent:

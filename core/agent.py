@@ -7,7 +7,7 @@ Tools run here, on this workstation, over one MCP bridge per app:
 
   After Effects    npx @engine-room/after-effects-mcp  ->  CEP panel on :7777
   DaVinci Resolve  davinci-resolve-mcp (local venv)    ->  Resolve scripting API
-  ComfyUI          studio_comfy_mcp.py (this folder)   ->  HTTP API on the LLM PC
+  ComfyUI          apps/comfyui/mcp.py (this folder)   ->  HTTP API on the LLM PC
 
 Every app the agent can drive lives in APPS below. Adding one is a registry
 entry, not a code change - see AGENTS.md.
@@ -52,7 +52,7 @@ COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://100.127.17.38:8188").rstrip(
 # OpenCode runs on this machine as a child of this window, in one folder - this
 # repository unless OPENCODE_WORKSPACE names another - and asks the user before
 # every edit, command and fetch. It listens on loopback with a password.
-# studio_opencode_mcp.py reads the same variables in its own process - keep
+# apps/opencode/mcp.py reads the same variables in its own process - keep
 # them agreeing.
 OPENCODE_URL = os.environ.get("OPENCODE_URL", "http://127.0.0.1:4096").rstrip("/")
 OPENCODE_WORKSPACE = (os.environ.get("OPENCODE_WORKSPACE")
@@ -1685,7 +1685,7 @@ job is to brief it well, let it work, and tell the user what came back.
 
 HOW THE WORK IS SHAPED
 - opencode_status says which folder OpenCode works in. Paths you pass to the file
-  tools are relative to it: "studio_agent.py", "tests/test_mcp.py".
+  tools are relative to it: "core/agent.py", "tests/test_mcp.py".
 - A session is one piece of work with its own history. opencode_ask sends a task to
   a session and follows it to the end; it continues the last session by itself, so
   OpenCode remembers what it did. Pass new_session=true for an unrelated job.
@@ -2148,10 +2148,10 @@ class AppSpec:
     # with no model and no bridge behind it.
     panel = False
     # True only for IMAGE_STUDIO below: a panel tab whose body is our own
-    # form (studio_images_ui.py) rather than another program's window.
+    # form (apps/image_studio/ui.py) rather than another program's window.
     images = False
     # True only for TERMINALS below: a panel tab that mirrors console windows
-    # opened outside the app (studio_terminals_ui.py).
+    # opened outside the app (core/terminals_ui.py).
     terminals = False
 
     def __init__(self, id, name, tab, code, fg, bg, exe_globs, probe, command,
@@ -2576,7 +2576,7 @@ PPRO_GROUPS = {
 
 # The Chat tab's bridge: this PC's files and the web, every tool a read. Both
 # groups are on by default; the prompt teaches all five tools.
-# The panel inside Premiere listens here; studio_premiere_mcp.py and the panel's
+# The panel inside Premiere listens here; apps/adobe/premiere.py and the panel's
 # main.js both read STUDIO_PREMIERE_PORT, so one variable moves every end.
 PREMIERE_PORT = os.environ.get("STUDIO_PREMIERE_PORT") or "7787"
 
@@ -2776,7 +2776,7 @@ APPS = [
         system_prompt=OPENCODE_PROMPT,
         examples=[
             "Have OpenCode explain how a tab's bridge is started",
-            "Add a Copy button to each folded tool-call row in studio_chat.py",
+            "Add a Copy button to each folded tool-call row in core/chat.py",
             "What has OpenCode changed that is not committed yet?",
             "Run the OpenCode bridge's tests and fix what fails",
         ],
@@ -2861,7 +2861,7 @@ APPS = [
             "Export the active sequence as H.264 to my Desktop",
         ],
         launch_note="Premiere Pro also needs the Studio Assist Bridge panel under Window > "
-                    "Extensions; `python studio_premiere_mcp.py --install-panel` installs it.",
+                    "Extensions; `python apps/adobe/premiere.py --install-panel` installs it.",
         readback=[("ppro_get_clip", ["clip_id"]), ("ppro_get_sequence", [])],
         review=("ppro_screenshot", []),
         docs=[("Premiere Pro scripting guide (the object model ppro_run_jsx drives)",
@@ -2949,7 +2949,7 @@ class PanelSpec(AppSpec):
     A tab that holds another program's window instead of a conversation: no
     model, no bridge, no transcript, no composer. Milanote is the one - a web
     app with no API to drive, so the tab is a container for it and for files
-    dropped onto it (studio_milanote.py).
+    dropped onto it (apps/milanote/milanote.py).
 
     `panel` is the flag the GUI asks. It duck-types AppSpec like ChatSpec does
     so the tab strip and its menu need no special case, and it is not in APPS
@@ -3002,7 +3002,7 @@ MILANOTE = PanelSpec(
 class ImagesSpec(PanelSpec):
     """The Image Studio: a form over ComfyUI - person, style, scene,
     references, generate - with the graph built underneath
-    (studio_imagegen.py) and the tab itself in studio_images_ui.py. A panel
+    (apps/image_studio/imagegen.py) and the tab itself in apps/image_studio/ui.py. A panel
     tab like Milanote (no model, no bridge, no composer), but what it holds
     is ours, so there is no window to start."""
     images = True
@@ -3015,8 +3015,8 @@ IMAGE_STUDIO = ImagesSpec(
 
 class TerminalSpec(PanelSpec):
     """Console windows opened outside the app - ComfyUI's, a cmd started by
-    hand - hidden from the desktop and mirrored here (studio_consoles.py,
-    studio_terminals_ui.py). The app opens this tab itself when it takes one."""
+    hand - hidden from the desktop and mirrored here (core/consoles.py,
+    core/terminals_ui.py). The app opens this tab itself when it takes one."""
     terminals = True
 
     def __init__(self, **kw):
@@ -3235,7 +3235,7 @@ ADOBE_DIR = r"C:\Program Files\Adobe"
 
 # Each row carries where the product's own executable sits under its install
 # folder: the UI reads the app's real icon straight out of that PE file
-# (studio_icons.py), and falls back to the two-letter badge when it cannot.
+# (core/icons.py), and falls back to the two-letter badge when it cannot.
 # The globs are loose because a Beta install renames the exe after itself.
 PRODUCTS = [
     ("After Effects", "Ae", "After Effects", "#9999FF", "#00005B",

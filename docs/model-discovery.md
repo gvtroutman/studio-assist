@@ -42,7 +42,7 @@ to the discovery cache. Each response is capped at 2 MiB with a 15-second socket
 timeout, using at most four concurrent requests. If feeds fail, available results
 remain usable and old cached candidates are marked as previous results.
 
-Implementation: `studio_discovery.py`, `studio_addons.py`; windows: `studio_images_ui.py`.
+Implementation: `apps/image_studio/addons/discovery.py`, `apps/image_studio/addons/nodes.py`; windows: `apps/image_studio/ui.py`.
 Tests: `tests/test_discovery.py`, `tests/test_addons.py` and `TestImageStudioTab` in `tests/test_imagegen.py`.
 
 API references:

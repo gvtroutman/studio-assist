@@ -18,9 +18,9 @@ are percent.
 
 Stdlib only. The protocol is studio_mcp's; this file is the tools.
 
-    python studio_premiere_mcp.py --list-tools
-    python studio_premiere_mcp.py --check
-    python studio_premiere_mcp.py --install-panel      # with Premiere closed
+    python apps/adobe/premiere.py --list-tools
+    python apps/adobe/premiere.py --check
+    python apps/adobe/premiere.py --install-panel      # with Premiere closed
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout

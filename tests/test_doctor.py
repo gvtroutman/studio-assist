@@ -161,7 +161,7 @@ class ModuleBoundaryTest(unittest.TestCase):
     """The split is only worth having if it is enforced. These are the rules
     the modules were pulled out of studio_chat to keep."""
 
-    HEADLESS = ("studio_doctor", "studio_files")
+    HEADLESS = ("core.doctor", "core.files")
 
     def test_the_headless_modules_load_with_no_tkinter_at_all(self):
         """The real invariant, tested the real way. A guarded probe inside a
@@ -200,15 +200,17 @@ class ModuleBoundaryTest(unittest.TestCase):
     def test_a_module_pulled_out_of_studio_chat_never_imports_it_back(self):
         import ast
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for name in self.HEADLESS + ("studio_ui",):
+        for name in self.HEADLESS + ("core.ui",):
             with self.subTest(module=name):
-                with open(os.path.join(here, name + ".py"), encoding="utf-8") as f:
+                with open(os.path.join(here, *name.split(".")) + ".py", encoding="utf-8") as f:
                     tree = ast.parse(f.read())
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
-                        self.assertNotIn("studio_chat", [a.name for a in node.names])
+                        self.assertNotIn("core.chat", [a.name for a in node.names])
                     elif isinstance(node, ast.ImportFrom):
-                        self.assertNotEqual(node.module, "studio_chat")
+                        self.assertNotEqual(node.module, "core.chat")
+                        if node.module == "core":
+                            self.assertNotIn("chat", [a.name for a in node.names])
 
     def test_studio_chat_still_answers_for_the_names_it_re_exports(self):
         """The rest of the app reaches for these where it always did; moving
