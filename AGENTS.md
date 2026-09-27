@@ -566,13 +566,17 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   creator's alone, though a character's body and accessories still reach the prompt.
 - **A character's tags are words for its pictures** (2026-09-27, the user: "tags need
   images to upload. so when i say glasses i reference the image"). The creator's
-  Tags tab lists every `item_refs` entry (the item pictures are tags too) and makes
+  Tags tab is for things on the person (the user: "glasses, earrings, dress, tattoos,
+  etc."). It lists every `item_refs` entry (the item pictures are tags too) and makes
   one from a word plus a picture uploaded then: no picture, no tag. The copy goes
   under `references/` (`keep_reference`), and *From library* gives this character a
   tag another character already has, sharing its copy. `outfit_of` counts a tag
   when a slot holds it exactly (as before) or when `says` finds its word, any case
-  and a plural allowed, in a slot or the scene ("round glasses", "she pushes her
-  glasses up"; not "sunglasses"). A tag said only in the scene is clothing when its
+  and a plural allowed, in a `TAG_SLOTS` slot (the item slots and Traits, where
+  tattoos are) or the scene ("round glasses", "she pushes her
+  glasses up"; not "sunglasses"). The longer tag goes first and uses up
+  its words, so "a rose tattoo" brings the rose tattoo's picture and not a plain
+  "tattoo" tag's as well. A tag said only in the scene is clothing when its
   word names a Clothes pick's garment and nothing on the head, else an accessory.
   The pictures then go through Kontext as any item picture does. Scenes with people
   still blank `item_refs` (`studio_scene.generation`): tags are the form's person's.
