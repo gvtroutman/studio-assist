@@ -10,8 +10,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_agent as eng
-import studio_doctor as doctor
+import core.agent as eng
+import core.doctor as doctor
 
 
 class Fake:
@@ -185,7 +185,7 @@ class ModuleBoundaryTest(unittest.TestCase):
             for name in self.HEADLESS:
                 with self.subTest(module=name):
                     importlib.import_module(name)       # must not raise
-            rows = sys.modules["studio_doctor"].python_rows()
+            rows = sys.modules["core.doctor"].python_rows()
             tk_row = [r for r in rows if r[0] == "Tkinter"][0]
             self.assertEqual(tk_row[2], "err")
             self.assertIn("the window cannot open", tk_row[1])
@@ -195,7 +195,7 @@ class ModuleBoundaryTest(unittest.TestCase):
                 if k in self.HEADLESS:
                     del sys.modules[k]
             sys.modules.update(saved)
-            importlib.import_module("studio_doctor")
+            importlib.import_module("core.doctor")
 
     def test_a_module_pulled_out_of_studio_chat_never_imports_it_back(self):
         import ast
@@ -213,7 +213,7 @@ class ModuleBoundaryTest(unittest.TestCase):
     def test_studio_chat_still_answers_for_the_names_it_re_exports(self):
         """The rest of the app reaches for these where it always did; moving
         them must not have been a rename."""
-        import studio_chat
+        import core.chat as studio_chat
         for name in ("settings_path", "error_log_path", "log_error", "ERROR_LOG",
                      "LOG_MAX_BYTES", "is_picture", "image_dims",
                      "describe_attachment", "attachment_note", "this_pc",

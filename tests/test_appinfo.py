@@ -8,8 +8,8 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_agent as eng
-import studio_appinfo as appinfo
+import core.agent as eng
+import core.appinfo as appinfo
 
 
 class Page:

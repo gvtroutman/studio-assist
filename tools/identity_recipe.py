@@ -53,7 +53,7 @@ def cases(recipe, stage, portrait_report=None):
 
 
 def run(recipe, stage, output, portrait_report=None):
-    import studio_imagegen as ig
+    import apps.image_studio.imagegen as ig
     planned = cases(recipe, stage, portrait_report)
     output.mkdir(parents=True, exist_ok=False)
     (output / 'recipe.json').write_text(json.dumps(recipe, indent=2), encoding='utf-8')

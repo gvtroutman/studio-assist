@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
-import studio_imagegen as ig
+import apps.image_studio.imagegen as ig
 from test_imagegen import FakeClient, PNG
 
 
@@ -92,8 +92,8 @@ class WithAnyoneTests(unittest.TestCase):
         self.assertIn("has 6", " ".join(self.plan().errors))
 
     def test_scene_builder_accepts_face_positions_without_controlnet(self):
-        import studio_scene as sc
-        from studio_scene_ui import SceneBuilder
+        import apps.image_studio.scene.scene as sc
+        from apps.image_studio.scene.ui import SceneBuilder
         studio = SimpleNamespace(lib=self.lib, workflow_loader=ig.load_workflow)
         builder = SimpleNamespace(owner=SimpleNamespace(studio=studio))
         self.assertEqual(SceneBuilder.takes(builder, "withanyone"), {"face_positions"})
@@ -145,7 +145,7 @@ class WithAnyoneTests(unittest.TestCase):
         self.assertEqual(job.record["references"]["face2"], self.photos[1])
 
     def test_selected_profiles_do_not_require_or_run_facefusion(self):
-        import studio_facefusion as ff
+        import apps.image_studio.facefusion as ff
         self.settings.pop("scene_faces")
         self.lib.save("identities", [{"id": "left", "name": "Left",
                                       "references": self.photos, "face_swap": True}])

@@ -13,7 +13,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import studio_hub as hub  # noqa: E402
+import apps.image_studio.addons.hub as hub  # noqa: E402
 
 
 class Answer(io.BytesIO):

@@ -4,8 +4,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import studio_civitai as civ
-import studio_imagegen as ig
+import apps.image_studio.addons.civitai as civ
+import apps.image_studio.imagegen as ig
 
 
 def main():

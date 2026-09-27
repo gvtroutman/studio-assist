@@ -22,10 +22,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import studio_agent as eng
-import studio_mcp
-import studio_opencode_mcp as oc
-import studio_tasks as tasks
+import core.agent as eng
+import core.mcp as studio_mcp
+import apps.opencode.mcp as oc
+import core.tasks as tasks
 
 EDIT = {"permission": "edit", "patterns": ["hello.py"],
         "metadata": {"filepath": "<ws>/hello.py",

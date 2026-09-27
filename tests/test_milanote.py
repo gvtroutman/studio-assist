@@ -19,8 +19,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import studio_agent as eng
-import studio_milanote as milanote
+import core.agent as eng
+import apps.milanote.milanote as milanote
 
 
 class FakeDevTools:
@@ -290,7 +290,7 @@ class StubBrowser:
 class TestMilanoteTab(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.mod = studio_chat
         cls.dir = tempfile.mkdtemp()
         cls._real_settings = os.environ.get("STUDIO_SETTINGS")

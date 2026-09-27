@@ -8,9 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import studio_facefusion as ff
-import studio_imagegen as ig
-import studio_scene as sc
+import apps.image_studio.facefusion as ff
+import apps.image_studio.imagegen as ig
+import apps.image_studio.scene.scene as sc
 from test_imagegen import TempStudioMixin, PNG, settle, FakeClient, FaceClient
 
 
@@ -220,7 +220,7 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
                       job.record["notes"])
 
     def test_each_pass_graph_is_kept_in_the_record_for_the_nodes_view(self):
-        import studio_comfy_view as comfy_view
+        import apps.comfyui.view as comfy_view
         job, client, _ = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)])
         self.assertEqual(job.status, 'complete', job.detail)
         eyes, hands, glasses = client.graphs[-3:]
@@ -297,26 +297,26 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
 
 class TestSceneClose(unittest.TestCase):
     def test_retry_tick_cancels_its_pending_timer_and_never_starts_when_closing(self):
-        from studio_chat import Chat
+        from core.chat import Chat
         app = SimpleNamespace(closing=True, _stand_down=Mock(), _spawn=Mock())
         Chat._retry_host(app)
         app._stand_down.assert_called_once_with('host_timer')
         app._spawn.assert_not_called()
 
     def test_failed_save_and_cancelled_save_as_veto_final_close(self):
-        from studio_scene_ui import SceneBuilder
+        from apps.image_studio.scene.ui import SceneBuilder
         sb = SceneBuilder.__new__(SceneBuilder)
         sb.win = Mock()
         sb.dirty = True
         sb.has_content = lambda: True
         sb._save_recovery = Mock()
         sb.save = Mock(return_value=False)
-        with patch('studio_scene_ui.messagebox.askyesnocancel', return_value=True):
+        with patch('apps.image_studio.scene.ui.messagebox.askyesnocancel', return_value=True):
             self.assertFalse(sb.close(final=True))
         sb.win.destroy.assert_not_called()
 
     def test_quit_and_tab_close_leave_state_intact_after_veto(self):
-        from studio_chat import Chat
+        from core.chat import Chat
         session = SimpleNamespace(images=SimpleNamespace(can_close=lambda: False))
         app = SimpleNamespace(closing=False, sessions={'images': session}, active='images')
         Chat._quit(app)
@@ -325,7 +325,7 @@ class TestSceneClose(unittest.TestCase):
         self.assertIs(app.sessions['images'], session)
 
     def test_recovery_copy_is_valid_and_leaves_original_untouched(self):
-        from studio_scene_ui import SceneBuilder
+        from apps.image_studio.scene.ui import SceneBuilder
         with tempfile.TemporaryDirectory() as folder:
             sb = SceneBuilder.__new__(SceneBuilder)
             sb.scene = sc.new_scene(details='A recovered room')

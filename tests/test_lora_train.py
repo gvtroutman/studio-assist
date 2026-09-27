@@ -9,9 +9,9 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-import studio_imagegen as ig
-import studio_lora_train as lt
-from studio_images_ui import ImageStudio, RecordEditor
+import apps.image_studio.imagegen as ig
+import apps.image_studio.lora_train as lt
+from apps.image_studio.ui import ImageStudio, RecordEditor
 
 
 def photos(folder, n):

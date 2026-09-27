@@ -10,7 +10,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_pose as sp  # noqa: E402
+import apps.image_studio.scene.pose as sp  # noqa: E402
 
 
 def pixels(png):

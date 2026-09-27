@@ -18,9 +18,9 @@ import urllib.error
 import urllib.request
 import zlib
 
-import studio_agent as eng
-import studio_comfy_mcp as comfy
-import studio_tasks as tasks
+import core.agent as eng
+import apps.comfyui.mcp as comfy
+import core.tasks as tasks
 
 
 def tiny_png():

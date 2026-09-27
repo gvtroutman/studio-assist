@@ -11,8 +11,8 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-import studio_agent as eng
-import studio_tasks as tasks
+import core.agent as eng
+import core.tasks as tasks
 
 
 def call(name, args=None, ident="c1"):
@@ -1024,7 +1024,7 @@ class TestSchemaValidation(unittest.TestCase):
 
 class TestSessionRouting(unittest.TestCase):
     def test_old_generation_is_dropped_after_reopening_same_app(self):
-        import studio_chat as chat
+        import core.chat as chat
         old, new = chat.Session(eng.APPS[0]), chat.Session(eng.APPS[0])
         fake = Mock()
         fake.sessions = {new.id: new}

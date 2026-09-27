@@ -18,10 +18,10 @@ import urllib.error
 import urllib.request
 import zipfile
 
-import studio_agent as eng
-import studio_mcp
-import studio_research_mcp as research
-import studio_tasks as tasks
+import core.agent as eng
+import core.mcp as studio_mcp
+import apps.research.mcp as research
+import core.tasks as tasks
 
 
 def text_of(res):

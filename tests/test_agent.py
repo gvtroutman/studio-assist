@@ -22,7 +22,7 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import studio_agent as eng
+import core.agent as eng
 
 # An OpenCode edit as the bridge asks it (studio_opencode_mcp.ask_permission).
 APPROVAL = {
@@ -37,7 +37,7 @@ APPROVAL = {
                                    "Reject"]},
         "note": {"type": "string", "title": "Note for OpenCode"}},
         "required": ["decision"]}}
-import studio_icons as icons
+import core.icons as icons
 
 
 class TestSchemaSanitizing(unittest.TestCase):
@@ -1005,7 +1005,7 @@ class TestAppRegistry(unittest.TestCase):
         self.assertIsNone(oc.exe())
         self.assertEqual(oc.installed(), eng.opencode_exe() is not None)
         self.assertEqual(oc.command, eng.sys.executable)
-        self.assertEqual(os.path.basename(oc.args[0]), "studio_opencode_mcp.py")
+        self.assertEqual(os.path.basename(oc.args[0]), "apps.opencode.mcp.py")
         self.assertTrue(os.path.isfile(oc.args[0]))
         if not os.environ.get("OPENCODE_WORKSPACE"):
             self.assertEqual(oc.workspace, eng.HERE)
@@ -1179,7 +1179,7 @@ class TestAppRegistry(unittest.TestCase):
         comfy = eng.APPS_BY_ID["comfyui"]
         self.assertEqual(comfy.command, eng.sys.executable)
         self.assertTrue(os.path.isfile(comfy.args[0]))
-        self.assertEqual(os.path.basename(comfy.args[0]), "studio_comfy_mcp.py")
+        self.assertEqual(os.path.basename(comfy.args[0]), "apps.comfyui.mcp.py")
         self.assertIn(eng.COMFYUI_URL, comfy.probe)
 
     def test_chat_prompt_extends_the_cli_prompt(self):
@@ -1257,8 +1257,8 @@ class TestPlainChat(unittest.TestCase):
         """No subprocess: connect() is a Loopback over the research bridge's
         own Server, and every tool it offers is annotated read-only - the
         executor must never owe a read-back in this tab."""
-        import studio_mcp
-        import studio_research_mcp as research
+        import core.mcp as studio_mcp
+        import apps.research.mcp as research
         self.assertTrue(eng.CHAT.bridged)
         client = eng.CHAT.connect()
         try:
@@ -1273,7 +1273,7 @@ class TestPlainChat(unittest.TestCase):
         for t in tools:
             self.assertIs(t["annotations"]["readOnlyHint"], True, t["name"])
         # the script is named too, so the harness can check it like any bridge here
-        self.assertTrue(eng.CHAT.args[0].endswith("studio_research_mcp.py"))
+        self.assertTrue(eng.CHAT.args[0].endswith("apps.research.mcp.py"))
         self.assertTrue(os.path.isfile(eng.CHAT.args[0]))
 
     def test_the_prompt_teaches_its_tools_and_no_app_rules(self):
@@ -1395,7 +1395,7 @@ class TestHandEnteredBridges(unittest.TestCase):
 
     def test_the_cli_takes_a_command_line(self):
         import subprocess
-        out = subprocess.run([sys.executable, "studio_agent.py", "--help"], capture_output=True,
+        out = subprocess.run([sys.executable, "core.agent.py", "--help"], capture_output=True,
                              text=True, cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.assertIn("--mcp", out.stdout)
 
@@ -1406,8 +1406,8 @@ class TestComBridges(unittest.TestCase):
     host's `run` is replaced and the tool bodies are checked as text."""
 
     def setUp(self):
-        import studio_photoshop_mcp as ps
-        import studio_illustrator_mcp as ai
+        import apps.adobe.photoshop as ps
+        import apps.adobe.illustrator as ai
         self.ps, self.ai = ps, ai
         self.calls = []
         self._real = (ps.HOST.run, ai.HOST.run, ps.HOST.running, ai.HOST.running)
@@ -1423,8 +1423,8 @@ class TestComBridges(unittest.TestCase):
         host.running = lambda: running
 
     def test_registry_entries_point_at_the_scripts_beside_the_engine(self):
-        for app_id, script in (("photoshop", "studio_photoshop_mcp.py"),
-                               ("illustrator", "studio_illustrator_mcp.py")):
+        for app_id, script in (("photoshop", "apps.adobe.photoshop.py"),
+                               ("illustrator", "apps.adobe.illustrator.py")):
             app = eng.APPS_BY_ID[app_id]
             self.assertEqual(app.command, eng.sys.executable)
             self.assertEqual(os.path.basename(app.args[0]), script)
@@ -1439,7 +1439,7 @@ class TestComBridges(unittest.TestCase):
         self.assertFalse(res.get("isError"))
 
     def test_layers_are_addressed_by_id_and_a_bad_id_is_a_sentence(self):
-        import studio_com
+        import apps.adobe.com as studio_com
         self._answer(self.ps.HOST, {"layer_id": 7, "name": "Title", "kind": "text", "visible": True,
                                     "opacity": 100, "blend_mode": "normal", "locked": False,
                                     "depth": 0, "bounds": [10, 20, 110, 60]})
@@ -1484,7 +1484,7 @@ class TestComBridges(unittest.TestCase):
         self.assertIn("relative_to", res["content"][0]["text"])
 
     def test_the_prelude_serializes_what_extendscript_cannot(self):
-        import studio_com
+        import apps.adobe.com as studio_com
         js = studio_com.script("return 1", setup="SETUP;", teardown="TEARDOWN;")
         for needle in ("function __J(", "SETUP;", "TEARDOWN;", "__error", "return 1"):
             self.assertIn(needle, js)
@@ -1501,7 +1501,7 @@ class TestComBridges(unittest.TestCase):
     def test_process_check_survives_tasklist_truncating_long_image_names(self):
         """tasklist's table view cuts image names at 25 characters, which lost the
         ".exe" of Premiere Beta's; both helpers ask for CSV, which does not."""
-        import studio_com
+        import apps.adobe.com as studio_com
         seen = []
 
         class Out:
@@ -1523,7 +1523,7 @@ class TestComBridges(unittest.TestCase):
     def test_a_progid_nobody_registered_is_a_sentence_not_a_hang(self):
         """The one test that runs the PowerShell worker. No app is named, so
         nothing starts; the COM error comes back as prose within seconds."""
-        import studio_com
+        import apps.adobe.com as studio_com
         if not shutil.which("powershell.exe"):
             self.skipTest("no PowerShell")
         host = studio_com.ComHost("Studio.NoSuchApp.Test", "Nothing", "Nothing.exe")
@@ -1642,7 +1642,7 @@ class TestPrefs(unittest.TestCase):
         self.path = os.path.join(self.dir, "settings.json")
 
     def _prefs(self):
-        import studio_chat
+        import core.chat as studio_chat
         return studio_chat.Prefs(self.path)
 
     def test_round_trip(self):
@@ -1671,7 +1671,7 @@ class TestPrefs(unittest.TestCase):
                 self.assertIsNone(p.get("tabs"))
 
     def test_an_unwritable_path_is_survivable(self):
-        import studio_chat
+        import core.chat as studio_chat
         p = studio_chat.Prefs(os.path.join(self.dir, "settings.json", "no", "x.json"))
         p.set(theme="light")                 # must not raise
 
@@ -1681,7 +1681,7 @@ class TestErrorLog(unittest.TestCase):
     `pythonw.exe`, so there is no console a traceback could reach instead."""
 
     def setUp(self):
-        import studio_chat
+        import core.chat as studio_chat
         self.mod = studio_chat
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
@@ -1738,7 +1738,7 @@ class TestErrorLog(unittest.TestCase):
 class TestThemes(unittest.TestCase):
     def test_both_palettes_carry_every_role(self):
         """A role missing from one palette is a KeyError mid theme switch."""
-        import studio_chat
+        import core.chat as studio_chat
         self.assertEqual(set(studio_chat.DARK), set(studio_chat.LIGHT))
         for palette in studio_chat.THEMES.values():
             for role, value in palette.items():
@@ -1746,7 +1746,7 @@ class TestThemes(unittest.TestCase):
                     self.assertRegex(value, r"^#[0-9a-f]{6}$")
 
     def test_named_themes_are_the_ones_on_offer(self):
-        import studio_chat
+        import core.chat as studio_chat
         self.assertEqual([k for k, _label in studio_chat.THEME_NAMES],
                          list(studio_chat.THEMES))
 
@@ -1780,7 +1780,7 @@ class TestGui(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.mod = studio_chat
         # Settings are a real file under %APPDATA%; a test run must not touch
         # the one the user's own window is reading.
@@ -2060,8 +2060,8 @@ class TestGui(unittest.TestCase):
         the research bridge's; still warmed against its own prompt prefix and
         the same tool list a real message uses, which is the whole reason the
         first reply is quick."""
-        import studio_mcp
-        import studio_tasks as tasks
+        import core.mcp as studio_mcp
+        import core.tasks as tasks
         warmed = []
 
         class OneReply:
@@ -2943,7 +2943,7 @@ class TestGui(unittest.TestCase):
         self.assertTrue(any("the button said no" in t for t in logged), logged)
 
     def _save_a_task(self, s, brief, steps=1, broken=False):
-        import studio_tasks as tasks
+        import core.tasks as tasks
         folder = os.path.dirname(self.app._task_path(s))
         os.makedirs(folder, exist_ok=True)
         self.addCleanup(shutil.rmtree, folder, True)
@@ -3031,7 +3031,7 @@ class TestGui(unittest.TestCase):
     def test_diagnostics_opens_saying_so_and_then_paints_the_report(self):
         """The probe talks to the host, so the window has to open before the
         answer does - a tailnet timeout must not look like a frozen app."""
-        import studio_doctor
+        import core.doctor as studio_doctor
         fake = [("Inference host", [("Model", "qwen3-coder-30b", "ok"),
                                     ("Context window", "8,192 loaded", "warn")])]
         real = studio_doctor.report
@@ -3435,7 +3435,7 @@ class TestGui(unittest.TestCase):
         """Live 2026-09-27: handed to the model, "remember run tests with pytest
         -q" read as a task and it cycled making tools until stopped. A message
         that only states a lesson is kept as said and answered at once."""
-        import studio_lessons as lessons
+        import core.lessons as lessons
         s = self.app.cur()
         d = tempfile.mkdtemp()
         emitted = []
@@ -3557,7 +3557,7 @@ class TestGui(unittest.TestCase):
         shape Tk would give. Every button goes through `_button`, which makes
         a `Pill`. Read from the source because the dialogs that hold most of
         them are not open."""
-        import studio_ui
+        import core.ui as studio_ui
         for module in (self.mod, studio_ui):
             with self.subTest(module=module.__name__):
                 with open(module.__file__, encoding="utf-8") as f:
@@ -4019,7 +4019,7 @@ class TestGui(unittest.TestCase):
         """The connect dialog's values go through _save_bridge; a bad set is a
         sentence back to the dialog, a good one is a new drivable row, an open
         tab and a record in the settings file. Forgetting undoes all three."""
-        script = os.path.join(os.path.dirname(eng.__file__), "studio_comfy_mcp.py")
+        script = os.path.join(os.path.dirname(eng.__file__), "apps", "comfyui", "mcp.py")
         line = '"%s" "%s"' % (sys.executable, script)
         self.assertIn("name", self.app._save_bridge({"name": " ", "command": line}))
         self.assertIn("command line", self.app._save_bridge({"name": "Blender", "command": ""}))
@@ -4149,7 +4149,7 @@ class TestGui(unittest.TestCase):
 
 class TestSingleInstance(unittest.TestCase):
     def test_second_claim_refused(self):
-        import studio_chat
+        import core.chat as studio_chat
         port = 57999
         self.assertTrue(studio_chat.claim_single_instance(port))
         self.addCleanup(studio_chat._LOCK.close)

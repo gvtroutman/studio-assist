@@ -17,9 +17,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
-import studio_icons  # noqa: E402
-import studio_imagegen as ig  # noqa: E402
-import studio_scene as sc  # noqa: E402
+import core.icons as studio_icons  # noqa: E402
+import apps.image_studio.imagegen as ig  # noqa: E402
+import apps.image_studio.scene.scene as sc  # noqa: E402
 from test_imagegen import FLUX_FILES, FakeClient, TempStudioMixin, _headless  # noqa: E402
 
 
@@ -508,7 +508,7 @@ class TestMaps(unittest.TestCase):
         self.assertIsNone(sc.pose_png(s))
 
     def test_one_figure_draws_as_the_stick_figure_editor_does(self):
-        import studio_pose as sp
+        import apps.image_studio.scene.pose as sp
         pts = sp.preset("standing", 512, 768)
         self.assertEqual(sp.render(pts, 512, 768),
                          sp.render_figures([{"points": pts}], 512, 768))
@@ -1768,7 +1768,7 @@ def tk_label():
 
 
 def sc_room():
-    import studio_scene_ui
+    import apps.image_studio.scene.ui as studio_scene_ui
     return studio_scene_ui.ROOM
 
 
@@ -1781,7 +1781,7 @@ class Ev:
 class TestSceneBuilderWindow(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import studio_chat
+        import core.chat as studio_chat
         cls.mod = studio_chat
         cls.dir = tempfile.mkdtemp()
         cls._real_settings = os.environ.get("STUDIO_SETTINGS")
@@ -2303,7 +2303,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertTrue(sb.dirty)
         self.assertEqual(sb.outfit_name, "Red night")
         from unittest import mock
-        with mock.patch("studio_scene_ui.messagebox.askyesno", return_value=True):
+        with mock.patch("apps.image_studio.scene.ui.messagebox.askyesno", return_value=True):
             sb._delete_outfit("red NIGHT")
         self.assertEqual(ui.studio.lib.all("outfits"), [])
         self.assertEqual(b["look"]["top"], "red sweater")    # wearers keep their clothes
