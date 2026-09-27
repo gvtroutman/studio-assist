@@ -447,8 +447,9 @@ class Chat(tk.Tk):
         s.studio = self.studio
         if app.bridged:
             s.library = toolsmith.Library.for_app(app.id, self._data_dir())
-            s.notebook = lessons.Notebook.for_app(app.id, self._data_dir())
+            s.notebook = lessons.for_app(app, self._data_dir())
             s.notebook.load()             # a problem is said at boot, in the tab
+            self._publish_lessons(s)
         s.messages[0] = {"role": "system", "content": s.prompt()}
         return s
 
@@ -5000,6 +5001,15 @@ class Chat(tk.Tk):
         words, its report as the reply. Every step it wants still comes up as
         an approval card - the bridge asks, whoever sent the task."""
         emit("status", ("OpenCode is working" + ELLIPSIS, "muted", True))
+        stated = lessons.explicit_lesson(s.messages[-1]["content"])
+        if stated and s.notebook is not None:
+            try:
+                lesson, note = s.notebook.add(stated, "user")
+                emit("sys", "Lesson kept (%s): %s" % (self._layer_name(s, lesson["text"]),
+                                                      lesson["text"]))
+                self._publish_lessons(s)
+            except ValueError:
+                pass
         res = s.mcp.call_tool("opencode_ask", {"prompt": s.messages[-1]["content"]})
         reply = eng.mcp_result_to_text(res).strip() or "(OpenCode said nothing)"
         emit("token", reply)
@@ -5020,7 +5030,19 @@ class Chat(tk.Tk):
             emit("status", ("thinking about what to remember" + ELLIPSIS, "muted", True))
         for text in eng.learn_from_run(executor, s.messages, s.notebook,
                                        s.llm or self.llm, s.app.name):
-            emit("sys", "Lesson kept for %s: %s" % (s.app.name, text))
+            emit("sys", "Lesson kept (%s): %s" % (self._layer_name(s, text), text))
+        self._publish_lessons(s)
+
+    def _layer_name(self, s, text):
+        where = s.notebook.where(text) if isinstance(s.notebook, lessons.Stack) else None
+        return {"everywhere": "every tab", "folder": "this folder"}.get(where, s.app.name)
+
+    def _publish_lessons(self, s):
+        """OpenCode reads the lessons from a file its config names, so a lesson
+        reaches it in Direct mode too. Best-effort."""
+        path = getattr(s.app, "lessons_path", None)
+        if path and s.notebook is not None:
+            lessons.write_brief_file(s.notebook, path)
 
     # ------------------------------------------------ the studio and the lessons
     def _studio_path(self):
@@ -5134,7 +5156,10 @@ class Chat(tk.Tk):
                 view.insert("end", "\n")
                 view.window_create("end", window=self._forget_lesson_button(view, s, lesson["text"]))
                 view.insert("end", "  " + lesson["text"] + "\n", "name")
-                view.insert("end", "      %s%s\n" % (
+                view.insert("end", "      %s%s%s\n" % (
+                    {"everywhere": "every tab  ·  ", "folder": "this folder  ·  "}.get(
+                        s.notebook.where(lesson["text"]) if isinstance(s.notebook, lessons.Stack)
+                        else None, ""),
                     {"user": "you said so", "model": "the model kept it",
                      "review": "reflected after a task", "error": "a refused call"}[lesson["source"]],
                     "  ·  came up %d more time%s" % (lesson["hits"], "" if lesson["hits"] == 1 else "s")
@@ -5238,6 +5263,7 @@ class Chat(tk.Tk):
             if s.busy:
                 return                    # the worker may be writing the notebook
             s.notebook.remove(text)
+            self._publish_lessons(s)
             self._lessons_window()
         return self._button(parent, "forget", forget, kind="ghost", bg="card",
                             font=self.f_small, padx=self._px(9),

@@ -783,7 +783,11 @@ class Executor:
             validate(args, lessons.REMEMBER_TOOL["function"]["parameters"])
             if self.notebook is None:
                 raise ValueError("This tab keeps no notebook; nothing was recorded.")
-            lesson, note = self.notebook.add(args["lesson"], "model")
+            scope = args.get("scope")
+            if isinstance(self.notebook, lessons.Stack):
+                lesson, note = self.notebook.add(args["lesson"], "model", scope)
+            else:
+                lesson, note = self.notebook.add(args["lesson"], "model")
             self.emit("sys", "Remembered: " + lesson["text"])
             return ("Kept for future tasks in this app: %s%s" % (
                 lesson["text"], "" if not note else " (" + note + ")"), False, False)
