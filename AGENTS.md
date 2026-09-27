@@ -564,6 +564,18 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   character. Under it, **Editor** (the creator) and **Image references** (the
   profiles). The form's look tabs are `FORM_LOOKS`: Body and Accessories are the
   creator's alone, though a character's body and accessories still reach the prompt.
+- **A character's tags are words for its pictures** (2026-09-27, the user: "tags need
+  images to upload. so when i say glasses i reference the image"). The creator's
+  Tags tab lists every `item_refs` entry (the item pictures are tags too) and makes
+  one from a word plus a picture uploaded then: no picture, no tag. The copy goes
+  under `references/` (`keep_reference`), and *From library* gives this character a
+  tag another character already has, sharing its copy. `outfit_of` counts a tag
+  when a slot holds it exactly (as before) or when `says` finds its word, any case
+  and a plural allowed, in a slot or the scene ("round glasses", "she pushes her
+  glasses up"; not "sunglasses"). A tag said only in the scene is clothing when its
+  word names a Clothes pick's garment and nothing on the head, else an accessory.
+  The pictures then go through Kontext as any item picture does. Scenes with people
+  still blank `item_refs` (`studio_scene.generation`): tags are the form's person's.
 - **Item pictures go into the picture itself, through FLUX Kontext**
   (2026-09-25; before, Try On redrew the finished picture, which the user did not
   want). They are chosen on the form's Clothes, Hair and Accessories tabs as in
