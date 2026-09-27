@@ -84,6 +84,30 @@ def job_fields(job):
             "paste_graph": job.paste_graph, "passes": job.passes, "dress": job.dress}
 
 
+def leave(dt, method, params=None):
+    """`method` (Page.navigate or Page.reload) on a ComfyUI page, its "Leave
+    app? Changes you made may not be saved" answered Leave. A loaded graph is
+    an unsaved workflow, so every page that had one asks, and unanswered the
+    navigation waits forever. Nothing is lost: ComfyUI keeps each open
+    workflow as a draft in the profile and reopens it on that page's next
+    visit. -> the call's result."""
+    dt.call("Page.enable")                # the dialog's event is the Page domain's
+    dt.seq += 1
+    ask = dt.seq
+    dt.ws.send(json.dumps({"id": ask, "method": method, "params": params or {}}))
+    while True:
+        msg = json.loads(dt.ws.recv())
+        if msg.get("method") == "Page.javascriptDialogOpening":
+            dt.seq += 1
+            dt.ws.send(json.dumps({"id": dt.seq, "method": "Page.handleJavaScriptDialog",
+                                   "params": {"accept": True}}))
+        elif msg.get("id") == ask:
+            if "error" in msg:
+                raise milanote.DevToolsError("%s: %s" % (method,
+                                                         msg["error"].get("message")))
+            return msg.get("result", {})
+
+
 class ComfyBrowser(milanote.Browser):
     """A backend's ComfyUI in a window of our own. Blocking methods run off
     the UI thread; `embed`, `fit`, `focus` and `release` on it."""
@@ -108,11 +132,7 @@ class ComfyBrowser(milanote.Browser):
         workflow tab called `title`. -> how many nodes it has. Blocks."""
         dt = self.page()
         try:
-            if url and origin(url) != origin(self.url):
-                self.url = url
-                dt.call("Page.navigate", {"url": url})
-                time.sleep(0.5)           # the old page's `app` is still there a moment
-            self._wait_ready(dt)
+            self._go(dt, url)
             # Twice at most: a count that is not the graph's means something
             # (the session's tabs coming back) drew over it.
             for _ in range(2):
@@ -131,6 +151,29 @@ class ComfyBrowser(milanote.Browser):
         finally:
             dt.close()
         return count
+
+    def goto(self, url):
+        """Show the ComfyUI at `url`, with nothing loaded. Blocks."""
+        dt = self.page()
+        try:
+            self._go(dt, url)
+        finally:
+            dt.close()
+
+    def reload(self):
+        dt = self.page()
+        try:
+            leave(dt, "Page.reload", {"ignoreCache": False})
+        finally:
+            dt.close()
+
+    def _go(self, dt, url):
+        """To the ComfyUI at `url` if it is another one; then ready."""
+        if url and origin(url) != origin(self.url):
+            self.url = url
+            leave(dt, "Page.navigate", {"url": url})
+            time.sleep(0.5)               # the old page's `app` is still there a moment
+        self._wait_ready(dt)
 
     def _wait_ready(self, dt, wait=READY_WAIT):
         deadline = time.monotonic() + wait
