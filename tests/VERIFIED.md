@@ -63,6 +63,8 @@ Re-check an entry only when a later change touches its code; then move it to
 | --- | --- |
 | Enrich live runs | `SHAPES`/`ENRICH_SYSTEM` now list the new shapes and props; no live model run since |
 
+| Accent picker in Preferences | `ui.palette` and the saved `accent` pref are covered by `TestPrefs`; the colour dialog itself has not been clicked through in the live window |
+
 ## Gaps (write tests here next)
 
 - `apps/image_studio/ui.py` — no test file.

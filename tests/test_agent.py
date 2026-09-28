@@ -1684,6 +1684,24 @@ class TestPrefs(unittest.TestCase):
         p = studio_chat.Prefs(os.path.join(self.dir, "settings.json", "no", "x.json"))
         p.set(theme="light")                 # must not raise
 
+    def test_accent_round_trips_and_junk_falls_back(self):
+        p = self._prefs()
+        self.assertIsNone(p.get("accent"))
+        p.set(accent="#2255aa")
+        self.assertEqual(self._prefs().get("accent"), "#2255aa")
+        p.set(accent="red; drop")
+        self.assertIsNone(self._prefs().get("accent"))
+
+    def test_palette_derives_the_accent_roles(self):
+        import core.ui as ui
+        self.assertEqual(ui.palette("dark"), ui.DARK)
+        pale, deep = ui.palette("dark", "#ffe066"), ui.palette("light", "#2255AA")
+        self.assertEqual(deep["accent"], "#2255aa")
+        self.assertEqual(pale["accent_fg"], "#16150f")   # dark text on pale
+        self.assertEqual(deep["accent_fg"], "#ffffff")
+        self.assertNotEqual(deep["accent_dk"], deep["accent"])
+        self.assertEqual(ui.palette("light", "nope")["accent"], ui.LIGHT["accent"])
+
 
 class TestErrorLog(unittest.TestCase):
     """The app's only forensic record: the shortcut starts it with

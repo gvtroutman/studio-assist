@@ -196,7 +196,7 @@ class Prefs:
     read-only or locked-down profile costs you the preference, never the app.
     """
 
-    DEFAULTS = {"theme": "dark", "tabs": None, "pinned": [], "hidden": [], "bridges": [],
+    DEFAULTS = {"theme": "dark", "accent": None, "tabs": None, "pinned": [], "hidden": [], "bridges": [],
                 "hold_consoles": True}
 
     def __init__(self, path=None):
@@ -213,6 +213,8 @@ class Prefs:
         # must not be able to stop the window opening.
         if self.data.get("theme") not in THEMES:
             self.data["theme"] = "dark"
+        if not ui.is_hex(self.data.get("accent")):
+            self.data["accent"] = None
         for key in ("pinned", "hidden"):
             got = self.data.get(key)
             # `isinstance(got, list)` first: a bare string is iterable, and
@@ -385,7 +387,7 @@ class Chat(tk.Tk):
                      min(self._px(520), int(sh * 0.9)))
 
         self.prefs = Prefs()
-        self.C = dict(THEMES[self.prefs.get("theme")])
+        self.C = ui.palette(self.prefs.get("theme"), self.prefs.get("accent"))
         self.skin = {}                    # widget -> {tk option: palette role}
         self.dot_role = {}                # canvas -> palette role
         self.marks = {}                   # icon key -> [(canvas, size, spec)]
@@ -588,10 +590,15 @@ class Chat(tk.Tk):
         self.pills = [p for p in self.pills if p.winfo_exists()]
         self.repaints = [(w, d) for w, d in self.repaints if w.winfo_exists()]
 
+    def _accent(self, colour):
+        """Save the accent (None for the theme's own) and repaint with it."""
+        self.prefs.set(accent=colour if ui.is_hex(colour) else None)
+        self._theme(self.prefs.get("theme"))
+
     def _theme(self, name):
         if name not in THEMES:
             return
-        self.C = dict(THEMES[name])
+        self.C = ui.palette(name, self.prefs.get("accent"))
         self.prefs.set(theme=name)
         self.configure(bg=self.C["bg"])
         self._forget()
@@ -2501,6 +2508,37 @@ class Chat(tk.Tk):
         # registered so a theme change from the menu relights the right card
         self.windows["prefs_paint"] = paint
         paint()
+
+        self._cap(body, "ACCENT COLOUR", bg="bg").pack(fill="x", pady=(22, 8))
+        row = self._skin(tk.Frame(body), bg="bg")
+        row.pack(fill="x")
+        swatch = tk.Canvas(row, width=self._px(28), height=self._px(28),
+                           highlightthickness=0, bd=0, cursor="hand2")
+        self._skin(swatch, bg="bg")
+        swatch.pack(side="left", padx=(0, 10))
+
+        def paint_swatch():
+            try:
+                swatch.delete("all")
+                s = self._px(28)
+                rounded(swatch, 0, 0, s, s, self._px(7), fill=self.C["accent"],
+                        outline=self.C["border"])
+            except tk.TclError:
+                pass
+
+        def pick():
+            from tkinter import colorchooser
+            got = colorchooser.askcolor(color=self.C["accent"], parent=win,
+                                        title="Accent colour")[1]
+            if got:
+                self._accent(got)
+
+        swatch.bind("<Button-1>", lambda ev: pick())
+        self._button(row, "Choose...", pick).pack(side="left")
+        self._button(row, "Reset", lambda: self._accent(None)).pack(
+            side="left", padx=(8, 0))
+        self._repaint_on_theme(swatch, paint_swatch)
+        paint_swatch()
 
         self._cap(body, "SIDEBAR", bg="bg").pack(fill="x", pady=(22, 8))
         count = tk.Label(body, font=self.f_small, anchor="w")

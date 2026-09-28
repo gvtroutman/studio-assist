@@ -43,6 +43,27 @@ THEMES = {"dark": DARK, "light": LIGHT}
 THEME_NAMES = [("dark", "Dark"), ("light", "Light")]
 
 
+def is_hex(s):
+    """A "#rrggbb" string - the only shape a saved accent may take."""
+    return (isinstance(s, str) and len(s) == 7 and s[0] == "#"
+            and all(c in "0123456789abcdefABCDEF" for c in s[1:]))
+
+
+def palette(name, accent=None):
+    """Theme `name` with the user's accent laid over it. The pressed shade and
+    the text on the accent are derived, so one pick recolours every accent role
+    and the label on a pale accent stays readable."""
+    p = dict(THEMES.get(name, DARK))
+    if is_hex(accent):
+        accent = accent.lower()
+        r, g, b = (int(accent[i:i + 2], 16) for i in (1, 3, 5))
+        light = 0.299 * r + 0.587 * g + 0.114 * b > 150
+        p["accent"] = accent
+        p["accent_dk"] = blend(accent, "#000000", 0.14)
+        p["accent_fg"] = "#16150f" if light else "#ffffff"
+    return p
+
+
 def blend(a, b, t):
     """Hex colour `a` moved `t` of the way to `b`. Dots that breathe and bands
     that sweep need the shades between two palette roles, and a palette holds
