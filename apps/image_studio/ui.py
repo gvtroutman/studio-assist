@@ -1733,8 +1733,11 @@ class ImageStudio:
             self.skin(self.warn, bg="bg", fg="err")
             b = next((x for x in self.studio.backends() if x["enabled"]), None)
             if b is None:
+                if hasattr(self, "act_nodes") and not self._selected_steps()[0]:
+                    self.act_nodes.set(state="disabled")
                 return
-            v = self.studio.preview(s, b).values
+            p = self.studio.preview(s, b)
+            v = p.values
         else:
             p = self.studio.preview(s, b)
             lines = p.errors + p.warnings
@@ -1745,6 +1748,9 @@ class ImageStudio:
                                    + ("" if h else " Not checked yet: Check asks it."))
             self.skin(self.route_note, bg="bg", fg="err" if p.errors else "muted")
             v = p.values
+        if hasattr(self, "act_nodes"):
+            self.act_nodes.set(state="normal" if (self._selected_steps()[0]
+                                                  or ig.preview_graph(p)) else "disabled")
         try:
             self.planned_size = (int(v.get("width") or 1024), int(v.get("height") or 1024))
         except (TypeError, ValueError):
@@ -1879,11 +1885,9 @@ class ImageStudio:
         acts.pack(side="bottom", fill="x", padx=self.px(10), pady=(self.px(4), self.px(10)))
         self.act_again = self.button(acts, "Generate again  ▾", self._again_menu, bg="card")
         self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
-        self.act_nodes = self.button(acts, "Nodes", self._show_nodes, bg="card")
         self.act_again.pack(side="left")
-        self.act_nodes.pack(side="right")
-        self.act_fix.pack(side="right", padx=(0, self.px(6)))
-        for p in (self.act_again, self.act_fix, self.act_nodes):
+        self.act_fix.pack(side="right")
+        for p in (self.act_again, self.act_fix):
             p.set(state="disabled")
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
         self.caption.pack(side="bottom", fill="x", padx=self.px(12))
@@ -1896,6 +1900,12 @@ class ImageStudio:
         self.preview.bind("<Double-Button-1>", lambda ev: self._open_selected())
         self.preview.bind("<Button-3>", self._picture_menu)
         self.preview.bind("<Configure>", lambda ev: self._repaint_preview())
+        # Nodes floats over the picture's top-right corner, not in this row -
+        # it opens ComfyUI's own editor, not an action on the picture itself.
+        # Built last, so it stacks above the preview label under it.
+        self.act_nodes = self.button(top, "Nodes", self._show_nodes, bg="card")
+        self.act_nodes.place(relx=1.0, x=-self.px(8), y=self.px(8), anchor="ne")
+        self.act_nodes.set(state="disabled")
 
         tabs = self.frame(right)
         tabs.grid(row=1, column=0, sticky="ew", pady=(self.px(10), self.px(4)))
@@ -2217,7 +2227,8 @@ class ImageStudio:
             self.act_retry_faces.pack_forget()
         self.act_again.set(state="normal" if rec or item[0] == "job" else "disabled")
         self.act_fix.set(state="normal" if path and os.path.isfile(path) else "disabled")
-        self.act_nodes.set(state="normal" if self._selected_steps()[0] else "disabled")
+        self.act_nodes.set(state="normal" if (self._selected_steps()[0]
+                                              or self._form_steps()[0]) else "disabled")
 
     @staticmethod
     def clip(text, n=180):
@@ -2323,28 +2334,56 @@ class ImageStudio:
     # ============================================================ the Nodes view
     def _selected_steps(self):
         """-> ([(label, graph)], ComfyUI url, name) of the picture selected;
-        ([], None, None) when it has no graph."""
+        ([], None, None) when it has none yet - a job still waiting for its
+        lane composes nothing until it starts, so it falls back to a
+        preview graph built locally for the backend it is assigned to."""
         item = self.selected
         if item is None:
             return [], None, None
         rec = self._selected_record()
         if rec:
             fields, backend, name = rec, rec.get("backend") or {}, rec.get("id")
-        elif item[0] == "job":
-            job = item[1]
-            fields, backend, name = comfy_view.job_fields(job), job.backend or {}, job.id
-        else:
+            steps = comfy_view.graph_steps(fields)
+            url = backend.get("url")
+            return (steps, url, name) if steps and url else ([], None, None)
+        if item[0] != "job":
             return [], None, None
+        job = item[1]
+        fields, backend, name = comfy_view.job_fields(job), job.backend or {}, job.id
         steps = comfy_view.graph_steps(fields)
         url = backend.get("url")
-        return (steps, url, name) if steps and url else ([], None, None)
+        if steps and url:
+            return steps, url, name
+        if not backend.get("url"):
+            return [], None, None
+        graph = ig.preview_graph(self.studio.preview(job.settings, backend))
+        return ([("Pipeline", graph)], backend["url"], name) if graph else ([], None, None)
+
+    def _form_steps(self):
+        """The pipeline the form would submit right now, on the backend Auto
+        would send it to - composed locally, nothing sent to ComfyUI. ([],
+        None, None) when there is not enough on the form to build one."""
+        s = self.collect()
+        b, _why = self.studio.plan_route(s)
+        if b is None:
+            b = next((x for x in self.studio.backends() if x["enabled"]), None)
+        if b is None:
+            return [], None, None
+        graph = ig.preview_graph(self.studio.preview(s, b))
+        return ([("Pipeline", graph)], b["url"], "This picture") if graph else ([], None, None)
 
     def _show_nodes(self):
         """The picture's graphs in ComfyUI's own editor: the ComfyUI tab's
-        Nodes view (studio_nodes_ui), where each step can be opened."""
+        Nodes view (studio_nodes_ui), where each step can be opened. The
+        picture selected in Queue or History first; the form itself
+        (whatever Generate would send right now) otherwise - so Nodes
+        always shows the pipeline connected to the instance that will run
+        it, built only now, on demand."""
         steps, url, name = self._selected_steps()
         if not steps:
-            return self.say("This picture has no ComfyUI graph to show.", "warn")
+            steps, url, name = self._form_steps()
+        if not steps:
+            return self.say("Not enough set to show a pipeline yet.", "warn")
         self.host.open_nodes(steps, url, name)
 
     def _open_selected(self, select=False):

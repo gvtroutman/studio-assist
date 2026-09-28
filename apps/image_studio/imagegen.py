@@ -449,7 +449,7 @@ def character_faces(rec, lib=None):
     return out
 
 
-def clean_outfit(d):
+def clean_outfit_preset(d):
     """A clothes preset: a name and what it puts in each OUTFIT_KEYS slot.
     Putting it on replaces all of those slots, so a slot it leaves empty
     is taken off (a summer outfit has no coat)."""
@@ -564,7 +564,7 @@ def clean_image(d):
 
 CLEAN = {"images": clean_image, "backends": clean_backend, "models": clean_model, "loras": clean_lora,
          "identities": clean_identity, "styles": clean_style,
-         "characters": clean_character, "outfits": clean_outfit, "presets": clean_preset}
+         "characters": clean_character, "outfits": clean_outfit_preset, "presets": clean_preset}
 
 
 def _default_backends():
@@ -4383,6 +4383,29 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     return p
 
 
+def preview_graph(plan):
+    """`plan.workflow` filled to look at, not to run - for the Nodes button
+    on a form or a queued job that has not been submitted (and so has no
+    `job.graph` yet): a reference shows its local file's name since nothing
+    is uploaded, and the output name is a placeholder. -> the API-format
+    graph, or None when there is nothing to build (an error, or no workflow
+    chosen yet)."""
+    if plan is None or not plan.workflow or plan.errors:
+        return None
+    values = dict(plan.values)
+    for var, path in plan.images.items():
+        values.setdefault(var, os.path.basename(path))
+    values.setdefault("filename_prefix", "ImageStudio/preview")
+    try:
+        graph = fill(plan.workflow, values, plan.loras)
+    except TemplateError:
+        return None
+    if plan.items:
+        add_item_refs(graph, plan.workflow["items"],
+                      [os.path.basename(path) for _, path in plan.items])
+    return graph
+
+
 # ================================================================ routing
 
 def route(role, backends, health, has_model=None, load=None):
@@ -4536,9 +4559,9 @@ class JobQueue:
         with lane.cv:
             lane.waiting.append(job)
             lane.cv.notify()
-        if lane.thread is None or not lane.thread.is_alive():
-            lane.thread = threading.Thread(target=self._work, args=(lane,), daemon=True)
-            lane.thread.start()
+            if lane.thread is None or not lane.thread.is_alive():
+                lane.thread = threading.Thread(target=self._work, args=(lane,), daemon=True)
+                lane.thread.start()
         self.notify(job)
 
     def cancel(self, job):

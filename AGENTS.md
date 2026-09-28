@@ -1548,13 +1548,25 @@ transcript back. The conversation and its bridge are untouched either way.
 - **The window is the session's `browser`.** `_close_tab` releases it before the frame
   goes and `Session.close` ends it, with no code of its own. Its workers come back as
   `("nodes", sid, callable)`, which `_handle` runs on the UI thread.
-- **The Image Studio's Nodes** (beside Fix a spot, and Show nodes on the picture's
-  right-click menu) calls `Chat.open_nodes(steps, url, name)`. That opens or selects the
-  ComfyUI tab, switches it to Nodes, and loads the picture's Picture step on the
-  backend that made it. The picture's steps sit on the bar until another backend is
-  picked by hand (`_switch`), because they were made on the first one. The first
-  version took over the Image Studio's own body instead. It moved here because two
-  windows cannot share one profile.
+- **The Image Studio's Nodes button** (2026-09-28: floats over the picture's top-right
+  corner rather than sitting in the action row - Fix a spot took its old seat there;
+  Show nodes is still on the picture's right-click menu too) calls
+  `Chat.open_nodes(steps, url, name)`. That opens or selects the ComfyUI tab, switches
+  it to Nodes, and loads the picture's Picture step on the backend that made it. The
+  picture's steps sit on the bar until another backend is picked by hand (`_switch`),
+  because they were made on the first one. The first version took over the Image
+  Studio's own body instead. It moved here because two windows cannot share one
+  profile.
+- **A job still waiting has no graph yet** (`Job.graph` is set inside `run_job`, once
+  its lane starts it - not at enqueue) **and neither does the form before Generate is
+  pressed.** `ImageStudio._selected_steps` falls back for a queued job, and
+  `ImageStudio._form_steps` builds one for the form itself, both through
+  `ig.preview_graph(plan)`: `compose()`'s `Plan` (already no I/O, used for the form's
+  warnings) filled with `fill()` - the same adapter `run_job` uses - but with each
+  reference's local file *name* standing in for an uploaded one, since nothing is sent
+  to the backend. `_show_nodes` tries the selection first, the form second, so Nodes
+  is connected to whichever backend would actually run it (Auto included) and never
+  blocks: nothing opens or loads until it is pressed.
 
 `apps/comfyui/view.py` holds the window and the graphs:
 
