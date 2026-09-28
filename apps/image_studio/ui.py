@@ -15,9 +15,12 @@ payload) events through the window's pump and land in `handle()`.
 import colorsys
 import math
 import os
+import random
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -33,6 +36,7 @@ import apps.image_studio.addons.nodes as addons
 import apps.comfyui.view as comfy_view
 import apps.image_studio.imagegen as ig
 import apps.image_studio.facefusion as ff
+import apps.image_studio.breed as sb
 import apps.image_studio.lora_train as lt
 import apps.image_studio.scene.pose as sp
 import apps.image_studio.scene.ui as studio_scene_ui
@@ -2984,6 +2988,166 @@ class ImageLibraryWindow:
         self.status("Removed from the library. Existing references and saved generations keep their copy.")
 
 
+class NewPhotos:
+    """Angles or Breed (`breed`) for the identity editor: new photos of the
+    person drawn on the Kontext backend, shown as they come; a click picks
+    one, Add puts the picked ones into the references (Save keeps them).
+    Again makes another round; closing the window stops the run."""
+    PER_PHOTO = 4
+
+    def __init__(self, editor, pics, mode, parents):
+        self.editor, self.pics, self.mode, self.parents = editor, pics, mode, parents
+        o = self.owner = editor.owner
+        host = o.host
+        self.made, self.sel, self.stop = [], set(), threading.Event()
+        self.running = False
+        self.folder = tempfile.mkdtemp(prefix="studio-%s-" % mode)
+        win = self.win = tk.Toplevel(editor.win)
+        win.title("Breed" if mode == "breed" else "Angles")
+        win.transient(editor.win)
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(640), host._px(560)))
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        top = o.frame(win)
+        top.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(12), 0))
+        o.label(top, "Parents" if mode == "breed" else "From", "muted", host.f_small).pack(
+            side="left", padx=(0, o.px(6)))
+        for p in parents[:6]:
+            img = photo(p, o.px(64), profile=True)
+            if img is not None:
+                o.keep.append(img)
+                tk.Label(top, image=img, bd=0).pack(side="left", padx=o.px(2))
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(12), pady=o.px(12))
+        o.button(foot, "Add to references", self.add, kind="accent").pack(side="right")
+        o.button(foot, "Again", self.start).pack(side="right", padx=(0, o.px(4)))
+        o.button(foot, "Stop", self.stop.set, kind="ghost").pack(
+            side="right", padx=(0, o.px(4)))
+        self.msg = o.label(foot, "", "muted", host.f_small)
+        self.msg.pack(side="left", fill="x", expand=True)
+        outer, self.grid = o.scrolled(win)
+        outer.pack(side="top", fill="both", expand=True, padx=o.px(12), pady=(o.px(8), 0))
+        self.start()
+
+    def status(self, text, role="muted"):
+        if self.win.winfo_exists():
+            self.msg.config(text=text)
+            self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def jobs(self):
+        """[(label, parent, angle or None)] for one round."""
+        if self.mode == "breed":
+            return [("child", None, None)]
+        return [(angle, p, angle) for p in self.parents
+                for angle in sb.pick_angles(self.PER_PHOTO)]
+
+    def start(self):
+        if self.running:
+            return self.status("Still making the last round; Stop ends it.")
+        self.running = True
+        self.stop.clear()
+        jobs, studio = self.jobs(), self.owner.studio
+        self.status("Finding a backend with FLUX Kontext" + ELLIPSIS)
+
+        def say(text, role="muted"):
+            self.owner._post("call", lambda: self.status(text, role))
+
+        def work():
+            error = None
+            try:
+                backend, why = sb.route(studio)
+                if backend is None:
+                    raise ig.ComfyError(why)
+                client = studio.client(backend)
+                names = {p: client.upload_image(p) for p in self.parents}
+                size = sb.size_for(self.parents[0])
+                for n, (label, parent, angle) in enumerate(jobs):
+                    if self.stop.is_set():
+                        break
+                    seed = random.randint(0, ig.MAX_SEED)
+                    graph = (sb.breed_graph(names[self.parents[0]], names[self.parents[1]],
+                                            size, seed) if angle is None
+                             else sb.angle_graph(names[parent], angle, seed))
+                    head = "%s %d of %d on %s" % ("Breeding" if angle is None else
+                                                  "Angle: " + angle, n + 1, len(jobs),
+                                                  backend["name"])
+                    say(head + ELLIPSIS)
+                    data = sb.run(client, graph, self.stop.is_set,
+                                  lambda v, t, head=head: say("%s · step %d of %d"
+                                                              % (head, v, t)))
+                    if data is None:
+                        break
+                    path = os.path.join(self.folder, "%s_%d.png" % (
+                        re.sub(r"\W+", "-", label), seed))
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    self.owner._post("call", lambda p=path, l=label: self.arrived(p, l))
+            except (ig.ComfyError, OSError) as e:
+                error = str(e)
+
+            def done():
+                self.running = False
+                if error:
+                    self.status(error, "err")
+                elif self.stop.is_set():
+                    self.status("Stopped.")
+                else:
+                    self.status("Click the ones to keep, then Add to references.", "ok")
+            self.owner._post("call", done)
+        self.owner.host._spawn(self.owner.s.event_id, work)
+
+    def arrived(self, path, label):
+        self.made.append((path, label))
+        self.draw()
+
+    def draw(self, cols=4):
+        if not self.win.winfo_exists():
+            return
+        o, host, side = self.owner, self.owner.host, self.owner.px(140)
+        for w in self.grid.winfo_children():
+            w.destroy()
+        for i, (path, label) in enumerate(self.made):
+            tile = tk.Frame(self.grid, bd=0, highlightthickness=o.px(3))
+            ring = "accent" if i in self.sel else "bg"
+            o.skin(tile, bg="card", highlightbackground=ring, highlightcolor=ring)
+            tile.grid(row=i // cols, column=i % cols, padx=o.px(2), pady=o.px(2))
+            img = photo(path, side)
+            if img is not None:
+                o.keep.append(img)
+                lbl = tk.Label(tile, image=img, bd=0, width=side, height=side)
+            else:                          # sizes in characters without an image
+                lbl = tk.Label(tile, text="no preview", bd=0, font=host.f_small,
+                               width=12, height=6)
+            o.skin(lbl, bg="card", fg="muted")
+            lbl.pack()
+            cap = o.label(tile, label, "muted", host.f_small, bg="card")
+            cap.pack()
+            for w in (tile, lbl, cap):
+                w.bind("<Button-1>", lambda ev, i=i: self.toggle(i))
+
+    def toggle(self, i):
+        self.sel ^= {i}
+        self.draw()
+
+    def add(self):
+        picked = [self.made[i][0] for i in sorted(self.sel)]
+        if not picked:
+            return self.status("Click the photos to keep first.")
+        if not self.pics["grid"].winfo_exists():
+            return self.status("The person's form was closed; open it again.", "err")
+        self.editor._import_paths(self.pics, picked)
+        self.made = [m for i, m in enumerate(self.made) if i not in self.sel]
+        self.sel = set()
+        self.draw()
+        self.status("Added %d. Save the person to keep them." % len(picked), "ok")
+
+    def close(self):
+        self.stop.set()
+        self.win.destroy()
+        if not self.running and not self.pics.get("importing"):
+            shutil.rmtree(self.folder, ignore_errors=True)
+
+
 class RecordEditor:
     """One editor for every list the studio keeps: the records on the left,
     a form built from `fields` on the right. `fields` is (key, label, kind)
@@ -3174,10 +3338,19 @@ class RecordEditor:
                     o.button(actions, "Build LoRA" + ELLIPSIS,
                              lambda: self.owner.build_lora(self)).pack(
                         side="left", padx=(o.px(4), 0))
+                    o.button(actions, "Angles" + ELLIPSIS,
+                             lambda p=pics: self._new_photos(p, "angles")).pack(
+                        side="left", padx=(o.px(4), 0))
+                    o.button(actions, "Breed" + ELLIPSIS,
+                             lambda p=pics: self._new_photos(p, "breed")).pack(
+                        side="left", padx=(o.px(4), 0))
                     o.label(parent, "Use clear photos of the same person, one face per photo.\n"
                             "Choose a clear front view as Primary. Enable pooling to let the "
                             "other photos guide identity too. Build LoRA trains the "
-                            "person's own FLUX LoRA from %d or more photos." % lt.MIN_PHOTOS,
+                            "person's own FLUX LoRA from %d or more photos.\n"
+                            "Angles draws the selected photos from %d other angles; Breed "
+                            "mixes two selected photos into a new one." % (
+                                lt.MIN_PHOTOS, NewPhotos.PER_PHOTO),
                             "muted", host.f_small).pack(
                                 side="top", anchor="w")
                 o.button(row, "Remove", lambda p=pics: self._remove_paths(p),
@@ -3268,6 +3441,18 @@ class RecordEditor:
         paths = filedialog.askopenfilenames(parent=self.win, filetypes=[
             ("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
         self._import_paths(pics, paths)
+
+    def _new_photos(self, pics, mode):
+        """Angles of the selected photos, or a child of the two selected."""
+        chosen = [pics["paths"][i] for i in sorted(pics["sel"])
+                  if os.path.isfile(pics["paths"][i])]
+        if mode == "breed" and len(chosen) != 2:
+            return self.status("Select exactly two photos to breed.")
+        if mode == "angles" and not chosen:
+            return self.status("Select the photos to see from other angles.")
+        if self.owner.lora_build is not None:
+            return self.status("A LoRA is being built and has the GPU; wait for it.", "err")
+        NewPhotos(self, pics, mode, chosen)
 
     def _primary_path(self, pics):
         if len(pics["sel"]) != 1:
