@@ -110,6 +110,11 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
   Direct mode: `_toggle_direct`, `_direct_turn`.
 - **Add-ons** - `apps/opencode/codeaddons.py` (records, `config`, MCP registry / npm / skills
   search and install) and `apps/opencode/codeaddons_ui.py` (`AddonsWindow`).
+- **Trainer** - `apps/opencode/trainer_mcp.py`: an MCP server for *Claude Code*
+  (`.mcp.json`, "opencode-trainer"), not the app. `t_tasks`/`trouble_in`, `t_task`
+  (`transcript`), `t_diff`, `t_session`, `t_lessons`, `t_keep`/`t_forget` (+ `publish`
+  to `lessons.md`). The window sees its lessons through `Notebook._sync`.
+  Tests: `tests/test_trainer_mcp.py`.
 - **Tests** - `tests/test_opencode.py` (`FakeOpenCode` plays a server),
   `tests/test_codeaddons.py`, `TestElicitation` in `tests/test_mcp.py`.
 

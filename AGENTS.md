@@ -36,6 +36,9 @@ this PC's files and the web instead. Two moving parts:
   `ServerSpec` starts on this PC. It follows each task to the end and puts every step
   OpenCode asks permission for to the *user*, through MCP elicitation. `--list-tools`
   prints its contract. See *The app this window serves*.
+- **`apps/opencode/trainer_mcp.py`** — the trainer's MCP server, for Claude Code (not
+  for the app): reads OpenCode's saved tasks, diffs and sessions, keeps and forgets
+  lessons. See *OpenCode's trainer*.
 - **`apps/opencode/codeaddons.py`** / **`apps/opencode/codeaddons_ui.py`** — OpenCode's Add-ons (MCP
   servers, plugins, skills): the records and catalogs, and the window. See *OpenCode's
   Add-ons*.
@@ -1498,6 +1501,35 @@ pill per kind, Installed and Catalog tabs, Turn off, Remove on a second click.
   (`apps.image_studio.addons.catalog.recycle`); a folder the user pointed at is left alone.
 - Threads post back with the window-level `("call", None, fn)` event, which `_handle`
   runs before any tab lookup; a stale answer is dropped by `gen`.
+
+### OpenCode's trainer: Claude Code, from outside the app
+
+The user asked (2026-09-28) for Claude "beside [OpenCode] as a trainer", and then, firmly,
+**not through the API**: he has a Claude plan and will not buy API credits. So the
+trainer is Claude Code itself, in the Claude app, and this repo gives it an MCP server,
+`apps/opencode/trainer_mcp.py`, registered in `.mcp.json` as `opencode-trainer`. Sitter
+says "review the last OpenCode task" or "teach it X" there; Claude reads through the
+server and keeps or forgets lessons. The app calls no model for this, and **nothing
+here may call Anthropic's API** - a first version did (a Trainer menu, a key window),
+and was thrown out for that reason. The community plugins that put a Claude
+subscription inside OpenCode are against Anthropic's terms; do not wire one in.
+
+- **It reads what the window already saves**: the OpenCode tab's task records
+  (`tasks/opencode/*.json` beside the settings - the whole conversation, OpenCode's
+  reports and their "refused: ..." lines), `tasks.json` for what a session changed
+  (its merge commit, or the diff in its worktree), and OpenCode's own session when the
+  server is up. `trainer_tasks` flags trouble per task (`trouble_in`: an unfinished
+  status, a correction, undo/discard, refused steps, failing calls).
+- **It teaches only through the notebook** (`trainer_keep` / `trainer_forget`), with
+  the source `trainer`, which outranks everything but the user's own lessons
+  (`lessons.PRIORITY`). It never forgets a user lesson unless told `user_agreed`.
+  Each change rewrites `lessons.md` in OpenCode's state folder, so OpenCode reads it
+  on its next prompt.
+- **Two processes, one file.** A `Notebook` re-reads its file when it changed on disk
+  since it last read or wrote it (`_sync`, on find/add/remove/ordered). Without it
+  the window, holding its old list, saved over the trainer's lesson on its next add,
+  and never saw the lesson in `fresh()`. With it, a trainer lesson reaches the tab's
+  next request without a restart.
 
 ### The Nodes view: a picture's graph in ComfyUI's own editor
 

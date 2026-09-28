@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "opencode-trainer": {
+      "command": "python",
+      "args": ["apps/opencode/trainer_mcp.py"]
+    }
+  }
+}
