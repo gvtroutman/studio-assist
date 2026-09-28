@@ -1877,14 +1877,10 @@ class ImageStudio:
         top.grid(row=0, column=0, sticky="nsew")
         acts = self.frame(top, "card")
         acts.pack(side="bottom", fill="x", padx=self.px(10), pady=(self.px(4), self.px(10)))
-        self.act_again = self.button(acts, "Repeat seed", self._again_selected, bg="card")
-        self.act_vary = self.button(acts, "New seed", lambda: self._again_selected(True),
-                                    bg="card")
-        self.act_reuse = self.button(acts, "Reuse settings", self._reuse_selected, bg="card")
+        self.act_again = self.button(acts, "Generate again  ▾", self._again_menu, bg="card")
         self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
         self.act_nodes = self.button(acts, "Nodes", self._show_nodes, bg="card")
-        for p in (self.act_again, self.act_vary, self.act_reuse, self.act_fix,
-                  self.act_nodes):
+        for p in (self.act_again, self.act_fix, self.act_nodes):
             p.pack(side="left", padx=(0, self.px(6)))
             p.set(state="disabled")
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
@@ -2217,8 +2213,7 @@ class ImageStudio:
                                 + (" " + error if error else ""))
         else:
             self.act_retry_faces.pack_forget()
-        for p in (self.act_again, self.act_vary, self.act_reuse):
-            p.set(state="normal" if rec or item[0] == "job" else "disabled")
+        self.act_again.set(state="normal" if rec or item[0] == "job" else "disabled")
         self.act_fix.set(state="normal" if path and os.path.isfile(path) else "disabled")
         self.act_nodes.set(state="normal" if self._selected_steps()[0] else "disabled")
 
@@ -2281,6 +2276,17 @@ class ImageStudio:
                 return self.say(str(error), "err")
             self.say("Applying the saved face profiles to the kept picture; no regeneration.", "muted")
             self.host._spawn(self.s.event_id, self._submit, settings)
+
+    def _again_menu(self):
+        """Repeat seed, New seed and Reuse settings, one menu under one
+        button rather than three pills fighting the row for space."""
+        menu = tk.Menu(self.act_again, tearoff=0)
+        self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
+        menu.add_command(label="Repeat seed", command=self._again_selected)
+        menu.add_command(label="New seed", command=lambda: self._again_selected(True))
+        menu.add_command(label="Reuse settings", command=self._reuse_selected)
+        menu.tk_popup(self.act_again.winfo_rootx(),
+                      self.act_again.winfo_rooty() + self.act_again.winfo_height())
 
     def _again_selected(self, new_seed=False):
         rec = self._selected_record()
