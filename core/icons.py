@@ -483,6 +483,135 @@ def icon_png(exe, size=26):
     return out
 
 
+# ------------------------------------------------------- icons the user uploads
+
+UPLOAD_SIDE = 256          # an uploaded icon is kept as one square PNG this size
+DIRECT_LIMIT = 1024 * 1024  # pixels decoded here; a bigger picture Windows shrinks first
+ICO_MAGIC = b"\x00\x00\x01\x00"
+
+# System.Drawing reads JPEG, GIF, BMP, TIFF and every PNG this module cannot
+# (16-bit, interlaced), and shrinks a photo in a blink where `resample` would
+# take a minute in pure Python. The paths come on stdin, so nothing in them
+# needs quoting.
+# Stop, or a file that is no picture sails on through a null image and
+# saves a blank 1x1 PNG, which reads as a successful upload.
+_CONVERT_PS = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$src = [Console]::In.ReadLine(); $dst = [Console]::In.ReadLine()
+$img = [System.Drawing.Image]::FromFile($src)
+$k = [Math]::Min(1.0, SIDE / [Math]::Max($img.Width, $img.Height))
+$w = [Math]::Max(1, [int]($img.Width * $k)); $h = [Math]::Max(1, [int]($img.Height * $k))
+$bmp = New-Object System.Drawing.Bitmap $w, $h, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$g.DrawImage($img, 0, 0, $w, $h)
+$bmp.Save($dst, [System.Drawing.Imaging.ImageFormat]::Png)
+"""
+
+
+def ico_to_rgba(data):
+    """The biggest image in a .ico file -> (rgba, width, height). An .ico is
+    the same directory an exe's RT_GROUP_ICON holds, with file offsets."""
+    count = struct.unpack_from("<H", data, 4)[0]
+    best = None
+    for i in range(count):
+        w, h, _c, _r, _p, _b, size, at = struct.unpack_from("<BBBBHHII", data, 6 + 16 * i)
+        entry = ((w or 256) * (h or 256), at, size)
+        if best is None or entry[0] > best[0]:
+            best = entry
+    if best is None:
+        raise ValueError("an empty .ico")
+    image = data[best[1]:best[1] + best[2]]
+    return png_to_rgba(image) if image[:8] == PNG_MAGIC else dib_to_rgba(image)
+
+
+def _by_windows(path, side):
+    """PNG bytes of any picture Windows can read, fitted inside side x side,
+    or None. Blocks for about a second: off the UI thread."""
+    import subprocess
+    import tempfile
+    import core.procs as procs
+    if os.name != "nt":
+        return None
+    fd, out = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        child = procs.spawn(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             _CONVERT_PS.replace("SIDE", str(int(side)))],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=procs.NO_WINDOW)
+        try:
+            child.proc.communicate(("%s\n%s\n" % (path, out)).encode("utf-8"),
+                                   timeout=60)
+        finally:
+            child.kill()
+        with open(out, "rb") as f:
+            data = f.read()
+        return data if data[:8] == PNG_MAGIC else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+
+
+def squared(rgba, width, height):
+    """The picture centred on a transparent square, never stretched: a wide
+    logo stays wide inside the badge's square."""
+    side = max(width, height)
+    if width == height:
+        return rgba, side
+    out = bytearray(side * side * 4)
+    x0, y0 = (side - width) // 2, (side - height) // 2
+    for y in range(height):
+        at = ((y0 + y) * side + x0) * 4
+        out[at:at + width * 4] = rgba[y * width * 4:(y + 1) * width * 4]
+    return bytes(out), side
+
+
+def upload_png(path):
+    """An uploaded icon, as the square PNG it is kept as: PNG and .ico read
+    here, anything else (and anything big) through Windows. Raises ValueError
+    with the reason when the file is not a picture this can read."""
+    with open(path, "rb") as f:
+        data = f.read()
+    rgba = None
+    try:
+        if data[:4] == ICO_MAGIC:
+            rgba, w, h = ico_to_rgba(data)
+        elif data[:8] == PNG_MAGIC:
+            w, h = struct.unpack_from(">II", data, 16)
+            if w * h <= DIRECT_LIMIT:
+                rgba, w, h = png_to_rgba(data)
+    except (ValueError, KeyError, zlib.error, struct.error, IndexError):
+        rgba = None
+    if rgba is None:
+        converted = _by_windows(path, UPLOAD_SIDE)
+        if not converted:
+            raise ValueError("%s is not a picture Windows can read (PNG, ICO, "
+                             "JPEG, GIF, BMP or TIFF)" % os.path.basename(path))
+        rgba, w, h = png_to_rgba(converted)
+    rgba, side = squared(rgba, w, h)
+    if side > UPLOAD_SIDE:
+        rgba, side = resample(rgba, side, side, UPLOAD_SIDE), UPLOAD_SIDE
+    return png(rgba, side, side)
+
+
+def sized_png(path, size):
+    """A kept upload (`upload_png`'s PNG) at size x size, or None."""
+    try:
+        with open(path, "rb") as f:
+            rgba, w, h = png_to_rgba(f.read())
+        rgba, side = squared(rgba, w, h)
+        return png(resample(rgba, side, side, size), size, size)
+    except (OSError, ValueError, KeyError, zlib.error, struct.error, IndexError):
+        return None
+
+
 def main(argv):
     if len(argv) < 2:
         return "usage: core/icons.py <exe> [out.png] [size]"
