@@ -6268,8 +6268,9 @@ class Chat(tk.Tk):
                 view.insert("end", "  " + lesson["text"] + "\n", "name")
                 view.insert("end", "      %s%s%s\n" % (
                     self._layer_name(s, lesson["text"]) + "  ·  ",
-                    {"user": "you said so", "model": "the model kept it",
-                     "review": "reflected after a task", "error": "a refused call"}[lesson["source"]],
+                    {"user": "you said so", "trainer": "the trainer (Claude) kept it",
+                     "model": "the model kept it", "review": "reflected after a task",
+                     "error": "a refused call"}[lesson["source"]],
                     "  ·  came up %d more time%s" % (lesson["hits"], "" if lesson["hits"] == 1 else "s")
                     if lesson["hits"] else ""), "desc")
         view.config(state="disabled")
