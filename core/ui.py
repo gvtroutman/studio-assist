@@ -25,9 +25,12 @@ DARK = {
     "muted": "#928d86", "faint": "#6b6862", "accent": "#abb899",
     "accent_dk": "#939e84", "accent_fg": "#16150f", "ok": "#5fb87f",
     "warn": "#e0a458", "err": "#e0685c", "sel": "#3d3b37", "code": "#d7d1c9",
-    "asst": "#8fb0c9",
+    "asst": "#8fb0c9", "strip": "#0b0b0a", "strip_hi": "#1e1e1c",
 }
 
+# `strip` is the band the tabs sit in, a step off `bg` so the selected tab -
+# which is `bg`, the page's own colour - reads as part of the page below it;
+# `strip_hi` is an unselected tab under the pointer.
 # Neutral, not warm: a near-white canvas with true white surfaces on it, and the
 # sage as the one colour in the window. The earlier beige greys read as dated.
 # The sage is darkened here: #abb899 itself is too pale to read on white.
@@ -37,7 +40,7 @@ LIGHT = {
     "muted": "#52525b", "faint": "#71717a", "accent": "#636b59",
     "accent_dk": "#565c4c", "accent_fg": "#ffffff", "ok": "#2f7d52",
     "warn": "#96650f", "err": "#b23b30", "sel": "#e4e4ea", "code": "#3f3f46",
-    "asst": "#2c6a91",
+    "asst": "#2c6a91", "strip": "#dfe3da", "strip_hi": "#ebeee7",
 }
 
 THEMES = {"dark": DARK, "light": LIGHT}
@@ -115,6 +118,35 @@ def rounded(canvas, x1, y1, x2, y2, r, **kw):
     # Under a pixel of radius, smoothing only softens the corners into a
     # blur of a bevel; "Square" means square.
     return canvas.create_polygon(pts, smooth=r >= 1, **kw)
+
+
+def tab_flare(r):
+    """How far a browser tab's feet reach past its sides: its corner radius,
+    scaled like every other corner. The canvas a tab is drawn on is this much
+    wider each side than the tab itself."""
+    return int(round(r * ROUNDING))
+
+
+def browser_tab(canvas, x1, y1, x2, y2, r, **kw):
+    """A browser tab: rounded on top, and at the bottom curving outward into
+    the surface under it, so the tab and the page read as one piece. Plotted
+    point by point - a smoothed polygon cannot tell a concave corner from a
+    convex one. `r` is the caller's radius; the feet reach `tab_flare(r)`
+    outside x1..x2, so the canvas has to leave that much room."""
+    r = min(tab_flare(r), (y2 - y1) / 2.0, (x2 - x1) / 2.0)
+    if r < 1:
+        return canvas.create_polygon(x1, y1, x2, y1, x2, y2, x1, y2, **kw)
+    steps = max(4, int(r))
+
+    def arc(cx, cy, a0, a1):
+        return [c for i in range(steps + 1)
+                for c in (cx + r * math.cos(math.radians(a0 + (a1 - a0) * i / steps)),
+                          cy + r * math.sin(math.radians(a0 + (a1 - a0) * i / steps)))]
+    pts = (arc(x1 - r, y2 - r, 90, 0)           # left foot, curving up
+           + arc(x1 + r, y1 + r, 180, 270)      # top left
+           + arc(x2 - r, y1 + r, 270, 360)      # top right
+           + arc(x2 + r, y2 - r, 180, 90))      # right foot, curving out
+    return canvas.create_polygon(pts, **kw)
 
 
 def lifted(canvas, w, h, r, fill, under, tags):
