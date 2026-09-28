@@ -1677,7 +1677,7 @@ class Chat(tk.Tk):
         self.tabbar.pack(side="left", anchor="s", pady=(top, 0))
         self.btn_add = self._glyph(strip, "add", self._tab_menu, bg="strip",
                                    tip="Open a tab for another app")
-        self.btn_add.pack(side="left", padx=(2, 0), pady=(top, 0))
+        self.btn_add.pack(side="left", padx=(8, 0), pady=(top, 0))
         for sid in self.order:
             self._make_tab(sid)
         strip.bind("<Configure>", self._fit_tabs)
@@ -1854,7 +1854,7 @@ class Chat(tk.Tk):
         strip = self.tabbar.master
         # both buttons and the literal paddings _build_tabs packs them with
         avail = (strip.winfo_width() - self.btn_add.winfo_reqwidth()
-                 - self.btn_list.winfo_reqwidth() - 20)
+                 - self.btn_list.winfo_reqwidth() - 26)
         if avail <= 1 or not self.tab_ui:
             return                        # not laid out yet; <Configure> will call back
         # Measured from the parts, not the packed tab: a part's requested width
