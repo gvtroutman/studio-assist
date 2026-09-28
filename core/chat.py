@@ -617,7 +617,7 @@ class Chat(tk.Tk):
         self.marks_px = {"row": self._px(30), "tab": self._px(22),
                          "menu": self._px(18), "hero": self._px(72)}
         self.dot_px = self._px(8)
-        # A tab chip's inset and corner radius. The frame inside it must clear
+        # A tab's inset and corner radius. The frame inside it must clear
         # the curve - a corner of radius r bulges r*(1 - 1/root 2) past the
         # inset, so the pad is comfortably over a third of the radius - and
         # `_fit_tabs` measures against the same pad rather than a literal.
@@ -993,8 +993,10 @@ class Chat(tk.Tk):
         self.composer = composer          # a panel tab has none; _select hides it
         self._build_composer(composer)
 
-        strip = self._skin(tk.Frame(right), bg="bg")
-        strip.pack(side="top", fill="x", padx=14, pady=(10, 6))
+        # Edge to edge, so the band reads as the window's tab strip and the
+        # selected tab can run straight down into the page under it.
+        strip = self._skin(tk.Frame(right), bg="strip")
+        strip.pack(side="top", fill="x")
         self.strip = strip
         self._build_tabs(strip)
 
@@ -1663,75 +1665,167 @@ class Chat(tk.Tk):
     # ---------------------------------------------------------------- tab strip
     def _build_tabs(self, strip):
         self.tab_ui = {}
-        # Tabs live in their own frame so the + button trails them without
-        # having to be re-packed every time a tab opens or closes.
-        self.tabbar = self._skin(tk.Frame(strip), bg="bg")
-        self.tabbar.pack(side="left")
-        self.btn_add = self._glyph(strip, "add", self._tab_menu, bg="bg",
+        # Laid out like a browser's: the open-tabs list at the far left, the
+        # tabs, and + trailing them. Tabs live in their own frame so the +
+        # trails them without being re-packed on every open and close. Both
+        # buttons sit level with the tabs' bodies, which start `top` down.
+        top = self._px(8)
+        self.btn_list = self._glyph(strip, "more", self._open_tabs_menu,
+                                    bg="strip", tip="Go to an open tab")
+        self.btn_list.pack(side="left", padx=(8, 4), pady=(top, 0))
+        self.tabbar = self._skin(tk.Frame(strip), bg="strip")
+        self.tabbar.pack(side="left", anchor="s", pady=(top, 0))
+        self.btn_add = self._glyph(strip, "add", self._tab_menu, bg="strip",
                                    tip="Open a tab for another app")
-        self.btn_add.pack(side="left", padx=(4, 0), pady=(6, 7))
+        self.btn_add.pack(side="left", padx=(2, 0), pady=(top, 0))
         for sid in self.order:
             self._make_tab(sid)
         strip.bind("<Configure>", self._fit_tabs)
 
     def _make_tab(self, sid):
         """
-        A tab is a rounded chip drawn on its own canvas, with the mark, label,
-        dot and close glyph in a frame placed on top of it - the same shape
-        the composer's outline is made with, and for the same reason: a Tk
-        Frame is a rectangle and nothing on it bends.
+        A tab is drawn on its own canvas, with the mark, label, dot and close
+        glyph in a frame placed on top of it - the same way the composer's
+        outline is made, and for the same reason: a Tk Frame is a rectangle
+        and nothing on it bends.
 
-        The frame sits `PAD` inside the curve so its square corners never poke
-        out of it, the canvas follows the frame's requested size, and the
-        active tab's accent bar is drawn rather than packed, inset by the
-        radius so it stays inside the shape.
+        The shape is a browser's: the selected tab is the page's own colour,
+        rounded on top, with feet curving out at the bottom into the page
+        under the strip, so tab and page read as one surface. The others are
+        bare on the strip, split by a hairline, and lift into a paler tab
+        under the pointer. Each canvas is `ui.tab_flare` wider each side than
+        the tab to hold its feet - the selected one only, see `_tab_margin`.
+        The frame sits `PAD` inside the curve so its square corners never
+        poke out of it.
         """
         app = self.sessions[sid].app
         PAD, R = self.tab_pad, self.tab_r
         tab = tk.Canvas(self.tabbar, highlightthickness=0, bd=0, cursor="hand2")
-        self._skin(tab, bg="bg")
-        tab.pack(side="left", padx=(0, 4))
-        inner = self._skin(tk.Frame(tab), bg="bg")
-        item = tab.create_window(PAD, PAD, window=inner, anchor="nw")
+        self._skin(tab, bg="strip")
+        tab.pack(side="left")
+        inner = self._skin(tk.Frame(tab), bg="strip")
+        item = tab.create_window(0, PAD, window=inner, anchor="nw")
         mark = self._mark(inner, self._spec_for(app), self.marks_px["tab"],
-                          bg="bg")
-        mark.pack(side="left")
+                          bg="strip")
+        mark.pack(side="left", padx=(4, 0))
         lbl = tk.Label(inner, font=self.f_ui)
-        self._skin(lbl, bg="bg", fg="muted")
+        self._skin(lbl, bg="strip", fg="muted")
         self._dress(lbl, app.id, app.tab)
         lbl.pack(side="left", padx=(8, 8))
-        dot = self._dot(inner, "faint", bg="bg")
+        dot = self._dot(inner, "faint", bg="strip")
         dot.pack(side="left")
         close = tk.Label(inner, text=self.g["close"], font=self.f_glyph,
                          cursor="hand2", padx=2)
-        self._skin(close, bg="bg", fg="faint")
+        self._skin(close, bg="strip", fg="faint")
         self._glyph_icon(close, "close")
-        close.pack(side="left", padx=(8, 0))
+        close.pack(side="left", padx=(12, 0))
 
         def paint(_ev=None):
+            m = self._tab_margin(sid)
             w = inner.winfo_reqwidth() + 2 * PAD
             h = inner.winfo_reqheight() + 2 * PAD
-            tab.config(width=w, height=h)
+            tab.config(width=w + 2 * m, height=h)
+            tab.coords(item, m + PAD, PAD)
             tab.delete("chip")
-            on = sid == self.active
-            fill = self.C["card" if on else "bg"]
-            rounded(tab, 0, 0, w, h, R, fill=fill, outline=fill, tags="chip")
-            if on:
-                tab.create_line(R, h - self._px(2), w - R, h - self._px(2),
-                                fill=self.C["accent"], width=self._px(2),
-                                capstyle="round", tags="chip")
+            role = self._tab_role(sid)
+            if role == "bg":
+                ui.browser_tab(tab, m, 0, m + w, h, R, fill=self.C[role],
+                               outline=self.C[role], tags="chip")
+            elif role != "strip":         # lit: the tab's body, without feet
+                rounded(tab, m, 0, m + w, h + R, R, fill=self.C[role],
+                        outline=self.C[role], tags="chip")
+            if self._tab_divider(sid):
+                x = w + 2 * m - 1
+                line = blend(self.C["strip"], self.C["muted"], 0.45)
+                tab.create_line(x, h * 0.28, x, h * 0.72, fill=line,
+                                tags="chip")
             tab.tag_lower("chip")
 
         inner.bind("<Configure>", paint)
         self.tab_ui[sid] = {"tab": tab, "label": lbl, "dot": dot, "paint": paint,
                             "close": close, "mark": mark, "compact": False,
-                            "bgs": [inner, lbl, mark, dot, close]}
+                            "hot": False, "bgs": [inner, lbl, mark, dot, close]}
         paint()
         self._hook_click(tab, lambda ev, i=sid: self._select(i))
         # after _hook_click, so the close glyph keeps its own handler
         close.bind("<Button-1>", lambda ev, i=sid: (self._close_tab(i), "break")[1])
+        self._hover_tab(sid)
         self._tip(mark, self._name(app.id, app.name))   # once the label is folded away
+        self._paint_tabs()                # the old last tab grows a hairline
         self._fit_tabs()
+
+    def _tab_margin(self, sid):
+        """Room either side of a tab's body on its canvas. The selected tab
+        needs its feet's worth; the rest only a hairline's gap - seven tabs
+        each carrying feet they never draw would not fold into a small
+        window. `ui.tab_flare` is read live: Corners can change it."""
+        return ui.tab_flare(self.tab_r) if sid == self.active else self._px(2)
+
+    def _tab_role(self, sid):
+        """The colour a tab is filled with: the page's for the selected one,
+        a paler step under the pointer, and none - the strip showing through
+        - for the rest."""
+        if sid == self.active:
+            return "bg"
+        return "strip_hi" if self.tab_ui.get(sid, {}).get("hot") else "strip"
+
+    def _tab_divider(self, sid):
+        """Whether a hairline follows this tab. Not after the last one, and
+        not beside a tab that is filled in - a line against a shape reads as
+        a crack in it rather than a gap between two tabs."""
+        i = self.order.index(sid) if sid in self.order else -1
+        if i < 0 or i + 1 >= len(self.order):
+            return False
+        return (self._tab_role(sid) == "strip"
+                and self._tab_role(self.order[i + 1]) == "strip")
+
+    def _hover_tab(self, sid):
+        """Light a tab under the pointer. <Leave> also fires when the pointer
+        moves onto one of its parts, so check where it went, as `_hover`
+        does; the neighbours are repainted too, for their hairlines."""
+        tab = self.tab_ui[sid]["tab"]
+
+        def set_hot(hot):
+            ui_ = self.tab_ui.get(sid)
+            if ui_ is None or ui_["hot"] == hot:
+                return
+            ui_["hot"] = hot
+            self._paint_tab(sid)
+            self._paint_tabs(chips_only=True)
+
+        def leave(ev):
+            under = tab.winfo_containing(ev.x_root, ev.y_root)
+            while under is not None:
+                if under is tab:
+                    return
+                under = getattr(under, "master", None)
+            set_hot(False)
+
+        for w in [tab] + self.tab_ui[sid]["bgs"]:
+            w.bind("<Enter>", lambda ev: set_hot(True), add="+")
+            w.bind("<Leave>", leave, add="+")
+
+    def _paint_tabs(self, chips_only=False):
+        """Every tab again: a hairline depends on the tab after it, so one
+        tab opening, closing or lighting up changes its neighbour's."""
+        for sid in self.order:
+            if sid in self.tab_ui:
+                if chips_only:
+                    self.tab_ui[sid]["paint"]()
+                else:
+                    self._paint_tab(sid)
+
+    def _open_tabs_menu(self, widget=None):
+        """The list at the strip's left: every open tab, by its full name,
+        for when the strip has folded them down to their marks."""
+        m = self._menu()
+        for sid in self.order:
+            app = self.sessions[sid].app
+            self._menu_item(m, ("• " if sid == self.active else "   ") + app.name,
+                            app.id, lambda i=sid: self._select(i))
+        if not self.order:
+            m.add_command(label="No tabs open", state="disabled")
+        self._popup(m, widget or self.btn_list)
 
     def _compact_tab(self, sid, on):
         """Fold a tab down to its mark and dot, or unfold it. Pack order is
@@ -1740,12 +1834,13 @@ class Chat(tk.Tk):
         if ui["compact"] == on:
             return
         ui["compact"] = on
+        ui["mark"].pack_configure(padx=0 if on else (4, 0))
         if on:
             ui["label"].pack_forget()
             ui["close"].pack_forget()
         else:
             ui["label"].pack(side="left", padx=(8, 8), before=ui["dot"])
-            ui["close"].pack(side="left", padx=(8, 0))
+            ui["close"].pack(side="left", padx=(12, 0))
 
     def _fit_tabs(self, _ev=None):
         """
@@ -1757,21 +1852,24 @@ class Chat(tk.Tk):
         again when there is room. Called on every add, close, select and resize.
         """
         strip = self.tabbar.master
-        avail = strip.winfo_width() - self.btn_add.winfo_reqwidth() - 8
+        # both buttons and the literal paddings _build_tabs packs them with
+        avail = (strip.winfo_width() - self.btn_add.winfo_reqwidth()
+                 - self.btn_list.winfo_reqwidth() - 20)
         if avail <= 1 or not self.tab_ui:
             return                        # not laid out yet; <Configure> will call back
         # Measured from the parts, not the packed tab: a part's requested width
         # is known at once, while the tab's own needs an idle pass - and an idle
         # pass from inside a <Configure> handler re-enters this method.
         # Paddings are the literal ones _make_tab packs with.
-        def labelled(ui):
-            # 4 for the gap the tab is packed with, 16 for the label's own
-            # padding and 8 for the close glyph's - and the chip's inset,
-            # which unlike those scales with the display.
-            return (ui["mark"].winfo_reqwidth() + ui["dot"].winfo_reqwidth()
-                    + ui["label"].winfo_reqwidth() + ui["close"].winfo_reqwidth()
-                    + 2 * self.tab_pad + 28)
-        fold = sum(labelled(ui) for ui in self.tab_ui.values()) > avail
+        def labelled(sid, parts):
+            # 4 before the mark, 16 for the label's own padding and 12 for
+            # the close glyph's - and the tab's inset and margin, which unlike
+            # those scale with the display.
+            return (parts["mark"].winfo_reqwidth() + parts["dot"].winfo_reqwidth()
+                    + parts["label"].winfo_reqwidth()
+                    + parts["close"].winfo_reqwidth()
+                    + 2 * (self.tab_pad + self._tab_margin(sid)) + 32)
+        fold = sum(labelled(*kv) for kv in self.tab_ui.items()) > avail
         for sid in self.tab_ui:
             self._compact_tab(sid, fold and sid != self.active)
 
@@ -1783,12 +1881,13 @@ class Chat(tk.Tk):
         ui = self.tab_ui[sid]
         s = self.sessions[sid]
         on = sid == self.active
+        role = self._tab_role(sid)
         for w in ui["bgs"]:
-            w.config(bg=self.C["card"] if on else self.C["bg"])
+            w.config(bg=self.C[role])
         ui["label"].config(fg=self.C["text"] if on else self.C["muted"])
         ui["close"].config(fg=self.C["muted"] if on else self.C["faint"])
-        ui["paint"]()                     # the chip is drawn, so it is repainted
-        self._pulse_dot(ui["dot"], s.bridge[0], "card" if on else "bg", s.busy)
+        ui["paint"]()                     # the tab is drawn, so it is repainted
+        self._pulse_dot(ui["dot"], s.bridge[0], role, s.busy)
 
     def _menu_tabs(self):
         """Which app to talk to. Every drivable app is offered, and Chat - the
@@ -1846,6 +1945,7 @@ class Chat(tk.Tk):
         if s.terminals is not None:
             s.terminals.release()         # every console back on the desktop
         s.frame.destroy()
+        self._paint_tabs()                # the new last tab loses its hairline
         self._fit_tabs()
         # Shutting an MCP subprocess down can block for a moment; a turn still
         # in flight keeps running and its events are dropped by _handle.
