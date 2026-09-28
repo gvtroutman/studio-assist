@@ -2407,6 +2407,52 @@ screen's DPI, so on this 150% workstation every label is half again as wide whil
 pixels goes through `Chat._px()`, and `_metrics()` sizes the rail against the widest
 row it is actually going to draw. Design at 96dpi, multiply on the way out.
 
+**Corners, text size and icons are Preferences, applied live** (2026-09-28, the user:
+"ui settings to adjust rounding as well as uploading icons for everything ... and
+font scaling"). *Corners* is `ui.ROUNDING`, a factor every `ui.rounded` corner (and
+`_round_off`'s masked picture corners) is multiplied by. Callers still pass their
+designed radius, so nothing else knows about it. Past the caller's own radius it
+stops at half the shape, because a smoothed polygon with a bigger radius folds over
+itself. At 0 the polygon is not smoothed, since smoothing blurs the corner into a
+bevel. `Pill(round=True)` discs are ovals and stay round. `_rounding` is the theme's
+repaint plus `_redraw_marks`, because `_theme` never redraws badges. *Text size*
+(`_scale_fonts`) configures every `tkfont.Font` the window made, plus Tk's named
+fonts that other windows fall back on, to a multiple of the size recorded the first
+time. Configuring a shared `Font` resizes every widget using it in place.
+`_text_size` then re-runs `_metrics` for the rail's width (`side_frame`), repaints
+(pills and chips measure their text) and refits the tab strip. A window that makes
+its own fonts (the Image Studio's emoji) does not follow. Both settings are one of
+`ui.ROUNDINGS` / `ui.TEXT_SIZES` or they fall back to 1.0 (`Prefs`). *Icons*: any
+mark (every tab in `TABS`, bridges added by hand, every rail row) can be replaced by
+an upload. `icons.upload_png` reads PNG and .ico itself and anything else through
+System.Drawing (`_by_windows`, which also shrinks a big PNG before `resample`'s pure
+Python sees it). It centres the picture on a transparent square, never stretching
+it, and keeps a 256 px PNG under `icons/` beside the settings. The file is named by
+its bytes, and the prefs hold only that bare name (a path is dropped). `_read_icons`
+tries the upload first, then the .exe, then the drawn mark, and now reads every tab
+at row size too, since Preferences shows them all at it. The conversion script sets
+`$ErrorActionPreference = 'Stop'`; without it, a file that is not a picture ran on
+through a null image and saved a blank 1x1 PNG, which read as a successful upload.
+The list is its own scrolling window (`_icons_window`), not a section of
+Preferences: its rows made Preferences taller than a laptop screen, and Preferences
+does not resize.
+
+**Buttons take icons too, by label** (the user: "let me upload icons for all buttons as
+well", then "hide text, show text, only show the icon"). A text button's icon is
+keyed `button:<label>`, so the Send of every tab is one upload. A glyph button's is
+keyed `glyph:<name>` (`GLYPH_NAMES`: add, close, pin, unpin, folder, more). Both kinds
+live in the same `icons` pref and folder as the app marks. `Pill.icon` and
+`Pill.show` are class hooks the window sets. `Pill.paint` asks them for the picture
+(the text's line height, drawn before the label) and for `BUTTON_SHOWS`: text, both
+(the default, not saved) or icon. Icon alone drops the words only when there is a
+picture, so no button can be blank. Glyph labels are registered in `glyphs`
+(`_glyph_icon`) and show the picture in place of the character. The pictures are made
+on the UI thread from the kept PNG (`_icon_photo`, cached by key, size and file name).
+They are not read by the icon worker, because a button's size follows the text size.
+`_repaint_buttons` redraws both kinds after an upload, a Reset, a mode change or a
+text-size change. The Icons window lists the labels of the pills alive at the moment
+it opens (`_button_labels`), plus any label that already has an icon.
+
 **Do not remove the startup warm-up.** It looks like a redundant throwaway request.
 It is not: a full tool-schema set took about a minute to prefill cold - seconds, since
 the model loads onto an empty card (see *A model loads onto an empty card*). The warm-up

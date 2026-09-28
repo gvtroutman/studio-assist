@@ -93,11 +93,28 @@ def clip(s, n):
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
+# Preferences > Corners and Text size. Every corner `rounded` draws is scaled
+# by ROUNDING, so one number reshapes the window; the text sizes scale the
+# window's fonts (`Chat._text_size`). Both are chosen from these lists only,
+# which keeps a hand-edited settings file from asking for something silly.
+ROUNDING = 1.0
+ROUNDINGS = [(0.0, "Square"), (0.5, "Subtle"), (1.0, "Standard"), (1.6, "Round")]
+TEXT_SIZES = [(0.9, "Small"), (1.0, "Standard"), (1.15, "Large"), (1.3, "Larger")]
+
+
 def rounded(canvas, x1, y1, x2, y2, r, **kw):
-    """Rounded rectangle - Tk's canvas has no primitive for it."""
+    """Rounded rectangle - Tk's canvas has no primitive for it. The radius is
+    the caller's times ROUNDING; grown past the caller's own, it stops at half
+    the shape, where a smoothed polygon would otherwise fold over itself."""
+    grown = r * ROUNDING
+    if grown > r:
+        grown = min(grown, max(r, min(x2 - x1, y2 - y1) / 2.0))
+    r = grown
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-    return canvas.create_polygon(pts, smooth=True, **kw)
+    # Under a pixel of radius, smoothing only softens the corners into a
+    # blur of a bevel; "Square" means square.
+    return canvas.create_polygon(pts, smooth=r >= 1, **kw)
 
 
 def lifted(canvas, w, h, r, fill, under, tags):
@@ -165,6 +182,11 @@ class Pill(tk.Canvas):
     switch, and `set()` covers what _apply_status used to config() on the
     Button - the text and whether it takes clicks.
     """
+
+    # `icon(label, size)`: the PhotoImage uploaded for buttons with that label,
+    # or None. The window sets it; a pill made without a window draws none.
+    icon = None
+    show = None                           # `show(label)`: "text", "both" or "icon"
 
     def __init__(self, parent, text, command, font, roles, padx=18, pady=6, r=12,
                  anchor="center", round=False, **kw):
@@ -282,7 +304,20 @@ class Pill(tk.Canvas):
             tw = self.font.measure(self.text)
             gap = self.font.measure(" ") if dots else 0
             trail = jump_width(self.font) + gap if dots else 0
-            w = tw + trail + 2 * self.padx
+            # An icon the user uploaded for this label (Preferences > Icons),
+            # the text's height, before the text. Kept on the pill: Tk drops
+            # an image nothing holds a reference to.
+            # `Pill.show(label)` says what to draw: "text", "both" or "icon".
+            # Icon only drops the words, never the picture - a button with no
+            # picture keeps its text whatever it says.
+            show = Pill.show(self.text) if Pill.show else "both"
+            self.image = (Pill.icon(self.text, self.font.metrics("linespace"))
+                          if Pill.icon and show != "text" else None)
+            words = self.text if not (self.image and show == "icon") else ""
+            tw = self.font.measure(words)
+            lead = (self.image.width() + (self.font.measure(" ") if words else 0)
+                    if self.image else 0)
+            w = tw + trail + lead + 2 * self.padx
             h = self.font.metrics("linespace") + 2 * self.pady
             if self.round:
                 # Two circles and the band between them. A smoothed polygon
@@ -298,8 +333,11 @@ class Pill(tk.Canvas):
             else:
                 self.config(width=w, height=h)
                 rounded(self, d, d, w - d, h - d, self.r, fill=fill, outline=fill)
-            left = (w - tw - trail) / 2.0
-            self.create_text(left + tw / 2.0 + d, h / 2 + d, text=self.text,
+            left = (w - tw - trail - lead) / 2.0
+            if self.image:
+                self.create_image(left + d, h / 2 + d, image=self.image, anchor="w")
+                left += lead
+            self.create_text(left + tw / 2.0 + d, h / 2 + d, text=words,
                              font=self.font, fill=ink)
             if dots:
                 size = jump_metrics(self.font)[0]

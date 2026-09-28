@@ -21,6 +21,7 @@ if __package__ in (None, ""):  # run as a script: import from the checkout
     _sys.path[0] = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".."))
 
 import base64
+import hashlib
 import json
 import math
 import logging
@@ -190,6 +191,11 @@ error_log_path = doctor.error_log_path
 log_error = doctor.log_error
 
 
+# What a button with an uploaded icon shows (Preferences > Icons), in the
+# order the choice offers them. Without an icon every button shows its text.
+BUTTON_SHOWS = {"text": "Text", "both": "Both", "icon": "Icon"}
+
+
 class Prefs:
     """
     A small JSON file under %APPDATA%. Best-effort in both directions: a
@@ -197,7 +203,8 @@ class Prefs:
     """
 
     DEFAULTS = {"theme": "dark", "accent": None, "tabs": None, "pinned": [], "hidden": [], "bridges": [],
-                "hold_consoles": True}
+                "hold_consoles": True, "rounding": 1.0, "text_size": 1.0, "icons": {},
+                "button_show": {}}
 
     def __init__(self, path=None):
         self.path = path or settings_path()
@@ -223,6 +230,22 @@ class Prefs:
                               if isinstance(got, list) else [])
         if not isinstance(self.data.get("hold_consoles"), bool):
             self.data["hold_consoles"] = True
+        # Corners and text size are one of Preferences' choices or nothing.
+        for key, choices in (("rounding", ui.ROUNDINGS), ("text_size", ui.TEXT_SIZES)):
+            if self.data.get(key) not in [v for v, _label in choices]:
+                self.data[key] = 1.0
+        # Uploaded icons: icon key -> a file name in the icons folder beside
+        # this file. A bare name only, so a hand edit cannot point elsewhere.
+        got = self.data.get("icons")
+        self.data["icons"] = ({k: v for k, v in got.items()
+                               if isinstance(k, str) and isinstance(v, str)
+                               and v == os.path.basename(v) and v.endswith(".png")}
+                              if isinstance(got, dict) else {})
+        # What a button with an uploaded icon shows: label -> text/both/icon.
+        got = self.data.get("button_show")
+        self.data["button_show"] = ({k: v for k, v in got.items()
+                                     if isinstance(k, str) and v in BUTTON_SHOWS}
+                                    if isinstance(got, dict) else {})
         tabs = self.data.get("tabs")
         self.data["tabs"] = ([x for x in tabs if isinstance(x, str)]
                              if isinstance(tabs, list) else None)
@@ -387,6 +410,7 @@ class Chat(tk.Tk):
                      min(self._px(520), int(sh * 0.9)))
 
         self.prefs = Prefs()
+        ui.ROUNDING = self.prefs.get("rounding")
         self.C = ui.palette(self.prefs.get("theme"), self.prefs.get("accent"))
         self.skin = {}                    # widget -> {tk option: palette role}
         self.dot_role = {}                # canvas -> palette role
@@ -420,6 +444,10 @@ class Chat(tk.Tk):
         self.pills = []                   # every Pill in the window, for _theme
         self.row_role = {}                # rail row canvas -> the role it is drawn in
         self.repaints = []                # (widget, draw) for shapes _theme must redraw
+        self.glyphs = []                  # (label, glyph name), for uploaded icons
+        self.button_photos = {}           # (icon key, size, file) -> PhotoImage or None
+        Pill.icon = self._button_icon     # buttons wear the pictures uploaded for their label
+        Pill.show = self._button_show     # ...as text, both, or the icon alone
         self.closing = False              # set by _quit, so no timer outlives the window
         # Console windows opened outside the app, hidden and held in the
         # Terminal tab (core/consoles.py). Watched from the start, whether
@@ -440,6 +468,7 @@ class Chat(tk.Tk):
         self.active = self.order[0] if self.order else None
 
         self._fonts()
+        self._scale_fonts(self.prefs.get("text_size"))
         self._metrics()
         self._build()
         self._menus()
@@ -536,6 +565,30 @@ class Chat(tk.Tk):
                  "file": 0x2750, "folder": 0x25AD, "closed": 0x203A, "open": 0x02C5}
         self.g = {k: chr(v) for k, v in (mdl2 if have else plain).items()}
 
+    def _scale_fonts(self, k):
+        """Preferences > Text size: every font of the window's, and Tk's own
+        named ones that plain widgets in other windows fall back on, at `k`
+        times the size it was made at. A Font is shared by every widget using
+        it, so configuring it resizes them all where they stand; what was
+        measured against the old size (the rail, pills, chips) `_text_size`
+        lays out again."""
+        if not hasattr(self, "font_base"):
+            fonts = [f for f in vars(self).values() if isinstance(f, tkfont.Font)]
+            for name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont",
+                         "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+                         "TkIconFont", "TkTooltipFont"):
+                try:
+                    fonts.append(tkfont.nametofont(name, root=self))
+                except tk.TclError:
+                    pass
+            self.font_base = [(f, int(f.cget("size"))) for f in fonts]
+        for font, size in self.font_base:
+            if not size:                  # 0 is "the platform's default": leave it
+                continue
+            # Tk's own fonts may be sized in pixels, which it writes negative.
+            grown = max(6, int(round(abs(size) * k)))
+            font.configure(size=-grown if size < 0 else grown)
+
     def _px(self, n):
         """A pixel count designed at 96dpi, in this display's pixels."""
         return int(round(n * self.scale))
@@ -589,11 +642,48 @@ class Chat(tk.Tk):
         # of the session's history of it.
         self.pills = [p for p in self.pills if p.winfo_exists()]
         self.repaints = [(w, d) for w, d in self.repaints if w.winfo_exists()]
+        self.glyphs = [(w, n) for w, n in self.glyphs if w.winfo_exists()]
 
     def _accent(self, colour):
         """Save the accent (None for the theme's own) and repaint with it."""
         self.prefs.set(accent=colour if ui.is_hex(colour) else None)
         self._theme(self.prefs.get("theme"))
+
+    def _rounding(self, k):
+        """Preferences > Corners. `ui.rounded` reads the factor as it draws,
+        so a repaint is all it takes - the theme's repaint, which already
+        reaches every drawn shape, plus the badges, which it leaves alone."""
+        ui.ROUNDING = k
+        self.prefs.set(rounding=k)
+        self._theme(self.prefs.get("theme"))
+        self._redraw_marks()
+
+    def _text_size(self, k):
+        """Preferences > Text size: resize the fonts, then lay out again what
+        was measured against them - the rail's width, and (by the theme's
+        repaint) every pill, chip and field."""
+        self.prefs.set(text_size=k)
+        self._scale_fonts(k)
+        self._metrics()
+        side = getattr(self, "side_frame", None)
+        if side is not None and side.winfo_exists():
+            side.config(width=self.side_w)
+        self._theme(self.prefs.get("theme"))
+        self._repaint_buttons()           # uploaded button pictures, at the new size
+        self._fit_tabs()                  # labels grew or shrank under the strip
+
+    def _redraw_marks(self, key=None):
+        """Draw every app mark again (or only `key`'s): after the corners
+        change, and when an uploaded icon arrives or is taken away."""
+        for k, entries in list(self.marks.items()):
+            if key is not None and k != key:
+                continue
+            for canvas, size, spec in entries:
+                try:
+                    if canvas.winfo_exists():
+                        self._draw_mark(canvas, size, spec)
+                except tk.TclError:
+                    pass
 
     def _theme(self, name):
         if name not in THEMES:
@@ -857,7 +947,7 @@ class Chat(tk.Tk):
         main = self._skin(tk.Frame(self), bg="bg")
         main.pack(side="top", fill="both", expand=True)
 
-        side = tk.Frame(main, width=self.side_w)
+        side = self.side_frame = tk.Frame(main, width=self.side_w)
         self._skin(side, bg="side")
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
@@ -1289,12 +1379,87 @@ class Chat(tk.Tk):
         lbl = tk.Label(parent, text=self.g[name], font=self.f_glyph, cursor="hand2",
                        padx=3)
         self._skin(lbl, bg=bg, fg=fg)
+        self._glyph_icon(lbl, name)
         lbl.bind("<Button-1>", lambda ev: (command(lbl), "break")[1])
         lbl.bind("<Enter>", lambda ev: lbl.config(fg=self.C["text"]))
         lbl.bind("<Leave>", lambda ev: lbl.config(fg=self.C[fg]))
         if tip:
             self._tip(lbl, tip)
         return lbl
+
+    # The one-character buttons, by the name Preferences > Icons lists them
+    # under. Each can wear an uploaded picture in place of its glyph.
+    GLYPH_NAMES = [("add", "Add (+)"), ("close", "Close (x)"), ("pin", "Pin"),
+                   ("unpin", "Unpin"), ("folder", "Attach folder"),
+                   ("more", "More (v)")]
+
+    def _glyph_icon(self, lbl, name):
+        """Show `name`'s uploaded picture on a glyph label instead of its
+        character, or the character when there is none; remembered, so an
+        upload, a Reset or a text size change can do it again."""
+        self.glyphs.append((lbl, name))
+        photo = self._icon_photo("glyph:" + name, self.f_glyph.metrics("linespace"))
+        try:
+            if photo is not None:
+                lbl.config(image=photo, text="")
+            else:
+                lbl.config(image="", text=self.g[name])
+        except tk.TclError:
+            pass
+
+    def _icon_photo(self, key, size):
+        """The PhotoImage uploaded for a button (`button:<label>`) or glyph
+        (`glyph:<name>`) at size x size, or None. Made on the UI thread from
+        the kept 256px PNG and cached by file, so an upload is a new entry
+        and never an old picture; a few dozen milliseconds the first time."""
+        name = self.prefs.get("icons").get(key)
+        if not name or size < 1:
+            return None
+        cache = (key, size, name)
+        if cache not in self.button_photos:
+            data = icons.sized_png(os.path.join(self._icons_dir(), name), size)
+            try:
+                self.button_photos[cache] = data and tk.PhotoImage(
+                    data=base64.b64encode(data).decode("ascii"), master=self)
+            except tk.TclError:
+                self.button_photos[cache] = None
+        return self.button_photos[cache]
+
+    def _button_icon(self, label, size):
+        """`Pill.icon`: every button with this label wears the same picture."""
+        return self._icon_photo("button:" + label.strip(), size) if label else None
+
+    def _button_show(self, label):
+        """`Pill.show`: "text", "both" (the default) or "icon" for this label."""
+        return self.prefs.get("button_show").get((label or "").strip(), "both")
+
+    def _set_button_show(self, label, mode):
+        """Save what buttons with this label show, and redraw them."""
+        got = dict(self.prefs.get("button_show"))
+        if mode == "both":
+            got.pop(label, None)          # the default is not worth a line in the file
+        elif mode in BUTTON_SHOWS:
+            got[label] = mode
+        self.prefs.set(button_show=got)
+        self._repaint_buttons()
+        self._fit_tabs()
+
+    def _repaint_buttons(self):
+        """After an upload, a Reset or a text size change: every pill and
+        glyph drawn again with whatever picture it now has."""
+        self._forget()
+        for pill in self.pills:
+            try:
+                pill.paint(self.C)
+            except tk.TclError:
+                pass
+        live, self.glyphs = self.glyphs, []
+        for lbl, name in live:
+            try:
+                if lbl.winfo_exists():
+                    self._glyph_icon(lbl, name)
+            except tk.TclError:
+                pass
 
     def _tip(self, widget, text):
         """A plain tooltip - these controls are small and their meaning is not
@@ -1431,6 +1596,7 @@ class Chat(tk.Tk):
         close = tk.Label(inner, text=self.g["close"], font=self.f_glyph,
                          cursor="hand2", padx=2)
         self._skin(close, bg="bg", fg="faint")
+        self._glyph_icon(close, "close")
         close.pack(side="left", padx=(8, 0))
 
         def paint(_ev=None):
@@ -1910,6 +2076,7 @@ class Chat(tk.Tk):
         if command:
             more = tk.Label(head, text=self.g["more"], font=self.f_glyph)
             self._skin(more, bg="side", fg="faint")
+            self._glyph_icon(more, "more")
             more.pack(side="left", padx=(6, 0))
             row.config(cursor="hand2")
             self._hook_click(row, lambda ev: command(row))
@@ -2540,6 +2707,33 @@ class Chat(tk.Tk):
         self._repaint_on_theme(swatch, paint_swatch)
         paint_swatch()
 
+        # Corners and text size: one row of choices each, the chosen one in
+        # the accent. Either applies at once, the way the theme cards do.
+        def choices(title, options, pref, apply):
+            self._cap(body, title, bg="bg").pack(fill="x", pady=(22, 8))
+            line = self._skin(tk.Frame(body), bg="bg")
+            line.pack(fill="x")
+            pills = {}
+
+            def light():
+                for value, pill in pills.items():
+                    pill.roles = self.PILL_ROLES[
+                        "accent" if self.prefs.get(pref) == value else "quiet"]
+                    pill.paint(self.C)
+
+            def choose(value):
+                apply(value)
+                light()
+
+            for value, label in options:
+                pills[value] = self._button(line, label, lambda v=value: choose(v))
+                pills[value].pack(side="left", padx=(0, 8))
+            light()
+
+        choices("CORNERS", ui.ROUNDINGS, "rounding", self._rounding)
+        choices("TEXT SIZE", ui.TEXT_SIZES, "text_size", self._text_size)
+        self._icons_section(body, win)
+
         self._cap(body, "SIDEBAR", bg="bg").pack(fill="x", pady=(22, 8))
         count = tk.Label(body, font=self.f_small, anchor="w")
         self._skin(count, bg="bg", fg="faint")
@@ -2730,6 +2924,9 @@ class Chat(tk.Tk):
         rather than under it, which at these radii is indistinguishable from
         the picture having been rounded."""
         c.delete("mask")
+        r = min(r * ui.ROUNDING, w / 2.0, h / 2.0)   # Preferences > Corners
+        if r < 1:
+            return
         bg, steps = self.C["bg"], 10
         for cx, cy, sx, sy in ((0, 0, 1, 1), (w, 0, -1, 1),
                                (w, h, -1, -1), (0, h, 1, -1)):
@@ -3263,23 +3460,306 @@ class Chat(tk.Tk):
         except Exception:
             pass
 
-    def _read_icons(self):
+    def _read_icons(self, only=None, uploaded=None):
         """
         Off the UI thread: an app's icon lives inside its .exe, and a cold read
         of a 500MB Photoshop binary is not something to do while the window is
         trying to open. Badges are drawn until these land.
+
+        An icon the user uploaded (Preferences > Icons) wins over the .exe's,
+        and every tab takes one - Chat and the panel tabs too, which have no
+        .exe and otherwise keep their badge. `only` reads one key's again;
+        `uploaded` is the prefs' icons as the UI thread saw them.
         """
         row, tab, menu, hero = (self.marks_px["row"], self.marks_px["tab"],
                                 self.marks_px["menu"], self.marks_px["hero"])
+        uploaded = dict(self.prefs.get("icons") if uploaded is None else uploaded)
         jobs = [(a["id"] or a["name"], a["exe"], row) for a in self.detected]
-        for app in eng.APPS:
-            exe = app.exe()
-            jobs += [(app.id, exe, tab), (app.id, exe, menu), (app.id, exe, hero)]
+        for app in list(eng.TABS) + list(eng.custom_bridges()):
+            if only is not None and app.id != only:
+                continue
+            exe = app.exe() if app in eng.APPS else None
+            # The row size too: Preferences > Icons shows every tab at it.
+            jobs += [(app.id, exe, s) for s in (row, tab, menu, hero)]
+        done = set()
         for key, exe, size in jobs:
+            if (only is not None and key != only) or (key, size) in done:
+                continue
+            done.add((key, size))
+            custom = uploaded.get(key)
+            data = (icons.sized_png(os.path.join(self._icons_dir(), custom), size)
+                    if custom else None)
             # No .exe (ComfyUI is on the LLM PC): its mark is drawn instead.
-            data = icons.icon_png(exe, size) or icons.drawn_png(key, size)
+            data = data or icons.icon_png(exe, size) or icons.drawn_png(key, size)
             if data:
                 self.q.put(("icon", None, (key, size, data)))
+
+    def _icons_dir(self):
+        return os.path.join(self._data_dir(), "icons")
+
+    def _icon_specs(self):
+        """[(mark spec, name)] for every mark the window can draw: each kind
+        of tab, bridges added by hand, then any app in the rail that is none
+        of those. Preferences > Icons lists them in this order."""
+        out, seen = [], set()
+        for app in list(eng.TABS) + list(eng.custom_bridges()):
+            if app.id not in seen:
+                seen.add(app.id)
+                out.append((self._spec_for(app), app.name))
+        for a in self.detected:
+            key = a["id"] or a["name"]
+            if key not in seen:
+                seen.add(key)
+                out.append(({"key": key, "code": a["code"], "fg": a["fg"],
+                             "bg": a["bg"]}, a["name"]))
+        return out
+
+    def _icons_section(self, body, _prefs):
+        """Preferences > Icons: one line and a button. The list itself is a
+        window of its own - a dozen rows of it made Preferences taller than a
+        laptop's screen, and Preferences does not resize."""
+        self._cap(body, "ICONS", bg="bg").pack(fill="x", pady=(22, 8))
+        row = self._skin(tk.Frame(body), bg="bg")
+        row.pack(fill="x")
+        self._button(row, "Change icons...", self._icons_window).pack(side="left")
+        n = tk.Label(row, font=self.f_small, anchor="w")
+        self._skin(n, bg="bg", fg="faint")
+        n.pack(side="left", padx=(10, 0))
+
+        def count():
+            k = len(self.prefs.get("icons"))
+            try:
+                n.config(text="Every app's own icon." if not k else
+                         "%d uploaded icon%s." % (k, "" if k == 1 else "s"))
+            except tk.TclError:
+                pass
+        self.windows["icons_count"] = count
+        count()
+
+    def _button_labels(self):
+        """Every text button's label in the window now (and any that has an
+        icon but is not on screen), once each: an icon is per label, so the
+        Send of every tab is one row."""
+        live = {p.text.strip() for p in self.pills
+                if p.anchor == "center" and p.text.strip() and p.winfo_exists()}
+        kept = {k[len("button:"):] for k in self.prefs.get("icons")
+                if k.startswith("button:")}
+        return sorted(live | kept, key=str.lower)
+
+    def _icons_window(self):
+        """Every app and tab with its mark as drawn now, then every button,
+        each with Upload... to give it a picture and Reset to take it back.
+        Scrolls: with the Image Studio built there are dozens of buttons."""
+        from tkinter import filedialog, messagebox
+        win = self.windows.get("icons")
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        self._forget()
+        labels = self._button_labels()    # before this window adds pills of its own
+        win = tk.Toplevel(self)
+        self.windows["icons"] = win
+        win.title("Icons")
+        win.transient(self)
+        self._skin(win, bg="bg")
+        outer = self._skin(tk.Frame(win), bg="bg")
+        outer.pack(fill="both", expand=True, padx=(22, 6), pady=18)
+        note = tk.Label(outer, font=self.f_small, anchor="w", justify="left",
+                        wraplength=self._px(620),
+                        text="PNG, ICO, JPEG, GIF, BMP or TIFF. Square pictures "
+                             "look best; others are centred, not stretched. A "
+                             "button's picture goes on every button with its label.")
+        self._skin(note, bg="bg", fg="faint")
+        note.pack(fill="x", pady=(0, 10))
+        foot = self._skin(tk.Frame(outer), bg="bg")
+        foot.pack(side="bottom", fill="x")
+        self._button(foot, "Close", win.destroy, kind="accent").pack(
+            anchor="e", pady=(12, 0), padx=(0, 16))
+        scroller = tk.Canvas(outer, highlightthickness=0, bd=0)
+        self._skin(scroller, bg="bg")
+        bar = tk.Scrollbar(outer, orient="vertical", command=scroller.yview)
+        scroller.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        scroller.pack(side="left", fill="both", expand=True)
+        body = self._skin(tk.Frame(scroller), bg="bg")
+        scroller.create_window(0, 0, window=body, anchor="nw")
+
+        def fit(_ev=None):
+            scroller.configure(scrollregion=scroller.bbox("all"),
+                               width=body.winfo_reqwidth())
+        body.bind("<Configure>", fit)
+        wheel = lambda ev: scroller.yview_scroll(int(-ev.delta / 120), "units")
+        win.bind("<MouseWheel>", wheel)
+
+        def counted():
+            if callable(self.windows.get("icons_count")):
+                self.windows["icons_count"]()
+
+        def section(title):
+            self._cap(body, title, bg="bg").pack(fill="x", pady=(0, 6))
+            grid = self._skin(tk.Frame(body), bg="bg")
+            grid.pack(fill="x", pady=(0, 16))
+            return grid
+
+        size = self.marks_px["row"]
+        rows = [(spec["key"], name, spec) for spec, name in self._icon_specs()]
+        rows.append(None)                 # the Buttons heading
+        rows += [("glyph:" + g, label, None) for g, label in self.GLYPH_NAMES]
+        rows += [("button:" + label, label, None) for label in labels]
+        # Apps in two columns; buttons in one, since each also carries the
+        # Text / Both / Icon choice.
+        grid, i, cols = section("APPS AND TABS"), 0, 2
+        for entry in rows:
+            if entry is None:
+                grid, i, cols = section("BUTTONS"), 0, 1
+                continue
+            key, name, spec = entry
+            cell = self._skin(tk.Frame(grid), bg="bg")
+            cell.grid(row=i // cols, column=i % cols, sticky="w", padx=(0, 18), pady=3)
+            i += 1
+            if spec is not None:
+                self._mark(cell, spec, size, bg="bg").pack(side="left")
+                preview = None
+            else:
+                # A button's picture as it will be worn, or its glyph, or
+                # nothing yet: a blank square the size of a mark.
+                preview = tk.Label(cell, font=self.f_glyph, compound="center",
+                                   bd=0, padx=0, pady=0)
+                self._skin(preview, bg="bg", fg="faint")
+                preview.pack(side="left")
+            label = tk.Label(cell, text=clip(name, 22), font=self.f_ui, anchor="w",
+                             width=18)
+            self._skin(label, bg="bg", fg="text")
+            label.pack(side="left", padx=(8, 6))
+            reset = self._button(cell, "Reset", lambda: None, kind="ghost")
+
+            def state(key=key, reset=reset, preview=preview):
+                try:
+                    reset.set(state="normal" if key in self.prefs.get("icons")
+                              else "disabled")
+                    if preview is not None:
+                        photo = self._icon_photo(key, size)
+                        glyph = (self.g.get(key[len("glyph:"):], "")
+                                 if key.startswith("glyph:") else "")
+                        # An empty image of the mark's size keeps an empty
+                        # row as tall as the rest.
+                        preview.config(image=photo or self._blank(size),
+                                       text="" if photo else glyph)
+                except tk.TclError:
+                    pass                  # the window closed while an upload ran
+                counted()
+
+            def upload(key=key, name=name, state=state):
+                path = filedialog.askopenfilename(
+                    parent=win, title="Icon for %s" % name,
+                    filetypes=[("Pictures", "*.png *.ico *.jpg *.jpeg *.gif "
+                                            "*.bmp *.tif *.tiff"),
+                               ("All files", "*.*")])
+                if not path:
+                    return
+
+                def done(error):
+                    if error:
+                        messagebox.showerror("Icon not changed", error,
+                                             parent=win if win.winfo_exists() else self)
+                    state()
+                self._spawn(None, self._upload_icon, key, path, done)
+
+            def forget(key=key, state=state):
+                self._set_icon(key, None)
+                state()
+
+            self._button(cell, "Upload...", upload).pack(side="left")
+            reset.command = forget
+            reset.pack(side="left", padx=(6, 0))
+            if key.startswith("button:"):
+                self._show_choice(cell, key[len("button:"):])
+            state()
+        win.update_idletasks()
+        fit()
+        scroller.configure(height=min(body.winfo_reqheight(),
+                                      int(self.winfo_screenheight() * 0.6)))
+
+    def _show_choice(self, parent, label):
+        """Text / Both / Icon for buttons labelled `label`, the chosen one in
+        the accent. Icon alone still shows the text while there is no icon."""
+        line = self._skin(tk.Frame(parent), bg="bg")
+        line.pack(side="left", padx=(14, 0))
+        pills = {}
+
+        def light():
+            for mode, pill in pills.items():
+                pill.roles = self.PILL_ROLES[
+                    "accent" if self._button_show(label) == mode else "quiet"]
+                pill.paint(self.C)
+
+        def choose(mode):
+            self._set_button_show(label, mode)
+            light()
+
+        for mode, word in BUTTON_SHOWS.items():
+            # Small: three of these per row, beside Upload and Reset.
+            pills[mode] = self._button(line, word, lambda m=mode: choose(m),
+                                       font=self.f_small, padx=10, pady=3)
+            pills[mode].pack(side="left", padx=(0, 4))
+        light()
+        return pills
+
+    def _blank(self, size):
+        """A transparent size x size image: a Label given one is sized in
+        pixels, so a row with no picture yet stands as tall as one with."""
+        key = ("blank", size, 0)
+        if key not in self.photos:
+            self.photos[key] = tk.PhotoImage(width=size, height=size, master=self)
+        return self.photos[key]
+
+    def _upload_icon(self, key, path, done):
+        """Worker: make `path` the icon for `key`. The picture is kept as a
+        square PNG under the icons folder, named by its bytes so a new upload
+        is never mistaken for the old one; `done(error)` runs on the UI thread."""
+        try:
+            data = icons.upload_png(path)
+            name = "%s-%s.png" % (re.sub(r"[^A-Za-z0-9_.-]+", "_", key)[:40],
+                                  hashlib.sha1(data).hexdigest()[:10])
+            os.makedirs(self._icons_dir(), exist_ok=True)
+            with open(os.path.join(self._icons_dir(), name), "wb") as f:
+                f.write(data)
+        except (OSError, ValueError) as e:
+            why = str(e)                  # `e` itself is gone once the block ends
+            self.q.put(("call", None, lambda: done(why)))
+            return
+
+        def keep():
+            self._set_icon(key, name)
+            done(None)
+        self.q.put(("call", None, keep))
+
+    def _set_icon(self, key, name):
+        """Save `key`'s uploaded icon (None to go back to the app's own), put
+        the badge up until the new picture is read, and read it."""
+        got = dict(self.prefs.get("icons"))
+        old = got.pop(key, None)
+        if name:
+            got[key] = name
+        self.prefs.set(icons=got)
+        if old and old != name:
+            try:
+                os.remove(os.path.join(self._icons_dir(), old))
+            except OSError:
+                pass
+        if key.startswith(("button:", "glyph:")):
+            # Drawn by the UI thread from the kept file, not read from an .exe.
+            for k in [k for k in self.button_photos if k[0] == key]:
+                del self.button_photos[k]
+            self._repaint_buttons()
+            return
+        # (icon key, size); the discs' keys are 3-tuples and stay
+        for k in [k for k in self.photos
+                  if isinstance(k, tuple) and len(k) == 2 and k[0] == key]:
+            del self.photos[k]
+        self._redraw_marks(key)
+        self._spawn(None, self._read_icons, key, got)
 
     def _handle(self, kind, sid, payload):
         if kind == "call":

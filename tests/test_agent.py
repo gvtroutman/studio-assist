@@ -1652,6 +1652,56 @@ class TestIcons(unittest.TestCase):
         self.assertEqual(icons.best_entry(group, 26)[0], 48)
         self.assertEqual(icons.best_entry(group, 12)[0], 16)
 
+    def _file(self, data, name):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_an_uploaded_png_is_kept_square_and_not_stretched(self):
+        """A wide logo is centred on a transparent square: its top and bottom
+        rows are empty, and its own pixels survive in the middle."""
+        red = bytes([255, 0, 0, 255]) * (4 * 2)
+        kept = icons.upload_png(self._file(icons.png(red, 4, 2), "wide.png"))
+        rgba, w, h = icons.png_to_rgba(kept)
+        self.assertEqual((w, h), (4, 4))
+        self.assertEqual(rgba[3], 0)                        # row 0: padding
+        self.assertEqual(rgba[4 * 4 + 3], 255)              # row 1: the logo
+        self.assertEqual(rgba[4 * 4:4 * 4 + 4], bytes([255, 0, 0, 255]))
+
+    def test_an_upload_bigger_than_the_kept_size_is_shrunk(self):
+        side = icons.UPLOAD_SIDE * 2
+        big = icons.png(bytes([0, 128, 255, 255]) * (side * side), side, side)
+        rgba, w, h = icons.png_to_rgba(icons.upload_png(self._file(big, "big.png")))
+        self.assertEqual((w, h), (icons.UPLOAD_SIDE, icons.UPLOAD_SIDE))
+        self.assertEqual(rgba[:4], bytes([0, 128, 255, 255]))
+
+    def test_an_ico_upload_takes_its_biggest_image(self):
+        small, large = icons.png(bytes(4 * 4), 2, 2), icons.png(bytes([9, 9, 9, 255]) * 16, 4, 4)
+        head = struct.pack("<HHH", 0, 1, 2)
+        at = 6 + 16 * 2
+        entries = (struct.pack("<BBBBHHII", 2, 2, 0, 0, 1, 32, len(small), at)
+                   + struct.pack("<BBBBHHII", 4, 4, 0, 0, 1, 32, len(large),
+                                 at + len(small)))
+        path = self._file(head + entries + small + large, "app.ico")
+        rgba, w, h = icons.png_to_rgba(icons.upload_png(path))
+        self.assertEqual((w, h), (4, 4))
+        self.assertEqual(rgba[:4], bytes([9, 9, 9, 255]))
+
+    def test_a_file_that_is_no_picture_says_so(self):
+        with self.assertRaises(ValueError):
+            icons.upload_png(self._file(b"not a picture at all", "notes.png"))
+
+    def test_a_kept_upload_comes_back_at_any_size(self):
+        path = self._file(icons.png(bytes([1, 2, 3, 255]) * 16, 4, 4), "k.png")
+        for size in (2, 18, 30):
+            data = icons.sized_png(path, size)
+            with self.subTest(size=size):
+                self.assertEqual(struct.unpack(">II", data[16:24]), (size, size))
+        self.assertIsNone(icons.sized_png(path + ".gone", 30))
+
 
 class TestPrefs(unittest.TestCase):
     """Settings live outside the checkout; nothing here may reach the real one."""
@@ -1701,6 +1751,44 @@ class TestPrefs(unittest.TestCase):
         self.assertEqual(self._prefs().get("accent"), "#2255aa")
         p.set(accent="red; drop")
         self.assertIsNone(self._prefs().get("accent"))
+
+    def test_corners_text_size_and_icons_take_only_what_is_offered(self):
+        p = self._prefs()
+        self.assertEqual((p.get("rounding"), p.get("text_size"), p.get("icons")),
+                         (1.0, 1.0, {}))
+        p.set(rounding=1.6, text_size=1.3, icons={"chat": "chat-1.png"})
+        again = self._prefs()
+        self.assertEqual((again.get("rounding"), again.get("text_size")), (1.6, 1.3))
+        self.assertEqual(again.get("icons"), {"chat": "chat-1.png"})
+        # A hand edit: a size nobody offered, and icons pointing out of the folder.
+        p.set(button_show={"Send": "icon", "Stop": "loud", "Go": "text"})
+        self.assertEqual(self._prefs().get("button_show"), {"Send": "icon", "Go": "text"})
+        p.set(rounding=40, text_size="huge",
+              icons={"chat": r"..\..\secret.png", "ps": "C:/x.png", "ok": "a.png",
+                     "bad": 7})
+        again = self._prefs()
+        self.assertEqual((again.get("rounding"), again.get("text_size")), (1.0, 1.0))
+        self.assertEqual(again.get("icons"), {"ok": "a.png"})
+
+    def test_rounded_scales_its_corner_and_squares_at_zero(self):
+        import tkinter
+        import core.ui as ui
+        if _headless():
+            self.skipTest("no display")
+        root = tkinter.Tk()
+        self.addCleanup(root.destroy)
+        c = tkinter.Canvas(root)
+        real = ui.ROUNDING
+        self.addCleanup(setattr, ui, "ROUNDING", real)
+        ui.ROUNDING = 0.0
+        item = ui.rounded(c, 0, 0, 40, 20, 8)
+        self.assertEqual(c.itemcget(item, "smooth"), "0")
+        self.assertEqual(c.coords(item)[:2], [0.0, 0.0])      # a square corner
+        ui.ROUNDING = 1.6
+        item = ui.rounded(c, 0, 0, 40, 20, 8)
+        self.assertEqual(c.coords(item)[0], 10.0)             # 12.8, stopped at half
+        ui.ROUNDING = 1.0
+        self.assertEqual(c.coords(ui.rounded(c, 0, 0, 40, 20, 8))[0], 8.0)
 
     def test_palette_derives_the_accent_roles(self):
         import core.ui as ui
@@ -1833,7 +1921,8 @@ class TestGui(unittest.TestCase):
         studio_chat.Chat._boot_host = lambda self, *a, **k: None
         cls._real_ensure = studio_chat.Chat._ensure
         studio_chat.Chat._ensure = lambda self, s: None
-        studio_chat.Chat._read_icons = lambda self: None
+        cls._real_read_icons = studio_chat.Chat._read_icons
+        studio_chat.Chat._read_icons = lambda self, *a, **k: None
         # A tab's boot fits the model's window on the host: no host here.
         cls._real_fit = (eng.loaded_instances, eng.fit_model)
         eng.loaded_instances = lambda *a, **k: [("m", 8192)]
@@ -2881,6 +2970,188 @@ class TestGui(unittest.TestCase):
         self.app.update()
         self.assertIn("survives-a-repaint",
                       self.app.sessions[sid].view.get("1.0", "end"))
+
+    def test_text_size_resizes_every_font_and_comes_back(self):
+        import core.ui as ui
+        before = self.app.f_ui.cget("size")
+        self.app._text_size(1.3)
+        self.app.update()
+        self.assertEqual(self.app.f_ui.cget("size"), round(before * 1.3))
+        self.assertEqual(self.app.prefs.get("text_size"), 1.3)
+        self.assertEqual(self.app.side_frame.cget("width"), self.app.side_w)
+        self.app._text_size(1.0)
+        self.app.update()
+        self.assertEqual(self.app.f_ui.cget("size"), before)
+        self.assertIn(1.0, [v for v, _l in ui.TEXT_SIZES])
+
+    def test_corners_repaint_the_live_window_and_keep_transcripts(self):
+        import core.ui as ui
+        sid = self.app.order[0]
+        self.app._handle("sys", sid, "survives-square-corners")
+        self.app._rounding(0.0)
+        self.app.update()
+        self.assertEqual(ui.ROUNDING, 0.0)
+        self.assertEqual(self.app.prefs.get("rounding"), 0.0)
+        self.app._rounding(1.0)
+        self.app.update()
+        self.assertIn("survives-square-corners",
+                      self.app.sessions[sid].view.get("1.0", "end"))
+
+    def _widget_labels(self, win):
+        labels = []
+
+        def walk(w):
+            for child in w.winfo_children():
+                if isinstance(child, self.mod.Pill):
+                    labels.append(child.text)
+                elif isinstance(child, self.mod.tk.Label):
+                    labels.append(child.cget("text"))
+                walk(child)
+        walk(win)
+        return labels
+
+    def test_preferences_offers_corners_text_size_and_every_tabs_icon(self):
+        self.app._prefs_window()
+        self.app.update()
+        win = self.app.windows["prefs"]
+        self.addCleanup(win.destroy)
+        labels = self._widget_labels(win)
+        for want in ("CORNERS", "Square", "Round", "TEXT SIZE", "Larger", "ICONS",
+                     "Change icons..."):
+            self.assertIn(want, labels)
+        self.app._icons_window()
+        self.app.update()
+        icons_win = self.app.windows["icons"]
+        self.addCleanup(icons_win.destroy)
+        labels = self._widget_labels(icons_win)
+        for app in eng.TABS:                  # Chat and the panel tabs too
+            self.assertIn(self.mod.clip(app.name, 22), labels)
+
+    def _keep_icon(self, key):
+        """Upload a small green square as `key`'s icon, synchronously."""
+        import core.icons as icons
+        src = os.path.join(self.dir, "button.png")
+        with open(src, "wb") as f:
+            f.write(icons.png(bytes([0, 200, 0, 255]) * 64, 8, 8))
+        said = []
+        self.app._upload_icon(key, src, said.append)
+        self.app._drain()
+        self.assertEqual(said, [None])
+
+    def test_a_buttons_icon_goes_on_every_button_with_its_label_and_resets(self):
+        pill = next(p for p in self.app.pills
+                    if p.anchor == "center" and p.text.strip() and p.winfo_exists())
+        label = pill.text.strip()
+        self.assertIn(label, self.app._button_labels())
+        width = int(pill.cget("width"))
+        self.assertIsNone(pill.image)
+        self._keep_icon("button:" + label)
+        self.assertIsNotNone(pill.image)
+        self.assertEqual(pill.image.height(), self.app.f_ui.metrics("linespace"))
+        self.assertGreater(int(pill.cget("width")), width)   # room made for it
+        # A pill made afterwards with the same label wears it too.
+        again = self.app._button(self.app, label, lambda: None)
+        self.addCleanup(again.destroy)
+        self.assertIsNotNone(again.image)
+        self.app._set_icon("button:" + label, None)
+        self.assertIsNone(pill.image)
+        self.assertEqual(int(pill.cget("width")), width)
+
+    def test_a_button_shows_text_both_or_only_its_icon(self):
+        pill = self.app._button(self.app, "Show mode probe", lambda: None)
+        self.addCleanup(pill.destroy)
+        texts = lambda: [pill.itemcget(i, "text") for i in pill.find_all()
+                         if pill.type(i) == "text"]
+        # No icon: Icon alone still shows the words, never a blank button.
+        self.app._set_button_show("Show mode probe", "icon")
+        self.assertEqual(texts(), ["Show mode probe"])
+        self._keep_icon("button:Show mode probe")
+        self.assertEqual(texts(), [""])
+        self.assertIsNotNone(pill.image)
+        icon_only = int(pill.cget("width"))
+        self.app._set_button_show("Show mode probe", "both")
+        self.assertEqual(texts(), ["Show mode probe"])
+        self.assertIsNotNone(pill.image)
+        self.assertGreater(int(pill.cget("width")), icon_only)
+        self.app._set_button_show("Show mode probe", "text")
+        self.assertIsNone(pill.image)
+        self.assertEqual(texts(), ["Show mode probe"])
+        # Saved, with the default left out of the file.
+        again = self.mod.Prefs(self.app.prefs.path).get("button_show")
+        self.assertEqual(again.get("Show mode probe"), "text")
+        self.app._set_button_show("Show mode probe", "both")
+        self.assertNotIn("Show mode probe", self.app.prefs.get("button_show"))
+        self.app._set_icon("button:Show mode probe", None)
+
+    def test_the_icons_window_offers_text_both_icon_per_button(self):
+        self.app._icons_window()
+        self.app.update()
+        win = self.app.windows["icons"]
+        self.addCleanup(win.destroy)
+        labels = self._widget_labels(win)
+        self.assertGreaterEqual(labels.count("Icon"), 1)
+        self.assertEqual(labels.count("Text"), labels.count("Both"))
+
+    def test_a_glyph_buttons_icon_replaces_its_character(self):
+        add = self.app.btn_add
+        self.assertEqual(add.cget("text"), self.app.g["add"])
+        self._keep_icon("glyph:add")
+        self.assertEqual(add.cget("text"), "")
+        self.assertTrue(add.cget("image"))
+        self.app._set_icon("glyph:add", None)
+        self.assertEqual(add.cget("text"), self.app.g["add"])
+        self.assertFalse(add.cget("image"))
+
+    def test_the_icons_window_lists_buttons_and_glyphs(self):
+        self.app._icons_window()
+        self.app.update()
+        win = self.app.windows["icons"]
+        self.addCleanup(win.destroy)
+        labels = self._widget_labels(win)
+        for want in ("APPS AND TABS", "BUTTONS", "Add (+)", "Attach folder"):
+            self.assertIn(want, labels)
+        self.assertIn(self.mod.clip("New chat", 22), labels) if any(
+            p.text == "New chat" for p in self.app.pills) else None
+
+    def test_an_upload_that_is_no_picture_is_said_and_changes_nothing(self):
+        src = os.path.join(self.dir, "notes.png")
+        with open(src, "wb") as f:
+            f.write(b"not a picture")
+        before = dict(self.app.prefs.get("icons"))
+        said = []
+        self.app._upload_icon(eng.CHAT.id, src, said.append)
+        self.app._drain()
+        self.assertEqual(len(said), 1)
+        self.assertIn("notes.png", said[0])
+        self.assertEqual(self.app.prefs.get("icons"), before)
+
+    def test_an_uploaded_icon_replaces_the_mark_and_reset_takes_it_back(self):
+        import core.icons as icons
+        chat = eng.CHAT.id
+        src = os.path.join(self.dir, "mine.png")
+        with open(src, "wb") as f:
+            f.write(icons.png(bytes([0, 200, 0, 255]) * 64, 8, 8))
+        # The real reader, synchronously, instead of the class's stub.
+        self.app._spawn = lambda sid, fn, *a: fn(*a)
+        real = type(self)._real_read_icons    # through the class: a plain function
+        self.app._read_icons = lambda *a: real(self.app, *a)
+        self.addCleanup(self.app.__dict__.pop, "_spawn", None)
+        self.addCleanup(self.app.__dict__.pop, "_read_icons", None)
+        errors = []
+        self.app._upload_icon(chat, src, errors.append)
+        self.app._drain()                 # the kept file, then the icons it read
+        self.app._drain()
+        self.assertEqual(errors, [None])
+        name = self.app.prefs.get("icons")[chat]
+        kept = os.path.join(self.app._icons_dir(), name)
+        self.assertTrue(os.path.isfile(kept))
+        tab = self.app.marks_px["tab"]
+        self.assertIn((chat, tab), self.app.photos)
+        self.app._set_icon(chat, None)
+        self.app._drain()
+        self.assertNotIn(chat, self.app.prefs.get("icons"))
+        self.assertFalse(os.path.exists(kept))
+        self.assertNotIn((chat, tab), self.app.photos)      # the badge again
 
     def test_status_colours_are_roles_not_hex(self):
         """Anything that puts a colour on the queue has to survive a theme
