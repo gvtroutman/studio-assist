@@ -1609,7 +1609,8 @@ def t_read_file(a):
 
 
 def t_search_files(a):
-    """Bounded literal search. Offsets feed directly into the file reader."""
+    """Bounded search: literal by default, or a regex with regex=true. Offsets
+    feed directly into the file reader."""
     base = _base(a)
     root = inside(a.get("path") or "", base)
     if os.path.isfile(root):
@@ -1617,9 +1618,19 @@ def t_search_files(a):
     else:
         rows, partial = list_files(a.get("path") or "", base=base)
         paths = [row.rsplit("  (", 1)[0] for row in rows]
-    needle = a["query"].casefold()
-    if not needle.strip():
+    query = a["query"]
+    if not query.strip():
         raise ValueError("query must contain text")
+    if a.get("regex"):
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError("Invalid regex: %s" % e)
+        needle = None
+        matched = pattern.search
+    else:
+        needle = query.casefold()
+        matched = lambda line: needle in line.casefold()
     out, size, scanned = [], 0, 0
     deadline = time.monotonic() + 3
     for path in paths:
@@ -1641,15 +1652,16 @@ def t_search_files(a):
             continue
         offset = 0
         for line_no, line in enumerate(data.splitlines(keepends=True), 1):
-            if needle in line.casefold():
+            if matched(line):
                 row = "%s:%d start=%d: %s" % (path, line_no, offset, line.strip()[:240])
                 if len(out) >= 40 or size + len(row) + 1 > MAX_FILE_CHARS:
                     return result("Partial search; narrow path or query.\n" + "\n".join(out))
                 out.append(row)
                 size += len(row) + 1
             offset += len(line)
-    hint = (" This is literal search, not regex; try one exact term such as transcript."
-            if not out and any(t in needle for t in (".*", ".+", "\\b", "\\s")) else "")
+    hint = (" This is literal search, not regex; pass regex=true for patterns such as \\bword\\b."
+            if needle is not None and not out
+            and any(t in needle for t in (".*", ".+", "\\b", "\\s")) else "")
     return result(("Partial search; narrow path or query.\n" if partial else "")
                   + ("\n".join(out) or "No matches in the text searched." + hint))
 
@@ -1739,9 +1751,13 @@ TOOLS = [
            "limit": _i("Characters to return; default 6000.", minimum=1, maximum=6000),
            "session_id": SESSION}, ["path"])),
     ("opencode_search_files", t_search_files,
-     "Find literal text (case insensitive) in workspace files. Returns paths, lines and start offsets "
-     "for opencode_read_file. Bounded search reports partial results; narrow path when needed.",
-     _obj({"query": _s("Literal text to find.", minLength=1, maxLength=200),
+     "Find text in workspace files: literal (case insensitive) by default, or a regex with "
+     "regex=true. Returns paths, lines and start offsets for opencode_read_file. Bounded "
+     "search reports partial results; narrow path when needed.",
+     _obj({"query": _s("Literal text, or a regex when regex=true.", minLength=1, maxLength=200),
+           "regex": {"type": "boolean",
+                     "description": "Treat query as a regex (case insensitive) instead of "
+                                    "literal text. Default false."},
            "path": _s("File or subfolder to search. Omit for workspace."),
            "session_id": SESSION}, ["query"])),
     ("opencode_merge", t_merge,

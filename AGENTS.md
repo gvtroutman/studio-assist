@@ -1415,8 +1415,9 @@ picks the same session up. There is no tool that approves anything, and
   an OpenCode permission request.
 - **Workspace reads fit the executor's result budget.** `opencode_read_file`
   returns at most 6000 characters plus a header with the next `start` character
-  offset. `opencode_search_files` does bounded case-insensitive literal search,
-  returning line numbers and offsets for that reader. Search and listing report
+  offset. `opencode_search_files` does bounded case-insensitive search - literal by
+  default, or a regex with `regex=true` - returning line numbers and offsets for
+  that reader. Search and listing report
   partial results when bounded; normal listings/searches skip `.runtime`, `.work` and
   `.studio-attachments` along with dependencies. Explicit paths still work.
 - **Stopping is not evidence of an edit.** A read-only journal says no

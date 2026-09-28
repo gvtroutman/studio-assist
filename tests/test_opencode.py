@@ -561,6 +561,20 @@ class TestOtherTools(Base):
         self.assertIn("def restart_server():", page)
         self.assertTrue(oc.call_tool("opencode_search_files", {"query": "x", "path": "../"})["isError"])
 
+    def test_search_files_supports_regex(self):
+        with open(os.path.join(oc.WORKSPACE, "handlers.py"), "w") as f:
+            f.write("def restart_server():\n    pass\n\n\ndef restart_client():\n    pass\n")
+        literal = self.text(oc.call_tool("opencode_search_files", {"query": "restart_.*("}))
+        self.assertIn("This is literal search, not regex", literal)
+        self.assertIn("No matches", literal)
+        out = self.text(oc.call_tool("opencode_search_files",
+                                     {"query": r"def restart_\w+\(", "regex": True}))
+        self.assertIn("handlers.py:1", out)
+        self.assertIn("handlers.py:5", out)
+        bad = oc.call_tool("opencode_search_files", {"query": "restart_(", "regex": True})
+        self.assertTrue(bad["isError"])
+        self.assertIn("Invalid regex", self.text(bad))
+
     def test_search_and_listing_fit_executor_budget_and_report_partial(self):
         for i in range(150):
             with open(os.path.join(oc.WORKSPACE, "%03d_%s.txt" % (i, "x" * 60)), "w") as f:
