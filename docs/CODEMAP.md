@@ -60,6 +60,9 @@ After Effects and Resolve use outside npm servers.
   is the first diagnostic.
 - **Critic** - `apps/image_studio/critic.py`.
 - **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`, `tools/`.
+  Angles / Breed (new reference photos by FLUX Kontext): `apps/image_studio/breed.py`
+  (`angle_graph`, `breed_graph`, `route`, `run`) under `ui.NewPhotos`, opened by
+  `RecordEditor._new_photos`.
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,
   `scene/pose.py`.
