@@ -3344,7 +3344,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status == "complete")
         w = ui.rows[ui.jobs[0].id]
         self.assertEqual([l.cget("text") for l in w["stages"]],
-                         ["Queued", "Loading", "Sampling", "Decoding", "Complete"])
+                         ["Sampling", "Decoding", "Hand pass", "Complete"])
 
     def test_a_settled_tab_animates_nothing(self):
         s, ui = self.tab()

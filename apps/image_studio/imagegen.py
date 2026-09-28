@@ -4411,6 +4411,7 @@ def route(role, backends, health, has_model=None, load=None):
 # ================================================================ jobs
 
 STATUSES = ("queued", "uploading", "loading", "sampling", "decoding", "running", "refining",
+            "face", "critic", "face_swap", "eyes", "hands", "glasses",
             "complete", "failed", "cancelled")
 FINISHED = ("complete", "failed", "cancelled")
 # The stages a job is shown moving through. "running" and "refining" are what
@@ -4439,6 +4440,30 @@ def stage_of(wf, graph, node_id):
         if any(m in cls for m in marks):
             return stage
     return ""
+
+
+def pipeline_stages(lib, settings):
+    """The stops a job's pipeline strip shows, in the order Generate runs
+    them: the two ComfyUI stages every job goes through, then each optional
+    finishing pass these settings turn on. Queued and loading are left off -
+    obvious, not worth a stop on the strip."""
+    import apps.image_studio.facefusion as facefusion
+    stages = [("sampling", "Sampling")]
+    if faces_of(settings):
+        stages.append(("face", "Face pass"))
+    if settings.get("auto_refine"):
+        stages.append(("critic", "Critic"))
+    stages.append(("decoding", "Decoding"))
+    profiles = facefusion.selected(lib, settings)
+    if profiles:
+        stages.append(("face_swap", "Face swap"))
+        stages.append(("eyes", "Eye pass"))
+    if settings.get("hand_pass", True) is not False:
+        stages.append(("hands", "Hand pass"))
+    if profiles:
+        stages.append(("glasses", "Glasses"))
+    stages.append(("complete", "Complete"))
+    return stages
 
 
 class Job:
@@ -5434,7 +5459,7 @@ class Studio:
         else:
             record = job.record = checkpoint
         job.outputs = list(job.record["images"])
-        say("refining", "Generated picture saved; applying faces")
+        say("face_swap", "Generated picture saved; applying faces")
         try:
             result = self._apply_profiles(job, pictures, profiles, say)
             if job.cancel.is_set():
@@ -5469,7 +5494,7 @@ class Studio:
             for index, profile in enumerate(profiles):
                 if job.cancel.is_set():
                     raise RuntimeError("Face swap cancelled.")
-                say("refining", "Applying %s's face" % profile["name"], None)
+                say("face_swap", "Applying %s's face" % profile["name"], None)
                 options = ({"face_index": index, "face_count": len(profiles)}
                            if len(profiles) > 1 else {})
                 data, report = facefusion.swap(data, profile, stop=job.cancel.is_set, **options)
@@ -5586,7 +5611,8 @@ class Studio:
                 with open(path, "wb") as fh:
                     fh.write(data)
                 image = client.upload_image(path)
-                say("refining", "Finding the %s" % " and ".join(looking), None)
+                say("eyes" if profiles else "hands",
+                    "Finding the %s" % " and ".join(looking), None)
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
                                                    stop=job.cancel.is_set)
@@ -5637,7 +5663,8 @@ class Studio:
                                                            match_tone=tone),
                                        plan.loras, image, crops, oval,
                                        values["filename_prefix"] + tag)
-                    files = self._run_pass(job, client, graph, say, label)
+                    files = self._run_pass(job, client, graph, say, label,
+                                           status=tag.lstrip("_"))
                     if files is None:     # cancelled: keep what is finished
                         break
                     done = files[0]
@@ -6340,7 +6367,7 @@ class Studio:
                                client.upload_image(oval), values["filename_prefix"] + "_faces",
                                faces=faces, pulid_file=pulid,
                                boxes=[boxes[i] for i, _ in pairs])
-            say("refining", "redrawing %d face%s at %d px" % (
+            say("face", "redrawing %d face%s at %d px" % (
                 len(crops), "" if len(crops) == 1 else "s", FACE_EDIT), None)
             pid = client.queue_workflow(graph)
         except (ComfyError, TemplateError, OSError) as e:
@@ -6355,7 +6382,7 @@ class Studio:
                 return
             value, total, nid = data
             face = (nid or "").split("_")[0][2:] if (nid or "").startswith("fc") else "?"
-            say("refining", "redrawing face %s of %d · step %d of %d" % (face, n, value, total),
+            say("face", "redrawing face %s of %d · step %d of %d" % (face, n, value, total),
                 value / float(total))
         watch = client.watch() if hasattr(client, "watch") else None
         try:
@@ -6431,7 +6458,7 @@ class Studio:
             if job.cancel.is_set():
                 stop = "cancelled"
                 break
-            say("refining", "Analyzing result" + ("" if n == 1 else " again") + "...", None)
+            say("critic", "Analyzing result" + ("" if n == 1 else " again") + "...", None)
             try:
                 raw = client.fetch(files[0])
                 result = critic.analyze_generated_image(vision, raw, intent, canonical, refs)
@@ -6458,7 +6485,7 @@ class Studio:
             for action in nxt["actions"]:
                 if job.cancel.is_set():
                     break
-                say("refining", critic.progress_text(action) + "...", None)
+                say("critic", critic.progress_text(action) + "...", None)
                 try:
                     got = self._correct(job, client, plan, values, files, raw, action,
                                         intent, canonical, n, say)
@@ -6550,7 +6577,8 @@ class Studio:
                 fh.write(oval_png())
         graph = face_graph(wf, v, plan.loras, image, crops, client.upload_image(oval),
                            "%s_pass%d_%s" % (values["filename_prefix"], n, kind.lower()))
-        return self._run_pass(job, client, graph, say, critic.progress_text(action))
+        return self._run_pass(job, client, graph, say, critic.progress_text(action),
+                              status="critic")
 
     def _regenerate(self, job, client, prompt, n, say):
         """A new picture from the compiled prompt and a new seed, for a
@@ -6569,14 +6597,14 @@ class Studio:
         v["filename_prefix"] = "ImageStudio/%s_%s_regen%d" % (
             p.workflow.get("id", "job"), job.id, n)
         return self._run_pass(job, client, fill(p.workflow, v, p.loras), say,
-                              "Regenerating the picture")
+                              "Regenerating the picture", status="critic")
 
     def _sam3_of(self, backend):
         inv = self.inventories.get(backend["id"]) or {}
         sam = sorted(c for c in inv.get("checkpoints") or () if SAM3 in c.lower())
         return sam[0] if sam else None
 
-    def _run_pass(self, job, client, graph, say, label):
+    def _run_pass(self, job, client, graph, say, label, status="refining"):
         """Run one refinement graph to its end. -> files, or None if cancelled.
         Raises ComfyError when it ends without a picture."""
         job.passes.append({"label": label, "graph": graph})
@@ -6584,7 +6612,7 @@ class Studio:
 
         def on_event(kind, data):
             if kind == "progress" and data[1]:
-                say("refining", "%s · step %d of %d" % (label, data[0], data[1]),
+                say(status, "%s · step %d of %d" % (label, data[0], data[1]),
                     data[0] / float(data[1]))
         watch = client.watch() if hasattr(client, "watch") else None
         try:
@@ -6627,7 +6655,7 @@ class Studio:
                                     f["filename"], f.get("type") or "output")
             graph = paste_graph(image, faces, values["seed"],
                                 values["filename_prefix"] + "_real")
-            say("refining", "matching each face to its photos", None)
+            say("face", "matching each face to its photos", None)
             pid = client.queue_workflow(graph)
             entry = client.listen_for_progress(pid, lambda *a: None, stop=job.cancel.is_set)
         except (ComfyError, OSError) as e:
@@ -6749,10 +6777,10 @@ class Studio:
             elif kind == "executing":
                 st["node"] = data
                 if data and data.startswith("fd") and data in graph:
-                    say("refining", "finding faces · " + node_name(data), None)
+                    say("face", "finding faces · " + node_name(data), None)
                     return
                 if data in refine:
-                    say("refining", "refining detail · " + node_name(data), None)
+                    say("face", "refining detail · " + node_name(data), None)
                     return
                 stage = stage_of(wf, graph, data)
                 if stage == "sampling" and data not in st["stepped"]:
@@ -6766,7 +6794,7 @@ class Studio:
                 nid = nid or st["node"]
                 st["stepped"].add(nid)
                 if total:
-                    status = "refining" if nid in refine else "sampling"
+                    status = "face" if nid in refine else "sampling"
                     say(status, "step %d of %d · %d%% · %s" % (
                         value, total, round(100.0 * value / total), node_name(nid)),
                         value / float(total))
