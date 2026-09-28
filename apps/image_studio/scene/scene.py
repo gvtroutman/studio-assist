@@ -2728,6 +2728,21 @@ class Poly:
         self.cam, self.nrm = cam, nrm
 
 
+def _bilinear(px, tw, th, uc, vc):
+    """The picture `px` (`tw` x `th`), sampled at continuous texel
+    coordinates (`uc`, `vc`), wrapped and blended across its four neighbours."""
+    uc += 1e6
+    vc += 1e6
+    u0, v0 = int(uc), int(vc)
+    fu, fv = uc - u0, vc - v0
+    i0, i1 = u0 % tw, (u0 + 1) % tw
+    j0, j1 = v0 % th, (v0 + 1) % th
+    p00, p10 = px[j0 * tw + i0], px[j0 * tw + i1]
+    p01, p11 = px[j1 * tw + i0], px[j1 * tw + i1]
+    return bytes(int((p00[k] * (1 - fu) + p10[k] * fu) * (1 - fv) +
+                      (p01[k] * (1 - fu) + p11[k] * fu) * fv) for k in range(3))
+
+
 class TexMap:
     """A picture laid on a plane, as the frame sees it. For pixel (x, y) the
     ray is d = a + b x + c y (unnormalised, frame pixels); it meets the plane
@@ -2754,7 +2769,10 @@ class TexMap:
         buf[row + xa * 3:row + (xb + 1) * 3] = self.span(y, xa, xb)
 
     def span(self, y, xa, xb):
-        """Pixels xa..xb of row y, as RGB bytes."""
+        """Pixels xa..xb of row y, as RGB bytes: bilinear within a mip level
+        and blended between the two levels `spread` falls between, so the
+        floor does not pop between sharp and blurred as it recedes, and a
+        small picture (a flower on grass) does not alias into jagged dots."""
         yc = y + 0.5
         n0, nx = self.n[0] + self.n[2] * yc, self.n[1]
         u0, ux = self.U[0] + self.U[2] * yc, self.U[1]
@@ -2767,13 +2785,23 @@ class TexMap:
             dn = n0 + nx * xc
             t = c / dn if dn else 0.0
             # How many picture pixels this one frame pixel spans, roughly
-            # (further and more edge-on is more): each level is 4x fewer.
+            # (further and more edge-on is more): each level is 4x fewer, so
+            # that count in "levels" is log base 4 of the spread.
             spread = abs(t / dn) * fine if dn else 1e9
-            lv = 0 if spread < 1 else 1 if spread < 4 else 2 if spread < 16 else 3
-            px, tw, th, k = levels[min(lv, top)]
-            i = int((eu + t * (u0 + ux * xc)) * k + 1e6) % tw
-            j = int((ev + t * (v0 + vx * xc)) * k + 1e6) % th
-            out.append(px[j * tw + i])
+            lv = 0.0 if spread < 1 else min(top, math.log(spread, 4))
+            lv0 = int(lv)
+            frac = lv - lv0
+            u = eu + t * (u0 + ux * xc)
+            v = ev + t * (v0 + vx * xc)
+            px0, tw0, th0, s0 = levels[lv0]
+            c0 = _bilinear(px0, tw0, th0, u * s0, v * s0)
+            lv1 = min(top, lv0 + 1)
+            if frac and lv1 != lv0:
+                px1, tw1, th1, s1 = levels[lv1]
+                c1 = _bilinear(px1, tw1, th1, u * s1, v * s1)
+                out.append(bytes(int(c0[i] * (1 - frac) + c1[i] * frac) for i in range(3)))
+            else:
+                out.append(c0)
         return b"".join(out)
 
 
