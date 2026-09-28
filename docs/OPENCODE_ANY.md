@@ -25,5 +25,22 @@ commands that change history; a checkpoint is saved after each task for you.
 4. When finished, say in a few lines which files and functions you changed and what
    the tests reported. If you could not finish, say exactly what is left.
 
-Keep a todo list for tasks with more than two steps, and tick items off as you go -
-your memory of earlier steps may be compacted away, the todo list is not.
+## Asking the user
+When a choice is the user's (which approach, which file, what a name should be),
+ask with the `question` tool - the user sees it as a form. Do not ask in your reply
+text and stop; do not guess. Give 2-4 short option labels, each with a one-line
+description, recommended first; set `multiple` when several can apply. The form
+always has an "own words" box, so no "Other" option. One question per decision;
+batch related ones in one call. Declined means: carry on with the safest choice.
+
+## Microtasks
+For any task with more than two steps, write a todo list FIRST, made of microtasks:
+each one is a single tool call (at most three), names the tool and its exact target,
+and says what "done" is. Tick it off the moment it is done - your memory of earlier
+steps may be compacted away, the todo list is not.
+- Good: "grep `def fit_window` in core/agent.py", "read core/agent.py 2400-2480",
+  "edit fit_window: clamp to 32k", "run python -m unittest tests.test_agent".
+- Bad: "understand the config code", "implement the feature", "fix tests".
+- Only the next few microtasks need to be exact; add more as you learn the code.
+- A microtask that took three calls without finishing is too big: split it.
+- Never repeat a call you already made (same grep, same read range); use its result.
