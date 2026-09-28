@@ -515,7 +515,7 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(identities=[{"id": "sitter", "strength": 0.9}], style="sx70-authentic",
                       scene="At Munich Oktoberfest, raising a stein.", seed=3)
         self.assertEqual(p.errors, [])
-        self.assertTrue(p.prompt.startswith("SITTERPERSON, wearing plain underwear. At Munich Oktoberfest"))
+        self.assertTrue(p.prompt.startswith("SITTERPERSON, wearing clothes suited to the scene. At Munich Oktoberfest"))
         self.assertIn("SX-70 instant film", p.prompt)
         self.assertEqual(p.loras, [("sitter.safetensors", 0.9), ("sx70.safetensors", 0.55)])
         self.assertEqual(p.values["seed"], 3)
@@ -526,7 +526,7 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
                       camera="85mm, shallow depth of field", anatomy=False)
         self.assertEqual(p.errors, [])
         self.assertEqual(p.prompt, "a woman in her 30s, slim build, green eyes, auburn hair, "
-                                   "freckles, wearing plain underwear. On a pier at dusk. "
+                                   "freckles, wearing clothes suited to the scene. On a pier at dusk. "
                                    "85mm, shallow depth of field.")
 
     def test_attributes_keep_their_own_nouns(self):
@@ -593,12 +593,12 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
 
     def test_identity_joins_the_described_person(self):
         p = self.plan(identities=["sitter"], style="none", hair="grey", scene="Reading.")
-        self.assertTrue(p.prompt.startswith("SITTERPERSON, grey hair, wearing plain underwear. Reading."), p.prompt)
+        self.assertTrue(p.prompt.startswith("SITTERPERSON, grey hair, wearing clothes suited to the scene. Reading."), p.prompt)
 
     def test_a_person_alone_is_enough(self):
         p = self.plan(style="none", subject="an old fisherman", anatomy=False)
         self.assertEqual(p.errors, [])
-        self.assertEqual(p.prompt, "an old fisherman, wearing plain underwear.")
+        self.assertEqual(p.prompt, "an old fisherman, wearing clothes suited to the scene.")
 
     def test_nobody_is_left_undressed(self):
         p = self.plan(style="none", subject="a woman", chest_size=2, anatomy=False)
@@ -649,7 +649,7 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
 
     def test_two_people_in_one_picture(self):
         p = self.plan(identities=["sitter", "partner"], scene="Dancing.")
-        self.assertTrue(p.prompt.startswith("SITTERPERSON and PARTNERPERSON, wearing plain underwear. Dancing."))
+        self.assertTrue(p.prompt.startswith("SITTERPERSON and PARTNERPERSON, wearing clothes suited to the scene. Dancing."))
 
     def test_identity_carries_no_style(self):
         p = self.plan(identities=["sitter"], scene="Portrait.", style="none")

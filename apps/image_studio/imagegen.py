@@ -3612,7 +3612,7 @@ PEOPLE = re.compile(r"\b(wom[ae]n|m[ae]n|person|people|girls?|boys?|lady|ladies|
 # What a person wears when nothing names a garment: never nothing. "Natural
 # anatomy" and the chest words alone read to FLUX as undressed. A scene that
 # asks for bare skin gets the floor too; only a named garment replaces it.
-COVERED = "wearing plain underwear"
+COVERED = "wearing clothes suited to the scene"
 GARMENTS = re.compile(
     r"\b(wear(s|ing)?|dressed|clothe[sd]|clothing|outfits?|uniforms?|costumes?|"
     r"(t-?)?shirts?|blouses?|(tank|crop) tops?|sweaters?|jumpers?|hoodies?|cardigans?|vests?|"

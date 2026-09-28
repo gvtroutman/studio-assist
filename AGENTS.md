@@ -679,8 +679,9 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   one. On by default; the form has a switch (`anatomy`).
 - **Nobody is undressed** (`COVERED`, `is_dressed`): a picture with a person in it
   whose form Clothes (top, bottom, outerwear) and scene name no garment (`GARMENTS`)
-  says "wearing plain underwear" after the person. "Natural anatomy" and the chest
-  words alone drew people nude. It is a floor, not a switch: the anatomy switch
+  says "wearing clothes suited to the scene" after the person. "Natural anatomy" and
+  the chest words alone drew people nude; "plain underwear" was tried first and put
+  people in underwear at Oktoberfest. It is a floor, not a switch: the anatomy switch
   does not turn it off, and a scene asking for bare skin still gets it.
 - **Styles are chosen by picture.** The form shows each style as a tile of one cat
   photo in that style (`style_example`): the style's own `example` (a PNG), else
