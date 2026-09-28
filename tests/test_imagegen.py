@@ -452,6 +452,17 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(model="flux-dev", scene="x", loras=[{"id": "sx70", "strength": 0.3}])
         self.assertEqual(p.loras, [("sx70.safetensors", 0.3)])
 
+    def test_an_always_on_loras_trigger_reaches_the_prompt_same_as_a_picked_one(self):
+        lib = self.studio.lib
+        recs = lib.all("loras")
+        for r in recs:
+            if r["id"] == "sx70":
+                r["always"] = True
+                r["trigger"] = "sx70 photo, polaroid frame"
+        lib.save("loras", recs)
+        p = self.plan(model="flux-dev", scene="x")
+        self.assertIn("sx70 photo, polaroid frame", p.prompt)
+
     def test_a_saved_lora_mix_is_a_preset_on_its_built_in(self):
         lib = self.studio.lib
         lib.save("presets", [

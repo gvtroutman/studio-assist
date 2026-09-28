@@ -1200,6 +1200,39 @@ class Chat(tk.Tk):
         self._repaint_on_theme(shell, paint)
         return entry
 
+    def _switch(self, parent, var, command=None, bg="bg"):
+        """A toggle switch bound to a `tk.BooleanVar`: a pill track with a
+        knob that sits at whichever end is on. Drawn rather than a
+        Checkbutton for the same reason `_entry` draws its own outline - a
+        canvas that plotted the palette itself needs `_repaint_on_theme`,
+        not `config()`, to follow a theme switch."""
+        w, h = self._px(34), self._px(18)
+        pad = self._px(2)
+        c = tk.Canvas(parent, width=w, height=h, highlightthickness=0, bd=0,
+                      cursor="hand2")
+        self._skin(c, bg=bg)
+
+        def paint():
+            c.delete("all")
+            on = bool(var.get())
+            track = self.C["accent"] if on else self.C["faint"]
+            rounded(c, 0, 0, w, h, h / 2, fill=track, outline=track)
+            r = h / 2 - pad
+            cx = w - pad - r if on else pad + r
+            c.create_oval(cx - r, pad, cx + r, h - pad, fill=self.C["card"],
+                         outline=self.C["card"])
+
+        def toggle(_ev=None):
+            var.set(not var.get())
+            paint()
+            if command:
+                command()
+
+        c.bind("<Button-1>", toggle)
+        paint()
+        self._repaint_on_theme(c, paint)
+        return c
+
     def _cap(self, parent, text, bg="side"):
         lbl = tk.Label(parent, text=text, font=self.f_cap, anchor="w")
         self._skin(lbl, bg=bg, fg="faint")

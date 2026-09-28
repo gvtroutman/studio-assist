@@ -4168,7 +4168,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if extra:
             parts.append(extra)
     for rec, _, why in stack:
-        if why == "added" and rec["trigger"] and rec["trigger"] not in " ".join(parts):
+        if why in ("added", "always on") and rec["trigger"] and rec["trigger"] not in " ".join(parts):
             parts.append(rec["trigger"])
     p.prompt = ". ".join(x.rstrip(" .") for x in parts if x) + ("." if parts else "")
     if chest_prompt and any(m["why"] == "chest size" for m in p.lora_meta):
