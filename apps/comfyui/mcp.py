@@ -732,6 +732,7 @@ def collect(prompt_id, entry):
     if errors and not files:
         return result("Prompt %s failed: %s" % (prompt_id, "; ".join(errors)), error=True)
     content, lines = [], []
+    was_error = bool(errors)
     for f in files:
         try:
             path, data = fetch(f, prompt_id)
@@ -750,7 +751,7 @@ def collect(prompt_id, entry):
              if lines else "The prompt finished but wrote no output files.")
     if errors:
         text += "\nComfyUI also reported: " + "; ".join(errors)
-    return result(text, images=content)
+    return result(text, images=content, error=was_error)
 
 
 # ----------------------------------------------------------------- the tools
@@ -844,6 +845,12 @@ def t_generate(a):
     if (a.get("face_detail", True) and plan["kind"] == "split" and a.get("wait", True)
             and a.get("batch_size", 1) == 1 and has_sam3()):
         return face_detail(graph, plan, seed, a, recipe, notes)
+    if a.get("face_detail", True):
+        reason = ("no SAM3 checkpoint on this backend" if not has_sam3() else
+                  "batch_size > 1" if a.get("batch_size", 1) != 1 else
+                  "wait is False" if not a.get("wait", True) else
+                  "%s is an all-in-one checkpoint" % plan["label"])
+        notes = list(notes) + ["face detail skipped: %s" % reason]
     return run(graph, a, recipe, notes)
 
 
@@ -1211,7 +1218,7 @@ SWAP_INSTRUCTION = (
     "picture 1's lighting, colours, softness and film grain.")
 
 
-def find_faces(names, prompt="face:8", threshold=0.3):
+def find_faces(names, prompt="face:8", threshold=0.3, timeout=300):
     """SAM3's face boxes and each picture's size, in one quick run: per
     uploaded name, (width, height, [(x, y, w, h), ...]) with the incidental
     faces - a crowd behind the subjects - dropped, left to right."""
@@ -1231,7 +1238,7 @@ def find_faces(names, prompt="face:8", threshold=0.3):
         g[str(n + 3)] = {"class_type": "GetImageSize", "inputs": {"image": [str(n), 0]}}
         g[str(n + 4)] = {"class_type": "PreviewAny", "inputs": {"source": [str(n + 3), 0]}}
         g[str(n + 5)] = {"class_type": "PreviewAny", "inputs": {"source": [str(n + 3), 1]}}
-    entry = wait_for(submit(g), 300)
+    entry = wait_for(submit(g), timeout)
     out = entry.get("outputs") or {}
 
     def text(node):
@@ -1441,7 +1448,8 @@ def t_face_swap(a):
     outside the heads is touched."""
     started = time.monotonic()
     scene, people = input_image(a["image"]), input_image(a["faces"])
-    (sw, sh, targets), (_, _, sources) = find_faces([scene, people])
+    (sw, sh, targets), (_, _, sources) = find_faces(
+        [scene, people], timeout=min(a.get("timeout", DEFAULT_WAIT), MAX_WAIT))
     if not targets:
         return result("No face found in %s." % a["image"], error=True)
     if not sources:
@@ -1454,6 +1462,8 @@ def t_face_swap(a):
             return result("order has %s, but %s has %d face(s)."
                           % (order, a["faces"], len(sources)), error=True)
     pairs = list(zip(targets, sources))
+    order_note = (["order names only %d face(s); the rest of the scene's %d were left alone"
+                   % (len(order), len(targets))] if order and len(order) < len(targets) else [])
     plan = plan_edit(a)
     seed = new_seed(a)
     instruction = SWAP_INSTRUCTION
@@ -1568,7 +1578,7 @@ def t_face_swap(a):
               "%d found in the scene, %d in the faces picture)\n" % (
                   plan["label"], " + " + plan["lora"] if plan["lora"] else "", seed, steps,
                   cfg, len(pairs), len(targets), len(sources)))
-    notes = [vram_note(free, total)] if vram_note(free, total) else []
+    notes = order_note + ([vram_note(free, total)] if vram_note(free, total) else [])
     save = {"class_type": "SaveImage", "inputs": {
         "filename_prefix": a.get("filename_prefix", "StudioFaceSwap"), "images": last}}
     z = photo_finish() if a.get("face_detail", True) else None
@@ -1583,10 +1593,11 @@ def t_face_swap(a):
     # likeness kept - as the face detail pass does for a new picture.
     g["9"] = {"class_type": "PreviewImage", "inputs": {"images": last}}
     entry = wait_for(submit(g), a.get("timeout", DEFAULT_WAIT))
+    stitch_free, _ = gpu_memory()   # SAM3 (the stitch's model) may still be on the card here
     previews = [f for f in (entry.get("outputs") or {}).get("9", {}).get("images", []) or []
                 if f.get("type") == "temp"]
     if not previews:
-        release(free)
+        release(stitch_free)
         return result("The stitch failed: %s" % ("; ".join(status_messages(entry))
                                                 or "no picture came back"), error=True)
     f = previews[0]
@@ -1599,7 +1610,8 @@ def t_face_swap(a):
     g3["9"] = dict(save, inputs=dict(save["inputs"], images=out))
     notes.append("face detail: %d face(s) redrawn with %s at denoise %s"
                  % (len(small), z["label"].split(" (")[0], denoise))
-    return run(g3, dict(a, wait=True), header, notes, started=started, before=(free, total))
+    return run(g3, dict(a, wait=True), header, notes, started=started,
+               before=(stitch_free, total))
 
 
 def t_upscale(a):
@@ -1610,6 +1622,8 @@ def t_upscale(a):
         return result("Upscaling redraws detail with Z-Image, which is not installed on "
                       "ComfyUI.", error=True)
     plan = plan_model({"diffusion_model": photo[0]})
+    if not plan.get("hires"):
+        return result("%s has no detail-pass recipe to upscale with." % plan["label"], error=True)
     seed = new_seed(a)
     g = {}
     model, clip, vae = load_split(g, plan)
@@ -1818,9 +1832,9 @@ TOOLS = [
          "shift": _n("Split model: sampling shift. Default: the family's (3.0 for Z-Image).",
                      minimum=0, maximum=100),
          "width": _i("Pixels, multiple of 16, before the detail pass. Default 1024.",
-                     minimum=64, maximum=4096),
+                     minimum=64, maximum=4096, multipleOf=16),
          "height": _i("Pixels, multiple of 16, before the detail pass. Default 1024.",
-                      minimum=64, maximum=4096),
+                      minimum=64, maximum=4096, multipleOf=16),
          "steps": _i("Sampling steps. Default: the model's recipe (8 for Z-Image Turbo, "
                      "20 for a checkpoint).", minimum=1, maximum=150),
          "cfg": _n("Prompt adherence. Default: the model's recipe (1 for Z-Image Turbo, "
