@@ -23,6 +23,7 @@ import os
 import time
 
 import core.agent as eng
+import core.tablog as tablog
 
 ERROR_LOG = "studio_assistant_error.log"
 LOG_MAX_BYTES = 512 * 1024        # then it rolls over to a single `.1`
@@ -93,8 +94,11 @@ def start_activity_log():
             path, maxBytes=LOG_MAX_BYTES, backupCount=1, encoding="utf-8")
     except OSError:
         return None
+    # `[tab]` is the app id of the tab the line happened in (studio_tablog),
+    # "-" for the window's own: six tabs' calls no longer run together.
+    handler.addFilter(tablog.Stamp())
     handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-5s %(threadName)s %(name)s: %(message)s"))
+        "%(asctime)s %(levelname)-5s [%(tab)s] %(threadName)s %(name)s: %(message)s"))
     logger = logging.getLogger("studio")
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
