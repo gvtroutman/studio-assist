@@ -36,6 +36,7 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 
 try:
     import tkinter as tk
@@ -455,8 +456,17 @@ class Chat(tk.Tk):
         self.repaints = []                # (widget, draw) for shapes _theme must redraw
         self.glyphs = []                  # (label, glyph name), for uploaded icons
         self.button_photos = {}           # (icon key, size, file) -> PhotoImage or None
-        Pill.icon = self._button_icon     # buttons wear the pictures uploaded for their label
-        Pill.show = self._button_show     # ...as text, both, or the icon alone
+        # Buttons wear the pictures uploaded for their label, as text, both
+        # or the icon alone. The hooks hold the window weakly: a class
+        # attribute holding it outright kept a closed window's Tk images
+        # alive until some later moment, when Python could free them on a
+        # worker thread - "Tcl_AsyncDelete: async handler deleted by the
+        # wrong thread", which kills the process.
+        me = weakref.ref(self)
+        Pill.icon = lambda label, size: (me()._button_icon(label, size)
+                                         if me() is not None else None)
+        Pill.show = lambda label: (me()._button_show(label)
+                                   if me() is not None else "both")
         self.closing = False              # set by _quit, so no timer outlives the window
         # Console windows opened outside the app, hidden and held in the
         # Terminal tab (core/consoles.py). Watched from the start, whether

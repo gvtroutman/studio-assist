@@ -3093,6 +3093,16 @@ class TestGui(unittest.TestCase):
         self.assertGreaterEqual(labels.count("Icon"), 1)
         self.assertEqual(labels.count("Text"), labels.count("Both"))
 
+    def test_the_button_hooks_do_not_keep_the_window_alive(self):
+        """A class attribute holding the window outright kept a closed one's
+        Tk images until Python freed them on a worker thread, which kills
+        the process ("Tcl_AsyncDelete ... wrong thread")."""
+        for hook in (self.mod.Pill.icon, self.mod.Pill.show):
+            held = [c.cell_contents for c in (hook.__closure__ or ())]
+            self.assertFalse(any(isinstance(h, self.mod.Chat) for h in held))
+            self.assertIs(getattr(hook, "__self__", None), None)
+        self.assertEqual(self.mod.Pill.show("anything unset"), "both")
+
     def test_a_glyph_buttons_icon_replaces_its_character(self):
         add = self.app.btn_add
         self.assertEqual(add.cget("text"), self.app.g["add"])
