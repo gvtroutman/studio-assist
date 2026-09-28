@@ -43,6 +43,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/toolsmith.py` | 0.4k | Tools the model writes for itself from its own bridge tools | |
 | `core/ui.py` | 0.3k | Palette roles and drawing primitives | |
 | `core/procs.py` | 0.3k | Child processes that die with the parent | |
+| `core/tablog.py` | 0.1k | Each tab's log: records stamped with their tab, last lines kept per tab | `working_for`, `Stamp`, `BOOK`; the window is `Chat._log_window`, fed by `Chat._log_event` |
 | `core/files.py` | 0.1k | Attachments described for a model | |
 | `core/icons.py` | 0.4k | App icons pulled from each program's .exe | |
 | `core/terminals_ui.py`, `core/consoles.py` | | The Terminal tab: consoles found, hidden and mirrored | |
