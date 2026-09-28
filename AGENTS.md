@@ -682,7 +682,11 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   says "wearing clothes suited to the scene" after the person. "Natural anatomy" and
   the chest words alone drew people nude; "plain underwear" was tried first and put
   people in underwear at Oktoberfest. It is a floor, not a switch: the anatomy switch
-  does not turn it off, and a scene asking for bare skin still gets it.
+  does not turn it off, and a scene asking for bare skin still gets it. Every
+  picture with a person also gets `CLOTHED` after the scene, dressed or not: "partner
+  in a swimsuit" after "very full chest" was drawn topless on Z-Image Turbo (CFG 1,
+  so the negative does nothing). The anatomy constants no longer say "anatomically"
+  or "natural anatomy" for the same reason.
 - **Styles are chosen by picture.** The form shows each style as a tile of one cat
   photo in that style (`style_example`): the style's own `example` (a PNG), else
   `style_examples/<id>.png`, else a blank tile with its name. The shipped ones

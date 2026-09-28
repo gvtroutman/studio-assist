@@ -3600,7 +3600,7 @@ ANATOMY = [
      "malformed hands"),
     ("Feet", "two feet", "extra feet, extra legs, missing feet"),
     ("Eyes", "two eyes", "extra eyes, third eye, misaligned eyes"),
-    ("Body", "a proportionate body with natural anatomy",
+    ("Body", "a proportionate body",
      "extra limbs, extra arms, disproportionate body, elongated neck, deformed body"),
 ]
 # A scene with nobody described still gets the constants when it names a person.
@@ -3609,10 +3609,13 @@ PEOPLE = re.compile(r"\b(wom[ae]n|m[ae]n|person|people|girls?|boys?|lady|ladies|
                     r"crowd|dancers?|athletes?|workers?|someone|figure)\b", re.I)
 
 
-# What a person wears when nothing names a garment: never nothing. "Natural
-# anatomy" and the chest words alone read to FLUX as undressed. A scene that
-# asks for bare skin gets the floor too; only a named garment replaces it.
+# What a person wears when nothing names a garment: never nothing. The body
+# and chest words alone read to FLUX as undressed. A scene that asks for bare
+# skin gets the floor too; only a named garment replaces it.
 COVERED = "wearing clothes suited to the scene"
+# ...and said for every person, dressed or not: "in a swimsuit" after "very
+# full chest" was drawn topless on Z-Image Turbo (CFG 1: no negative prompt).
+CLOTHED = "Every person is clothed, the chest fully covered by their clothing or swimwear"
 GARMENTS = re.compile(
     r"\b(wear(s|ing)?|dressed|clothe[sd]|clothing|outfits?|uniforms?|costumes?|"
     r"(t-?)?shirts?|blouses?|(tank|crop) tops?|sweaters?|jumpers?|hoodies?|cardigans?|vests?|"
@@ -3630,7 +3633,7 @@ def is_dressed(settings):
 
 def anatomy_text():
     parts = [pos for _, pos, _ in ANATOMY]
-    return "Anatomically correct: every person has exactly " + _and(parts)
+    return "Drawn correctly: every person has exactly " + _and(parts)
 
 
 def anatomy_negative():
@@ -4136,10 +4139,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     person = person_text(s)
     named = " and ".join(t for t in who if t not in scene)
     posed = bool((s.get("references") or {}).get("pose"))
-    covered = COVERED if has_person(s, bool(idents)) and not is_dressed(s) else ""
+    someone = has_person(s, bool(idents))
+    covered = COVERED if someone and not is_dressed(s) else ""
     parts = [x for x in (view_text(s.get("view"), posed),
                          ", ".join(x for x in (named, person, covered) if x), scene,
-                         _field(s, "camera")) if x]
+                         CLOTHED if someone else "", _field(s, "camera")) if x]
     descriptions = identity_description_text(s, lib, idents)
     parts.extend(descriptions)
     if descriptions:
