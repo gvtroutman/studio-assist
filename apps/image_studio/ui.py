@@ -1880,8 +1880,10 @@ class ImageStudio:
         self.act_again = self.button(acts, "Generate again  ▾", self._again_menu, bg="card")
         self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
         self.act_nodes = self.button(acts, "Nodes", self._show_nodes, bg="card")
+        self.act_again.pack(side="left")
+        self.act_nodes.pack(side="right")
+        self.act_fix.pack(side="right", padx=(0, self.px(6)))
         for p in (self.act_again, self.act_fix, self.act_nodes):
-            p.pack(side="left", padx=(0, self.px(6)))
             p.set(state="disabled")
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
         self.caption.pack(side="bottom", fill="x", padx=self.px(12))
