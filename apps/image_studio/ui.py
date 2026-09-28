@@ -537,9 +537,9 @@ class ImageStudio:
         srow = self.frame(f)
         srow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
         self.button(srow, "Scene Builder…", self.build_scene).pack(
-            side="top", fill="x")
+            side="left", fill="x", expand=True, padx=(0, self.px(4)))
         self.button(srow, "Image library…", self.image_library).pack(
-            side="top", fill="x", pady=(self.px(4), 0))
+            side="left", fill="x", expand=True)
         self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
         # One dropdown for the person, characters and profiles both
