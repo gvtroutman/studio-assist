@@ -88,6 +88,8 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
   `write_config`, `fit_window`, `model_for`), `opencode_config`, `OPENCODE_PERMISSIONS`,
   `OPENCODE_BRIEF` (= `docs/OPENCODE.md`), `own_repo`, `opencode_exe`,
   `OPENCODE_GROUPS`, the `id="opencode"` entry in `APPS`, `OPENCODE_PROMPT`.
+  `OPENCODE_READ_CAP` = `apps/opencode/read_cap.js`, an OpenCode plugin always loaded:
+  a read with no line range on a file over 400 lines gets 400 lines and a grep hint.
   State (config, password, `last_session`, log) in `%LOCALAPPDATA%\StudioAssistant\opencode`.
 - **Bridge** - `apps/opencode/mcp.py`: `t_ask` -> `start_task` (git worktree per
   task, `tasks.json`) -> `prompt` -> `finish` -> `follow` (woken by `Events`, the

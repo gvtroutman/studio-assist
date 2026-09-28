@@ -1081,6 +1081,15 @@ class TestAppRegistry(unittest.TestCase):
         finally:
             (eng.context_window, eng.loaded_instances, eng.unload_model, eng.load_model) = real
 
+    def test_opencode_always_loads_the_read_cap_plugin_beside_the_add_ons(self):
+        self.assertTrue(os.path.isfile(eng.OPENCODE_READ_CAP))
+        mine = "file:///" + eng.OPENCODE_READ_CAP.replace(os.sep, "/")
+        cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"])
+        self.assertEqual(cfg["plugin"], [mine])
+        cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"],
+                                  addons=[{"kind": "plugin", "name": "p", "package": "p@1"}])
+        self.assertEqual(cfg["plugin"], [mine, "p@1"])
+
     def test_on_this_repo_opencode_gets_the_short_brief_not_agents_md(self):
         # AGENTS.md is far larger than the model's window; loaded whole it
         # pushed the task out of OpenCode's memory.

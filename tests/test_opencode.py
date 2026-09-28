@@ -853,5 +853,31 @@ class TestEventsAndContext(Base):
         self.assertIn("compacted this session 1 time", out)
         self.assertEqual(oc.context_report([]), "")
 
+
+class TestTestsFor(unittest.TestCase):
+    def test_changed_files_map_to_their_tests_in_the_packaged_layout(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "tests"))
+        for t in ("mcp", "opencode", "comfy", "comfy_view", "imagegen", "agent", "update"):
+            open(os.path.join(root, "tests", "test_%s.py" % t), "w").close()
+        cases = {
+            "apps/opencode/mcp.py": ["tests.test_opencode"],     # not core's test_mcp
+            "apps/opencode/codeaddons_ui.py": ["tests.test_opencode"],
+            "apps\\opencode\\mcp.py": ["tests.test_opencode"],
+            "apps/comfyui/mcp.py": ["tests.test_comfy"],
+            "apps/comfyui/view.py": ["tests.test_comfy_view"],
+            "apps/image_studio/imagegen.py": ["tests.test_imagegen"],
+            "apps/image_studio/ui.py": ["tests.test_imagegen"],
+            "core/mcp.py": ["tests.test_mcp"],
+            "core/agent.py": ["tests.test_agent"],
+            "studio_update.py": ["tests.test_update"],
+            "tests/test_mcp.py": ["tests.test_mcp"],
+            "core/chat.py": [],
+            "apps/opencode/read_cap.js": [],
+        }
+        for f, want in cases.items():
+            self.assertEqual(oc.tests_for(root, [f]), want, f)
+
 if __name__ == "__main__":
     unittest.main()
