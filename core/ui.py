@@ -22,19 +22,20 @@ import tkinter as tk
 DARK = {
     "bg": "#141413", "side": "#1a1a18", "head": "#1a1a18", "card": "#232321",
     "hover": "#262623", "border": "#302f2c", "text": "#ecebe8",
-    "muted": "#928d86", "faint": "#6b6862", "accent": "#d97757",
-    "accent_dk": "#c26343", "accent_fg": "#16150f", "ok": "#5fb87f",
+    "muted": "#928d86", "faint": "#6b6862", "accent": "#abb899",
+    "accent_dk": "#939e84", "accent_fg": "#16150f", "ok": "#5fb87f",
     "warn": "#e0a458", "err": "#e0685c", "sel": "#3d3b37", "code": "#d7d1c9",
     "asst": "#8fb0c9",
 }
 
 # Neutral, not warm: a near-white canvas with true white surfaces on it, and the
-# orange as the one colour in the window. The earlier beige greys read as dated.
+# sage as the one colour in the window. The earlier beige greys read as dated.
+# The sage is darkened here: #abb899 itself is too pale to read on white.
 LIGHT = {
     "bg": "#f7f7f8", "side": "#ffffff", "head": "#ffffff", "card": "#ffffff",
     "hover": "#efeff1", "border": "#e4e4e7", "text": "#18181b",
-    "muted": "#52525b", "faint": "#71717a", "accent": "#c2582f",
-    "accent_dk": "#a44821", "accent_fg": "#ffffff", "ok": "#2f7d52",
+    "muted": "#52525b", "faint": "#71717a", "accent": "#636b59",
+    "accent_dk": "#565c4c", "accent_fg": "#ffffff", "ok": "#2f7d52",
     "warn": "#96650f", "err": "#b23b30", "sel": "#e4e4ea", "code": "#3f3f46",
     "asst": "#2c6a91",
 }
