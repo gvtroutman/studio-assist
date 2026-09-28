@@ -91,6 +91,7 @@ class MCPClient:
     """
 
     on_elicit = None                      # see __init__
+    on_progress = None                    # f(text): a call's progress, for a UI
     _eliciting = 0
 
     def __init__(self, command, args, quiet=False):
@@ -256,6 +257,11 @@ class MCPClient:
             text = params.get("message") or "%s/%s" % (params.get("progress"),
                                                         params.get("total", "?"))
             log("  [mcp] ... " + str(text)[:200], self.quiet)
+            if self.on_progress is not None:
+                try:
+                    self.on_progress(str(text)[:200])
+                except Exception:
+                    pass                    # a display must not break the call
 
     def initialize(self, timeout=180):
         res = self.request("initialize", timeout=timeout, params={

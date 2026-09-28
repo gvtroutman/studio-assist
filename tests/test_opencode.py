@@ -151,6 +151,8 @@ class FakeOpenCode:
                 return {"id": sid, "parentID": self.sessions[sid].get("parentID")}
             if action == "message":
                 return self.messages[sid]
+            if action == "todo":
+                return getattr(self, "todos", [])
             if action == "prompt_async":
                 if self.error_next:
                     code, body = self.error_next
@@ -580,6 +582,28 @@ class TestOtherTools(Base):
         tasks.validate({"session_id": "ses_1"}, schema["opencode_wait"])
         with self.assertRaises(ValueError):
             tasks.validate({"prompt": "x", "timeout": 5}, schema["opencode_ask"])
+
+
+class TestProgress(Base):
+    def test_todos_are_the_fraction(self):
+        sid = self.fake.route("POST", "/session", b"{}", "")["id"]
+        self.assertIsNone(oc.todo_count(sid))           # no list yet
+        self.fake.todos = [{"content": "a", "status": "completed"},
+                           {"content": "b", "status": "in_progress"},
+                           {"content": "c", "status": "pending"}, "junk"]
+        self.assertEqual(oc.todo_count(sid), (1, 3))
+        self.assertIsNone(oc.todo_count("ses_gone"))    # 404 is not a crash
+
+    def test_line_says_working_or_stuck(self):
+        line = oc.progress_line("busy", (1, 4), 2, 0, 7)
+        self.assertEqual(line, "OpenCode is working; 1/4 to-dos (25%); 2 file(s) changed; "
+                               "last activity 7s ago")
+        stuck = oc.progress_line("busy", None, None, 1, oc.STALL + 5)
+        self.assertIn("1 step(s) decided", stuck)
+        self.assertIn("nothing for 2m 05s - may be stuck", stuck)
+
+    def test_files_changed_outside_a_copy_is_unknown(self):
+        self.assertIsNone(oc.files_changed(None))
 
 
 class TestTheWire(Base):

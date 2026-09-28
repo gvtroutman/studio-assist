@@ -2616,6 +2616,32 @@ class Chat(tk.Tk):
         if makes_a_picture(name):
             self._stage(s)
 
+    def _show_progress(self, s, text):
+        """A bridge's latest progress report beside the dots of the newest
+        call still running - replaced by each report, gone with the dots when
+        the result comes, since it sits inside the row's status range."""
+        if not s.pending:
+            return
+        n = max(s.pending)
+        v = s.view
+        try:
+            v.config(state="normal")
+            old = v.tag_ranges("prog:%d" % n)
+            if old:
+                at = v.index(old[0])
+                v.delete(old[0], old[1])
+            else:
+                status = v.tag_ranges("status:%d" % n)
+                if not status:
+                    return
+                at = v.index(status[1])
+            row = tuple(t for t in v.tag_names("%s-1c" % at) if t != "glyph")
+            v.insert(at, " " + text, row + ("status:%d" % n, "prog:%d" % n))
+        except tk.TclError:
+            pass                          # the transcript was cleared under it
+        finally:
+            v.config(state="disabled")
+
     def _show_result(self, s, payload):
         """The outcome of the latest call of that name still waiting for one:
         the header loses its ellipsis - or gains a word when the call failed -
@@ -3237,6 +3263,9 @@ class Chat(tk.Tk):
             return
         s = self.sessions.get(sid) or self.cur()
 
+        if kind == "progress":
+            self._show_progress(s, payload)
+            return
         if kind == "icon":
             key, size, data = payload
             # PhotoImage has to be built on the UI thread, and something must
@@ -3834,6 +3863,9 @@ class Chat(tk.Tk):
             # What the bridge asks the user - OpenCode's edits, above all -
             # goes to a form in this tab, and the answer straight back.
             mcp.on_elicit = lambda params: self._elicit(s, params)
+            # A long call's progress goes beside its row, so working and stuck
+            # look different.
+            mcp.on_progress = lambda text: self.q.put(("progress", sid, text))
             mcp.initialize(timeout=75)
             allt = mcp.list_tools(timeout=45)
         except Exception as e:

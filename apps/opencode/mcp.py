@@ -68,6 +68,8 @@ POLL = 1.0                   # seconds between looks at a working session
 SETTLE = 2.0                 # a task just handed over may not show as busy yet
 EVENT_WAIT = 5.0             # ... between looks while the event stream is up
 EVENT_TIMEOUT = 90           # a stream silent this long is taken as dropped
+LOOK = 5.0                   # seconds between counting to-dos and changed files
+STALL = 120                  # seconds with no sign of work before progress says "stuck?"
 CONTEXT_HIGH = 80            # % of the window at which the report warns
 TEST_TIMEOUT = 300           # seconds the tests of an ask's changes may run
 MAX_REPLY_CHARS = 6000       # what an ask hands back; the executor caps at 8000
@@ -96,6 +98,7 @@ ROUTES = {
     "question_reply": "/question/{requestID}/reply",
     "question_reject": "/question/{requestID}/reject",
     "diff": "/vcs/diff",
+    "todo": "/session/{sessionID}/todo",
     "events": "/event",
 }
 
@@ -525,6 +528,7 @@ class Events:
     def __init__(self, directory=None):
         self.flag = threading.Event()
         self.alive = False
+        self.last = time.monotonic()      # when the last real event came in
         self.resp = None
         try:
             self.resp = _open(_request(ROUTES["events"], directory=directory), EVENT_TIMEOUT)
@@ -547,6 +551,7 @@ class Events:
                 except (ValueError, AttributeError):
                     kind = ""
                 if kind not in self.QUIET:
+                    self.last = time.monotonic()
                     self.flag.set()
         except Exception:
             pass
@@ -650,6 +655,53 @@ def settle(family, log):
     return n
 
 
+def todo_count(sid, directory=None):
+    """(done, total) of the session's to-do list, or None when it has none -
+    the one real fraction there is for a coding task."""
+    try:
+        items = get_json(route("todo", sessionID=sid), timeout=5, directory=directory)
+    except (OpenCodeError, ValueError):
+        return None
+    items = [t for t in items if isinstance(t, dict)] if isinstance(items, list) else []
+    if not items:
+        return None
+    return (sum(1 for t in items if t.get("status") in ("completed", "cancelled")),
+            len(items))
+
+
+def files_changed(directory):
+    """How many files a task's copy has changed since its last checkpoint;
+    None for a session in the server's own folder."""
+    if not directory:
+        return None
+    try:
+        return len(changed_files(directory))
+    except Exception:
+        return None
+
+
+def _span(seconds):
+    seconds = int(seconds)
+    return "%ds" % seconds if seconds < 60 else "%dm %02ds" % divmod(seconds, 60)
+
+
+def progress_line(state, todos, files, decided, quiet):
+    """The one line the chat shows beside a running ask."""
+    parts = ["OpenCode is " + ("working" if state != "idle" else "finishing")]
+    if todos:
+        done, total = todos
+        parts.append("%d/%d to-dos (%d%%)" % (done, total, 100 * done // total))
+    if files is not None:
+        parts.append("%d file(s) changed" % files)
+    if decided:
+        parts.append("%d step(s) decided" % decided)
+    if quiet >= STALL:
+        parts.append("nothing for %s - may be stuck; Stop ends it" % _span(quiet))
+    else:
+        parts.append("last activity %s ago" % _span(quiet))
+    return "; ".join(parts)
+
+
 def follow(sid, seen, work_limit):
     """Follow session `sid` until it is idle, putting each step it asks about
     to the user. Returns (state, report): state is "done", "stopped" or
@@ -664,6 +716,10 @@ def follow(sid, seen, work_limit):
     started = time.monotonic()
     stopped = None
     idle_polls = 0
+    # What progress shows: the to-do list as n/m, the files changed, and how
+    # long since anything moved - an event, a to-do ticked, a file written -
+    # so a stuck session reads as stuck rather than as endless dots.
+    last_act, next_look, snap = started, 0.0, None
     try:
         while True:
             if studio_mcp.cancelled():
@@ -672,6 +728,7 @@ def follow(sid, seen, work_limit):
             asked = settle(family, log)
             if asked:
                 idle_polls = 0
+                last_act = time.monotonic()  # the user's time is not a stall
                 continue                    # decided; look again before sleeping
             state = (statuses(directory).get(sid) or {}).get("type", "idle")
             if state == "idle":
@@ -681,9 +738,16 @@ def follow(sid, seen, work_limit):
                     break
             else:
                 idle_polls = 0
-            studio_mcp.progress("OpenCode is %s%s" % (
-                "working" if state != "idle" else "finishing",
-                "; %d step(s) decided" % len(log) if log else ""))
+            now = time.monotonic()
+            if now >= next_look:
+                next_look = now + LOOK
+                look = (todo_count(sid, directory), files_changed(directory))
+                if look != snap:
+                    snap, last_act = look, now
+            last_act = max(last_act, events.last)
+            todos, files = snap
+            studio_mcp.progress(progress_line(state, todos, files, len(log), now - last_act),
+                                *(todos or (None, None)))
             events.wait(max(POLL, EVENT_WAIT) if events.alive else POLL)
             worked += time.monotonic() - tick
             if worked > work_limit:
