@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import logging
 import tkinter as tk
 import unittest
 import urllib.error
@@ -4182,6 +4183,102 @@ class TestGui(unittest.TestCase):
                          "100.127.17.38:1234")
         self.assertEqual(self.mod.clip("short", 24), "short")
         self.assertEqual(len(self.mod.clip("x" * 40, 24)), 24)
+
+    # --------------------------------------------------------------- tab logs
+    def _log_texts(self, sid):
+        import core.tablog as tablog
+        return [e["text"] for e in tablog.BOOK.lines(sid)]
+
+    def test_every_tab_keeps_a_log_of_its_own(self):
+        """What a tab is told goes in its own log, a panel tab's too, and in
+        no other tab's - whether the event names the tab or its event id."""
+        for sid in self.app.order:
+            s = self.app.sessions[sid]
+            self.app._handle("sys", s.event_id, "note for %s" % sid)
+            self.app._handle("error", sid, "trouble in %s" % sid)
+        for sid in self.app.order:
+            with self.subTest(tab=sid):
+                texts = self._log_texts(sid)
+                self.assertIn("note for %s" % sid, texts)
+                self.assertIn("trouble in %s" % sid, texts)
+                others = [t for t in texts if t.startswith(("note for", "trouble in"))
+                          and not t.endswith(" " + sid)]
+                self.assertEqual(others, [])
+
+    def test_a_status_is_logged_when_it_changes_not_on_every_event(self):
+        sid = self.app.order[0]
+        before = len(self._log_texts(sid))
+        for _ in range(3):
+            self.app._handle("status", sid, ("rendering a test" + self.mod.ELLIPSIS, "accent", False))
+        self.app._handle("status", sid, ("done testing", "muted", False))
+        new = self._log_texts(sid)[before:]
+        self.assertEqual([t for t in new if t.startswith("status:")],
+                         ["status: rendering a test" + self.mod.ELLIPSIS, "status: done testing"])
+
+    def test_work_a_tab_starts_is_logged_under_that_tab(self):
+        """The engine logs tool calls and model requests knowing nothing of
+        tabs; the thread `_spawn` started for a tab files them there."""
+        sid = self.app.order[1]
+        s = self.app.sessions[sid]
+        self.app._spawn(s.event_id, lambda: logging.getLogger("studio.agent").info(
+            "worker line for %s" % sid))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "worker line for %s" % sid not in self._log_texts(sid):
+            time.sleep(0.02)
+        self.assertIn("worker line for %s" % sid, self._log_texts(sid))
+        self.assertNotIn("worker line for %s" % sid, self._log_texts(self.app.order[0]))
+
+    def test_an_image_job_is_logged_as_its_status_changes(self):
+        import types
+        job = types.SimpleNamespace(id="job12345", status="queued", detail="",
+                                    backend={"name": "5090 Workstation"}, outputs=[],
+                                    elapsed=lambda: 12.0)
+        sid = eng.IMAGE_STUDIO.id
+        before = len(self._log_texts(sid))
+        for status, detail in (("queued", ""), ("sampling", "step 1 of 20"),
+                               ("sampling", "step 2 of 20"), ("failed", "out of memory")):
+            job.status, job.detail = status, detail
+            self.app._log_event(sid, "images", ("job", job))
+        new = [t for t in self._log_texts(sid)[before:] if "job12345" in t]
+        self.assertEqual(new, ["job job12345 on 5090 Workstation: queued",
+                               "job job12345 on 5090 Workstation: sampling",
+                               "job job12345 on 5090 Workstation: failed - out of memory"])
+
+    def test_the_log_window_shows_its_tabs_lines_and_follows_new_ones(self):
+        import core.tablog as tablog
+        sid, other = self.app.order[0], self.app.order[1]
+        self.app._select(sid)
+        tablog.log(sid, "said before the window opened")
+        tablog.log(other, "another tab's business")
+        self.app._drain()
+        self.app._log_window()
+        win = self.app.windows[("log", sid)]
+        view = self.app.log_views[sid]
+        text = view.get("1.0", "end")
+        self.assertIn("said before the window opened", text)
+        self.assertNotIn("another tab's business", text)
+        self.assertIn(self.app.sessions[sid].app.name, win.title())
+        tablog.log(sid, "said while it was open", logging.WARNING)
+        tablog.log(other, "still another tab's")
+        self.app._drain()
+        text = view.get("1.0", "end")
+        self.assertIn("said while it was open", text)
+        self.assertNotIn("still another tab's", text)
+        self.assertIn("warn", view.tag_names(view.search("said while it was open", "1.0")))
+        # Asked again, the same window comes forward rather than a second one.
+        self.app._log_window()
+        self.assertIs(self.app.windows[("log", sid)], win)
+        self.app._theme(self.app.prefs.get("theme"))   # its colours follow the theme
+        self.app.tk.call(win.protocol("WM_DELETE_WINDOW"))
+        self.assertNotIn(sid, self.app.log_views)
+        self.assertFalse(win.winfo_exists())
+
+    def test_the_header_has_a_log_button_for_every_tab(self):
+        for sid in self.app.order:
+            self.app._select(sid)
+            self.app.update()
+            with self.subTest(tab=sid):
+                self.assertTrue(self.app.btn_log.winfo_ismapped())
 
 
 class TestSingleInstance(unittest.TestCase):

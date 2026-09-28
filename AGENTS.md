@@ -2696,6 +2696,28 @@ composer.
   best-effort: a hand-wrecked or unwritable file costs a preference, never the app,
   and everything loaded off disk is re-validated — `"hidden": "nope"` must not hide
   four apps called n, o, p and e.
+- **Every tab has a log of its own** (2026-09-28, the user: "add logs to every tab").
+  The header's **Log** button, File ▸ Log for this tab… and Ctrl+L open a window
+  of the current tab's lines, live (`_log_window`). The lines are the activity
+  log's (`studio_activity.log`), filed by tab: `core.tablog` gives every record a
+  `tab` (`Stamp`), the file prints it as `[app id]` (`-` for the window's own), and
+  `tablog.BOOK` keeps each tab's last `KEEP` lines in memory, so a Log window
+  opened late still shows what came before. A record gets its tab two ways. First,
+  `_log_event` writes each tab's events from `_handle`, the one place every tab's
+  events pass: sys/error lines, calls and results, status and bridge
+  *changes*, replies, questions, a panel tab's notes, an Image Studio job's status
+  changes. Nothing frequent is written (no tokens, step counts or terminal
+  screens). Second, `_guard` runs a tab's worker in `tablog.working_for(tab)`,
+  so `studio.agent`'s tool-call and model-request lines land in the tab that made
+  them without the engine knowing tabs exist. That is a thread-local, and **a
+  thread started inside a tab's work does not inherit it**. `MCPClient` reads
+  `tablog.current()` in `__init__` and re-enters it on its stderr thread, which
+  is how a bridge's stderr (`studio.bridge`) reaches its tab. Before this, that
+  stderr went to a console `pythonw.exe` does not have. Log lines reach an open
+  window through the queue (`("log", tab, entry)`), never from the logging thread
+  to a widget. `BOOK` takes one listener per window, since the tests build
+  several and a second must not silence the first. Tests: `tests/test_tablog.py`,
+  the `tab logs` tests at the end of `TestGui`.
 
 ## Task execution and recovery
 

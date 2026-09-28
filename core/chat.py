@@ -56,6 +56,7 @@ import apps.image_studio.ui as images_ui
 import apps.comfyui.nodes_ui as nodes_ui
 import core.terminals_ui as terminals_ui
 import core.procs as procs
+import core.tablog as tablog
 import core.ui as ui
 import core.icons as icons
 import core.tasks as tasks
@@ -395,9 +396,17 @@ class Chat(tk.Tk):
         self.attachments = []             # file and folder paths waiting in the composer
         self.windows = {}                 # ("tools", app id) / "prefs" -> Toplevel
         self.tool_views = {}              # app id -> that window's Text
+        self.log_views = {}               # app id -> its Log window's Text
+        self.log_seen = {}                # app id -> what its log last said changed
         self.configure(bg=self.C["bg"])
 
         self.q = queue.Queue()
+        # Every tab's log lines, from any thread, reach its Log window through
+        # the pump like every other event. The queue alone is held, not the
+        # window, so a window the tests throw away is not kept alive by it.
+        q = self.q
+        self._on_log_line = lambda tab, entry: q.put(("log", tab, entry))
+        tablog.install(self._on_log_line)
         self.llm = None
         self.model_ids = []               # what the host serves, for per-app picks
         self.vision = None                # eng.Vision, or None when nothing served can see
@@ -629,6 +638,11 @@ class Chat(tk.Tk):
                 self._tool_tags(view)
             else:
                 del self.tool_views[app_id]
+        for app_id, view in list(self.log_views.items()):
+            if view.winfo_exists():
+                self._log_tags(view)
+            else:
+                del self.log_views[app_id]
         self._build_apps()                # rows carry their own hover colours
         for sid in self.order:
             self._paint_tab(sid)
@@ -656,6 +670,8 @@ class Chat(tk.Tk):
         m_file.add_command(label="Chat history...", accelerator="Ctrl+H",
                            command=self._resume_task)
         m_file.add_command(label="Task progress...", command=self._task_progress)
+        m_file.add_command(label="Log for this tab...", accelerator="Ctrl+L",
+                           command=self._log_window)
         m_file.add_command(label="Lessons for this tab...", command=self._lessons_window)
         m_file.add_command(label="About this studio...", command=self._studio_window)
         m_file.add_command(label="New tab...", accelerator="Ctrl+T",
@@ -723,6 +739,7 @@ class Chat(tk.Tk):
         # bindings (Ctrl+T transposes characters) never also fire.
         for seq, fn in (("<Control-n>", self._on_new),
                         ("<Control-h>", self._resume_task),
+                        ("<Control-l>", self._log_window),
                         ("<Control-t>", lambda: self._tab_menu(self.btn_add)),
                         ("<Control-w>", self._close_tab),
                         ("<Control-o>", self._on_attach),
@@ -841,6 +858,9 @@ class Chat(tk.Tk):
         # to them, beside the button that starts the next one.
         self.btn_hist = self._button(head, "History", self._resume_task, bg="head")
         self.btn_hist.pack(side="right", padx=(6, 0))
+        # What this tab has done, live: every tab has one, a panel tab too.
+        self.btn_log = self._button(head, "Log", self._log_window, bg="head")
+        self.btn_log.pack(side="right", padx=(6, 0))
         # What OpenCode is given beyond its own tools; shown on its tab only.
         self.btn_addons = self._button(head, "Add-ons", self._open_code_addons, bg="head")
         self.code_addons = None
@@ -1536,6 +1556,7 @@ class Chat(tk.Tk):
             return
         s = self._session(eng.TABS_BY_ID[app_id])
         self.sessions[app_id] = s
+        tablog.log(app_id, "tab opened")
         self.order.append(app_id)
         self._build_transcript(s)
         self._make_tab(app_id)
@@ -1555,6 +1576,8 @@ class Chat(tk.Tk):
         if s.images is not None and not s.images.can_close():
             return
         self.sessions.pop(sid)
+        tablog.log(sid, "tab closed")
+        self.log_seen.pop(sid, None)      # reopened, its first status is news again
         s.closed = True
         s.cancel.set()
         self.order.remove(sid)
@@ -2997,7 +3020,9 @@ class Chat(tk.Tk):
             self.btn_send.set(state="disabled")
             self.btn_new.set(state="disabled")
             self.btn_hist.set(state="disabled")
+            self.btn_log.set(state="disabled")
             return
+        self.btn_log.set(state="normal")
         text, role, fixable = s.status
         # A status ending in an ellipsis is one still happening, and the dots
         # jump so the window never sits looking stalled while it works. See
@@ -3099,9 +3124,11 @@ class Chat(tk.Tk):
         threading.Thread(target=self._guard, args=(sid, fn) + a, daemon=True).start()
 
     def _guard(self, sid, fn, *a):
-        """No traceback ever reaches the user - it goes to the transcript as prose."""
+        """No traceback ever reaches the user - it goes to the transcript as prose.
+        What the work logs is filed under its tab (studio_tablog)."""
         try:
-            fn(*a)
+            with tablog.working_for(tablog.tab_of(sid)):
+                fn(*a)
         except Exception as e:
             self.q.put(("error", sid, "%s: %s" % (type(e).__name__, e)))
             self.q.put(("trace", sid, traceback.format_exc()))
@@ -3287,12 +3314,19 @@ class Chat(tk.Tk):
             # thread started: the one way such work touches Tk.
             payload()
             return
+        if kind == "log":                 # a line for a tab's Log window, any tab's
+            self._log_line(sid, payload)
+            return
         if isinstance(sid, tuple):
             app_id, generation = sid
             live = self.sessions.get(app_id)
             if live is None or live.generation != generation:
                 return
             sid = app_id
+        try:
+            self._log_event(sid, kind, payload)
+        except Exception:
+            pass                          # the log is a record, never a reason to drop the event
         # A sid of None means "whatever tab the user is looking at" - startup
         # errors from the shared inference host have no app of their own. A sid
         # whose tab has been closed is dropped: a turn still finishing must not
@@ -3454,6 +3488,215 @@ class Chat(tk.Tk):
         # One writer, so the rollover is in one place. A failure to write costs
         # the entry, not the app - the transcript already has it as prose.
         log_error(text)
+
+    # ------------------------------------------------------------- tab logs
+    def _log_event(self, sid, kind, payload):
+        """Every tab's log is written here, from the one place every tab's
+        events pass: what it said, what it called and got back, its status and
+        bridge changing, its errors. A panel tab (Image Studio, Milanote, the
+        Terminal) has no transcript, and this is its record too. Nothing
+        frequent is written - no tokens, no step counts, no screen mirrors -
+        so a tab's log reads as what happened, not as the pump's traffic.
+        What the tab's own threads log (tool calls with their times, model
+        requests, a bridge's stderr) arrives beside these through the thread
+        (`_guard`)."""
+        tab = sid if isinstance(sid, str) else None
+        seen = self.log_seen.setdefault(tab, {})
+
+        def say(text, level=logging.INFO):
+            tablog.log(tab, text, level)
+
+        def changed(key, value):
+            if seen.get(key) == value:
+                return False
+            seen[key] = value
+            return True
+
+        if kind == "status":
+            text, role = payload[0], payload[1]
+            if changed("status", text):
+                say("status: %s" % text, logging.WARNING if role == "err" else logging.INFO)
+        elif kind == "bridge":
+            role, detail = payload
+            detail = " ".join(str(detail).split("\n")[1:]) or str(detail)
+            if changed("bridge", (role, detail)):
+                say("bridge: %s" % detail, logging.WARNING if role == "err" else logging.INFO)
+        elif kind == "sys":
+            say(str(payload).strip())
+        elif kind == "error":
+            say(str(payload).strip(), logging.ERROR)
+        elif kind == "trace":
+            last = (str(payload).strip().splitlines() or [""])[-1]
+            say("%s  (full trace in %s)" % (last, doctor.ERROR_LOG), logging.ERROR)
+        elif kind == "roadmap":
+            say("plan: %s" % roadmap_text(payload).strip())
+        elif kind == "tool":
+            say("call %s %s" % (payload.get("name"),
+                                json.dumps(payload.get("arguments"), default=str)[:300]))
+        elif kind == "tool_result":
+            status = payload.get("status") or "ok"
+            text = str(payload.get("text") or "")
+            say("result %s: %s, %d chars%s" % (
+                payload.get("name"), status, len(text),
+                (" - " + text[:200].replace("\n", " ")) if status not in ("ok", "done") else ""),
+                logging.WARNING if status in ("error", "failed") or text.startswith("TOOL ERROR")
+                else logging.INFO)
+        elif kind == "preview":
+            path = (payload.get("_meta") or {}).get("path") if isinstance(payload, dict) else None
+            say("picture shown%s" % (": %s" % path if path else ""))
+        elif kind == "ask":
+            say("asked you a question")
+        elif kind == "elicit":
+            params = payload[0] if isinstance(payload, tuple) else {}
+            say("the bridge asks you: %s" % str(params.get("message", "")).strip()[:300])
+        elif kind == "elicit_done":
+            say("you answered the bridge")
+        elif kind == "stream_end":
+            s = self.sessions.get(tab)
+            reply = "".join(s._stream_buf).strip() if s is not None else ""
+            say("replied, %d chars: %s" % (len(reply), reply[:200].replace("\n", " ")))
+        elif kind == "ready":
+            say("ready")
+        elif kind == "idle":
+            say("idle")
+        elif kind == "panel":
+            what, arg = payload
+            if what == "window":
+                say("window opened")
+            elif what == "failed":
+                say(str(arg), logging.ERROR)
+            elif what == "note":
+                text, role = (arg[0], arg[1]) if len(arg) > 1 else (arg[0], "muted")
+                say(str(text), logging.ERROR if role == "err" else
+                    logging.WARNING if role == "warn" else logging.INFO)
+        elif kind == "images":
+            what, arg = payload
+            if what == "job":
+                job = arg
+                if changed(("job", job.id), job.status):
+                    where = (job.backend or {}).get("name", "?")
+                    line = "job %s on %s: %s" % (job.id, where, job.status)
+                    level = logging.INFO
+                    if job.status == "failed":
+                        line, level = line + " - " + str(job.detail), logging.ERROR
+                    elif job.status == "complete":
+                        line += " in %.0fs%s" % (job.elapsed(), (" -> " + job.outputs[0])
+                                                 if job.outputs else "")
+                    say(line, level)
+            elif what == "submitted":
+                say("submitted %d job%s" % (len(arg), "" if len(arg) == 1 else "s"))
+            elif what == "said":
+                role = arg[1] if len(arg) > 1 else "muted"
+                say(str(arg[0]), logging.ERROR if role == "err" else
+                    logging.WARNING if role == "warn" else logging.INFO)
+            elif what == "import-done":
+                say(str(arg[3]))
+        elif kind == "terminals":
+            what, arg = payload
+            if what == "error" and changed("terminal-error", arg[1]):
+                say(str(arg[1]), logging.WARNING)
+            elif what == "said":
+                say(str(arg[0]))
+
+    def _log_line(self, tab, entry):
+        """A line landed in a tab's log: show it if its Log window is open."""
+        view = self.log_views.get(tab)
+        if view is None:
+            return
+        try:
+            if not view.winfo_exists():
+                self.log_views.pop(tab, None)
+                return
+            self._append_log(view, entry)
+        except tk.TclError:
+            self.log_views.pop(tab, None)
+
+    def _append_log(self, view, entry):
+        at_end = view.yview()[1] >= 0.999
+        view.config(state="normal")
+        view.insert("end", tablog.format_line(entry) + "\n",
+                    {"ERROR": "err", "CRITICAL": "err", "WARNING": "warn"}.get(entry["level"], "text"))
+        # Only what the book keeps: a window left open for a day stays a page.
+        excess = int(view.index("end-1c").split(".")[0]) - 1 - tablog.KEEP
+        if excess > 0:
+            view.delete("1.0", "%d.0" % (excess + 1))
+        view.config(state="disabled")
+        if at_end:                        # following the end, unless scrolled back to read
+            view.see("end")
+
+    def _log_window(self, sid=None):
+        """The current tab's log: what it has done since the app started, live.
+        The lines are the activity log's for this tab (studio_tablog.BOOK), so
+        they are there to read whether or not this window was open."""
+        s = self.sessions.get(sid) if sid else self.cur()
+        if s is None:
+            return
+        key = ("log", s.id)
+        win = self.windows.get(key)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        win = tk.Toplevel(self)
+        self.windows[key] = win
+        win.title("Log - %s" % s.app.name)
+        win.geometry("%dx%d" % (self._px(760), self._px(480)))
+        self._skin(win, bg="bg")
+        bar = tk.Frame(win)
+        self._skin(bar, bg="bg")
+        bar.pack(side="bottom", fill="x", padx=12, pady=(6, 10))
+        scroll = tk.Scrollbar(win, highlightthickness=0, bd=0, width=11)
+        self._skin(scroll, bg="bg", troughcolor="bg", activebackground="faint")
+        scroll.pack(side="right", fill="y")
+        view = tk.Text(win, font=self.f_mono, wrap="word", bd=0, padx=14, pady=10,
+                       yscrollcommand=scroll.set, state="disabled", highlightthickness=0)
+        self._skin(view, bg="bg", fg="text", selectbackground="sel")
+        view.pack(side="left", fill="both", expand=True)
+        scroll.config(command=view.yview)
+        self._log_tags(view)
+        self.log_views[s.id] = view
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(view.get("1.0", "end-1c"))
+
+        def clear():
+            tablog.BOOK.clear(s.id)
+            view.config(state="normal")
+            view.delete("1.0", "end")
+            view.config(state="disabled")
+
+        def open_file():
+            path = doctor.activity_log_path()
+            if os.path.exists(path):
+                os.startfile(path)
+            else:
+                messagebox.showinfo(APP_NAME, "No activity log has been written yet.", parent=win)
+
+        self._button(bar, "Copy", copy, bg="bg").pack(side="left")
+        self._button(bar, "Clear", clear, bg="bg").pack(side="left", padx=(6, 0))
+        self._button(bar, "Open log file", open_file, bg="bg").pack(side="right")
+
+        lines = tablog.BOOK.lines(s.id)
+        if not lines:
+            view.config(state="normal")
+            view.insert("end", "Nothing logged for %s yet.\n" % s.app.name, "text")
+            view.config(state="disabled")
+        for entry in lines:
+            self._append_log(view, entry)
+        view.see("end")
+
+        def closed():
+            if self.log_views.get(s.id) is view:
+                self.log_views.pop(s.id, None)
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", closed)
+
+    def _log_tags(self, view):
+        """Colours copied out of the palette, so `_theme` calls this again."""
+        for tag in ("text", "warn", "err"):
+            view.tag_configure(tag, foreground=self.C[tag], font=self.f_mono,
+                               lmargin2=self._px(84), spacing3=1)
 
     # --------------------------------------------------------------- preflight
     def _boot_host(self, first=True, quiet=False):
@@ -5397,6 +5640,7 @@ class Chat(tk.Tk):
         # flag and does not re-arm. Leaving them armed is what printed
         # "invalid command name ..._drain" over a window that was already gone.
         self.closing = True
+        tablog.BOOK.unlisten(self._on_log_line)   # nobody will read the queue now
         for s in self.sessions.values():
             if s.images is not None:
                 s.images.release(confirmed=True)

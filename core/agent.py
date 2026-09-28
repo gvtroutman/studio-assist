@@ -40,6 +40,7 @@ import urllib.request
 
 import core.mcp as studio_mcp
 import core.procs as studio_procs
+import core.tablog as tablog
 
 DEFAULT_HOST = "http://100.127.17.38:1234/v1"
 # The longest an MCP call may run while its bridge keeps reporting progress. A
@@ -72,6 +73,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # The activity log; `studio_doctor.start_activity_log` gives it a file.
 LOG = logging.getLogger("studio.agent")
+BRIDGE_LOG = logging.getLogger("studio.bridge")   # what a bridge says on stderr
 
 
 def log(msg, quiet=False):
@@ -124,6 +126,9 @@ class MCPClient:
             text=True, encoding="utf-8", bufsize=1, creationflags=NO_WINDOW,
         )
         self.proc = self.child.proc
+        # The tab this bridge was started for: its stderr goes to that tab's
+        # log, from a thread that would not otherwise know (studio_tablog).
+        self.tab = tablog.current()
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
 
@@ -143,9 +148,13 @@ class MCPClient:
             self._inbox.put({"_closed": True})
 
     def _drain_stderr(self):
-        for line in self.proc.stderr:
-            if line.strip():
-                log("  [mcp] " + line.rstrip(), self.quiet)
+        # What a bridge says on stderr is its only diagnostic, and the shortcut's
+        # `pythonw.exe` has no console to print it to: it goes to the log too.
+        with tablog.working_for(self.tab):
+            for line in self.proc.stderr:
+                if line.strip():
+                    log("  [mcp] " + line.rstrip(), self.quiet)
+                    BRIDGE_LOG.info("%s", line.rstrip()[:2000])
 
     def _send(self, payload):
         with self._send_lock:
