@@ -1089,14 +1089,11 @@ class Chat(tk.Tk):
 
     def _tags(self, v):
         C = self.C
-        v.tag_configure("role_user", foreground=C["accent"], font=self.f_cap,
-                        spacing1=18, spacing3=6)
-        v.tag_configure("role_asst", foreground=C["asst"], font=self.f_cap,
-                        spacing1=18, spacing3=6)
-        v.tag_configure("user", background=C["card"], lmargin1=16, lmargin2=16,
-                        rmargin=16, spacing1=6, spacing3=10, borderwidth=0)
-        v.tag_configure("asst", lmargin1=16, lmargin2=16, rmargin=60, spacing2=4,
-                        spacing3=10)
+        v.tag_configure("user", background=C["card"], justify="right",
+                        lmargin1=60, lmargin2=60, rmargin=16, spacing1=18,
+                        spacing3=10, borderwidth=0)
+        v.tag_configure("asst", lmargin1=16, lmargin2=16, rmargin=60, spacing1=18,
+                        spacing2=4, spacing3=10)
         v.tag_configure("tool", foreground=C["faint"], font=self.f_mono, lmargin1=22,
                         lmargin2=36, rmargin=16, spacing1=2, spacing3=2)
         # A tool call is one folded row: the header in "tool", the glyph that
@@ -2961,9 +2958,6 @@ class Chat(tk.Tk):
         s.view.config(state="disabled")
         s.view.see("end")
 
-    def _role(self, s, name, tag):
-        self._write(s, "\n%s\n" % name, tag)
-
     def _clear_view(self, s):
         """Empty a transcript - the folded call rows' own tags with it, and
         the rows still waiting for a result, which now has nowhere to land.
@@ -4190,7 +4184,6 @@ class Chat(tk.Tk):
         elif kind == "elicit_done":
             self._settle_elicit(s, *payload)
         elif kind == "stream_start":
-            self._role(s, s.app.tab.upper(), "role_asst")
             s._asst_start = s.view.index("end-1c")
             s._stream_buf = []
             s._stream_open = True
@@ -5419,7 +5412,6 @@ class Chat(tk.Tk):
             self._hide_hero(s)
             for msg in messages:
                 if msg.get("role") in ("user", "assistant") and isinstance(msg.get("content"), str):
-                    self._role(s, "YOU" if msg["role"] == "user" else s.app.tab.upper(), "role_user" if msg["role"] == "user" else "role_asst")
                     self._write(s, msg["content"] + "\n", "user" if msg["role"] == "user" else "asst")
             self._write(s, "Reopened from history. Send a message to carry on; the current project must be inspected first.\n", "sys")
         except Exception as e:
@@ -5695,7 +5687,6 @@ class Chat(tk.Tk):
         is closed either way: a typed reply is an answer too."""
         self._settle_ask(s)
         self._hide_hero(s)
-        self._role(s, "YOU", "role_user")
         self._write(s, task + "\n", "user")
         for p in attached:
             self._show_attachment(s, p)
