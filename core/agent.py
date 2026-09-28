@@ -3050,7 +3050,7 @@ class ImagesSpec(PanelSpec):
 
 
 IMAGE_STUDIO = ImagesSpec(
-    id="image-studio", name="Image Studio", tab="Images", code="IS",
+    id="image-studio", name="Image Studio", tab="Image Studio", code="IS",
     fg="#ffffff", bg="#5b3cc4", url="",
     note="The Image Studio sends its work to the ComfyUI backends listed under Backends.")
 

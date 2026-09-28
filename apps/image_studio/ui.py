@@ -64,10 +64,18 @@ ADVANCED = [                  # (setting, label, kind)
 ]
 STATUS_ROLE = {"queued": "muted", "uploading": "accent", "loading": "accent",
                "sampling": "accent", "decoding": "accent", "running": "accent",
-               "refining": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
-# Where each status sits on the Queued -> ... -> Complete strip.
-STAGE_AT = {"queued": 0, "uploading": 0, "loading": 1, "running": 2, "sampling": 2,
-            "refining": 2, "decoding": 3, "complete": 4}
+               "refining": "accent", "face": "accent", "critic": "accent",
+               "face_swap": "accent", "eyes": "accent", "hands": "accent",
+               "glasses": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
+STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "face_swap": "Face swap",
+               "eyes": "Eye pass", "hands": "Hand pass", "glasses": "Glasses"}
+# A status to the key on the job's own pipeline strip (ig.pipeline_stages) it
+# lights up. Queued/uploading/loading run before the strip's first stop, so
+# nothing is lit yet.
+STAGE_KEY = {"queued": None, "uploading": None, "loading": None, "running": "sampling",
+             "sampling": "sampling", "face": "face", "critic": "critic",
+             "decoding": "decoding", "face_swap": "face_swap", "eyes": "eyes",
+             "hands": "hands", "glasses": "glasses", "complete": "complete"}
 READY_MARK = {"ready": "✓", "missing": "✗", "offline": "○", "disabled": "–",
               "unchecked": "?"}
 
@@ -1795,11 +1803,7 @@ class ImageStudio:
             self._post("said", (str(e), "err"))
             self._post("health")
             return
-        names = sorted({j.backend["name"] for j in jobs})
         self._post("submitted", jobs)
-        self._post("said", ("Queued %d job%s on %s." % (len(jobs), "" if len(jobs) == 1
-                                                        else "s", " and ".join(names)),
-                            "muted"))
         self._post("health")
 
     # ============================================================== backends
@@ -2012,14 +2016,15 @@ class ImageStudio:
         self.wrap(meta, right, self.px(12))
         strip = self.frame(right, "card")
         strip.pack(side="top", fill="x", pady=(self.px(3), 0))
-        stages = []
-        for i, name in enumerate(ig.STAGES):
+        stages, stage_keys = [], []
+        for i, (key, label) in enumerate(ig.pipeline_stages(self.studio.lib, s)):
             if i:
                 self.label(strip, "→", "faint", self.host.f_small, bg="card").pack(
                     side="left", padx=self.px(3))
-            lbl = self.label(strip, name.capitalize(), "faint", self.host.f_small, bg="card")
+            lbl = self.label(strip, label, "faint", self.host.f_small, bg="card")
             lbl.pack(side="left")
             stages.append(lbl)
+            stage_keys.append(key)
         bar = tk.Canvas(right, height=self.px(4), highlightthickness=0, bd=0)
         self.skin(bar, bg="card")
         bar.pack(side="top", fill="x", pady=(self.px(4), 0), padx=(0, self.px(8)))
@@ -2028,7 +2033,7 @@ class ImageStudio:
         self.wrap(detail, right, self.px(12))
         widgets = {"row": row, "thumb": thumb, "status": status, "elapsed": elapsed,
                    "bar": bar, "detail": detail, "cancel": cancel, "meta": meta,
-                   "stages": stages, "strip": strip,
+                   "stages": stages, "stage_keys": stage_keys, "strip": strip,
                    "base": "%s · %s · %s · seed %s" % (
                        preset, model.get("label", s.get("model")), job.backend["name"],
                        s.get("seed")) if s.get("mode") != "dress" else
@@ -2045,7 +2050,8 @@ class ImageStudio:
         if w is None:
             return
         cancelling = job.cancel.is_set() and job.status not in ig.FINISHED
-        w["status"].config(text="Cancelling…" if cancelling else job.status.capitalize())
+        w["status"].config(text="Cancelling…" if cancelling else
+                           STATUS_TEXT.get(job.status, job.status.capitalize()))
         if cancelling:
             w["cancel"].set(state="disabled")
         self.skin(w["status"], bg="card", fg=STATUS_ROLE.get(job.status, "muted"))
@@ -2054,10 +2060,12 @@ class ImageStudio:
         w["meta"].config(text=w["base"] + (" · " + loras if loras else ""))
         w["detail"].config(text=job.detail or "")
         self.skin(w["detail"], bg="card", fg="err" if job.status == "failed" else "faint")
-        at = STAGE_AT.get(job.status)
-        if at is None:                    # failed or cancelled: the strip has said its piece
+        key = STAGE_KEY.get(job.status, False)
+        if key is False:                  # failed or cancelled: the strip has said its piece
             w["strip"].pack_forget()
         else:
+            keys = w["stage_keys"]
+            at = keys.index(key) if key in keys else -1
             for i, lbl in enumerate(w["stages"]):
                 role = "ok" if i < at or job.status == "complete" else (
                     "accent" if i == at else "faint")
