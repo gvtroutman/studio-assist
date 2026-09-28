@@ -36,7 +36,6 @@ import threading
 import time
 import traceback
 import uuid
-import weakref
 
 try:
     import tkinter as tk
@@ -206,7 +205,7 @@ class Prefs:
 
     DEFAULTS = {"theme": "dark", "accent": None, "tabs": None, "pinned": [], "hidden": [], "bridges": [],
                 "hold_consoles": True, "rounding": 1.0, "text_size": 1.0, "icons": {},
-                "button_show": {}}
+                "button_show": {}, "names": {}}
 
     def __init__(self, path=None):
         self.path = path or settings_path()
@@ -232,10 +231,17 @@ class Prefs:
                               if isinstance(got, list) else [])
         if not isinstance(self.data.get("hold_consoles"), bool):
             self.data["hold_consoles"] = True
-        # Corners and text size are one of Preferences' choices or nothing.
-        for key, choices in (("rounding", ui.ROUNDINGS), ("text_size", ui.TEXT_SIZES)):
-            if self.data.get(key) not in [v for v, _label in choices]:
+        # Corners and text size are sliders; outside their range is nothing.
+        for key, bounds in (("rounding", ui.ROUNDING_RANGE), ("text_size", ui.TEXT_RANGE)):
+            if not ui.in_range(self.data.get(key), bounds):
                 self.data[key] = 1.0
+        # What the user renamed things to in the Icons window: icon key ->
+        # words. Short and one line, whatever the file says.
+        got = self.data.get("names")
+        self.data["names"] = ({k: " ".join(v.split())[:60] for k, v in got.items()
+                               if isinstance(k, str) and isinstance(v, str)
+                               and v.strip()}
+                              if isinstance(got, dict) else {})
         # Uploaded icons: icon key -> a file name in the icons folder beside
         # this file. A bare name only, so a hand edit cannot point elsewhere.
         got = self.data.get("icons")
@@ -456,17 +462,7 @@ class Chat(tk.Tk):
         self.repaints = []                # (widget, draw) for shapes _theme must redraw
         self.glyphs = []                  # (label, glyph name), for uploaded icons
         self.button_photos = {}           # (icon key, size, file) -> PhotoImage or None
-        # Buttons wear the pictures uploaded for their label, as text, both
-        # or the icon alone. The hooks hold the window weakly: a class
-        # attribute holding it outright kept a closed window's Tk images
-        # alive until some later moment, when Python could free them on a
-        # worker thread - "Tcl_AsyncDelete: async handler deleted by the
-        # wrong thread", which kills the process.
-        me = weakref.ref(self)
-        Pill.icon = lambda label, size: (me()._button_icon(label, size)
-                                         if me() is not None else None)
-        Pill.show = lambda label: (me()._button_show(label)
-                                   if me() is not None else "both")
+        self.dressed = []                 # (label, icon key, default text, clip, icon?)
         self.closing = False              # set by _quit, so no timer outlives the window
         # Console windows opened outside the app, hidden and held in the
         # Terminal tab (core/consoles.py). Watched from the start, whether
@@ -662,6 +658,7 @@ class Chat(tk.Tk):
         self.pills = [p for p in self.pills if p.winfo_exists()]
         self.repaints = [(w, d) for w, d in self.repaints if w.winfo_exists()]
         self.glyphs = [(w, n) for w, n in self.glyphs if w.winfo_exists()]
+        self.dressed = [e for e in self.dressed if e[0].winfo_exists()]
 
     def _accent(self, colour):
         """Save the accent (None for the theme's own) and repaint with it."""
@@ -1073,8 +1070,9 @@ class Chat(tk.Tk):
         s.hero = self._skin(tk.Frame(s.frame), bg="bg")
         self._mark(s.hero, self._spec_for(s.app), self.marks_px["hero"],
                    bg="bg").pack()
-        self._skin(tk.Label(s.hero, text=s.app.name, font=self.f_hero),
-                   bg="bg", fg="text").pack(pady=(self._px(14), 0))
+        hero_name = self._skin(tk.Label(s.hero, font=self.f_hero), bg="bg", fg="text")
+        self._dress(hero_name, s.app.id, s.app.name)
+        hero_name.pack(pady=(self._px(14), 0))
         if not s.app.drivable:
             # Say the one thing this tab is not, before the model has to.
             note = tk.Label(s.hero, font=self.f_ui, justify="center",
@@ -1459,9 +1457,87 @@ class Chat(tk.Tk):
         """`Pill.icon`: every button with this label wears the same picture."""
         return self._icon_photo("button:" + label.strip(), size) if label else None
 
+    # What every Pill asks of its window (`self._root()`) as it paints: its
+    # uploaded icon, whether to show text, both or the icon, and its new name.
+    def pill_icon(self, label, size):
+        return self._button_icon(label, size)
+
+    def pill_show(self, label):
+        return self._button_show(label)
+
+    def pill_rename(self, label):
+        return self._renamed("button:" + (label or "").strip())
+
     def _button_show(self, label):
         """`Pill.show`: "text", "both" (the default) or "icon" for this label."""
         return self.prefs.get("button_show").get((label or "").strip(), "both")
+
+    def _renamed(self, key):
+        """What the user renamed `key` to in the Icons window, or None."""
+        return self.prefs.get("names").get(key)
+
+    def _name(self, key, default):
+        """`key`'s name as shown: the user's words, else the program's."""
+        return self._renamed(key) or default
+
+    def _rename(self, key, text, default):
+        """Save a rename from the Icons window - blank, or the default itself,
+        takes the rename away - and show it everywhere at once."""
+        text = " ".join((text or "").split())[:60]
+        got = dict(self.prefs.get("names"))
+        if not text or text == default:
+            got.pop(key, None)
+        else:
+            got[key] = text
+        if got == self.prefs.get("names"):
+            return
+        self.prefs.set(names=got)
+        self._renamed_everywhere()
+
+    def _dress(self, lbl, key, default, clip_n=None, icon=False):
+        """A plain label that shows `key`'s name (renamed or not) and, with
+        `icon`, the picture uploaded for it before the words - text, both or
+        the icon alone, like a button. Remembered, so a rename, upload or
+        text size change can dress it again."""
+        self.dressed.append((lbl, key, default, clip_n, icon))
+        text = self._name(key, default)
+        if clip_n:
+            text = clip(text, clip_n)
+        photo = None
+        if icon:
+            photo = self._icon_photo(key, self.f_ui.metrics("linespace"))
+            if photo is not None and self._button_show(key) == "text":
+                photo = None
+        try:
+            if photo is not None:
+                alone = self._button_show(key) == "icon"
+                lbl.config(image=photo, compound="left",
+                           text="" if alone else " " + text)
+            else:
+                lbl.config(image="", text=text)
+        except tk.TclError:
+            pass
+        return lbl
+
+    def _redress(self):
+        """Every dressed label again, after a rename, an upload or a change of
+        what a label shows."""
+        live, self.dressed = self.dressed, []
+        for entry in live:
+            try:
+                if entry[0].winfo_exists():
+                    self._dress(*entry)
+            except tk.TclError:
+                pass
+
+    def _renamed_everywhere(self):
+        """A rename reaches the rail (rebuilt), the tab chips, the heroes and
+        the connection rows (dressed), and every button (repainted)."""
+        self._build_apps()
+        self._repaint_buttons()           # and every dressed label
+        for sid in self.order:
+            self._paint_tab(sid)
+        self._fit_tabs()
 
     def _set_button_show(self, label, mode):
         """Save what buttons with this label show, and redraw them."""
@@ -1475,8 +1551,9 @@ class Chat(tk.Tk):
         self._fit_tabs()
 
     def _repaint_buttons(self):
-        """After an upload, a Reset or a text size change: every pill and
-        glyph drawn again with whatever picture it now has."""
+        """After an upload, a Reset, a rename or a text size change: every
+        pill, glyph and dressed label drawn again with whatever picture and
+        name it now has."""
         self._forget()
         for pill in self.pills:
             try:
@@ -1490,6 +1567,7 @@ class Chat(tk.Tk):
                     self._glyph_icon(lbl, name)
             except tk.TclError:
                 pass
+        self._redress()
 
     def _tip(self, widget, text):
         """A plain tooltip - these controls are small and their meaning is not
@@ -1618,8 +1696,9 @@ class Chat(tk.Tk):
         mark = self._mark(inner, self._spec_for(app), self.marks_px["tab"],
                           bg="bg")
         mark.pack(side="left")
-        lbl = tk.Label(inner, text=app.tab, font=self.f_ui)
+        lbl = tk.Label(inner, font=self.f_ui)
         self._skin(lbl, bg="bg", fg="muted")
+        self._dress(lbl, app.id, app.tab)
         lbl.pack(side="left", padx=(8, 8))
         dot = self._dot(inner, "faint", bg="bg")
         dot.pack(side="left")
@@ -1651,7 +1730,7 @@ class Chat(tk.Tk):
         self._hook_click(tab, lambda ev, i=sid: self._select(i))
         # after _hook_click, so the close glyph keeps its own handler
         close.bind("<Button-1>", lambda ev, i=sid: (self._close_tab(i), "break")[1])
-        self._tip(mark, app.name)         # the name, once the label is folded away
+        self._tip(mark, self._name(app.id, app.name))   # once the label is folded away
         self._fit_tabs()
 
     def _compact_tab(self, sid, on):
@@ -1718,7 +1797,8 @@ class Chat(tk.Tk):
         m = self._menu()
         for app in eng.TABS:
             open_now = app.id in self.sessions
-            self._menu_item(m, "%s%s" % (app.name, "   (open)" if open_now else ""),
+            self._menu_item(m, "%s%s" % (self._name(app.id, app.name),
+                                         "   (open)" if open_now else ""),
                             app.id, lambda i=app.id: self._add_tab(i))
         return m
 
@@ -1876,10 +1956,10 @@ class Chat(tk.Tk):
         self._cap(conns, "CONNECTIONS").pack(fill="x", padx=18, pady=(18, 8))
         self.conn = {"host": self._conn_row(conns, "Inference",
                                             pretty_host(self.host),
-                                            command=self._host_menu)}
+                                            command=self._host_menu, key="conn:host")}
         self.conn["bridges"] = self._conn_row(
             conns, "Bridges", "not started", arc=True,
-            command=self._bridges_menu)
+            command=self._bridges_menu, key="conn:bridges")
 
     def _build_apps(self):
         """
@@ -1998,8 +2078,9 @@ class Chat(tk.Tk):
 
         box = self._skin(tk.Frame(row), bg="side")
         box.pack(side="left", fill="x", expand=True, padx=(9, 0))
-        title = self._skin(tk.Label(box, text=clip(name, APP_NAME_CHARS),
-                                    font=self.f_ui, anchor="w"), bg="side", fg="text")
+        title = self._skin(tk.Label(box, font=self.f_ui, anchor="w"),
+                           bg="side", fg="text")
+        self._dress(title, spec["key"], name, clip_n=APP_NAME_CHARS)
         title.pack(fill="x")
         subtitle = self._skin(tk.Label(box, text=app_subtitle(a), font=self.f_small,
                                        anchor="w"), bg="side", fg="faint")
@@ -2086,7 +2167,11 @@ class Chat(tk.Tk):
         self._build_apps()
 
     # ------------------------------------------------------------- connections
-    def _conn_row(self, side, title, detail, arc=False, command=None):
+    # The connection rows, as Preferences > Icons lists them: each can be
+    # renamed and wear an icon before its title (the status mark stays).
+    CONN_NAMES = [("conn:host", "Inference"), ("conn:bridges", "Bridges")]
+
+    def _conn_row(self, side, title, detail, arc=False, command=None, key=None):
         row = self._skin(tk.Frame(side), bg="side")
         row.pack(fill="x", padx=14, pady=3)
         if arc:
@@ -2099,8 +2184,11 @@ class Chat(tk.Tk):
         box.pack(side="left", fill="x", expand=True, padx=(10, 0))
         head = self._skin(tk.Frame(box), bg="side")
         head.pack(fill="x")
-        self._skin(tk.Label(head, text=title, font=self.f_ui, anchor="w"),
-                   bg="side", fg="text").pack(side="left")
+        name = self._skin(tk.Label(head, text=title, font=self.f_ui, anchor="w"),
+                          bg="side", fg="text")
+        if key:
+            self._dress(name, key, title, icon=True)
+        name.pack(side="left")
         # no wraplength: these are pre-clipped, and char wrapping split IPs mid-number
         lbl = tk.Label(box, text=detail, font=self.f_small, anchor="w",
                        justify="left")
@@ -2153,7 +2241,7 @@ class Chat(tk.Tk):
                 note = "%d tools" % len(s.tools)
             else:
                 note = s.bridge[1].splitlines()[-1]
-            self._menu_item(m, "%s  —  %s" % (app.name, note), app.id,
+            self._menu_item(m, "%s  —  %s" % (self._name(app.id, app.name), note), app.id,
                             lambda i=app.id: self._tools_window(i))
         m.add_separator()
         m.add_command(label="Bridges run here on %s" % this_pc(), state="disabled")
@@ -2740,31 +2828,8 @@ class Chat(tk.Tk):
         self._repaint_on_theme(swatch, paint_swatch)
         paint_swatch()
 
-        # Corners and text size: one row of choices each, the chosen one in
-        # the accent. Either applies at once, the way the theme cards do.
-        def choices(title, options, pref, apply):
-            self._cap(body, title, bg="bg").pack(fill="x", pady=(22, 8))
-            line = self._skin(tk.Frame(body), bg="bg")
-            line.pack(fill="x")
-            pills = {}
-
-            def light():
-                for value, pill in pills.items():
-                    pill.roles = self.PILL_ROLES[
-                        "accent" if self.prefs.get(pref) == value else "quiet"]
-                    pill.paint(self.C)
-
-            def choose(value):
-                apply(value)
-                light()
-
-            for value, label in options:
-                pills[value] = self._button(line, label, lambda v=value: choose(v))
-                pills[value].pack(side="left", padx=(0, 8))
-            light()
-
-        choices("CORNERS", ui.ROUNDINGS, "rounding", self._rounding)
-        choices("TEXT SIZE", ui.TEXT_SIZES, "text_size", self._text_size)
+        self._slider(body, "CORNERS", ui.ROUNDING_RANGE, "rounding", self._rounding)
+        self._slider(body, "TEXT SIZE", ui.TEXT_RANGE, "text_size", self._text_size)
         self._icons_section(body, win)
 
         self._cap(body, "SIDEBAR", bg="bg").pack(fill="x", pady=(22, 8))
@@ -3551,6 +3616,50 @@ class Chat(tk.Tk):
                              "bg": a["bg"]}, a["name"]))
         return out
 
+    SLIDER_SETTLE_MS = 200                # a drag applies once it pauses this long
+
+    def _slider(self, body, title, bounds, pref, apply):
+        """A Preferences slider over `bounds`, shown as a percentage of the
+        designed size, with a Reset to 100%. Dragging applies it once the
+        drag pauses (`SLIDER_SETTLE_MS`): a text size change lays out the
+        whole window, and doing that for every pixel of a drag stutters."""
+        self._cap(body, title, bg="bg").pack(fill="x", pady=(22, 4))
+        line = self._skin(tk.Frame(body), bg="bg")
+        line.pack(fill="x")
+        var = tk.DoubleVar(master=line, value=self.prefs.get(pref))
+        shown = tk.Label(line, font=self.f_ui, width=5, anchor="e")
+        self._skin(shown, bg="bg", fg="text")
+        pending = {"id": None}
+
+        def settle():
+            pending["id"] = None
+            value = round(var.get(), 2)
+            if value != self.prefs.get(pref):
+                apply(value)
+
+        def moved(_value=None):
+            shown.config(text="%d%%" % round(var.get() * 100))
+            if pending["id"] is not None:
+                line.after_cancel(pending["id"])
+            pending["id"] = line.after(self.SLIDER_SETTLE_MS, settle)
+
+        scale = tk.Scale(line, variable=var, from_=bounds[0], to=bounds[1],
+                         resolution=0.05, orient="horizontal", showvalue=False,
+                         length=self._px(240), command=moved, bd=0,
+                         highlightthickness=0, sliderrelief="flat",
+                         width=self._px(12), sliderlength=self._px(22))
+        self._skin(scale, bg="accent", troughcolor="border",
+                   activebackground="accent_dk")
+        scale.pack(side="left")
+        shown.pack(side="left", padx=(10, 0))
+
+        def reset():
+            var.set(1.0)
+            moved()
+        self._button(line, "100%", reset, kind="ghost").pack(side="left", padx=(10, 0))
+        shown.config(text="%d%%" % round(var.get() * 100))
+        return scale
+
     def _icons_section(self, body, _prefs):
         """Preferences > Icons: one line and a button. The list itself is a
         window of its own - a dozen rows of it made Preferences taller than a
@@ -3640,18 +3749,27 @@ class Chat(tk.Tk):
             return grid
 
         size = self.marks_px["row"]
-        rows = [(spec["key"], name, spec) for spec, name in self._icon_specs()]
-        rows.append(None)                 # the Buttons heading
+        # (key, default name, mark spec or None). A string is a heading: apps
+        # take two columns, the rest one, since each of those also carries
+        # the Text / Both / Icon choice.
+        rows = ["APPS AND TABS"]
+        rows += [(spec["key"], name, spec) for spec, name in self._icon_specs()]
+        rows.append("CONNECTIONS")
+        rows += [(key, name, None) for key, name in self.CONN_NAMES]
+        rows.append("BUTTONS")
         rows += [("glyph:" + g, label, None) for g, label in self.GLYPH_NAMES]
         rows += [("button:" + label, label, None) for label in labels]
-        # Apps in two columns; buttons in one, since each also carries the
-        # Text / Both / Icon choice.
-        grid, i, cols = section("APPS AND TABS"), 0, 2
+        grid = i = cols = None
+        states = {}                       # key -> its row's refresh, for renames
         for entry in rows:
-            if entry is None:
-                grid, i, cols = section("BUTTONS"), 0, 1
+            if isinstance(entry, str):
+                grid, i, cols = section(entry), 0, 2 if entry == "APPS AND TABS" else 1
                 continue
             key, name, spec = entry
+            # Where Text / Both / Icon is saved: a button by its label, a
+            # connection row by its key. Glyphs and apps have no choice.
+            show_key = (key[len("button:"):] if key.startswith("button:")
+                        else key if key.startswith("conn:") else None)
             cell = self._skin(tk.Frame(grid), bg="bg")
             cell.grid(row=i // cols, column=i % cols, sticky="w", padx=(0, 18), pady=3)
             i += 1
@@ -3665,16 +3783,38 @@ class Chat(tk.Tk):
                                    bd=0, padx=0, pady=0)
                 self._skin(preview, bg="bg", fg="faint")
                 preview.pack(side="left")
-            label = tk.Label(cell, text=clip(name, 22), font=self.f_ui, anchor="w",
-                             width=18)
-            self._skin(label, bg="bg", fg="text")
-            label.pack(side="left", padx=(8, 6))
+            if key.startswith("glyph:"):
+                # A glyph shows a character or a picture, never words.
+                label = tk.Label(cell, text=clip(name, 22), font=self.f_ui,
+                                 anchor="w", width=18)
+                self._skin(label, bg="bg", fg="text")
+                label.pack(side="left", padx=(8, 6))
+            else:
+                # The name, editable in place: Enter or leaving the field
+                # saves it; emptied, the program's own name comes back.
+                var = tk.StringVar(master=cell, value=self._name(key, name))
+                field = tk.Entry(cell, textvariable=var, font=self.f_ui, width=20,
+                                 relief="flat", bd=0, highlightthickness=1)
+                self._skin(field, bg="card", fg="text", insertbackground="accent",
+                           highlightbackground="border", highlightcolor="accent")
+                field.pack(side="left", padx=(8, 6), ipady=self._px(3))
+
+                def rename(_ev=None, key=key, name=name, var=var):
+                    self._rename(key, var.get(), name)
+                    var.set(self._name(key, name))
+                    states.get(key, lambda: None)()
+                field.bind("<Return>", rename)
+                field.bind("<FocusOut>", rename)
             reset = self._button(cell, "Reset", lambda: None, kind="ghost")
 
-            def state(key=key, reset=reset, preview=preview):
+            def changed(key=key, show_key=show_key):
+                return (key in self.prefs.get("icons") or key in self.prefs.get("names")
+                        or (show_key is not None
+                            and show_key in self.prefs.get("button_show")))
+
+            def state(key=key, reset=reset, preview=preview, changed=changed):
                 try:
-                    reset.set(state="normal" if key in self.prefs.get("icons")
-                              else "disabled")
+                    reset.set(state="normal" if changed() else "disabled")
                     if preview is not None:
                         photo = self._icon_photo(key, size)
                         glyph = (self.g.get(key[len("glyph:"):], "")
@@ -3703,24 +3843,39 @@ class Chat(tk.Tk):
                     state()
                 self._spawn(None, self._upload_icon, key, path, done)
 
-            def forget(key=key, state=state):
+            choice = {}
+
+            def forget(key=key, name=name, state=state, show_key=show_key,
+                       choice=choice, var=None if key.startswith("glyph:") else var):
+                """Everything back as the program made it: icon, name, and
+                what the button shows."""
                 self._set_icon(key, None)
+                self._rename(key, "", name)
+                if show_key is not None:
+                    self._set_button_show(show_key, "both")
+                if var is not None:
+                    var.set(name)
+                if choice.get("light"):
+                    choice["light"]()
                 state()
 
             self._button(cell, "Upload...", upload).pack(side="left")
             reset.command = forget
             reset.pack(side="left", padx=(6, 0))
-            if key.startswith("button:"):
-                self._show_choice(cell, key[len("button:"):])
+            if show_key is not None:
+                choice["light"] = self._show_choice(cell, show_key, after=state)
+            states[key] = state
             state()
         win.update_idletasks()
         fit()
         scroller.configure(height=min(body.winfo_reqheight(),
                                       int(self.winfo_screenheight() * 0.6)))
 
-    def _show_choice(self, parent, label):
-        """Text / Both / Icon for buttons labelled `label`, the chosen one in
-        the accent. Icon alone still shows the text while there is no icon."""
+    def _show_choice(self, parent, label, after=None):
+        """Text / Both / Icon for buttons labelled `label` (or a connection
+        row's key), the chosen one in the accent. Icon alone still shows the
+        text while there is no icon. Returns the function that relights it;
+        `after` runs once a choice is saved."""
         line = self._skin(tk.Frame(parent), bg="bg")
         line.pack(side="left", padx=(14, 0))
         pills = {}
@@ -3734,6 +3889,8 @@ class Chat(tk.Tk):
         def choose(mode):
             self._set_button_show(label, mode)
             light()
+            if after is not None:
+                after()
 
         for mode, word in BUTTON_SHOWS.items():
             # Small: three of these per row, beside Upload and Reset.
@@ -3741,7 +3898,7 @@ class Chat(tk.Tk):
                                        font=self.f_small, padx=10, pady=3)
             pills[mode].pack(side="left", padx=(0, 4))
         light()
-        return pills
+        return light
 
     def _blank(self, size):
         """A transparent size x size image: a Label given one is sized in
@@ -3785,7 +3942,7 @@ class Chat(tk.Tk):
                 os.remove(os.path.join(self._icons_dir(), old))
             except OSError:
                 pass
-        if key.startswith(("button:", "glyph:")):
+        if key.startswith(("button:", "glyph:", "conn:")):
             # Drawn by the UI thread from the kept file, not read from an .exe.
             for k in [k for k in self.button_photos if k[0] == key]:
                 del self.button_photos[k]

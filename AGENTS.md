@@ -2437,8 +2437,12 @@ fonts that other windows fall back on, to a multiple of the size recorded the fi
 time. Configuring a shared `Font` resizes every widget using it in place.
 `_text_size` then re-runs `_metrics` for the rail's width (`side_frame`), repaints
 (pills and chips measure their text) and refits the tab strip. A window that makes
-its own fonts (the Image Studio's emoji) does not follow. Both settings are one of
-`ui.ROUNDINGS` / `ui.TEXT_SIZES` or they fall back to 1.0 (`Prefs`). *Icons*: any
+its own fonts (the Image Studio's emoji) does not follow. Both are sliders
+(`_slider`, shown as a percentage) over `ui.ROUNDING_RANGE` / `ui.TEXT_RANGE`. A
+saved value outside its range falls back to 1.0 (`Prefs`, `ui.in_range`). The fixed
+choices came first; the user asked for sliders. A drag is applied once it pauses for
+`SLIDER_SETTLE_MS`, because a text-size change lays out the whole window, and doing
+that at every step of a drag stutters. *Icons*: any
 mark (every tab in `TABS`, bridges added by hand, every rail row) can be replaced by
 an upload. `icons.upload_png` reads PNG and .ico itself and anything else through
 System.Drawing (`_by_windows`, which also shrinks a big PNG before `resample`'s pure
@@ -2457,17 +2461,38 @@ does not resize.
 well", then "hide text, show text, only show the icon"). A text button's icon is
 keyed `button:<label>`, so the Send of every tab is one upload. A glyph button's is
 keyed `glyph:<name>` (`GLYPH_NAMES`: add, close, pin, unpin, folder, more). Both kinds
-live in the same `icons` pref and folder as the app marks. `Pill.icon` and
-`Pill.show` are class hooks the window sets. `Pill.paint` asks them for the picture
-(the text's line height, drawn before the label) and for `BUTTON_SHOWS`: text, both
-(the default, not saved) or icon. Icon alone drops the words only when there is a
-picture, so no button can be blank. Glyph labels are registered in `glyphs`
+live in the same `icons` pref and folder as the app marks. `Pill.paint` asks its
+own window (`self._root()`) through `pill_icon`, `pill_show` and `pill_rename`. It
+gets the picture (the text's line height, drawn before the label), a `BUTTON_SHOWS`
+mode (text, both or icon; both is the default and is not saved) and the renamed
+words. Icon alone drops the words only when there is a picture, so no button can be
+blank. **Nothing is held on the `Pill` class.** Class-level hooks came first. They
+pointed at whichever window was made last, so a test that made and closed a second
+window left every button asking a dead one. They also kept a closed window's Tk
+images alive until Python freed them on a worker thread, and "Tcl_AsyncDelete:
+async handler deleted by the wrong thread" killed a full test run. Glyph labels are registered in `glyphs`
 (`_glyph_icon`) and show the picture in place of the character. The pictures are made
 on the UI thread from the kept PNG (`_icon_photo`, cached by key, size and file name).
 They are not read by the icon worker, because a button's size follows the text size.
 `_repaint_buttons` redraws both kinds after an upload, a Reset, a mode change or a
 text-size change. The Icons window lists the labels of the pills alive at the moment
 it opens (`_button_labels`), plus any label that already has an icon.
+
+**Anything in the Icons window can be renamed, and the connection rows take icons**
+(the user: "the connections does not let me change icons. i would like to be able to
+change the text of items within the icon changer"). Every row but a glyph's has its
+name in an entry. Enter or leaving the field saves it (`_rename`, the `names` pref,
+key -> words); blank or the program's own name takes the rename away. Reset puts
+back all of icon, name and show. The names are for display only: `Pill.text`, a
+row's `a["name"]` (which pins and hides are keyed by) and `app.name` in messages stay
+the program's. What shows the new name: tab chips, heroes, rail rows, the new-tab
+and bridges menus, every button (`pill_rename`) and the Inference and Bridges rows
+(`CONN_NAMES`, keys `conn:host` / `conn:bridges`). A plain label is "dressed"
+(`_dress`, registered in `dressed`) with its key's name. With `icon=True`, as on the
+connection rows, it also shows the uploaded picture before the words, and Text / Both
+/ Icon applies there as it does on a button. The status dot or arc stays, because it
+is state and not decoration. `_repaint_buttons` redresses them all. A rename also
+rebuilds the rail and refits the tabs (`_renamed_everywhere`).
 
 **Do not remove the startup warm-up.** It looks like a redundant throwaway request.
 It is not: a full tool-schema set took about a minute to prefill cold - seconds, since

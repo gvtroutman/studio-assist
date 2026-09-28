@@ -95,11 +95,17 @@ def clip(s, n):
 
 # Preferences > Corners and Text size. Every corner `rounded` draws is scaled
 # by ROUNDING, so one number reshapes the window; the text sizes scale the
-# window's fonts (`Chat._text_size`). Both are chosen from these lists only,
-# which keeps a hand-edited settings file from asking for something silly.
+# window's fonts (`Chat._text_size`). Both are sliders over these ranges, and
+# a saved value outside one (a hand-edited settings file) falls back to 1.0.
 ROUNDING = 1.0
-ROUNDINGS = [(0.0, "Square"), (0.5, "Subtle"), (1.0, "Standard"), (1.6, "Round")]
-TEXT_SIZES = [(0.9, "Small"), (1.0, "Standard"), (1.15, "Large"), (1.3, "Larger")]
+ROUNDING_RANGE = (0.0, 2.0)               # square .. twice the designed corner
+TEXT_RANGE = (0.8, 1.6)                   # of the size each font was made at
+
+
+def in_range(value, bounds):
+    """A saved slider value: a plain number inside `bounds` (True is not 1)."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and bounds[0] <= value <= bounds[1])
 
 
 def rounded(canvas, x1, y1, x2, y2, r, **kw):
@@ -182,11 +188,6 @@ class Pill(tk.Canvas):
     switch, and `set()` covers what _apply_status used to config() on the
     Button - the text and whether it takes clicks.
     """
-
-    # `icon(label, size)`: the PhotoImage uploaded for buttons with that label,
-    # or None. The window sets it; a pill made without a window draws none.
-    icon = None
-    show = None                           # `show(label)`: "text", "both" or "icon"
 
     def __init__(self, parent, text, command, font, roles, padx=18, pady=6, r=12,
                  anchor="center", round=False, **kw):
@@ -304,16 +305,22 @@ class Pill(tk.Canvas):
             tw = self.font.measure(self.text)
             gap = self.font.measure(" ") if dots else 0
             trail = jump_width(self.font) + gap if dots else 0
-            # An icon the user uploaded for this label (Preferences > Icons),
-            # the text's height, before the text. Kept on the pill: Tk drops
-            # an image nothing holds a reference to.
-            # `Pill.show(label)` says what to draw: "text", "both" or "icon".
-            # Icon only drops the words, never the picture - a button with no
-            # picture keeps its text whatever it says.
-            show = Pill.show(self.text) if Pill.show else "both"
-            self.image = (Pill.icon(self.text, self.font.metrics("linespace"))
-                          if Pill.icon and show != "text" else None)
-            words = self.text if not (self.image and show == "icon") else ""
+            # What the user set for this label in Preferences > Icons, asked of
+            # the pill's own window (its Tk root): an icon the text's height,
+            # drawn before the text and kept on the pill (Tk drops an image
+            # nothing holds); whether to show "text", "both" or "icon" - icon
+            # alone drops the words only when there is a picture; and the
+            # words it was renamed to. `self.text` stays the program's own,
+            # since that is what code compares. Asked of the root, not held on
+            # the class: a class attribute pointed at whichever window was
+            # made last, and kept a closed one's Tk images alive.
+            root = self._root()
+            show = getattr(root, "pill_show", lambda _t: "both")(self.text)
+            icon = getattr(root, "pill_icon", None)
+            self.image = (icon(self.text, self.font.metrics("linespace"))
+                          if icon is not None and show != "text" else None)
+            shown = getattr(root, "pill_rename", lambda _t: None)(self.text) or self.text
+            words = shown if not (self.image and show == "icon") else ""
             tw = self.font.measure(words)
             lead = (self.image.width() + (self.font.measure(" ") if words else 0)
                     if self.image else 0)

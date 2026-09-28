@@ -1764,6 +1764,14 @@ class TestPrefs(unittest.TestCase):
         # A hand edit: a size nobody offered, and icons pointing out of the folder.
         p.set(button_show={"Send": "icon", "Stop": "loud", "Go": "text"})
         self.assertEqual(self._prefs().get("button_show"), {"Send": "icon", "Go": "text"})
+        p.set(rounding=1.35, text_size=0.85, names={"chat": "  Talk   to me ", "x": 3,
+                                                     "y": "   "})
+        again = self._prefs()
+        self.assertEqual((again.get("rounding"), again.get("text_size")), (1.35, 0.85))
+        self.assertEqual(again.get("names"), {"chat": "Talk to me"})
+        p.set(rounding=True, text_size=9.0)
+        again = self._prefs()
+        self.assertEqual((again.get("rounding"), again.get("text_size")), (1.0, 1.0))
         p.set(rounding=40, text_size="huge",
               icons={"chat": r"..\..\secret.png", "ps": "C:/x.png", "ok": "a.png",
                      "bad": 7})
@@ -2983,7 +2991,7 @@ class TestGui(unittest.TestCase):
         self.app._text_size(1.0)
         self.app.update()
         self.assertEqual(self.app.f_ui.cget("size"), before)
-        self.assertIn(1.0, [v for v, _l in ui.TEXT_SIZES])
+        self.assertTrue(ui.in_range(1.0, ui.TEXT_RANGE))
 
     def test_corners_repaint_the_live_window_and_keep_transcripts(self):
         import core.ui as ui
@@ -3007,6 +3015,8 @@ class TestGui(unittest.TestCase):
                     labels.append(child.text)
                 elif isinstance(child, self.mod.tk.Label):
                     labels.append(child.cget("text"))
+                elif isinstance(child, self.mod.tk.Entry):
+                    labels.append(child.get())
                 walk(child)
         walk(win)
         return labels
@@ -3017,8 +3027,7 @@ class TestGui(unittest.TestCase):
         win = self.app.windows["prefs"]
         self.addCleanup(win.destroy)
         labels = self._widget_labels(win)
-        for want in ("CORNERS", "Square", "Round", "TEXT SIZE", "Larger", "ICONS",
-                     "Change icons..."):
+        for want in ("CORNERS", "TEXT SIZE", "100%", "ICONS", "Change icons..."):
             self.assertIn(want, labels)
         self.app._icons_window()
         self.app.update()
@@ -3026,7 +3035,109 @@ class TestGui(unittest.TestCase):
         self.addCleanup(icons_win.destroy)
         labels = self._widget_labels(icons_win)
         for app in eng.TABS:                  # Chat and the panel tabs too
-            self.assertIn(self.mod.clip(app.name, 22), labels)
+            self.assertIn(app.name, labels)
+        for want in ("CONNECTIONS", "Inference", "Bridges"):
+            self.assertIn(want, labels)
+
+    def _scales(self, win):
+        found = []
+
+        def walk(w):
+            for child in w.winfo_children():
+                if isinstance(child, self.mod.tk.Scale):
+                    found.append(child)
+                walk(child)
+        walk(win)
+        return found
+
+    def test_corners_and_text_size_are_sliders_applied_when_the_drag_pauses(self):
+        import core.ui as ui
+        self.app._prefs_window()
+        self.app.update()
+        win = self.app.windows["prefs"]
+        self.addCleanup(win.destroy)
+        corners, text = self._scales(win)
+        self.assertEqual((float(corners.cget("from")), float(corners.cget("to"))),
+                         ui.ROUNDING_RANGE)
+        self.assertEqual((float(text.cget("from")), float(text.cget("to"))),
+                         ui.TEXT_RANGE)
+        before = self.app.f_ui.cget("size")
+        text.set(1.25)
+        corners.set(1.75)
+        self.app.update()
+        self.assertEqual(self.app.prefs.get("text_size"), 1.0)   # not mid-drag
+        deadline = time.time() + 2
+        while self.app.prefs.get("text_size") != 1.25 and time.time() < deadline:
+            time.sleep(0.05)
+            self.app.update()
+        self.assertEqual(self.app.prefs.get("text_size"), 1.25)
+        self.assertEqual(self.app.prefs.get("rounding"), 1.75)
+        self.assertEqual(ui.ROUNDING, 1.75)
+        self.assertEqual(self.app.f_ui.cget("size"), round(before * 1.25))
+        self.app._text_size(1.0)
+        self.app._rounding(1.0)
+        self.app.update()
+
+    def test_renaming_an_app_a_button_and_a_connection_shows_everywhere(self):
+        sid = self.app.order[0]
+        app = self.app.sessions[sid].app
+        self.app._rename(sid, "My Renamed App", app.name)
+        self.addCleanup(self.app._rename, sid, "", app.name)
+        self.assertEqual(self.app.tab_ui[sid]["label"].cget("text"), "My Renamed App")
+        menu = self.app._menu_tabs()
+        self.assertIn("My Renamed App", " ".join(self._labels(menu)))
+        # A button: the words change, the program's own label does not.
+        pill = self.app._button(self.app, "Rename probe", lambda: None)
+        self.addCleanup(pill.destroy)
+        self.app._rename("button:Rename probe", "Go", "Rename probe")
+        self.addCleanup(self.app._rename, "button:Rename probe", "", "Rename probe")
+        words = [pill.itemcget(i, "text") for i in pill.find_all()
+                 if pill.type(i) == "text"]
+        self.assertEqual(words, ["Go"])
+        self.assertEqual(pill.cget("text"), "Rename probe")
+        # The Inference row, with an icon on it too.
+        self.app._rename("conn:host", "Brain", "Inference")
+        self.addCleanup(self.app._rename, "conn:host", "", "Inference")
+        titles = [lbl.cget("text") for lbl, key, *_ in self.app.dressed
+                  if key == "conn:host" and lbl.winfo_exists()]
+        self.assertEqual(titles, ["Brain"])
+        self._keep_icon("conn:host")
+        self.addCleanup(self.app._set_icon, "conn:host", None)
+        dressed = [lbl for lbl, key, *_ in self.app.dressed
+                   if key == "conn:host" and lbl.winfo_exists()]
+        self.assertTrue(dressed[0].cget("image"))
+        self.assertEqual(dressed[0].cget("text"), " Brain")
+        # Blank takes a rename away.
+        self.app._rename("conn:host", "  ", "Inference")
+        self.assertNotIn("conn:host", self.app.prefs.get("names"))
+
+    def test_reset_in_the_icons_window_takes_back_icon_name_and_show(self):
+        self._keep_icon("conn:bridges")
+        self.app._rename("conn:bridges", "Links", "Bridges")
+        self.app._set_button_show("conn:bridges", "icon")
+        self.app._icons_window()
+        self.app.update()
+        win = self.app.windows["icons"]
+        self.addCleanup(win.destroy)
+        field = next(w for w in self._all(win)
+                     if isinstance(w, self.mod.tk.Entry) and w.get() == "Links")
+        reset = next(w for w in self._all(field.master)
+                     if isinstance(w, self.mod.Pill) and w.text == "Reset")
+        self.assertEqual(reset.state, "normal")
+        reset.invoke()
+        self.app.update()
+        self.assertNotIn("conn:bridges", self.app.prefs.get("icons"))
+        self.assertNotIn("conn:bridges", self.app.prefs.get("names"))
+        self.assertNotIn("conn:bridges", self.app.prefs.get("button_show"))
+        self.assertEqual(field.get(), "Bridges")
+        self.assertEqual(reset.state, "disabled")
+
+    def _all(self, w):
+        out = []
+        for child in w.winfo_children():
+            out.append(child)
+            out += self._all(child)
+        return out
 
     def _keep_icon(self, key):
         """Upload a small green square as `key`'s icon, synchronously."""
@@ -3093,15 +3204,20 @@ class TestGui(unittest.TestCase):
         self.assertGreaterEqual(labels.count("Icon"), 1)
         self.assertEqual(labels.count("Text"), labels.count("Both"))
 
-    def test_the_button_hooks_do_not_keep_the_window_alive(self):
-        """A class attribute holding the window outright kept a closed one's
-        Tk images until Python freed them on a worker thread, which kills
-        the process ("Tcl_AsyncDelete ... wrong thread")."""
-        for hook in (self.mod.Pill.icon, self.mod.Pill.show):
-            held = [c.cell_contents for c in (hook.__closure__ or ())]
-            self.assertFalse(any(isinstance(h, self.mod.Chat) for h in held))
-            self.assertIs(getattr(hook, "__self__", None), None)
-        self.assertEqual(self.mod.Pill.show("anything unset"), "both")
+    def test_buttons_ask_their_own_window_and_nothing_is_held_on_the_class(self):
+        """Class-level hooks pointed at whichever window was made last - a
+        closed one, once a test made a second - and kept its Tk images
+        alive until Python freed them on a worker thread, which kills the
+        process ("Tcl_AsyncDelete ... wrong thread")."""
+        for name in ("icon", "show", "rename"):
+            self.assertFalse(hasattr(self.mod.Pill, name), name)
+        # A pill under another root, with no Studio window, draws plainly.
+        other = self.mod.tk.Tk()
+        self.addCleanup(other.destroy)
+        plain = self.mod.Pill(other, "Plain", lambda: None, self.mod.tkfont.Font(
+            root=other, size=9), self.app.PILL_ROLES["quiet"])
+        plain.paint(self.app.C)
+        self.assertIsNone(plain.image)
 
     def test_a_glyph_buttons_icon_replaces_its_character(self):
         add = self.app.btn_add
