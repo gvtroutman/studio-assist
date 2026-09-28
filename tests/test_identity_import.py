@@ -46,6 +46,29 @@ class IdentityImportTests(unittest.TestCase):
         editor.status.assert_called_once()
         self.assertEqual(pics['paths'], ['front', 'side', 'other'])
 
+    def test_breed_takes_exactly_two_and_angles_at_least_one(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = []
+            for n in range(3):
+                paths.append(os.path.join(folder, '%d.png' % n))
+                Path(paths[-1]).write_bytes(PNG)
+            editor = RecordEditor.__new__(RecordEditor)
+            editor.status = mock.Mock()
+            editor.owner = mock.Mock(lora_build=None)
+            with mock.patch('apps.image_studio.ui.NewPhotos') as window:
+                for sel, mode, opens in (({0}, 'breed', False), ({0, 1, 2}, 'breed', False),
+                                         ({0, 2}, 'breed', True), (set(), 'angles', False),
+                                         ({1, 2}, 'angles', True)):
+                    window.reset_mock()
+                    pics = {'paths': paths, 'sel': sel}
+                    editor._new_photos(pics, mode)
+                    self.assertEqual(window.called, opens, (sel, mode))
+                self.assertEqual(window.call_args[0][3], paths[1:])
+                editor.owner.lora_build = object()      # training holds the GPU
+                window.reset_mock()
+                editor._new_photos({'paths': paths, 'sel': {0, 1}}, 'breed')
+                window.assert_not_called()
+
     def test_save_cannot_publish_an_incomplete_import(self):
         editor = RecordEditor.__new__(RecordEditor)
         editor._imports = 1
