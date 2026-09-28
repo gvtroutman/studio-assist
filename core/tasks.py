@@ -931,7 +931,15 @@ class Executor:
         self.record.journal.append(entry)
         self._save()  # record intent before a call can change the project
         try:
-            result = self.mcp.call_tool(name, args)
+            result = self.mcp.call_tool(name, args, cancel=self.cancel)
+        except eng.Cancelled as e:
+            # The Stop the model's own loop is about to notice anyway
+            # (`self.cancel.is_set()`, checked between calls); this is the
+            # same stop, just caught early enough to end a call that would
+            # otherwise block for minutes. Not a tool error.
+            entry["status"] = "unknown" if not read else "error"
+            entry["result"] = str(e)
+            raise
         except (TimeoutError, ConnectionError, BrokenPipeError, EOFError) as e:
             self.failed_calls.add(signature)
             entry["status"] = "unknown" if not read else "error"
@@ -1257,6 +1265,10 @@ class Executor:
                         # nothing for the notebook to learn a platitude from.
                         out = "Not executed: " + str(e)
                         repeated = True
+                    except eng.Cancelled as e:
+                        # Not a tool error: the bridge call was interrupted by
+                        # The user's own Stop, already reflected in self.cancel.
+                        out = "Cancelled: " + str(e)
                     except Exception as e:
                         out = "TOOL ERROR: " + str(e)
                         if self.record.journal and self.record.journal[-1].get("status") == "unknown":

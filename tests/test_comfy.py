@@ -230,7 +230,7 @@ class ComfyBridgeTest(unittest.TestCase):
         finished; the model could only answer with studio_task_update, and the
         conversation cycled on the task record until it stopped 'unverified'."""
         class Bridge:
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 return comfy.call_tool(name, args)
 
         class LLM:
@@ -788,7 +788,7 @@ class ComfyBridgeTest(unittest.TestCase):
     def test_only_rendering_tools_make_room_first(self):
         calls = []
         class Bridge:
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 calls.append(name)
                 return {}
             instructions = "x"
@@ -815,7 +815,7 @@ class ComfyBridgeTest(unittest.TestCase):
     def test_the_tabs_model_comes_back_even_when_the_render_fails(self):
         calls = []
         class Broken:
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 raise TimeoutError("bridge gone")
         wrapped = eng.YieldGPU(Broken(), {"comfy_generate"}, lambda: 16384,
                                lambda ctx: calls.append(ctx))
@@ -834,7 +834,7 @@ class ComfyBridgeTest(unittest.TestCase):
         away rather than loading it only to unload it again."""
         order = []
         class Bridge:
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 order.append(name)
                 return {"content": [{"type": "image", "data": "x"}]}
         windows = iter([32768, None])     # what it had; then, away, nothing
@@ -871,7 +871,7 @@ class ComfyBridgeTest(unittest.TestCase):
                 asked.append("check")
                 return "A fox in the snow.\nMatches the brief."
         class Bridge:
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 return {"content": [{"type": "text", "text": "saved fox.png"},
                                     {"type": "image", "mimeType": "image/png", "data": "x"}]}
         seen = []
@@ -899,7 +899,7 @@ class ComfyBridgeTest(unittest.TestCase):
         class Bridge:
             def settle(self):
                 order.append("settle")
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 order.append(name)
                 return {"content": [{"type": "text", "text": "ok"}]}
         class LLM:
