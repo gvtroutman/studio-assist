@@ -389,6 +389,9 @@ class ImageStudio:
     def button(self, parent, text, command, kind="quiet", bg="bg", **kw):
         return self.host._button(parent, text, command, kind=kind, bg=bg, **kw)
 
+    def switch(self, parent, var, command=None, bg="bg"):
+        return self.host._switch(parent, var, command=command, bg=bg)
+
     def say(self, text, role="muted"):
         self.note.config(text=text)
         self.skin(self.note, bg="bg", fg=role)
@@ -3351,11 +3354,7 @@ class RecordEditor:
                 self.widgets[key] = (kind, t)
             elif kind == "bool":
                 var = tk.BooleanVar(value=bool(val))
-                b = tk.Checkbutton(parent, text="yes", variable=var, anchor="w",
-                                   font=host.f_ui, bd=0, highlightthickness=0)
-                o.skin(b, bg="bg", fg="text", activebackground="bg", selectcolor="card",
-                       activeforeground="text")
-                b.pack(side="top", fill="x")
+                o.switch(parent, var).pack(side="top", anchor="w")
                 self.widgets[key] = (kind, var)
             elif isinstance(kind, tuple) and kind[0] == "choice":
                 var = tk.StringVar(value=val or "")
@@ -5656,12 +5655,16 @@ class AddonsWindow:
         o.choice(mid, [(k, "Made for " + v if k else v) for k, v in fams], rec["family"],
                  lambda v, r=rec: self.set_family(r, v), bg="card").pack(
             side="top", anchor="w", pady=(o.px(4), 0))
-        o.button(right, "Turn off" if on else "Turn on",
-                 lambda r=rec: self.flip(r, "enabled"), bg="card",
-                 kind="option" if on else "accent").pack(side="top", fill="x")
-        o.button(right, "Always on ✓" if rec.get("always") else "Always on",
-                 lambda r=rec: self.flip(r, "always"), kind="option", bg="card").pack(
-            side="top", fill="x", pady=(o.px(4), 0))
+        def switch_row(text, key, val):
+            row = o.frame(right, bg="card")
+            row.pack(side="top", fill="x", pady=(0, o.px(4)))
+            var = tk.BooleanVar(value=bool(val))
+            o.switch(row, var, lambda r=rec, k=key: self.flip(r, k), bg="card").pack(
+                side="left")
+            o.label(row, text, "text", host.f_small, bg="card").pack(
+                side="left", padx=(o.px(6), 0))
+        switch_row("On" if on else "Off", "enabled", on)
+        switch_row("Always on", "always", rec.get("always"))
         if rec.get("source", "").startswith("https://civitai.com/"):
             o.button(right, "Page", lambda u=rec["source"]: webbrowser.open(u),
                      kind="option", bg="card").pack(side="top", fill="x", pady=(o.px(4), 0))
