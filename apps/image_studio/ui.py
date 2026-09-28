@@ -704,10 +704,12 @@ class ImageStudio:
             if img:
                 portraits[ident["id"]] = img
         self.identity_photos = portraits
-        # Characters first (a look and a face), then the profiles alone (a
-        # face); a character shows its profile's portrait.
+        # Characters first (a look and a face), then the profiles not already
+        # wrapped by a character (a face alone); a character shows its
+        # profile's portrait.
         people = [("", "No one")] + [("c:" + c["id"], c["name"]) for c in chars]
-        idents = lib.all("identities")
+        wrapped = {c.get("identity") for c in chars}
+        idents = [i for i in lib.all("identities") if i["id"] not in wrapped]
         if chars and idents:
             people.append((None, ""))
         people += [("i:" + i["id"], i["name"]) for i in idents]
