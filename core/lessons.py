@@ -9,11 +9,17 @@ that memory: a Notebook of one-line lessons per app, on disk beside the
 settings, folded into the prompt at boot and, when one is added mid-session,
 carried at the tail of the request until the next boot.
 
-Lessons come from four places, each marked by `source`:
+Lessons come from five places, each marked by `source`:
 
   user    - a message that begins "remember ..." / "from now on ..." is stored
             as it stands (`explicit_lesson`), and a correction ("no, ...",
             "I meant ...") marks the run for reflection (`looks_like_correction`).
+  trainer - Claude Code, reviewing OpenCode's tasks from outside this app
+            through apps/opencode/trainer_mcp.py. Outranks all but the user's.
+
+The files are shared with that other process, so a notebook re-reads its file
+whenever it changed on disk (`_sync`) before it is read or edited: otherwise
+the app would save its old list over a lesson the trainer had just kept.
   model   - the studio_remember tool, which the prompt tells the model to use
             for a convention it found or a correction it was given.
   error   - a validator refusal (`Executor.refusals`): an unsupported action,
@@ -42,7 +48,7 @@ REFUSALS_PER_RUN = 3      # validator refusals learned from one run
 REFLECT_CHARS = 24000     # of the conversation the reflection sees
 
 # Higher survives longer when the notebook is full.
-PRIORITY = {"user": 3, "model": 2, "review": 1, "error": 0}
+PRIORITY = {"user": 4, "trainer": 3, "model": 2, "review": 1, "error": 0}
 
 REMEMBER_TOOL = {"type": "function", "function": {
     "name": "studio_remember",
@@ -125,6 +131,19 @@ class Notebook:
         self.lessons = []
         self.problem = None
         self._carried = set()
+        self._stamp = None        # the file's mtime and size when last read or written
+
+    def _disk_stamp(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_mtime_ns, st.st_size)
+        except (OSError, TypeError):
+            return None
+
+    def _sync(self):
+        """Re-read the file if another process changed it since we last did."""
+        if self.path and self._stamp is not None and self._disk_stamp() != self._stamp:
+            self.load()
 
     @classmethod
     def for_app(cls, app_id, base=None):
@@ -140,8 +159,10 @@ class Notebook:
     def load(self):
         """Read the lessons back; returns a problem sentence or None."""
         self.lessons, self.problem = [], None
+        self._stamp = ()          # loaded: from now on, a change on disk is noticed
         if not self.path or not os.path.exists(self.path):
             return None
+        self._stamp = self._disk_stamp()
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -173,6 +194,7 @@ class Notebook:
                     json.dump({"version": 1, "app": self.app_id, "lessons": self.lessons},
                               f, indent=1, ensure_ascii=False)
                 os.replace(tmp, self.path)
+                self._stamp = self._disk_stamp()
             finally:
                 if os.path.exists(tmp):
                     os.unlink(tmp)
@@ -183,6 +205,7 @@ class Notebook:
     # --------------------------------------------------------------- editing
 
     def find(self, text):
+        self._sync()
         key = normal(text)
         for lesson in self.lessons:
             if normal(lesson["text"]) == key:
@@ -197,7 +220,7 @@ class Notebook:
             raise ValueError("a lesson is at least a short sentence")
         if source not in PRIORITY:
             source = "model"
-        existing = self.find(text)
+        existing = self.find(text)        # re-reads the file if it changed
         if existing is not None:
             existing["hits"] += 1
             if PRIORITY[source] > PRIORITY[existing["source"]]:
@@ -241,6 +264,7 @@ class Notebook:
     # ------------------------------------------------------------- rendering
 
     def ordered(self):
+        self._sync()
         return sorted(self.lessons, key=lambda l: (l["created"], l["text"]))
 
     @staticmethod
@@ -278,6 +302,8 @@ class Stack:
 
     @property
     def lessons(self):
+        for _, nb in self.layers:
+            nb._sync()
         return [l for _, nb in self.layers for l in nb.lessons]
 
     @property
