@@ -841,6 +841,20 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
     def test_identity_preset_wants_a_person(self):
         self.assertTrue(self.plan(preset="identity", scene="x").errors)
 
+    def test_preview_graph_uses_the_local_file_not_an_upload(self):
+        src = os.path.join(self.dir, "frame.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        p = self.plan(model="flux-dev", scene="x", references={"source": src}, denoise=0.8)
+        graph = ig.preview_graph(p)
+        self.assertIsNotNone(graph)
+        node = next(n for n in graph.values() if n["inputs"].get("image") == "frame.png")
+        self.assertEqual(node["class_type"], "LoadImage")
+
+    def test_preview_graph_is_none_without_a_workflow_or_with_errors(self):
+        self.assertIsNone(ig.preview_graph(None))
+        self.assertIsNone(ig.preview_graph(self.plan(preset="identity", scene="x")))
+
 
 class TestRouting(TempStudioMixin, unittest.TestCase):
     def test_role_decides_and_falls_back(self):
