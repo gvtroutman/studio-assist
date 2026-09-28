@@ -90,6 +90,9 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
   `OPENCODE_GROUPS`, the `id="opencode"` entry in `APPS`, `OPENCODE_PROMPT`.
   `OPENCODE_READ_CAP` = `apps/opencode/read_cap.js`, an OpenCode plugin always loaded:
   a read with no line range on a file over 400 lines gets 400 lines and a grep hint.
+  `OPENCODE_REPO_MAP` = `apps/opencode/repomap.py`, MCP server "repo" always loaded:
+  `repo_map` (`t_map`: `folder_map` / `file_map`, `outline_py` via ast) and `repo_find`
+  (`t_find`), built from disk on each call. Tests: `tests/test_repomap.py`.
   State (config, password, `last_session`, log) in `%LOCALAPPDATA%\StudioAssistant\opencode`.
 - **Bridge** - `apps/opencode/mcp.py`: `t_ask` -> `start_task` (git worktree per
   task, `tasks.json`) -> `prompt` -> `finish` -> `follow` (woken by `Events`, the

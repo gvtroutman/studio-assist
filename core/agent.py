@@ -2641,6 +2641,9 @@ OPENCODE_BRIEF_ANY = os.path.join(os.path.abspath(os.path.join(os.path.dirname(_
 # Our own OpenCode plugin: a read with no line range on a long file gets the
 # first lines and a note to grep and read around the match (apps/opencode/read_cap.js).
 OPENCODE_READ_CAP = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "apps", "opencode", "read_cap.js")
+# Our own MCP server "repo": repo_map outlines a folder or file with line
+# ranges, repo_find says where a name is defined (apps/opencode/repomap.py).
+OPENCODE_REPO_MAP = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "apps", "opencode", "repomap.py")
 
 
 def own_repo(workspace):
@@ -2683,6 +2686,10 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
     for k, v in extra.pop("permission", {}).items():
         cfg["permission"].setdefault(k, v)
     cfg["plugin"] += extra.pop("plugin", [])
+    # Ours first; an add-on of the same name does not replace it.
+    cfg["mcp"] = dict(extra.pop("mcp", {}))
+    cfg["mcp"]["repo"] = {"type": "local", "command": [sys.executable, OPENCODE_REPO_MAP],
+                          "enabled": True}
     cfg.update(extra)
     return cfg
 

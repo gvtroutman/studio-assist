@@ -7,6 +7,9 @@ context window. These rules hold in every folder; a project may add its own.
 - Look for the project's own guide first: `AGENTS.md`, `CLAUDE.md`, `README.md`,
   `CONTRIBUTING.md`, a `docs/` folder. Check its size before reading it: over ~20k
   characters, do NOT read it whole - grep it for the topic you need.
+- Map before you read: `repo_map` on a folder lists its files with classes and
+  functions and their line ranges; on a file, its full outline. `repo_find` says where
+  a name is defined. Then read just those lines with offset and limit.
 - Read the function you will change, not the whole file. Grep for its callers.
 - Follow the project's conventions (style, test runner, dependency rules) over your
   own habits. Never add a dependency the project does not already use without saying
