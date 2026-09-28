@@ -1050,16 +1050,31 @@ def checkpoint(sid, label):
     return sha
 
 
+# An app package whose tests are named after something else.
+TEST_ALIASES = {"comfyui": "comfy", "image_studio": "imagegen"}
+# Module names every app has; apps/<app>/mcp.py is tested by test_<app>, not test_mcp.
+GENERIC_MODULES = {"mcp", "ui", "view"}
+
+
 def tests_for(root, files):
     """The test modules that cover `files`: a changed test file itself, and
-    tests/test_<name>.py for a changed module (studio_ and _mcp/_ui dropped)."""
+    tests/test_<name>.py for a changed module (studio_ and _mcp/_ui dropped).
+    In apps/<app>/ the app's name is tried too: apps/opencode/mcp.py ->
+    test_opencode, apps/comfyui/view.py -> test_comfy_view."""
     mods = []
     for f in files:
         if not f.endswith(".py"):
             continue
         name = os.path.basename(f)[:-3]
+        parts = f.replace("\\", "/").split("/")
+        app = parts[-2] if len(parts) >= 3 and parts[-3] == "apps" else None
         if name.startswith("test_"):
             candidates = [name]
+        elif app:
+            a = TEST_ALIASES.get(app, app)
+            base = re.sub(r"_(mcp|ui)$", "", name)
+            candidates = [] if name in GENERIC_MODULES else ["test_" + name]
+            candidates += ["test_%s_%s" % (a, name), "test_%s_%s" % (a, base), "test_" + a]
         else:
             stem = name[7:] if name.startswith("studio_") else name
             candidates = ["test_" + stem, "test_" + re.sub(r"_(mcp|ui)$", "", stem)]

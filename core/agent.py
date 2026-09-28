@@ -2638,6 +2638,9 @@ def addons_config(addons):
 OPENCODE_CONTEXT = 65536   # the window OpenCode's model is loaded with, at least
 OPENCODE_BRIEF = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "docs", "OPENCODE.md")
 OPENCODE_BRIEF_ANY = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "docs", "OPENCODE_ANY.md")
+# Our own OpenCode plugin: a read with no line range on a long file gets the
+# first lines and a note to grep and read around the match (apps/opencode/read_cap.js).
+OPENCODE_READ_CAP = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "apps", "opencode", "read_cap.js")
 
 
 def own_repo(workspace):
@@ -2671,6 +2674,7 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
         "permission": dict(OPENCODE_PERMISSIONS),
         "autoupdate": False,
         "share": "disabled",
+        "plugin": ["file:///" + OPENCODE_READ_CAP.replace(os.sep, "/")],
     }
     if brief:
         cfg["instructions"] = [brief] if isinstance(brief, str) else list(brief)
@@ -2678,6 +2682,7 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
     # An add-on's permissions only add to the ones above; none is loosened.
     for k, v in extra.pop("permission", {}).items():
         cfg["permission"].setdefault(k, v)
+    cfg["plugin"] += extra.pop("plugin", [])
     cfg.update(extra)
     return cfg
 

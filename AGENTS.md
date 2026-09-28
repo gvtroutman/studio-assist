@@ -1417,8 +1417,8 @@ OpenCode's to keep and invisible.
   user's uncommitted edits are not in it. A folder that is not a repo gets no copy and
   works in place, as before (`isolated: false`).
 - **After each ask that ends idle** (`after_ask`): the changed files' tests run in the
-  copy - `tests_for` maps `studio_x.py`/`studio_x_mcp.py`/`studio_x_ui.py` to
-  `tests/test_x.py`, a changed test file to itself - with `TEST_TIMEOUT`; then a
+  copy - `tests_for` maps `core/x.py` to `tests/test_x.py`, `apps/<app>/mcp.py` /
+  `ui.py` to `tests/test_<app>.py` (`TEST_ALIASES` for comfy, imagegen), a changed test file to itself - with `TEST_TIMEOUT`; then a
   checkpoint commit (identity `OpenCode <opencode@localhost>`) on the task's branch.
   The report says passed/FAILED with the output's tail. These tests run code the user
   approved edit by edit, in the copy, without another ask.
