@@ -3609,6 +3609,25 @@ PEOPLE = re.compile(r"\b(wom[ae]n|m[ae]n|person|people|girls?|boys?|lady|ladies|
                     r"crowd|dancers?|athletes?|workers?|someone|figure)\b", re.I)
 
 
+# What a person wears when nothing names a garment: never nothing. "Natural
+# anatomy" and the chest words alone read to FLUX as undressed. A scene that
+# asks for bare skin gets the floor too; only a named garment replaces it.
+COVERED = "wearing plain underwear"
+GARMENTS = re.compile(
+    r"\b(wear(s|ing)?|dressed|clothe[sd]|clothing|outfits?|uniforms?|costumes?|"
+    r"(t-?)?shirts?|blouses?|(tank|crop) tops?|sweaters?|jumpers?|hoodies?|cardigans?|vests?|"
+    r"dress(es)?|gowns?|skirts?|suits?|tuxedos?|jackets?|coats?|blazers?|robes?|"
+    r"kimonos?|sarees?|saris?|jeans|trousers|pants|shorts|leggings|overalls|"
+    r"underwear|lingerie|bras?|briefs|boxers|panties|bikinis?|swimsuits?|"
+    r"swim ?trunks|armou?r|pyjamas|pajamas|towel)\b", re.I)
+
+
+def is_dressed(settings):
+    """Whether the form or the scene names something the person wears."""
+    return bool(any(_field(settings, k) for k in ("top", "bottom", "outerwear"))
+                or GARMENTS.search(_field(settings, "scene")))
+
+
 def anatomy_text():
     parts = [pos for _, pos, _ in ANATOMY]
     return "Anatomically correct: every person has exactly " + _and(parts)
@@ -4117,8 +4136,9 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     person = person_text(s)
     named = " and ".join(t for t in who if t not in scene)
     posed = bool((s.get("references") or {}).get("pose"))
+    covered = COVERED if has_person(s, bool(idents)) and not is_dressed(s) else ""
     parts = [x for x in (view_text(s.get("view"), posed),
-                         ", ".join(x for x in (named, person) if x), scene,
+                         ", ".join(x for x in (named, person, covered) if x), scene,
                          _field(s, "camera")) if x]
     descriptions = identity_description_text(s, lib, idents)
     parts.extend(descriptions)
