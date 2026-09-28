@@ -908,7 +908,10 @@ class Loopback:
             if not cursor:
                 return tools
 
-    def call_tool(self, name, arguments):
+    def call_tool(self, name, arguments, cancel=None):
+        # In-process and synchronous: nothing can interrupt handle() once it is
+        # called, so `cancel` (accepted for the same call_tool(..., cancel=)
+        # contract every bridge client shares) has nothing to check here.
         return self.request("tools/call", {"name": name, "arguments": arguments,
                                            "_meta": {"progressToken": self._id + 1}})
 

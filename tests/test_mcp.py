@@ -709,3 +709,59 @@ class TestElicitation(unittest.TestCase):
                              {"action": "cancel"})
         finally:
             sys.stdout = real
+
+
+# --------------------------------------------------------------- user Stop
+#
+# core/tasks.py's Executor.cancel is set by the chat window's Stop button but
+# was only ever checked between calls; a call already in flight - opencode_ask
+# can run for minutes - had nothing that would interrupt it. MCPClient.request
+# now polls a passed-in cancel event on the same schedule it already polls for
+# a reply, so a slow bridge's tool call ends within about a second of Stop
+# rather than running to its own timeout.
+
+SLOW = r'''
+import sys, time
+sys.path.insert(0, %r)
+import core.mcp as mcp
+
+def slow(a):
+    for _ in range(8):                    # 4s if nothing interrupts it
+        if mcp.cancelled():
+            return mcp.result("stopped mid-work")
+        mcp.progress("still working")
+        time.sleep(0.5)
+    return mcp.result("finished without being stopped")
+
+tools = [mcp.Tool("slow", slow, "Takes a while.", {"type": "object", "properties": {}})]
+sys.exit(mcp.main(mcp.Server("slow", "1", tools)))
+'''
+
+
+class TestClientCancellation(unittest.TestCase):
+    def test_stop_ends_a_slow_call_promptly_instead_of_waiting_it_out(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        client = eng.MCPClient(sys.executable, ["-c", SLOW % here], quiet=True)
+        try:
+            client.initialize(timeout=30)
+            cancel = threading.Event()
+            threading.Timer(0.3, cancel.set).start()
+            started = time.monotonic()
+            with self.assertRaises(eng.Cancelled):
+                client.call_tool("slow", {}, cancel=cancel)
+            # The tool sleeps in half-second steps for up to 4s; ending well
+            # under that is the fix - the old code waited for the call to
+            # return on its own no matter when Stop was pressed.
+            self.assertLess(time.monotonic() - started, 2.0)
+        finally:
+            client.close(grace=0.5)
+
+    def test_without_a_cancel_event_a_call_runs_to_completion_as_before(self):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        client = eng.MCPClient(sys.executable, ["-c", SLOW % here], quiet=True)
+        try:
+            client.initialize(timeout=30)
+            res = client.call_tool("slow", {})
+            self.assertIn("finished", res["content"][0]["text"])
+        finally:
+            client.close(grace=0.5)

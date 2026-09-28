@@ -81,6 +81,10 @@ def log(msg, quiet=False):
         print(msg, file=sys.stderr, flush=True)
 
 
+class Cancelled(RuntimeError):
+    """The user pressed Stop while an MCPClient call was in flight."""
+
+
 class MCPClient:
     """Minimal MCP stdio client: newline-delimited JSON-RPC over a child process.
 
@@ -161,12 +165,12 @@ class MCPClient:
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
 
-    def request(self, method, params=None, timeout=180):
+    def request(self, method, params=None, timeout=180, cancel=None):
         # One reader owns each response; concurrent calls cannot steal replies.
         with self._request_lock:
-            return self._request(method, params, timeout)
+            return self._request(method, params, timeout, cancel)
 
-    def _request(self, method, params=None, timeout=180):
+    def _request(self, method, params=None, timeout=180, cancel=None):
         with self._lock:
             self._id += 1
             rid = self._id
@@ -181,6 +185,12 @@ class MCPClient:
         deadline = time.monotonic() + timeout
         cap = time.monotonic() + max(timeout, PROGRESS_CAP)
         while True:
+            # The user's Stop, not the bridge's own pace: checked every poll
+            # (below, at most 1s apart) so a call that would otherwise run to
+            # its full timeout - opencode_ask can take 600s - ends promptly.
+            if cancel is not None and cancel.is_set():
+                self._cancel(rid, "user stop")
+                raise Cancelled("the user pressed Stop")
             if self._eliciting:
                 # A person is deciding; the bridge is not hung. The clock
                 # starts again from their answer.
@@ -212,17 +222,20 @@ class MCPClient:
                     deadline = min(time.monotonic() + timeout, cap)
             # Late replies to timed-out serialized requests must not
             # accumulate forever in the inbox.
-        # Tell the bridge we stopped listening; one built on studio_mcp stops
-        # waiting too, and never replies to a request nobody owns.
-        try:
-            self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
-                        "params": {"requestId": rid, "reason": "timeout"}})
-        except Exception:
-            pass
+        self._cancel(rid, "timeout")
         raise TimeoutError("no MCP reply to %s in %ss" % (method, timeout)
                            if time.monotonic() < cap else
                            "no MCP reply to %s in %ss, though it reported progress"
                            % (method, int(max(timeout, PROGRESS_CAP))))
+
+    def _cancel(self, rid, reason):
+        # Tell the bridge we stopped listening; one built on studio_mcp stops
+        # waiting too, and never replies to a request nobody owns.
+        try:
+            self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": rid, "reason": reason}})
+        except Exception:
+            pass
 
     def _server_request(self, msg):
         """A request from the bridge. ping is answered here; an elicitation is
@@ -298,10 +311,11 @@ class MCPClient:
             if not cursor:
                 return tools
 
-    def call_tool(self, name, arguments):
+    def call_tool(self, name, arguments, cancel=None):
         t0 = time.monotonic()
         try:
-            res = self.request("tools/call", {"name": name, "arguments": arguments})
+            res = self.request("tools/call", {"name": name, "arguments": arguments},
+                               cancel=cancel)
         except Exception as e:
             LOG.warning("tool %s failed after %.1fs: %s", name, time.monotonic() - t0, e)
             raise
@@ -1166,14 +1180,14 @@ class YieldGPU:
         self.before, self.after = before, after
         self.away = None                  # (token,) while a render has the model away
 
-    def call_tool(self, name, arguments):
+    def call_tool(self, name, arguments, cancel=None):
         if name not in self.heavy:
-            return self.bridge.call_tool(name, arguments)
+            return self.bridge.call_tool(name, arguments, cancel=cancel)
         token = self.before()
         if self.away:
             token = self.away[0]          # still away: what it had before the first
         try:
-            return self.bridge.call_tool(name, arguments)
+            return self.bridge.call_tool(name, arguments, cancel=cancel)
         finally:
             if self.after:
                 self.away = (token,)
@@ -2124,10 +2138,10 @@ class Router:
         self.bridge, self.sidecar = bridge, sidecar
         self.sidecar_names = frozenset(sidecar_names)
 
-    def call_tool(self, name, arguments):
+    def call_tool(self, name, arguments, cancel=None):
         if name in self.sidecar_names:
-            return self.sidecar.call_tool(name, arguments)
-        return self.bridge.call_tool(name, arguments)
+            return self.sidecar.call_tool(name, arguments, cancel=cancel)
+        return self.bridge.call_tool(name, arguments, cancel=cancel)
 
     def __getattr__(self, attr):
         return getattr(self.bridge, attr)

@@ -270,7 +270,7 @@ class TestExecutor(unittest.TestCase):
 
     def test_stop_during_batch_skips_remaining_calls_and_repairs_history(self):
         cancel = threading.Event()
-        def execute(*args):
+        def execute(*args, **kw):
             cancel.set()
             return {"content": [{"type": "text", "text": "ok"}]}
         bridge = Mock()
@@ -437,7 +437,7 @@ class TestExecutor(unittest.TestCase):
     def test_a_call_the_executor_will_not_run_is_still_shown_as_one(self):
         cancel = threading.Event()
         bridge = Mock()
-        def execute(*args):
+        def execute(*args, **kw):
             cancel.set()
             return {"content": [{"type": "text", "text": "ok"}]}
         bridge.call_tool.side_effect = execute
@@ -489,7 +489,7 @@ class TestToolsByReference(unittest.TestCase):
         self.assertEqual(ex.run(self.messages), "Made")
         self.assertIn('"width"', self.messages[3]["content"])
         self.assertIn("nope: no such tool", self.messages[3]["content"])
-        self.bridge.call_tool.assert_any_call("create_comp", {"width": 10})
+        self.bridge.call_tool.assert_any_call("create_comp", {"width": 10}, cancel=ex.cancel)
         self.assertEqual(ex.record.journal[0]["name"], "create_comp")
         self.assertIn(("tool", {"name": "create_comp", "arguments": {"width": 10}, "via": None}),
                       self.events)
