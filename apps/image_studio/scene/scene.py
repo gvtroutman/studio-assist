@@ -56,10 +56,18 @@ each object go into the prompt as written. The pieces:
   frame as "Name (where it is in the frame, which way a person faces): a
   person's look. The description, verbatim", then the camera. An object outside the frame is
   left out and said so (`Words.notes`).
+- **Instance, part, normal and world-position buffers** (`id_render`): the
+  same rendered polygons, once more, as per-pixel buffers instead of
+  shading - which body a pixel belongs to, which of that body's pieces,
+  which way its surface faces, and the exact 3D point it is - and the
+  sidecar that names the instance and part numbers. Not sent to
+  generation; a render artifact for masking a region, regenerating one
+  part, or compositing after the fact.
 
 No tkinter here; `apps/image_studio/scene/ui.py` is the window. Stdlib only.
 """
 
+import array
 import bisect
 import copy
 import hashlib
@@ -2706,12 +2714,18 @@ class Poly:
     the object and part it belongs to (None for the room). `tex` is a
     `TexMap` when the face wears a picture; `rgb` is then its mean colour.
     `dim` (0-1) makes it a shadow: it darkens what is under it by that
-    factor instead of painting over it, and `rgb` is only a stand-in."""
-    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex", "dim")
+    factor instead of painting over it, and `rgb` is only a stand-in.
+    `cam` is `pts`' own camera-space (x, y, z=depth), None for the room and
+    shadows; `nrm` is the face's unit world-space normal, one for the whole
+    face (flat-shaded, so it never varies across it). `id_render` reads
+    both - `cam` to interpolate world position, `nrm` to fill it straight
+    in - without walking the scene's geometry a second time."""
+    __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex", "dim", "cam", "nrm")
 
-    def __init__(self, pts, rgb, depth, owner, part, tex=None, dim=None):
+    def __init__(self, pts, rgb, depth, owner, part, tex=None, dim=None, cam=None, nrm=None):
         self.pts, self.rgb, self.depth, self.owner, self.part = pts, rgb, depth, owner, part
         self.tex, self.dim = tex, dim
+        self.cam, self.nrm = cam, nrm
 
 
 class TexMap:
@@ -2823,7 +2837,7 @@ def card(obj, cam, tex):
     normal = cross(along, (0, 1, 0))
     depth = cam.to_camera((x, y + h / 2, z))[2]
     return Poly([cam.to_screen(p) for p in c], tex.mean, depth, obj["id"], "body",
-                CutMap(cam, top_left, along, normal, w, h, tex))
+                CutMap(cam, top_left, along, normal, w, h, tex), cam=c, nrm=normal)
 
 
 def render(scene, width=None, height=None):
@@ -2866,7 +2880,7 @@ def render(scene, width=None, height=None):
                     continue
                 depth = sum(p[2] for p in c) / len(c)
                 faces.append(Poly([cam.to_screen(p) for p in c], shade(rgb, n), depth,
-                                  obj["id"], part))
+                                  obj["id"], part, cam=c, nrm=norm(n)))
     faces.sort(key=lambda p: -p.depth)
     return polys + faces
 
@@ -3065,6 +3079,30 @@ def grid_lines(scene, width, height, spacing=1.0, reach=10):
 
 # ==================================================================== raster
 
+def _spans(poly, width, height):
+    """(y, xa, xb) for every screen row a convex poly covers, in frame
+    pixels - xa..xb inclusive, a row with no width left out. The scanline
+    walk `rasterise` and `id_render` both fill from."""
+    pts = poly.pts
+    ys = [p[1] for p in pts]
+    y0 = max(0, int(math.ceil(min(ys) - 0.5)))
+    y1 = min(height - 1, int(math.floor(max(ys) - 0.5)))
+    if y1 < y0:
+        return
+    edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
+    edges = [(a, b) if a[1] <= b[1] else (b, a) for a, b in edges if a[1] != b[1]]
+    for y in range(y0, y1 + 1):
+        yc = y + 0.5
+        xs = [a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+              for a, b in edges if a[1] <= yc < b[1]]
+        if len(xs) < 2:
+            continue
+        xa = max(0, int(math.ceil(min(xs) - 0.5)))
+        xb = min(width - 1, int(math.floor(max(xs) - 0.5)))
+        if xb >= xa:
+            yield y, xa, xb
+
+
 def rasterise(polys, width, height, sky=SKY, flat=False):
     """Painter's-order polygons -> RGB bytes. A scanline fill of convex
     polygons; every face the renderer makes is convex. A face with a picture
@@ -3072,27 +3110,10 @@ def rasterise(polys, width, height, sky=SKY, flat=False):
     buf = bytearray(bytes(sky) * (width * height))
     stride = width * 3
     for poly in polys:
-        pts = poly.pts
-        ys = [p[1] for p in pts]
-        y0 = max(0, int(math.ceil(min(ys) - 0.5)))
-        y1 = min(height - 1, int(math.floor(max(ys) - 0.5)))
-        if y1 < y0:
-            continue
         colour = bytes(poly.rgb)
         tex = None if flat else poly.tex
         dim = bytes(int(v * poly.dim) for v in range(256)) if poly.dim else None
-        edges = [(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
-        edges = [(a, b) if a[1] <= b[1] else (b, a) for a, b in edges if a[1] != b[1]]
-        for y in range(y0, y1 + 1):
-            yc = y + 0.5
-            xs = [a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
-                  for a, b in edges if a[1] <= yc < b[1]]
-            if len(xs) < 2:
-                continue
-            xa = max(0, int(math.ceil(min(xs) - 0.5)))
-            xb = min(width - 1, int(math.floor(max(xs) - 0.5)))
-            if xb < xa:
-                continue
+        for y, xa, xb in _spans(poly, width, height):
             row = y * stride
             a, b = row + xa * 3, row + (xb + 1) * 3
             if dim:
@@ -3531,6 +3552,220 @@ def depth_crop_png(scene, region, size, oid=None):
     for i in range(3):
         rgb[i::3] = grey
     return rgb_png(bytes(rgb), dw, dh)
+
+
+# ===================================================================== ids
+# Which pixels belong to which thing, which way they face, and where they
+# are - not guessed by a model after the fact (SAM over the finished
+# picture, a depth net's relief) but read straight off the same polygons
+# pose and depth already come from, at the same boundaries: a hand round a
+# cup, hair over the background, two people touching. Not sent to
+# generation - only pose and depth condition the ControlNet (`scene_maps`) -
+# these are render artifacts for what comes after: a mask, a regional
+# regeneration, replacing one person's clothes without touching their skin,
+# compositing a corrected arm back in, or - from `world` - answering "what
+# 3D point is this bad pixel" at all.
+#
+# Four buffers, `id_render`'s one pass over `render`'s polygons (no second
+# walk of the scene's geometry):
+# `instance` - which body a pixel belongs to (an object is one instance, a
+# crowd one per member), one byte, 0 for the room and its shadows.
+# `part` - which of that body's pieces (a crowd member is one piece,
+# "body"), one byte, 0 the same way. Both: a part only gets a number when
+# the render actually paints one of its pixels, so the numbering is only
+# promised to agree with itself within one call, not across a moved camera.
+# `normal` - the face's own unit world-space normal (flat-shaded, so it is
+# the same at every pixel of one face) - three `array('f')` floats, (0,0,0)
+# for the room. `world` - the exact world-space point under the pixel,
+# perspective-correct across the face (`_plane`), not just its centre -
+# three `array('f')` floats, (0,0,0) for the room.
+ID_LIMIT = 255                 # the id buffers are one byte a pixel; the 256th body shares 255's
+
+
+def _stable_triangle(xy):
+    """The indices (0, i, i+1) of a convex screen poly's least edge-on
+    triangle, for `_plane` to fit against - None if the whole poly is
+    edge-on (a sliver, invisible either way)."""
+    x0, y0 = xy[0]
+    best = None
+    for i in range(1, len(xy) - 1):
+        x1, y1 = xy[i]
+        x2, y2 = xy[i + 1]
+        det = abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))
+        if best is None or det > best[0]:
+            best = (det, i)
+    if best is None or best[0] < 1e-6:
+        return None
+    return 0, best[1], best[1] + 1
+
+
+def _plane(tri, xy, qs):
+    """(a, b, c): q = a + b*x + c*y across the screen, fit to `qs` at the
+    three screen points `xy` names by `tri` - affine across a flat, convex
+    poly under perspective projection, the trick `_fill_depth` uses for
+    1/z, reused here for camera-space x/z and y/z too."""
+    i0, i1, i2 = tri
+    x0, y0 = xy[i0]
+    x1, y1 = xy[i1]
+    x2, y2 = xy[i2]
+    q0, q1, q2 = qs[i0], qs[i1], qs[i2]
+    det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+    b = ((q1 - q0) * (y2 - y0) - (q2 - q0) * (y1 - y0)) / det
+    c = ((x1 - x0) * (q2 - q0) - (x2 - x0) * (q1 - q0)) / det
+    a = q0 - b * x0 - c * y0
+    return a, b, c
+
+
+def _instance_owners(scene):
+    """{(object id, crowd member key or None): instance id}, 1 up in scene
+    order, capped at ID_LIMIT. A crowd is one instance per member (its
+    pieces are already parted "m0", "m1", ... by `crowd_pieces`); anything
+    else is one instance for the whole object."""
+    owners = {}
+    for obj in scene["objects"]:
+        if obj["asset"] == "crowd":
+            for m in range(len(crowd_members(obj["crowd"]))):
+                owners[(obj["id"], "m%d" % m)] = min(ID_LIMIT, len(owners) + 1)
+        else:
+            owners[(obj["id"], None)] = min(ID_LIMIT, len(owners) + 1)
+    return owners
+
+
+def _instance_meta(obj, member):
+    """The sidecar entry for one instance: `member` is a crowd piece's part
+    ("m3"), or None for a plain object."""
+    if member is not None:
+        return {"owner": obj["id"], "name": "%s %s" % (obj["name"], member[1:]),
+                "type": "crowd_member"}
+    meta = {"owner": obj["id"], "name": obj["name"], "type": obj["asset"]}
+    if obj["asset"] == "person":
+        meta["character"] = obj.get("character") or ""
+    return meta
+
+
+def id_render(scene, width=None, height=None):
+    """-> (instance bytes, part bytes, normal floats, world floats,
+    sidecar): every per-pixel truth buffer, one pass over `render`'s own
+    polygons (`_spans`) - instance and part a byte a pixel, normal and
+    world three `array('f')` floats a pixel (x, y, z in a pixel's 3 slots),
+    all 0 for the room and its shadows. `sidecar` names the instance and
+    part numbers -
+    `{"instances": {"<id>": {"owner", "name", "type"[, "character"]}},
+    "parts": {"<id>": {"<part id>": "<label>"}}}` - JSON-safe (string keys).
+
+    `normal` is one vector for a whole face (flat-shaded, so it does not
+    vary across it); `world` is the exact point under each pixel,
+    perspective-correct across the face, not just its centre - so a bad
+    pixel's instance, part, facing and 3D position can all be read back."""
+    if width is None:
+        width, height = frame_size(scene)
+    owners = _instance_owners(scene)
+    by_id = {obj["id"]: obj for obj in scene["objects"]}
+    cam = Camera(scene["camera"], width, height)
+    ex, ey, ez = cam.eye
+    rx, ry, rz = cam.r
+    ux, uy, uz = cam.u
+    fx, fy, fz = cam.f
+    n = width * height
+    inst, part = bytearray(n), bytearray(n)
+    normal, world = array.array("f", [0.0]) * (n * 3), array.array("f", [0.0]) * (n * 3)
+    parts, meta = {}, {}                   # instance id -> {label: part id}; -> sidecar entry
+    for poly in render(scene, width, height):
+        if poly.owner is None:
+            continue
+        crowd = bool(poly.part) and poly.part[0] == "m" and poly.part[1:].isdigit()
+        iid = owners.get((poly.owner, poly.part if crowd else None))
+        if iid is None:
+            continue
+        spans = list(_spans(poly, width, height))
+        if not spans:
+            continue                       # projects off-canvas: paints nothing, means nothing
+        if iid not in meta:
+            meta[iid] = _instance_meta(by_id[poly.owner], poly.part if crowd else None)
+        label = "body" if crowd else poly.part
+        seen = parts.setdefault(iid, {})
+        pid = seen.get(label)
+        if pid is None:
+            pid = seen[label] = min(ID_LIMIT, len(seen) + 1)
+        nx, ny, nz = poly.nrm or (0.0, 0.0, 0.0)
+        tri = _stable_triangle(poly.pts) if poly.cam else None
+        pz = px = py = None
+        if tri:
+            iz = [1.0 / c[2] for c in poly.cam]
+            xz = [c[0] / c[2] for c in poly.cam]
+            yz = [c[1] / c[2] for c in poly.cam]
+            pz, px, py = (_plane(tri, poly.pts, iz), _plane(tri, poly.pts, xz),
+                          _plane(tri, poly.pts, yz))
+            az, bz, cz = pz
+            ax, bx, cx = px
+            ay, by, cy = py
+        for y, xa, xb in spans:
+            row = y * width
+            inst[row + xa:row + xb + 1] = bytes([iid]) * (xb - xa + 1)
+            part[row + xa:row + xb + 1] = bytes([pid]) * (xb - xa + 1)
+            yc = y + 0.5
+            for x in range(xa, xb + 1):
+                o = (row + x) * 3
+                normal[o], normal[o + 1], normal[o + 2] = nx, ny, nz
+                if pz is None:
+                    continue
+                xc = x + 0.5
+                q = az + bz * xc + cz * yc
+                if not q:
+                    continue
+                z = 1.0 / q
+                cx_, cy_ = (ax + bx * xc + cx * yc) * z, (ay + by * xc + cy * yc) * z
+                world[o] = ex + cx_ * rx + cy_ * ux + z * fx
+                world[o + 1] = ey + cx_ * ry + cy_ * uy + z * fy
+                world[o + 2] = ez + cx_ * rz + cy_ * uz + z * fz
+    sidecar = {"instances": {str(iid): m for iid, m in meta.items()},
+               "parts": {str(iid): {str(pid): label for label, pid in labels.items()}
+                         for iid, labels in parts.items()}}
+    return bytes(inst), bytes(part), normal, world, sidecar
+
+
+def instance_id_png(scene):
+    """The instance buffer as a picture: its byte in all three channels, so
+    it reads as flat grey regions and decodes exactly from any one of
+    them."""
+    inst = id_render(scene)[0]
+    w, h = frame_size(scene)
+    rgb = bytearray(w * h * 3)
+    for i in range(3):
+        rgb[i::3] = inst
+    return rgb_png(bytes(rgb), w, h)
+
+
+def part_id_png(scene):
+    """The part buffer as a picture: red is the instance byte (so it reads
+    the same as `instance_id_png`'s red channel), green the part byte, blue
+    unused - each exact on its own channel, nothing blended across them."""
+    inst, part = id_render(scene)[:2]
+    w, h = frame_size(scene)
+    rgb = bytearray(w * h * 3)
+    rgb[0::3] = inst
+    rgb[1::3] = part
+    return rgb_png(bytes(rgb), w, h)
+
+
+def normal_png(scene):
+    """The normal buffer as a picture, the usual normal-map convention:
+    each axis's [-1, 1] mapped to [0, 255], only for this picture - the
+    buffer itself (`id_render`) keeps the real floats, not this
+    quantising."""
+    normal = id_render(scene)[2]
+    w, h = frame_size(scene)
+    rgb = bytearray(w * h * 3)
+    for i in range(w * h):
+        for k in range(3):
+            rgb[i * 3 + k] = max(0, min(255, int(round((normal[i * 3 + k] + 1) * 127.5))))
+    return rgb_png(bytes(rgb), w, h)
+
+
+def id_map(scene):
+    """The sidecar alone - what `instance_id_png`/`part_id_png`'s numbers
+    mean - without rendering any buffer."""
+    return id_render(scene)[4]
 
 
 def framing(scene):
