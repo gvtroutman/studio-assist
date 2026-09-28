@@ -1089,11 +1089,14 @@ class Chat(tk.Tk):
 
     def _tags(self, v):
         C = self.C
-        v.tag_configure("user", background=C["card"], justify="right",
-                        lmargin1=60, lmargin2=60, rmargin=16, spacing1=18,
-                        spacing3=10, borderwidth=0)
-        v.tag_configure("asst", lmargin1=16, lmargin2=16, rmargin=60, spacing1=18,
-                        spacing2=4, spacing3=10)
+        # "user" carries no background of its own any more - the bubble a turn
+        # embeds (_bubble/_write_user_bubble) draws that, rounded and only as
+        # wide as its text. The tag just pins that one embedded window flush
+        # to the right margin and spaces it from the turns around it.
+        v.tag_configure("user", justify="right", rmargin=16, spacing1=8,
+                        spacing3=8)
+        v.tag_configure("asst", lmargin1=16, lmargin2=16, rmargin=60, spacing1=8,
+                        spacing2=4, spacing3=8)
         v.tag_configure("tool", foreground=C["faint"], font=self.f_mono, lmargin1=22,
                         lmargin2=36, rmargin=16, spacing1=2, spacing3=2)
         # A tool call is one folded row: the header in "tool", the glyph that
@@ -2957,6 +2960,62 @@ class Chat(tk.Tk):
         s.view.insert("end", text, tag)
         s.view.config(state="disabled")
         s.view.see("end")
+
+    def _wrap_lines(self, font, text, max_width):
+        """Break `text` into lines no wider than `max_width` pixels, measured
+        in `font` - word by word, so a bubble sizes to what it actually holds
+        instead of a fixed column count."""
+        lines = []
+        for para in text.split("\n"):
+            words = para.split(" ")
+            cur = ""
+            for word in words:
+                trial = word if not cur else cur + " " + word
+                if cur and font.measure(trial) > max_width:
+                    lines.append(cur)
+                    cur = word
+                else:
+                    cur = trial
+            lines.append(cur)
+        return lines
+
+    def _bubble(self, s, text):
+        """A rounded card sized to its own wrapped text - no wider than it
+        needs to be, capped so one long line doesn't run the width of the
+        window. A canvas that plots palette colours into its own items, not
+        a widget option, so it is registered with `_repaint_on_theme` rather
+        than left to go stale on the next theme switch."""
+        font = self.f_body
+        pad_x, pad_y = self._px(12), self._px(8)
+        max_text_w = self._px(420) - 2 * pad_x
+        lines = self._wrap_lines(font, text, max_text_w)
+        line_h = font.metrics("linespace")
+        text_w = max((font.measure(ln) for ln in lines), default=0)
+        w = text_w + 2 * pad_x
+        h = line_h * len(lines) + 2 * pad_y
+        c = tk.Canvas(s.view, width=w, height=h, highlightthickness=0, bd=0)
+        self._skin(c, bg="bg")
+
+        def draw():
+            c.delete("all")
+            rounded(c, 0, 0, w, h, self._px(14), fill=self.C["card"],
+                    outline=self.C["card"])
+            for i, ln in enumerate(lines):
+                c.create_text(pad_x, pad_y + i * line_h, anchor="nw", text=ln,
+                               font=font, fill=self.C["text"])
+        draw()
+        self._repaint_on_theme(c, draw)
+        return c
+
+    def _write_user_bubble(self, s, text):
+        """A user turn: a bubble embedded in the transcript, pinned to the
+        right margin by the "user" tag's justify."""
+        v = s.view
+        v.config(state="normal")
+        self._embed(v, self._bubble(s, text), tags=("user",))
+        v.insert("end", "\n", "user")
+        v.config(state="disabled")
+        v.see("end")
 
     def _clear_view(self, s):
         """Empty a transcript - the folded call rows' own tags with it, and
@@ -5412,7 +5471,10 @@ class Chat(tk.Tk):
             self._hide_hero(s)
             for msg in messages:
                 if msg.get("role") in ("user", "assistant") and isinstance(msg.get("content"), str):
-                    self._write(s, msg["content"] + "\n", "user" if msg["role"] == "user" else "asst")
+                    if msg["role"] == "user":
+                        self._write_user_bubble(s, msg["content"])
+                    else:
+                        self._write(s, msg["content"] + "\n", "asst")
             self._write(s, "Reopened from history. Send a message to carry on; the current project must be inspected first.\n", "sys")
         except Exception as e:
             self._write(s, "Could not restore task: %s\n" % e, "err")
@@ -5687,7 +5749,7 @@ class Chat(tk.Tk):
         is closed either way: a typed reply is an answer too."""
         self._settle_ask(s)
         self._hide_hero(s)
-        self._write(s, task + "\n", "user")
+        self._write_user_bubble(s, task)
         for p in attached:
             self._show_attachment(s, p)
         s.messages.append({"role": "user", "content": task + note})

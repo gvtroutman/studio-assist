@@ -2980,6 +2980,28 @@ class TestGui(unittest.TestCase):
         self.assertIn("survives-a-repaint",
                       self.app.sessions[sid].view.get("1.0", "end"))
 
+    def test_a_user_bubble_hugs_its_text_and_stays_right_aligned(self):
+        sid = self.app.order[0]
+        s = self.app.sessions[sid]
+        self.app._clear_view(s)
+        self.app._write_user_bubble(s, "hi")
+        self.app.update()
+        short = [w for w in s.view.winfo_children()
+                 if isinstance(w, tk.Canvas)][-1]
+        short_w = short.winfo_reqwidth()
+        self.app._write_user_bubble(
+            s, "a message with a good deal more text in it than the one above")
+        self.app.update()
+        long_ = [w for w in s.view.winfo_children()
+                 if isinstance(w, tk.Canvas)][-1]
+        self.assertGreater(long_.winfo_reqwidth(), short_w,
+                            "a bubble should size to its own text")
+        self.assertTrue(s.view.tag_ranges("user"))
+        self.assertEqual(s.view.tag_cget("user", "justify"), "right")
+        # A canvas that plots palette colours into its own items has to be
+        # registered so `_theme` can repaint it, not just reconfigured.
+        self.assertTrue(any(w is short for w, _ in self.app.repaints))
+
     def test_text_size_resizes_every_font_and_comes_back(self):
         import core.ui as ui
         before = self.app.f_ui.cget("size")
