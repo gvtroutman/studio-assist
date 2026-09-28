@@ -1090,6 +1090,16 @@ class TestAppRegistry(unittest.TestCase):
                                   addons=[{"kind": "plugin", "name": "p", "package": "p@1"}])
         self.assertEqual(cfg["plugin"], [mine, "p@1"])
 
+    def test_opencode_always_gets_the_repo_map_server_beside_add_on_servers(self):
+        self.assertTrue(os.path.isfile(eng.OPENCODE_REPO_MAP))
+        cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"])
+        self.assertEqual(cfg["mcp"]["repo"]["command"][-1], eng.OPENCODE_REPO_MAP)
+        cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"], addons=[
+            {"kind": "mcp", "name": "notes", "config": {"type": "local", "command": ["x"]}},
+            {"kind": "mcp", "name": "repo", "config": {"type": "local", "command": ["y"]}}])
+        self.assertIn("notes", cfg["mcp"])
+        self.assertEqual(cfg["mcp"]["repo"]["command"][-1], eng.OPENCODE_REPO_MAP)
+
     def test_on_this_repo_opencode_gets_the_short_brief_not_agents_md(self):
         # AGENTS.md is far larger than the model's window; loaded whole it
         # pushed the task out of OpenCode's memory.
