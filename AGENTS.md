@@ -875,6 +875,22 @@ pictures park it. The trigger is the profile's own, else `trigger_for(name)`
 (`lilperson`). This assigns on completion, unlike the recipe tool; completion
 is still not a likeness review. Tests: `tests/test_lora_train.py`.
 
+**Angles and Breed** (identity editor, beside Build LoRA; Sitter 2026-09-28: "add
+breeding to reference images", then "breed is a seperate step. the angles are
+something every photo has"). Two buttons, two things. Angles: each selected
+photo gets `NewPhotos.PER_PHOTO` (4) random, different `breed.ANGLES`, each a
+single-image FLUX Kontext edit of that photo. Breed: exactly two selected photos
+go in as chained `ReferenceLatent`s and the child is drawn on an empty latent at
+the first parent's shape (~1 MP), so it copies neither; each Again is a new
+child. `apps.image_studio.breed` (stdlib) builds the graphs, routes to an up
+backend with `KONTEXT` (the 5090 first) and runs them through the studio's
+client; `ui.NewPhotos` shows results as they come, and Add sends the picked
+ones through `_import_paths` (Save keeps them). Nothing is scored: measured on
+Partner, breeds kept her (new settings), while angles are hit and miss. Profile
+right and over-the-shoulder kept her; one profile left came out as a
+short-haired look-alike, and three-quarter right barely turned. The person picks.
+Refused while a LoRA build holds the GPU. Tests: `tests/test_breed.py`.
+
 Profiles' editable `description` is visual identity prose used alongside photos,
 not the private `notes`. `identity_description_text` binds it to selected people
 or Scene Builder's linked identities and positions; scene identities supersede
