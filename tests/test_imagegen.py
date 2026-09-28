@@ -527,6 +527,8 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(p.errors, [])
         self.assertEqual(p.prompt, "a woman in her 30s, slim build, green eyes, auburn hair, "
                                    "freckles, wearing clothes suited to the scene. On a pier at dusk. "
+                                   "Every person is clothed, the chest fully covered by their "
+                                   "clothing or swimwear. "
                                    "85mm, shallow depth of field.")
 
     def test_attributes_keep_their_own_nouns(self):
@@ -598,7 +600,7 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
     def test_a_person_alone_is_enough(self):
         p = self.plan(style="none", subject="an old fisherman", anatomy=False)
         self.assertEqual(p.errors, [])
-        self.assertEqual(p.prompt, "an old fisherman, wearing clothes suited to the scene.")
+        self.assertEqual(p.prompt, "an old fisherman, wearing clothes suited to the scene. " + ig.CLOTHED + ".")
 
     def test_nobody_is_left_undressed(self):
         p = self.plan(style="none", subject="a woman", chest_size=2, anatomy=False)
@@ -614,6 +616,17 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
             self.assertNotIn(ig.COVERED, p.prompt, dressed)
         p = self.plan(style="none", scene="A red bicycle on top of a hill.")
         self.assertNotIn(ig.COVERED, p.prompt)                  # nobody in it
+        self.assertNotIn(ig.CLOTHED, p.prompt)
+
+    def test_a_swimsuit_still_covers_the_chest(self):
+        # Drawn topless on Z-Image Turbo, 2026-09-27: the swimsuit alone lost
+        # to "very full chest" and "natural anatomy".
+        p = self.plan(identities=["sitter"], style="none", subject="a woman", build="curvy",
+                      chest_size=3, scene="sitterperson in a swimsuit")
+        self.assertNotIn(ig.COVERED, p.prompt)                  # a garment is named
+        self.assertIn(ig.CLOTHED, p.prompt)
+        self.assertNotIn("natural anatomy", p.prompt)
+        self.assertNotIn("Anatomically", p.prompt)
 
     def test_item_pictures_need_a_workflow_that_takes_them(self):
         pic = os.path.join(self.dir, "glasses.png")
