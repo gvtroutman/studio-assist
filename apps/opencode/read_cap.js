@@ -28,8 +28,9 @@ export const ReadCap = async () => {
       const lines = capped.get(input.callID)
       capped.delete(input.callID)
       output.output += `\n\n[Studio Assist: this file has ${lines} lines; only the first ` +
-        `${READ_CAP} are shown. Do not page through it. Grep for "def name" or ` +
-        `"class Name", then read with offset and limit around the match.]`
+        `${READ_CAP} are shown. Do not page through it. Call repo_map on this file ` +
+        `for its outline with line ranges, or repo_find with a name, then read with ` +
+        `offset and limit.]`
     },
   }
 }
