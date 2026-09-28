@@ -575,6 +575,66 @@ class TestMaps(unittest.TestCase):
         self.assertEqual((s["pose_strength"], s["depth_strength"], s["frame_keep"]),
                          (sc.POSE_STRENGTH, sc.DEPTH_STRENGTH, sc.FRAME_KEEP))
 
+    def test_the_id_buffers_name_each_instance_at_its_own_pixels(self):
+        s = staged("person", "box")
+        s["objects"][0]["name"] = "Sitter"
+        s["objects"][1]["position"] = [0.8, 0, -4]
+        w, h = sc.frame_size(s)
+        inst, part, normal, world, sidecar = sc.id_render(s)
+        self.assertEqual((len(inst), len(part)), (w * h, w * h))
+        self.assertEqual((len(normal), len(world)), (w * h * 3, w * h * 3))
+        self.assertEqual(sidecar, sc.id_map(s))       # same call, same answer
+        self.assertEqual(sidecar["instances"], {
+            "1": {"owner": "person", "name": "Sitter", "type": "person", "character": ""},
+            "2": {"owner": "box", "name": "Crate", "type": "box"}})
+        self.assertEqual(sidecar["parts"]["2"], {"1": "body"})
+        self.assertIn("head", sidecar["parts"]["1"].values())
+
+        def at(obj):
+            lo, hi = sc.bounds(obj)
+            cam = sc.Camera(s["camera"], w, h)
+            x, y, _ = cam.project(((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2))
+            return int(y) * w + int(x)
+        i_sitter, i_box = at(s["objects"][0]), at(s["objects"][1])
+        self.assertEqual(inst[i_sitter], 1)                     # Sitter's own instance
+        self.assertEqual(inst[i_box], 2)                       # the box's, not Sitter's
+        self.assertEqual((inst[0], part[0]), (0, 0))           # the sky is background
+        self.assertEqual(tuple(normal[0:3]), (0.0, 0.0, 0.0))
+        self.assertEqual(tuple(world[0:3]), (0.0, 0.0, 0.0))
+
+        # the box faces the camera: its normal points roughly back at the eye
+        cam = sc.Camera(s["camera"], w, h)
+        bn = tuple(normal[i_box * 3:i_box * 3 + 3])
+        self.assertAlmostEqual(sum(v * v for v in bn), 1.0, places=4)      # unit length
+        self.assertGreater(sc.dot(bn, sc.norm(sc.sub(cam.eye, s["objects"][1]["position"]))), 0)
+        # the box's world position lands near its own place, not the origin
+        bw = tuple(world[i_box * 3:i_box * 3 + 3])
+        self.assertLess(math.dist(bw, s["objects"][1]["position"]), 0.5)
+
+        self.assertEqual(png_size(sc.instance_id_png(s)), (w, h))
+        self.assertEqual(png_size(sc.part_id_png(s)), (w, h))
+        self.assertEqual(png_size(sc.normal_png(s)), (w, h))
+
+    def test_a_crowd_is_one_instance_a_member_not_the_whole_crowd(self):
+        s = staged("crowd")
+        s["objects"][0]["crowd"]["count"] = 3
+        inst, part, normal, world, sidecar = sc.id_render(s)
+        self.assertTrue(all(m["type"] == "crowd_member" and m["owner"] == "crowd"
+                            for m in sidecar["instances"].values()))
+        self.assertTrue(all(labels == {"1": "body"} for labels in sidecar["parts"].values()))
+        seen = set(inst) - {0}
+        self.assertTrue(1 < len(seen) <= 3)        # more than one member actually painted
+
+    def test_an_object_out_of_frame_paints_no_instance(self):
+        s = staged("person")
+        s["objects"][0]["position"] = [30, 0, 0]
+        inst, part, normal, world, sidecar = sc.id_render(s)
+        self.assertEqual(sidecar, {"instances": {}, "parts": {}})
+        self.assertEqual(set(inst), {0})
+        self.assertEqual(set(part), {0})
+        self.assertEqual(set(normal), {0.0})
+        self.assertEqual(set(world), {0.0})
+
 
 class TestLibraryAssets(unittest.TestCase):
     """Shapes, props and the background crowd."""
