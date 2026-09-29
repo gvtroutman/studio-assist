@@ -2575,6 +2575,41 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(window.call_args.kwargs, {"around_head": True})
         self.assertEqual(ui.studio.lib.all("identities"), before)
 
+    def test_resting_on_a_thumbnail_shows_the_picture_larger(self):
+        import apps.image_studio.ui as ui_mod
+        _, ui = self.tab()
+        big = os.path.join(self.dir, "peek_big.png")
+        ui_mod.tk.PhotoImage(master=self.app, width=400, height=300).write(big, format="png")
+        win = ui_mod.tk.Toplevel(self.app)
+        self.addCleanup(win.destroy)
+        box = ui._thumb(win, big)
+        box.pack()
+        self.pump(lambda: box.img.winfo_ismapped())
+        pk = self.app._studio_peek
+        self.assertIs(box._peek, box.img._peek)     # frame and picture are one picture
+        box.img.event_generate("<Enter>", x=5, y=5)
+        self.assertFalse(pk.shown())                # not before the pointer rests
+        self.pump(pk.shown)
+        img = pk.win.label.image
+        self.assertEqual((img.width(), img.height()), (400, 300))   # never past its own size
+        self.assertGreater(img.width(), ui.px(ui_mod.THUMB))
+        box.img.event_generate("<ButtonPress-1>", x=5, y=5)
+        self.assertFalse(pk.shown())                # a click still selects, and closes it
+        # A thumbnail whose picture changes shows the new one; no picture, nothing.
+        ui.set_thumb(box, None)
+        box.img.event_generate("<Enter>", x=5, y=5)
+        self.app.after(ui_mod.PEEK_DELAY + 100)
+        self.app.update()
+        self.assertFalse(pk.shown())
+        pk.hide()
+        # Leaving before the delay never opens it.
+        ui.set_thumb(box, big)
+        box.img.event_generate("<Enter>", x=5, y=5)
+        box.img.event_generate("<Leave>", x=-50, y=-50)
+        self.app.after(ui_mod.PEEK_DELAY + 100)
+        self.app.update()
+        self.assertFalse(pk.shown())
+
     def test_characters_tab_lists_identities_with_their_photo_count(self):
         _, ui = self.tab()
         photos = []
