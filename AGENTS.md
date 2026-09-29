@@ -930,6 +930,16 @@ it never becomes a face reference. `face_swap` defaults to true independently
 of the older `use_references` switch. Profiles without photos retain their LoRA
 behavior. The profile editor keeps technical fields under Advanced settings.
 
+**A face FaceFusion will swap is not drawn with PuLID first** (2026-09-28,
+The user: "this is a waste of time otherwise"). In a scene, the face pass
+(`_face_pass`) used to give every scene person with a face photo a PuLID
+likeness redraw regardless of whether FaceFusion was about to swap that same
+person's face afterward - the swap fully overwrites the redraw's pixels, so
+the likeness pass on that face was pure waste. `_face_pass` now asks
+`facefusion.selected` which scene person ids it will swap (matched by the
+scene's own `person_id`) and leaves those faces' redraw to words only, no
+photo; FaceFusion still does the identity work, once.
+
 `apps/image_studio/facefusion.py` is a stdlib adapter to the isolated environment in
 `.runtime/facefusion-venv`; it uses `core.procs` for cancellation and process
 containment. `tools/facefusion_swap.py` runs the official pipeline, captures its

@@ -3611,6 +3611,47 @@ def random_looks(rng=random, sections=None):
     return out
 
 
+# The two things a plain "no style" composition never says on its own, because
+# nothing in the form has a slot for them: what time and light the scene is in,
+# and the small human-error detail a real photograph has and a form-built list
+# of attributes does not - a flyaway hair, a crease, an uneven tan line. Left
+# out, a no-style picture reads as a tag list rendered flat, not a photograph.
+# Skipped whenever a style is chosen: its own prompt already carries this
+# (see _default_styles), and a second, contradictory light or texture fights it.
+TIME_OF_DAY = [
+    "soft morning light", "golden hour, warm low sun", "overcast daylight, soft shadows",
+    "harsh midday sun", "hazy late afternoon light", "blue hour twilight",
+    "neon light at night", "a single lamp at night",
+]
+IMPERFECTIONS = [
+    "a flyaway strand of hair", "a faint crease in the fabric", "a slightly untucked shirt",
+    "asymmetrical shoulders", "a small skin blemish", "windswept hair",
+    "a scuff on the shoes", "uneven tan lines", "a loose thread on a sleeve",
+    "slightly chapped lips",
+]
+# A scene or camera field that already names a time or light of its own: do
+# not add a second, possibly contradictory one on top of the user's words.
+LIGHT_TIME = re.compile(
+    r"\b(morning|noon|midday|afternoon|evening|dusk|dawn|night|sunset|sunrise|"
+    r"daylight|golden hour|blue hour|overcast|backlit|lit by|lamp|neon|moonlit|"
+    r"twilight)\b", re.I)
+
+
+def time_of_day_text(settings, seed):
+    """A light/time phrase for a no-style photograph, or "" when the scene or
+    camera already names one. Deterministic from `seed`: the same seed keeps
+    the same light; a new seed for "a different take" can bring a new one."""
+    if LIGHT_TIME.search(_field(settings, "scene")) or LIGHT_TIME.search(_field(settings, "camera")):
+        return ""
+    return random.Random(int(seed or 0) + 104729).choice(TIME_OF_DAY)
+
+
+def imperfection_text(seed):
+    """One human-error detail for a no-style photograph of a person, picked
+    the same deterministic way as time_of_day_text."""
+    return random.Random(int(seed or 0) + 224737).choice(IMPERFECTIONS)
+
+
 # The constants: what every person in every picture has, whoever they are
 # and whatever the creator says about them. Diffusion models lose count of
 # fingers and limbs, so the prompt says it outright. (part, positive,
@@ -4167,6 +4208,10 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     parts = [x for x in (view_text(s.get("view"), posed),
                          ", ".join(x for x in (named, person, covered) if x), scene,
                          CLOTHED if someone else "", _field(s, "camera")) if x]
+    if not style:
+        parts.append(time_of_day_text(s, s.get("seed")))
+        if someone:
+            parts.append(imperfection_text(s.get("seed")))
     descriptions = identity_description_text(s, lib, idents)
     parts.extend(descriptions)
     if descriptions:
@@ -6371,11 +6416,20 @@ class Studio:
                 plan.notes.append("Face pass: %s's face was not found where the scene puts it%s."
                                   % (person["name"], ", so their face picture was not used"
                                      if person.get("face") else ""))
+        # A person FaceFusion will swap after gets that face drawn twice
+        # otherwise: PuLID's likeness redraw here is thrown away the moment
+        # FaceFusion replaces the same pixels (2026-09-28, the user: "this is a
+        # waste of time otherwise"). Their crop is still redrawn for the
+        # waxy-face fix, just from the words, not their photo.
+        import apps.image_studio.facefusion as facefusion
+        swapped = {p["person_id"] for p in facefusion.selected(self.lib, job.settings)
+                  if p.get("person_id")}
+        likely = {i for i, p in known.items() if p.get("id") not in swapped}
         pulid, why = self._pulid(client, plan, types=None) if any(
-            p.get("face") for p in known.values()) else (None, "")
+            p.get("face") for i, p in known.items() if i in likely) else (None, "")
         if why:
             plan.warnings.append(why)
-        likeness = {i for i, p in known.items() if p.get("face") and pulid}
+        likeness = {i for i, p in known.items() if p.get("face") and pulid and i in likely}
         layout = job.settings.get("scene_layout")
         head_k = scene.get("head_depth", 0) or 0
         shaped = ({i for i, p in known.items() if p.get("head")}
