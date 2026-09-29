@@ -32,6 +32,11 @@ the app would save its old list over a lesson the trainer had just kept.
 
 Every entry is data, bounded, de-duplicated and best-effort on disk: a wrecked
 or unwritable file costs a lesson, never the app.
+
+`trouble_in` and `self_review`, below, look across tasks rather than within
+one: the same signs `apps/opencode/trainer_mcp.py`'s `t_tasks` shows per task,
+checked for a repeat. Neither writes a lesson - they only propose one, for the
+trainer to show the user and keep (`trainer_keep`) if they agree.
 """
 
 import json
@@ -46,6 +51,8 @@ LESSON_CHARS = 300        # one lesson, one sentence or two
 BRIEF_CHARS = 4000        # the rendered block in the prompt
 REFUSALS_PER_RUN = 3      # validator refusals learned from one run
 REFLECT_CHARS = 24000     # of the conversation the reflection sees
+SELF_REVIEW_TASKS = 8     # recent tasks a self-review compares by default
+SELF_REVIEW_MIN_HITS = 2  # a kind of trouble must recur at least this often
 
 # Higher survives longer when the notebook is full.
 PRIORITY = {"user": 4, "trainer": 3, "model": 2, "review": 1, "error": 0}
@@ -465,3 +472,87 @@ def parse_reflection(text):
     lesson = m.group(1).strip().strip('"').strip()
     lesson = re.split(r"\s(?=NONE$)", lesson)[0]
     return clean(lesson) if len(lesson) >= 8 else None
+
+
+# ------------------------------------------------------------- cross-task review
+
+def _content_text(content):
+    """Plain text from one message's content: a string, or the text parts of
+    a list of content blocks (a tool result can be either)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+REFUSED = re.compile(r"^\s*refused: ", re.M)
+_DIGITS = re.compile(r"\d+")
+
+
+def trouble_in(record, messages):
+    """What went wrong in a saved task, as short phrases; [] for a clean one.
+
+    Shared with `apps/opencode/trainer_mcp.py`'s `t_tasks`, which lists these
+    per task, and `self_review` below, which looks for the same one recurring.
+    """
+    signs = []
+    status = record.get("status") or ""
+    if status and not status.startswith("response complete"):
+        signs.append("ended as: " + status[:80])
+    if any(looks_like_correction(b) for b in (record.get("briefs") or [])[1:]):
+        signs.append("the user corrected it")
+    names = [(c.get("function") or {}).get("name") for m in messages
+             for c in (m.get("tool_calls") or [])]
+    if "opencode_undo" in names or "opencode_discard" in names:
+        signs.append("the user undid or discarded work")
+    refused = sum(len(REFUSED.findall(_content_text(m.get("content")))) for m in messages
+                  if m.get("role") in ("tool", "assistant"))
+    if refused:
+        signs.append("%d step(s) refused" % refused)
+    errors = sum(1 for m in messages if m.get("role") == "tool"
+                 and re.match(r"\s*(tool error|error|failed|refused by the validator)",
+                              _content_text(m.get("content")), re.I))
+    if errors:
+        signs.append("%d failing call(s)" % errors)
+    return signs
+
+
+def _trouble_kind(sign):
+    """A sign's dedup key: digits folded away, so '3 step(s) refused' and
+    '5 step(s) refused' in two different tasks count as the same kind of
+    trouble, not two different ones."""
+    return _DIGITS.sub("N", sign)
+
+
+def self_review(tasks, min_hits=SELF_REVIEW_MIN_HITS):
+    """Does the same kind of trouble show up in `min_hits` or more of the most
+    recent saved tasks, rather than being read one at a time by hand?
+
+    `tasks` is [(record, messages), ...] as `apps/opencode/trainer_mcp.py`
+    loads `tasks/opencode/*.json`, newest first; only the count of tasks it
+    shows up in matters here, not their order. Each task counts a kind of
+    trouble at most once, so one task with the same refusal three times over
+    cannot manufacture a pattern on its own.
+
+    Returns one concrete lesson sentence - naming the recurring sign itself,
+    not a vague "be more careful" - or None when nothing repeats often enough.
+    This proposes; it writes nothing. Keep the result only after the user
+    agrees, through the same notebook path as any other lesson.
+    """
+    hits, example = {}, {}
+    for record, messages in tasks:
+        kinds = {}                # once per task
+        for sign in trouble_in(record, messages):
+            kinds.setdefault(_trouble_kind(sign), sign)
+        for kind, sign in kinds.items():
+            hits[kind] = hits.get(kind, 0) + 1
+            example.setdefault(kind, sign)
+    if not hits:
+        return None
+    kind = max(hits, key=lambda k: (hits[k], k))
+    if hits[kind] < min_hits:
+        return None
+    return clean("Recurring trouble in %d of the last %d saved tasks: %s."
+                 % (hits[kind], len(tasks), example[kind].rstrip(".")))

@@ -240,6 +240,63 @@ class TestReadingTheUser(unittest.TestCase):
         self.assertLess(len(sent), len(messages))
 
 
+class TestSelfReview(unittest.TestCase):
+    """Cross-task pattern check: the same trouble recurring across the last
+    N saved tasks, rather than read one at a time by hand."""
+
+    def clean_task(self):
+        return {"status": "response complete", "briefs": ["do a thing"]}, [
+            {"role": "user", "content": "do a thing"}]
+
+    def stopped_task(self, status="Stopped after repeated tool errors.", n_refused=0):
+        messages = [{"role": "user", "content": "do a thing"}]
+        for i in range(n_refused):
+            messages.append({"role": "tool", "tool_call_id": "c%d" % i,
+                             "content": "refused: run rm -rf /"})
+        return {"status": status, "briefs": ["do a thing"]}, messages
+
+    def test_a_clean_run_has_no_trouble_to_find(self):
+        self.assertIsNone(lessons.self_review([self.clean_task() for _ in range(5)]))
+
+    def test_trouble_seen_once_is_not_a_pattern(self):
+        tasks = [self.clean_task(), self.clean_task(), self.stopped_task()]
+        self.assertIsNone(lessons.self_review(tasks))
+
+    def test_the_same_trouble_twice_is_one_suggestion_not_one_per_task(self):
+        tasks = [self.stopped_task(), self.clean_task(), self.stopped_task()]
+        suggestion = lessons.self_review(tasks)
+        self.assertIsInstance(suggestion, str)
+        self.assertIn("2 of the last 3", suggestion)
+        self.assertIn("Stopped after repeated tool errors", suggestion)
+
+    def test_counts_fold_together_as_the_same_kind_of_trouble(self):
+        """One task refused twice and another refused five times are still
+        the same *kind* of trouble - a step keeps getting refused - not two."""
+        tasks = [self.stopped_task(status="response complete", n_refused=2),
+                 self.stopped_task(status="response complete", n_refused=5)]
+        suggestion = lessons.self_review(tasks)
+        self.assertIn("step(s) refused", suggestion)
+        self.assertIn("2 of the last 2", suggestion)
+
+    def test_a_repeat_within_one_task_does_not_manufacture_a_pattern(self):
+        """Three refusals in a single task is one task's trouble, not two."""
+        tasks = [self.stopped_task(status="response complete", n_refused=3), self.clean_task()]
+        self.assertIsNone(lessons.self_review(tasks))
+
+    def test_min_hits_is_adjustable(self):
+        tasks = [self.stopped_task(), self.stopped_task(), self.clean_task()]
+        self.assertIsNone(lessons.self_review(tasks, min_hits=3))
+        self.assertIsNotNone(lessons.self_review(tasks, min_hits=2))
+
+    def test_the_most_frequent_kind_of_trouble_wins(self):
+        tasks = [self.stopped_task(status="Stopped: A"),
+                 self.stopped_task(status="Stopped: A"),
+                 self.stopped_task(status="Stopped: B"),
+                 self.stopped_task(status="Stopped: B"),
+                 self.stopped_task(status="Stopped: B")]
+        self.assertIn("Stopped: B", lessons.self_review(tasks))
+
+
 class TestExecutorLearnsAndAsks(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
