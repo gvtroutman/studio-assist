@@ -2403,6 +2403,12 @@ class ImageStudio:
             self.studio.clients.clear()
             self._paint_health()
             self.refresh_backends()
+        if kind == "camera_profiles" and self.scene_builder is not None:
+            try:
+                if self.scene_builder.win.winfo_exists():
+                    self.scene_builder._inspect()
+            except tk.TclError:
+                pass
         self._recheck()
 
     def edit_backends(self):
@@ -2864,6 +2870,19 @@ class ImageStudio:
             ("example", "Example picture (PNG; the tile on the form)", "path"),
             ("notes", "Notes", "long"),
         ], template={"name": "New style"})
+
+    def edit_camera_profiles(self):
+        """Cameras for the Scene Builder's Camera body picker: a name, its
+        chemistry (film stock or digital colour science, in words), and
+        optionally the native lens it sets and a picture of the camera for
+        its button."""
+        return RecordEditor(self, "camera_profiles", "Cameras", [
+            ("name", "Name", "text"),
+            ("chemistry", "Chemistry (film stock or colour science, in words)", "long"),
+            ("lens", "Native lens (mm; sets the scene's lens when chosen)", "number"),
+            ("image", "Picture of the camera (PNG; the button in Scene Builder)", "path"),
+            ("notes", "Notes", "long"),
+        ], template={"name": "New camera"})
 
     def can_close(self):
         sb = self.scene_builder
