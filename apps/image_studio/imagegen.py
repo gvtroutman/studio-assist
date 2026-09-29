@@ -2413,6 +2413,15 @@ PULID_FAMILIES = {"flux1"}
 # face drawn into a stranger's head at the end came out a sticker - a smooth
 # pale face on a tan neck, a halo where the stranger's hair had been.
 PULID_BASE_WEIGHT = 1.0
+# 2026-09-29: a single photo's PuLID embedding is what looked "pasted on" at
+# high denoise (the user, 2026-09-25) - one angle, one lighting, over-trusted.
+# Chaining more of the person's own photos onto the same masked region adds
+# real signal (other angles, lighting) instead of just pushing one photo's
+# weight higher. The first photo carries the full weight; each further one
+# chains in at PULID_EXTRA_WEIGHT so an odd angle or poor light cannot swamp
+# a clear photo - needs a live test to dial in against real faces.
+PULID_EXTRA_WEIGHT = 0.5
+REFERENCE_PHOTOS_MAX = 3        # photos of one person chained into PuLID at once
 REGION_EDGE = 64                # px on a region mask's long edge
 
 
@@ -2433,10 +2442,15 @@ def region_png(region, width, height):
 
 
 def add_pulid(graph, pulid_file, faces, weight=PULID_BASE_WEIGHT):
-    """Into a filled graph: one ApplyPulidFlux per (face picture, region
+    """Into a filled graph: one ApplyPulidFlux per (face picture(s), region
     mask) - LoadImage names - chained on the model its samplers share, each
     confined to its mask, or to nothing when the mask is None (the whole
-    frame). Every KSampler on that model takes the chain."""
+    frame). Every KSampler on that model takes the chain.
+
+    A person's entry may be one photo (a name) or several (a list, most
+    recognisable first): each extra photo chains onto the same masked region
+    at PULID_EXTRA_WEIGHT, capped at REFERENCE_PHOTOS_MAX, so more angles of
+    the same person add signal without the first photo losing the lead."""
     samplers = [n for n in graph.values() if n["class_type"] == "KSampler"]
     if not samplers or not faces:
         return graph
@@ -2445,19 +2459,25 @@ def add_pulid(graph, pulid_file, faces, weight=PULID_BASE_WEIGHT):
     graph["pb2"] = {"class_type": "PulidFluxEvaClipLoader", "inputs": {}}
     graph["pb3"] = {"class_type": "PulidFluxInsightFaceLoader", "inputs": {"provider": "CUDA"}}
     last = base
-    for i, (face, mask) in enumerate(faces, 1):
-        n = "pb_%d" % i
-        graph[n + "f"] = {"class_type": "LoadImage", "inputs": {"image": face}}
-        graph[n] = {"class_type": "ApplyPulidFlux", "inputs": {
-            "model": last, "pulid_flux": ["pb1", 0], "eva_clip": ["pb2", 0],
-            "face_analysis": ["pb3", 0], "image": [n + "f", 0], "weight": weight,
-            "start_at": 0.0, "end_at": 1.0}}
+    for i, (photos, mask) in enumerate(faces, 1):
+        photos = [photos] if isinstance(photos, str) else list(photos)[:REFERENCE_PHOTOS_MAX]
+        mask_link = None
         if mask is not None:
-            graph[n + "m"] = {"class_type": "LoadImage", "inputs": {"image": mask}}
-            graph[n + "k"] = {"class_type": "ImageToMask", "inputs": {"image": [n + "m", 0],
-                                                                      "channel": "red"}}
-            graph[n]["inputs"]["attn_mask"] = [n + "k", 0]
-        last = [n, 0]
+            graph["pb_%dm" % i] = {"class_type": "LoadImage", "inputs": {"image": mask}}
+            graph["pb_%dk" % i] = {"class_type": "ImageToMask", "inputs": {
+                "image": ["pb_%dm" % i, 0], "channel": "red"}}
+            mask_link = ["pb_%dk" % i, 0]
+        for j, face in enumerate(photos):
+            n = "pb_%d" % i if j == 0 else "pb_%d_%d" % (i, j + 1)
+            graph[n + "f"] = {"class_type": "LoadImage", "inputs": {"image": face}}
+            graph[n] = {"class_type": "ApplyPulidFlux", "inputs": {
+                "model": last, "pulid_flux": ["pb1", 0], "eva_clip": ["pb2", 0],
+                "face_analysis": ["pb3", 0], "image": [n + "f", 0],
+                "weight": weight if j == 0 else PULID_EXTRA_WEIGHT,
+                "start_at": 0.0, "end_at": 1.0}}
+            if mask_link is not None:
+                graph[n]["inputs"]["attn_mask"] = mask_link
+            last = [n, 0]
     for node in samplers:
         if node["inputs"]["model"] == base:
             node["inputs"]["model"] = last
@@ -2584,13 +2604,16 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
         if face.get("words") and values.get("face_prompt"):
             positive, negative = _restated(g, links, values["face_prompt"],
                                            FACE_PROMPT % face["words"], "_" + n[:-1])
-        if face.get("image"):
-            g[n + "r"] = {"class_type": "LoadImage", "inputs": {"image": face["image"]}}
-            g[n + "p"] = {"class_type": "ApplyPulidFlux", "inputs": {
+        images = face.get("images") or ([face["image"]] if face.get("image") else [])
+        for j, img in enumerate(images[:REFERENCE_PHOTOS_MAX]):
+            rn, pn = (n + "r", n + "p") if j == 0 else (n + "r%d" % (j + 1), n + "p%d" % (j + 1))
+            g[rn] = {"class_type": "LoadImage", "inputs": {"image": img}}
+            g[pn] = {"class_type": "ApplyPulidFlux", "inputs": {
                 "model": model, "pulid_flux": ["pl1", 0], "eva_clip": ["pl2", 0],
-                "face_analysis": ["pl3", 0], "image": [n + "r", 0], "weight": PULID_WEIGHT,
+                "face_analysis": ["pl3", 0], "image": [rn, 0],
+                "weight": PULID_WEIGHT if j == 0 else PULID_EXTRA_WEIGHT,
                 "start_at": 0.0, "end_at": 1.0}}
-            model = [n + "p", 0]
+            model = [pn, 0]
         g[n + "1"] = {"class_type": "ImageCropV2", "inputs": {"image": last,
                                                               "crop_region": region}}
         g[n + "2"] = {"class_type": "ImageScale", "inputs": {
@@ -6540,10 +6563,15 @@ class Studio:
                 if person is None:
                     faces.append(None)
                     continue
-                image = client.upload_image(person["face"]) if i in likeness else None
+                images = []
+                if i in likeness:
+                    photos = [p for p in (person.get("photos") or [person["face"]])
+                             if os.path.isfile(p)] or [person["face"]]
+                    images = [client.upload_image(p) for p in photos[:REFERENCE_PHOTOS_MAX]]
                 words = " ".join(x for x in (person.get("words"), style) if x)
-                face = dict({"words": words, "image": image,
-                             "denoise": scene.get("likeness") if image else None,
+                face = dict({"words": words, "image": images[0] if images else None,
+                             "images": images,
+                             "denoise": scene.get("likeness") if images else None,
                              "name": person["name"]}, **heads.get(i, {}))
                 # A head shape needs the redraw deep enough to move the jaw.
                 deep = face.pop("head_denoise", None)
@@ -6617,6 +6645,10 @@ class Studio:
             plan.notes.append("Likeness: %s drawn from their face picture%s at %s." % (
                 ", ".join(f["name"] for f in drawn), "" if len(drawn) == 1 else "s",
                 scene.get("likeness")))
+        chained = [f["name"] for f in drawn if len(f.get("images") or []) > 1]
+        if chained:
+            plan.notes.append("%s drawn from more than one of their photos for a stronger "
+                              "match." % _and(sorted(chained)))
         if scene.get("real"):
             job.real_faces = [{"name": p["name"], "box": list(boxes[i]),
                                "photos": p.get("photos") or ([p["face"]] if p.get("face") else [])}
@@ -6915,26 +6947,32 @@ class Studio:
             return True                   # the face pass says why, once
         if not w or not h:
             return True
-        faces = []
+        faces, chained = [], []
         try:
             folder = os.path.join(self.lib.root, "face_regions")
             os.makedirs(folder, exist_ok=True)
             for person in people:
                 if job.cancel.is_set():
                     return False
+                photos = [p for p in (person.get("photos") or [person["face"]])
+                         if os.path.isfile(p)] or [person["face"]]
+                photos = photos[:REFERENCE_PHOTOS_MAX]
+                if len(photos) > 1:
+                    chained.append(person["name"])
+                uploaded = [client.upload_image(p) for p in photos]
                 if list(person["region"]) == WHOLE_FRAME:
                     # No mask: one the size of the picture's tokens does not
                     # fit when Kontext adds the item picture's (2026-09-26:
                     # "tensor a (8022) must match ... (3952)"), and a mask of
                     # everything masks nothing.
-                    faces.append((client.upload_image(person["face"]), None))
+                    faces.append((uploaded, None))
                     continue
                 data = region_png(person["region"], w, h)
                 path = os.path.join(folder, hashlib.sha1(data).hexdigest()[:16] + ".png")
                 if not os.path.isfile(path):
                     with open(path, "wb") as f:
                         f.write(data)
-                faces.append((client.upload_image(person["face"]), client.upload_image(path)))
+                faces.append((uploaded, client.upload_image(path)))
         except (ComfyError, OSError) as e:
             plan.warnings.append("The face pictures could not be sent (%s); the picture is "
                                  "drawn without them." % e)
@@ -6942,6 +6980,9 @@ class Studio:
         add_pulid(graph, pulid, faces)
         plan.notes.append("%s drawn from their face picture%s in the picture itself." % (
             ", ".join(p["name"] for p in people), "" if len(people) == 1 else "s"))
+        if chained:
+            plan.notes.append("%s drawn from more than one of their photos for a stronger "
+                              "match." % _and(sorted(chained)))
         return True
 
     def _pulid(self, client, plan, types=None):

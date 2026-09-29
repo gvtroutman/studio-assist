@@ -1918,8 +1918,11 @@ class ImageStudio:
                                      kind="option")
         self.tab_hist = self.button(tabs, "History", lambda: self._show_list("history"),
                                     kind="ghost")
+        self.tab_chars = self.button(tabs, "Characters", lambda: self._show_list("characters"),
+                                     kind="ghost")
         self.tab_queue.pack(side="left")
         self.tab_hist.pack(side="left", padx=(self.px(6), 0))
+        self.tab_chars.pack(side="left", padx=(self.px(6), 0))
         outer, self.list_box = self.scrolled(right)
         outer.pack_propagate(False)
         outer.grid(row=2, column=0, sticky="nsew")
@@ -1950,7 +1953,8 @@ class ImageStudio:
         self.view = which
         self.tab_queue.roles = self.host.PILL_ROLES["option" if which == "queue" else "ghost"]
         self.tab_hist.roles = self.host.PILL_ROLES["option" if which == "history" else "ghost"]
-        for p in (self.tab_queue, self.tab_hist):
+        self.tab_chars.roles = self.host.PILL_ROLES["option" if which == "characters" else "ghost"]
+        for p in (self.tab_queue, self.tab_hist, self.tab_chars):
             p.paint(self.host.C)
         for w in self.list_box.winfo_children():
             w.destroy()
@@ -1964,6 +1968,8 @@ class ImageStudio:
                     side="top", fill="x", padx=self.px(8), pady=self.px(8))
             for job in self.jobs:
                 self._job_row(job)
+        elif which == "characters":
+            self._show_characters()
         else:
             records = self.studio.history.list(self.shown_history + 1)
             if not records:
@@ -1979,6 +1985,166 @@ class ImageStudio:
     def _more_history(self):
         self.shown_history += HISTORY_PAGE
         self._show_list("history")
+
+    # ------------------------------------------------------------ Characters
+    def _show_characters(self):
+        """Every character (Library > Identities) as a card: their photos to
+        add to or click off, a name to rename by. LoRA, face swap and notes
+        stay in the fuller editor, opened per card - this tab is for the
+        photos every character needs, not the tuning a few of them get."""
+        top = self.frame(self.list_box)
+        top.pack(side="top", fill="x", padx=(0, self.px(4)), pady=(0, self.px(6)))
+        self.button(top, "New character", self._new_character, bg="card").pack(side="left")
+        idents = self.studio.lib.all("identities")
+        if not idents:
+            self.label(self.list_box, "No characters yet. New character adds one, then "
+                       "drop in their photos below.", "faint", wraplength=self.px(420)).pack(
+                side="top", fill="x", padx=self.px(8), pady=self.px(8))
+        for rec in idents:
+            self._character_row(rec)
+
+    def _character_row(self, rec):
+        row = self.frame(self.list_box, "card")
+        row.pack(side="top", fill="x", pady=(0, self.px(6)), padx=(0, self.px(4)))
+        head = self.frame(row, "card")
+        head.pack(side="top", fill="x", padx=self.px(8), pady=(self.px(8), self.px(2)))
+        var = tk.StringVar(value=rec.get("name") or "")
+        e = self.host._entry(head, var)
+        e.master.pack(side="left", fill="x", expand=True)
+        e.bind("<Return>", lambda ev, r=rec, v=var: self._rename_character(r, v))
+        e.bind("<FocusOut>", lambda ev, r=rec, v=var: self._rename_character(r, v))
+        self.button(head, "More settings" + ELLIPSIS, lambda r=rec: self._character_settings(r),
+                   kind="ghost", bg="card").pack(side="right")
+        photos = [p for p in rec.get("references") or [] if os.path.isfile(p)]
+        self.label(row, "%d reference photo%s%s" % (
+            len(photos), "" if len(photos) == 1 else "s",
+            " - the first is Primary" if photos else ""), "muted", self.host.f_small,
+            bg="card").pack(side="top", anchor="w", padx=self.px(8))
+        grid = self.frame(row, "card")
+        grid.pack(side="top", fill="x", padx=self.px(8), pady=(self.px(4), self.px(8)))
+        side = self.px(72)
+        shown = photos[:6]
+
+        def tile(col, ring="hover"):
+            f = tk.Frame(grid, width=side, height=side, bd=0, highlightthickness=self.px(2))
+            self.skin(f, bg="hover", highlightbackground=ring, highlightcolor=ring)
+            f.grid_propagate(False)
+            f.grid(row=0, column=col, padx=self.px(2))
+            return f
+
+        for i, p in enumerate(shown):
+            box = tile(i, "accent" if i == 0 else "hover")
+            img = photo(p, side, profile=True)
+            if img is not None:
+                self.keep.append(img)
+                lbl = tk.Label(box, image=img, bd=0)
+            else:
+                lbl = tk.Label(box, text=os.path.basename(p), font=self.host.f_small,
+                               wraplength=side - self.px(8))
+            self.skin(lbl, bg="hover", fg="muted")
+            lbl.place(relx=0.5, rely=0.5, anchor="center")
+            for w in (box, lbl):
+                w.bind("<Button-1>", lambda ev, r=rec, path=p: self._remove_character_photo(r, path))
+        col = len(shown)
+        if len(photos) > 6:
+            self.label(grid, "+%d more - More settings…" % (len(photos) - 6), "faint",
+                      self.host.f_small, bg="card").grid(row=0, column=col, padx=self.px(6),
+                                                         sticky="w")
+            col += 1
+        add = tile(col)
+        plus = tk.Label(add, text="+ Add", font=self.host.f_small)
+        self.skin(plus, bg="hover", fg="accent")
+        plus.place(relx=0.5, rely=0.5, anchor="center")
+        for w in (add, plus):
+            w.bind("<Button-1>", lambda ev, r=rec: self._add_character_photo(r))
+
+    def _new_character(self):
+        names = {r.get("name") for r in self.studio.lib.all("identities")}
+        name, i = "New person", 2
+        while name in names:
+            name, i = "New person %d" % i, i + 1
+        try:
+            self.studio.lib.save("identities", self.studio.lib.all("identities") +
+                                 [{"name": name}])
+        except OSError as e:
+            return self.say("Could not add a new character: %s" % e, "err")
+        self._saved("identities")
+        self._show_list("characters")
+
+    def _rename_character(self, rec, var):
+        name = var.get().strip()
+        if not name or name == (rec.get("name") or ""):
+            var.set(rec.get("name") or "")
+            return
+        rec["name"] = name
+        try:
+            self.studio.lib.save("identities", self.studio.lib.all("identities"))
+        except OSError as e:
+            return self.say("Could not rename: %s" % e, "err")
+        self._saved("identities")
+        self._show_list("characters")
+
+    def _add_character_photo(self, rec):
+        paths = filedialog.askopenfilenames(parent=self.host, filetypes=[
+            ("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
+        if not paths:
+            return
+        rid, owner = rec.get("id"), rec.get("name") or "person"
+        existing = list(rec.get("references") or [])
+        self.say("Adding %s's photo%s" % (owner, "" if len(paths) == 1 else "s") + ELLIPSIS,
+                 "muted")
+
+        def work():
+            try:
+                result = self.studio.lib.import_identity_photos(paths, owner, existing)
+            except OSError as e:
+                result = {"added": [], "duplicates": 0, "errors": [str(e)]}
+
+            def done():
+                # save() replaces every record with a freshly-cleaned copy, so
+                # a save elsewhere while this copy ran (another card's rename
+                # or photo add) leaves `rec` stale - look the person up by id,
+                # on the library's current list, rather than trust the object.
+                current = self.studio.lib.get("identities", rid)
+                if current is None:
+                    return    # deleted from elsewhere while the copy ran
+                refs = current.setdefault("references", [])
+                refs.extend(p for p in result["added"] if p not in refs)
+                try:
+                    self.studio.lib.save("identities", self.studio.lib.all("identities"))
+                except OSError as e:
+                    return self.say("Could not save the new photo(s): %s" % e, "err")
+                self._saved("identities")
+                if self.view == "characters":
+                    self._show_list("characters")
+                if result["errors"]:
+                    self.say("Added %d, %d unreadable: %s" % (
+                        len(result["added"]), len(result["errors"]),
+                        "; ".join(result["errors"][:2])), "warn")
+            self._post("call", done)
+        self.host._spawn(self.s.event_id, work)
+
+    def _remove_character_photo(self, rec, path):
+        if not messagebox.askyesno("Remove photo", "Remove this photo from %s's references?"
+                                   % (rec.get("name") or "this person"), parent=self.host):
+            return
+        rec["references"] = [p for p in rec.get("references") or [] if p != path]
+        try:
+            self.studio.lib.save("identities", self.studio.lib.all("identities"))
+        except OSError as e:
+            return self.say("Could not save: %s" % e, "err")
+        self._saved("identities")
+        self._show_list("characters")
+
+    def _character_settings(self, rec):
+        editor = self.edit_identities()
+        for i, r in enumerate(editor.records):
+            if r.get("id") == rec.get("id"):
+                editor.lb.selection_clear(0, "end")
+                editor.lb.selection_set(i)
+                editor.lb.see(i)
+                editor._pick()
+                break
 
     def _thumb(self, parent, path, bg="card"):
         """A fixed square holding the picture. A Frame, because a Label with

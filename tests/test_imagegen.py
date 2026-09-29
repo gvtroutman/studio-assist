@@ -379,6 +379,31 @@ class TestFill(unittest.TestCase):
         at = lambda x, y: rgba[(y * w + x) * 4]
         self.assertEqual((at(20, 10), at(5, 10), at(20, 40)), (255, 0, 0))
 
+    def test_add_pulid_chains_one_persons_extra_photos_at_the_lower_weight(self):
+        graph = {"ks": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}}}
+        ig.add_pulid(graph, "pulid.safetensors",
+                     [(["a.png", "b.png", "c.png", "d.png"], "mask.png")])
+        # capped at REFERENCE_PHOTOS_MAX (3): a fourth photo is dropped, not chained.
+        self.assertNotIn("pb_1_4", graph)
+        self.assertEqual(graph["pb_1f"]["inputs"]["image"], "a.png")
+        self.assertEqual(graph["pb_1"]["inputs"]["weight"], ig.PULID_BASE_WEIGHT)
+        self.assertEqual(graph["pb_1"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(graph["pb_1_2f"]["inputs"]["image"], "b.png")
+        self.assertEqual(graph["pb_1_2"]["inputs"]["weight"], ig.PULID_EXTRA_WEIGHT)
+        self.assertEqual(graph["pb_1_2"]["inputs"]["model"], ["pb_1", 0])
+        self.assertEqual(graph["pb_1_3f"]["inputs"]["image"], "c.png")
+        self.assertEqual(graph["pb_1_3"]["inputs"]["model"], ["pb_1_2", 0])
+        # the same mask - one person, one region - covers every one of their photos.
+        for n in ("pb_1", "pb_1_2", "pb_1_3"):
+            self.assertEqual(graph[n]["inputs"]["attn_mask"], ["pb_1k", 0])
+        self.assertEqual(graph["ks"]["inputs"]["model"], ["pb_1_3", 0])
+        # a bare string (one photo) still works exactly as before.
+        graph2 = {"ks": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}}}
+        ig.add_pulid(graph2, "pulid.safetensors", [("a.png", None)])
+        self.assertEqual(graph2["pb_1"]["inputs"]["weight"], ig.PULID_BASE_WEIGHT)
+        self.assertNotIn("pb_1_2", graph2)
+        self.assertNotIn("attn_mask", graph2["pb_1"]["inputs"])
+
     def test_the_face_graph_keeps_only_what_the_redraw_needs(self):
         wf = ig.load_workflow("flux_dev_baseline")
         crops = [{"x": 10, "y": 20, "width": 200, "height": 200},
@@ -1557,17 +1582,28 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         # After them, main's face finding on each reference photo - reads only.
         for g in graphs[3:]:
             self.assertIn("SAM3_Detect", {n.get("class_type") for n in g.values()})
-        self.assertEqual(first["40"]["inputs"]["model"], ["pb_1", 0])
+        # Both of Partner's photos chain into PuLID: the first at full weight,
+        # the second (a different angle) supporting it at PULID_EXTRA_WEIGHT.
+        self.assertEqual(first["40"]["inputs"]["model"], ["pb_1_2", 0])
         self.assertEqual(first["pb_1f"]["inputs"]["image"], "studio_partner.png")
+        self.assertEqual(first["pb_1"]["inputs"]["weight"], ig.PULID_BASE_WEIGHT)
+        self.assertEqual(first["pb_1_2f"]["inputs"]["image"], "studio_partner_left.png")
+        self.assertEqual(first["pb_1_2"]["inputs"]["weight"], ig.PULID_EXTRA_WEIGHT)
+        self.assertEqual(first["pb_1_2"]["inputs"]["model"], ["pb_1", 0])
         self.assertNotIn("attn_mask", first["pb_1"]["inputs"])   # the whole frame: no mask
         self.assertNotIn("pb_1m", first)
         self.assertEqual(second["fc1_r"]["inputs"]["image"], "studio_partner.png")
+        self.assertEqual(second["fc1_p"]["inputs"]["weight"], ig.PULID_WEIGHT)
+        self.assertEqual(second["fc1_r2"]["inputs"]["image"], "studio_partner_left.png")
+        self.assertEqual(second["fc1_p2"]["inputs"]["weight"], ig.PULID_EXTRA_WEIGHT)
         self.assertEqual(second["fc1_4"]["inputs"]["denoise"], ig.FORM_LIKENESS)
         self.assertEqual(json.loads(third["pp"]["inputs"]["faces"])[0]["references"],
                          ["studio_partner.png", "studio_partner_left.png"])
         rec = self.studio.history.list()[0]
         self.assertTrue(any("Face: Partner, from 2 photos" in n for n in rec["notes"]),
                         rec["notes"])
+        self.assertTrue(any("Partner drawn from more than one of their photos" in n
+                            for n in rec["notes"]), rec["notes"])
         self.assertEqual(rec["settings"]["face_photos"], photos)     # Generate Again has them
 
     def test_a_scene_face_wins_over_the_forms(self):
@@ -2533,6 +2569,76 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertTrue(os.path.isfile(kept))
         self.assertEqual(window.call_args.kwargs, {"around_head": True})
         self.assertEqual(ui.studio.lib.all("identities"), before)
+
+    def test_characters_tab_lists_identities_with_their_photo_count(self):
+        _, ui = self.tab()
+        photos = []
+        for name in ("char_a.png", "char_b.png"):
+            photos.append(os.path.join(self.dir, name))
+            with open(photos[-1], "wb") as f:
+                f.write(PNG)
+        ui.studio.lib.save("identities", [{"name": "Partner", "references": photos}])
+        try:
+            ui._show_list("characters")
+            self.assertEqual(ui.tab_chars.roles, ui.host.PILL_ROLES["option"])
+            self.assertEqual(ui.tab_queue.roles, ui.host.PILL_ROLES["ghost"])
+
+            def gather(w, kind):
+                out = [w] if type(w).__name__ == kind else []
+                for c in w.winfo_children():
+                    out += gather(c, kind)
+                return out
+            shown = [w.cget("text") for w in gather(ui.list_box, "Label")]
+            names = [e.get() for e in gather(ui.list_box, "Entry")]
+            self.assertIn("Partner", names)
+            self.assertTrue(any("2 reference photos" in t for t in shown), shown)
+        finally:
+            ui.studio.lib.save("identities", [])
+            ui._show_list("queue")
+
+    def test_new_character_can_be_renamed_from_the_tab(self):
+        import apps.image_studio.ui as ui_mod
+        _, ui = self.tab()
+        before = {r["id"] for r in ui.studio.lib.all("identities")}
+        try:
+            ui._new_character()
+            added = [r for r in ui.studio.lib.all("identities") if r["id"] not in before]
+            self.assertEqual(len(added), 1)
+            self.assertEqual(added[0]["name"], "New person")
+            var = ui_mod.tk.StringVar(value="Sabine")
+            ui._rename_character(added[0], var)
+            rec = ui.studio.lib.get("identities", added[0]["id"])
+            self.assertEqual(rec["name"], "Sabine")
+        finally:
+            ui.studio.lib.save("identities", [r for r in ui.studio.lib.all("identities")
+                                              if r["id"] in before])
+            ui._show_list("queue")
+
+    def test_add_and_remove_a_characters_photo_from_the_tab(self):
+        from unittest.mock import patch
+        import apps.image_studio.ui as ui_mod
+        _, ui = self.tab()
+        src = os.path.join(self.dir, "new_char_photo.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        ui.studio.lib.save("identities", [{"name": "New Face"}])
+        rec = next(r for r in ui.studio.lib.all("identities") if r["name"] == "New Face")
+        try:
+            with patch.object(ui_mod.filedialog, "askopenfilenames", return_value=(src,)), \
+                    patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()):
+                ui._add_character_photo(rec)
+                self.pump(lambda: ui.studio.lib.get("identities", rec["id"])["references"])
+            added = ui.studio.lib.get("identities", rec["id"])["references"]
+            self.assertEqual(len(added), 1)
+            self.assertNotEqual(added[0], src)          # copied into the library, not linked
+            self.assertTrue(os.path.isfile(added[0]))
+            with patch.object(ui_mod.messagebox, "askyesno", return_value=True):
+                ui._remove_character_photo(ui.studio.lib.get("identities", rec["id"]), added[0])
+            self.assertEqual(ui.studio.lib.get("identities", rec["id"])["references"], [])
+        finally:
+            ui.studio.lib.save("identities", [r for r in ui.studio.lib.all("identities")
+                                              if r["id"] != rec["id"]])
+            ui._show_list("queue")
 
     def test_head_window_requires_lock_and_queues_without_face_redraw(self):
         from unittest.mock import patch
