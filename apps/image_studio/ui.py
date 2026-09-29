@@ -43,6 +43,7 @@ import apps.image_studio.scene.ui as studio_scene_ui
 
 THUMB = 72                    # px, before the display's scale
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
+CAMERA_CARD = 150             # px, the Shot on card's long edge, before the display's scale
 HISTORY_PAGE = 40
 # The look sections the People tab shows. Body and Accessories are the
 # Editor's (CharacterCreator) alone: a character's still reach the prompt.
@@ -662,6 +663,14 @@ class ImageStudio:
         self.model_row = self.frame(setup)
         self.model_row.pack(side="top", fill="x", **pad)
 
+        # Shot on: the cameras as cards to flip through, above the Scene
+        # field. The card showing is the camera - for the form's Generate
+        # (its words and frame shape) and the Scene Builder's alike.
+        self.cap(f, "Shot on").pack(**pad)
+        self.camera_deck = self.frame(f)
+        self.camera_deck.pack(side="top", fill="x", pady=(0, self.px(8)), **pad)
+        self._build_camera_deck()
+
         shell = self.frame(f, "card")
         shell.pack(side="top", fill="x", **pad)
         self.scene = tk.Text(shell, height=5, wrap="word", bd=0, highlightthickness=0,
@@ -680,15 +689,6 @@ class ImageStudio:
             side="left", fill="x", expand=True, padx=(0, self.px(4)))
         self.button(srow, "Image library…", self.image_library).pack(
             side="left", fill="x", expand=True)
-        # Shot on: the camera body the Scene Builder's viewfinder is set to,
-        # so the form says what a scene's pictures are shot on. A click opens
-        # the builder at its Camera section, where it is chosen.
-        self.shot_on = self.label(f, "", "muted", self.host.f_small,
-                                  wraplength=self.px(380))
-        self.shot_on.config(cursor="hand2")
-        self.shot_on.bind("<Button-1>", lambda ev: self.choose_scene_camera())
-        self.shot_on.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
-        self.show_shot_on()
         self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
         # One dropdown for the person, characters and profiles both
@@ -1796,6 +1796,8 @@ class ImageStudio:
         for key in ("preset", "model", "backend", "style"):
             self.settings[key] = s.get(key) or self.settings[key]
         self.settings["character"] = s.get("character") or ""
+        if (s.get("camera_profile") or "none") != self.settings.get("camera_profile"):
+            self.set_camera(s.get("camera_profile") or "none")
         chosen = {d["id"]: d.get("strength") for d in s.get("identities") or []
                   if isinstance(d, dict)}
         for iid, (bv, sv, _) in self.idents.items():
@@ -1954,34 +1956,97 @@ class ImageStudio:
         self.show_shot_on()
         return self.scene_builder
 
-    def shot_on_text(self):
-        """'Shot on …' for the form: the open Scene Builder's camera body and
-        lens, or why there is none."""
+    # ------------------------------------------------------------ Shot on
+    # The cameras as a deck of cards above the Scene field: one card at a
+    # time, flipped with ‹ › (or the wheel over it). The card showing is the
+    # camera, `settings["camera_profile"]`. With the Scene Builder open the
+    # two are one choice: a flip here sets the scene's camera, and a camera
+    # chosen there (or a scene opened with one) turns the deck to it.
+    def _camera_cards(self):
+        return self.studio.lib.all("camera_profiles")
+
+    def _build_camera_deck(self):
+        for w in self.camera_deck.winfo_children():
+            w.destroy()
+        cards = self._camera_cards()
+        if not cards:
+            self.label(self.camera_deck, "No cameras yet.", "faint").pack(side="left")
+            return
+        ids = [c["id"] for c in cards]
+        cid = self.settings.get("camera_profile") or ""
+        if cid not in ids:
+            cid = "none" if "none" in ids else ids[0]
+            self.settings["camera_profile"] = cid
+        i = ids.index(cid)
+        cp = cards[i]
+        side = self.px(CAMERA_CARD)
+        row = self.frame(self.camera_deck)
+        row.pack(side="top", anchor="w")
+        self.camera_prev = self.button(row, "‹", lambda: self._flip_camera(-1), kind="ghost")
+        self.camera_prev.pack(side="left", fill="y")
+        card = tk.Frame(row, bd=0, highlightthickness=self.px(2))
+        self.skin(card, bg="card", highlightbackground="accent")
+        card.pack(side="left", padx=self.px(6))
+        img = (photo_at(cp["image"], side, card)
+               if cp.get("image") and os.path.isfile(cp["image"]) else None)
+        self.camera_photo = img
+        if img is not None:
+            pic = tk.Label(card, image=img, bd=0)
+            self.skin(pic, bg="card")
+        else:
+            pic = self.frame(card, "card")
+            pic.config(width=side, height=side * 2 // 3)
+            pic.pack_propagate(False)
+            self.label(pic, cp["name"], "faint", self.host.f_small, bg="card",
+                       wraplength=side - self.px(8)).pack(expand=True)
+        pic.pack(side="top")
+        self.camera_next = self.button(row, "›", lambda: self._flip_camera(1), kind="ghost")
+        self.camera_next.pack(side="left", fill="y")
+        about = [x for x in (("%dmm" % cp["lens"]) if cp.get("lens") else "",
+                             cp.get("format") or "") if x]
+        self.camera_name = self.label(self.camera_deck, cp["name"], "text", self.host.f_ui)
+        self.camera_name.pack(side="top", anchor="w", pady=(self.px(4), 0))
+        self.camera_about = self.label(
+            self.camera_deck, " · ".join(about + ["%d of %d" % (i + 1, len(cards))]),
+            "muted", self.host.f_small)
+        self.camera_about.pack(side="top", anchor="w")
+        foot = self.frame(self.camera_deck)
+        foot.pack(side="top", anchor="w")
+        self.button(foot, "Cameras…", self.edit_camera_profiles, kind="ghost").pack(side="left")
+        for w in (card, pic, *pic.winfo_children()):
+            w.bind("<MouseWheel>", lambda ev: self._flip_camera(-1 if ev.delta > 0 else 1))
+
+    def _flip_camera(self, step):
+        cards = self._camera_cards()
+        if not cards:
+            return
+        ids = [c["id"] for c in cards]
+        cid = self.settings.get("camera_profile") or ""
+        i = ids.index(cid) if cid in ids else 0
+        self.set_camera(ids[(i + step) % len(ids)])
+
+    def set_camera(self, cid):
+        """The deck's choice: the form's camera, and the open scene's."""
+        self.settings["camera_profile"] = cid
+        self._build_camera_deck()
         sb = self.scene_builder
-        if sb is None:
-            return "Shot on: no scene open (Scene Builder… to choose a camera)"
-        body = sb.camera_body()
-        shot = "%dmm · %d x %d" % ((round(sb.scene["camera"]["lens"]),)
-                                   + studio_scene_ui.sc.frame_size(sb.scene))
-        if not body:
-            return "Shot on: no camera set in the Scene Builder · " + shot
-        return "Shot on %s · %s (Scene Builder)" % (body, shot)
+        if sb is not None and (sb.scene["camera"].get("profile") or "none") != cid:
+            sb._set_camera_profile(cid)
+        self._recheck()
 
     def show_shot_on(self):
-        label = getattr(self, "shot_on", None)
-        if label is None:
+        """The Scene Builder's camera changed (or it opened or closed): turn
+        the deck to it."""
+        sb = self.scene_builder
+        if sb is None or getattr(self, "camera_deck", None) is None:
             return
-        try:
-            label.config(text=self.shot_on_text())
-        except tk.TclError:
-            pass
-
-    def choose_scene_camera(self):
-        """Open the Scene Builder on its Camera section, where the body is picked."""
-        sb = self.build_scene()
-        sb.select(None)
-        sb._inspector_tab("Camera")
-        return sb
+        cid = sb.scene["camera"].get("profile") or "none"
+        if cid != self.settings.get("camera_profile"):
+            self.settings["camera_profile"] = cid
+            try:
+                self._build_camera_deck()
+            except tk.TclError:
+                pass
 
     def _submit(self, s):
         """Off the UI thread: routing may check a backend's health."""
@@ -2751,6 +2816,8 @@ class ImageStudio:
             self.studio.clients.clear()
             self._paint_health()
             self.refresh_backends()
+        if kind == "camera_profiles":
+            self._build_camera_deck()
         if kind == "camera_profiles" and self.scene_builder is not None:
             try:
                 if self.scene_builder.win.winfo_exists():

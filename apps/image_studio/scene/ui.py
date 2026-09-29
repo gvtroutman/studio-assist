@@ -91,6 +91,7 @@ class SceneBuilder:
         host = self.host = owner.host
         form_scene = owner.scene.get("1.0", "end").strip()
         self.scene = sc.new_scene(details=form_scene)
+        self._bake_camera(owner.settings.get("camera_profile"))   # the form's Shot on card
         self.path = None
         self.dirty = False
         self.recovery_path = self._new_recovery_path()
@@ -681,6 +682,14 @@ class SceneBuilder:
         one) to the scene; baked in as plain words, so a saved scene keeps
         its camera's look even if the library entry is later edited or
         removed."""
+        self._bake_camera(cid)
+        self._inspect()               # the tiles' highlight and the frames it offers
+        self.sync()
+        self.changed()                # via _words, the form's Shot on deck turns to it
+
+    def _bake_camera(self, cid):
+        """A camera's name, format, chemistry and native lens into the scene,
+        and the frame to its shape - no widgets touched."""
         cam = self.scene["camera"]
         cp = self.owner.studio.lib.get("camera_profiles", cid) if cid else None
         cam["profile"] = cp["id"] if cp else ""
@@ -692,9 +701,6 @@ class SceneBuilder:
         # The viewfinder is the camera's: a square camera shoots square, a
         # 35mm one 3:2, held the way the frame already was.
         self.scene["frame"] = sc.camera_frame(cam["format"], self.scene["frame"])
-        self._inspect()               # the tiles' highlight and the frames it offers
-        self.sync()
-        self.changed()
 
     def _scene_controls(self):
         o, p, s = self.owner, self.panel, self.scene
@@ -1903,7 +1909,10 @@ class SceneBuilder:
             pill.paint(self.host.C)
 
     def reset_camera(self):
+        """Back to the starting view; the camera body stays the same."""
+        body = self.scene["camera"].get("profile")
         self.scene["camera"] = sc.new_scene()["camera"]
+        self._bake_camera(body)
         self.sync()
         self.changed()
 
@@ -2389,6 +2398,7 @@ class SceneBuilder:
         if not self._ask_save():
             return
         self.scene = sc.new_scene()
+        self._bake_camera(self.owner.settings.get("camera_profile"))
         self.making, self.suggestion = {}, None
         self.path, self.dirty = None, False
         self._forget()
