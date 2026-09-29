@@ -90,4 +90,3 @@ Re-check an entry only when a later change touches its code; then move it to
 - `apps/image_studio/ui.py` — no test file.
 - `apps/image_studio/scene/ui.py` — no test file (mannequin: body, clothes, hats/glasses, hair, shoe shapes).
 - `core/chat.py` — no test file.
-- `test_lessons.TestGuiForms.test_a_click_on_a_choice_is_the_next_message` fails on main (e5e518e, 2026-09-29): the transcript is empty where "25 fps" is expected.
