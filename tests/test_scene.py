@@ -625,6 +625,61 @@ class TestMaps(unittest.TestCase):
         seen = set(inst) - {0}
         self.assertTrue(1 < len(seen) <= 3)        # more than one member actually painted
 
+    def test_character_masks_isolate_each_named_person(self):
+        s = staged("person", "person", "box")
+        s["objects"][0].update(name="Sitter", character="sitter")
+        s["objects"][1].update(name="Partner", character="partner")
+        s["objects"][1]["position"] = [0.8, 0, -4]
+        w, h = sc.frame_size(s)
+
+        def at(obj):
+            lo, hi = sc.bounds(obj)
+            cam = sc.Camera(s["camera"], w, h)
+            x, y, _ = cam.project(((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2))
+            return int(y) * w + int(x)
+        i_sitter, i_partner = at(s["objects"][0]), at(s["objects"][1])
+
+        width, height, buffers = sc._character_mask_buffers(s, feather=0)
+        self.assertEqual((width, height), (w, h))
+        self.assertEqual(set(buffers), {"sitter", "partner"})    # the box has no character
+        self.assertEqual(buffers["sitter"][i_sitter], 255)
+        self.assertEqual(buffers["sitter"][i_partner], 0)        # not Partner's pixels
+        self.assertEqual(buffers["partner"][i_partner], 255)
+        self.assertEqual(buffers["partner"][i_sitter], 0)
+        self.assertEqual(buffers["sitter"][0], 0)               # the sky is nobody's
+
+        masks = sc.character_masks(s, feather=0)
+        self.assertEqual(set(masks), {"sitter", "partner"})
+        self.assertEqual({png_size(m) for m in masks.values()}, {(w, h)})
+
+    def test_character_mask_feathering_softens_the_edge(self):
+        s = staged("person")
+        s["objects"][0].update(name="Sitter", character="sitter")
+        w, h, hard = sc._character_mask_buffers(s, feather=0)
+        _, _, soft = sc._character_mask_buffers(s, feather=6)
+        hard, soft = hard["sitter"], soft["sitter"]
+        self.assertEqual(set(hard), {0, 255})                  # a binary mask
+        edge = [i for i in range(1, len(hard) - 1)
+                if hard[i - 1] != hard[i] or hard[i + 1] != hard[i]]
+        self.assertTrue(edge)
+        self.assertTrue(any(0 < soft[i] < 255 for i in edge))  # the feathered one is not
+
+    def test_scene_text_regional_pulls_a_characters_line_out_of_the_base(self):
+        s = staged("person", "person", "box")
+        s["objects"][0].update(name="Sitter", character="sitter")
+        s["objects"][0]["description"] = "brown lederhosen"
+        s["objects"][1].update(name="Partner", character="")    # no character: stays in base
+        s["objects"][1]["description"] = "blue dress"
+        base, by_character = sc.scene_text_regional(s)
+        self.assertEqual(list(by_character), ["sitter"])
+        self.assertIn("brown lederhosen", by_character["sitter"])
+        self.assertNotIn("brown lederhosen", base.text)
+        self.assertIn("blue dress", base.text)                 # Partner stayed in the base
+        # the non-regional text is unchanged and still says everything
+        plain = sc.scene_text(s)
+        self.assertIn("brown lederhosen", plain.text)
+        self.assertIn("blue dress", plain.text)
+
     def test_an_object_out_of_frame_paints_no_instance(self):
         s = staged("person")
         s["objects"][0]["position"] = [30, 0, 0]

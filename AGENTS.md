@@ -2059,6 +2059,26 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   The depth map uses the same card and its transparent holes, including cropped
   depth maps; it must not retain the original stand-in mesh. An imported PNG with
   transparency keeps its existing cutout instead of being colour-keyed again.
+- **Regional character prompting keeps each named character's words in their own
+  part of the picture** (2026-09-28: the instance buffer `id_render` renders for
+  masking landed the same day with nothing downstream reading it yet - this is
+  that downstream). `character_masks` (`scene.py`) turns each named character's
+  own instance id, from `id_render`'s sidecar, into a soft-edged binary mask
+  (`_feather`, a stdlib box blur - no PIL/numpy); `scene_text_regional` pulls
+  that character's line out of `scene_text`'s shared paragraph into its own
+  entry, so the base text does not repeat what a masked region already says.
+  Off by default (`scene["regional_prompting"]`, the Scene Builder's own
+  checkbox) and a no-op under two named characters - one character is not a
+  bleed problem. `imagegen.fill()`'s `regional_conditioning` block (declared
+  by a workflow template, so far only `zimage_hq.json`) injects one
+  `LoadImage` -> `ImageToMask` -> `CLIPTextEncode` -> `ConditioningSetMask`
+  chain per character and combines them onto the base prompt's own
+  conditioning with stock `ConditioningCombine` nodes - deliberately not
+  ComfyUI Impact Pack, so nothing new has to be installed. A model whose
+  workflow does not declare it just gets the words normally; regional
+  prompting never blocks a job. `tools/ab_regional_prompt.py` runs the same
+  scene, seed, model, LoRAs, pose and depth twice (regional off, then on)
+  for a by-hand comparison - not yet run live.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle

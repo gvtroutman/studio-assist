@@ -71,6 +71,7 @@ import array
 import bisect
 import copy
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -114,6 +115,12 @@ FRAME_KEEP_MAX = 0.7
 FALLBACK_KEEP = 0.3            # the frame kept for a model with no ControlNet (denoise 0.7)
 FACE_LIKENESS = 0.6            # how far a face given a picture is redrawn at the end
 REAL_FACES = True              # then their own face pasted over it, where a photo's angle fits
+# Off by default: a new, unproven layer (2026-09-28). Each named character's own
+# words go to their own masked region of the picture instead of one shared
+# paragraph, from the instance buffer id_render already computes - see
+# character_masks/scene_text_regional. A workflow without regional_conditioning
+# ignores it; so does a scene with fewer than two named characters.
+REGIONAL_PROMPTING = False
 FACE_LIKENESS_RANGE = (0.3, 0.95)
 DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet scales it
 # A person's head shape (`mq.HEAD_SHAPE`) reaches the picture in the face
@@ -1997,6 +2004,7 @@ def new_scene(details=""):
             "frame_keep": FRAME_KEEP, "face_likeness": FACE_LIKENESS,
             "head_depth": HEAD_DEPTH,
             "real_faces": REAL_FACES,
+            "regional_prompting": REGIONAL_PROMPTING,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0},
             "room": new_room(), "objects": [], "enrich": new_enrich()}
@@ -2175,6 +2183,7 @@ def clean_scene(d):
     s["face_likeness"] = _num(d.get("face_likeness"), FACE_LIKENESS, *FACE_LIKENESS_RANGE)
     s["head_depth"] = _num(d.get("head_depth"), HEAD_DEPTH, *HEAD_DEPTH_RANGE)
     s["real_faces"] = bool(d.get("real_faces", REAL_FACES))
+    s["regional_prompting"] = bool(d.get("regional_prompting", REGIONAL_PROMPTING))
     cam = d.get("camera") if isinstance(d.get("camera"), dict) else {}
     c = s["camera"]
     c["target"] = _vec(cam.get("target"), c["target"], -100, 100)
@@ -3796,6 +3805,71 @@ def id_map(scene):
     return id_render(scene)[4]
 
 
+def _box_blur_1d(buf, length, count, base_stride, elem_stride, radius):
+    """`count` lines of `length` values each - line `i` starts at
+    `i * base_stride` and its values are `elem_stride` apart - box-averaged
+    along their own length, clipped at each end (so an edge does not darken),
+    via a running prefix sum."""
+    out = bytearray(len(buf))
+    for i in range(count):
+        base = i * base_stride
+        line = buf[base:base + length] if elem_stride == 1 else \
+            bytes(buf[base + j * elem_stride] for j in range(length))
+        prefix = [0]
+        prefix.extend(itertools.accumulate(line))
+        for x in range(length):
+            lo, hi = max(0, x - radius), min(length - 1, x + radius)
+            total = prefix[hi + 1] - prefix[lo]
+            out[base + x * elem_stride] = total // (hi - lo + 1)
+    return out
+
+
+def _feather(buf, width, height, radius):
+    """A 0/255 mask, softened `radius` pixels at its edge: a box blur along
+    rows then columns, so a masked composite has no hard seam."""
+    if radius <= 0:
+        return buf
+    rows = _box_blur_1d(buf, width, height, width, 1, radius)
+    return _box_blur_1d(rows, height, width, 1, width, radius)
+
+
+def _character_mask_buffers(scene, feather=6):
+    """(width, height, {character id: bytearray}) - the pixels `character_masks`
+    turns into PNGs, kept separate so a test can check a mask's own bytes
+    without decoding a PNG back out."""
+    inst, _, _, _, sidecar = id_render(scene)
+    w, h = frame_size(scene)
+    by_character = {}
+    for iid_str, meta in sidecar["instances"].items():
+        char = meta.get("character")
+        if char:
+            by_character.setdefault(char, set()).add(int(iid_str))
+    buffers = {}
+    for char, iids in by_character.items():
+        table = bytes(255 if i in iids else 0 for i in range(256))
+        buffers[char] = _feather(bytearray(inst.translate(table)), w, h, feather)
+    return w, h, buffers
+
+
+def character_masks(scene, feather=6):
+    """{character id: mask png bytes} - one soft-edged mask per named
+    character in this scene, from the instance buffer `id_render` already
+    computes: 255 where that character's own instance painted a pixel, 0
+    elsewhere. Occlusion and overlap fall out for free (a covered character's
+    hidden pixels were never painted with their id, so two masks never
+    claim the same pixel). A crowd member or a person with no character
+    assigned has no `"character"` in the sidecar, so it gets no mask -
+    regional prompting is for named characters only."""
+    w, h, buffers = _character_mask_buffers(scene, feather)
+    masks = {}
+    for char, buf in buffers.items():
+        rgb = bytearray(w * h * 3)
+        for i in range(3):
+            rgb[i::3] = buf
+        masks[char] = rgb_png(bytes(rgb), w, h)
+    return masks
+
+
 def framing(scene):
     """-> (name, factor): the shot by its biggest face (FRAMING), and how
     much of the pose and depth strengths it gets."""
@@ -4098,19 +4172,26 @@ def camera_words(scene):
     return "Shot from %s on a %dmm %slens" % (angle, lens, kind)
 
 
-def scene_text(scene):
-    """The scene's words for the prompt. Every description is kept exactly
-    as written; only where things are in the frame is added around it."""
+def _join_parts(parts):
+    return "\n".join(p if p.endswith((".", "!", "?")) else p + "." for p in parts)
+
+
+def _scene_parts(scene):
+    """(Words with only `.notes` set, [(character id or None, part text)]) -
+    every line `scene_text` joins into one prompt, each tagged with the
+    character it belongs to (None for room/details/camera/crowd/unassigned
+    people) so `scene_text_regional` can split them without repeating this
+    walk of `scene["objects"]`."""
     out = Words()
     parts = []
     details = scene["details"].strip()
     if details:
-        parts.append(details.rstrip())
+        parts.append((None, details.rstrip()))
     room = scene.get("room") or new_room()
     for key, label, _ in SURFACES:
         words = room[key]["prompt"].strip()
         if words and (key == "floor" or room["walls"]):
-            parts.append("The %s: %s" % (label.lower(), words))
+            parts.append((None, "The %s: %s" % (label.lower(), words)))
     for obj in scene["objects"]:
         where = placement(scene, obj)
         if where is None:
@@ -4146,17 +4227,42 @@ def scene_text(scene):
         desc = obj["description"].strip()
         look = look_text(obj) if obj["asset"] == "person" else ""
         said = ". ".join(x for x in (look, posture, desc) if x)
-        parts.append(line + (": " + said if said else ""))
+        char = obj.get("character") if obj["asset"] == "person" else None
+        parts.append((char or None, line + (": " + said if said else "")))
         said = look or desc
         if not said:
             out.notes.append("%s has no description; the picture has only its shape and "
                              "name to go on." % obj["name"])
     for detail in (scene.get("enrich") or {}).get("added") or []:
         if detail.strip():
-            parts.append(detail.strip())
-    parts.append(camera_words(scene))
-    out.text = "\n".join(p if p.endswith((".", "!", "?")) else p + "." for p in parts)
+            parts.append((None, detail.strip()))
+    parts.append((None, camera_words(scene)))
+    return out, parts
+
+
+def scene_text(scene):
+    """The scene's words for the prompt. Every description is kept exactly
+    as written; only where things are in the frame is added around it."""
+    out, parts = _scene_parts(scene)
+    out.text = _join_parts(p for _, p in parts)
     return out
+
+
+def scene_text_regional(scene):
+    """(base Words, {character id: text}) - like `scene_text`, but a person
+    with a character assigned is pulled out of the shared text into their own
+    entry (unchanged wording), so a regional prompt's base conditioning does
+    not repeat what a masked region already says. A crowd or an unassigned
+    person stays in the base text, same as `scene_text`."""
+    out, parts = _scene_parts(scene)
+    base, by_character = [], {}
+    for char, text in parts:
+        if char:
+            by_character[char] = text if text.endswith((".", "!", "?")) else text + "."
+        else:
+            base.append(text)
+    out.text = _join_parts(base)
+    return out, by_character
 
 
 def people(scene):
@@ -4298,8 +4404,16 @@ def generation(scene, maps, characters=None, identities=None):
     and to their face picture's likeness where they have one."""
     import apps.image_studio.imagegen as ig
     w, h = frame_size(scene)
-    words = scene_text(scene)
     s, _ = clean_scene(scene)
+    by_character = {}
+    if s["regional_prompting"]:
+        words, regional_text = scene_text_regional(scene)
+        if len(regional_text) >= 2:            # one named character is not a bleed problem
+            by_character = regional_text
+        else:
+            words = scene_text(scene)
+    else:
+        words = scene_text(scene)
     extra = {"width": w, "height": h, "scene_layout": copy.deepcopy(s),
              "references": dict(maps), "pose": None, "composition": None}
     shot, factor = framing(s)
@@ -4333,6 +4447,11 @@ def generation(scene, maps, characters=None, identities=None):
                                 "head_depth": round(s["head_depth"], 3),
                                 "real": s["real_faces"],
                                 "people": face_targets(s, characters, identities)}
+    if by_character:
+        masks = character_masks(scene)
+        extra["character_regions"] = [
+            {"prompt": text, "mask_path": _write(masks[char], "character_mask")}
+            for char, text in by_character.items() if char in masks]
     return words, extra
 
 
