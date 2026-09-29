@@ -1517,6 +1517,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(rec["face_detail"]["likeness"], [])
         self.assertFalse(any("Likeness: Partner" in n for n in rec["notes"]), rec["notes"])
         self.assertTrue(any("FaceFusion applied" in n for n in rec["notes"]), rec["notes"])
+        self.assertTrue(any("Partner not drawn with PuLID" in n for n in rec["notes"]), rec["notes"])
 
     def test_a_characters_face_photos_draw_the_forms_person(self):
         """The plain form: the character's photos are its one person's face -
