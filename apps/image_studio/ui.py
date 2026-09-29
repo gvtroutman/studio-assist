@@ -36,7 +36,7 @@ import apps.image_studio.addons.nodes as addons
 import apps.comfyui.view as comfy_view
 import apps.image_studio.imagegen as ig
 import apps.image_studio.facefusion as ff
-import apps.image_studio.breed as sb
+import apps.image_studio.blend as sb
 import apps.image_studio.viewcube as viewcube
 import apps.image_studio.lora_train as lt
 import apps.image_studio.scene.pose as sp
@@ -2133,8 +2133,10 @@ class ImageStudio:
         acts.pack(side="bottom", fill="x", padx=self.px(10), pady=(self.px(4), self.px(10)))
         self.act_again = self.button(acts, "Generate again  ▾", self._again_menu, bg="card")
         self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
+        self.act_blend = self.button(acts, "Blend" + ELLIPSIS, self._blend_selected, bg="card")
         self.act_again.pack(side="left")
         self.act_fix.pack(side="right")
+        self.act_blend.pack(side="right", padx=(0, self.px(4)))
         for p in (self.act_again, self.act_fix):
             p.set(state="disabled")
         # The prompt and settings are in the Queue / History row below, so the
@@ -2187,6 +2189,7 @@ class ImageStudio:
         self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
         menu.add_command(label="Open", command=self._open_selected)
         menu.add_command(label="Fix a spot" + ELLIPSIS, command=self._fix_selected)
+        menu.add_command(label="Blend with" + ELLIPSIS, command=self._blend_selected)
         if self._selected_steps()[0]:
             menu.add_command(label="Show nodes", command=self._show_nodes)
         menu.add_command(label="Show in folder", command=lambda: self._open_selected(True))
@@ -2463,8 +2466,9 @@ class ImageStudio:
                    "stages": stages, "stage_keys": stage_keys, "strip": strip,
                    "base": "%s · %s · %s · seed %s" % (
                        preset, model.get("label", s.get("model")), job.backend["name"],
-                       s.get("seed")) if s.get("mode") != "dress" else
-                   "Try On · %s · seed %s" % (job.backend["name"], s.get("seed"))}
+                       s.get("seed")) if s.get("mode") not in ("dress", "blend") else
+                   "%s · %s · seed %s" % ("Try On" if s["mode"] == "dress" else "Blend",
+                                          job.backend["name"], s.get("seed"))}
         if ig.local_faces(s):
             widgets["base"] = "Face swap · this PC"
         for w in (row, right, thumb, thumb.img, status, meta, detail):
@@ -2732,6 +2736,8 @@ class ImageStudio:
         if settings.get("mode") == "dress":
             return self.say("That was a Try On, which the form no longer has; Generate "
                             "Again remakes it.", "warn")
+        if settings.get("mode") == "blend":       # a blend's form is its own window
+            return self.blend(settings=settings)
         self.apply(self.studio.fix_base(settings) if settings.get("mode") == "fix"
                    else settings)
 
@@ -2741,6 +2747,22 @@ class ImageStudio:
         if not path or not os.path.isfile(path) or s is None:
             return self.say("Choose a finished picture to fix.", "warn")
         FixWindow(self, path, s)
+
+    def _blend_selected(self):
+        """Blend, with the picture shown (if there is one) as its first."""
+        path = self.pending_preview
+        self.blend(path if path and os.path.isfile(path) else None)
+
+    def blend(self, first=None, settings=None):
+        """The Blend window (`BlendWindow`): one, raised if it is already
+        open, taking `first` as its first picture or a blend's `settings`
+        (Reuse settings) as everything it holds."""
+        window = getattr(self, "_blend_window", None)
+        if window is None or not window.win.winfo_exists():
+            window = self._blend_window = BlendWindow(self)
+        window.take(first, settings)
+        window.win.lift()
+        return window
 
     # ============================================================ the Nodes view
     def _selected_steps(self):
@@ -2765,8 +2787,8 @@ class ImageStudio:
         url = backend.get("url")
         if steps and url:
             return steps, url, name
-        if not backend.get("url"):
-            return [], None, None
+        if not backend.get("url") or job.settings.get("mode") == "blend":
+            return [], None, None         # a blend is not composed from the form
         graph = ig.preview_graph(self.studio.preview(job.settings, backend))
         return ([("Pipeline", graph)], backend["url"], name) if graph else ([], None, None)
 
@@ -3322,10 +3344,12 @@ class ImageStudio:
 class ImageLibraryWindow:
     """Every picture you have generated, newest first, with explicit roles in
     the existing generation plan - so a past result becomes a new source,
-    style or pose reference without any separate saving step."""
+    style or pose reference without any separate saving step. With `pick`
+    it is a chooser instead: the selected picture's path goes to `pick` and
+    the window closes (the Blend window's Library buttons)."""
 
-    def __init__(self, owner, kind="source"):
-        self.owner, self.studio = owner, owner.studio
+    def __init__(self, owner, kind="source", pick=None):
+        self.owner, self.studio, self.pick = owner, owner.studio, pick
         self.records = []
         self.image = None
         o = owner
@@ -3364,13 +3388,18 @@ class ImageLibraryWindow:
         self.detail.pack(fill="x", pady=o.px(8))
         foot = o.frame(win)
         foot.pack(fill="x", padx=o.px(12), pady=(0, o.px(12)))
-        o.label(foot, "Use as").pack(side="left")
         labels = [label for _, label, _ in ig.REFERENCE_KINDS]
         self.role = tk.StringVar(master=win, value=dict((k, l) for k, l, _ in ig.REFERENCE_KINDS)[kind])
-        menu = tk.OptionMenu(foot, self.role, *labels)
-        o.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
-        menu.pack(side="left", padx=o.px(8))
-        o.button(foot, "Use selected image", self.use, kind="accent").pack(side="right")
+        if pick is None:
+            o.label(foot, "Use as").pack(side="left")
+            menu = tk.OptionMenu(foot, self.role, *labels)
+            o.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
+            menu.pack(side="left", padx=o.px(8))
+            o.button(foot, "Use selected image", self.use, kind="accent").pack(side="right")
+            o.button(foot, "Blend" + ELLIPSIS, self.blend).pack(side="right",
+                                                                padx=(0, o.px(4)))
+        else:
+            o.button(foot, "Use this picture", self.use, kind="accent").pack(side="right")
         self.message = o.label(win, "", "muted", o.host.f_small, wraplength=o.px(730))
         self.message.pack(fill="x", padx=o.px(12), pady=(0, o.px(12)))
         self.reload()
@@ -3424,13 +3453,155 @@ class ImageLibraryWindow:
             return self.status("Select an image first.")
         if not os.path.isfile(rec["path"]):
             return self.status("This image is missing.", "err")
+        if self.pick is not None:
+            self.win.destroy()
+            return self.pick(rec["path"])
         kind = next(k for k, label, _ in ig.REFERENCE_KINDS if label == self.role.get())
         self.owner.use_library_image(kind, rec["path"])
         self.status("Selected as %s. Check References, then Generate." % self.role.get(), "ok")
 
+    def blend(self):
+        """The Blend window, with the selected picture as its first."""
+        rec = self.selected()
+        if rec is not None and not os.path.isfile(rec["path"]):
+            return self.status("This image is missing.", "err")
+        self.owner.blend(rec["path"] if rec else None)
+
+
+class BlendWindow:
+    """Blend anywhere (`blend`): two pictures - the library's, a file, the
+    one shown in the tab - into a new one. Blend queues a job like
+    Generate's (`blend.submit`), so the picture arrives in Queue and is kept
+    in History with both pictures, the words and the seed; Generate Again
+    remakes it and Reuse settings opens this window on it. The identity
+    editor's Blend (`NewPhotos`) is the other way in: there the picked
+    blends join the person's references."""
+    SIDE = 220
+
+    def __init__(self, owner):
+        self.owner = o = owner
+        host = o.host
+        self.paths = [None, None]
+        self.win = win = tk.Toplevel(host)
+        win.title("Blend")
+        win.transient(host)
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(560), host._px(490)))
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(12), pady=o.px(12))
+        o.button(foot, "Blend", self.start, kind="accent").pack(side="right")
+        o.button(foot, "Swap", self.swap, kind="ghost").pack(side="right", padx=(0, o.px(4)))
+        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(360))
+        self.msg.pack(side="left", fill="x", expand=True)
+        pair = o.frame(win)
+        pair.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(12), 0))
+        self.slots = [self._slot(pair, i) for i in (0, 1)]
+        o.label(win, "The new picture takes picture 1's shape, at about a megapixel.",
+                "faint", host.f_small).pack(side="top", anchor="w", padx=o.px(12),
+                                            pady=(o.px(6), 0))
+        row = o.frame(win)
+        row.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(10), 0))
+        self.person = tk.BooleanVar(master=win, value=False)
+        o.switch(row, self.person).pack(side="left")
+        o.label(row, "The same person is in both: keep their face", "text").pack(
+            side="left", padx=(o.px(8), 0))
+        o.label(win, "Anything to add (optional)", "muted", host.f_small).pack(
+            side="top", anchor="w", padx=o.px(12), pady=(o.px(10), o.px(2)))
+        self.words = tk.StringVar(master=win)
+        host._entry(win, self.words).master.pack(side="top", fill="x", padx=o.px(12))
+        self.status("Choose two pictures, then Blend.")
+
+    def _slot(self, parent, i):
+        """One picture's place: its square, its name, and where to take it
+        from. -> {"pic", "name"}."""
+        o, host, side = self.owner, self.owner.host, self.owner.px(self.SIDE)
+        col = o.frame(parent)
+        col.pack(side="left", expand=True)
+        o.label(col, "Picture %d" % (i + 1), "muted", host.f_small).pack(side="top", anchor="w")
+        box = tk.Frame(col, width=side, height=side, bd=0, highlightthickness=0)
+        o.skin(box, bg="card")
+        box.pack_propagate(False)
+        box.pack(side="top")
+        pic = tk.Label(box, bd=0, highlightthickness=0, text="None yet", font=host.f_small)
+        o.skin(pic, bg="card", fg="faint")
+        pic.pack(expand=True)
+        peek(pic, lambda: self.paths[i])
+        name = o.label(col, "", "faint", host.f_small, wraplength=side)
+        name.pack(side="top", anchor="w")
+        btns = o.frame(col)
+        btns.pack(side="top", anchor="w", pady=(o.px(4), 0))
+        o.button(btns, "Library" + ELLIPSIS, lambda: self.from_library(i)).pack(side="left")
+        o.button(btns, "File" + ELLIPSIS, lambda: self.from_file(i)).pack(
+            side="left", padx=(o.px(4), 0))
+        return {"pic": pic, "name": name}
+
+    def status(self, text, role="muted"):
+        if self.win.winfo_exists():
+            self.msg.config(text=text)
+            self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def take(self, first=None, settings=None):
+        """Fill the window: a blend's `settings` whole, else `first` into
+        the first place that is empty (the first when neither is)."""
+        if settings is not None:
+            d = sb.clean_blend(settings.get("blend"))
+            self.paths = (d["images"] + [None, None])[:2]
+            self.person.set(d["person"])
+            self.words.set(d["words"])
+        elif first:
+            self.paths[1 if self.paths[0] and not self.paths[1] else 0] = first
+        self.draw()
+
+    def set(self, i, path):
+        if self.win.winfo_exists() and path:
+            self.paths[i] = path
+            self.draw()
+            self.win.lift()
+
+    def from_library(self, i):
+        ImageLibraryWindow(self.owner, pick=lambda path: self.set(i, path))
+
+    def from_file(self, i):
+        self.set(i, filedialog.askopenfilename(parent=self.win, filetypes=[
+            ("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")]))
+
+    def swap(self):
+        self.paths.reverse()
+        self.draw()
+
+    def draw(self):
+        o = self.owner
+        for slot, path in zip(self.slots, self.paths):
+            img = photo(path, o.px(self.SIDE)) if path and os.path.isfile(path) else None
+            if img is not None:
+                o.keep.append(img)
+            slot["pic"].image = img
+            slot["pic"].config(image=img or "", text="" if img else (
+                "None yet" if not path else "No preview" if os.path.isfile(path)
+                else "Missing"))
+            slot["name"].config(text=os.path.basename(path) if path else "")
+
+    def settings(self):
+        """The job Blend sends: a new seed each time."""
+        return {"mode": "blend", "seed": -1, "backend": "auto",
+                "blend": {"images": [p for p in self.paths if p],
+                          "person": bool(self.person.get()), "words": self.words.get()}}
+
+    def start(self):
+        o, s = self.owner, self.settings()
+        wrong = sb.problem(sb.clean_blend(s["blend"]))
+        if wrong:
+            return self.status(wrong)
+        if o.lora_build is not None:
+            return self.status("A LoRA is being built and has the GPU; wait for it.", "err")
+        self.status("Sent. It is in the Queue now, and in History once it is made; "
+                    "Blend again for another.", "ok")
+        o._show_list("queue")
+        o.host._spawn(o.s.event_id, o._submit, s)
+
 
 class NewPhotos:
-    """Angles or Breed (`breed`) for the identity editor: new photos of the
+    """Angles or Blend (`blend`) for the identity editor: new photos of the
     person drawn on the Kontext backend, shown as they come; a click picks
     one, Add puts the picked ones into the references (Save keeps them).
     Again makes another round; closing the window stops the run.
@@ -3448,15 +3619,15 @@ class NewPhotos:
         self.cube = None
         self.folder = tempfile.mkdtemp(prefix="studio-%s-" % mode)
         win = self.win = tk.Toplevel(editor.win)
-        win.title("Breed" if mode == "breed" else "Angles")
+        win.title("Blend" if mode == "blend" else "Angles")
         win.transient(editor.win)
         host._skin(win, bg="bg")
-        win.geometry("%dx%d" % (host._px(640 if mode == "breed" else 860),
-                                host._px(560 if mode == "breed" else 600)))
+        win.geometry("%dx%d" % (host._px(640 if mode == "blend" else 860),
+                                host._px(560 if mode == "blend" else 600)))
         win.protocol("WM_DELETE_WINDOW", self.close)
         top = o.frame(win)
         top.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(12), 0))
-        o.label(top, "Parents" if mode == "breed" else "From", "muted", host.f_small).pack(
+        o.label(top, "Blending" if mode == "blend" else "From", "muted", host.f_small).pack(
             side="left", padx=(0, o.px(6)))
         for p in parents[:6]:
             img = photo(p, o.px(64), profile=True)
@@ -3466,17 +3637,17 @@ class NewPhotos:
         foot = o.frame(win)
         foot.pack(side="bottom", fill="x", padx=o.px(12), pady=o.px(12))
         o.button(foot, "Add to references", self.add, kind="accent").pack(side="right")
-        o.button(foot, "Again" if mode == "breed" else "Make", self.start).pack(
+        o.button(foot, "Again" if mode == "blend" else "Make", self.start).pack(
             side="right", padx=(0, o.px(4)))
         o.button(foot, "Stop", self.stop.set, kind="ghost").pack(
             side="right", padx=(0, o.px(4)))
         self.msg = o.label(foot, "", "muted", host.f_small)
         self.msg.pack(side="left", fill="x", expand=True)
-        if mode != "breed":
+        if mode != "blend":
             self._build_cube(win)
         outer, self.grid = o.scrolled(win)
         outer.pack(side="top", fill="both", expand=True, padx=o.px(12), pady=(o.px(8), 0))
-        if mode == "breed":
+        if mode == "blend":
             self.start()
         else:
             self.status("Click the sides of the cube to look from, then Make. "
@@ -3523,8 +3694,8 @@ class NewPhotos:
 
     def jobs(self):
         """[(label, parent, angle or None)] for one round."""
-        if self.mode == "breed":
-            return [("child", None, None)]
+        if self.mode == "blend":
+            return [("blend", None, None)]
         views = self.cube.chosen if self.cube is not None else sb.pick_angles(self.PER_PHOTO)
         return [(angle, p, angle) for p in self.parents for angle in views]
 
@@ -3554,10 +3725,10 @@ class NewPhotos:
                     if self.stop.is_set():
                         break
                     seed = random.randint(0, ig.MAX_SEED)
-                    graph = (sb.breed_graph(names[self.parents[0]], names[self.parents[1]],
+                    graph = (sb.blend_graph(names[self.parents[0]], names[self.parents[1]],
                                             size, seed) if angle is None
                              else sb.angle_graph(names[parent], angle, seed))
-                    head = "%s %d of %d on %s" % ("Breeding" if angle is None else
+                    head = "%s %d of %d on %s" % ("Blending" if angle is None else
                                                   "Angle: " + angle, n + 1, len(jobs),
                                                   backend["name"])
                     say(head + ELLIPSIS)
@@ -3826,15 +3997,15 @@ class RecordEditor:
                     o.button(actions, "Angles" + ELLIPSIS,
                              lambda p=pics: self._new_photos(p, "angles")).pack(
                         side="left", padx=(o.px(4), 0))
-                    o.button(actions, "Breed" + ELLIPSIS,
-                             lambda p=pics: self._new_photos(p, "breed")).pack(
+                    o.button(actions, "Blend" + ELLIPSIS,
+                             lambda p=pics: self._new_photos(p, "blend")).pack(
                         side="left", padx=(o.px(4), 0))
                     o.label(parent, "Use clear photos of the same person, one face per photo.\n"
                             "Choose a clear front view as Primary. Enable pooling to let the "
                             "other photos guide identity too. Build LoRA trains the "
                             "person's own FLUX LoRA from %d or more photos.\n"
                             "Angles draws the selected photos from the sides you pick on "
-                            "a view cube; Breed mixes two selected photos into a new "
+                            "a view cube; Blend mixes two selected photos into a new "
                             "one." % lt.MIN_PHOTOS,
                             "muted", host.f_small).pack(
                                 side="top", anchor="w")
@@ -3928,11 +4099,11 @@ class RecordEditor:
         self._import_paths(pics, paths)
 
     def _new_photos(self, pics, mode):
-        """Angles of the selected photos, or a child of the two selected."""
+        """Angles of the selected photos, or a blend of the two selected."""
         chosen = [pics["paths"][i] for i in sorted(pics["sel"])
                   if os.path.isfile(pics["paths"][i])]
-        if mode == "breed" and len(chosen) != 2:
-            return self.status("Select exactly two photos to breed.")
+        if mode == "blend" and len(chosen) != 2:
+            return self.status("Select exactly two photos to blend.")
         if mode == "angles" and not chosen:
             return self.status("Select the photos to see from other angles.")
         if self.owner.lora_build is not None:
@@ -4137,11 +4308,16 @@ class FixWindow:
     Lock mode a click (or Find) marks a square the fix may not change: the
     original is laid back over it last. An identity's face (the Face swap
     row) is swapped onto the picture's biggest face after everything else,
-    and needs no spots."""
+    and needs no spots.
+
+    What is wrong is a note on the spot marked last (or, after Find, on
+    them all): what the Visual Critic is asked after when Afterwards is
+    "Critic checks it", and a spot still wrong is then redrawn again."""
 
     TARGETS = [("hand", "Hand"), ("face", "Face"), ("other", "Accessory / other")]
     STRENGTHS = [("light", "Light"), ("medium", "Medium"), ("strong", "Strong")]
     MODES = [("redraw", "Redraw"), ("lock", "Lock (keep as is)")]
+    CHECKS = [("off", "Leave as made"), ("on", "Critic checks it")]
     FINDS = [("hand", "Find hands"), ("face", "Find face"), ("other", "Find accessories")]
 
     def __init__(self, owner, path, settings, around_head=False):
@@ -4152,6 +4328,9 @@ class FixWindow:
         self.spots = []                   # [{"x", "y", "size"}] in the picture's pixels
         self.locks = []                   # the same, kept as they are
         self.target, self.strength, self.mode = "hand", "medium", "redraw"
+        self.check = "off"                # "on": the Visual Critic looks at the result
+        self.current = None               # the spot the note is on; None: on them all
+        self.wide = ""                    # the note on them all
         if around_head:
             self.target, self.strength, self.mode = "other", "strong", "lock"
         self.finding = False
@@ -4196,7 +4375,8 @@ class FixWindow:
             row.pack_forget()
         for key, items, label in (("mode", self.MODES, "A click"),
                                   ("target", self.TARGETS, "Redraw"),
-                                  ("strength", self.STRENGTHS, "Change")):
+                                  ("strength", self.STRENGTHS, "Change"),
+                                  ("check", self.CHECKS, "Afterwards")):
             row = o.frame(opts)
             row.pack(side="top", fill="x", pady=(0, o.px(4)))
             o.label(row, label, "muted", width=10).pack(side="left")
@@ -4215,6 +4395,15 @@ class FixWindow:
             self.words.set(settings.get("scene") or "")
         e = host._entry(row, self.words)
         e.master.pack(side="left", fill="x", expand=True)
+        row = o.frame(opts)
+        row.pack(side="top", fill="x", pady=(o.px(4), 0))
+        o.label(row, "Wrong", "muted", width=10).pack(side="left")
+        self.note = tk.StringVar()
+        self.note.trace_add("write", lambda *_: self._noted())
+        e = host._entry(row, self.note)
+        e.master.pack(side="left", fill="x", expand=True)
+        if around_head:
+            row.pack_forget()
         row = o.frame(opts)
         row.pack(side="top", fill="x", pady=(o.px(4), 0))
         o.label(row, "Face swap", "muted", width=10).pack(side="left")
@@ -4315,6 +4504,9 @@ class FixWindow:
             label = str(n)
             if sp.get("photo"):
                 label += " · " + os.path.basename(sp["photo"])
+            if sp.get("note"):
+                label += " · " + (sp["note"] if len(sp["note"]) <= 28
+                                  else sp["note"][:27] + ELLIPSIS)
             if sp.get("outline"):
                 flat = [v for x, y in sp["outline"]
                         for v in (self.ox + x * self.k, self.oy + y * self.k)]
@@ -4387,8 +4579,34 @@ class FixWindow:
         if marks is self.locks:
             spot.pop("outline")
         marks.append(spot)
+        if marks is self.spots:
+            self._note_on(len(marks) - 1)
         self._draw()
         self._status()
+
+    def _note_on(self, i):
+        """The Wrong field now writes on spot `i` (None: on every spot
+        without a note of its own) and shows what is written there."""
+        self.current = i
+        self.showing = True           # showing it writes nothing
+        try:
+            self.note.set(self.wide if i is None else self.spots[i].get("note", ""))
+        finally:
+            self.showing = False
+
+    def _noted(self):
+        if getattr(self, "showing", False):
+            return
+        text = self.note.get().strip()[:ig.FIX_NOTE_MAX]
+        if self.current is None or self.current >= len(self.spots):
+            self.wide = text
+            return
+        sp = self.spots[self.current]
+        if text:
+            sp["note"] = text
+        else:
+            sp.pop("note", None)
+        self._draw()
 
     def _add(self, ev):
         at = self._to_pic(ev)
@@ -4403,6 +4621,8 @@ class FixWindow:
         if marks is self.spots and len(marks) >= ig.FIX_MAX_SPOTS:
             return self._status("Eight at a time; redraw these first.", "warn")
         marks.append({"x": at[0], "y": at[1], "size": self.size})
+        if marks is self.spots:
+            self._note_on(len(marks) - 1)
         self._draw()
         self._status()
 
@@ -4430,6 +4650,8 @@ class FixWindow:
             i = self._under(at, marks)
             if i is not None:
                 del marks[i]
+                if marks is self.spots:
+                    self._note_on(len(marks) - 1 if marks else None)
                 self._draw()
                 return self._status()
 
@@ -4483,6 +4705,7 @@ class FixWindow:
                 self.locks.extend(spots)
             else:
                 self.spots = spots
+                self._note_on(None)
                 self._pick("target", kind)
             self._draw()
             self._status("Found %d. %s" % (len(spots), "Locked." if mode == "lock" else
@@ -4538,7 +4761,8 @@ class FixWindow:
         self.owner.skin(self.msg, bg="bg", fg=role)
 
     def _clear(self):
-        self.spots, self.locks = [], []
+        self.spots, self.locks, self.wide = [], [], ""
+        self._note_on(None)
         self._draw()
         self._status()
 
@@ -4553,7 +4777,8 @@ class FixWindow:
             "image": self.path, "target": self.target, "strength": self.strength,
             "words": self.words.get().strip(), "spots": [dict(sp) for sp in self.spots],
             "locks": [dict(sp) for sp in self.locks], "face_swap": self.face,
-            "face_point": self.face_point})
+            "face_point": self.face_point, "note": self.wide,
+            "check": self.check == "on" and bool(self.spots)})
         if self.around_head:
             s.update(identities=[], character="", scene_faces={}, hand_pass=False)
             s["fix"].update(around_head=True, tone=0)

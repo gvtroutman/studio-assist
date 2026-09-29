@@ -266,9 +266,52 @@ class LoopTest(TempStudioMixin, unittest.TestCase):
     def test_the_pass_limit_holds_when_the_critic_is_never_satisfied(self):
         face = ob("jaw", "MISMATCH", correction="broader jaw")
         answers = [{"needs_refinement": True, "observations": [face]}] * 5
-        job, _ = self.run_with(answers, refine_passes=2)
-        self.assertEqual(len(self.vision.asked), 2)
+        job, client = self.run_with(answers, refine_passes=2)
+        self.assertEqual(len(self.vision.asked), 3)      # two passes, and a look at the last
+        self.assertEqual(len(client.graphs), 1 + 2 * 2)  # each pass: the finder, the redraw
         self.assertEqual(job.record["refinement"]["stopped"], "pass limit reached")
+        self.assertEqual(job.record["refinement"]["left"], ["jaw"])
+
+    def test_a_fault_still_there_is_redrawn_harder_then_left_to_the_user(self):
+        jaw = ob("jaw", "MISMATCH", correction="broader jaw")
+
+        def still(fix):
+            return {"needs_refinement": True, "observations": [], "followups": [
+                {"id": 1, "outcome": "PERSISTS", "observation": "jaw still narrow",
+                 "correction": fix}]}
+        job, client = self.run_with([{"needs_refinement": True, "observations": [jaw]},
+                                     still("a wide square jaw"), still("wider")])
+        ref = job.record["refinement"]
+        self.assertEqual(len(self.vision.asked), 3)
+        self.assertIn("FAULTS FOUND BEFORE", str(self.vision.asked[1]))
+        self.assertIn("1. jaw", str(self.vision.asked[1]))
+        first, second = client.graphs[2], client.graphs[4]
+        self.assertEqual(first["fc1_4"]["inputs"]["denoise"], 0.45)
+        self.assertEqual(second["fc1_4"]["inputs"]["denoise"], 0.6)
+        self.assertIn("a wide square jaw", second["f10"]["inputs"]["text"])
+        self.assertEqual(len(client.graphs), 5)          # tried twice, not a third time
+        self.assertEqual(ref["stopped"], "faults left to the user")
+        self.assertEqual(ref["left"], ["jaw"])
+        self.assertEqual([(x["outcome"], x["tries"]) for x in ref["scores"]],
+                         [("PERSISTS", 2)])
+        self.assertEqual(ref["history"][1]["scores"][0]["outcome"], "PERSISTS")
+        self.assertTrue(any("left to you" in n for n in job.record["notes"]))
+
+    def test_a_pass_that_made_it_worse_is_taken_back(self):
+        jaw = ob("jaw", "MISMATCH", correction="broader jaw")
+        job, client = self.run_with([
+            {"needs_refinement": True, "observations": [jaw]},
+            {"needs_refinement": False, "observations": [], "followups": [
+                {"id": 1, "outcome": "WORSE", "observation": "a seam across the chin"}]},
+            {"needs_refinement": False, "observations": [], "followups": [
+                {"id": 1, "outcome": "CLEARED"}]}])
+        ref = job.record["refinement"]
+        self.assertTrue(ref["history"][1]["taken_back"])
+        # Redrawn again from the picture before, not from the damaged one.
+        self.assertEqual(client.graphs[4]["fi"]["inputs"]["image"],
+                         client.graphs[2]["fi"]["inputs"]["image"])
+        self.assertEqual(ref["scores"][0]["outcome"], "CLEARED")
+        self.assertEqual(ref["left"], [])
 
     def test_a_structural_failure_makes_a_new_picture_from_the_compiled_prompt(self):
         job, client = self.run_with([
@@ -301,6 +344,204 @@ class LoopTest(TempStudioMixin, unittest.TestCase):
         job, client = self.run_with([{"needs_refinement": False, "observations": []}])
         self.assertIn("red velvet curtain behind him", client.graphs[0]["10"]["inputs"]["text"])
         self.assertIn("red velvet curtain", str(self.vision.asked[0]))   # checked, not reinvented
+
+
+class FaultsTest(unittest.TestCase):
+    """The user's notes as faults, and what became of a fault by the next look."""
+    SPOTS = [{"x": 40, "y": 40, "size": 64, "note": "thumb on the wrong side"},
+             {"x": 90, "y": 40, "size": 64},
+             {"x": 90, "y": 90, "size": 64, "photo": "hat.png"}]
+
+    def test_the_users_notes_are_certain_faults_already_tried_once(self):
+        a, b, c = critic.user_faults(self.SPOTS, "hand", note="six fingers")
+        self.assertEqual((a["id"], a["spot"], a["source"], a["confidence"], a["tries"]),
+                         (1, 0, "user", 1.0, 1))
+        self.assertEqual(a["observation"], "thumb on the wrong side")
+        self.assertEqual(b["observation"], "six fingers")     # the fix's note, for the rest
+        self.assertTrue(a["redo"])
+        self.assertFalse(c["redo"])                            # a photo is not redrawn
+        (bare,) = critic.user_faults([{"x": 1, "y": 1, "size": 64}], "face")
+        self.assertEqual(bare["observation"], "the face looked wrong")
+
+    def test_the_question_asks_after_each_fault_by_number(self):
+        intent = critic.intent_from({}, "A man waves.")
+        faults = critic.user_faults(self.SPOTS[:1], "hand")
+        text = critic.critic_prompt(intent, {}, faults, closeups=[1])
+        self.assertIn("1. hand 1: thumb on the wrong side. [marked by the user]", text)
+        self.assertIn("is a close-up of fault 1", text)
+        self.assertNotIn("references", text)
+        plain = critic.critic_prompt(intent, {})
+        self.assertIn("references", plain)
+        self.assertNotIn("FAULTS FOUND BEFORE", plain)
+
+    def test_a_close_up_is_sent_in_place_of_the_references(self):
+        v = FakeVision([{"observations": []}])
+        with tempfile.TemporaryDirectory() as d:
+            ref = os.path.join(d, "r.jpg")
+            with open(ref, "wb") as f:
+                f.write(b"x")
+            critic.analyze_generated_image(
+                v, b"png", {"prompt": "p", "scene": "", "camera": ""}, {}, [ref],
+                faults=critic.user_faults(self.SPOTS[:1]), closeups=[(1, b"crop")])
+        self.assertEqual(len(v.asked[0][0]["content"]), 3)     # words, picture, close-up
+
+    def test_a_fix_is_scored_by_its_number_else_by_its_name_else_not_at_all(self):
+        faults = critic.as_faults([ob("jaw", "MISMATCH"), ob("beard", "MISMATCH"),
+                                   ob("hat", "MISMATCH"), ob("ear", "MISMATCH")], 1)
+        self.assertEqual([(f["id"], f["tries"]) for f in faults],
+                         [(1, 1), (2, 1), (3, 1), (4, 1)])
+        look = critic.clean_result({"observations": [
+            ob("Beard", "MATCH"), ob("hat", "MISMATCH", correction="a felt hat")],
+            "followups": [{"id": 1, "outcome": "persists", "correction": "wider"},
+                          {"id": "x"}, {"id": 9, "outcome": "CLEARED"}]})
+        got = critic.score_fixes(faults, look)
+        self.assertEqual([f["outcome"] for f in got],
+                         ["PERSISTS", "CLEARED", "PERSISTS", "UNKNOWN"])
+        self.assertEqual(got[0]["correction"], "wider")
+        self.assertEqual(got[2]["correction"], "a felt hat")
+        made_up = critic.clean_result({"followups": [{"id": 1, "outcome": "sort of"}]})
+        self.assertEqual(critic.score_fixes(faults[:1], made_up)[0]["outcome"], "UNKNOWN")
+
+    def test_a_users_note_is_not_reworded_by_the_critic(self):
+        (f,) = critic.user_faults(self.SPOTS[:1], "hand")
+        (got,) = critic.score_fixes([f], critic.clean_result({"followups": [
+            {"id": 1, "outcome": "PERSISTS", "observation": "hand looks fine-ish",
+             "correction": "thumb beside the index finger"}]}))
+        self.assertEqual(got["observation"], "thumb on the wrong side")
+        self.assertEqual(got["correction"], "thumb beside the index finger")
+
+    def test_what_is_still_there_goes_again_until_it_was_tried_twice(self):
+        scored = [dict(ob("jaw", "MISMATCH"), id=1, tries=1, outcome="PERSISTS"),
+                  dict(ob("hat", "MISMATCH"), id=2, tries=2, outcome="WORSE"),
+                  dict(ob("ear", "MISMATCH"), id=3, tries=1, outcome="CLEARED"),
+                  dict(ob("eye", "MISMATCH"), id=4, tries=1, outcome="UNKNOWN"),
+                  dict(ob("bag", "MISMATCH"), id=5, tries=1, outcome="PERSISTS", redo=False)]
+        again, left = critic.carry(scored)
+        self.assertEqual([f["feature"] for f in again], ["jaw"])
+        self.assertEqual([f["feature"] for f in left], ["hat", "bag"])
+        self.assertFalse(critic.went_wrong(scored))            # the ear was mended
+        self.assertTrue(critic.went_wrong(scored[:2]))
+        self.assertFalse(critic.went_wrong(scored[:1]))
+
+    def test_a_redraw_is_harder_each_time_up_to_its_top(self):
+        self.assertEqual(critic.harder(0.45, 0, 0.6), 0.45)
+        self.assertEqual(critic.harder(0.45, 1, 0.6), 0.6)
+        self.assertEqual(critic.harder(0.45, 2, 0.6), 0.6)
+        self.assertEqual(critic.harder(0.6, 1, 0.6), 0.6)      # a hand's does not rise
+        self.assertEqual(critic.harder(0.7, 1, 0.6), 0.7)      # nor fall under what was asked
+
+    def test_a_carried_fault_is_planned_once_and_knows_its_tries(self):
+        canon = critic.initial_canonical({}, ())
+        carried = [dict(ob("jaw", "MISMATCH", correction="wider"), id=1, tries=1)]
+        plan = critic.plan_next_refinement(
+            result(ob("Jaw", "MISMATCH", correction="again"), needs=False), canon,
+            carried=carried, closed=["jaw"])
+        (action,) = plan["actions"]
+        self.assertTrue(plan["needs_pass"])                    # whatever the critic said
+        self.assertEqual((action["type"], action["tries"]), ("FACE_CORRECTION", 1))
+        self.assertEqual(action["corrections"], ["jaw seen. wider."])
+        self.assertEqual(critic.progress_text(action), "Refining faces again, harder")
+
+
+class CloseUpClient(FaceClient):
+    """FaceClient that also cuts the critic's close-ups."""
+    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+        graph = self.graphs[int(pid[3:]) - 1]
+        if "cs0" in graph:
+            return {"status": {"completed": True}, "outputs": {
+                k: {"images": [{"filename": k + ".png", "subfolder": "", "type": "temp"}]}
+                for k in graph if k.startswith("cs")}}
+        return super().listen_for_progress(pid, on_event, stop, timeout)
+
+
+class FixCheckTest(TempStudioMixin, unittest.TestCase):
+    """Fix a spot with the critic's check: the user's spots are the faults."""
+
+    def fix_with(self, answers, client=CloseUpClient, **fix):
+        self.vision = FakeVision(answers) if answers is not None else None
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=client, vision=lambda: self.vision)
+        FaceClient.fail_pass = False
+        src = os.path.join(self.dir, "made.png")
+        with open(src, "wb") as f:
+            f.write(ig.oval_png(256))
+        s = self.studio.fix_base(dict(ig.default_settings(), model="flux-dev",
+                                      scene="On a pier.", backend="5090"))
+        s.update(mode="fix", seed=5, fix=dict({
+            "image": src, "target": "hand", "strength": "light", "check": True,
+            "spots": [{"x": 60, "y": 60, "size": 64, "note": "thumb on the wrong side"},
+                      {"x": 180, "y": 180, "size": 64}]}, **fix))
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        return jobs[0], FaceClient.instances[-1]
+
+    def follow(self, *outcomes):
+        return {"observations": [ob("sky", "MISMATCH", "scene", subject="scene")],
+                "followups": [{"id": i, "outcome": o, "correction": "thumb by the index finger"}
+                              for i, o in enumerate(outcomes, 1)]}
+
+    def test_a_note_is_kept_with_its_spot(self):
+        f = ig.clean_fix({"note": " six fingers ", "check": 1, "spots": [
+            {"x": 5, "y": 6, "size": 100, "note": "x" * 500}]})
+        self.assertEqual(f["note"], "six fingers")
+        self.assertFalse(f["check"])                           # True alone turns it on
+        self.assertEqual(len(f["spots"][0]["note"]), ig.FIX_NOTE_MAX)
+
+    def test_without_the_check_a_fix_asks_no_one(self):
+        job, client = self.fix_with([], check=False)
+        self.assertEqual(len(client.graphs), 1)
+        self.assertEqual(self.vision.asked, [])
+        self.assertIsNone(job.record["refinement"])
+
+    def test_the_spot_still_wrong_is_redrawn_again_and_the_other_left_alone(self):
+        job, client = self.fix_with([self.follow("PERSISTS", "CLEARED"),
+                                     self.follow("CLEARED")])
+        fix, cut, redo, cut2 = client.graphs
+        self.assertIn("fc2_4", fix)                            # the fix: both spots
+        self.assertEqual(sorted(k for k in cut if k.startswith("cs")), ["cs0", "cs1"])
+        asked = self.vision.asked[0][0]["content"]
+        self.assertEqual(len(asked), 4)                        # words, picture, two close-ups
+        self.assertIn("1. hand 1: thumb on the wrong side. [marked by the user]",
+                      asked[0]["text"])
+        self.assertIn("fc1_4", redo)
+        self.assertNotIn("fc2_4", redo)                        # only the one still wrong
+        self.assertEqual(redo["fc1_1"]["inputs"]["crop_region"],
+                         fix["fc1_1"]["inputs"]["crop_region"])
+        self.assertEqual(redo["fc1_4"]["inputs"]["denoise"], 0.6)   # light 0.45, harder
+        said = [n["inputs"]["text"] for n in redo.values()
+                if n["class_type"] == "CLIPTextEncode"]
+        self.assertTrue(any("thumb by the index finger" in t for t in said))
+        self.assertEqual(redo["fi"]["inputs"]["image"], "ImageStudio/faces_00001_.png [output]")
+        self.assertEqual(list(cut2), ["cu", "cu0", "cs0"])     # only what was redrawn
+        ref = job.record["refinement"]
+        self.assertEqual(ref["history"][0]["type"], "fix")
+        self.assertEqual([(x["spot"], x["outcome"]) for x in ref["scores"]],
+                         [(0, "CLEARED"), (1, "CLEARED")])
+        self.assertEqual(ref["stopped"], "no meaningful problems left")
+        self.assertEqual(job.record["fix"]["spots"][0]["note"], "thumb on the wrong side")
+
+    def test_what_the_critic_finds_elsewhere_is_not_touched_by_a_fix(self):
+        job, client = self.fix_with([self.follow("CLEARED", "CLEARED")])
+        self.assertEqual(len(client.graphs), 2)                # the fix, the close-ups
+        self.assertEqual(job.record["refinement"]["history"][0]["scores"][0]["outcome"],
+                         "CLEARED")
+
+    def test_a_spot_wrong_after_two_redraws_is_left_to_the_user(self):
+        job, client = self.fix_with([self.follow("PERSISTS", "CLEARED"),
+                                     self.follow("PERSISTS"), self.follow("PERSISTS")])
+        self.assertEqual(len(self.vision.asked), 2)
+        self.assertEqual(job.record["refinement"]["left"], ["hand 1"])
+        self.assertEqual(job.record["refinement"]["stopped"], "faults left to the user")
+
+    def test_without_close_ups_the_critic_judges_by_the_whole_picture(self):
+        job, client = self.fix_with([self.follow("CLEARED", "CLEARED")], client=FaceClient)
+        self.assertEqual(len(self.vision.asked[0][0]["content"]), 2)
+
+    def test_without_a_vision_model_the_fix_is_kept_with_a_warning(self):
+        job, client = self.fix_with(None)
+        self.assertEqual(len(client.graphs), 1)
+        self.assertTrue(any("critic's check" in w for w in job.record["warnings"]))
 
 
 class MemoryTest(unittest.TestCase):

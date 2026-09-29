@@ -13,6 +13,13 @@ Three kinds of state, kept apart on purpose:
   generator invented if the critic likes it (`merge_canonical`), one value per
   key, so it grows sideways, never by appending;
 - the **corrections** - what the next pass fixes. Replaced after every look.
+
+And one thing carried from look to look, the **faults**: what the last pass
+redrew, each with a number. The next look says what became of each
+(`score_fixes`), so a fault that is still there is redrawn harder, not the
+same way again, one that was tried `MAX_TRIES` times is left to the user, and
+a redraw that made things worse is taken back. The user's own notes on a
+picture (Fix a spot) are faults too (`user_faults`): certain, never guessed.
 """
 
 import base64
@@ -26,7 +33,11 @@ CATEGORIES = ("identity", "body", "clothing", "scene", "interaction", "camera",
               "lighting", "realism")
 ACTIONS = ("FACE_CORRECTION", "LOCAL_INPAINT", "OBJECT_CORRECTION", "GLOBAL_REFINEMENT",
            "FULL_REGENERATION", "NO_CHANGE")
+OUTCOMES = ("CLEARED", "PERSISTS", "WORSE", "UNKNOWN")
 MAX_PASSES = 3
+MAX_TRIES = 2                 # redraws of one fault; still wrong after them, it is the user's
+HARDER = 0.15                 # denoise added for each redraw that left the fault there
+CLOSEUPS = 3                  # marked spots shown to the critic large, beside the picture
 MIN_CONFIDENCE = 0.6          # below this a mismatch is noted, never corrected
 PROMOTE_CONFIDENCE = 0.75     # and below this an invented detail is not kept
 # What one picture costs the vision model at most: LM Studio scales a large
@@ -55,9 +66,12 @@ CHECKS = {
                "textures",
 }
 
+REFERENCES = ("Any pictures after it are references for\nhow a person must look.")
+CLOSE = ("The %d after it %s of fault%s %s, in that order, as %s\nnow, for you to "
+         "judge %s by.")
+
 CRITIC_PROMPT = """You are checking a generated picture against what was asked for.
-The first picture is the generated one. Any pictures after it are references for
-how a person must look.
+The first picture is the generated one. %(pictures)s
 
 WHAT WAS ASKED (the user's request, the source of truth):
 %(intent)s
@@ -91,6 +105,27 @@ a structural failure: the wrong composition, camera angle, place or environment,
 a main subject missing or in the wrong place, a failed pose, badly wrong
 perspective or light. Set needs_refinement to false when nothing meaningful is
 wrong."""
+
+# The backward look: what the last pass redrew, asked after by number. The
+# model is small, so each fault is one line and the answer one word.
+FOLLOWUP_PROMPT = """
+
+FAULTS FOUND BEFORE. Each has been redrawn since. Find each one in the picture
+and say what became of it:
+%(faults)s
+
+Add to your JSON, beside "observations":
+ "followups": [
+  {"id": the fault's number,
+   "outcome": "CLEARED" | "PERSISTS" | "WORSE" | "UNKNOWN",
+   "observation": "what you see there now",
+   "correction": "for PERSISTS or WORSE: what it should be instead, said as the fix"}
+ ]
+
+CLEARED = it is right now. PERSISTS = it is still wrong. WORSE = the redraw
+damaged it: a seam, a double, a smear, a patch of the wrong colour. UNKNOWN =
+you cannot tell - never guess. A fault the user marked was there: judge only
+whether it still is. Do not list these faults again under "observations"."""
 
 
 # ============================================================ the three states
@@ -162,12 +197,27 @@ def _canonical_text(state):
     return "\n".join(lines) or "(nothing beyond the request)"
 
 
-def critic_prompt(intent, canonical):
-    return CRITIC_PROMPT % {
+def critic_prompt(intent, canonical, faults=(), closeups=()):
+    """The question. `faults` are what the last pass redrew, asked after by
+    number; `closeups` the numbers of those whose close-up is sent too."""
+    pictures = REFERENCES
+    if closeups:
+        one = len(closeups) == 1
+        pictures = CLOSE % (len(closeups), "is a close-up" if one else "are close-ups",
+                            "" if one else "s", ", ".join(str(i) for i in closeups),
+                            "it is" if one else "they are", "it" if one else "them")
+    text = CRITIC_PROMPT % {
+        "pictures": pictures,
         "intent": intent["prompt"] or intent["scene"] or "(no words given)",
         "canonical": _canonical_text(canonical),
         "checks": "\n".join("- %s: %s" % (k, v) for k, v in CHECKS.items()),
         "categories": "|".join(CATEGORIES)}
+    if faults:
+        text += FOLLOWUP_PROMPT % {"faults": "\n".join(
+            "%d. %s%s" % (f["id"], fault_text(f),
+                          " [marked by the user]" if f.get("source") == "user" else "")
+            for f in faults)}
+    return text
 
 
 def _json_in(text):
@@ -219,21 +269,44 @@ def clean_result(raw):
             "target": str(o.get("target") or "").strip().lower()[:40],
             "value": str(o.get("value") or "").strip()[:200],
         })
+    follow = []
+    for f in raw.get("followups") or []:
+        if not isinstance(f, dict):
+            continue
+        try:
+            fid = int(f.get("id"))
+        except (TypeError, ValueError):
+            continue
+        outcome = str(f.get("outcome") or "").upper().strip()
+        follow.append({"id": fid,
+                       "outcome": outcome if outcome in OUTCOMES else "UNKNOWN",
+                       "observation": str(f.get("observation") or "")[:300],
+                       "correction": str(f.get("correction") or "")[:300]})
     needs = raw.get("needs_refinement")
     return {"summary": str(raw.get("summary") or "")[:400],
             "needs_refinement": needs if isinstance(needs, bool) else
             any(o["status"] == "MISMATCH" for o in obs),
-            "observations": obs}
+            "observations": obs, "followups": follow}
 
 
 def analyze_generated_image(vision, generated_image, original_intent, canonical_state,
-                            reference_images=(), max_tokens=3000):
+                            reference_images=(), max_tokens=3000, faults=(), closeups=()):
     """The Visual Critic. `vision` is a studio_agent.Vision; `generated_image`
     the picture's PNG bytes; `reference_images` paths of pictures of the
-    people (the first two are sent). -> a clean critic result (clean_result).
-    Raises ValueError when the model gave no usable JSON."""
-    content = [{"type": "text", "text": critic_prompt(original_intent, canonical_state)},
-               _image_part(vision, generated_image, "image/png")]
+    people (the first two are sent). `faults` are what the last pass redrew,
+    to be scored (`score_fixes`); `closeups` [(fault id, PNG bytes)] shows
+    some of them large, and is sent instead of the references: a small model
+    told two things about the pictures after the first mixes them up.
+    -> a clean critic result (clean_result). Raises ValueError when the model
+    gave no usable JSON."""
+    closeups = list(closeups)[:CLOSEUPS]
+    content = [{"type": "text", "text": critic_prompt(
+        original_intent, canonical_state, faults, [i for i, _ in closeups])},
+        _image_part(vision, generated_image, "image/png")]
+    for _, raw in closeups:
+        content.append(_image_part(vision, raw, "image/png"))
+    if closeups:
+        reference_images = ()
     for path in list(reference_images)[:2]:
         try:
             with open(path, "rb") as f:
@@ -285,17 +358,27 @@ def action_for(o):
     return "GLOBAL_REFINEMENT", ""
 
 
-def plan_next_refinement(critic_result, canonical_state, min_confidence=MIN_CONFIDENCE):
+def plan_next_refinement(critic_result, canonical_state, min_confidence=MIN_CONFIDENCE,
+                         carried=(), closed=()):
     """What to keep, what to fix, which tool fixes it, and whether a pass is
     wanted at all. -> {"preserve", "correct", "actions": [{"type", "target",
-    "corrections"}], "ignored", "promote", "needs_pass", "deferred"}.
+    "corrections", "faults", "tries"}], "ignored", "promote", "needs_pass",
+    "deferred"}.
 
     A full regeneration, when any structural failure calls for one, is the
     only action. Otherwise the local fixes run together, and a whole-picture
-    touch-up waits until nothing local is left: it would be redrawn over."""
+    touch-up waits until nothing local is left: it would be redrawn over.
+
+    `carried` are the faults still there after a redraw (`carry`): planned
+    again beside what this look found, their action knowing how often it was
+    tried. `closed` are features already scored this look; the critic naming
+    one again as a new mismatch does not make it a second fault."""
     obs = critic_result["observations"]
+    known = {_key(f["feature"]) for f in carried} | {_key(k) for k in closed}
     preserve = [o["feature"] for o in obs if o["status"] == "MATCH"]
-    confident = [o for o in obs if o["status"] == "MISMATCH" and o["confidence"] >= min_confidence]
+    confident = list(carried) + [
+        o for o in obs if o["status"] == "MISMATCH" and o["confidence"] >= min_confidence
+        and _key(o["feature"]) not in known]
     ignored = [o["feature"] for o in obs if o["status"] == "MISMATCH"
                and o["confidence"] < min_confidence]
     locked = set(canonical_state.get("locked") or ())
@@ -305,24 +388,28 @@ def plan_next_refinement(critic_result, canonical_state, min_confidence=MIN_CONF
                and not any(m["feature"] == o["feature"] for m in confident)]
     groups = {}
     for o in confident:
-        kind, target = action_for(o)
-        groups.setdefault((kind, target), []).append(_fix_text(o))
-    actions = [{"type": k, "target": t, "corrections": c} for (k, t), c in groups.items()]
+        groups.setdefault(action_for(o), []).append(o)
+
+    def action(kind, target, faults):
+        return {"type": kind, "target": target, "faults": faults,
+                "corrections": [_fix_text(o) for o in faults],
+                "tries": max(int(o.get("tries") or 0) for o in faults)}
+    actions = [action(k, t, f) for (k, t), f in groups.items()]
     deferred = []
     if any(a["type"] == "FULL_REGENERATION" for a in actions):
-        actions = [{"type": "FULL_REGENERATION", "target": "",
-                    "corrections": [c for a in actions for c in a["corrections"]]}]
+        actions = [action("FULL_REGENERATION", "", [o for a in actions for o in a["faults"]])]
     elif any(a["type"] != "GLOBAL_REFINEMENT" for a in actions):
         deferred = [c for a in actions if a["type"] == "GLOBAL_REFINEMENT"
                     for c in a["corrections"]]
         actions = [a for a in actions if a["type"] != "GLOBAL_REFINEMENT"]
     order = {k: i for i, k in enumerate(ACTIONS)}
     actions.sort(key=lambda a: order[a["type"]])
-    needs = bool(critic_result["needs_refinement"] and actions)
+    needs = bool((critic_result["needs_refinement"] or carried) and actions)
     return {"preserve": preserve,
             "correct": [c for a in actions for c in a["corrections"]] if needs else [],
             "actions": actions if needs else [{"type": "NO_CHANGE", "target": "",
-                                               "corrections": []}],
+                                               "corrections": [], "faults": [],
+                                               "tries": 0}],
             "ignored": ignored, "promote": promote, "needs_pass": needs,
             "deferred": deferred if needs else []}
 
@@ -331,6 +418,113 @@ def _fix_text(o):
     fix = o["correction"].strip().rstrip(".")
     seen = o["observation"].strip().rstrip(".")
     return (seen + ". " + fix + ".") if fix and seen else (fix or seen) + "."
+
+
+# ================================================================ the faults
+# A fault is an observation that was redrawn, with a number ("id"), how often
+# ("tries") and who found it ("source": "critic" or "user"). A marked spot's
+# also says which spot ("spot") and whether it can be redrawn again ("redo").
+
+def fault_text(f):
+    """A fault in one line, as the critic is asked after it."""
+    return "%s: %s" % (f["feature"], _fix_text(f)) if _fix_text(f) != "." else f["feature"]
+
+
+def user_faults(spots, target="other", note=""):
+    """Fix a spot's spots -> the faults they are, numbered from 1 in the
+    spots' order. A spot's own `note` says what is wrong with it, else the
+    fix's `note`, else only that the thing was marked. The user saw it, so it
+    is certain, and it has been redrawn once: the fix did that."""
+    noun = {"hand": "hand", "face": "face"}.get(target, "spot")
+    out = []
+    for i, sp in enumerate(spots):
+        said = str(sp.get("note") or note or "").strip()[:200]
+        out.append({"id": i + 1, "spot": i, "source": "user", "tries": 1,
+                    "feature": "%s %d" % (sp.get("word") or noun, i + 1),
+                    "category": "identity" if target == "face" else "realism",
+                    "subject": "scene", "status": "MISMATCH", "confidence": 1.0,
+                    "severity": "minor", "target": sp.get("word") or noun,
+                    "observation": said or "the %s looked wrong" % noun,
+                    "correction": "", "value": "", "redo": not sp.get("photo")})
+    return out
+
+
+def as_faults(observations, first_id):
+    """What a pass redrew -> its faults: each numbered (kept, when it has a
+    number already) and tried once more."""
+    out = []
+    for o in observations:
+        f = dict(o, tries=int(o.get("tries") or 0) + 1)
+        f.setdefault("source", "critic")
+        if "id" not in f:
+            f["id"] = first_id
+            first_id += 1
+        out.append(f)
+    return out
+
+
+def score_fixes(faults, critic_result):
+    """What became of each fault, by this look. -> the faults, each with
+    `outcome` (OUTCOMES) and, when it is still there, what is seen now and
+    the fix in the critic's newer words. A fault the model did not answer
+    for is read from its observations - the same feature called right or
+    wrong - and is UNKNOWN without one: never a guess."""
+    said = {f["id"]: f for f in critic_result.get("followups") or []}
+    seen = {_key(o["feature"]): o for o in critic_result["observations"]}
+    out = []
+    for fault in faults:
+        f, o = said.get(fault["id"]), seen.get(_key(fault["feature"]))
+        outcome, now, fix = "UNKNOWN", "", ""
+        if f:
+            outcome, now, fix = f["outcome"], f["observation"], f["correction"]
+        elif o and o["status"] == "MATCH":
+            outcome, now = "CLEARED", o["observation"]
+        elif o and o["status"] == "MISMATCH" and o["confidence"] >= MIN_CONFIDENCE:
+            outcome, now, fix = "PERSISTS", o["observation"], o["correction"]
+        scored = dict(fault, outcome=outcome)
+        if outcome in ("PERSISTS", "WORSE"):
+            # A user's note stays what is seen: it is what they said was wrong.
+            if now and fault.get("source") != "user":
+                scored["observation"] = now
+            if fix:
+                scored["correction"] = fix
+        out.append(scored)
+    return out
+
+
+def carry(scored, max_tries=MAX_TRIES):
+    """The scored faults still there -> (those to redraw again, those left
+    to the user: tried `max_tries` times, or not redrawable)."""
+    there = [f for f in scored if f["outcome"] in ("PERSISTS", "WORSE")]
+    again = [f for f in there if f["tries"] < max_tries and f.get("redo", True)]
+    return again, [f for f in there if f not in again]
+
+
+def went_wrong(scored):
+    """Whether the pass these faults were redrawn in is to be taken back: it
+    damaged something and mended nothing."""
+    return (any(f["outcome"] == "WORSE" for f in scored)
+            and not any(f["outcome"] == "CLEARED" for f in scored))
+
+
+def harder(denoise, tries, top):
+    """The denoise of a redraw that follows `tries` that left the fault
+    there: HARDER more for each, to `top` - never under what was asked."""
+    return round(max(denoise, min(top, denoise + HARDER * max(0, int(tries or 0)))), 2)
+
+
+def score_lines(scored):
+    """The scores as the log and the job's notes say them."""
+    return ["%s: %s%s" % (f["feature"], f["outcome"].lower(),
+                          " after %d redraw%s" % (f["tries"], "" if f["tries"] == 1 else "s"))
+            for f in scored]
+
+
+def score_records(scored):
+    """The scores as the record keeps them: what a later picture learns from."""
+    return [{k: f.get(k) for k in ("id", "feature", "category", "target", "source",
+                                   "tries", "outcome", "observation", "spot")
+             if f.get(k) is not None} for f in scored]
 
 
 def _detail_path(o):
@@ -454,8 +648,9 @@ def generator_prompt(original_intent, canonical_state, corrections, focus=None):
 
 # ================================================================== the log
 
-def log_text(n, critic_result, plan):
-    """The block for the log: what matched, what did not, what was chosen."""
+def log_text(n, critic_result, plan, scored=()):
+    """The block for the log: what became of the last pass's fixes, what
+    matched, what did not, what was chosen."""
     obs = critic_result["observations"]
 
     def lines(items):
@@ -464,7 +659,8 @@ def log_text(n, critic_result, plan):
             if o["status"] == "MISMATCH"]
     return "\n".join([
         "VISUAL CRITIC PASS %d" % n, "",
-        "Summary: " + (critic_result["summary"] or "-"), "",
+        "Summary: " + (critic_result["summary"] or "-"), ""] + ([
+            "Last pass's fixes:", lines(score_lines(scored)), ""] if scored else []) + [
         "Matches:", lines(plan["preserve"]), "",
         "Mismatches:", lines(mism), "",
         "Uncertain:", lines(o["feature"] for o in obs if o["status"] == "UNCERTAIN"), "",
@@ -482,4 +678,5 @@ PROGRESS = {"FACE_CORRECTION": "Refining faces", "LOCAL_INPAINT": "Correcting %s
 
 def progress_text(action):
     t = PROGRESS.get(action["type"], action["type"])
-    return (t % (action["target"] or "detail")) if "%s" in t else t
+    t = (t % (action["target"] or "detail")) if "%s" in t else t
+    return t + (" again, harder" if action.get("tries") else "")
