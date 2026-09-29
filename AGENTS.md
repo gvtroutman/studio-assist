@@ -916,6 +916,27 @@ right and over-the-shoulder kept her; one profile left came out as a
 short-haired look-alike, and three-quarter right barely turned. The person picks.
 Refused while a LoRA build holds the GPU. Tests: `tests/test_breed.py`.
 
+Angles asks which way to look before it draws (Sitter 2026-09-29: "use angles as a
+preset and ask which way we want it to look based on a cube like bambu studio has").
+The window opens with a view cube (`apps.image_studio.viewcube.ViewCube`) instead of
+starting a random round. The cube is the person: a face drawn on the front, and
+RIGHT/LEFT are *theirs*, so seen from in front their right face is on screen left.
+Each face is cut in three both ways, into 26 parts (6 face middles, 12 edge strips,
+8 corners). Each part is a view key `(x, y, z)` in the person's frame: the camera
+stands out along it. A click picks or drops a part; a drag (more than `DRAG` px)
+turns the cube. `breed.view_name` names the key ("front right", "back left from
+above", "straight below") and `breed.view_prompt` words it. Each prompt says where
+the camera went *and* which edge of the picture they face, because "their left" and
+the picture's left are opposite ways round: with the camera at their right they face
+the picture's right. These are reference photos of a face, so back views have them
+look back over the shoulder. The pick is the preset: saved on every change to
+`angle_views.json` in `studio_dir()` (`load_views`/`save_views`; `DEFAULT_VIEWS`
+when the file is missing or unreadable). Make draws every selected photo from every
+picked view; Surprise me picks `PER_PHOTO` random ones. The old eight hand-worded
+angles are gone. The cube's words carry their phrasing, but none of them has been
+run live yet. Tests: `tests/test_viewcube.py`, and
+`test_angles_asks_on_a_view_cube_and_keeps_the_pick_as_the_preset`.
+
 Profiles' editable `description` is visual identity prose used alongside photos,
 not the private `notes`. `identity_description_text` binds it to selected people
 or Scene Builder's linked identities and positions; scene identities supersede

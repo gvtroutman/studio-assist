@@ -5,7 +5,9 @@ identity" - and then "breed is a seperate step. the angles are something every
 photo has". So two things, both in the identity editor:
 
 - Angles: any reference photo -> the same person seen from other angles
-  (`ANGLES`), one Kontext edit of that photo per angle (`angle_graph`).
+  (`ANGLES`), one Kontext edit of that photo per angle (`angle_graph`). The
+  angles are the parts of a view cube, picked on one (`viewcube`), and the
+  last pick is kept as the preset (`load_views`).
 - Breed: two reference photos -> one new photo that mixes them
   (`breed_graph`): both go in as Kontext reference latents, the child is drawn
   on an empty latent at the first parent's shape, so it copies neither.
@@ -17,6 +19,8 @@ ArcFace; that needs ComfyUI's venv, and a person looking works as well.)
 Stdlib only; the ComfyUI calls go through the studio's own client.
 """
 
+import json
+import os
 import random
 
 import apps.image_studio.imagegen as ig
@@ -34,26 +38,74 @@ KEEP = (" Keep this person's exact same face, face shape, facial features, body 
         "skin tone, eye colour, hairstyle and hair length, and glasses if they wear them. "
         "The same person, not a look-alike. A real photograph.")
 
+# The views are the 26 parts of a view cube (`viewcube`), the way Bambu Studio
+# asks which side of the model to look at (the user, 2026-09-29): 6 faces, 12
+# edges, 8 corners. A view is where the camera stands, as a key (x, y, z) in
+# the person's own frame, each -1, 0 or 1: x their right, y up, z in front of
+# them. "Right" and "left" are always theirs.
+VIEW_KEYS = [(x, y, z) for y in (0, 1, -1) for z in (1, 0, -1) for x in (0, 1, -1)
+             if (x, y, z) != (0, 0, 0)]
+PRESET_FILE = "angle_views.json"
+
+
+def view_name(key):
+    """'front', 'front right', 'right side', 'back left from above',
+    'straight above' ..."""
+    x, y, z = key
+    side = {1: "right", -1: "left", 0: ""}[x]
+    if z:
+        flat = ("front" if z > 0 else "back") + (" " + side if side else "")
+    else:
+        flat = side + " side" if side else ""
+    if not flat:
+        return "straight above" if y > 0 else "straight below"
+    return flat + {1: " from above", -1: " from below", 0: ""}[y]
+
+
+VIEW_NAMES = [view_name(k) for k in VIEW_KEYS]
+VIEW_OF = dict(zip(VIEW_NAMES, VIEW_KEYS))
+DEFAULT_VIEWS = ["front left", "front right", "left side", "right side"]
+
+
 # Kontext-style edits: what changes, then what stays. Head turns were the
 # weakest edit in make_variations, so each says so plainly and moves the camera,
-# not only the head.
-ANGLES = [
-    ("three-quarter left", "Show this person from a three-quarter angle, their face "
-                           "turned 45 degrees to their left, the camera moved to match"),
-    ("three-quarter right", "Show this person from a three-quarter angle, their face "
-                            "turned 45 degrees to their right, the camera moved to match"),
-    ("profile left", "Show this person in full side profile facing left, the camera "
-                     "directly beside them"),
-    ("profile right", "Show this person in full side profile facing right, the camera "
-                      "directly beside them"),
-    ("front", "Show this person facing the camera straight on, looking into the lens"),
-    ("from above", "Show this person from a high camera angle, looking down at them as "
-                   "they look up towards the camera"),
-    ("from below", "Show this person from a low camera angle, looking up at them"),
-    ("over the shoulder", "Show this person looking back over their shoulder at the "
-                          "camera, their body turned away"),
-]
-ANGLE_NAMES = [name for name, _ in ANGLES]
+# not only the head - and says which edge of the picture they face, since
+# "their left" and the picture's left are opposite ways round. With the camera
+# at their right they face the picture's right. These are reference photos of
+# a face, so from behind they still look back at the lens.
+def view_prompt(key):
+    x, y, z = key
+    side = "right" if x > 0 else "left"
+    if not x and not z:
+        return ("Show this person from directly above, the camera looking straight "
+                "down at them as they look up into the lens" if y > 0 else
+                "Show this person from directly below, the camera looking straight "
+                "up at them")
+    if not x:
+        flat = ("Show this person facing the camera straight on, looking into the lens"
+                if z > 0 else
+                "Show this person from directly behind, their back to the camera, "
+                "turning their head to look back over their shoulder so their face "
+                "shows")
+    elif z > 0:
+        flat = ("Show this person from a three-quarter angle: the camera has moved 45 "
+                "degrees round to their %s, so we see more of the %s side of their "
+                "face and they face towards the %s of the picture" % (side, side, side))
+    elif not z:
+        flat = ("Show this person in full side profile: the camera directly at their "
+                "%s side, so we see the %s side of their face and they face the %s "
+                "edge of the picture" % (side, side, side))
+    else:
+        flat = ("Show this person from behind and to their %s, their back half turned "
+                "to the camera, looking back over their %s shoulder at the lens so "
+                "their face is still seen" % (side, side))
+    return flat + {1: ", from a high camera angle looking down at them as they look "
+                      "up towards it", -1: ", from a low camera angle looking up at them",
+                   0: ""}[y]
+
+
+ANGLES = [(name, view_prompt(key)) for name, key in zip(VIEW_NAMES, VIEW_KEYS)]
+ANGLE_NAMES = VIEW_NAMES
 
 BREED = ("Make one new photograph of the same person who is in both of these pictures. "
          "Mix the two: take the pose and framing from one and the setting, light and "
@@ -68,6 +120,29 @@ def angle_prompt(name):
 def pick_angles(n, rng=random):
     """`n` different angles, in a random order."""
     return rng.sample(ANGLE_NAMES, min(n, len(ANGLE_NAMES)))
+
+
+def load_views(root=None):
+    """The views picked last time (the preset), else DEFAULT_VIEWS. Names
+    that are not views any more are dropped."""
+    try:
+        with open(os.path.join(root or ig.studio_dir(), PRESET_FILE), encoding="utf-8") as f:
+            names = json.load(f)
+    except (OSError, ValueError):
+        return list(DEFAULT_VIEWS)
+    if not isinstance(names, list):
+        return list(DEFAULT_VIEWS)
+    return [n for n in names if n in VIEW_OF]
+
+
+def save_views(names, root=None):
+    """Keep `names` as the preset, atomically. Raises OSError."""
+    root = root or ig.studio_dir()
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, PRESET_FILE)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump([n for n in names if n in VIEW_OF], f)
+    os.replace(path + ".tmp", path)
 
 
 def lacks(inventory):

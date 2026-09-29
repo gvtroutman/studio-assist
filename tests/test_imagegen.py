@@ -2594,6 +2594,39 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(window.call_args.kwargs, {"around_head": True})
         self.assertEqual(ui.studio.lib.all("identities"), before)
 
+    def test_angles_asks_on_a_view_cube_and_keeps_the_pick_as_the_preset(self):
+        from unittest.mock import patch
+        import apps.image_studio.breed as sb
+        import apps.image_studio.ui as ui_mod
+        _, ui = self.tab()
+        photos = []
+        for n in range(2):
+            photos.append(os.path.join(self.dir, "angle_src_%d.png" % n))
+            with open(photos[-1], "wb") as f:
+                f.write(PNG)
+        sb.save_views(["back left", "front"])
+        editor = type("Editor", (), {})()
+        editor.owner, editor.win = ui, ui_mod.tk.Toplevel(self.app)
+        self.addCleanup(editor.win.destroy)
+        with patch.object(ui.host, "_spawn") as spawn:
+            w = ui_mod.NewPhotos(editor, {"paths": photos, "sel": {0, 1}}, "angles", photos)
+            spawn.assert_not_called()                    # it asks before it draws
+            self.assertEqual(w.cube.chosen, ["back left", "front"])
+            self.assertEqual(w.jobs(), [(v, p, v) for p in photos
+                                        for v in ("back left", "front")])
+            self.assertIn("4 photos a round", w.picked.cget("text"))
+            w.cube.toggle("straight above")              # a click on the cube's top
+            self.assertEqual(sb.load_views(), ["back left", "front", "straight above"])
+            w.cube.set_chosen([])
+            w.start()
+            spawn.assert_not_called()                    # nothing picked, nothing run
+            self.assertIn("Pick at least one", w.msg.cget("text"))
+            w.cube.set_chosen(["right side"])
+            w.start()
+            spawn.assert_called_once()
+        w.running = False
+        w.close()
+
     def test_resting_on_a_thumbnail_shows_the_picture_larger(self):
         import apps.image_studio.ui as ui_mod
         _, ui = self.tab()
