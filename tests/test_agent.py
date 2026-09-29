@@ -1392,6 +1392,21 @@ class TestHandEnteredBridges(unittest.TestCase):
         self.assertEqual(spec.id, "photoshop-bridge")
         self.assertFalse(eng.APPS_BY_ID["photoshop"].custom)
 
+    def test_a_bridge_named_for_a_built_in_tab_does_not_take_its_id(self):
+        """Chat, Milanote and Image Studio are tabs but not APPS entries: a
+        bridge named "Chat" used to take TABS_BY_ID["chat"], and forgetting it
+        deleted the Chat tab's id with it."""
+        tabs = dict(eng.TABS_BY_ID)
+        self.addCleanup(eng.TABS_BY_ID.update, tabs)   # so a failure here spoils no other test
+        for name, tab in (("Chat", eng.CHAT), ("Milanote", eng.MILANOTE),
+                          ("Image Studio", eng.IMAGE_STUDIO)):
+            spec = eng.add_bridge(eng.bridge_from_record({"name": name, "command": "npx"}))
+            self.assertEqual(spec.id, tab.id + "-bridge")
+            self.assertIs(eng.TABS_BY_ID[tab.id], tab)
+            eng.remove_bridge(spec.id)
+            self.assertIs(eng.get_app(tab.id), tab)
+            self.assertEqual(eng.TABS.count(tab), 1)
+
     def test_command_lines_split_the_windows_way(self):
         self.assertEqual(eng.split_command(r'"C:\Program Files\x\python.exe" s.py --a "b c"'),
                          (r"C:\Program Files\x\python.exe", ["s.py", "--a", "b c"]))
