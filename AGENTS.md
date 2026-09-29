@@ -438,11 +438,15 @@ recipe; the wrong encoder type or latent gives noise, not an error.
 
 ### The Image Studio: a form over several ComfyUIs
 
-The **Image library…** button opens a reusable image collection (`images.json`).
-Imports copy images into `references/image-library` by content hash; removing an
-entry keeps the file so existing references and history remain usable. The library
-picker assigns a picture to an existing reference slot, so normal workflow support
-checks still apply. The preview menu can add generated images to the library.
+The **Image library…** button (`ImageLibraryWindow`) is every past generation,
+newest first, built fresh from `self.studio.history.list()` each time it opens or
+its search box changes - not a separate saved collection (`Library.all("images")`,
+`images.json`, still exists for `Library.import_image`/`register_image` and their
+own tests, but no UI reads it any more). One entry per output picture; a batch of
+several from one job gets "(2/3)" appended to its prompt so they stay distinguishable.
+Search matches the prompt, not a filename. Picking one assigns it to an existing
+reference slot (source, style, pose, …), so normal workflow support checks still
+apply.
 
 The ComfyUI tab is a conversation; the Image Studio (`IMAGE_STUDIO`, an `ImagesSpec`,
 a `PanelSpec` with `images = True`) is a form. It holds no other program's window,

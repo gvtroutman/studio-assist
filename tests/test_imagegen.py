@@ -2428,35 +2428,32 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertFalse(sent["auto_refine"])
         self.assertFalse(sent["hand_pass"])
 
-    def test_image_library_import_search_and_use_reaches_generation_settings(self):
-        from unittest.mock import patch
-        import apps.image_studio.ui as ui_mod
-        _, ui = self.tab()
+    def test_image_library_is_past_generations_search_and_use_reaches_settings(self):
+        s, ui = self.tab()
         before = ui.collect()
         self.addCleanup(lambda: ui.apply(before))
-        src = os.path.join(self.dir, "library-reference.png")
-        with open(src, "wb") as f:
-            f.write(PNG)
+        ui.scene.delete("1.0", "end")
+        ui.scene.insert("1.0", "A red bicycle against a white wall")
+        ui.settings["model"] = "z-image-turbo"
+        ui.settings["backend"] = "auto"
+        n = len(ui.jobs)
+        ui.generate()
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status in ig.FINISHED)
+        self.assertEqual(ui.jobs[0].status, "complete", ui.jobs[0].detail)
+        rec = ui.studio.history.list()[0]
         window = ui.image_library()
         self.addCleanup(window.win.destroy)
-        with patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()), \
-                patch.object(ui_mod.ff, "prepare_previews"):
-            window.import_paths([src, src])
-        self.pump(lambda: not window.busy)
-        rec = window.selected()
-        self.assertEqual(rec["name"], "library-reference.png")
-        self.assertEqual(len(window.records), 1)
-        window.search.set("no-match")
+        found = window.selected()
+        self.assertEqual(found["path"], rec["images"][0])
+        self.assertIn("red bicycle", found["name"])
+        window.search.set("no-match-at-all-xyz")
         self.assertIsNone(window.selected())
-        window.search.set("library-reference")
+        window.search.set("red bicycle")
         for kind, label, _ in ig.REFERENCE_KINDS:
             window.role.set(label)
             window.use()
-            self.assertEqual(ui.collect()["references"][kind], rec["path"])
+            self.assertEqual(ui.collect()["references"][kind], rec["images"][0])
         self.assertIsNone(ui.pose)
-        window.remove()
-        self.assertTrue(os.path.isfile(rec["path"]))
-        self.assertIsNone(window.selected())
 
     @classmethod
     def setUpClass(cls):

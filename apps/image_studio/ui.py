@@ -1942,8 +1942,6 @@ class ImageStudio:
         if self._selected_steps()[0]:
             menu.add_command(label="Show nodes", command=self._show_nodes)
         menu.add_command(label="Show in folder", command=lambda: self._open_selected(True))
-        menu.add_command(label="Add to image library", command=lambda:
-                         self.image_library().import_paths([path]))
         menu.add_command(label="Copy path", command=lambda: (
             self.host.clipboard_clear(), self.host.clipboard_append(path)))
         menu.tk_popup(ev.x_root, ev.y_root)
@@ -2892,11 +2890,12 @@ class ImageStudio:
 
 
 class ImageLibraryWindow:
-    """Reusable pictures, with explicit roles in the existing generation plan."""
+    """Every picture you have generated, newest first, with explicit roles in
+    the existing generation plan - so a past result becomes a new source,
+    style or pose reference without any separate saving step."""
 
     def __init__(self, owner, kind="source"):
-        self.owner, self.lib = owner, owner.studio.lib
-        self.busy = False
+        self.owner, self.studio = owner, owner.studio
         self.records = []
         self.image = None
         o = owner
@@ -2907,13 +2906,11 @@ class ImageLibraryWindow:
         win.geometry("%dx%d" % (o.px(780), o.px(580)))
         bar = o.frame(win)
         bar.pack(fill="x", padx=o.px(12), pady=o.px(12))
-        o.button(bar, "Import images…", self.import_files).pack(side="left")
-        o.button(bar, "Remove from library", self.remove, kind="ghost").pack(side="right")
         self.search = tk.StringVar(master=win)
         entry = o.host._entry(bar, self.search)
-        entry.master.pack(side="left", fill="x", expand=True, padx=o.px(12))
+        entry.master.pack(side="left", fill="x", expand=True)
         self.search.trace_add("write", lambda *_: self.reload())
-        o.label(win, "Search by filename. Import several images at once; copies are kept in your library.",
+        o.label(win, "Search by prompt. Everything you have generated is here.",
                 "muted", o.host.f_small).pack(fill="x", padx=o.px(12))
         body = o.frame(win)
         body.pack(fill="both", expand=True, padx=o.px(12), pady=o.px(12))
@@ -2959,10 +2956,23 @@ class ImageLibraryWindow:
         current = self.selected()
         rid = rid or (current or {}).get("id")
         query = self.search.get().strip().casefold()
-        self.records = [r for r in self.lib.all("images") if query in r["name"].casefold()]
+        self.records = []
+        for rec in self.studio.history.list():
+            prompt = rec.get("prompt") or ""
+            if query and query not in prompt.casefold():
+                continue
+            images = rec.get("images") or []
+            for i, path in enumerate(images):
+                name = self.owner.clip(prompt, 70) or "(no prompt)"
+                if len(images) > 1:
+                    name += " (%d/%d)" % (i + 1, len(images))
+                self.records.append({"id": "%s_%d" % (rec["id"], i), "name": name,
+                                     "path": path,
+                                     "when": (rec.get("created") or "")[5:16].replace("T", " ")})
         self.listbox.delete(0, "end")
         for r in self.records:
-            self.listbox.insert("end", r["name"] + ("" if os.path.isfile(r["path"]) else " (missing)"))
+            missing = "" if os.path.isfile(r["path"]) else " (missing)"
+            self.listbox.insert("end", (r["when"] + "  " + r["name"] + missing).strip())
         if self.records:
             at = next((i for i, r in enumerate(self.records) if r["id"] == rid), 0)
             self.listbox.selection_set(at)
@@ -2973,79 +2983,19 @@ class ImageLibraryWindow:
         rec = self.selected()
         self.image = photo(rec["path"], self.owner.px(280), profile=True) if rec else None
         self.picture.config(image=self.image or "", width=0 if self.image else 30,
-                            text="" if self.image else "Preview unavailable" if rec else "Import images to get started")
+                            text="" if self.image else "Preview unavailable" if rec else
+                            "Generate an image to get started")
         self.detail.config(text=rec["name"] if rec else "")
-
-    def import_files(self):
-        if self.busy:
-            return
-        paths = filedialog.askopenfilenames(parent=self.win, title="Import images into the library",
-                  filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.gif *.bmp")])
-        if paths:
-            self.import_paths(paths)
-
-    def import_paths(self, paths):
-        if self.busy:
-            return self.status("An import is already running.")
-        self.busy = True
-        self.status("Importing images…")
-        # Copy on a worker; publish records on Tk so simultaneous windows cannot
-        # overwrite an image list while another import is saving it.
-        def work():
-            kept, errors = [], []
-            for path in paths:
-                try:
-                    with open(path, "rb") as f:
-                        data = f.read()
-                    ext = ig.picture_ext(data)
-                    if not ext:
-                        raise ValueError("not a supported image")
-                    dest = self.lib.keep_bytes(data, ext, "image-library")
-                    kept.append((path, dest))
-                except (OSError, ValueError) as e:
-                    errors.append("%s: %s" % (os.path.basename(path), e))
-            if ff.PYTHON.is_file():
-                try:
-                    ff.prepare_previews([{"references": [dest for _, dest in kept]}])
-                except OSError:
-                    pass  # An unavailable thumbnail does not prevent using the image.
-            def done():
-                rid = None
-                for original, dest in kept:
-                    try:
-                        rec = self.lib.register_image(dest, os.path.basename(original))
-                        rid = rec["id"]
-                    except (OSError, ValueError) as e:
-                        errors.append("%s: %s" % (os.path.basename(original), e))
-                self.busy = False
-                if self.win.winfo_exists():
-                    self.search.set("")
-                    self.reload(rid)
-                    self.status("; ".join(errors) if errors else "Images saved. Select one and choose how to use it.",
-                                "err" if errors else "ok")
-            self.owner._post("call", done)
-        self.owner.host._spawn(self.owner.s.event_id, work)
 
     def use(self):
         rec = self.selected()
         if rec is None:
             return self.status("Select an image first.")
         if not os.path.isfile(rec["path"]):
-            return self.status("This image is missing. Import it again before using it.", "err")
+            return self.status("This image is missing.", "err")
         kind = next(k for k, label, _ in ig.REFERENCE_KINDS if label == self.role.get())
         self.owner.use_library_image(kind, rec["path"])
         self.status("Selected as %s. Check References, then Generate." % self.role.get(), "ok")
-
-    def remove(self):
-        rec = self.selected()
-        if rec is None or self.busy:
-            return
-        try:
-            self.lib.save_images([r for r in self.lib.all("images") if r["id"] != rec["id"]])
-        except (OSError, ValueError) as e:
-            return self.status("Could not save the library: %s" % e, "err")
-        self.reload()
-        self.status("Removed from the library. Existing references and saved generations keep their copy.")
 
 
 class NewPhotos:
