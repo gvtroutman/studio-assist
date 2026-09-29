@@ -472,7 +472,10 @@ class SceneBuilder:
         self.status("%s removed." % obj["name"], "muted")
 
     def select(self, oid, part=None):
-        section = ("Pose" if part != "body" else "Object") if part else "Object"
+        if part:
+            section = "Pose" if part != "body" else "Object"
+        else:
+            section = "Scene" if oid is None else "Object"
         if (oid != self.sel or (part and part != self.part)
                 or section != getattr(self, "inspector_section", "Object")):
             self.inspector_section = section
@@ -574,19 +577,23 @@ class SceneBuilder:
             self._inspect_object(obj)
 
     def _inspect_scene(self):
+        o, p = self.owner, self.panel
+        section = getattr(self, "inspector_section", "Scene")
+        tabs = o.frame(p)
+        tabs.pack(side="top", fill="x", pady=(0, o.px(8)))
+        for name in ("Scene", "Camera"):
+            o.button(tabs, name, lambda n=name: self._inspector_tab(n),
+                     kind="accent" if name == section else "quiet").pack(
+                side="left", padx=(0, o.px(4)))
+        if section == "Camera":
+            self._camera_controls()
+        else:
+            self._scene_controls()
+        self._words_box()
+
+    def _camera_controls(self):
         o, p, s = self.owner, self.panel, self.scene
         cam = s["camera"]
-        o.cap(p, "Scene details")
-
-        def details(v):
-            s["details"] = v
-            self.changed()
-        self.details = self._text(p, s["details"], details, height=5)
-        o.label(p, "Where this is and what matters in it: the place, the light, the "
-                "weather, the state of things.", "faint", self.host.f_small,
-                wraplength=o.px(310)).pack(side="top", fill="x")
-        self._enrich_box(p)
-
         o.cap(p, "Frame")
         o.choice(p, [(k, label) for k, label, _, _ in sc.FRAMES], s["frame"],
                  self._set_frame).pack(side="top", anchor="w")
@@ -614,6 +621,19 @@ class SceneBuilder:
             return write
         self._slider(p, "aim_y", "Aim height (m)", lambda: cam["target"][1], aim(1),
                      0, 3, 0.05)
+
+    def _scene_controls(self):
+        o, p, s = self.owner, self.panel, self.scene
+        o.cap(p, "Scene details")
+
+        def details(v):
+            s["details"] = v
+            self.changed()
+        self.details = self._text(p, s["details"], details, height=5)
+        o.label(p, "Where this is and what matters in it: the place, the light, the "
+                "weather, the state of things.", "faint", self.host.f_small,
+                wraplength=o.px(310)).pack(side="top", fill="x")
+        self._enrich_box(p)
 
         o.cap(p, "What the picture follows")
 
@@ -2350,7 +2370,7 @@ class SceneBuilder:
             return
         self.scene, self.path = box["scene"], None
         self.making = {}
-        self.sel = None
+        self.sel, self.inspector_section = None, "Scene"
         self._forget("From %s" % name)
         self.dirty = True
         self._title()
@@ -2393,7 +2413,7 @@ class SceneBuilder:
             self.status("Could not open %s: %s" % (os.path.basename(path), e), "err")
             return False
         self.scene, self.path, self.dirty = scene, path, False
-        self.sel = None
+        self.sel, self.inspector_section = None, "Scene"
         self.making, self.suggestion = {}, None
         self._forget("Opened %s" % os.path.basename(path))
         self._list()

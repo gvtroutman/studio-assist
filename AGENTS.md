@@ -1611,7 +1611,11 @@ slicer: library and object list on the left, the viewport with Move / Rotate / S
 the middle, the selected object's controls on the right, File / Build from photo /
 Suggest details along the top, and Model / Generate picture along the bottom. Undo and
 History have their own row below the editing tools. People have Object / Pose / Look
-inspector sections; clicking a body part opens Pose. Image Studio has Image / People /
+inspector sections; clicking a body part opens Pose. The scene row (no object selected)
+has Scene / Camera sections the same way - Scene details, Enrich and what the picture
+follows on one, Frame and the camera's lens/orbit/pitch/distance/aim on the other -
+reselecting the row resets to Scene, as reselecting a person resets to Object. Image
+Studio has Image / People /
 References / Settings sections, keeps Generate outside the scrolling form, and puts
 LoRAs inside Advanced in Settings. Section changes retain settings and reset scrolling.
 Generate inside the builder includes its arrangement; a plain Generate in the form does

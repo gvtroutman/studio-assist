@@ -2009,6 +2009,23 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertIn("x", sb.vars)
         self.assertEqual(person, before)
 
+    def test_camera_is_its_own_tab_apart_from_the_scene(self):
+        ui, sb = self.builder()
+        person = sb.add("person")
+        sb.select(None)
+        self.assertEqual(sb.inspector_section, "Scene")
+        self.assertNotIn("lens", sb.vars)
+        self.assertIn("real_faces", sb.vars)          # a "what the picture follows" slider
+        sb._inspector_tab("Camera")
+        self.assertIn("lens", sb.vars)
+        self.assertIn("distance", sb.vars)
+        self.assertNotIn("real_faces", sb.vars)        # the scene tab's controls are gone
+        # Selecting a person and back to the scene lands on Scene again, not
+        # wherever Camera left it - same rule person tabs already follow.
+        sb.select(person["id"])
+        sb.select(None)
+        self.assertEqual(sb.inspector_section, "Scene")
+
     def test_the_builder_goes_with_its_form(self):
         """It writes into the Image Studio's form, so closing the tab closes
         it - on the UI thread, since Session.close runs on a worker."""
