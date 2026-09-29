@@ -134,10 +134,13 @@ def view_prompt(key):
 # on Partner; "from near the floor" and "the height of their waist" did not).
 HEIGHT = {
     0: "Show %s",
-    1: ("Rotate the camera up and over this person to a bird's-eye view from above, "
-        "looking down at them from about 45 degrees overhead, and show %s, their "
-        "head tilted up towards the camera. Zoom out a little so their head, "
-        "shoulders and upper body are seen from above"),
+    # "Their head tilted up towards the camera" turned every view from above
+    # to face the lens; this keeps about 30 degrees of a turn (round 5). A
+    # bird's-eye shot still pulls the face round - it is the weak row.
+    1: ("Raise the camera high above this person to a bird's-eye view looking down at "
+        "them from about 45 degrees overhead, without changing their pose: show %s, "
+        "the top of their head and their shoulders seen from above, their face "
+        "pointing the same way as before"),
     -1: ("Rotate the camera down to a worm's-eye view from below, looking up at this "
          "person from about 45 degrees under them, and show %s, their head tipped "
          "down towards the camera. Zoom out so they tower over the camera: their "

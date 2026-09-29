@@ -11,6 +11,7 @@ import threading
 import uuid
 
 import core.agent as eng
+import core.ideas as ideas
 import core.lessons as lessons
 import core.mcp as studio_mcp
 import core.toolsmith as toolsmith
@@ -74,7 +75,8 @@ RECALL_TOOL = {"type": "function", "function": {
         "limit": {"type": "integer", "minimum": 1, "maximum": 6000,
                   "description": "Characters per page, default 4000."}}}}}
 
-INTERNAL_TOOLS = (TASK_TOOL, toolsmith.CREATE_TOOL, ASK_TOOL, lessons.REMEMBER_TOOL, RECALL_TOOL)
+INTERNAL_TOOLS = (TASK_TOOL, toolsmith.CREATE_TOOL, ASK_TOOL, lessons.REMEMBER_TOOL, RECALL_TOOL,
+                  ideas.IDEA_TOOL)
 OPENCODE_EXPLORATION = {"opencode_list_files", "opencode_read_file", "opencode_search_files"}
 
 QUALITY_RULES = """
@@ -112,7 +114,8 @@ TASK QUALITY
 - studio_ask shows the user a question with choices; ask it alone, then stop.
   studio_remember keeps one reusable lesson for this app: use it when corrected,
   told how the user works, or when a failed call finds what works. Neither touches
-  the project.
+  the project. studio_idea suggests an update to this app itself, only when a
+  limit of the app (not the project) stopped or slowed you.
 """
 
 # A reply that announces the next step instead of taking it: "Now I'll generate
@@ -131,7 +134,7 @@ PROMISE_HINT = ("You described what you would do, but this reply called no tool,
 # Calls that note something down and change nothing in the project: an answer
 # written beside only these is the answer (see Executor._run).
 BOOKKEEPING = frozenset((TASK_TOOL["function"]["name"], lessons.REMEMBER_TOOL["function"]["name"],
-                         toolsmith.CREATE_TOOL["function"]["name"]))
+                         toolsmith.CREATE_TOOL["function"]["name"], ideas.IDEA_TOOL["function"]["name"]))
 
 ROADMAP_NUDGES = 2
 ROADMAP_HINT = ("Your roadmap still has step %(n)d open: \"%(step)s\". Do it now. If it is "
@@ -603,8 +606,10 @@ def offered_tools(tools):
 class Executor:
     def __init__(self, llm, mcp, tools, schemas=None, record=None, cancel=None,
                  emit=None, checkpoint=None, vision=None, max_chars=100000,
-                 library=None, readback=(), review=None, notebook=None):
+                 library=None, readback=(), review=None, notebook=None, tab=""):
         self.llm, self.mcp = llm, mcp
+        self.tab = tab                    # the app's name, on the ideas studio_idea adds
+        self.ideas_added = 0
         self.bridge_tools = list(tools)
         self.library = library
         self.tools = inference_tools(self.bridge_tools, library)
@@ -864,6 +869,15 @@ class Executor:
             self.emit("sys", "Remembered: " + lesson["text"])
             return ("Kept for future tasks in this app: %s%s" % (
                 lesson["text"], "" if not note else " (" + note + ")"), False, False)
+        if name == ideas.IDEA_TOOL["function"]["name"]:
+            validate(args, ideas.IDEA_TOOL["function"]["parameters"])
+            if self.ideas_added >= ideas.MODEL_IDEAS_PER_RUN:
+                raise ValueError("Enough ideas from one task; nothing added. Finish the task.")
+            reply = ideas.Ideas().suggest(args["idea"], self.tab)
+            if reply.startswith("Added"):
+                self.ideas_added += 1
+                self.emit("sys", "Idea for Studio Assist added: " + " ".join(args["idea"].split()))
+            return reply, False, False
         made = self.library.get(name) if self.library is not None else None
         if made is not None:
             validate(args, made.parameters())

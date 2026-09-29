@@ -116,7 +116,7 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("three-quarter view", sb.view_prompt((-1, 0, 1)))
         self.assertIn("over their shoulder", sb.view_prompt((-1, 0, -1)))
         above, below = sb.view_prompt((0, 1, 1)), sb.view_prompt((0, -1, 1))
-        self.assertIn("Rotate the camera up", above)
+        self.assertIn("bird's-eye view", above)
         self.assertIn("facing the camera straight on", above)
         self.assertIn("worm's-eye view", below)
         self.assertIn("straight down", sb.view_prompt((0, 1, 0)))
