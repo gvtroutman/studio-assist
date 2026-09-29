@@ -52,7 +52,6 @@ SOURCES = {"user": "the user said so", "trainer": "the trainer kept it",
            "model": "the local model kept it", "review": "reflected after a task",
            "error": "a refused call"}
 SESSION_ID = re.compile(r"\bses_[A-Za-z0-9]+\b")
-REFUSED = re.compile(r"^\s*refused: ", re.M)
 
 
 class TrainerError(Exception):
@@ -136,28 +135,10 @@ def transcript(messages):
     return "\n\n".join(parts)
 
 
-def trouble_in(record, messages):
-    """What went wrong in a saved task, as short phrases; [] for a clean one."""
-    signs = []
-    status = record.get("status") or ""
-    if status and not status.startswith("response complete"):
-        signs.append("ended as: " + status[:80])
-    if any(lessons.looks_like_correction(b) for b in (record.get("briefs") or [])[1:]):
-        signs.append("the user corrected it")
-    names = [(c.get("function") or {}).get("name") for m in messages
-             for c in (m.get("tool_calls") or [])]
-    if "opencode_undo" in names or "opencode_discard" in names:
-        signs.append("the user undid or discarded work")
-    refused = sum(len(REFUSED.findall(_text(m.get("content")))) for m in messages
-                  if m.get("role") in ("tool", "assistant"))
-    if refused:
-        signs.append("%d step(s) refused" % refused)
-    errors = sum(1 for m in messages if m.get("role") == "tool"
-                 and re.match(r"\s*(tool error|error|failed|refused by the validator)",
-                              _text(m.get("content")), re.I))
-    if errors:
-        signs.append("%d failing call(s)" % errors)
-    return signs
+# trouble_in and self_review now live in core.lessons (shared with the
+# cross-task check below), so this and self_review both read tasks the same
+# way. trouble_in still takes (record, messages) exactly as before.
+trouble_in = lessons.trouble_in
 
 
 def sessions_in(messages):
@@ -206,6 +187,34 @@ def t_tasks(a):
             if len(briefs) > 1 else "",
             ("\n    trouble: " + "; ".join(trouble)) if trouble else "\n    clean"))
     return result("The OpenCode tab's saved tasks, newest first:\n\n" + "\n\n".join(rows))
+
+
+def _recent_tasks(limit):
+    """The last `limit` saved tasks as (record, messages), newest first,
+    skipping any that fail to load. Shared by t_tasks-style listing and
+    t_self_review, which both read tasks/opencode/*.json the same way."""
+    paths = sorted(glob.glob(os.path.join(records_dir(), "*.json")),
+                   key=os.path.getmtime, reverse=True)[:limit]
+    loaded = []
+    for path in paths:
+        try:
+            loaded.append(load_record(os.path.splitext(os.path.basename(path))[0]))
+        except TrainerError:
+            continue
+    return loaded
+
+
+def t_self_review(a):
+    limit = max(2, min(int(a.get("limit") or lessons.SELF_REVIEW_TASKS), 50))
+    loaded = _recent_tasks(limit)
+    if len(loaded) < 2:
+        return result("Fewer than 2 readable saved tasks; nothing to compare yet.")
+    suggestion = lessons.self_review(loaded)
+    if suggestion is None:
+        return result("No recurring trouble across the last %d task(s)." % len(loaded))
+    return result("Checked the last %d task(s) for a repeat, not a one-off:\n%s\n\n"
+                  "This is a suggestion, not a kept lesson - show it to the user, and only "
+                  "call trainer_keep if they agree." % (len(loaded), suggestion))
 
 
 def t_task(a):
@@ -332,6 +341,12 @@ TOOLS = [
      "Every lesson in the notebook the local model and OpenCode read before each task, "
      "with where it applies and who kept it. Read before keeping or forgetting one.",
      _schema()),
+    ("trainer_self_review", t_self_review,
+     "Check the last N saved tasks at once for the same kind of trouble recurring - a "
+     "status, a refusal, an undo, failing calls - instead of reading each one by hand. "
+     "Only suggests a lesson when one shows up 2 or more times; never writes it. Show the "
+     "suggestion to the user and call trainer_keep only if they agree.",
+     _schema({"limit": {"type": "integer", "minimum": 2, "maximum": 50}})),
     ("trainer_keep", t_keep,
      "Keep one lesson for the local model and OpenCode: one or two plain sentences it can "
      "act on next time (an instruction, not a story), naming no session ids or line "
@@ -347,7 +362,7 @@ TOOLS = [
 ]
 
 READ_ONLY = {"trainer_tasks", "trainer_task", "trainer_diff", "trainer_session",
-             "trainer_lessons"}
+             "trainer_lessons", "trainer_self_review"}
 HINTS = {"trainer_keep": {"destructive": False, "idempotent": True, "open_world": False},
          "trainer_forget": {"destructive": True, "idempotent": True, "open_world": False}}
 for _name in READ_ONLY:

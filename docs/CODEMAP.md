@@ -38,7 +38,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/agent.py` | 3.7k | Engine: app registry, LLM client, MCP client, prompts, CLI | `APPS`, `AppSpec`, `ServerSpec`, `LLM`, `MCPClient`, `Router`, `*_PROMPT` |
 | `core/mcp.py` | 1.2k | MCP harness every bridge is built on | `Server`, `tools_from_table`, `elicit`, `Declined`, `progress`, `cancelled`, `Loopback` |
 | `core/tasks.py` | 0.9k | Task execution and recoverable task records | |
-| `core/lessons.py` | 0.3k | What the model learns after each task, per app | |
+| `core/lessons.py` | 0.5k | What the model learns after each task, per app; `trouble_in`/`self_review` for the trainer's cross-task check | |
 | `core/appinfo.py` | 0.2k | Each app tab's profile for its prompt: name, installed release, Wikipedia overview (cached in `appinfo/`) | `refresh`, `render`, `WIKI` |
 | `core/toolsmith.py` | 0.4k | Tools the model writes for itself from its own bridge tools | |
 | `core/ui.py` | 0.3k | Palette roles and drawing primitives | |
@@ -111,9 +111,11 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
 - **Add-ons** - `apps/opencode/codeaddons.py` (records, `config`, MCP registry / npm / skills
   search and install) and `apps/opencode/codeaddons_ui.py` (`AddonsWindow`).
 - **Trainer** - `apps/opencode/trainer_mcp.py`: an MCP server for *Claude Code*
-  (`.mcp.json`, "opencode-trainer"), not the app. `t_tasks`/`trouble_in`, `t_task`
-  (`transcript`), `t_diff`, `t_session`, `t_lessons`, `t_keep`/`t_forget` (+ `publish`
-  to `lessons.md`). The window sees its lessons through `Notebook._sync`.
+  (`.mcp.json`, "opencode-trainer"), not the app. `t_tasks`/`trouble_in` (the latter now
+  `core.lessons.trouble_in`), `t_task` (`transcript`), `t_diff`, `t_session`, `t_lessons`,
+  `t_self_review` (`_recent_tasks` + `lessons.self_review`: the same trouble recurring
+  across the last N tasks - a suggestion only, never written), `t_keep`/`t_forget`
+  (+ `publish` to `lessons.md`). The window sees its lessons through `Notebook._sync`.
   Tests: `tests/test_trainer_mcp.py`.
 - **Tests** - `tests/test_opencode.py` (`FakeOpenCode` plays a server),
   `tests/test_codeaddons.py`, `TestElicitation` in `tests/test_mcp.py`.

@@ -123,6 +123,48 @@ class TestReading(Base):
         self.assertIn("trainer_task", text)
 
 
+class TestSelfReview(Base):
+    def test_too_few_tasks_to_compare(self):
+        self.save_task("aaaa1111", ["x"], [{"role": "user", "content": "x"}], age=0)
+        text, error = call("trainer_self_review")
+        self.assertFalse(error)
+        self.assertIn("Fewer than 2", text)
+
+    def test_no_recurring_trouble(self):
+        for i, age in enumerate((0, 100, 200)):
+            self.save_task("c1ea0%03d" % i, ["x"],
+                           [{"role": "user", "content": "x"}], age=age)
+        text, error = call("trainer_self_review")
+        self.assertFalse(error)
+        self.assertIn("No recurring trouble", text)
+
+    def test_a_repeated_status_is_suggested_once_not_written(self):
+        self.save_task("aaaa1111", ["x"], [{"role": "user", "content": "x"}],
+                       status="Stopped after repeated tool errors.", age=0)
+        self.save_task("bbbb2222", ["y"], [{"role": "user", "content": "y"}],
+                       status="Stopped after repeated tool errors.", age=100)
+        self.save_task("cccc3333", ["z"], [{"role": "user", "content": "z"}], age=200)
+        text, error = call("trainer_self_review")
+        self.assertFalse(error)
+        self.assertIn("2 of the last 3", text)
+        self.assertIn("Stopped after repeated tool errors", text)
+        self.assertIn("suggestion, not a kept lesson", text)
+        # Nothing was written until trainer_keep says so.
+        lessons_text, _ = call("trainer_lessons")
+        self.assertIn("No lessons yet", lessons_text)
+
+    def test_limit_narrows_how_far_back_it_looks(self):
+        self.save_task("aaaa1111", ["x"], [{"role": "user", "content": "x"}],
+                       status="Stopped after repeated tool errors.", age=0)
+        self.save_task("bbbb2222", ["y"], [{"role": "user", "content": "y"}],
+                       status="Stopped after repeated tool errors.", age=100)
+        self.save_task("cccc3333", ["z"], [{"role": "user", "content": "z"}],
+                       status="Stopped after repeated tool errors.", age=200)
+        text, error = call("trainer_self_review", {"limit": 2})
+        self.assertFalse(error)
+        self.assertIn("2 of the last 2", text)
+
+
 class TestTeaching(Base):
     def test_keep_goes_to_the_folder_and_reaches_opencode(self):
         text, error = call("trainer_keep", {"lesson": "Run tests.test_chat after editing core/chat.py."})
