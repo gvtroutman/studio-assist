@@ -25,6 +25,7 @@ import atexit
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -334,14 +335,13 @@ HEX = r"^#?[0-9a-fA-F]{6}$"
 
 
 def rgb(hex_color):
-    """'#RRGGBB' -> (r, g, b) ints, or ComError."""
-    h = (hex_color or "").lstrip("#")
-    if len(h) != 6:
-        raise ComError("colour must be #RRGGBB, got %r" % hex_color)
-    try:
-        return tuple(int(h[k:k + 2], 16) for k in (0, 2, 4))
-    except ValueError:
-        raise ComError("colour must be #RRGGBB, got %r" % hex_color)
+    """'#RRGGBB' -> (r, g, b) ints, or ComError. Checked against HEX rather than
+    left to int(): int(" f", 16) and int("-f", 16) both parse, so "-fffff"
+    used to come back as a negative channel."""
+    if not isinstance(hex_color, str) or not re.fullmatch(HEX, hex_color):
+        raise ComError("colour must be #RRGGBB, got %r" % (hex_color,))
+    h = hex_color.lstrip("#")
+    return tuple(int(h[k:k + 2], 16) for k in (0, 2, 4))
 
 
 def js_str(value):
