@@ -2918,6 +2918,12 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertFalse(ui.collect()["hand_pass"])
         ui.apply({k: v for k, v in ui.collect().items() if k != "hand_pass"})
         self.assertTrue(ui.collect()["hand_pass"])     # an older picture: it was on
+        # The head swap before the face swap, likewise.
+        self.assertTrue(ui.collect()["head_swap"])
+        ui.apply(dict(ui.collect(), head_swap=False))
+        self.assertFalse(ui.collect()["head_swap"])
+        ui.apply({k: v for k, v in ui.collect().items() if k != "head_swap"})
+        self.assertTrue(ui.collect()["head_swap"])
 
     def test_the_picture_card_holds_no_prompt_only_a_failed_face_swap_note(self):
         _, ui = self.tab()

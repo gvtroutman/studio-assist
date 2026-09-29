@@ -1066,6 +1066,58 @@ Neither has been measured live yet. The eye pass that follows (0.5) redraws the
 eyes from words on the picture's model, and eyes carry much of a likeness: if a
 swap looks right before the finish passes and weaker after, that is the place.
 
+**The head is redrawn before the face is swapped, and the swap is inswapper's**
+(2026-09-29, the user: "i think we need flux klein", then "klein with inswapper seems
+to work well enough"). FaceFusion changes the inside of a face and nothing else, so
+the head it landed on - shape, hair, glasses - stayed the generated stranger's.
+`Studio._head_swap` (Generate only, passed to `finish_profiles` as `before`, so the
+checkpoint kept before the faces is still the picture as generated) runs
+`apps.image_studio.headswap`: one SAM3 run (`FIND`, faces), `targets` picks each
+profile's face by FaceFusion's own `target_face` rule, `head_crop` cuts a square
+`CROP` (4) faces wide round the face, and `head_graph` has
+FLUX.2 Klein 4B redraw it at 1024 px from an empty latent with two
+`ReferenceLatent`s - the crop, then the profile's FIRST photo - in 4 steps at cfg 1
+(ComfyUI's own Klein template). Its colour is moved `TONE` (0.5) of the way to the
+crop's (ColorTransfer). It is blended back through the head and hair alone:
+SAM3's `WORDS` (`head:1`, `hair:1`) in the crop before and after, grown, inside a
+soft square. Klein 4B is
+Apache 2.0 and shares Z-Image's `qwen_3_4b` encoder (CLIPLoader type `flux2`); the
+9B is gated and non-commercial and is not used. `settings["head_swap"]` (on by
+default and for pictures saved before it; "Head swap before the face swap" under
+Generate) turns it off. A backend without SAM3, Klein's three files or its nodes,
+a failed run and a cancel all leave the picture as it was generated, with a note:
+the head swap is an extra and never costs the picture. The local face-only swap
+(Fix a spot, Retry face swap) has no ComfyUI and gets none.
+`facefusion.SWAP_MODEL` is now `inswapper_128` (a profile's `swap_model` wins;
+HyperSwap 1a was the first recipe). Measured on Partner, ArcFace against her photos,
+on the two pictures of the FaceFusion and BFS trials: no swap 0.11-0.17, HyperSwap
+1a 0.20 and 0.70, Klein alone 0.23-0.35, inswapper alone 0.81 and 0.78, Klein then
+inswapper 0.77-0.85, the same at strength 0.5, 0.65 and 0.8. inswapper was trained
+on the ArcFace that scores it, so its numbers flatter it. Live through
+`Studio.submit` by script on the 5090 (Z-Image, one seed, a dancer in a meadow): 0.70
+with the head swap against 0.57 without, 108 s against 94 s, the head swap itself
+about 8 s. That first version left two flaws the user asked to have fixed ("fix the
+two flaws first"). **The generated hair stayed**: long blonde hair under a darker
+crown. The mask was not the cause - Klein itself drew image 1's hair, on every
+seed, until `PROMPT` told it to remove that hair "including any of it lying on
+the neck, shoulders and chest"; the crop grew from 3 faces to 4 and lost its
+rise so that hair is inside it, and `hair:1` joined the mask so what Klein took
+off does not come back from underneath. Dark, pulled back, on 3 seeds of 3.
+**The face came back pale pink in a low sun**, from two places. Klein's head:
+the prompt now says whose light falls on it. FaceFusion's swap, which paints
+the references' skin over a head that had the light right:
+`tools/facefusion_swap.py --tone` (`facefusion.SWAP_TONE`, 0.8) moves the new
+face, inside its mask, to the Lab mean and spread of the face it replaced, the
+spread's gain held to 0.7-1.3. It applies to every FaceFusion swap, with or
+without a head swap. Live after both: 0.71, 104 s. Still open: where the old
+hair lay Klein draws skin and blouse of its own, and into that it copies things
+from the photo - a thin necklace on 3 seeds of 3, a floral trim on the blouse on
+1 of 3; the prompt's last sentence lessens it, and cutting the photo to its head
+(`photo_crop`, which `head_graph` takes and `_head_swap` does not yet send) did
+not help with a photo that is mostly head already. The colour match is a modest
+change, not a relight; a cheek keeps some pink. The seed matters: one close-up
+scored 0.23 and 0.35 on two seeds. Tests: `tests/test_headswap.py`.
+
 **The eyes and then the glasses are redrawn after the swap** (Generate only;
 `Studio._finish_passes`). FaceFusion pastes the new face over the frames,
 so the eyes came back soft and the glasses faint. The user asked for "an eye pass

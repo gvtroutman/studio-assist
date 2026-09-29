@@ -20,6 +20,20 @@ SCRIPT = ROOT / 'tools/facefusion_swap.py'
 # until 2026-09-27 (the user: "not as strong as i'd like"). A profile's own
 # `swap_strength` wins.
 SWAP_STRENGTH = 0.8
+# The swap model. HyperSwap 1a was the first approved recipe; on a small,
+# turned, full-body face it barely changed it (ArcFace against Partner's photos
+# 0.17 -> 0.20, 2026-09-27) where inswapper_128 reached 0.81, and after a
+# Klein head swap (`headswap`) inswapper reached 0.77-0.85 on both trial
+# pictures at 0.5, 0.65 and 0.8 alike (2026-09-29, the user: "klein with
+# inswapper seems to work well enough"). A profile's own `swap_model` wins.
+SWAP_MODEL = 'inswapper_128'
+SWAP_MODELS = ('inswapper_128', 'hyperswap_1a_256', 'hyperswap_1b_256', 'hyperswap_1c_256',
+               'ghost_2_256', 'simswap_256', 'blendswap_256')
+# How far the swapped face's colour is moved to that of the face it replaced
+# (tools/facefusion_swap.py --tone). Without it Partner's face came back pale
+# pink on a body in a low sun, after a head swap that had the light right
+# (live, 2026-09-29).
+SWAP_TONE = 0.8
 _SWAP_LOCK = threading.Lock()  # FaceFusion's jobs/temp directories are shared across backend lanes.
 
 
@@ -134,6 +148,12 @@ def strength(identity):
     return round(min(1.0, max(0.0, value)) * 20) / 20
 
 
+def model(identity):
+    """The profile's swap model when it names one FaceFusion has, else SWAP_MODEL."""
+    value = identity.get('swap_model')
+    return value if value in SWAP_MODELS else SWAP_MODEL
+
+
 def swap(data, identity, stop=None, face_index=None, face_count=1):
     while not _SWAP_LOCK.acquire(timeout=0.1):
         if stop and stop():
@@ -157,7 +177,8 @@ def _swap(data, identity, stop=None, face_index=None, face_count=1):
         target.write_bytes(data)
         args = [str(PYTHON), str(SCRIPT), '--identity', identity['id'], '--sources', *refs,
                 '--target', str(target), '--output', str(output),
-                '--weight', str(strength(identity))]
+                '--model', model(identity), '--weight', str(strength(identity)),
+                '--tone', str(SWAP_TONE)]
         if face_index is not None:
             args += ['--face-index', str(face_index), '--face-count', str(face_count)]
         if identity.get('target_region') is not None:

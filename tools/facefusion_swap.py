@@ -30,6 +30,9 @@ def main():
     parser.add_argument('--weight', type=float, default=0.5,
                         help='FaceFusion\'s face swapper weight: 0.5 is the reference face as it '
                              'is, higher pushes it further from the face it replaces.')
+    parser.add_argument('--tone', type=float, default=0.0,
+                        help='How far (0-1) the swapped face\'s colour is moved to that of '
+                             'the face it replaced, inside the mask.')
     parser.add_argument('--reference', type=int, help='Use just this reference (1-based).')
     parser.add_argument('--provider', default='cpu')
     args = parser.parse_args()
@@ -143,6 +146,22 @@ def main():
         raise RuntimeError('FaceFusion changed the dimensions; refusing the result.')
     final = original.copy()
     final[mask] = frame[mask]
+    tone = min(1.0, max(0.0, args.tone))
+    if tone:
+        # The swap model paints the references' skin: a studio photo's pale pink
+        # face in a picture lit by a low sun. Inside the mask the new face takes
+        # the mean and spread (Lab) of the face it replaced, which the picture's
+        # own light fell on. The spread is held near its own, so a face in
+        # hard light does not posterize a smooth one.
+        new = cv2.cvtColor(final, cv2.COLOR_RGB2LAB).astype(np.float32)
+        old = cv2.cvtColor(original, cv2.COLOR_RGB2LAB).astype(np.float32)
+        for c in range(3):
+            a, b = new[..., c][mask], old[..., c][mask]
+            gain = min(1.3, max(0.7, float(b.std()) / max(float(a.std()), 1e-3)))
+            moved = (a - a.mean()) * gain + b.mean()
+            new[..., c][mask] = a + (moved - a) * tone
+        toned = cv2.cvtColor(np.clip(new, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+        final[mask] = toned[mask]
     if not np.any(final != original):
         raise RuntimeError('The swap made no pixel changes.')
     save_args = {}
@@ -156,7 +175,7 @@ def main():
     Image.fromarray(mask.astype('uint8') * 255).save(output.with_name(output.stem + '-mask.png'))
     report = {'target': str(target), 'output': str(output), 'identity': args.identity,
               'references': refs, 'model': args.model, 'faces_swapped': captured['count'],
-              'weight': round(round(args.weight * 20) / 20, 2),
+              'weight': round(round(args.weight * 20) / 20, 2), 'tone': tone,
               'pixel_boost': captured.get('pixel_boost'),
               'mask_pixels': int(mask.sum()), 'outside_mask_changed_pixels': outside_changes,
               'changed_pixels': int(np.any(check != original, axis=2).sum()),

@@ -370,6 +370,8 @@ def clean_identity(d):
         # FaceFusion's swapper weight (studio_facefusion.SWAP_STRENGTH): 0.5 is
         # neutral, 1 strongest.
         "swap_strength": _num(d.get("swap_strength", 0.8), float, 0.8, 0.0, 1.0),
+        # "" is studio_facefusion.SWAP_MODEL; a name picks another of SWAP_MODELS.
+        "swap_model": _str(d.get("swap_model")),
         "reference_strength": _num(d.get("reference_strength", 0.6), float, 0.6, 0.0, 2.0),
         "use_references": d.get("use_references", True) is not False,
         "notes": _str(d.get("notes")),
@@ -3517,7 +3519,7 @@ def default_settings():
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
             "face_detail": None, "batch": 1, "pose": None, "composition": None,
-            "auto_refine": False, "refine_passes": 3, "hand_pass": True,
+            "auto_refine": False, "refine_passes": 3, "hand_pass": True, "head_swap": True,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -4750,7 +4752,7 @@ def route(role, backends, health, has_model=None, load=None):
 # ================================================================ jobs
 
 STATUSES = ("queued", "uploading", "loading", "sampling", "decoding", "running", "refining",
-            "face", "critic", "face_swap", "eyes", "hands", "glasses",
+            "face", "critic", "head_swap", "face_swap", "eyes", "hands", "glasses",
             "complete", "failed", "cancelled")
 FINISHED = ("complete", "failed", "cancelled")
 # The stages a job is shown moving through. "running" and "refining" are what
@@ -4798,6 +4800,8 @@ def pipeline_stages(lib, settings):
     stages.append(("decoding", "Decoding"))
     profiles = facefusion.selected(lib, settings)
     if profiles:
+        if settings.get("head_swap", True) is not False:
+            stages.append(("head_swap", "Head swap"))
         stages.append(("face_swap", "Face swap"))
         stages.append(("eyes", "Eye pass"))
     if settings.get("hand_pass", True) is not False:
@@ -5795,7 +5799,9 @@ class Studio:
             return self.queue._finish(job, "failed", "The picture was made but could not be "
                                       "fetched from %s: %s" % (b["name"], e))
         if profiles:
-            pictures = self.finish_profiles(job, graph, pictures, profiles, say)
+            pictures = self.finish_profiles(
+                job, graph, pictures, profiles, say,
+                before=lambda made: self._head_swap(job, client, values, made, profiles, say))
             if pictures is None:
                 return
         if not plan.workflow.get("multi_identity"):
@@ -5805,9 +5811,12 @@ class Studio:
         self.queue._finish(job, "complete",
                            "; ".join(plan.warnings[:1]) if plan.warnings else "")
 
-    def finish_profiles(self, job, graph, pictures, profiles, say, checkpoint=None):
+    def finish_profiles(self, job, graph, pictures, profiles, say, checkpoint=None, before=None):
         """Durable checkpoint before a fallible finishing step; never lose the base.
-        A retry passes the checkpoint it retries, already saved."""
+        A retry passes the checkpoint it retries, already saved. `before`
+        (pictures -> pictures; Generate's head swap) runs after the
+        checkpoint and before the faces, so the checkpoint is the picture
+        as it was generated."""
         if checkpoint is None:
             record = copy.deepcopy(self.record_for(job, graph))
             record["id"] += "-generated"
@@ -5819,6 +5828,10 @@ class Studio:
         job.outputs = list(job.record["images"])
         say("face_swap", "Generated picture saved; applying faces")
         try:
+            if before is not None:
+                pictures = before(pictures)
+                if job.cancel.is_set():
+                    raise RuntimeError("Face swap cancelled.")
             result = self._apply_profiles(job, pictures, profiles, say)
             if job.cancel.is_set():
                 raise RuntimeError("Face swap cancelled.")
@@ -5844,8 +5857,81 @@ class Studio:
             checkpoint["finish"].update(state="complete", results=list(job.outputs))
             self._update_checkpoint(checkpoint)
 
+    def _head_swap(self, job, client, values, pictures, profiles, say):
+        """Before the face swap, on the lane's thread: each profile's whole
+        head redrawn from their first photo by FLUX.2 Klein (`headswap`), so
+        the face FaceFusion swaps after lands on their head, hair and
+        glasses and not the generated stranger's. Unless
+        settings["head_swap"] is off. -> the pictures; those given when the
+        backend cannot, on any failure, and on a cancel - a head swap is an
+        extra, the picture is never lost to it."""
+        import apps.image_studio.headswap as headswap
+        if job.settings.get("head_swap", True) is False:
+            return pictures
+        b = job.backend
+        sam = self.sam3_on(b)
+        try:
+            short = headswap.lacks(self.inventories.get(b["id"]),
+                                   client.node_types() if sam else None)
+        except ComfyError:
+            short = []
+        if not sam or short:
+            job.notes.append("No head swap before the face swap: %s." % (
+                "%s has no SAM3 checkpoint" % b["name"] if not sam else
+                "%s lacks %s" % (b["name"], ", ".join(short))))
+            return pictures
+        folder = os.path.join(self.lib.root, "finish")
+        out = []
+        try:
+            os.makedirs(folder, exist_ok=True)
+            photos = {}
+            for n, (filename, data) in enumerate(pictures):
+                if job.cancel.is_set():
+                    out.append((filename, data))
+                    continue
+                path = os.path.join(folder, "%s_head_%d.png" % (job.id, n))
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                image = client.upload_image(path)
+                say(headswap.STATUS, "Finding the heads", None)
+                job.prompt_id = client.queue_workflow(parts_graph(image, sam, [headswap.FIND]))
+                entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
+                                                   stop=job.cancel.is_set)
+                said = parts_found(entry or {}, 1)
+                heads = []
+                if said is not None:
+                    width, height, boxes = said
+                    for profile, face in headswap.targets(width, height, boxes, profiles):
+                        photo = profile["references"][0]
+                        if photo not in photos:
+                            photos[photo] = client.upload_image(photo)
+                        heads.append({"crop": headswap.head_crop(width, height, face),
+                                      "photo": photos[photo], "name": profile["name"]})
+                if not heads:
+                    if not job.cancel.is_set():
+                        job.notes.append("SAM3 found no face of a chosen person, so no head "
+                                         "swap was made before the face swap.")
+                    out.append((filename, data))
+                    continue
+                graph = headswap.head_graph(image, heads, int(values.get("seed") or 0),
+                                            values["filename_prefix"] + "_head", sam)
+                files = self._run_pass(job, client, graph, say, headswap.LABEL,
+                                       status=headswap.STATUS)
+                if files is None:         # cancelled: the picture as it was
+                    out.append((filename, data))
+                    continue
+                out.append((filename, client.fetch(files[0])))
+                job.notes.append("Head swap before the face swap: %s redrawn from their "
+                                 "photo by FLUX.2 Klein." % ", ".join(
+                                     "%s's head" % h["name"] for h in heads))
+            return out
+        except (ComfyError, Unreachable, OSError) as e:
+            job.notes.append("The head swap before the face swap could not run (%s); the "
+                             "faces are swapped on the picture as it was generated." % e)
+            return pictures
+
     def _apply_profiles(self, job, pictures, profiles, say):
-        """Last pixel-changing step: the same HyperSwap recipe as the approved trial."""
+        """The final face swap, by FaceFusion (`facefusion.SWAP_MODEL`)."""
         import apps.image_studio.facefusion as facefusion
         result = []
         for filename, data in pictures:
