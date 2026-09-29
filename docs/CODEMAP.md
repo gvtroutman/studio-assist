@@ -34,7 +34,16 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 ## core/ (every tab)
 | File | Lines | What it is | Start at |
 | --- | --- | --- | --- |
-| `core/chat.py` | 6.6k | The Tkinter window: tabs, chat, approval cards | `Chat`, `_drain`/`_handle`/`_report`, `_elicit`/`_show_elicit`/`_diff_box`/`_settle_elicit` |
+| `core/chat.py` | 4.8k | The Tkinter window shell: `__init__`, layout, tabs, the transcript, host/model fit, the send/turn pipeline, the event pump. Inherits the mixins below, so `Chat`'s full method list is split across all of them | `Chat`, `_drain`/`_handle`/`_report`, `_turn`, `_boot_host`/`_fit`/`_make_room` |
+| `core/chat_theme.py` | 0.1k | Applying the palette; repainting drawn (not `config()`-able) widgets on a theme switch | `ChatThemeMixin`, `_theme`, `_skin`, `_redraw_marks` |
+| `core/chat_widgets.py` | 0.6k | The drawing primitives every window is built from - buttons, fields, marks, dots, arcs, menus | `ChatWidgetsMixin`, `_button`, `_entry`, `_dots`, `_arc`, `_mark` |
+| `core/chat_updates.py` | 0.1k | Checking GitHub for updates and pulling them | `ChatUpdatesMixin`, `_check_updates`, `_on_update` |
+| `core/chat_icons.py` | 0.4k | Preferences > Icons: reading an app's icon from its .exe, upload/reset, the icons window | `ChatIconsMixin`, `_read_icons`, `_icons_window`, `_upload_icon` |
+| `core/chat_bridge_dialog.py` | 0.2k | Connect an MCP bridge by hand: the dialog and its registry writes | `ChatBridgeDialogMixin`, `_bridge_dialog`, `_save_bridge` |
+| `core/chat_ask.py` | 0.1k | `studio_ask` as a form in the transcript; the card chrome `chat_elicit.py` shares | `ChatAskMixin`, `_show_ask`, `_form_card`, `_place_form` |
+| `core/chat_elicit.py` | 0.2k | A bridge's MCP elicitation, answered by the user, never the model | `ChatElicitMixin`, `_elicit`, `_show_elicit`, `_diff_box` |
+| `core/chat_lessons_studio.py` | 0.1k | The studio brief editor and the per-app lessons window | `ChatLessonsMixin`, `_studio_window`, `_lessons_window` |
+| `core/chat_diagnostics.py` | 0.1k | The Diagnostics window: the same facts `--doctor` prints, read live | `ChatDiagnosticsMixin`, `_diagnostics_window`, `_refresh_diagnostics` |
 | `core/agent.py` | 1.9k | Engine core: app registry, LLM client, GPU/model fit, OpenCode plumbing. Re-exports the split-out files below, so `core.agent.X` still finds everything | `APPS`, `AppSpec`, `ServerSpec`, `LLM`, `fit_model`, `make_room` |
 | `core/agent_mcp_client.py` | 0.4k | MCP stdio transport: the JSON-RPC client every bridge is built on | `MCPClient`, `sanitize_schema`, `to_openai_tools`, `HostUnreachable` |
 | `core/agent_prompts.py` | 0.7k | Every app's system prompt, and the shared rule blocks - pure string data | `*_PROMPT`, `BASE_RULES`, `CHAT_RULES` |
