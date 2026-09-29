@@ -639,7 +639,18 @@ class TestGuiForms(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertTrue(self.s.busy)
         self.assertEqual(self.s.ask_buttons, [])                  # settled
-        self.assertIn("25 fps", self.s.view.get("1.0", "end"))
+        # The answer lands in a drawn bubble (core/chat.py's _bubble), not as
+        # literal text in the widget - read its canvas items instead of
+        # get(). The "thinking" dots land after it and are a canvas too, so
+        # walk back to the last one that actually carries text items.
+        texts = []
+        for canvas in reversed([w for w in self.s.view.winfo_children()
+                                if isinstance(w, self.mod.tk.Canvas)]):
+            texts = [canvas.itemcget(i, "text") for i in canvas.find_all()
+                     if canvas.type(i) == "text"]
+            if texts:
+                break
+        self.assertIn("25 fps", texts)
 
     def test_ticked_choices_go_together_and_nothing_ticked_sends_nothing(self):
         asked = {"question": "Which platforms?", "multiple": True,
