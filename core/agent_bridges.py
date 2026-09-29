@@ -171,8 +171,10 @@ def bridge_from_record(rec):
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         args = []
     want = rec.get("id") if isinstance(rec.get("id"), str) else slug(name)
-    if want in APPS_BY_ID and not APPS_BY_ID[want].custom:
-        want += "-bridge"                 # never shadow a bridge written here
+    # TABS, not APPS: Chat, Milanote and Image Studio are tabs with no entry in
+    # APPS, and a bridge named for one would take its id over in TABS_BY_ID.
+    if want in TABS_BY_ID and not TABS_BY_ID[want].custom:
+        want += "-bridge"                 # never shadow a tab written here
     return BridgeSpec(name.strip(), command.strip(), args, exe=str(rec.get("exe") or ""),
                       probe=str(rec.get("probe") or ""), note=str(rec.get("note") or ""),
                       id=want)
