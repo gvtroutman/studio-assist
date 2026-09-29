@@ -436,6 +436,38 @@ def clean_camera_profile(d):
 CAMERA_FORMATS = ("", "1:1", "3:2")
 DEFAULT_CAMERA_FORMATS = {"digital-5d": "3:2", "leica-m6": "3:2", "hasselblad-500cm": "1:1",
                           "canon-ae1": "3:2", "sx-70": "1:1", "sony-a7siii": "3:2"}
+FORMAT_RATIO = {"1:1": 1.0, "3:2": 1.5}
+
+
+def chosen_camera(lib, s):
+    """The camera the form is set to (`camera_profile`, the deck above the
+    Scene field), or None for none."""
+    cid = s.get("camera_profile") or ""
+    return lib.get("camera_profiles", cid) if cid and cid != "none" else None
+
+
+def camera_profile_words(cp):
+    """A camera's words for the prompt: its chemistry, named when the
+    chemistry does not say which camera it is."""
+    chem, name = cp["chemistry"].strip(), cp["name"].strip()
+    if name and name.lower() not in chem.lower():
+        chem = ("Shot on a %s. %s" % (name, chem)).strip()
+    return chem
+
+
+def camera_size(fmt, width, height):
+    """(width, height) reshaped to a camera's format at about the same
+    area, held the same way (a portrait size stays upright; a square one
+    turns landscape for 3:2), in multiples of 64 - the long side from the
+    short one, so 3:2 at a megapixel is 1216 x 832, the Scene Builder's frame.
+    Unchanged for no format."""
+    ratio = FORMAT_RATIO.get(fmt)
+    if not ratio or not width or not height:
+        return width, height
+    area = float(width) * float(height)
+    short = int(round((area / ratio) ** 0.5 / 64)) * 64
+    long_ = int(short * ratio // 64) * 64
+    return (short, long_) if height > width else (long_, short)
 
 
 def clean_item_refs(v):
@@ -3459,7 +3491,8 @@ def missing_for(model, backend, inventory, nodes=None, workflow_loader=None):
 def default_settings():
     return {"preset": "standard", "model": "z-image-turbo", "backend": "auto",
             "identities": [], "style": "none", "style_strength": None,
-            "scene": "", "camera": "", "negative": "", "loras": [], "references": {},
+            "scene": "", "camera": "", "camera_profile": "", "negative": "", "loras": [],
+            "references": {},
             "character": "", "item_refs": {}, "face_photos": [], "face_name": "",
             "anatomy": True,
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
@@ -4318,9 +4351,15 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     posed = bool((s.get("references") or {}).get("pose"))
     someone = has_person(s, bool(idents))
     covered = COVERED if someone and not is_dressed(s) else ""
+    # The form's camera body; a scene's own words already carry its camera.
+    cam_body = chosen_camera(lib, s)
+    body_words = (camera_profile_words(cam_body) if cam_body and not s.get("scene_layout")
+                  else "")
+    if body_words and body_words in scene:
+        body_words = ""
     parts = [x for x in (view_text(s.get("view"), posed),
                          ", ".join(x for x in (named, person, covered) if x), scene,
-                         CLOTHED if someone else "", _field(s, "camera")) if x]
+                         CLOTHED if someone else "", _field(s, "camera"), body_words) if x]
     if not style:
         parts.append(time_of_day_text(s, s.get("seed")))
         if someone:
@@ -4374,6 +4413,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         if style and style.get(k) not in (None, ""):
             look[k] = style[k]
     look.update({k: x for k, x in preset["values"].items()})
+    # The camera body's frame shape, over the model's size; a size typed in
+    # Advanced (or a scene's frame) still wins below.
+    if cam_body and cam_body.get("format") and "width" in look and "height" in look:
+        look["width"], look["height"] = camera_size(cam_body["format"], look["width"],
+                                                    look["height"])
     for k in ("steps", "guidance", "sampler", "scheduler", "width", "height", "denoise",
               "refine", "upscale", "refine_denoise", "face_detail"):
         if s.get(k) not in (None, ""):

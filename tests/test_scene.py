@@ -2113,19 +2113,28 @@ class TestSceneBuilderWindow(unittest.TestCase):
         s["camera"]["format"], s["frame"] = "3:2", "landscape"   # a file edited by hand
         self.assertEqual(sc.clean_scene(s)[0]["frame"], "landscape_3x2")
 
-    def test_the_form_says_what_the_scene_is_shot_on(self):
+    def test_the_form_s_shot_on_deck_and_the_builder_are_one_choice(self):
         ui, sb = self.builder()
-        self.assertIn("no camera set", ui.shot_on.cget("text"))
-        sb._set_camera_profile("leica-m6")
-        self.assertEqual(ui.shot_on.cget("text"),
-                         "Shot on Leica M6 · 35mm · 832 x 1216 (Scene Builder)")
+        self.addCleanup(lambda: ui.settings.update(camera_profile="none"))
+        self.assertEqual(ui.camera_name.cget("text"), "No camera set")
+        sb._set_camera_profile("leica-m6")              # chosen in the builder: the deck turns
+        self.assertEqual(ui.settings["camera_profile"], "leica-m6")
+        self.assertEqual(ui.camera_name.cget("text"), "Leica M6")
+        self.assertIn("35mm · 3:2", ui.camera_about.cget("text"))
         self.assertEqual(sb.scene["camera"]["body"], "Leica M6")
         sb.scene["camera"]["body"] = ""                 # a scene saved before the name was kept
         self.assertEqual(sb.camera_body(), "Leica M6")
+        ids = [c["id"] for c in ui.studio.lib.all("camera_profiles")]
+        ui._flip_camera(1)                              # flipped in the form: the scene follows
+        nxt = ids[(ids.index("leica-m6") + 1) % len(ids)]
+        self.assertEqual(sb.scene["camera"]["profile"], nxt)
+        ui._flip_camera(-1)
+        self.assertEqual(sb.scene["camera"]["profile"], "leica-m6")
         sb.close(final=True, confirmed=True)
-        self.assertIn("no scene open", ui.shot_on.cget("text"))
-        sb = ui.choose_scene_camera()
-        self.assertEqual(sb.inspector_section, "Camera")
+        ui.set_camera("sx-70")                          # a new scene starts on the deck's card
+        sb = ui.build_scene()
+        self.assertEqual((sb.scene["camera"]["profile"], sb.scene["frame"]), ("sx-70", "square"))
+        self.assertEqual(ui.collect()["camera_profile"], "sx-70")
 
     def test_the_builder_goes_with_its_form(self):
         """It writes into the Image Studio's form, so closing the tab closes

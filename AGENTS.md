@@ -1719,10 +1719,18 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   camera shoots (`camera_frame`: kept upright if it was; `FORMAT_FRAMES`, the 3:2 frames
   are 1216 x 832 / 832 x 1216); the Frame choice then offers only those, and
   `clean_scene` holds a saved scene to it. `camera_words` says "Shot on a <body>" when
-  the chemistry does not already name it. The Image Studio form's **Shot on** line,
-  under Scene Builder…, shows the open builder's body, lens and frame
-  (`ImageStudio.shot_on_text`, refreshed from `SceneBuilder._words`); a click opens the
-  builder on its Camera section.
+  the chemistry does not already name it.
+- **Shot on is a deck of cards above the Scene field.** The Image Studio form shows
+  one camera card at a time (its picture, else its name), flipped with ‹ › or the wheel
+  over it; the card showing is the choice, `settings["camera_profile"]`
+  (`_build_camera_deck`, `set_camera`). A plain Generate gets its words
+  (`imagegen.camera_profile_words`, after the Camera field) and its shape
+  (`camera_size`: the model's size reshaped to 1:1 or 3:2 at about the same area,
+  held the same way up; a size typed in Advanced wins). A scene job skips both - its
+  words carry the camera and its frame is sent. With the Scene Builder open the deck
+  and the builder are one choice: a flip calls `_set_camera_profile`, and the builder's
+  `_words` calls `ImageStudio.show_shot_on`, which turns the deck to the scene's camera.
+  A new scene (and Reset camera) starts with it through `_bake_camera`.
 - **Descriptions are sent as written.** `scene_text()` adds only what the words cannot
   know - where each object is in the frame, which way a person faces, a non-standing
   pose - in parentheses before the user's text (and a person's look between the two),

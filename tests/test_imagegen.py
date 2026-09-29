@@ -484,6 +484,25 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         s.update(kw)
         return ig.compose(s, self.studio.lib, self.backend(backend), inventory, nodes=nodes)
 
+    def test_the_shot_on_camera_says_its_words_and_shapes_the_picture(self):
+        plain = self.plan(scene="a harbour at dusk")
+        w, h = plain.values["width"], plain.values["height"]
+        leica = self.plan(scene="a harbour at dusk", camera_profile="leica-m6")
+        self.assertIn("Kodak Portra 400", leica.prompt)
+        lw, lh = leica.values["width"], leica.values["height"]
+        self.assertAlmostEqual(max(lw, lh) / min(lw, lh), 1.5, delta=0.06)
+        self.assertEqual(lh > lw, h > w)                  # held the same way up
+        sx = self.plan(scene="a harbour at dusk", camera_profile="sx-70")
+        self.assertEqual(sx.values["width"], sx.values["height"])
+        typed = self.plan(scene="a harbour", camera_profile="sx-70", width=1344, height=768)
+        self.assertEqual((typed.values["width"], typed.values["height"]), (1344, 768))
+        # A scene's words already carry its camera: not said twice.
+        scene = self.plan(scene="x", camera_profile="leica-m6", scene_layout={"objects": []})
+        self.assertNotIn("Portra", scene.prompt)
+        self.assertNotIn("Leica", self.plan(scene="a harbour", camera_profile="none").prompt)
+        self.assertEqual(ig.camera_size("3:2", 1024, 1024), (1216, 832))
+        self.assertEqual(ig.camera_size("", 896, 1152), (896, 1152))
+
     def test_character_regions_reach_the_plan_as_masked_images(self):
         d = tempfile.mkdtemp()
         mask1, mask2 = os.path.join(d, "a.png"), os.path.join(d, "b.png")
