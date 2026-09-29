@@ -2054,6 +2054,25 @@ class TestLibrary(unittest.TestCase):
             os.path.join(ig.STYLE_EXAMPLES_DIR, "cinema.png"))
         self.assertIsNone(ig.style_example(ig.clean_style({"name": "Brand new"})))
 
+    def test_default_cameras_load_with_a_no_camera_choice_first(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        cams = lib.all("camera_profiles")
+        self.assertEqual(cams[0]["id"], "none")
+        self.assertEqual(cams[0]["chemistry"], "")
+        self.assertTrue(all(c["name"] and isinstance(c["chemistry"], str) for c in cams))
+
+    def test_clean_camera_profile_drops_junk_and_keeps_a_blank_lens_optional(self):
+        self.assertIsNone(ig.clean_camera_profile({"name": ""}))
+        self.assertIsNone(ig.clean_camera_profile("not a dict"))
+        cam = ig.clean_camera_profile({"name": "Leica M6", "chemistry": "Warm tones.",
+                                       "lens": "35", "image": "", "notes": 7})
+        self.assertEqual(cam, {"id": "leica-m6", "name": "Leica M6",
+                               "chemistry": "Warm tones.", "lens": 35.0, "image": "",
+                               "notes": ""})
+        self.assertIsNone(ig.clean_camera_profile({"name": "No lens"})["lens"])
+        # A lens out of the camera's own sane range is clamped, like a style's.
+        self.assertEqual(ig.clean_camera_profile({"name": "Wild", "lens": 5000})["lens"], 300)
+
 DRESS_FILES = {"diffusion_models": {"qwen_image_edit_2509_fp8_e4m3fn.safetensors"},
                "text_encoders": {"qwen_2.5_vl_7b_fp8_scaled.safetensors"},
                "vae": {"qwen_image_vae.safetensors"},

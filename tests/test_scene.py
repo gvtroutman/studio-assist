@@ -1163,7 +1163,8 @@ class TestSceneFile(unittest.TestCase):
         s["objects"][0]["pose"] = {"preset": "kneeling",
                                    "controls": sc.pose_controls("kneeling")}
         s["objects"][1].update(name="Workbench", scale=[1.8, 0.9, 0.8], colour="#8a6a4a")
-        s["camera"].update(yaw=30.0, lens=50.0)
+        s["camera"].update(yaw=30.0, lens=50.0, profile="leica-m6",
+                          chemistry="Shot on a Leica M6. Warm, creamy skin tones.")
         s["frame"], s["pose_strength"], s["frame_keep"] = "landscape", 0.62, 0.15
         path = os.path.join(tempfile.mkdtemp(), "shop.scene.json")
         sc.save(s, path)
@@ -1289,6 +1290,19 @@ class TestWords(unittest.TestCase):
     def test_the_camera_in_words(self):
         s = staged()
         s["camera"].update(pitch=45, lens=24)
+        self.assertEqual(sc.camera_words(s),
+                         "Shot from a high angle looking down on a 24mm wide-angle lens")
+
+    def test_a_chosen_camera_adds_its_chemistry(self):
+        s = staged()
+        s["camera"].update(pitch=45, lens=24,
+                           chemistry="Shot on a Leica M6. Warm, creamy skin tones.")
+        self.assertEqual(sc.camera_words(s),
+                         "Shot from a high angle looking down on a 24mm wide-angle lens. "
+                         "Shot on a Leica M6. Warm, creamy skin tones.")
+        # No camera chosen: the sentence is unchanged, as every scene before
+        # this feature existed already looked.
+        s["camera"]["chemistry"] = ""
         self.assertEqual(sc.camera_words(s),
                          "Shot from a high angle looking down on a 24mm wide-angle lens")
 
@@ -2025,6 +2039,24 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb.select(person["id"])
         sb.select(None)
         self.assertEqual(sb.inspector_section, "Scene")
+
+    def test_choosing_a_camera_bakes_in_its_chemistry_and_lens(self):
+        ui, sb = self.builder()
+        sb._inspector_tab("Camera")
+        self.assertIn("none", sb.camera_tiles)
+        self.assertIn("leica-m6", sb.camera_tiles)
+        sb._set_camera_profile("leica-m6")
+        cam = sb.scene["camera"]
+        self.assertEqual(cam["profile"], "leica-m6")
+        self.assertIn("Leica M6", cam["chemistry"])
+        self.assertIn("Kodak Portra 400", cam["chemistry"])
+        self.assertEqual(cam["lens"], 35.0)          # the Leica's native lens
+        self.assertIn(cam["chemistry"], sc.scene_text(sb.scene).text)
+        # Clearing it keeps the lens where the camera left it - only the
+        # words are detached, not the shot the user already framed.
+        sb._set_camera_profile("none")
+        self.assertEqual((cam["profile"], cam["chemistry"]), ("none", ""))
+        self.assertEqual(cam["lens"], 35.0)
 
     def test_the_builder_goes_with_its_form(self):
         """It writes into the Image Studio's form, so closing the tab closes

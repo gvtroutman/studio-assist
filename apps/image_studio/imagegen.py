@@ -402,6 +402,26 @@ def clean_style(d):
     }
 
 
+def clean_camera_profile(d):
+    """A camera in the Scene Builder's Camera body picker: its chemistry (film
+    stock or digital colour science, in words) rides into the scene's camera
+    words when it is chosen, and its native lens (optional) replaces the
+    scene's. `image` is a picture of the camera itself, not a sample photo -
+    a camera with none shows its name on a blank tile, as a style with no
+    example does."""
+    if not isinstance(d, dict) or not _str(d.get("name")):
+        return None
+    lens = d.get("lens")
+    return {
+        "id": slug(d.get("id") or d["name"]),
+        "name": _str(d["name"]),
+        "chemistry": _str(d.get("chemistry")),
+        "lens": None if lens in (None, "") else _num(lens, float, None, 10, 300),
+        "image": _str(d.get("image")),
+        "notes": _str(d.get("notes")),
+    }
+
+
 def clean_item_refs(v):
     """{item as the form names it: picture path}, junk dropped."""
     return {k.strip(): x.strip() for k, x in v.items() if isinstance(k, str) and k.strip()
@@ -563,7 +583,7 @@ def clean_image(d):
 
 
 CLEAN = {"images": clean_image, "backends": clean_backend, "models": clean_model, "loras": clean_lora,
-         "identities": clean_identity, "styles": clean_style,
+         "identities": clean_identity, "styles": clean_style, "camera_profiles": clean_camera_profile,
          "characters": clean_character, "outfits": clean_outfit_preset, "presets": clean_preset}
 
 
@@ -683,9 +703,45 @@ def _default_styles():
     ]
 
 
+def _default_camera_profiles():
+    # Chemistry, not example photos: a camera is named and shot on real film
+    # or a real sensor, so its own words say what that does to a picture.
+    return [
+        {"id": "none", "name": "No camera set", "chemistry": ""},
+        {"id": "digital-5d", "name": "Canon 5D Mark IV",
+         "chemistry": "Shot on a Canon 5D Mark IV: clean full-frame digital colour "
+                      "science, natural skin tones, moderate dynamic range, minimal "
+                      "noise, crisp fine detail.",
+         "lens": 50.0},
+        {"id": "leica-m6", "name": "Leica M6",
+         "chemistry": "Shot on a Leica M6, a 35mm rangefinder loaded with Kodak Portra "
+                      "400 colour negative film: warm, creamy skin tones, fine grain, "
+                      "gentle highlight roll-off.",
+         "lens": 35.0},
+        {"id": "hasselblad-500cm", "name": "Hasselblad 500C/M",
+         "chemistry": "Shot on a Hasselblad 500C/M medium format camera loaded with "
+                      "Kodak Portra 160: ultra-smooth tonal gradation, shallow depth of "
+                      "field, fine grain.",
+         "lens": 50.0},
+        {"id": "canon-ae1", "name": "Canon AE-1",
+         "chemistry": "Shot on a Canon AE-1, 35mm black and white on Kodak Tri-X: deep "
+                      "blacks, visible grain, high contrast, strong directional light.",
+         "lens": 50.0},
+        {"id": "sx-70", "name": "Polaroid SX-70",
+         "chemistry": "Shot on a Polaroid SX-70 instant camera: soft focus, warm faded "
+                      "colour, lifted blacks, gentle vignetting, square format.",
+         "lens": 35.0},
+        {"id": "sony-a7siii", "name": "Sony a7S III",
+         "chemistry": "Shot on a Sony a7S III: low-light video-grade digital sensor, "
+                      "clean high ISO, slightly cool colour science, smooth shadow "
+                      "detail.",
+         "lens": 35.0},
+    ]
+
+
 DEFAULTS = {"images": list, "backends": _default_backends, "models": _default_models, "loras": list,
-            "identities": list, "styles": _default_styles, "characters": list,
-            "outfits": _default_outfits, "presets": list}
+            "identities": list, "styles": _default_styles, "camera_profiles": _default_camera_profiles,
+            "characters": list, "outfits": _default_outfits, "presets": list}
 
 
 class Library:

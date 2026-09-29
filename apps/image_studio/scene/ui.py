@@ -69,6 +69,7 @@ ROOM_ROW = "Floor and walls"
 ROOM = "\0room"              # the room's row in the list; never an object's id
 BAKE = 2                      # the viewport's pictures are baked at 1/BAKE size
 REACH = 20                    # m either way an object can be placed
+CAMERA_TILE = 96              # px, before the display's scale; a camera's button
 
 
 def _inside(x, y, pts):
@@ -598,6 +599,15 @@ class SceneBuilder:
         o.choice(p, [(k, label) for k, label, _, _ in sc.FRAMES], s["frame"],
                  self._set_frame).pack(side="top", anchor="w")
 
+        o.cap(p, "Camera body")
+        o.label(p, "The camera this scene is shot on. Its chemistry - film stock or "
+                "digital colour science - is added to the words, and its native lens "
+                "replaces the one below.", "faint", self.host.f_small,
+                wraplength=o.px(310)).pack(side="top", fill="x")
+        self._camera_profile_tiles()
+        o.button(p, "Cameras…", self.owner.edit_camera_profiles, kind="ghost").pack(
+            side="top", anchor="w", pady=(0, o.px(10)))
+
         o.cap(p, "Camera")
         lens = o.frame(p)
         lens.pack(side="top", fill="x", pady=(0, o.px(4)))
@@ -621,6 +631,65 @@ class SceneBuilder:
             return write
         self._slider(p, "aim_y", "Aim height (m)", lambda: cam["target"][1], aim(1),
                      0, 3, 0.05)
+
+    def _camera_profile_tiles(self):
+        """The camera library as a grid of pictures, each its own photo of
+        that camera where there is one, else a blank tile with its name -
+        `ImageStudio._build_style_tiles`'s fallback for a style with no
+        example. A click bakes that camera's chemistry, and its native lens
+        when it names one, into the scene (`_set_camera_profile`)."""
+        import apps.image_studio.ui as studio_ui   # lazy: studio_ui imports this module
+        o, p = self.owner, self.panel
+        cams = self.owner.studio.lib.all("camera_profiles")
+        grid = o.frame(p)
+        grid.pack(side="top", fill="x", pady=(0, o.px(4)))
+        self.camera_tiles, self.camera_photos = {}, []
+        side = o.px(CAMERA_TILE)
+        current = self.scene["camera"].get("profile")
+        for n, cp in enumerate(cams):
+            tile = tk.Frame(grid, bd=0, highlightthickness=o.px(2), cursor="hand2")
+            o.skin(tile, bg="bg", highlightbackground="accent" if cp["id"] == current
+                   else "border")
+            tile.grid(row=n // 3, column=n % 3, padx=(0, o.px(6)), pady=(0, o.px(6)),
+                      sticky="n")
+            img = (studio_ui.photo_at(cp["image"], side, grid)
+                   if cp["image"] and os.path.isfile(cp["image"]) else None)
+            if img is not None:
+                self.camera_photos.append(img)
+                pic = tk.Label(tile, image=img, bd=0)
+            else:
+                pic = o.frame(tile, "card")
+                pic.config(width=side, height=side)
+                pic.pack_propagate(False)
+                o.label(pic, cp["name"], "faint", self.host.f_small, bg="card",
+                        wraplength=side - o.px(8)).pack(expand=True)
+            pic.pack(side="top")
+            name = o.label(tile, cp["name"], "text", self.host.f_small, wraplength=side)
+            name.config(anchor="center", justify="center")
+            name.pack(side="top", fill="x", pady=(o.px(2), o.px(2)))
+            for w in (tile, pic, name, *pic.winfo_children()):
+                w.bind("<Button-1>", lambda ev, cid=cp["id"]: self._set_camera_profile(cid))
+            self.camera_tiles[cp["id"]] = tile
+        if not cams:
+            o.label(grid, "No cameras yet - add one with Cameras… below.",
+                    "faint").pack(side="left")
+
+    def _set_camera_profile(self, cid):
+        """Attach a camera's chemistry (and its native lens, when it names
+        one) to the scene; baked in as plain words, so a saved scene keeps
+        its camera's look even if the library entry is later edited or
+        removed."""
+        cam = self.scene["camera"]
+        cp = self.owner.studio.lib.get("camera_profiles", cid) if cid else None
+        cam["profile"] = cp["id"] if cp else ""
+        cam["chemistry"] = cp["chemistry"] if cp else ""
+        if cp and cp["lens"]:
+            cam["lens"] = float(cp["lens"])
+        for tid, tile in self.camera_tiles.items():
+            self.owner.skin(tile, bg="bg", highlightbackground="accent" if tid == cam["profile"]
+                            else "border")
+        self.sync()
+        self.changed()
 
     def _scene_controls(self):
         o, p, s = self.owner, self.panel, self.scene

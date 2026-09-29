@@ -2006,7 +2006,7 @@ def new_scene(details=""):
             "real_faces": REAL_FACES,
             "regional_prompting": REGIONAL_PROMPTING,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
-                       "distance": 4.2, "lens": 35.0},
+                       "distance": 4.2, "lens": 35.0, "profile": "", "chemistry": ""},
             "room": new_room(), "objects": [], "enrich": new_enrich()}
 
 
@@ -2191,6 +2191,12 @@ def clean_scene(d):
     c["pitch"] = _num(cam.get("pitch"), c["pitch"], -80, 85)
     c["distance"] = _num(cam.get("distance"), c["distance"], 0.3, 80)
     c["lens"] = _num(cam.get("lens"), c["lens"], 10, 300)
+    # Which camera profile shot this scene (Scene Builder's Camera body
+    # picker) and the words it baked in when chosen - kept here so a saved
+    # scene still says the same thing after the library entry changes or is
+    # deleted (`apps.image_studio.scene.ui._set_camera_profile`).
+    c["profile"] = str(cam.get("profile") or "")
+    c["chemistry"] = str(cam.get("chemistry") or "")
     room = d.get("room") if isinstance(d.get("room"), dict) else {}
     r = s["room"]
     r["walls"] = room.get("walls") is True
@@ -4169,7 +4175,9 @@ def camera_words(scene):
         angle = "a low angle looking up"
     else:
         angle = "eye level"
-    return "Shot from %s on a %dmm %slens" % (angle, lens, kind)
+    words = "Shot from %s on a %dmm %slens" % (angle, lens, kind)
+    chemistry = (c.get("chemistry") or "").strip()
+    return words + ". " + chemistry if chemistry else words
 
 
 def _join_parts(parts):
