@@ -143,7 +143,7 @@ class CepHost:
             headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                answer = json.loads(r.read().decode("utf-8"))
+                text = r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:500]
             raise CepError("the %s panel answered HTTP %d: %s" % (self.name, e.code, detail))
@@ -157,7 +157,15 @@ class CepHost:
             raise CepError(self.explain_unreachable(e.reason))
         except OSError as e:
             raise CepError(self.explain_unreachable(e))
-        if not isinstance(answer, dict) or "result" not in answer:
+        # Something other than the panel can hold its port and answer 200 -
+        # with a page, or with JSON of its own shape. Say so, not a traceback.
+        try:
+            answer = json.loads(text)
+        except ValueError:
+            raise CepError("the %s panel's port answered with something that is not JSON - "
+                           "is another program using %s? %s" % (self.name, self.url, text[:300]))
+        if (not isinstance(answer, dict) or "result" not in answer
+                or not isinstance(answer["result"], (str, type(None)))):
             raise CepError("the %s panel returned something unexpected: %r" % (self.name, answer))
         return self.decode(answer["result"])
 
