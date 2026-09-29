@@ -643,6 +643,23 @@ class SceneBuilder:
                activeforeground="text")
         b.pack(side="top", fill="x")
         self.vars["real_faces"] = (real, lambda: s["real_faces"])
+        regional = tk.BooleanVar(value=s["regional_prompting"])
+
+        def flip_regional():
+            s["regional_prompting"] = bool(regional.get())
+            self.changed()
+        rb = tk.Checkbutton(p, text="Regional character prompting (experimental)",
+                            variable=regional, command=flip_regional, anchor="w",
+                            font=self.host.f_small, bd=0, highlightthickness=0)
+        o.skin(rb, bg="bg", fg="text", activebackground="bg", selectcolor="card",
+               activeforeground="text")
+        rb.pack(side="top", fill="x")
+        self.vars["regional_prompting"] = (regional, lambda: s["regional_prompting"])
+        o.label(p, "Two or more named characters each get their own words in their own "
+                "part of the picture, instead of one shared paragraph - less hair, "
+                "clothing and prop bleed between them. Needs a model whose workflow "
+                "supports it (Z-Image Turbo); otherwise it is ignored.",
+                "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
         o.label(p, "Pose holds each body's joints; layout holds where everything is and "
                 "how far away. Both leave how things look to the words. The grey frame "
                 "is off by default: kept, the picture copies the mannequins' blocky "

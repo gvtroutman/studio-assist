@@ -1537,6 +1537,29 @@ def fill(wf, values, loras=()):
             v["clip_out"] = clip
     elif loras:
         raise TemplateError("Workflow %s takes no LoRAs." % wf["id"])
+    regional = wf.get("regional_conditioning")
+    if regional and v.get("character_regions"):
+        base_clip = regional["base_clip"]
+        clip_in = graph[base_clip]["inputs"]["clip"]
+        combined = [base_clip, 0]                  # the base text covers the whole frame
+        for i, region in enumerate(v["character_regions"], 1):
+            img, mask, clip_node, cond = ("char%dmaskimg" % i, "char%dmask" % i,
+                                          "char%dclip" % i, "char%dcond" % i)
+            graph[img] = {"class_type": "LoadImage",
+                          "inputs": {"image": "{{%s}}" % region["mask_var"]}}
+            graph[mask] = {"class_type": "ImageToMask",
+                           "inputs": {"image": [img, 0], "channel": "red"}}
+            graph[clip_node] = {"class_type": "CLIPTextEncode",
+                                "inputs": {"clip": clip_in, "text": region["prompt"]}}
+            graph[cond] = {"class_type": "ConditioningSetMask", "inputs": {
+                "conditioning": [clip_node, 0], "mask": [mask, 0],
+                "strength": 1.0, "set_cond_area": "default"}}
+            combine = "charcombine%d" % i
+            graph[combine] = {"class_type": "ConditioningCombine", "inputs": {
+                "conditioning_1": combined, "conditioning_2": [cond, 0]}}
+            combined = [combine, 0]
+        for nid, key in regional["positive_in"]:
+            graph[nid]["inputs"][key] = combined
     for name, sw in (wf.get("switches") or {}).items():
         pick = sw["then"] if v.get(sw["when"]) else sw["else"]
         m = PLACEHOLDER.fullmatch(pick.strip()) if isinstance(pick, str) else None
@@ -4276,6 +4299,26 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             continue
         p.images[var] = path
         p.references[kind] = path
+    regions_in = s.get("character_regions") or []
+    if regions_in and wf.get("regional_conditioning"):
+        regions = []
+        for i, region in enumerate(regions_in, 1):
+            path = region.get("mask_path")
+            if not path or not os.path.isfile(path):
+                p.warnings.append("A character's mask picture is not on this PC any "
+                                  "more; regional prompting skipped for it.")
+                continue
+            var = "char_mask_%d" % i
+            p.images[var] = path
+            regions.append({"prompt": region["prompt"], "mask_var": var})
+        if regions:
+            v["character_regions"] = regions
+            p.notes.append("%d character%s given their own words and region of the "
+                           "picture." % (len(regions), "" if len(regions) == 1 else "s"))
+    elif regions_in:
+        p.notes.append("Regional character prompting needs a workflow that supports it "
+                       "(the %s workflow does not); used as ordinary words instead."
+                       % wf.get("label", wid))
     plan_items(p, s, wf, v, backend, lacking("items"), nodes)
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)

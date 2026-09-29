@@ -240,6 +240,37 @@ class TestFill(unittest.TestCase):
         self.assertEqual(g["lora1"]["class_type"], "LoraLoaderModelOnly")
         self.assertEqual(g["4"]["inputs"]["model"], ["lora1", 0])
 
+    def test_no_character_regions_leaves_the_graph_as_it_was(self):
+        base = {"model": "m", "encoder": "e", "vae": "v", "prompt": "p", "seed": 1,
+               "refine": True}
+        with_field = ig.fill(ig.load_workflow("zimage_hq"), base)
+        self.assertEqual(with_field["40"]["inputs"]["positive"], ["10", 0])
+        self.assertEqual(with_field["44"]["inputs"]["positive"], ["10", 0])
+        self.assertFalse([n for n in with_field if n.startswith("char")])
+
+    def test_regional_conditioning_chains_any_number_of_characters(self):
+        base = {"model": "m", "encoder": "e", "vae": "v", "prompt": "base scene", "seed": 1,
+               "refine": True}
+        for count in (1, 2, 3):
+            regions = [{"prompt": "person %d" % i, "mask_var": "mask%d" % i}
+                      for i in range(1, count + 1)]
+            values = dict(base, character_regions=regions,
+                         **{"mask%d" % i: "m%d.png" % i for i in range(1, count + 1)})
+            g = ig.fill(ig.load_workflow("zimage_hq"), values)
+            for i in range(1, count + 1):
+                self.assertEqual(g["char%dmaskimg" % i]["inputs"]["image"], "m%d.png" % i)
+                self.assertEqual(g["char%dmask" % i]["inputs"], {
+                    "image": ["char%dmaskimg" % i, 0], "channel": "red"})
+                self.assertEqual(g["char%dclip" % i]["inputs"]["text"], "person %d" % i)
+                self.assertEqual(g["char%dcond" % i]["inputs"]["mask"], ["char%dmask" % i, 0])
+            final = ["charcombine%d" % count, 0]
+            self.assertEqual(g["40"]["inputs"]["positive"], final)
+            self.assertEqual(g["44"]["inputs"]["positive"], final)
+            # the base text still covers the whole frame, first in the chain
+            first_combine = g["charcombine1"]["inputs"]
+            self.assertEqual(first_combine["conditioning_1"], ["10", 0])
+            self.assertEqual(g["10"]["inputs"]["text"], "base scene")
+
     def test_optional_nodes_follow_their_values(self):
         base = {"model": "m", "clip_l": "c", "t5": "t", "vae": "v", "prompt": "p", "seed": 1}
         plain = ig.fill(self.wf(), base)
@@ -427,6 +458,34 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         s["model"] = "flux-hq"
         s.update(kw)
         return ig.compose(s, self.studio.lib, self.backend(backend), inventory, nodes=nodes)
+
+    def test_character_regions_reach_the_plan_as_masked_images(self):
+        d = tempfile.mkdtemp()
+        mask1, mask2 = os.path.join(d, "a.png"), os.path.join(d, "b.png")
+        for path in (mask1, mask2):
+            with open(path, "wb") as f:
+                f.write(PNG)
+        p = self.plan(model="z-image-turbo", scene="a beer hall", character_regions=[
+            {"prompt": "the user, lederhosen", "mask_path": mask1},
+            {"prompt": "Partner, blue dress", "mask_path": mask2}])
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.values["character_regions"],
+                         [{"prompt": "the user, lederhosen", "mask_var": "char_mask_1"},
+                          {"prompt": "Partner, blue dress", "mask_var": "char_mask_2"}])
+        self.assertEqual(p.images["char_mask_1"], mask1)
+        self.assertEqual(p.images["char_mask_2"], mask2)
+
+    def test_a_missing_character_mask_is_skipped_with_a_warning(self):
+        p = self.plan(model="z-image-turbo", scene="a beer hall", character_regions=[
+            {"prompt": "the user, lederhosen", "mask_path": "C:\\gone.png"}])
+        self.assertNotIn("character_regions", p.values)
+        self.assertTrue(any("not on this PC" in w for w in p.warnings), p.warnings)
+
+    def test_character_regions_on_a_workflow_without_regional_conditioning_are_explained(self):
+        p = self.plan(model="flux-hq", scene="a beer hall", character_regions=[
+            {"prompt": "the user, lederhosen", "mask_path": "C:\\gone.png"}])
+        self.assertNotIn("character_regions", p.values)
+        self.assertTrue(any("does not" in n for n in p.notes), p.notes)
 
     def test_flux_applies_identity_and_style_loras_and_refines(self):
         p = self.plan(model="flux-dev", scene="On a pier.", preset="hq_final",

@@ -14,6 +14,10 @@
   "files": {"model": "diffusion_models", "encoder": "text_encoders", "vae": "vae"},
   "references": {"source": "source_image"},
   "lora_chain": {"model": ["1", 0]},
+  "regional_conditioning": {
+    "base_clip": "10",
+    "positive_in": [["40", "positive"], ["44", "positive"]]
+  },
   "switches": {
     "latent": {"when": "source_image", "then": ["22", 0], "else": ["20", 0]},
     "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]}
