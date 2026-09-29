@@ -240,6 +240,28 @@ class TestFill(unittest.TestCase):
         self.assertEqual(g["lora1"]["class_type"], "LoraLoaderModelOnly")
         self.assertEqual(g["4"]["inputs"]["model"], ["lora1", 0])
 
+    def test_zimage_pose_and_depth_patch_only_the_first_pass_model(self):
+        wf = ig.load_workflow("zimage_hq")
+        base = {"model": "m", "encoder": "e", "vae": "v", "prompt": "p", "seed": 1,
+                "refine": True}
+        plain = ig.fill(wf, base)
+        self.assertEqual(plain["40"]["inputs"]["model"], ["4", 0])
+        self.assertFalse({"50", "52", "54", "56"} & set(plain))
+        for maps in ({"pose_image": "pose.png"}, {"composition_image": "depth.png"},
+                     {"pose_image": "pose.png", "composition_image": "depth.png"}):
+            g = ig.fill(wf, dict(base, **maps))
+            self.assertEqual(g["50"]["class_type"], "ModelPatchLoader")
+            self.assertEqual(g["50"]["inputs"]["name"], wf["defaults"]["model_patch"])
+            self.assertEqual(g["40"]["inputs"]["model"], ["56", 0])
+            last = "54" if "composition_image" in maps else "52"
+            self.assertEqual(g["56"]["inputs"]["model"], [last, 0])
+            if len(maps) == 2:                      # depth chained after pose
+                self.assertEqual(g["54"]["inputs"]["model"], ["52", 0])
+                self.assertEqual(g["52"]["inputs"]["strength"], 0.85)
+            self.assertEqual(g["44"]["inputs"]["model"], ["4", 0])   # refine: unpatched
+            self.assertEqual(g["4"]["inputs"]["model"], ["1", 0])
+        self.assertEqual(wf["face_detail"]["model"], ["4", 0])       # face pass: unpatched
+
     def test_no_character_regions_leaves_the_graph_as_it_was(self):
         base = {"model": "m", "encoder": "e", "vae": "v", "prompt": "p", "seed": 1,
                "refine": True}
@@ -2864,6 +2886,31 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertFalse(ui.collect()["hand_pass"])
         ui.apply({k: v for k, v in ui.collect().items() if k != "hand_pass"})
         self.assertTrue(ui.collect()["hand_pass"])     # an older picture: it was on
+
+    def test_the_picture_card_holds_no_prompt_only_a_failed_face_swap_note(self):
+        _, ui = self.tab()
+        src = os.path.join(self.dir, "shown.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        rec = {"id": "r1", "images": [src], "prompt": "partner. A woman on a meadow",
+               "settings": {}, "warnings": ["Chest size is using words only."]}
+        ui._select(("record", rec))
+        self.app.update()
+        self.assertFalse(ui.caption.winfo_ismapped())
+        self.assertFalse(ui.act_retry_faces.winfo_ismapped())
+        failed = dict(rec, id="r2", finish={"profiles": ["partner"], "state": "failed",
+                                             "error": "No face found."})
+        ui._select(("record", failed))
+        self.app.update()
+        self.assertTrue(ui.caption.winfo_ismapped())
+        self.assertTrue(ui.act_retry_faces.winfo_ismapped())
+        text = ui.caption.cget("text")
+        self.assertIn("before the final face swap", text)
+        self.assertIn("No face found.", text)
+        self.assertNotIn("meadow", text)
+        ui._select(("record", rec))
+        self.app.update()
+        self.assertFalse(ui.caption.winfo_ismapped())
 
     def test_fix_a_spot_marks_squares_and_queues_a_fix(self):
         import apps.image_studio.ui as ui_mod

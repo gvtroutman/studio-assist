@@ -1,18 +1,23 @@
 {
   "id": "zimage_hq",
   "label": "Z-Image Turbo high quality",
-  "about": "Z-Image Turbo text to image (ComfyUI's own recipe) with model-only LoRAs, an optional source picture, and the upscale-and-refine detail pass the chat tab's bridge uses.",
+  "about": "Z-Image Turbo text to image (ComfyUI's own recipe) with model-only LoRAs, an optional source picture, and the upscale-and-refine detail pass the chat tab's bridge uses. A pose (OpenPose stick figure) and a composition (depth map) go through Alibaba PAI's Z-Image-Turbo Fun ControlNet Union, a model patch, depth chained after pose; unlike FLUX's ControlNet it patches the model, not the conditioning, so only the first pass samples with the patched model - the face pass and the refine pass keep node 4, unpatched, as a whole-frame map over a face crop would pull it out of shape.",
   "families": ["z-image"],
   "defaults": {
     "steps": 8, "guidance": 1.0, "sampler": "res_multistep", "scheduler": "simple",
     "width": 1024, "height": 1024, "denoise": 1.0, "shift": 3.0,
     "encoder_device": "default", "refine": false, "upscale": 1.5,
     "refine_steps": 5, "refine_denoise": 0.33, "refine_sampler": "dpmpp_2m_sde",
-    "refine_scheduler": "beta", "filename_prefix": "ImageStudio/zimage"
+    "refine_scheduler": "beta", "filename_prefix": "ImageStudio/zimage",
+    "model_patch": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
+    "pose_strength": 0.85, "composition_strength": 0.5
   },
   "source_denoise": 0.6,
-  "files": {"model": "diffusion_models", "encoder": "text_encoders", "vae": "vae"},
-  "references": {"source": "source_image"},
+  "files": {"model": "diffusion_models", "encoder": "text_encoders", "vae": "vae",
+            "model_patch": "model_patches"},
+  "needs": {"pose_image": ["model_patch"], "composition_image": ["model_patch"]},
+  "references": {"pose": "pose_image", "composition": "composition_image",
+                 "source": "source_image"},
   "lora_chain": {"model": ["1", 0]},
   "regional_conditioning": {
     "base_clip": "10",
@@ -20,6 +25,12 @@
   },
   "switches": {
     "latent": {"when": "source_image", "then": ["22", 0], "else": ["20", 0]},
+    "posed_model": {"when": "pose_image", "then": ["52", 0], "else": "{{model_out}}"},
+    "controlled_model": {"when": "composition_image", "then": ["54", 0],
+                         "else": "{{posed_model}}"},
+    "sample_posed": {"when": "pose_image", "then": ["56", 0], "else": ["4", 0]},
+    "sample_model": {"when": "composition_image", "then": ["56", 0],
+                     "else": "{{sample_posed}}"},
     "final": {"when": "refine", "then": ["45", 0], "else": ["41", 0]}
   },
   "stages": {"refining": ["42", "43", "44", "45"]},
@@ -45,6 +56,21 @@
     "10": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["2", 0]}},
     "12": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["10", 0]}},
 
+    "50": {"_when": ["pose_image", "composition_image"], "class_type": "ModelPatchLoader",
+           "inputs": {"name": "{{model_patch}}"}},
+    "51": {"_when": "pose_image", "class_type": "LoadImage",
+           "inputs": {"image": "{{pose_image}}"}},
+    "52": {"_when": "pose_image", "class_type": "ZImageFunControlnet",
+           "inputs": {"model": "{{model_out}}", "model_patch": ["50", 0], "vae": ["3", 0],
+                      "strength": "{{pose_strength}}", "image": ["51", 0]}},
+    "53": {"_when": "composition_image", "class_type": "LoadImage",
+           "inputs": {"image": "{{composition_image}}"}},
+    "54": {"_when": "composition_image", "class_type": "ZImageFunControlnet",
+           "inputs": {"model": "{{posed_model}}", "model_patch": ["50", 0], "vae": ["3", 0],
+                      "strength": "{{composition_strength}}", "image": ["53", 0]}},
+    "56": {"_when": ["pose_image", "composition_image"], "class_type": "ModelSamplingAuraFlow",
+           "inputs": {"model": "{{controlled_model}}", "shift": "{{shift}}"}},
+
     "20": {"_unless": "source_image", "class_type": "EmptySD3LatentImage",
            "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
     "21": {"_when": "source_image", "class_type": "LoadImage",
@@ -53,7 +79,7 @@
            "inputs": {"pixels": ["21", 0], "vae": ["3", 0]}},
 
     "40": {"class_type": "KSampler",
-           "inputs": {"model": ["4", 0], "seed": "{{seed}}", "steps": "{{steps}}",
+           "inputs": {"model": "{{sample_model}}", "seed": "{{seed}}", "steps": "{{steps}}",
                       "cfg": 1.0, "sampler_name": "{{sampler}}", "scheduler": "{{scheduler}}",
                       "positive": ["10", 0], "negative": ["12", 0],
                       "latent_image": "{{latent}}", "denoise": "{{denoise}}"}},
