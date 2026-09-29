@@ -1894,6 +1894,32 @@ def clean_grid(raw):
     return out if any(v for row in out for v in row) else []
 
 
+_FLOOR_SHAPE_WORDS = {
+    "hill": "the ground rises into a hill",
+    "dip": "the ground dips down in the middle",
+    "ridge": "a ridge crosses the ground",
+    "rise": "the ground rises up behind",
+    "left": "the ground banks up to the left",
+    "right": "the ground banks up to the right",
+    "bowl": "the ground forms a shallow bowl, higher at the edges",
+    "rolling": "the ground rolls gently, uneven underfoot",
+}
+
+
+def floor_shape_words(grid):
+    """A short phrase for a shaped floor, so the words - the only thing this
+    pipeline sends of the ground - say what the preview already shows.
+    Matched by preset when the grid is exactly one; a hand-dragged shape
+    falls back to a plain "not flat"."""
+    grid = clean_grid(grid)
+    if not grid:
+        return ""
+    for key, rows in FLOOR_PRESET.items():
+        if key != "flat" and grid == rows:
+            return _FLOOR_SHAPE_WORDS[key]
+    return "the ground is uneven, not flat"
+
+
 def _bernstein(t):
     """The four cubic weights at `t` (0-1), eased so the surface leaves its
     edge level."""
@@ -4200,6 +4226,9 @@ def _scene_parts(scene):
         words = room[key]["prompt"].strip()
         if words and (key == "floor" or room["walls"]):
             parts.append((None, "The %s: %s" % (label.lower(), words)))
+    shape = floor_shape_words(room.get("grid"))
+    if shape:
+        parts.append((None, shape))
     for obj in scene["objects"]:
         where = placement(scene, obj)
         if where is None:
