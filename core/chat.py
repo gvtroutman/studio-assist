@@ -1570,16 +1570,17 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
     CONN_NAMES = [("conn:host", "Inference"), ("conn:bridges", "Bridges")]
 
     def _conn_row(self, side, title, detail, arc=False, command=None, key=None):
+        # The row shows its name and its menu arrow, nothing more. The status
+        # mark and the detail lines are still built and kept current - the
+        # probe, the bridges sync and the theme switch all paint them - but
+        # they are not packed: the user wanted the rail quiet. A host that is
+        # down still says so in the tab's own status line, and each bridge's
+        # state is in the Bridges menu.
         row = self._skin(tk.Frame(side), bg="side")
         row.pack(fill="x", padx=14, pady=3)
-        if arc:
-            lead = self._arc(row)
-            lead.pack(side="left", padx=(1, 0), pady=(2, 0), anchor="n")
-        else:
-            lead = self._dot(row, "faint")
-            lead.pack(side="left", padx=(6, 0), pady=(3, 0), anchor="n")
+        lead = self._arc(row) if arc else self._dot(row, "faint")
         box = self._skin(tk.Frame(row), bg="side")
-        box.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        box.pack(side="left", fill="x", expand=True, padx=(4, 0))
         head = self._skin(tk.Frame(box), bg="side")
         head.pack(fill="x")
         name = self._skin(tk.Label(head, text=title, font=self.f_ui, anchor="w"),
@@ -1591,7 +1592,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         lbl = tk.Label(box, text=detail, font=self.f_small, anchor="w",
                        justify="left")
         self._skin(lbl, bg="side", fg="faint")
-        lbl.pack(fill="x")
         if command:
             more = tk.Label(head, text=self.g["more"], font=self.f_glyph)
             self._skin(more, bg="side", fg="faint")
