@@ -933,8 +933,26 @@ look back over the shoulder. The pick is the preset: saved on every change to
 `angle_views.json` in `studio_dir()` (`load_views`/`save_views`; `DEFAULT_VIEWS`
 when the file is missing or unreadable). Make draws every selected photo from every
 picked view; Surprise me picks `PER_PHOTO` random ones. The old eight hand-worded
-angles are gone. The cube's words carry their phrasing, but none of them has been
-run live yet. Tests: `tests/test_viewcube.py`, and
+angles are gone. The cube's words carry their phrasing. **Live on Partner (2026-09-29,
+all 26, one seed): Kontext turns a face only to the picture's left.** The right-hand
+views came out the same as their left twins, so saying which edge they face does
+not steer it. Above/below became a head tilt, not a camera height. Straight
+above/below came out as the front view. Three-quarter views turned about 15
+degrees. Front and back views worked. Flipping the photo (`ImageFlip`), asking for
+the left twin and flipping the result back did give right-hand views that look like
+her. So `angle_graph` now does that for every view from their right (`mirrored`, two
+`ImageFlip` nodes, a core node both backends have). The words only ever ask for a
+left view. Camera height took four live rounds. "Rotate the camera up and over … to
+a bird's-eye view … zoom out a little" gives a real high angle. "Rotate the camera
+down to a worm's-eye view … zoom out so they tower over the camera … the ceiling and
+ceiling lights" gives a real low angle ("from near the floor" and "the height of
+their waist" did not). In one edit Kontext does *either* the turn *or* the height.
+So a turned view from above or below is two edits in one graph (`view_steps`): the
+level turn first, then the height on that picture (`KEEP_TURN`, seed + 1). Those
+views take ~36 s rather than ~18 s. Front from above/below and straight above/below
+stay one edit. Straight below comes out oddly posed (leaning over the lens) but is
+seen from beneath. Tests:
+`tests/test_viewcube.py`, and
 `test_angles_asks_on_a_view_cube_and_keeps_the_pick_as_the_preset`.
 
 Profiles' editable `description` is visual identity prose used alongside photos,

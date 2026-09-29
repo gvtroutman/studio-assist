@@ -32,9 +32,46 @@ class TestGraphs(unittest.TestCase):
         self.assertEqual(g["r1_load"]["inputs"]["image"], "a.png")
         self.assertEqual(g["ks"]["inputs"]["latent_image"], ["r1_enc", 0])
         self.assertIn("full side profile", g["text"]["inputs"]["text"])
-        self.assertIn("face the left edge of the picture", g["text"]["inputs"]["text"])
+        self.assertIn("facing the left edge of the picture", g["text"]["inputs"]["text"])
         self.assertIn("exact same face", g["text"]["inputs"]["text"])
         self.assertEqual(g["ks"]["inputs"]["seed"], 7)
+        self.assertNotIn("flip_in", g)                   # a left view as it is
+
+    def test_a_right_view_is_its_left_twin_in_a_mirror(self):
+        g = sb.angle_graph("a.png", "right side", 7)
+        self.assertEqual(g["text"]["inputs"]["text"],
+                         sb.angle_graph("a.png", "left side", 7)["text"]["inputs"]["text"])
+        self.assertEqual(g["flip_in"]["inputs"], {"image": ["r1_load", 0],
+                                                  "flip_method": sb.FLIP})
+        self.assertEqual(g["r1_scale"]["inputs"]["image"], ["flip_in", 0])
+        self.assertEqual(g["flip_out"]["inputs"]["image"], ["dec", 0])
+        self.assertEqual(g["save"]["inputs"]["images"], ["flip_out", 0])
+        self.assertEqual([sb.mirrored(k) for k in ((1, 1, -1), (0, 0, 1), (-1, 0, 0))],
+                         [True, False, False])
+
+    def test_a_turn_from_above_or_below_is_turned_first_then_raised(self):
+        self.assertEqual(len(sb.view_steps((0, 0, 1))), 1)       # level
+        self.assertEqual(len(sb.view_steps((0, 1, 1))), 1)       # front from above
+        self.assertEqual(len(sb.view_steps((0, -1, 0))), 1)      # straight below
+        turn = sb.view_steps((-1, -1, 1))
+        self.assertEqual(turn[0], sb.view_prompt((-1, 0, 1)))
+        self.assertIn("worm's-eye view", turn[1])
+        self.assertIn(sb.KEEP_TURN, turn[1])
+        g = sb.angle_graph("a.png", "right side from above", 7)  # mirrored and raised
+        self.assertIn("bird's-eye view", g["text2"]["inputs"]["text"])
+        self.assertEqual(g["s2_scale"]["inputs"]["image"], ["flip_out", 0])
+        self.assertEqual(g["ks2"]["inputs"]["latent_image"], ["s2_enc", 0])
+        self.assertEqual(g["ks2"]["inputs"]["seed"], 8)
+        self.assertEqual(g["save"]["inputs"]["images"], ["dec2", 0])
+        self.assertEqual(sb.angle_graph("a.png", "left side from below", 7)[
+            "s2_scale"]["inputs"]["image"], ["dec", 0])
+        for name in sb.VIEW_NAMES:                               # every link resolves
+            g = sb.angle_graph("a.png", name, sb.ig.MAX_SEED)
+            self.assertLessEqual(g.get("ks2", g["ks"])["inputs"]["seed"], sb.ig.MAX_SEED)
+            for node in g.values():
+                for v in node["inputs"].values():
+                    if isinstance(v, list):
+                        self.assertIn(v[0], g, name)
 
     def test_breed_chains_both_parents_onto_an_empty_latent(self):
         g = sb.breed_graph("a.png", "b.png", (832, 1216), 3)
@@ -73,13 +110,17 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(sb.view_name((0, -1, 0)), "straight below")
         self.assertTrue(set(sb.DEFAULT_VIEWS) <= set(sb.VIEW_NAMES))
 
-    def test_a_view_says_where_the_camera_is_and_which_way_they_face(self):
-        right = sb.view_prompt((1, 0, 1))
-        self.assertIn("round to their right", right)
-        self.assertIn("towards the right of the picture", right)
-        self.assertIn("high camera angle", sb.view_prompt((0, 1, 1)))
-        self.assertIn("over their left shoulder", sb.view_prompt((-1, 0, -1)))
+    def test_a_view_moves_the_camera_and_always_asks_for_the_left(self):
+        for key in sb.VIEW_KEYS:
+            self.assertNotIn("right", sb.view_prompt(key), key)
+        self.assertIn("three-quarter view", sb.view_prompt((-1, 0, 1)))
+        self.assertIn("over their shoulder", sb.view_prompt((-1, 0, -1)))
+        above, below = sb.view_prompt((0, 1, 1)), sb.view_prompt((0, -1, 1))
+        self.assertIn("Rotate the camera up", above)
+        self.assertIn("facing the camera straight on", above)
+        self.assertIn("worm's-eye view", below)
         self.assertIn("straight down", sb.view_prompt((0, 1, 0)))
+        self.assertIn("directly beneath", sb.view_prompt((0, -1, 0)))
 
     def test_the_preset_is_kept_and_read_back(self):
         with tempfile.TemporaryDirectory() as d:

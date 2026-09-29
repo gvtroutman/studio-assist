@@ -67,44 +67,97 @@ VIEW_OF = dict(zip(VIEW_NAMES, VIEW_KEYS))
 DEFAULT_VIEWS = ["front left", "front right", "left side", "right side"]
 
 
+FLIP = "y-axis: horizontally"           # ImageFlip's left-right mirror
+
+
+def mirrored(key):
+    """Is this view made from its left twin in a mirror? Live on Partner
+    (2026-09-29, all 26, one seed) Kontext turned a face only towards the
+    picture's left: each right view came out as its left twin, whatever the
+    words said. So a view from their right is made in a mirror: the photo
+    flipped, the left twin asked for, the result flipped back - which is
+    their real right side, not a fake (a mirrored person's left is their
+    right)."""
+    return key[0] > 0
+
+
 # Kontext-style edits: what changes, then what stays. Head turns were the
 # weakest edit in make_variations, so each says so plainly and moves the camera,
-# not only the head - and says which edge of the picture they face, since
-# "their left" and the picture's left are opposite ways round. With the camera
-# at their right they face the picture's right. These are reference photos of
-# a face, so from behind they still look back at the lens.
-def view_prompt(key):
+# not only the head. What Kontext is asked is always a left view (`mirrored`):
+# the camera at their left, so they face the picture's left - the way it turns
+# them anyway. These are reference photos of a face, so from behind they
+# still look back at the lens.
+def view_steps(key):
+    """The edits view `key` is made by, the words of each: one, or - for a
+    turn seen from above or below - the turn level, then the camera's height
+    on that picture. In one edit Kontext did one or the other: a turn from
+    below came out facing the camera, a turn from above lost its turn. In
+    two (live, 2026-09-29) the turn stayed. A right view's words are its left
+    twin's (`mirrored`)."""
     x, y, z = key
-    side = "right" if x > 0 else "left"
     if not x and not z:
-        return ("Show this person from directly above, the camera looking straight "
-                "down at them as they look up into the lens" if y > 0 else
-                "Show this person from directly below, the camera looking straight "
-                "up at them")
+        return [STRAIGHT[y]]
+    if not y or (not x and z > 0):
+        return [view_prompt(key)]
+    return [view_prompt((x, 0, z)), HEIGHT[y] % KEEP_TURN]
+
+
+def view_prompt(key):
+    """The words for view `key` in one edit - for a right view, its left
+    twin's (`mirrored`)."""
+    x, y, z = key
+    if not x and not z:
+        return STRAIGHT[y]
     if not x:
-        flat = ("Show this person facing the camera straight on, looking into the lens"
+        flat = ("this person facing the camera straight on, looking into the lens"
                 if z > 0 else
-                "Show this person from directly behind, their back to the camera, "
-                "turning their head to look back over their shoulder so their face "
-                "shows")
+                "this person from directly behind, their back to the camera, turning "
+                "their head to look back over their shoulder so their face shows")
     elif z > 0:
-        flat = ("Show this person from a three-quarter angle: the camera has moved 45 "
-                "degrees round to their %s, so we see more of the %s side of their "
-                "face and they face towards the %s of the picture" % (side, side, side))
+        flat = ("this person turned 45 degrees towards the left of the picture, in a "
+                "three-quarter view: their nose points towards the left edge of the "
+                "picture, their far cheek partly hidden, one ear visible")
     elif not z:
-        flat = ("Show this person in full side profile: the camera directly at their "
-                "%s side, so we see the %s side of their face and they face the %s "
-                "edge of the picture" % (side, side, side))
+        flat = ("this person in full side profile facing the left edge of the picture, "
+                "the camera directly beside them")
     else:
-        flat = ("Show this person from behind and to their %s, their back half turned "
-                "to the camera, looking back over their %s shoulder at the lens so "
-                "their face is still seen" % (side, side))
-    return flat + {1: ", from a high camera angle looking down at them as they look "
-                      "up towards it", -1: ", from a low camera angle looking up at them",
-                   0: ""}[y]
+        flat = ("this person from behind and to one side, their back half turned to "
+                "the camera, looking back over their shoulder towards the left of the "
+                "picture so their face is still seen")
+    return HEIGHT[y] % flat
 
 
-ANGLES = [(name, view_prompt(key)) for name, key in zip(VIEW_NAMES, VIEW_KEYS)]
+# The camera's height. "From a high camera angle" alone came out, live, as
+# the same camera with the head tilted. "Rotate the camera ... bird's-eye /
+# worm's-eye view", "zoom out" and the ceiling lights are what made Kontext
+# draw the body foreshortened from above and below (2026-09-29, four rounds
+# on Partner; "from near the floor" and "the height of their waist" did not).
+HEIGHT = {
+    0: "Show %s",
+    1: ("Rotate the camera up and over this person to a bird's-eye view from above, "
+        "looking down at them from about 45 degrees overhead, and show %s, their "
+        "head tilted up towards the camera. Zoom out a little so their head, "
+        "shoulders and upper body are seen from above"),
+    -1: ("Rotate the camera down to a worm's-eye view from below, looking up at this "
+         "person from about 45 degrees under them, and show %s, their head tipped "
+         "down towards the camera. Zoom out so they tower over the camera: their "
+         "whole upper body and arms seen from underneath, the ceiling and ceiling "
+         "lights far above them"),
+}
+KEEP_TURN = "this person keeping exactly the way they are turned and facing"
+STRAIGHT = {
+    1: ("Rotate the camera to a bird's-eye view directly above this person, looking "
+        "straight down at the crown of their head; their face turned up to the lens "
+        "and strongly foreshortened, the floor around their feet behind them"),
+    -1: ("Rotate the camera to lie on the floor directly beneath this person, pointing "
+         "straight up: zoom out so we see them from underneath, their body "
+         "foreshortened as it rises above the lens, their face looking straight down "
+         "into it, the ceiling behind them"),
+}
+
+
+ANGLES = [(name, " Then: ".join(view_steps(key)))
+          for name, key in zip(VIEW_NAMES, VIEW_KEYS)]         # for reading, not sent
 ANGLE_NAMES = VIEW_NAMES
 
 BREED = ("Make one new photograph of the same person who is in both of these pictures. "
@@ -113,8 +166,9 @@ BREED = ("Make one new photograph of the same person who is in both of these pic
          "picture exactly.")
 
 
-def angle_prompt(name):
-    return dict(ANGLES)[name] + "." + KEEP
+def angle_prompt(name, step=0):
+    """The words of edit `step` of view `name`, with what stays."""
+    return view_steps(VIEW_OF[name])[step] + "." + KEEP
 
 
 def pick_angles(n, rng=random):
@@ -202,12 +256,43 @@ def _finish(g, prompt_node, conditioning, latent, seed, prefix, steps, guidance)
 
 def angle_graph(image, angle, seed, prefix="identity/angle", steps=STEPS,
                 guidance=GUIDANCE):
-    """One photo (a LoadImage name) seen from `angle` (a name in ANGLES)."""
+    """One photo (a LoadImage name) seen from `angle` (a name in ANGLES); a
+    right view through a mirror both ways (`mirrored`), a turn from above or
+    below in two edits (`view_steps`), the second on the first's picture."""
+    key = VIEW_OF[angle]
     g = _loaders()
     g["text"] = {"class_type": "CLIPTextEncode", "inputs": {
         "text": angle_prompt(angle), "clip": ["2", 0]}}
     cond, latent = _reference(g, 1, image, ["text", 0])
-    return _finish(g, "text", cond, latent, seed, prefix, steps, guidance)
+    g = _finish(g, "text", cond, latent, seed, prefix, steps, guidance)
+    picture = ["dec", 0]
+    if mirrored(key):
+        g["flip_in"] = {"class_type": "ImageFlip", "inputs": {
+            "image": ["r1_load", 0], "flip_method": FLIP}}
+        g["r1_scale"]["inputs"]["image"] = ["flip_in", 0]
+        g["flip_out"] = {"class_type": "ImageFlip", "inputs": {
+            "image": ["dec", 0], "flip_method": FLIP}}
+        picture = ["flip_out", 0]
+    if len(view_steps(key)) > 1:
+        g["text2"] = {"class_type": "CLIPTextEncode", "inputs": {
+            "text": angle_prompt(angle, 1), "clip": ["2", 0]}}
+        g["s2_scale"] = {"class_type": "FluxKontextImageScale", "inputs": {"image": picture}}
+        g["s2_enc"] = {"class_type": "VAEEncode", "inputs": {
+            "pixels": ["s2_scale", 0], "vae": ["3", 0]}}
+        g["s2_ref"] = {"class_type": "ReferenceLatent", "inputs": {
+            "conditioning": ["text2", 0], "latent": ["s2_enc", 0]}}
+        g["guide2"] = dict(g["guide"], inputs=dict(g["guide"]["inputs"],
+                                                   conditioning=["s2_ref", 0]))
+        g["neg2"] = {"class_type": "ConditioningZeroOut", "inputs": {
+            "conditioning": ["text2", 0]}}
+        g["ks2"] = dict(g["ks"], inputs=dict(
+            g["ks"]["inputs"], seed=(int(seed) + 1) % (ig.MAX_SEED + 1), positive=["guide2", 0],
+            negative=["neg2", 0], latent_image=["s2_enc", 0]))
+        g["dec2"] = {"class_type": "VAEDecode", "inputs": {"samples": ["ks2", 0],
+                                                           "vae": ["3", 0]}}
+        picture = ["dec2", 0]
+    g["save"]["inputs"]["images"] = picture
+    return g
 
 
 def breed_graph(image_a, image_b, size, seed, prefix="identity/breed", steps=STEPS,
