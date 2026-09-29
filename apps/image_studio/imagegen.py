@@ -6430,6 +6430,10 @@ class Studio:
         if why:
             plan.warnings.append(why)
         likeness = {i for i, p in known.items() if p.get("face") and pulid and i in likely}
+        skipped = {p["name"] for i, p in known.items() if p.get("face") and p.get("id") in swapped}
+        if skipped:
+            plan.notes.append("Face pass: %s not drawn with PuLID - FaceFusion swaps their "
+                              "face after." % _and(sorted(skipped)))
         layout = job.settings.get("scene_layout")
         head_k = scene.get("head_depth", 0) or 0
         shaped = ({i for i, p in known.items() if p.get("head")}
