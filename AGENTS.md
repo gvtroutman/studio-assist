@@ -388,7 +388,8 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   installed `comfy_generate` runs the picture to a preview with SAM3's face boxes
   beside it, then a second run crops each face `FACE_PAD` (2x) its size, enlarges it
   to 1024, resamples it with the same model at `FACE_DENOISE` (0.45) under
-  `FACE_PROMPT` (the scene's prompt inside a face-specific one) and blends it back
+  `FACE_PROMPT` (the scene's prompt inside a face-specific one), with the sampler
+  the next entry is about, and blends it back
   through a soft oval (`oval_png`, a greyscale PNG the bridge draws and uploads).
   Two details matter. Each crop is taken from the picture as composited so far, so a
   neighbour's crop never pastes an old face back. And the blend is the oval, not the
@@ -403,6 +404,48 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   either off. The pass does not fix skin the prompt asked for: "weathered, ruddy,
   deep lines, visible pores" came back crackled and blotchy at every setting, with
   the pass and without, so the briefing says to name skin once and plainly.
+- **A new picture's faces are redrawn with a sampler of their own; a swapped
+  face is not** (a family's `redraw` in `FAMILIES`, `redraw_recipe`; 2026-09-29).
+  The face pass sampled with the picture's own sampler, and Z-Image Turbo's is
+  `res_multistep`, which adds no noise as it goes. The Image Studio had measured
+  what that does over an existing picture ("A redraw is sampled as a redraw");
+  measured again here, half of it holds and half is the reverse. On the 5090:
+  two pictures of 15 faces (a wedding party of eight, faces 79-108 px high; seven
+  friends at a table, 129-226 px), each saved once and its faces redrawn from
+  that file with the same seeds by four samplers at 0.45 and 0.3, looked at as
+  sampled (1024 px) and as they lie in the picture.
+  *Skin, as found there.* `res_multistep` left dark specks on foreheads, cheeks
+  and temples and white beads in beards and hair; plain `euler`, which adds no
+  noise either, left the same ones in the same places; the detail recipe's
+  `dpmpp_2m_sde`/`beta` left more, on rougher skin. `euler_ancestral`/`simple` at
+  the same 8 steps left clean skin. In the picture the specks are a pixel or two:
+  plain at x4, dirt on a face at full size.
+  *Likeness, the reverse.* `euler_ancestral` does not keep the face nearest the
+  one it redrew. ArcFace (antelopev2) against the face before the redraw, the
+  mean of each picture: at 0.45, 0.36 and 0.53 with `res_multistep`, 0.21 and
+  0.41 with `euler_ancestral`; at 0.3, 0.59 and 0.70 against 0.39 and 0.58 -
+  lower on every one of the 15 faces at both strengths. `euler_ancestral` at
+  0.3-0.35 strays as far as `res_multistep` at 0.45. It smooths age away with
+  the specks: the wedding's guests read 12 years younger at 0.45 (3 with
+  `res_multistep`), the friends, all under 35 but one, the same.
+  So the two passes part. `comfy_generate`'s faces are nobody's, and its face
+  pass takes the family's `redraw`: Z-Image names `euler_ancestral`/`simple`,
+  the first draw and the detail pass keep theirs, a sampler the caller names is
+  the picture's and not its redraws', and a family that names no `redraw` (all
+  the others) redraws as it draws. The result says which
+  ("face detail: ... sampler euler_ancestral/simple"). `comfy_face_swap`'s
+  finishing pass keeps `res_multistep`, specks and all, because there the
+  likeness is the point: on a real swap, ArcFace against the person swapped in
+  was 0.75 and 0.57 before the pass, 0.47 and 0.45 after it with `res_multistep`
+  and 0.41 and 0.42 with `euler_ancestral`, which also took six years off them
+  (two faces only: SAM3 found the bearded man twice, and the third face was not
+  a likeness before the pass either). The pass itself is what costs most: a
+  third of the likeness at 0.3 with any sampler. To give the swap the same
+  sampler, pass `redraw_recipe(z)` in `t_face_swap`. No sampler kept one face:
+  a woman of about seventy in the first draw came back at 0.45 as a man of forty
+  with `euler_ancestral` and `dpmpp_2m_sde`, and younger and mannish with the
+  other two. Time is the same, 24-26 s for eight faces. Not measured on the
+  3090, and on no picture with a LoRA.
 - **Every picture a bridge saved says where** (`_meta.path` on the image block).
   The transcript's preview is shrunk to fit; right-click on it saves, opens,
   shows or copies the full-size file, and a double-click opens it
