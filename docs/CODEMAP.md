@@ -81,6 +81,10 @@ After Effects and Resolve use outside npm servers.
   back by `start_denoise`, `recurring`, `prevention`, `blind_checks`) is written by
   `Studio._learn` and read in `_refine` and `compose`.
 - **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`, `tools/`.
+  The head swap before the final face swap (FLUX.2 Klein):
+  `apps/image_studio/headswap.py` (`lacks`, `targets`, `head_crop`, `head_graph`),
+  run by `Studio._head_swap` inside `finish_profiles`; the swap model is
+  `facefusion.SWAP_MODEL` / `model`.
   Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
   (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
   preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by

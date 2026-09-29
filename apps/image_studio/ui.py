@@ -67,16 +67,19 @@ ADVANCED = [                  # (setting, label, kind)
 STATUS_ROLE = {"queued": "muted", "uploading": "accent", "loading": "accent",
                "sampling": "accent", "decoding": "accent", "running": "accent",
                "refining": "accent", "face": "accent", "critic": "accent",
-               "face_swap": "accent", "eyes": "accent", "hands": "accent",
+               "head_swap": "accent", "face_swap": "accent", "eyes": "accent",
+               "hands": "accent",
                "glasses": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
-STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "face_swap": "Face swap",
+STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "head_swap": "Head swap",
+               "face_swap": "Face swap",
                "eyes": "Eye pass", "hands": "Hand pass", "glasses": "Glasses"}
 # A status to the key on the job's own pipeline strip (ig.pipeline_stages) it
 # lights up. Queued/uploading/loading run before the strip's first stop, so
 # nothing is lit yet.
 STAGE_KEY = {"queued": None, "uploading": None, "loading": None, "running": "sampling",
              "sampling": "sampling", "face": "face", "critic": "critic",
-             "decoding": "decoding", "face_swap": "face_swap", "eyes": "eyes",
+             "decoding": "decoding", "head_swap": "head_swap", "face_swap": "face_swap",
+             "eyes": "eyes",
              "hands": "hands", "glasses": "glasses", "complete": "complete"}
 READY_MARK = {"ready": "✓", "missing": "✗", "offline": "○", "disabled": "–",
               "unchecked": "?"}
@@ -445,6 +448,7 @@ class ImageStudio:
         self.faces_set = False        # likewise for the face pass
         self.auto_refine = tk.BooleanVar(value=False)   # the Visual Critic
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
+        self.head_swap = tk.BooleanVar(value=True)      # the head redrawn before the face swap
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
         self.lora_build = None        # the identity LoRA being trained (lt.Build)
@@ -788,6 +792,15 @@ class ImageStudio:
         # The hands pass (Studio._finish_passes): every hand SAM3 finds is
         # redrawn at the end of Generate, before the glasses.
         b = tk.Checkbutton(setup, text="Natural hands pass", variable=self.hand_pass,
+                           anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
+                           wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
+        # The head swap (Studio._head_swap): with a face profile, FLUX.2 Klein
+        # redraws the whole head from their photo before FaceFusion swaps the face.
+        b = tk.Checkbutton(setup, text="Head swap before the face swap",
+                           variable=self.head_swap,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
@@ -1775,6 +1788,7 @@ class ImageStudio:
         s["face_detail"] = bool(self.faces.get())
         s["auto_refine"] = bool(self.auto_refine.get())
         s["hand_pass"] = bool(self.hand_pass.get())
+        s["head_swap"] = bool(self.head_swap.get())
         for key, _, kind in ADVANCED:
             raw = self.adv[key].get().strip()
             if not raw:
@@ -1836,6 +1850,7 @@ class ImageStudio:
         self.faces_set = True
         self.auto_refine.set(bool(s.get("auto_refine")))
         self.hand_pass.set(s.get("hand_pass", True) is not False)
+        self.head_swap.set(s.get("head_swap", True) is not False)
         for r in list(self.loras):
             r["row"].destroy()
         self.loras = []
