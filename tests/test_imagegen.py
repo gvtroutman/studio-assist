@@ -2988,14 +2988,18 @@ class TestImageStudioTab(unittest.TestCase):
         class Ev:
             def __init__(self, px, py):
                 self.x, self.y = fw.ox + int(px * fw.k), fw.oy + int(py * fw.k)
+        self.assertEqual(fw.note_where.cget("text"), "on every spot")
         fw.note.set("six fingers")                # nothing marked: a note on them all
         fw._add(Ev(60, 60))
         self.assertEqual(fw.note.get(), "")       # a new spot, its own note
+        self.assertEqual(fw.note_where.cget("text"), "on spot 1")
         fw.note.set("thumb on the wrong side")
         fw._add(Ev(190, 190))
+        self.assertEqual(fw.note_where.cget("text"), "on spot 2")
         fw.note.set("too small")
         fw._remove(Ev(190, 190))                  # back on the spot before
         self.assertEqual(fw.note.get(), "thumb on the wrong side")
+        self.assertEqual(fw.note_where.cget("text"), "on spot 1")
         fw._add(Ev(190, 60))
         fw._pick("check", "on")
         fw._redraw()

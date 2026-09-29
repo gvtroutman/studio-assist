@@ -4400,8 +4400,11 @@ class FixWindow:
         o.label(row, "Wrong", "muted", width=10).pack(side="left")
         self.note = tk.StringVar()
         self.note.trace_add("write", lambda *_: self._noted())
+        self.note_where = o.label(row, "", "faint", host.f_small)
+        self.note_where.pack(side="right", padx=(o.px(6), 0))
         e = host._entry(row, self.note)
         e.master.pack(side="left", fill="x", expand=True)
+        self._note_on(None)
         if around_head:
             row.pack_forget()
         row = o.frame(opts)
@@ -4586,8 +4589,10 @@ class FixWindow:
 
     def _note_on(self, i):
         """The Wrong field now writes on spot `i` (None: on every spot
-        without a note of its own) and shows what is written there."""
+        without a note of its own) and shows what is written there, and
+        beside it which spot that is."""
         self.current = i
+        self.note_where.config(text="on every spot" if i is None else "on spot %d" % (i + 1))
         self.showing = True           # showing it writes nothing
         try:
             self.note.set(self.wide if i is None else self.spots[i].get("note", ""))

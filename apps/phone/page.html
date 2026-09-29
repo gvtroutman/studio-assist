@@ -41,11 +41,14 @@ header .grow { flex: 1; min-width: 0; }
 .chip { background: var(--raised); border-radius: 999px; padding: 6px 12px;
   max-width: 100%; border: 0; appearance: none; -webkit-appearance: none;
   text-overflow: ellipsis; font-size: 14px; }
-select.chip { width: 100%; }
+select.chip { width: 100%; padding-right: 30px; background-repeat: no-repeat;
+  background-position: right 12px center; background-size: 10px 6px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238a8880' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
 .toggle { flex: 0 0 auto !important; color: var(--faint); }
 .toggle[aria-pressed="true"] { color: var(--text); outline: 2px solid var(--accent); }
 .quiet { color: var(--faint); padding: 6px 10px; border-radius: 999px; font-size: 14px; }
 .quiet:active { background: var(--raised); }
+.quiet:disabled { opacity: .5; }
 
 main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .scroll { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
@@ -381,11 +384,17 @@ function grow() {
   t.style.height = Math.min(t.scrollHeight, innerHeight * .4) + "px";
 }
 
+let models = false;                      // the model list is in the chip
+let offline = null;                      // the note that says why it is not
+
 async function loadModels() {
   const pick = $("model");
+  models = false;
   try {
     const d = await api("/api/models");
-    if (!d.reachable) { pick.innerHTML = "<option value=''>LLM PC offline</option>"; note(d.error, true); return; }
+    if (offline) { offline.remove(); offline = null; }
+    if (!d.reachable) { pick.innerHTML = "<option value=''>LLM PC offline</option>"; offline = note(d.error, true); return; }
+    models = true;
     const want = store.get("model", "");
     pick.innerHTML = "";
     for (const m of d.models) {
@@ -440,11 +449,17 @@ async function loadChoices() {
   }
 }
 
+function stopping(on) {
+  $("job-stop").disabled = on;
+  $("job-stop").textContent = on ? "Cancelling…" : "Cancel";
+}
+
 function showJob(s) {
   $("job").hidden = false;
   const bar = $("job-bar");
   $("job-stop").hidden = s.done;
   if (s.done) {
+    stopping(false);
     bar.hidden = true;
     $("go").disabled = false;
     job = null; store.set("job", null);
@@ -502,7 +517,7 @@ async function generate() {
   $("go").disabled = true;
   $("job").hidden = false; $("job-bar").hidden = false; $("job-bar").className = "bar busy";
   $("job-text").style.color = ""; $("job-text").textContent = "Finding a GPU…";
-  $("job-result").innerHTML = ""; $("job-stop").hidden = true;
+  $("job-result").innerHTML = ""; $("job-stop").hidden = true; stopping(false);
   try {
     const s = await api("/api/jobs", {prompt, person: $("person").value, style: $("style").value,
                                       model: $("imodel").value, shape,
@@ -579,9 +594,10 @@ $("say").onkeydown = e => {
     e.preventDefault(); send(); }
 };
 $("model").onchange = () => store.set("model", $("model").value);
+$("model").onpointerdown = () => { if (!models) loadModels(); };
 $("new").onclick = () => {
+  if ((talk.length || stream) && !confirm("Start a new chat? This one is cleared from the phone.")) return;
   if (stream) stream.abort();
-  if (talk.length && !confirm("Start a new chat? This one is cleared from the phone.")) return;
   talk = []; store.set("talk", talk); drawTalk();
 };
 $("go").onclick = generate;
@@ -591,9 +607,23 @@ $("hands").onclick = () => {
   $("hands").setAttribute("aria-pressed", String(on));
   store.set("hands", on);
 };
-$("job-stop").onclick = async () => { if (job) { try { showJob(await api("/api/jobs/" + job + "/cancel", {})); } catch (e) {} } };
+$("job-stop").onclick = async () => {
+  if (!job) return;
+  stopping(true);
+  try { showJob(await api("/api/jobs/" + job + "/cancel", {})); }
+  catch (e) {
+    stopping(false);
+    if (e.message === "passcode") return;
+    $("job-text").style.color = "var(--err)";
+    $("job-text").textContent = e instanceof TypeError ? "Cannot reach the PC to cancel." : e.message;
+  }
+};
 $("view-close").onclick = () => { $("viewer").hidden = true; };
-document.addEventListener("visibilitychange", () => { if (!document.hidden && job) watch(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (job) watch();
+  if (!models) loadModels();
+});
 
 function start() {
   $("prompt").value = store.get("prompt", "");
