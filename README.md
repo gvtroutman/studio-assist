@@ -112,6 +112,27 @@ between dark and light, **Bridges** to jump straight to a tool list.
 apps. Preferences, pinned and hidden apps and open tabs are remembered in
 `%APPDATA%\StudioAssistant\settings.json`.
 
+### On a phone
+
+Double-click **Studio Assist Phone** in the app's folder. A window opens, says what it
+found (the model host, each ComfyUI) and shows the link to open on the phone, for
+example `http://desktop-ottfgpq:8765`. Leave the window open; closing it stops it.
+
+The phone needs the **Tailscale** app, signed in to the same account as this PC. That
+is what makes it work from anywhere and keeps everyone else out. The first time,
+Windows asks whether Python may accept connections: choose **Allow**.
+
+The page has two tabs. **Chat** talks to the local model: pick the model at the top (a
+dot marks what is already loaded, which answers at once), and the conversation stays on
+the phone. **Pictures** is the Image Studio's Generate with a few fields: what to show,
+a person, a style, a shape. Pictures land in the Image Studio's History, and the
+History is the gallery under the form. In the browser's menu, *Add to Home Screen*
+puts it beside the phone's apps.
+
+To use it on the home Wi-Fi without Tailscale, start it with `--lan` (edit the `.cmd`,
+or run `python apps/phone/server.py --lan`). The window then shows a six-digit passcode
+the phone asks for once.
+
 ### From a terminal
 
 ```bash

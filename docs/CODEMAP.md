@@ -20,6 +20,7 @@ apps/
   opencode/             the OpenCode tab: bridge and coding Add-ons
   milanote/             the Milanote tab
   research/             the Chat tab's files + web tools
+  phone/                chat and pictures as a web page for a phone (its own process)
 tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 ```
 - Every folder is a package; import by full name. Most modules are imported under
@@ -96,6 +97,13 @@ Milanote: `apps/milanote/milanote.py`. Research (Chat tab: files + web, read-onl
 `apps/research/mcp.py`, run in-process through `core.mcp.Loopback`.
 
 ## apps/opencode/, end to end
+## apps/phone/ (Studio Assist Phone.cmd)
+`apps/phone/server.py` over `apps/phone/page.html` (the whole page: markup, style and
+script). Start at `Phone` (`chat`, `generate`, `state`, `gallery`, `picture`,
+`make_room`), `Access` (who is served, the `--lan` passcode), `Handler` (`admitted`,
+`get`, `post`, `chat`), `plan`/`serve`/`main`. `python apps/phone/server.py --check`
+says what it would serve and where. Tests: `tests/test_phone.py`. AGENTS.md "The phone".
+
 ```
 Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
    ^  approval card                          |  HTTP + Basic auth (server.key)

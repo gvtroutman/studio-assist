@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16150f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Studio Assist">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" href="/icon.png">
+<title>Studio Assist</title>
+<style>
+:root {
+  --bg: #16150f; --panel: #1f1e17; --raised: #2a2920; --line: #38362b;
+  --text: #ecebe3; --faint: #9a978a; --accent: #d97757; --on-accent: #16150f;
+  --err: #e5786d; --ok: #8fbf7f;
+  --top: env(safe-area-inset-top, 0px); --bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f7f7f8; --panel: #ffffff; --raised: #efeff1; --line: #dcdce0;
+          --text: #1b1b1f; --faint: #6d6d78; --on-accent: #ffffff; }
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); overflow: hidden;
+  font: 16px/1.45 -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; }
+button, select, textarea, input { font: inherit; color: inherit; }
+button { border: 0; background: none; cursor: pointer; }
+[hidden] { display: none !important; }
+
+#app { display: flex; flex-direction: column; height: 100dvh; }
+header { display: flex; align-items: center; gap: 8px; flex: none;
+  padding: calc(var(--top) + 8px) 12px 8px; }
+.tabs { display: flex; background: var(--raised); border-radius: 999px; padding: 3px; }
+.tabs button { padding: 6px 16px; border-radius: 999px; color: var(--faint); }
+.tabs button.on { background: var(--panel); color: var(--text);
+  box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+header .grow { flex: 1; min-width: 0; }
+.chip { background: var(--raised); border-radius: 999px; padding: 6px 12px;
+  max-width: 100%; border: 0; appearance: none; -webkit-appearance: none;
+  text-overflow: ellipsis; font-size: 14px; }
+select.chip { width: 100%; }
+.toggle { flex: 0 0 auto !important; color: var(--faint); }
+.toggle[aria-pressed="true"] { color: var(--text); outline: 2px solid var(--accent); }
+.quiet { color: var(--faint); padding: 6px 10px; border-radius: 999px; font-size: 14px; }
+.quiet:active { background: var(--raised); }
+
+main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.scroll { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 8px 12px 16px; overscroll-behavior: contain; }
+
+/* chat */
+.msg { max-width: 88%; margin: 10px 0; padding: 10px 14px; border-radius: 18px;
+  overflow-wrap: anywhere; }
+.msg.user { margin-left: auto; background: var(--accent); color: var(--on-accent);
+  border-bottom-right-radius: 6px; white-space: pre-wrap; }
+.msg.assistant { background: var(--panel); border-bottom-left-radius: 6px; }
+.msg p { margin: 0 0 .6em; } .msg p:last-child { margin-bottom: 0; }
+.msg ul, .msg ol { margin: 0 0 .6em; padding-left: 1.3em; }
+.msg h3 { margin: .4em 0 .3em; font-size: 1.05em; }
+.msg pre { background: var(--bg); border-radius: 10px; padding: 10px; overflow-x: auto;
+  font: 13px/1.4 ui-monospace, Consolas, monospace; margin: 0 0 .6em; }
+.msg code { font: .9em ui-monospace, Consolas, monospace; background: var(--bg);
+  padding: 1px 5px; border-radius: 5px; }
+.msg pre code { background: none; padding: 0; }
+.msg details { color: var(--faint); font-size: 14px; margin-bottom: .5em; }
+.note { color: var(--faint); font-size: 13px; text-align: center; margin: 8px 24px; }
+.note.err { color: var(--err); }
+.dots::after { content: "\2022\2022\2022"; letter-spacing: 3px; color: var(--faint);
+  animation: pulse 1.2s infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+.empty { margin: auto; text-align: center; color: var(--faint); padding: 24px; }
+.empty b { display: block; color: var(--text); font-size: 20px; margin-bottom: 6px; }
+
+.composer { flex: none; margin: 0 12px calc(var(--bottom) + 10px); background: var(--panel);
+  border-radius: 22px; display: flex; align-items: flex-end; gap: 6px; padding: 6px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+.composer textarea { flex: 1; border: 0; outline: 0; resize: none; background: none;
+  padding: 8px 10px; max-height: 40dvh; min-height: 40px; }
+.send { flex: none; width: 40px; height: 40px; border-radius: 50%; background: var(--accent);
+  color: var(--on-accent); font-size: 18px; font-weight: 700; }
+.send:disabled { opacity: .4; }
+
+/* pictures */
+.card { background: var(--panel); border-radius: 18px; padding: 12px; margin-bottom: 12px; }
+.card textarea { width: 100%; border: 0; outline: 0; resize: none; background: none;
+  min-height: 84px; }
+.row { display: flex; gap: 8px; margin-top: 8px; }
+.row > * { flex: 1; min-width: 0; }
+.shapes { display: flex; gap: 6px; margin-top: 8px; }
+.shapes button { flex: 1; padding: 8px 0; border-radius: 12px; background: var(--raised);
+  color: var(--faint); font-size: 14px; }
+.shapes button.on { color: var(--text); outline: 2px solid var(--accent); }
+.go { width: 100%; margin-top: 10px; padding: 12px; border-radius: 14px;
+  background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.go:disabled { opacity: .45; }
+.bar { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden;
+  margin: 10px 0 6px; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent);
+  transition: width .4s; }
+.bar.busy i { width: 35%; animation: slide 1.4s infinite ease-in-out; }
+@keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+.status { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--faint); }
+.status span { flex: 1; min-width: 0; }
+.result img { width: 100%; border-radius: 12px; display: block; margin-top: 10px; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.grid button { aspect-ratio: 1; padding: 0; border-radius: 10px; overflow: hidden;
+  background: var(--raised); }
+.grid img { width: 100%; height: 100%; object-fit: cover; display: block; }
+h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint);
+  margin: 18px 4px 8px; font-weight: 600; }
+.health { font-size: 13px; color: var(--faint); margin: 0 4px 10px; }
+.health i { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 5px; background: var(--err); }
+.health i.ok { background: var(--ok); }
+
+/* viewer and passcode */
+.over { position: fixed; inset: 0; background: rgba(0,0,0,.92); z-index: 5; color: #ecebe3;
+  display: flex; flex-direction: column; padding: calc(var(--top) + 8px) 12px
+  calc(var(--bottom) + 12px); }
+.over .pic { flex: 1; min-height: 0; display: flex; align-items: center;
+  justify-content: center; }
+.over img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+.over p { font-size: 14px; color: #b9b6a8; max-height: 22dvh; overflow-y: auto; margin: 10px 2px; }
+.over .acts { display: flex; gap: 8px; }
+.over .acts > * { flex: 1; text-align: center; padding: 11px; border-radius: 12px;
+  background: #2a2920; color: #ecebe3; text-decoration: none; }
+.over .acts .main { background: var(--accent); color: #16150f; font-weight: 600; }
+.gate { margin: auto; width: min(320px, 86vw); text-align: center; }
+.gate input { width: 100%; text-align: center; font-size: 26px; letter-spacing: 8px;
+  padding: 12px; border-radius: 14px; border: 0; background: #2a2920; color: #ecebe3;
+  margin: 14px 0 10px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="tabs">
+      <button id="tab-chat" class="on">Chat</button>
+      <button id="tab-pictures">Pictures</button>
+    </div>
+    <div class="grow"><select id="model" class="chip" aria-label="Model"></select></div>
+    <button id="new" class="quiet">New</button>
+  </header>
+
+  <main id="chat">
+    <div id="log" class="scroll"></div>
+    <div class="composer">
+      <textarea id="say" rows="1" placeholder="Message the local model" enterkeyhint="send"></textarea>
+      <button id="send" class="send" aria-label="Send">&#8593;</button>
+    </div>
+  </main>
+
+  <main id="pictures" hidden>
+    <div class="scroll">
+      <div class="health" id="health"></div>
+      <div class="card">
+        <textarea id="prompt" placeholder="Describe the picture"></textarea>
+        <div class="row">
+          <select id="person" class="chip" aria-label="Person"></select>
+          <select id="style" class="chip" aria-label="Style"></select>
+        </div>
+        <div class="row">
+          <select id="imodel" class="chip" aria-label="Image model"></select>
+          <button id="hands" class="chip toggle" aria-pressed="false">Fix hands</button>
+        </div>
+        <div class="shapes" id="shapes"></div>
+        <button id="go" class="go">Generate</button>
+      </div>
+      <div class="card" id="job" hidden>
+        <div class="status"><span id="job-text"></span>
+          <button id="job-stop" class="quiet">Cancel</button></div>
+        <div class="bar" id="job-bar"><i></i></div>
+        <div class="result" id="job-result"></div>
+      </div>
+      <h2>Recent</h2>
+      <div class="grid" id="grid"></div>
+      <div class="note" id="grid-note"></div>
+    </div>
+  </main>
+</div>
+
+<div class="over" id="viewer" hidden>
+  <div class="pic"><img id="view-img" alt=""></div>
+  <p id="view-text"></p>
+  <div class="acts">
+    <button id="view-close">Close</button>
+    <button id="view-use">Use prompt</button>
+    <a id="view-save" class="main" download>Save</a>
+  </div>
+</div>
+
+<div class="over" id="gate" hidden>
+  <form class="gate" id="gate-form">
+    <b>Studio Assist</b>
+    <div class="note">Enter the passcode shown in the Studio Assist Phone window on the PC.</div>
+    <input id="gate-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+    <button class="go">Continue</button>
+    <div class="note err" id="gate-note"></div>
+  </form>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); }
+              catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)});
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (r.status === 401 && path !== "/api/pair") { showGate(); throw new Error("passcode"); }
+  if (!r.ok) throw new Error(data.error || ("The PC answered " + r.status + "."));
+  return data;
+}
+
+/* ------------------------------------------------------------- words */
+const esc = s => s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+function inline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
+}
+
+function blocks(text) {
+  const out = [];
+  let list = null, para = [];
+  const flush = () => {
+    if (para.length) { out.push("<p>" + para.map(inline).join("<br>") + "</p>"); para = []; }
+    if (list) { out.push("<" + list.tag + ">" + list.items.map(i => "<li>" + inline(i) + "</li>").join("") + "</" + list.tag + ">"); list = null; }
+  };
+  for (const line of text.split("\n")) {
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/), number = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    const head = line.match(/^#{1,6}\s+(.*)$/);
+    if (bullet || number) {
+      const tag = bullet ? "ul" : "ol";
+      if (para.length || (list && list.tag !== tag)) flush();
+      list = list || {tag, items: []};
+      list.items.push((bullet || number)[1]);
+    } else if (head) { flush(); out.push("<h3>" + inline(head[1]) + "</h3>"); }
+    else if (!line.trim()) flush();
+    else { if (list) flush(); para.push(line); }
+  }
+  flush();
+  return out.join("");
+}
+
+function render(text) {
+  let thought = "";
+  text = text.replace(/<think>([\s\S]*?)(<\/think>|$)/g, (m, inner) => { thought += inner; return ""; });
+  const parts = text.split("```");
+  let html = thought.trim() ? "<details><summary>Thinking</summary>" + blocks(thought.trim()) + "</details>" : "";
+  parts.forEach((part, i) => {
+    if (i % 2) html += "<pre><code>" + esc(part.replace(/^[\w+-]*\n/, "")) + "</code></pre>";
+    else html += blocks(part);
+  });
+  return html;
+}
+
+/* -------------------------------------------------------------- chat */
+let talk = store.get("talk", []);        // [{role, content}]
+let stream = null;                       // the AbortController of a reply under way
+const log = $("log");
+
+function bubble(role, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + role;
+  if (role === "user") d.textContent = text; else d.innerHTML = render(text);
+  log.appendChild(d);
+  return d;
+}
+function note(text, err) {
+  const d = document.createElement("div");
+  d.className = "note" + (err ? " err" : "");
+  d.textContent = text;
+  log.appendChild(d);
+  return d;
+}
+function nearEnd() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
+function toEnd() { log.scrollTop = log.scrollHeight; }
+
+function drawTalk() {
+  log.innerHTML = "";
+  if (!talk.length) {
+    log.innerHTML = '<div class="empty"><b>Studio Assist</b>The local model, from your phone. ' +
+      'Nothing here leaves the studio.</div>';
+    log.style.display = "flex";
+    return;
+  }
+  log.style.display = "";
+  for (const m of talk) bubble(m.role, m.content);
+  toEnd();
+}
+
+function busy(on) {
+  $("send").innerHTML = on ? "&#9632;" : "&#8593;";
+  $("send").setAttribute("aria-label", on ? "Stop" : "Send");
+}
+
+async function send() {
+  if (stream) { stream.abort(); return; }
+  const text = $("say").value.trim();
+  if (!text) return;
+  if (!talk.length) { log.innerHTML = ""; log.style.display = ""; }
+  $("say").value = ""; grow();
+  talk.push({role: "user", content: text});
+  store.set("talk", talk);
+  bubble("user", text);
+  const box = bubble("assistant", "");
+  box.innerHTML = '<span class="dots"></span>';
+  let waiting = null, reply = "", failed = "", done = false;
+  toEnd();
+  stream = new AbortController();
+  busy(true);
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST", headers: {"Content-Type": "application/json"}, signal: stream.signal,
+      body: JSON.stringify({model: $("model").value || null, messages: talk})});
+    if (r.status === 401) { showGate(); throw new Error("Give the passcode, then send again."); }
+    if (!r.ok) { let d = {}; try { d = await r.json(); } catch (e) {}
+                 throw new Error(d.error || ("The PC answered " + r.status + ".")); }
+    const reader = r.body.getReader(), decoder = new TextDecoder();
+    let rest = "";
+    for (;;) {
+      const {value, done: ended} = await reader.read();
+      if (ended) break;
+      rest += decoder.decode(value, {stream: true});
+      const lines = rest.split("\n");
+      rest = lines.pop();
+      const stick = nearEnd();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line);
+        if (ev.note) { if (waiting) waiting.remove(); waiting = note(ev.note); log.insertBefore(waiting, box); }
+        if (ev.t) { reply += ev.t; box.innerHTML = render(reply); }
+        if (ev.error) failed = ev.error;
+        if (ev.done) { done = true; if (ev.empty && !reply) failed = "The model answered with nothing. Try again, or pick another model."; }
+      }
+      if (stick) toEnd();
+    }
+    if (!done && !failed) failed = "The reply was cut off before it finished.";
+  } catch (e) {
+    failed = e.name === "AbortError" ? "" : (e.message || String(e));
+    if (e instanceof TypeError) failed = "Cannot reach the PC. Is Studio Assist Phone running, and Tailscale on?";
+  }
+  stream = null;
+  busy(false);
+  if (waiting) waiting.remove();
+  if (reply.trim()) {
+    talk.push({role: "assistant", content: reply});
+    box.innerHTML = render(reply);
+  } else {
+    // Nothing came back: the message returns to the composer, to send again.
+    box.remove();
+    talk.pop();
+    if (log.lastChild) log.lastChild.remove();
+    $("say").value = text; grow();
+  }
+  store.set("talk", talk);
+  if (!talk.length) drawTalk();
+  if (failed) {
+    if (!talk.length) { log.innerHTML = ""; log.style.display = ""; }
+    note(failed, true);
+  }
+  toEnd();
+}
+
+function grow() {
+  const t = $("say");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, innerHeight * .4) + "px";
+}
+
+async function loadModels() {
+  const pick = $("model");
+  try {
+    const d = await api("/api/models");
+    if (!d.reachable) { pick.innerHTML = "<option value=''>LLM PC offline</option>"; note(d.error, true); return; }
+    const want = store.get("model", "");
+    pick.innerHTML = "";
+    for (const m of d.models) {
+      const o = document.createElement("option");
+      o.value = m.id;
+      o.textContent = (m.loaded ? "● " : "") + m.id;
+      pick.appendChild(o);
+    }
+    pick.value = d.models.some(m => m.id === want) ? want : (d.model || "");
+  } catch (e) {
+    if (e.message !== "passcode") pick.innerHTML = "<option value=''>PC not answering</option>";
+  }
+}
+
+/* ---------------------------------------------------------- pictures */
+let shape = store.get("shape", "square");
+let job = store.get("job", null);        // the id of a picture being made
+let poll = null;
+let chosen = false;
+
+function options(el, items, first, keep) {
+  el.innerHTML = "";
+  if (first) items = [{id: "", name: first}].concat(items);
+  for (const it of items) {
+    const o = document.createElement("option");
+    o.value = it.id; o.textContent = it.name;
+    el.appendChild(o);
+  }
+  if (keep !== undefined && items.some(i => i.id === keep)) el.value = keep;
+}
+
+async function loadChoices() {
+  try {
+    const d = await api("/api/choices");
+    options($("person"), d.people, "No person", store.get("person", ""));
+    options($("style"), d.styles, null, store.get("style", "none"));
+    options($("imodel"), d.models, null, store.get("imodel", d.model));
+    $("shapes").innerHTML = "";
+    for (const s of d.shapes) {
+      const b = document.createElement("button");
+      b.textContent = s.name;
+      b.className = s.id === shape ? "on" : "";
+      b.onclick = () => { shape = s.id; store.set("shape", shape);
+        for (const x of $("shapes").children) x.className = x === b ? "on" : ""; };
+      $("shapes").appendChild(b);
+    }
+    $("health").innerHTML = d.backends.map(b =>
+      '<span><i class="' + (b.ok ? "ok" : "") + '"></i>' + esc(b.name) + "</span>").join(" &nbsp; ");
+    chosen = true;
+  } catch (e) {
+    if (e.message !== "passcode") $("health").textContent = e.message;
+  }
+}
+
+function showJob(s) {
+  $("job").hidden = false;
+  const bar = $("job-bar");
+  $("job-stop").hidden = s.done;
+  if (s.done) {
+    bar.hidden = true;
+    $("go").disabled = false;
+    job = null; store.set("job", null);
+    if (s.status === "complete") {
+      $("job-text").textContent = "Made on " + s.backend + " in " + Math.round(s.seconds) + " s" +
+        (s.detail ? ". " + s.detail : "");
+      $("job-result").innerHTML = "";
+      for (const p of s.pictures) {
+        const img = document.createElement("img");
+        img.src = p.full; img.alt = s.prompt;
+        img.onclick = () => view(p.full, s.prompt);
+        $("job-result").appendChild(img);
+      }
+      loadGrid();
+    } else {
+      $("job-text").textContent = s.status === "cancelled" ? "Cancelled." : (s.detail || "It failed.");
+      $("job-text").style.color = s.status === "cancelled" ? "" : "var(--err)";
+    }
+    return;
+  }
+  $("job-text").style.color = "";
+  $("job-result").innerHTML = "";
+  bar.hidden = false;
+  $("go").disabled = true;
+  const words = s.status.charAt(0).toUpperCase() + s.status.slice(1).replace("_", " ");
+  $("job-text").textContent = words + (s.detail ? ": " + s.detail : "") + "  (" + Math.round(s.seconds) + " s)";
+  if (typeof s.progress === "number") { bar.className = "bar"; bar.firstChild.style.width = Math.round(s.progress * 100) + "%"; }
+  else { bar.className = "bar busy"; bar.firstChild.style.width = ""; }
+}
+
+async function watch() {
+  clearTimeout(poll);
+  if (!job) return;
+  try {
+    const s = await api("/api/jobs/" + job);
+    showJob(s);
+  } catch (e) {
+    if (e.message === "passcode") return;
+    if (/not one this server/.test(e.message)) {
+      job = null; store.set("job", null); $("go").disabled = false;
+      $("job-text").textContent = e.message; $("job-bar").hidden = true; $("job-stop").hidden = true;
+      loadGrid();
+      return;
+    }
+    $("job-text").textContent = "Waiting for the PC to answer…";
+  }
+  if (job) poll = setTimeout(watch, document.hidden ? 4000 : 1000);
+}
+
+async function generate() {
+  const prompt = $("prompt").value.trim();
+  if (!prompt) { $("prompt").focus(); return; }
+  store.set("prompt", prompt); store.set("person", $("person").value);
+  store.set("style", $("style").value); store.set("imodel", $("imodel").value);
+  $("go").disabled = true;
+  $("job").hidden = false; $("job-bar").hidden = false; $("job-bar").className = "bar busy";
+  $("job-text").style.color = ""; $("job-text").textContent = "Finding a GPU…";
+  $("job-result").innerHTML = ""; $("job-stop").hidden = true;
+  try {
+    const s = await api("/api/jobs", {prompt, person: $("person").value, style: $("style").value,
+                                      model: $("imodel").value, shape,
+                                      hands: $("hands").getAttribute("aria-pressed") === "true"});
+    job = s.id; store.set("job", job);
+    showJob(s);
+    watch();
+  } catch (e) {
+    $("go").disabled = false;
+    $("job-bar").hidden = true;
+    $("job-text").style.color = "var(--err)";
+    $("job-text").textContent = e.message;
+  }
+}
+
+async function loadGrid() {
+  try {
+    const d = await api("/api/pictures");
+    const grid = $("grid");
+    grid.innerHTML = "";
+    for (const rec of d.pictures) for (const p of rec.pictures) {
+      const b = document.createElement("button"), img = document.createElement("img");
+      img.loading = "lazy"; img.src = p.thumb; img.alt = rec.prompt;
+      b.appendChild(img);
+      b.onclick = () => view(p.full, rec.prompt);
+      grid.appendChild(b);
+    }
+    $("grid-note").textContent = d.pictures.length ? "" : "Pictures made here or in the Image Studio show up here.";
+  } catch (e) {
+    if (e.message !== "passcode") $("grid-note").textContent = e.message;
+  }
+}
+
+function view(url, text) {
+  $("view-img").src = url;
+  $("view-text").textContent = text || "";
+  $("view-save").href = url;
+  $("view-save").setAttribute("download", url.split("/").slice(-2).join("_") + ".png");
+  $("view-use").onclick = () => { $("prompt").value = text || ""; $("viewer").hidden = true;
+    document.querySelector("#pictures .scroll").scrollTop = 0; };
+  $("viewer").hidden = false;
+}
+
+/* --------------------------------------------------------------- shell */
+function show(tab) {
+  store.set("tab", tab);
+  $("chat").hidden = tab !== "chat";
+  $("pictures").hidden = tab !== "pictures";
+  $("tab-chat").className = tab === "chat" ? "on" : "";
+  $("tab-pictures").className = tab === "pictures" ? "on" : "";
+  $("model").parentNode.style.visibility = tab === "chat" ? "" : "hidden";
+  $("new").style.visibility = tab === "chat" ? "" : "hidden";
+  if (tab === "pictures") { if (!chosen) loadChoices(); loadGrid(); watch(); }
+  else toEnd();
+}
+
+function showGate() { $("gate").hidden = false; $("gate-code").focus(); }
+
+$("gate-form").onsubmit = async e => {
+  e.preventDefault();
+  try {
+    await api("/api/pair", {passcode: $("gate-code").value.trim()});
+    $("gate").hidden = true; $("gate-note").textContent = "";
+    start();
+  } catch (err) { $("gate-note").textContent = err.message; $("gate-code").value = ""; }
+};
+
+$("tab-chat").onclick = () => show("chat");
+$("tab-pictures").onclick = () => show("pictures");
+$("send").onclick = send;
+$("say").oninput = grow;
+$("say").onkeydown = e => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(hover: hover)").matches) {
+    e.preventDefault(); send(); }
+};
+$("model").onchange = () => store.set("model", $("model").value);
+$("new").onclick = () => {
+  if (stream) stream.abort();
+  if (talk.length && !confirm("Start a new chat? This one is cleared from the phone.")) return;
+  talk = []; store.set("talk", talk); drawTalk();
+};
+$("go").onclick = generate;
+$("hands").setAttribute("aria-pressed", String(store.get("hands", false)));
+$("hands").onclick = () => {
+  const on = $("hands").getAttribute("aria-pressed") !== "true";
+  $("hands").setAttribute("aria-pressed", String(on));
+  store.set("hands", on);
+};
+$("job-stop").onclick = async () => { if (job) { try { showJob(await api("/api/jobs/" + job + "/cancel", {})); } catch (e) {} } };
+$("view-close").onclick = () => { $("viewer").hidden = true; };
+document.addEventListener("visibilitychange", () => { if (!document.hidden && job) watch(); });
+
+function start() {
+  $("prompt").value = store.get("prompt", "");
+  chosen = false;
+  drawTalk();
+  loadModels();
+  show(store.get("tab", "chat"));
+}
+
+(async () => {
+  try {
+    const a = await (await fetch("/api/access")).json();
+    if (a.paired === false) { drawTalk(); showGate(); return; }
+  } catch (e) {}
+  start();
+})();
+</script>
+</body>
+</html>
