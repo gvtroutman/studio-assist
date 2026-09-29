@@ -37,6 +37,7 @@ import apps.comfyui.view as comfy_view
 import apps.image_studio.imagegen as ig
 import apps.image_studio.facefusion as ff
 import apps.image_studio.breed as sb
+import apps.image_studio.viewcube as viewcube
 import apps.image_studio.lora_train as lt
 import apps.image_studio.scene.pose as sp
 import apps.image_studio.scene.ui as studio_scene_ui
@@ -3438,8 +3439,11 @@ class NewPhotos:
     """Angles or Breed (`breed`) for the identity editor: new photos of the
     person drawn on the Kontext backend, shown as they come; a click picks
     one, Add puts the picked ones into the references (Save keeps them).
-    Again makes another round; closing the window stops the run."""
-    PER_PHOTO = 4
+    Again makes another round; closing the window stops the run.
+    Angles asks first: the views are picked on a view cube (`viewcube`),
+    kept as the preset for next time, and Make draws each selected photo
+    from each of them."""
+    PER_PHOTO = 4                 # the views Surprise me picks
 
     def __init__(self, editor, pics, mode, parents):
         self.editor, self.pics, self.mode, self.parents = editor, pics, mode, parents
@@ -3447,12 +3451,14 @@ class NewPhotos:
         host = o.host
         self.made, self.sel, self.stop = [], set(), threading.Event()
         self.running = False
+        self.cube = None
         self.folder = tempfile.mkdtemp(prefix="studio-%s-" % mode)
         win = self.win = tk.Toplevel(editor.win)
         win.title("Breed" if mode == "breed" else "Angles")
         win.transient(editor.win)
         host._skin(win, bg="bg")
-        win.geometry("%dx%d" % (host._px(640), host._px(560)))
+        win.geometry("%dx%d" % (host._px(640 if mode == "breed" else 860),
+                                host._px(560 if mode == "breed" else 600)))
         win.protocol("WM_DELETE_WINDOW", self.close)
         top = o.frame(win)
         top.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(12), 0))
@@ -3466,14 +3472,55 @@ class NewPhotos:
         foot = o.frame(win)
         foot.pack(side="bottom", fill="x", padx=o.px(12), pady=o.px(12))
         o.button(foot, "Add to references", self.add, kind="accent").pack(side="right")
-        o.button(foot, "Again", self.start).pack(side="right", padx=(0, o.px(4)))
+        o.button(foot, "Again" if mode == "breed" else "Make", self.start).pack(
+            side="right", padx=(0, o.px(4)))
         o.button(foot, "Stop", self.stop.set, kind="ghost").pack(
             side="right", padx=(0, o.px(4)))
         self.msg = o.label(foot, "", "muted", host.f_small)
         self.msg.pack(side="left", fill="x", expand=True)
+        if mode != "breed":
+            self._build_cube(win)
         outer, self.grid = o.scrolled(win)
         outer.pack(side="top", fill="both", expand=True, padx=o.px(12), pady=(o.px(8), 0))
-        self.start()
+        if mode == "breed":
+            self.start()
+        else:
+            self.status("Click the sides of the cube to look from, then Make. "
+                        "Drag it to turn it.")
+
+    def _build_cube(self, win):
+        """The view cube down the left, with what is picked under it."""
+        o, host = self.owner, self.owner.host
+        side = o.frame(win)
+        side.pack(side="left", fill="y", padx=(o.px(12), 0), pady=(o.px(8), 0))
+        o.label(side, "Look from", "muted", host.f_small).pack(side="top", anchor="w")
+        self.cube = viewcube.ViewCube(side, lambda: host.C, o.px(200), sb.load_views(),
+                                      self._views_changed, font=host.f_small)
+        self.cube.pack(side="top", pady=(o.px(4), 0))
+        o.label(side, "Right and left are theirs.", "faint", host.f_small).pack(
+            side="top", anchor="w")
+        row = o.frame(side)
+        row.pack(side="top", fill="x", pady=(o.px(6), 0))
+        o.button(row, "Surprise me", lambda: self.cube.set_chosen(
+            sb.pick_angles(self.PER_PHOTO))).pack(side="left")
+        o.button(row, "Clear", lambda: self.cube.set_chosen([]), kind="ghost").pack(
+            side="left", padx=(o.px(4), 0))
+        o.button(row, "Turn back", self.cube.home, kind="ghost").pack(
+            side="left", padx=(o.px(4), 0))
+        self.picked = o.label(side, "", "text", host.f_small, wraplength=o.px(200))
+        self.picked.pack(side="top", anchor="w", pady=(o.px(6), 0))
+        self._views_changed(self.cube.chosen, save=False)
+
+    def _views_changed(self, names, save=True):
+        n = len(names) * len(self.parents)
+        self.picked.config(text="\n".join(names) + (
+            "\n\n%d photo%s a round" % (n, "" if n == 1 else "s") if names
+            else "Nothing picked yet."))
+        if save:
+            try:
+                sb.save_views(names)
+            except OSError:
+                pass                  # a preset is a convenience; the pick still stands
 
     def status(self, text, role="muted"):
         if self.win.winfo_exists():
@@ -3484,15 +3531,17 @@ class NewPhotos:
         """[(label, parent, angle or None)] for one round."""
         if self.mode == "breed":
             return [("child", None, None)]
-        return [(angle, p, angle) for p in self.parents
-                for angle in sb.pick_angles(self.PER_PHOTO)]
+        views = self.cube.chosen if self.cube is not None else sb.pick_angles(self.PER_PHOTO)
+        return [(angle, p, angle) for p in self.parents for angle in views]
 
     def start(self):
         if self.running:
             return self.status("Still making the last round; Stop ends it.")
+        jobs, studio = self.jobs(), self.owner.studio
+        if not jobs:
+            return self.status("Pick at least one side of the cube first.")
         self.running = True
         self.stop.clear()
-        jobs, studio = self.jobs(), self.owner.studio
         self.status("Finding a backend with FLUX Kontext" + ELLIPSIS)
 
         def say(text, role="muted"):
@@ -3790,9 +3839,9 @@ class RecordEditor:
                             "Choose a clear front view as Primary. Enable pooling to let the "
                             "other photos guide identity too. Build LoRA trains the "
                             "person's own FLUX LoRA from %d or more photos.\n"
-                            "Angles draws the selected photos from %d other angles; Breed "
-                            "mixes two selected photos into a new one." % (
-                                lt.MIN_PHOTOS, NewPhotos.PER_PHOTO),
+                            "Angles draws the selected photos from the sides you pick on "
+                            "a view cube; Breed mixes two selected photos into a new "
+                            "one." % lt.MIN_PHOTOS,
                             "muted", host.f_small).pack(
                                 side="top", anchor="w")
                 o.button(row, "Remove", lambda p=pics: self._remove_paths(p),

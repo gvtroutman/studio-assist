@@ -27,11 +27,12 @@ def classes(g):
 
 class TestGraphs(unittest.TestCase):
     def test_angle_edits_the_photo_it_was_given(self):
-        g = sb.angle_graph("a.png", "profile left", 7)
+        g = sb.angle_graph("a.png", "left side", 7)
         self.assertEqual(classes(g).count("LoadImage"), 1)
         self.assertEqual(g["r1_load"]["inputs"]["image"], "a.png")
         self.assertEqual(g["ks"]["inputs"]["latent_image"], ["r1_enc", 0])
-        self.assertIn("side profile facing left", g["text"]["inputs"]["text"])
+        self.assertIn("full side profile", g["text"]["inputs"]["text"])
+        self.assertIn("face the left edge of the picture", g["text"]["inputs"]["text"])
         self.assertIn("exact same face", g["text"]["inputs"]["text"])
         self.assertEqual(g["ks"]["inputs"]["seed"], 7)
 
@@ -61,6 +62,35 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(len(set(picked)), 4)
         self.assertTrue(set(picked) <= set(sb.ANGLE_NAMES))
         self.assertEqual(len(sb.pick_angles(99)), len(sb.ANGLES))
+
+    def test_the_26_views_of_a_cube_have_names_of_their_own(self):
+        self.assertEqual(len(sb.VIEW_KEYS), 26)
+        self.assertEqual(len(set(sb.VIEW_NAMES)), 26)
+        self.assertEqual(sb.view_name((0, 0, 1)), "front")
+        self.assertEqual(sb.view_name((1, 0, 1)), "front right")
+        self.assertEqual(sb.view_name((-1, 0, 0)), "left side")
+        self.assertEqual(sb.view_name((1, 1, -1)), "back right from above")
+        self.assertEqual(sb.view_name((0, -1, 0)), "straight below")
+        self.assertTrue(set(sb.DEFAULT_VIEWS) <= set(sb.VIEW_NAMES))
+
+    def test_a_view_says_where_the_camera_is_and_which_way_they_face(self):
+        right = sb.view_prompt((1, 0, 1))
+        self.assertIn("round to their right", right)
+        self.assertIn("towards the right of the picture", right)
+        self.assertIn("high camera angle", sb.view_prompt((0, 1, 1)))
+        self.assertIn("over their left shoulder", sb.view_prompt((-1, 0, -1)))
+        self.assertIn("straight down", sb.view_prompt((0, 1, 0)))
+
+    def test_the_preset_is_kept_and_read_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(sb.load_views(d), sb.DEFAULT_VIEWS)
+            sb.save_views(["back left", "no such view", "front"], d)
+            self.assertEqual(sb.load_views(d), ["back left", "front"])
+            sb.save_views([], d)
+            self.assertEqual(sb.load_views(d), [])
+            with open(os.path.join(d, sb.PRESET_FILE), "w") as f:
+                f.write("{broken")
+            self.assertEqual(sb.load_views(d), sb.DEFAULT_VIEWS)
 
     def test_lacks(self):
         self.assertEqual(sb.lacks(None), [])

@@ -75,8 +75,10 @@ After Effects and Resolve use outside npm servers.
 - **Critic** - `apps/image_studio/critic.py`.
 - **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`, `tools/`.
   Angles / Breed (new reference photos by FLUX Kontext): `apps/image_studio/breed.py`
-  (`angle_graph`, `breed_graph`, `route`, `run`) under `ui.NewPhotos`, opened by
-  `RecordEditor._new_photos`.
+  (`angle_graph`, `breed_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
+  preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by
+  `RecordEditor._new_photos`. The view cube Angles asks on:
+  `apps/image_studio/viewcube.py` (`cells`, `basis`, `facing`, `ViewCube`).
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,
   `scene/pose.py`.
