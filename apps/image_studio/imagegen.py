@@ -780,6 +780,10 @@ class Library:
         return out
 
     def save(self, kind, records=None):
+        """Write `<kind>.json` atomically, then publish it in memory - never
+        the other way round, or a failed write would leave `self.data[kind]`
+        claiming records that are not actually on disk."""
+        data = self.data[kind]
         if records is not None:
             cleaned, seen = [], set()
             for d in records:
@@ -788,13 +792,14 @@ class Library:
                     rec["id"] = unique_id(rec["id"], seen)
                     seen.add(rec["id"])
                     cleaned.append(rec)
-            self.data[kind] = cleaned
+            data = cleaned
         os.makedirs(self.root, exist_ok=True)
         path = self._path(kind)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data[kind], f, indent=2)
+            json.dump(data, f, indent=2)
         os.replace(tmp, path)
+        self.data[kind] = data
 
     def all(self, kind):
         return self.data[kind]
@@ -902,12 +907,7 @@ class Library:
         return record
 
     def save_images(self, records):
-        previous = self.data["images"]
-        try:
-            self.save("images", records)
-        except (OSError, ValueError):
-            self.data["images"] = previous
-            raise
+        self.save("images", records)
 
     def keep_bytes(self, data, ext, owner):
         """A picture's bytes under references/<owner>, named by their hash, so
@@ -1160,7 +1160,8 @@ class ComfyUIClient:
 
     def get_json(self, path, timeout=None):
         with self._open(self.url + path, timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+            body = r.read().decode("utf-8")
+        return self._parse(body)
 
     def post_json(self, path, payload, timeout=None):
         req = urllib.request.Request(
@@ -1168,7 +1169,18 @@ class ComfyUIClient:
             headers={"Content-Type": "application/json"}, method="POST")
         with self._open(req, timeout) as r:
             body = r.read().decode("utf-8")
-            return json.loads(body) if body.strip() else {}
+        return self._parse(body) if body.strip() else {}
+
+    def _parse(self, body):
+        """A 200 with a body that is not valid JSON - a proxy's HTML error
+        page, or ComfyUI cut off mid-restart - is the same kind of failure
+        as an HTTP error: a ComfyError, not a raw ValueError callers do not
+        expect."""
+        try:
+            return json.loads(body)
+        except ValueError as e:
+            raise ComfyError("%s answered with something that is not JSON (%s): %s"
+                             % (self.backend["name"], e, body[:200]))
 
     # ---------------------------------------------------------- reading
     def health(self):
@@ -1400,13 +1412,18 @@ class ComfyUIClient:
                             else:
                                 on_event("queued", ahead)
                         silent = None
-                    except Unreachable:
+                    except (Unreachable, ComfyError):
+                        # Not just a dropped connection: a malformed body from
+                        # a server mid-restart, or a history/queue read that
+                        # briefly errors, reads the same as busy - the poll
+                        # two seconds later either recovers or the deadline
+                        # above ends the job cleanly either way.
                         entry = None
                         silent = silent or now
                         on_event("busy", int(now - silent))
-                    if entry and (entry.get("status", {}).get("completed")
-                                  or entry.get("outputs")
-                                  or entry.get("status", {}).get("status_str") == "error"):
+                    status = (entry or {}).get("status") or {}
+                    if entry and (status.get("completed") or entry.get("outputs")
+                                  or status.get("status_str") == "error"):
                         return entry
                     if started and not watch.error and now - heard > QUIET_AFTER:
                         on_event("quiet", int(now - heard))
@@ -3944,6 +3961,7 @@ def plan_items(p, s, wf, v, backend, short, nodes):
 
 
 CRITIC_MEMORY = "critic_memory.json"
+CRITIC_MEMORY_LOCK = threading.Lock()  # two backends' lanes can both _refine at once
 
 
 def load_critic_memory(lib):
@@ -3994,7 +4012,7 @@ def identity_description_text(settings, library, identities):
             except (TypeError, ValueError):
                 pass
         elif len(people) > 1:
-            position = " from the left"
+            position = " (number %d of %d, left to right)" % (index, len(people))
         parts.append("Person %d%s (%s), identifying appearance: %s" %
                      (index, position, ident["name"], ident["description"]))
     if parts:
@@ -4695,12 +4713,16 @@ class JobQueue:
 
     def add(self, job):
         with self.lock:
+            if self.closed:
+                return self._finish(job, "cancelled", "cancelled before it started")
             self.jobs.append(job)
             lane = self.lanes.get(job.backend["id"])
             if lane is None:
                 lane = self.lanes[job.backend["id"]] = Lane(job.backend)
             lane.backend = job.backend
         with lane.cv:
+            if self.closed:            # close() ran between the two locks above
+                return self._finish(job, "cancelled", "cancelled before it started")
             lane.waiting.append(job)
             lane.cv.notify()
             if lane.thread is None or not lane.thread.is_alive():
@@ -4756,6 +4778,12 @@ class JobQueue:
                             lane.thread = None
                             return
                 if self.closed:
+                    # A job that reached lane.waiting between close()'s own
+                    # cancel pass and this thread waking up would otherwise
+                    # sit here forever, never notified as finished.
+                    leftover, lane.waiting = lane.waiting, []
+                    for job in leftover:
+                        self._finish(job, "cancelled", "cancelled before it started")
                     return
                 job = lane.current = lane.waiting.pop(0)
             try:
@@ -6035,6 +6063,8 @@ class Studio:
                 self.make_room(b)
             except Exception as e:
                 job.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
+        if job.cancel.is_set():
+            return self.queue._finish(job, "cancelled")
         files = graph = None
         face_done = False
         for label, graph in graphs:
@@ -6650,9 +6680,13 @@ class Studio:
             nxt = critic.plan_next_refinement(result, canonical)
             canonical, promoted = critic.merge_canonical(canonical, nxt["promote"])
             if promoted:
-                save_critic_memory(self.lib, critic.remember(
-                    load_critic_memory(self.lib), canonical, promoted,
-                    [i["id"] for i in idents], s.get("scene") or ""))
+                # Read-modify-write on one shared file: two backends' lanes
+                # can both be refining at once, and the second save must not
+                # overwrite what the first just learned.
+                with CRITIC_MEMORY_LOCK:
+                    save_critic_memory(self.lib, critic.remember(
+                        load_critic_memory(self.lib), canonical, promoted,
+                        [i["id"] for i in idents], s.get("scene") or ""))
             text = critic.log_text(n, result, nxt)
             log.append(text)
             self._critic_log(job, text)

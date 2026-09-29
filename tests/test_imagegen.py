@@ -667,6 +667,20 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(identities=["sitter"], style="none", hair="grey", scene="Reading.")
         self.assertTrue(p.prompt.startswith("SITTERPERSON, grey hair, wearing clothes suited to the scene. Reading."), p.prompt)
 
+    def test_identity_descriptions_tell_two_undrawn_people_apart(self):
+        """Without Scene Builder's own boxes, every person used to be labelled
+        identically "from the left" - indistinguishable text that could make
+        the model apply one person's features to the other's face."""
+        alice = {"name": "Alice", "description": "red hair, freckles"}
+        bob = {"name": "Bob", "description": "beard, glasses"}
+        parts = ig.identity_description_text({}, None, [(alice, None), (bob, None)])
+        self.assertEqual(len(parts), 3)          # Alice, Bob, the closing instruction
+        self.assertNotEqual(parts[0], parts[1])
+        self.assertIn("Alice", parts[0])
+        self.assertIn("Bob", parts[1])
+        self.assertIn("1 of 2", parts[0])
+        self.assertIn("2 of 2", parts[1])
+
     def test_a_person_alone_is_enough(self):
         p = self.plan(style="none", subject="an old fisherman", anatomy=False)
         self.assertEqual(p.errors, [])
@@ -1720,6 +1734,19 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         settle(jobs)
         self.assertEqual([j.status for j in jobs], ["complete", "cancelled"])
 
+    def test_add_after_close_finishes_the_job_instead_of_stranding_it(self):
+        """add() and close() (app shutdown) can race: a job that lands in
+        JobQueue after close() has already run its cancel pass used to sit
+        in lane.waiting forever, its lane thread returning at once without
+        ever touching it, never notified as finished."""
+        self.studio.queue.close()
+        job = ig.Job(dict(ig.default_settings(), scene="x"), self.backend("5090"))
+        self.studio.queue.add(job)
+        deadline = time.monotonic() + 2
+        while job.status == "queued" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(job.status, "cancelled")
+
     def test_a_plan_error_fails_the_job_in_words(self):
         jobs = self.studio.submit(dict(ig.default_settings(), scene="", backend="5090"))
         settle(jobs)
@@ -1868,6 +1895,38 @@ class TestErrors(unittest.TestCase):
         self.assertIn("no ComfyUI is running here", h["detail"])
         self.assertIn(r"Start it: D:\ComfyUI\start.cmd", h["detail"])
 
+    def test_a_body_that_is_not_json_is_a_comfyerror_not_a_crash(self):
+        """A proxy's HTML error page, or ComfyUI cut off mid-restart, answers
+        200 with a body that will not parse - the same kind of failure as an
+        HTTP error, not a raw ValueError callers do not expect."""
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9"})
+        with self.assertRaises(ig.ComfyError) as caught:
+            c._parse("<html>502 Bad Gateway</html>")
+        self.assertIn("X", str(caught.exception))
+        self.assertIn("not JSON", str(caught.exception))
+
+    def test_polling_survives_a_transient_error_and_an_explicit_null_status(self):
+        """listen_for_progress used to only tolerate Unreachable (a dropped
+        connection); a malformed body wrapped as ComfyError, or a history
+        entry whose status is JSON null rather than missing, used to crash
+        the polling thread instead of being read as busy-not-gone."""
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9"})
+        calls = []
+        def get_history(prompt_id):
+            calls.append(prompt_id)
+            if len(calls) == 1:
+                raise ig.ComfyError("X answered with something that is not JSON")
+            return {"status": None, "outputs": {"9": {}}}
+        c.get_history = get_history
+        c.position = lambda pid: None
+        events = []
+        watch = ig.Watch(None, ig.queue.Queue(), "")
+        entry = c.listen_for_progress("pid", lambda k, d: events.append((k, d)),
+                                      timeout=10, watch=watch)
+        self.assertEqual(entry, {"status": None, "outputs": {"9": {}}})
+        self.assertIn("busy", [k for k, _ in events])
+        self.assertEqual(len(calls), 2)
+
 
 class FakeWeb:
     """urlopen for fetch_picture: url -> bytes or (bytes, content type);
@@ -1932,6 +1991,22 @@ class TestLibrary(unittest.TestCase):
                     lib.import_image(src)
             self.assertEqual(lib.all("images"), [])
             self.assertEqual(ig.Library(lib.root).all("images"), [])
+
+    def test_a_failed_save_of_any_kind_rolls_back_in_memory_too(self):
+        """Only test_image_library_rejects_non_images_and_rolls_back_failed_save
+        used to be true: Library.save() published the new records in memory
+        before the atomic write, so a disk-full/read-only failure on any
+        other kind (loras, identities, ...) left the in-memory list claiming
+        an edit that was never actually saved."""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as folder:
+            lib = ig.Library(folder)
+            before = lib.all("loras")
+            with patch.object(ig.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    lib.save("loras", [{"id": "new", "file": "new.safetensors", "name": "New"}])
+            self.assertEqual(lib.all("loras"), before)
+            self.assertEqual(ig.Library(folder).all("loras"), before)
 
     def test_junk_on_disk_costs_the_record_not_the_list(self):
         d = tempfile.mkdtemp()
