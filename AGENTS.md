@@ -557,6 +557,24 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   hair"), then the scene, then the camera line, then the anatomy constants, then the
   style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
+- **A no-style prompt gets one light/time phrase and, with a person, one
+  human-error detail** (2026-09-28, the user: prompt richness as a bottleneck).
+  `person_text` is a flat attribute list ("olive skin, slim, green eyes..."),
+  not the photographer's prose the ComfyUI tab's chat system prompt tells its
+  model to write (light, lens, "real-world imperfections that sell it") - so a
+  plain form submission read as a tag list, not a photograph. `compose()` now
+  appends `time_of_day_text` (skipped when `scene` or `camera` already names a
+  time or light, via `LIGHT_TIME`) and, when `has_person`, `imperfection_text`
+  (a flyaway hair, a crease, uneven tan lines...), both picked deterministically
+  from the job's own seed - same seed keeps the same light and flaw, a new seed
+  for "a different take" can bring new ones. Skipped whenever a style is chosen:
+  a named style's own prompt (`_default_styles`) already carries its light and
+  texture, and a second one would fight it. `generator_prompt`'s replay
+  (`critic.py`) is unaffected: it always restates character facts from
+  `canonical_state` as its own flat list rather than parsing them back out of
+  the composed prose, and freezes `original_intent["prompt"]` - including
+  these two phrases - for every refinement pass, which is the desired
+  behaviour (consistent light and flaw across a scene's corrections).
 - **Pick person cuts one person out of a reference photo.** In the Identities editor,
   the photo is the selected reference, else one chosen from disk. `Studio.look_at`
   sends it through ComfyUI for its size and a PNG (Tk reads no JPEG; no SAM3), and a
