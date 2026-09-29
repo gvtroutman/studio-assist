@@ -544,6 +544,260 @@ class FixCheckTest(TempStudioMixin, unittest.TestCase):
         self.assertTrue(any("critic's check" in w for w in job.record["warnings"]))
 
 
+def scored(feature, outcome, action="FACE_CORRECTION", denoise=0.45, **kw):
+    return dict(ob(feature, "MISMATCH", **kw), id=1, tries=1, outcome=outcome,
+                action=action, denoise=denoise)
+
+
+class LedgerTest(unittest.TestCase):
+    """What the scores add up to, and what the next picture takes from it."""
+
+    def test_a_strength_that_seldom_mends_gives_way_to_one_that_does(self):
+        led = {}
+        for outcome in ("PERSISTS", "PERSISTS", "WORSE", "UNKNOWN"):
+            led = critic.note_fixes(led, "flux-dev", [scored("jaw", outcome, target="face")])
+        rec = led["fixes"]["flux-dev"]["identity/face"]["FACE_CORRECTION@0.45"]
+        self.assertEqual(rec, {"tried": 3, "cleared": 0, "worse": 1})   # unknown: no evidence
+        start = lambda top=0.6, model="flux-dev": critic.start_denoise(   # noqa: E731
+            led, model, "identity/face", "FACE_CORRECTION", 0.45, top)
+        self.assertEqual(start(), (0.45, ""))              # nothing harder is known to work
+        for outcome in ("CLEARED", "CLEARED"):
+            led = critic.note_fixes(led, "flux-dev", [scored("jaw", outcome, denoise=0.6,
+                                                             target="face")])
+        self.assertEqual(start()[0], 0.45)                 # two tries are not yet believed
+        led = critic.note_fixes(led, "flux-dev", [scored("jaw", "PERSISTS", denoise=0.6,
+                                                         target="face")])
+        d, why = start()
+        self.assertEqual(d, 0.6)
+        self.assertIn("0.45 mended 0 of 3 before, 0.6 2 of 3", why)
+        self.assertEqual(start(top=0.5)[0], 0.45)          # never past the top
+        self.assertEqual(start(model="z-image-turbo")[0], 0.45)   # another model's record
+
+    def test_a_strength_that_mends_is_kept(self):
+        led = {}
+        for outcome in ("CLEARED", "CLEARED", "PERSISTS"):
+            led = critic.note_fixes(led, "m", [scored("jaw", outcome, target="face")])
+        self.assertEqual(critic.start_denoise(led, "m", "identity/face", "FACE_CORRECTION",
+                                              0.45, 0.6), (0.45, ""))
+
+    def test_the_critic_must_repeat_itself_and_the_user_is_believed_at_once(self):
+        hand = ob("fingers", "MISMATCH", "realism", target="hand", correction="five fingers")
+        led = {}
+        for n in (1, 2):
+            led = critic.note_picture(led, "flux-dev", ["sitter"], "On a pier.", [hand])
+            self.assertEqual(critic.recurring(led, "flux-dev", ["sitter"]), [])
+        led = critic.note_picture(led, "flux-dev", ["sitter"], "On a pier.", [hand])
+        (r,) = critic.recurring(led, "flux-dev", ["sitter"], "on a pier")
+        self.assertEqual((r["kind"], r["weight"], r["seen"]), ("realism/hand", 3, 3))
+        self.assertEqual(critic.first_line(r), "- hand (realism): wrong in 3 pictures "
+                                               "before; last: fingers seen")
+        (mark,) = critic.user_faults([{"x": 1, "y": 1, "size": 64, "note": "six fingers"}],
+                                     "hand")
+        once = critic.note_picture({}, "flux-dev", ["partner"], "", [mark], looked=False)
+        (r,) = critic.recurring(once, "", ["partner"])
+        self.assertEqual((r["weight"], r["user"], r["said"]), (3, 1, "six fingers"))
+        self.assertIn("marked by the user", critic.first_line(r))
+        self.assertEqual(once["faults"]["identities"]["partner"]["pictures"], 0)
+
+    def test_a_fault_that_stopped_coming_back_is_unlearned(self):
+        hand = ob("fingers", "MISMATCH", "realism", target="hand")
+        led = {}
+        for n in range(3):
+            led = critic.note_picture(led, "m", ["sitter"], "", [hand])
+        led = critic.note_picture(led, "m", ["sitter"], "", [])
+        self.assertEqual(critic.recurring(led, "m", ["sitter"]), [])
+        for n in range(2):
+            led = critic.note_picture(led, "m", ["sitter"], "", [])
+        self.assertEqual(led["faults"]["identities"]["sitter"],
+                         {"pictures": 6, "kinds": {}})
+        marked = critic.note_picture(led, "m", ["sitter"], "", [], looked=False)
+        self.assertEqual(marked["faults"]["identities"]["sitter"]["pictures"], 6)
+
+    def test_with_two_people_a_fault_is_the_models_not_a_persons(self):
+        led = critic.note_picture({}, "m", ["a", "b"], "", [ob("jaw", "MISMATCH",
+                                                                target="face")])
+        self.assertEqual(sorted(led["faults"]), ["models"])
+        self.assertEqual(critic.note_picture({}, "m", ["a"], "A pier.", []), {})
+
+    def test_only_so_many_kinds_are_kept(self):
+        found = [ob("x", "MISMATCH", "scene", target="thing %d" % i) for i in range(20)]
+        led = critic.note_picture({}, "m", [], "", found)
+        self.assertEqual(len(led["faults"]["models"]["m"]["kinds"]), critic.KINDS_MAX)
+
+    def test_words_against_a_returning_fault_are_only_about_the_person(self):
+        jaw = ob("jaw", "MISMATCH", target="face", correction="a broad square jaw.")
+        hand = ob("fingers", "MISMATCH", "realism", target="hand", correction="five fingers")
+        led = {}
+        for n in range(3):
+            led = critic.note_picture(led, "m", ["sitter"], "", [jaw, hand])
+        self.assertEqual(critic.prevention(led, ["sitter"]),
+                         [("identity/face", "a broad square jaw")])
+        self.assertEqual(critic.prevention(led, ["sitter", "partner"]), [])
+        self.assertEqual(critic.prevention(led, ["partner"]), [])
+
+    def test_what_the_user_marks_on_a_passed_picture_is_a_blind_spot(self):
+        marks = critic.user_faults([{"x": 1, "y": 1, "size": 64, "note": "six fingers"}],
+                                   "hand")
+        made = {"history": [{"type": "initial_generation"}], "scores": []}
+        led = critic.note_blind({}, marks, made)
+        self.assertEqual(critic.blind_checks(led), {"realism": ["six fingers"]})
+        self.assertEqual(critic.note_blind({}, marks, None), {})          # it never looked
+        flagged = dict(made, scores=[{"category": "realism", "target": "hand",
+                                      "outcome": "PERSISTS"}])
+        self.assertEqual(critic.blind_checks(critic.note_blind({}, marks, flagged)), {})
+        fixed = {"history": [{"type": "fix"}], "scores": []}              # it saw only spots
+        self.assertEqual(critic.blind_checks(critic.note_blind({}, marks, fixed)), {})
+        fixed["scores"] = [{"category": "realism", "target": "hand", "outcome": "CLEARED"}]
+        self.assertEqual(critic.blind_checks(critic.note_blind({}, marks, fixed)),
+                         {"realism": ["six fingers"]})
+        bare = critic.user_faults([{"x": 1, "y": 1, "size": 64}], "hand")
+        self.assertEqual(critic.blind_checks(critic.note_blind({}, bare, made)),
+                         {"realism": ["a wrong hand"]})
+
+    def test_the_most_missed_are_the_ones_checked_for(self):
+        made = {"history": [{"type": "initial_generation"}], "scores": []}
+        led = {}
+        for i, times in enumerate((1, 3, 2, 1, 4)):
+            mark = critic.user_faults([{"x": 1, "y": 1, "size": 64, "note": "fault %d" % i}])
+            for n in range(times):
+                led = critic.note_blind(led, mark, made)
+        self.assertEqual(critic.blind_checks(led), {"realism": ["fault 4", "fault 1",
+                                                                "fault 2"]})
+
+    def test_a_fix_tried_again_is_not_one_more_picture_with_the_fault(self):
+        marks = critic.user_faults([{"x": 1, "y": 1, "size": 64, "note": "six fingers"}],
+                                   "hand")
+        led = critic.note_marked({}, "a.png", marks, "m", ["sitter"], "", None)
+        again = critic.note_marked(led, "a.png", marks, "m", ["sitter"], "", None)
+        self.assertEqual(again, led)
+        other = critic.note_marked(led, "b.png", marks, "m", ["sitter"], "", None)
+        kind = other["faults"]["identities"]["sitter"]["kinds"]["realism/hand"]
+        self.assertEqual((kind["seen"], kind["weight"]), (2, 6))
+        self.assertEqual(other["marked"], [["a.png", "realism/hand"],
+                                           ["b.png", "realism/hand"]])
+
+    def test_the_question_says_what_to_look_at_first_and_what_was_missed(self):
+        intent = critic.intent_from({}, "A man waves.")
+        text = critic.critic_prompt(
+            intent, {}, first=[{"kind": "realism/hand", "seen": 4, "user": 1,
+                                "said": "six fingers"}],
+            missed={"realism": ["six fingers", "a wrong hand"]})
+        self.assertIn("WRONG BEFORE in pictures like this one", text)
+        self.assertIn("- hand (realism): wrong in 4 pictures before, marked by the user; "
+                      "last: six fingers", text)
+        self.assertIn("AI textures; missed before: six fingers; a wrong hand", text)
+        self.assertLess(text.index("WRONG BEFORE"), text.index("Look at every category"))
+        self.assertNotIn("missed before", critic.critic_prompt(intent, {}))
+
+
+class LearningTest(TempStudioMixin, unittest.TestCase):
+    """The ledger on disk, through Generate and Fix a spot."""
+    HAND = ob("fingers", "MISMATCH", "realism", target="hand", correction="five fingers")
+    FINE = {"needs_refinement": False, "observations": []}
+
+    def generate(self, answers, client=CriticClient, **extra):
+        self.vision = FakeVision(answers)
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=client, vision=lambda: self.vision)
+        FaceClient.fail_pass = False
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+                                       scene="On a pier.", backend="5090", seed=5,
+                                       auto_refine=True, hand_pass=False, **extra))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        return jobs[0], FaceClient.instances[-1]
+
+    def ledger(self):
+        return ig.load_critic_ledger(self.studio.lib)
+
+    def test_what_a_redraw_did_is_filed_by_model_fault_tool_and_strength(self):
+        self.generate([{"needs_refinement": True, "observations": [self.HAND]},
+                       {"needs_refinement": False, "observations": [], "followups": [
+                           {"id": 1, "outcome": "CLEARED"}]}])
+        led = self.ledger()
+        self.assertEqual(led["fixes"]["flux-dev"]["realism/hand"],
+                         {"LOCAL_INPAINT@0.60": {"tried": 1, "cleared": 1, "worse": 0}})
+        self.assertEqual(led["faults"]["models"]["flux-dev"]["kinds"]["realism/hand"]["seen"], 1)
+        self.assertEqual(led["faults"]["scenes"]["on_a_pier"]["pictures"], 1)
+
+    def test_the_fourth_picture_is_looked_at_for_what_went_wrong_in_three(self):
+        for n in range(3):
+            self.generate([{"needs_refinement": True, "observations": [self.HAND]},
+                           dict(self.FINE, followups=[{"id": 1, "outcome": "CLEARED"}])])
+            self.assertNotIn("WRONG BEFORE", str(self.vision.asked[0]))
+        job, _ = self.generate([self.FINE])
+        self.assertIn("- hand (realism): wrong in 3 pictures before",
+                      self.vision.asked[0][0]["content"][0]["text"])
+        self.assertTrue(any("looked first" in n for n in job.record["notes"]))
+
+    def test_a_redraw_starts_where_the_ledger_says_it_mends(self):
+        jaw = ob("jaw", "MISMATCH", target="face", correction="broader jaw")
+        led = {}
+        for outcome, d in (("PERSISTS", 0.45),) * 3 + (("CLEARED", 0.6),) * 3:
+            led = critic.note_fixes(led, "flux-dev", [scored("jaw", outcome, denoise=d,
+                                                             target="face")])
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append)
+        ig.save_critic_ledger(self.studio.lib, led)
+        job, client = self.generate([{"needs_refinement": True, "observations": [jaw]},
+                                     dict(self.FINE, followups=[{"id": 1,
+                                                                 "outcome": "CLEARED"}])])
+        self.assertEqual(client.graphs[2]["fc1_4"]["inputs"]["denoise"], 0.6)
+        self.assertTrue(any("from the start" in n for n in job.record["notes"]))
+        self.assertEqual(self.ledger()["fixes"]["flux-dev"]["identity/face"]
+                         ["FACE_CORRECTION@0.60"]["tried"], 4)
+
+    def test_a_persons_returning_fault_is_drawn_against_in_their_next_picture(self):
+        jaw = ob("jaw", "MISMATCH", target="face", correction="a broad square jaw")
+        led = {}
+        for n in range(3):
+            led = critic.note_picture(led, "flux-dev", ["sitter"], "", [jaw])
+        ig.save_critic_ledger(self.studio.lib, led)
+        job, client = self.generate([self.FINE], preset="identity", identities=["sitter"])
+        self.assertIn("a broad square jaw", client.graphs[0]["10"]["inputs"]["text"])
+        self.assertTrue(any("Drawn against" in n for n in job.record["notes"]))
+        job, client = self.generate([self.FINE])          # a picture of no one known
+        self.assertNotIn("a broad square jaw", client.graphs[0]["10"]["inputs"]["text"])
+
+    def test_a_mark_on_a_picture_the_critic_passed_goes_into_its_checks(self):
+        made, _ = self.generate([self.FINE])
+        src = made.record["images"][0]
+        s = self.studio.fix_base(made.record["settings"])
+        s.update(mode="fix", seed=5, fix={"image": src, "target": "hand", "spots": [
+            {"x": 1, "y": 1, "size": 64, "note": "six fingers"}]})
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        led = self.ledger()
+        self.assertEqual(critic.blind_checks(led), {"realism": ["six fingers"]})
+        self.assertEqual(led["faults"]["models"]["flux-dev"]["kinds"]["realism/hand"]["user"], 1)
+        self.generate([self.FINE])
+        text = self.vision.asked[0][0]["content"][0]["text"]
+        self.assertIn("missed before: six fingers", text)
+        self.assertIn("- hand (realism): wrong in 1 picture before, marked by the user", text)
+
+    def test_a_checked_fix_files_what_its_redraws_did(self):
+        self.vision = FakeVision([{"observations": [], "followups": [
+            {"id": 1, "outcome": "PERSISTS", "correction": "five fingers"}]},
+            {"observations": [], "followups": [{"id": 1, "outcome": "CLEARED"}]}])
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=FaceClient, vision=lambda: self.vision)
+        src = os.path.join(self.dir, "made.png")
+        with open(src, "wb") as f:
+            f.write(ig.oval_png(256))
+        s = self.studio.fix_base(dict(ig.default_settings(), model="flux-dev",
+                                      scene="On a pier.", backend="5090"))
+        s.update(mode="fix", seed=5, fix={"image": src, "target": "hand", "check": True,
+                                          "strength": "light", "spots": [
+                                              {"x": 60, "y": 60, "size": 64}]})
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        self.assertEqual(self.ledger()["fixes"]["flux-dev"]["realism/hand"], {
+            "FIX@0.45": {"tried": 1, "cleared": 0, "worse": 0},
+            "FIX@0.60": {"tried": 1, "cleared": 1, "worse": 0}})
+        self.assertEqual(critic.blind_checks(self.ledger()), {})   # no record: never looked
+
+
 class MemoryTest(unittest.TestCase):
     def test_a_person_is_remembered_by_identity_and_a_scene_by_its_words(self):
         state = {"characters": {"character_a": {"jacket": "green wool jacket"}},

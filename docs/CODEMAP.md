@@ -77,6 +77,9 @@ After Effects and Resolve use outside npm servers.
 - **Critic** - `apps/image_studio/critic.py` (`analyze_generated_image`,
   `plan_next_refinement`; the faults: `user_faults`, `score_fixes`, `carry`, `harder`),
   run by `Studio._refine` - after Generate, and after a fix with `fix["check"]`.
+  Its ledger (`critic_ledger.json`: `note_fixes`, `note_picture`, `note_marked`; read
+  back by `start_denoise`, `recurring`, `prevention`, `blind_checks`) is written by
+  `Studio._learn` and read in `_refine` and `compose`.
 - **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`, `tools/`.
   Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
   (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
