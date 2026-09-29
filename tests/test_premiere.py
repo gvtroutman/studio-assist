@@ -29,6 +29,7 @@ class FakePanel:
 
     def __init__(self, answer="null", status=200, delay=0.0):
         self.answer, self.status, self.delay = answer, status, delay
+        self.body = None                    # bytes: sent as they are instead of {"result": answer}
         self.scripts = []
         panel = self
 
@@ -55,6 +56,11 @@ class FakePanel:
                 time.sleep(panel.delay)
                 if panel.status != 200:
                     return self._reply(panel.status, {"error": "boom"})
+                if panel.body is not None:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(panel.body)))
+                    self.end_headers()
+                    return self.wfile.write(panel.body)
                 self._reply(200, {"result": panel.answer})
 
         class Server(http.server.HTTPServer):
@@ -189,6 +195,22 @@ class TestTransport(unittest.TestCase):
         with self.assertRaises(studio_cep.CepError) as ctx:
             self.host(panel).run("return 1")
         self.assertIn("HTTP 500", str(ctx.exception))
+
+    def test_something_else_on_the_port_is_a_sentence_not_a_json_traceback(self):
+        # Another program on the panel's port answers 200 with its own page,
+        # or JSON of its own shape; either used to escape as a bare
+        # JSONDecodeError / AttributeError instead of a CepError.
+        panel = FakePanel()
+        self.addCleanup(panel.close)
+        panel.body = b"<html>not the bridge</html>"
+        with self.assertRaises(studio_cep.CepError) as ctx:
+            self.host(panel).run("return 1")
+        self.assertIn("not JSON", str(ctx.exception))
+        self.assertIn("<html>", str(ctx.exception))
+        panel.body = b'{"result": 5}'
+        with self.assertRaises(studio_cep.CepError) as ctx:
+            self.host(panel).run("return 1")
+        self.assertIn("unexpected", str(ctx.exception))
 
     def test_a_silent_panel_is_a_dialog_not_a_hang(self):
         panel = FakePanel(answer="1", delay=1.5)
