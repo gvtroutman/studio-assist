@@ -2005,10 +2005,15 @@ class TestGui(unittest.TestCase):
         # Two rows whatever the registry grows to: the shared host, and every
         # bridge behind one entry. The per-bridge detail is in its menu.
         self.assertEqual(set(self.app.conn), {"host", "bridges"})
+        # Each row shows only its name and menu arrow: the status mark and the
+        # detail lines are kept current but not shown.
         for key, (lead, lbl) in self.app.conn.items():
             with self.subTest(row=key):
-                self.assertTrue(lbl.winfo_ismapped())
-                self.assertLessEqual(self._bottom_of(lbl), win_h)
+                box = lbl.master
+                self.assertTrue(box.winfo_ismapped())
+                self.assertLessEqual(self._bottom_of(box), win_h)
+                self.assertFalse(lead.winfo_ismapped(), "no dot or arc")
+                self.assertFalse(lbl.winfo_ismapped(), "no address or detail")
 
     def test_the_bridges_row_counts_every_bridge_chats_included(self):
         """The chat tab's bridge runs in process, but it is a bridge with
