@@ -864,6 +864,19 @@ class TestRoom(unittest.TestCase):
         s["room"]["walls"] = True
         self.assertIn("The walls: whitewashed brick.", sc.scene_text(s).text)
 
+    def test_a_shaped_floor_is_said_in_words_not_only_drawn(self):
+        # The words are the only thing this pipeline sends of the ground, so
+        # a preset picked in the Scene Builder has to reach the prompt too -
+        # not only the preview's geometry - or "make it a hill" draws a plane.
+        s = staged()
+        self.assertEqual(sc.scene_text(s).text.count("ground"), 0)   # flat: unsaid
+        s["room"]["grid"] = sc.FLOOR_PRESET["hill"]
+        self.assertIn("the ground rises into a hill.", sc.scene_text(s).text)
+        s["room"]["grid"] = sc.FLOOR_PRESET["bowl"]
+        self.assertIn("shallow bowl", sc.scene_text(s).text)
+        s["room"]["grid"] = [[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+        self.assertIn("the ground is uneven, not flat.", sc.scene_text(s).text)
+
     def test_the_grid_stays_inside_the_walls(self):
         s = staged()
         s["room"].update(walls=True, width=4.0, depth=4.0)
