@@ -34,8 +34,13 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 ## core/ (every tab)
 | File | Lines | What it is | Start at |
 | --- | --- | --- | --- |
-| `core/chat.py` | 5.3k | The Tkinter window: tabs, chat, approval cards | `Chat`, `_drain`/`_handle`/`_report`, `_elicit`/`_show_elicit`/`_diff_box`/`_settle_elicit` |
-| `core/agent.py` | 3.7k | Engine: app registry, LLM client, MCP client, prompts, CLI | `APPS`, `AppSpec`, `ServerSpec`, `LLM`, `MCPClient`, `Router`, `*_PROMPT` |
+| `core/chat.py` | 6.6k | The Tkinter window: tabs, chat, approval cards | `Chat`, `_drain`/`_handle`/`_report`, `_elicit`/`_show_elicit`/`_diff_box`/`_settle_elicit` |
+| `core/agent.py` | 1.9k | Engine core: app registry, LLM client, GPU/model fit, OpenCode plumbing. Re-exports the split-out files below, so `core.agent.X` still finds everything | `APPS`, `AppSpec`, `ServerSpec`, `LLM`, `fit_model`, `make_room` |
+| `core/agent_mcp_client.py` | 0.4k | MCP stdio transport: the JSON-RPC client every bridge is built on | `MCPClient`, `sanitize_schema`, `to_openai_tools`, `HostUnreachable` |
+| `core/agent_prompts.py` | 0.7k | Every app's system prompt, and the shared rule blocks - pure string data | `*_PROMPT`, `BASE_RULES`, `CHAT_RULES` |
+| `core/agent_studio_brief.py` | 0.1k | The studio brief (About this studio...) and the research sidecar (files/web, read-only) | `studio_brief_path`, `read_studio_brief`, `Router`, `research_client` |
+| `core/agent_bridges.py` | 0.3k | Bridges entered by hand (`BridgeSpec`) and detecting what apps are installed | `add_bridge`, `remove_bridge`, `detect_apps`, `BridgeSpec` |
+| `core/agent_cli.py` | 0.4k | The console-mode CLI: elicitation at a terminal, one turn, the interactive REPL, argparse | `main`, `converse`, `run_agent`, `ask_at_terminal` |
 | `core/mcp.py` | 1.2k | MCP harness every bridge is built on | `Server`, `tools_from_table`, `elicit`, `Declined`, `progress`, `cancelled`, `Loopback` |
 | `core/tasks.py` | 0.9k | Task execution and recoverable task records | |
 | `core/lessons.py` | 0.5k | What the model learns after each task, per app; `trouble_in`/`self_review` for the trainer's cross-task check | |
