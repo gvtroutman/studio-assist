@@ -2178,8 +2178,13 @@ class TestLibrary(unittest.TestCase):
         cam = ig.clean_camera_profile({"name": "Leica M6", "chemistry": "Warm tones.",
                                        "lens": "35", "image": "", "notes": 7})
         self.assertEqual(cam, {"id": "leica-m6", "name": "Leica M6",
-                               "chemistry": "Warm tones.", "lens": 35.0, "image": "",
-                               "notes": ""})
+                               "chemistry": "Warm tones.", "lens": 35.0, "format": "3:2",
+                               "image": "", "notes": ""})
+        # A camera's format is 1:1 or 3:2 or nothing; a starter camera saved
+        # before formats existed takes its own.
+        self.assertEqual(ig.clean_camera_profile({"name": "Mine", "format": "3x2"})["format"], "3:2")
+        self.assertEqual(ig.clean_camera_profile({"name": "Mine", "format": "16:9"})["format"], "")
+        self.assertEqual(ig.clean_camera_profile({"name": "Mine"})["format"], "")
         self.assertIsNone(ig.clean_camera_profile({"name": "No lens"})["lens"])
         # A lens out of the camera's own sane range is clamped, like a style's.
         self.assertEqual(ig.clean_camera_profile({"name": "Wild", "lens": 5000})["lens"], 300)

@@ -864,6 +864,20 @@ class TestRoom(unittest.TestCase):
         s["room"]["walls"] = True
         self.assertIn("The walls: whitewashed brick.", sc.scene_text(s).text)
 
+    def test_only_what_the_viewfinder_shows_of_the_room_is_described(self):
+        s = staged()
+        s["room"].update(walls=True, width=40.0, depth=40.0)
+        s["room"]["floor"]["prompt"] = "wet cobbles"
+        s["room"]["wall"]["prompt"] = "whitewashed brick"
+        self.assertEqual(sc.room_seen(s), {"floor", "wall"})
+        s["camera"]["pitch"] = 80                       # straight down: floor alone
+        self.assertEqual(sc.room_seen(s), {"floor"})
+        words = sc.scene_text(s)
+        self.assertIn("The floor: wet cobbles.", words.text)
+        self.assertNotIn("brick", words.text)
+        self.assertIn("The walls are outside the viewfinder, so the words leave them out.",
+                      words.notes)
+
     def test_a_shaped_floor_is_said_in_words_not_only_drawn(self):
         # The words are the only thing this pipeline sends of the ground, so
         # a preset picked in the Scene Builder has to reach the prompt too -
@@ -1318,6 +1332,17 @@ class TestWords(unittest.TestCase):
         s["camera"]["chemistry"] = ""
         self.assertEqual(sc.camera_words(s),
                          "Shot from a high angle looking down on a 24mm wide-angle lens")
+
+    def test_a_camera_whose_words_skip_its_name_is_still_named(self):
+        s = staged()
+        s["camera"].update(pitch=45, lens=24, body="Pentax 67", chemistry="Warm tones.")
+        self.assertEqual(sc.camera_words(s),
+                         "Shot from a high angle looking down on a 24mm wide-angle lens. "
+                         "Shot on a Pentax 67. Warm tones.")
+        s["camera"]["chemistry"] = "Shot on a Pentax 67 with Portra."   # not said twice
+        self.assertEqual(sc.camera_words(s).count("Pentax"), 1)
+        self.assertEqual(sc.clean_scene(json.loads(json.dumps(s)))[0]["camera"]["body"],
+                         "Pentax 67")
 
     def test_each_person_says_their_own_look(self):
         s = staged("person", "person", "box")
@@ -1848,7 +1873,7 @@ class TestSceneFromPicture(unittest.TestCase):
 
     def test_the_frame_is_the_photos_shape(self):
         self.assertEqual(sc.picture_frame(1100, 1000), "square")
-        self.assertEqual(sc.picture_frame(4000, 3000), "landscape")     # 4:3 is nearer 7:4
+        self.assertEqual(sc.picture_frame(4000, 3000), "landscape_3x2")  # 4:3 is nearest 3:2
         self.assertEqual(sc.picture_frame(3000, 4000), "portrait")
         self.assertEqual(sc.picture_frame(1920, 1080), "landscape")
 
@@ -2070,6 +2095,37 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb._set_camera_profile("none")
         self.assertEqual((cam["profile"], cam["chemistry"]), ("none", ""))
         self.assertEqual(cam["lens"], 35.0)
+
+    def test_the_frame_is_the_camera_bodys_shape(self):
+        ui, sb = self.builder()
+        self.assertEqual(sb.scene["frame"], "portrait")
+        sb._set_camera_profile("leica-m6")                  # 3:2, still held upright
+        self.assertEqual(sb.scene["frame"], "portrait_2x3")
+        sb._set_camera_profile("sx-70")                     # square
+        self.assertEqual(sb.scene["frame"], "square")
+        sb._set_camera_profile("digital-5d")                # 3:2 from square: landscape
+        self.assertEqual(sb.scene["frame"], "landscape_3x2")
+        sb._set_camera_profile("none")                      # no camera: the frame stays
+        self.assertEqual(sb.scene["frame"], "landscape_3x2")
+        self.assertEqual(sc.camera_frame("1:1", "landscape"), "square")
+        self.assertEqual(sc.camera_frame("", "landscape"), "landscape")
+        s = staged()
+        s["camera"]["format"], s["frame"] = "3:2", "landscape"   # a file edited by hand
+        self.assertEqual(sc.clean_scene(s)[0]["frame"], "landscape_3x2")
+
+    def test_the_form_says_what_the_scene_is_shot_on(self):
+        ui, sb = self.builder()
+        self.assertIn("no camera set", ui.shot_on.cget("text"))
+        sb._set_camera_profile("leica-m6")
+        self.assertEqual(ui.shot_on.cget("text"),
+                         "Shot on Leica M6 · 35mm · 832 x 1216 (Scene Builder)")
+        self.assertEqual(sb.scene["camera"]["body"], "Leica M6")
+        sb.scene["camera"]["body"] = ""                 # a scene saved before the name was kept
+        self.assertEqual(sb.camera_body(), "Leica M6")
+        sb.close(final=True, confirmed=True)
+        self.assertIn("no scene open", ui.shot_on.cget("text"))
+        sb = ui.choose_scene_camera()
+        self.assertEqual(sb.inspector_section, "Camera")
 
     def test_the_builder_goes_with_its_form(self):
         """It writes into the Image Studio's form, so closing the tab closes

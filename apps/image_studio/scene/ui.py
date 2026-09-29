@@ -596,8 +596,10 @@ class SceneBuilder:
         o, p, s = self.owner, self.panel, self.scene
         cam = s["camera"]
         o.cap(p, "Frame")
-        o.choice(p, [(k, label) for k, label, _, _ in sc.FRAMES], s["frame"],
-                 self._set_frame).pack(side="top", anchor="w")
+        # Only the frames the camera body shoots (all of them with none set).
+        fits = sc.FORMAT_FRAMES.get(cam.get("format"))
+        o.choice(p, [(k, label) for k, label, _, _ in sc.FRAMES if not fits or k in fits],
+                 s["frame"], self._set_frame).pack(side="top", anchor="w")
 
         o.cap(p, "Camera body")
         o.label(p, "The camera this scene is shot on. Its chemistry - film stock or "
@@ -682,12 +684,15 @@ class SceneBuilder:
         cam = self.scene["camera"]
         cp = self.owner.studio.lib.get("camera_profiles", cid) if cid else None
         cam["profile"] = cp["id"] if cp else ""
+        cam["body"] = cp["name"] if cp and cp["id"] != "none" else ""
+        cam["format"] = (cp.get("format") or "") if cp else ""
         cam["chemistry"] = cp["chemistry"] if cp else ""
         if cp and cp["lens"]:
             cam["lens"] = float(cp["lens"])
-        for tid, tile in self.camera_tiles.items():
-            self.owner.skin(tile, bg="bg", highlightbackground="accent" if tid == cam["profile"]
-                            else "border")
+        # The viewfinder is the camera's: a square camera shoots square, a
+        # 35mm one 3:2, held the way the frame already was.
+        self.scene["frame"] = sc.camera_frame(cam["format"], self.scene["frame"])
+        self._inspect()               # the tiles' highlight and the frames it offers
         self.sync()
         self.changed()
 
@@ -1742,7 +1747,7 @@ class SceneBuilder:
 
     def _words_box(self):
         o = self.owner
-        o.cap(self.panel, "Words sent with the frame")
+        o.cap(self.panel, "Words sent with the viewfinder")
         box = o.frame(self.panel, "card")
         box.pack(side="top", fill="x", pady=(0, o.px(12)))
         self.words_label = o.label(box, "", "text", self.host.f_small, bg="card",
@@ -1752,6 +1757,7 @@ class SceneBuilder:
 
     def _words(self):
         self._title()
+        self.owner.show_shot_on()
         if not getattr(self, "words_label", None):
             return
         try:
@@ -1978,8 +1984,12 @@ class SceneBuilder:
         for box in ((0, 0, cw, y0), (0, y1, cw, ch), (0, y0, x0, y1), (x1, y0, cw, y1)):
             c.create_rectangle(*box, fill=C["bg"], outline="", stipple="gray50")
         c.create_rectangle(x0, y0, x1, y1, outline=C["accent"], width=2)
+        # The lit rectangle is the viewfinder: what is in it is what the
+        # picture is shown (the maps) and told (the words), nothing outside.
         c.create_text(x0 + 6, y0 - 4, anchor="sw", fill=C["muted"], font=self.host.f_small,
-                      text="Frame %d x %d · %dmm" % (w, h, round(self.scene["camera"]["lens"])))
+                      text="Viewfinder · %s · %dmm · %d x %d" % (
+                          self.camera_body() or "no camera set",
+                          round(self.scene["camera"]["lens"]), w, h))
         if self.ring and self.obj(self.ring["oid"]) is not None:
             self._draw_ring()
         self._draw_shape()
@@ -2062,6 +2072,16 @@ class SceneBuilder:
     def camera(self):
         w, h = sc.frame_size(self.scene)
         return sc.Camera(self.scene["camera"], w, h)
+
+    def camera_body(self):
+        """The name of the camera this scene is shot on, or '' for none. A
+        scene saved before the name was kept finds it by its profile id."""
+        cam = self.scene["camera"]
+        if cam.get("body"):
+            return cam["body"]
+        pid = cam.get("profile")
+        cp = self.owner.studio.lib.get("camera_profiles", pid) if pid and pid != "none" else None
+        return cp["name"] if cp else ""
 
     def hit(self, x, y):
         """-> (object id, part) under canvas point (x, y), or (None, None)."""
@@ -2526,6 +2546,7 @@ class SceneBuilder:
         self.win.destroy()
         if self.owner.scene_builder is self:
             self.owner.scene_builder = None
+            self.owner.show_shot_on()
         return True
 
     def has_content(self):

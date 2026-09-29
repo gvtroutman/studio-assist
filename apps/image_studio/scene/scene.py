@@ -100,8 +100,25 @@ FRAMES = [
     ("square", "Square 1024 x 1024", 1024, 1024),
     ("portrait", "Portrait 896 x 1152", 896, 1152),
     ("landscape", "Landscape 1344 x 768", 1344, 768),
+    ("landscape_3x2", "3:2 landscape 1216 x 832", 1216, 832),
+    ("portrait_2x3", "3:2 portrait 832 x 1216", 832, 1216),
 ]
 FRAME_SIZES = {k: (w, h) for k, _, w, h in FRAMES}
+# A camera's format (`imagegen.CAMERA_FORMATS`) -> the frames it shoots,
+# the way it is usually held first.
+FORMAT_FRAMES = {"1:1": ("square",), "3:2": ("landscape_3x2", "portrait_2x3")}
+
+
+def camera_frame(fmt, current):
+    """The frame a camera of format `fmt` shoots, held the way `current`
+    is (a portrait frame stays upright): `current` itself when it already
+    fits, or when the camera has no format."""
+    frames = FORMAT_FRAMES.get(fmt)
+    if not frames or current in frames:
+        return current
+    w, h = FRAME_SIZES.get(current, FRAME_SIZES["portrait"])
+    upright = [k for k in frames if FRAME_SIZES[k][1] > FRAME_SIZES[k][0]]
+    return upright[0] if h > w and upright else frames[0]
 LENSES = (24, 35, 50, 85)
 # What the picture is made from (`scene_maps`), each 0 for off: the pose map's
 # and the depth map's ControlNet strengths, and how much of the grey frame
@@ -2032,7 +2049,8 @@ def new_scene(details=""):
             "real_faces": REAL_FACES,
             "regional_prompting": REGIONAL_PROMPTING,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
-                       "distance": 4.2, "lens": 35.0, "profile": "", "chemistry": ""},
+                       "distance": 4.2, "lens": 35.0, "profile": "", "body": "",
+                       "format": "", "chemistry": ""},
             "room": new_room(), "objects": [], "enrich": new_enrich()}
 
 
@@ -2222,7 +2240,10 @@ def clean_scene(d):
     # scene still says the same thing after the library entry changes or is
     # deleted (`apps.image_studio.scene.ui._set_camera_profile`).
     c["profile"] = str(cam.get("profile") or "")
+    c["body"] = str(cam.get("body") or "")          # its name, for "Shot on" in the form
+    c["format"] = cam.get("format") if cam.get("format") in FORMAT_FRAMES else ""
     c["chemistry"] = str(cam.get("chemistry") or "")
+    s["frame"] = camera_frame(c["format"], s["frame"])    # the frame is the camera's
     room = d.get("room") if isinstance(d.get("room"), dict) else {}
     r = s["room"]
     r["walls"] = room.get("walls") is True
@@ -4203,7 +4224,26 @@ def camera_words(scene):
         angle = "eye level"
     words = "Shot from %s on a %dmm %slens" % (angle, lens, kind)
     chemistry = (c.get("chemistry") or "").strip()
+    body = (c.get("body") or "").strip()
+    if body and body.lower() not in chemistry.lower():   # a camera whose words skip its name
+        chemistry = ("Shot on a %s. %s" % (body, chemistry)).strip()
     return words + ". " + chemistry if chemistry else words
+
+
+def in_frame(pts, w, h):
+    """Whether screen points' box overlaps the w x h frame."""
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return bool(pts) and max(xs) > 0 and min(xs) < w and max(ys) > 0 and min(ys) < h
+
+
+def room_seen(scene):
+    """The room's surfaces the viewfinder shows: a subset of {"floor",
+    "wall"}. Only these are described - a wall behind the camera, or a floor
+    under a camera looking up at the sky, is not in the picture."""
+    w, h = frame_size(scene)
+    cam = Camera(scene["camera"], w, h)
+    return {"wall" if p.part == "wall" else "floor"
+            for p in room_polys(scene, cam) if in_frame(p.pts, w, h)}
 
 
 def _join_parts(parts):
@@ -4222,11 +4262,18 @@ def _scene_parts(scene):
     if details:
         parts.append((None, details.rstrip()))
     room = scene.get("room") or new_room()
+    seen = room_seen(scene)
     for key, label, _ in SURFACES:
         words = room[key]["prompt"].strip()
-        if words and (key == "floor" or room["walls"]):
-            parts.append((None, "The %s: %s" % (label.lower(), words)))
-    shape = floor_shape_words(room.get("grid"))
+        if not words or (key == "wall" and not room["walls"]):
+            continue
+        if key not in seen:
+            out.notes.append("The %s %s outside the viewfinder, so the words leave %s out."
+                             % ((label.lower(), "are", "them") if key == "wall"
+                                else (label.lower(), "is", "it")))
+            continue
+        parts.append((None, "The %s: %s" % (label.lower(), words)))
+    shape = floor_shape_words(room.get("grid")) if "floor" in seen else ""
     if shape:
         parts.append((None, shape))
     for obj in scene["objects"]:

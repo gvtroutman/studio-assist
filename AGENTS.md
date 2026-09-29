@@ -1708,7 +1708,21 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   rectangle is `render()` at the generation size, the same polygon list `png()`
   rasterises, so what is inside it is exactly the reference. Outside it is dimmed
   context. The metre grid and the selection outline are the window's only: the picture
-  must not be told the floor is tiled.
+  must not be told the floor is tiled. The rectangle is labelled the **viewfinder**
+  with the camera body, lens and size, and it is also what is described: an object
+  outside it is left out of the words (below), and so are walls or a floor it does not
+  show (`room_seen`), with a note saying so.
+- **The camera body sets the frame and is named in the form.** A camera profile has a
+  `format` ("1:1" or "3:2", `imagegen.CAMERA_FORMATS`; starter cameras saved before it
+  take `DEFAULT_CAMERA_FORMATS` by id). Choosing it bakes `profile`, `body` (its name),
+  `format` and `chemistry` into `scene["camera"]` and moves the frame to one that
+  camera shoots (`camera_frame`: kept upright if it was; `FORMAT_FRAMES`, the 3:2 frames
+  are 1216 x 832 / 832 x 1216); the Frame choice then offers only those, and
+  `clean_scene` holds a saved scene to it. `camera_words` says "Shot on a <body>" when
+  the chemistry does not already name it. The Image Studio form's **Shot on** line,
+  under Scene Builder…, shows the open builder's body, lens and frame
+  (`ImageStudio.shot_on_text`, refreshed from `SceneBuilder._words`); a click opens the
+  builder on its Camera section.
 - **Descriptions are sent as written.** `scene_text()` adds only what the words cannot
   know - where each object is in the frame, which way a person faces, a non-standing
   pose - in parentheses before the user's text (and a person's look between the two),
