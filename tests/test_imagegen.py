@@ -1484,6 +1484,40 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertTrue(any("Sitter's face was not found" in n for n in rec["notes"]))
         self.assertTrue(any("Likeness: Partner" in n for n in rec["notes"]), rec["notes"])
 
+    def test_a_face_facefusion_will_swap_is_not_also_drawn_with_pulid(self):
+        from unittest.mock import patch
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=PulidClient)
+        FaceClient.fail_pass = False
+        face = os.path.join(self.dir, "partner.png")
+        with open(face, "wb") as f:
+            f.write(PNG)
+        self.studio.lib.save("identities", [
+            {"id": "partner", "name": "Partner", "trigger": "PARTNERPERSON", "strength": 0.8,
+             "references": [face]}])
+        scene_faces = dict(self.scene_faces(face))
+        scene_faces["people"] = [dict(scene_faces["people"][0], identity="partner"),
+                                 scene_faces["people"][1]]
+        with patch("apps.image_studio.facefusion.available", return_value=True), \
+                patch("apps.image_studio.facefusion.swap",
+                     return_value=(PNG, {"outside_mask_changed_pixels": 0})):
+            jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                           backend="5090", seed=5, face_detail=True,
+                                           hand_pass=False, scene_faces=scene_faces))
+            settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        client = PulidClient.instances[-1]
+        second = client.graphs[1]           # the face pass, before FaceFusion's own swap
+        # Partner is about to be swapped by FaceFusion, so the face pass leaves
+        # her crop to the words - no PuLID photo redraw wasted on a face
+        # that gets fully overwritten a moment later.
+        self.assertNotIn("fc1_r", second)
+        self.assertNotIn("pl1", second)
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["face_detail"]["likeness"], [])
+        self.assertFalse(any("Likeness: Partner" in n for n in rec["notes"]), rec["notes"])
+        self.assertTrue(any("FaceFusion applied" in n for n in rec["notes"]), rec["notes"])
+
     def test_a_characters_face_photos_draw_the_forms_person(self):
         """The plain form: the character's photos are its one person's face -
         in the picture itself over the whole frame, on the biggest face in
