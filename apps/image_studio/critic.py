@@ -20,6 +20,14 @@ redrew, each with a number. The next look says what became of each
 same way again, one that was tried `MAX_TRIES` times is left to the user, and
 a redraw that made things worse is taken back. The user's own notes on a
 picture (Fix a spot) are faults too (`user_faults`): certain, never guessed.
+
+What outlives the job, beside the memory of good details, is the **ledger**
+(`note_fixes`, `note_picture`, `note_blind`): which redraw mended which kind of
+fault on which model, which faults keep coming back for a person, a scene or
+a model, and what the user marked that the critic had passed. The next
+picture starts from it: the redraw's strength (`start_denoise`), what the
+critic looks at first (`recurring`), words against a person's returning
+faults (`prevention`), and the critic's own checklist (`blind_checks`).
 """
 
 import base64
@@ -38,6 +46,18 @@ MAX_PASSES = 3
 MAX_TRIES = 2                 # redraws of one fault; still wrong after them, it is the user's
 HARDER = 0.15                 # denoise added for each redraw that left the fault there
 CLOSEUPS = 3                  # marked spots shown to the critic large, beside the picture
+# The ledger. The critic is a small model and misreads, so what it found
+# counts once and must repeat; what the user marked is believed at once.
+LEDGER_MIN = 3                # tries before a strength's record is believed
+MENDS = 0.5                   # cleared of tried, from which a strength is one that works
+USER_WEIGHT = 3               # a fault the user marked weighs this many of the critic's
+RECUR = 3                     # the weight from which a fault is one that keeps coming back
+WEIGHT_TOP = 9                # so a few good pictures unlearn an old fault
+KINDS_MAX = 12                # kinds of fault kept for one person, scene or model
+BLIND_MAX = 3                 # missed things added to one category's checks
+BLIND_KEPT = 8                # ... of those kept
+MARKED_KEPT = 60              # pictures' marks remembered, so a retried fix is not a new fault
+PERSON_BOUND = ("identity", "body", "clothing")   # faults words about the person can prevent
 MIN_CONFIDENCE = 0.6          # below this a mismatch is noted, never corrected
 PROMOTE_CONFIDENCE = 0.75     # and below this an invented detail is not kept
 # What one picture costs the vision model at most: LM Studio scales a large
@@ -78,7 +98,7 @@ WHAT WAS ASKED (the user's request, the source of truth):
 
 WHAT IS KNOWN ABOUT THE PICTURE:
 %(canonical)s
-
+%(first)s
 Look at every category and check:
 %(checks)s
 
@@ -197,9 +217,18 @@ def _canonical_text(state):
     return "\n".join(lines) or "(nothing beyond the request)"
 
 
-def critic_prompt(intent, canonical, faults=(), closeups=()):
+FIRST_PROMPT = """
+WRONG BEFORE in pictures like this one. Look at these first, and closely:
+%s
+"""
+
+
+def critic_prompt(intent, canonical, faults=(), closeups=(), first=(), missed=None):
     """The question. `faults` are what the last pass redrew, asked after by
-    number; `closeups` the numbers of those whose close-up is sent too."""
+    number; `closeups` the numbers of those whose close-up is sent too.
+    From the ledger: `first` the faults that keep coming back (`recurring`),
+    `missed` what the user marked that a look had passed, by category
+    (`blind_checks`), added to that category's checks."""
     pictures = REFERENCES
     if closeups:
         one = len(closeups) == 1
@@ -210,7 +239,9 @@ def critic_prompt(intent, canonical, faults=(), closeups=()):
         "pictures": pictures,
         "intent": intent["prompt"] or intent["scene"] or "(no words given)",
         "canonical": _canonical_text(canonical),
-        "checks": "\n".join("- %s: %s" % (k, v) for k, v in CHECKS.items()),
+        "first": FIRST_PROMPT % "\n".join(first_line(r) for r in first) if first else "",
+        "checks": "\n".join("- %s: %s%s" % (k, v, "; missed before: " + "; ".join(
+            (missed or {})[k]) if (missed or {}).get(k) else "") for k, v in CHECKS.items()),
         "categories": "|".join(CATEGORIES)}
     if faults:
         text += FOLLOWUP_PROMPT % {"faults": "\n".join(
@@ -290,7 +321,8 @@ def clean_result(raw):
 
 
 def analyze_generated_image(vision, generated_image, original_intent, canonical_state,
-                            reference_images=(), max_tokens=3000, faults=(), closeups=()):
+                            reference_images=(), max_tokens=3000, faults=(), closeups=(),
+                            first=(), missed=None):
     """The Visual Critic. `vision` is a studio_agent.Vision; `generated_image`
     the picture's PNG bytes; `reference_images` paths of pictures of the
     people (the first two are sent). `faults` are what the last pass redrew,
@@ -301,7 +333,7 @@ def analyze_generated_image(vision, generated_image, original_intent, canonical_
     gave no usable JSON."""
     closeups = list(closeups)[:CLOSEUPS]
     content = [{"type": "text", "text": critic_prompt(
-        original_intent, canonical_state, faults, [i for i, _ in closeups])},
+        original_intent, canonical_state, faults, [i for i, _ in closeups], first, missed)},
         _image_part(vision, generated_image, "image/png")]
     for _, raw in closeups:
         content.append(_image_part(vision, raw, "image/png"))
@@ -523,8 +555,205 @@ def score_lines(scored):
 def score_records(scored):
     """The scores as the record keeps them: what a later picture learns from."""
     return [{k: f.get(k) for k in ("id", "feature", "category", "target", "source",
-                                   "tries", "outcome", "observation", "spot")
+                                   "tries", "outcome", "observation", "spot",
+                                   "action", "denoise")
              if f.get(k) is not None} for f in scored]
+
+
+# ================================================================ the ledger
+# What the scores add up to, kept across jobs. {"fixes": {model: {kind:
+# {"ACTION@denoise": {"tried", "cleared", "worse"}}}}, "faults": {"models" |
+# "identities" | "scenes": {name: {"pictures": n, "kinds": {kind: {"weight",
+# "seen", "user", "fix", "said"}}}}}, "blind": {category: {key: {"text",
+# "count"}}}}. Every function here returns a changed copy; the caller reads
+# and writes the file. Nothing grows without bound: a kind is a category and
+# a target, not the critic's wording, and each list is capped.
+
+def fault_kind(o):
+    """What sort of fault, in a name that is the same from picture to
+    picture: "realism/hand", "identity/face", "scene/whole"."""
+    return "%s/%s" % (o.get("category") or "realism", _key(o.get("target") or "") or "whole")
+
+
+def _scopes(model, identity_ids, scene):
+    ids = list(identity_ids or ())
+    return ([("models", model)] if model else []) + (
+        [("identities", ids[0])] if len(ids) == 1 else []) + (
+        [("scenes", _key(scene))] if _key(scene) else [])
+
+
+def note_fixes(ledger, model, scored):
+    """`ledger` with each scored redraw filed under its model, kind of
+    fault, tool and strength. UNKNOWN files nothing: it is not evidence."""
+    ledger = copy.deepcopy(ledger or {})
+    for f in scored:
+        if f.get("outcome") not in ("CLEARED", "PERSISTS", "WORSE") or not f.get("action"):
+            continue
+        rec = (ledger.setdefault("fixes", {}).setdefault(model or "?", {})
+               .setdefault(fault_kind(f), {})
+               .setdefault("%s@%.2f" % (f["action"], float(f.get("denoise") or 0)),
+                           {"tried": 0, "cleared": 0, "worse": 0}))
+        rec["tried"] += 1
+        rec["cleared"] += f["outcome"] == "CLEARED"
+        rec["worse"] += f["outcome"] == "WORSE"
+    return ledger
+
+
+def start_denoise(ledger, model, kind, action, default, top):
+    """The strength a redraw of this kind starts at on this model: `default`,
+    unless its own record says it seldom mends (under MENDS of at least
+    LEDGER_MIN tries) and a harder one's, no higher than `top`, says it does.
+    -> (denoise, why) - why "" when it is the default."""
+    known = {}
+    for key, r in (((ledger or {}).get("fixes") or {}).get(model) or {}).get(kind, {}).items():
+        a, _, d = key.partition("@")
+        try:
+            if a == action and r["tried"] >= LEDGER_MIN:
+                known[float(d)] = r
+        except (KeyError, TypeError, ValueError):
+            continue
+    mine = known.get(round(default, 2))
+    if mine is None or mine["cleared"] >= MENDS * mine["tried"]:
+        return default, ""
+    works = [d for d, r in known.items()
+             if default < d <= top and r["cleared"] >= MENDS * r["tried"]]
+    if not works:
+        return default, ""
+    d = min(works)
+    return d, "%s mended %d of %d before, %s %d of %d" % (
+        default, mine["cleared"], mine["tried"], d, known[d]["cleared"], known[d]["tried"])
+
+
+def note_picture(ledger, model, identity_ids, scene, found, looked=True):
+    """`ledger` with one picture's faults filed for its model, its person
+    (only when it had exactly one) and its scene. A kind found gains weight
+    - USER_WEIGHT when the user marked it - and keeps the newest words for
+    it; with `looked` (the critic saw the whole picture) a kind not found
+    loses one, so a fault that stopped coming back is unlearned."""
+    ledger = copy.deepcopy(ledger or {})
+    seen = {}
+    for f in found:
+        e = seen.setdefault(fault_kind(f), {"user": False, "fix": "", "said": ""})
+        e["user"] = e["user"] or f.get("source") == "user"
+        e["fix"] = str(f.get("correction") or "").strip().rstrip(".")[:200] or e["fix"]
+        e["said"] = str(f.get("observation") or "").strip().rstrip(".")[:200] or e["said"]
+    for scope, name in _scopes(model, identity_ids, scene):
+        if not seen and name not in ((ledger.get("faults") or {}).get(scope) or {}):
+            continue                  # nothing to say of it yet
+        b = ledger.setdefault("faults", {}).setdefault(scope, {}).setdefault(
+            name, {"pictures": 0, "kinds": {}})
+        kinds = b.setdefault("kinds", {})
+        if looked:
+            b["pictures"] = int(b.get("pictures") or 0) + 1
+            for k, rec in kinds.items():
+                if k not in seen:
+                    rec["weight"] = max(0, int(rec.get("weight") or 0) - 1)
+        for k, e in seen.items():
+            rec = kinds.setdefault(k, {"weight": 0, "seen": 0, "user": 0, "fix": "",
+                                       "said": ""})
+            rec["weight"] = min(WEIGHT_TOP, int(rec.get("weight") or 0)
+                                + (USER_WEIGHT if e["user"] else 1))
+            rec["seen"] = int(rec.get("seen") or 0) + 1
+            rec["user"] = int(rec.get("user") or 0) + e["user"]
+            rec["fix"], rec["said"] = e["fix"] or rec.get("fix", ""), e["said"] or rec.get(
+                "said", "")
+        keep = sorted((k for k, r in kinds.items() if r.get("weight")),
+                      key=lambda k: -kinds[k]["weight"])[:KINDS_MAX]
+        b["kinds"] = {k: kinds[k] for k in keep}
+    return ledger
+
+
+def recurring(ledger, model, identity_ids=(), scene=""):
+    """The faults that keep coming back for a picture on this model, of
+    this person, in this scene: weight RECUR or more, heaviest first, each
+    kind once. -> [{"kind", "weight", "seen", "user", "fix", "said", "scope"}]."""
+    out = {}
+    for scope, name in _scopes(model, identity_ids, scene):
+        b = (((ledger or {}).get("faults") or {}).get(scope) or {}).get(name) or {}
+        for k, rec in (b.get("kinds") or {}).items():
+            w = int(rec.get("weight") or 0)
+            if w >= RECUR and w > out.get(k, {}).get("weight", 0):
+                out[k] = dict(rec, kind=k, weight=w, scope=scope)
+    return sorted(out.values(), key=lambda r: (-r["weight"], r["kind"]))
+
+
+def first_line(r):
+    """A returning fault as the critic is told of it."""
+    cat, _, what = r["kind"].partition("/")
+    n = int(r.get("seen") or 0)
+    return "- %s (%s): wrong in %d picture%s before%s%s" % (
+        what.replace("_", " ") if what != "whole" else "the whole picture", cat, n,
+        "" if n == 1 else "s", ", marked by the user" if r.get("user") else "",
+        "; last: " + r["said"] if r.get("said") else "")
+
+
+def prevention(ledger, identity_ids=()):
+    """Words for the prompt against one person's returning faults: the
+    critic's newest fix for each kind that is about the person (PERSON_BOUND),
+    since a hand or the light is not theirs to describe. -> [(kind, words)]."""
+    ids = list(identity_ids or ())
+    if len(ids) != 1:
+        return []
+    return [(r["kind"], r["fix"]) for r in recurring(ledger, "", ids)
+            if r.get("fix") and r["kind"].partition("/")[0] in PERSON_BOUND]
+
+
+def note_blind(ledger, faults, refinement):
+    """`ledger` with what the user marked on a picture the critic had
+    passed: a blind spot, by category. `refinement` is that picture's
+    record of the critic (None: it never looked, so it missed nothing).
+    After a Generate the critic saw everything, and missed whatever it did
+    not flag; after a fix it saw only the spots, and missed only what it
+    had called cleared."""
+    if not refinement or not faults:
+        return ledger
+    ledger = copy.deepcopy(ledger or {})
+    scores = [x for x in refinement.get("scores") or [] if isinstance(x, dict)]
+    flagged = {fault_kind(x) for x in scores if x.get("outcome") != "CLEARED"}
+    cleared = {fault_kind(x) for x in scores if x.get("outcome") == "CLEARED"}
+    whole = ((refinement.get("history") or [{}])[0] or {}).get("type") != "fix"
+    for f in faults:
+        k = fault_kind(f)
+        if k in flagged or not (whole or k in cleared):
+            continue
+        text = str(f.get("observation") or "").strip()
+        if not text or text.endswith("looked wrong"):
+            text = "a wrong %s" % (f.get("target") or "detail")
+        b = ledger.setdefault("blind", {}).setdefault(f.get("category") or "realism", {})
+        rec = b.setdefault(_key(text)[:60], {"text": text[:80], "count": 0})
+        rec["count"] += 1
+        for key in sorted(b, key=lambda x: -b[x]["count"])[BLIND_KEPT:]:
+            del b[key]
+    return ledger
+
+
+def note_marked(ledger, image, faults, model, identity_ids, scene, refinement):
+    """`ledger` with what the user marked on the picture `image` filed: its
+    faults (`note_picture`, not `looked`: only the spots were) and the
+    critic's blind spots (`note_blind`). A kind marked on this picture
+    before is not filed again - a fix tried again is the same fault, not
+    one more picture with it. The last MARKED_KEPT marks are remembered."""
+    done = set(tuple(x) for x in (ledger or {}).get("marked") or []
+               if isinstance(x, list) and len(x) == 2)
+    new = [f for f in faults if (image, fault_kind(f)) not in done]
+    if not new:
+        return ledger or {}
+    ledger = note_blind(note_picture(ledger, model, identity_ids, scene, new, looked=False),
+                        new, refinement)
+    marks = [list(x) for x in (ledger.get("marked") or [])] + sorted(
+        {(image, fault_kind(f)) for f in new})
+    ledger["marked"] = [list(x) for x in marks][-MARKED_KEPT:]
+    return ledger
+
+
+def blind_checks(ledger):
+    """What to add to each category's checks. -> {category: [text]}."""
+    out = {}
+    for cat, b in ((ledger or {}).get("blind") or {}).items():
+        if cat in CATEGORIES and isinstance(b, dict):
+            top = sorted(b.values(), key=lambda r: -int(r.get("count") or 0))[:BLIND_MAX]
+            out[cat] = [r["text"] for r in top if r.get("text")]
+    return {k: v for k, v in out.items() if v}
 
 
 def _detail_path(o):

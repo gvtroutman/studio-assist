@@ -1221,6 +1221,46 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
   without them it judges by the whole picture. A note says what is wrong,
   for the critic; Describe says what to draw, for the model. The note never
   goes into a prompt, and the critic never rewords it.
+- **The scores add up in a ledger** (2026-09-29):
+  `image-studio/critic_ledger.json`, pure logic in `critic.py`, read and
+  written by `Studio._learn` under `CRITIC_LEDGER_LOCK`. Three things are
+  filed. *Fixes* (`note_fixes`): model -> kind of fault -> `ACTION@denoise`
+  -> tried / cleared / worse, one entry per scored redraw; UNKNOWN files
+  nothing. *Faults* (`note_picture`): per model, per person (only a
+  picture of exactly one identity) and per scene, each kind's `weight` -
+  +1 when the critic found it, +`USER_WEIGHT` (3) when the user marked it,
+  -1 for every picture the critic looked at without finding it, capped at
+  `WEIGHT_TOP` - so a fault that stopped coming back is unlearned. *Blind
+  spots* (`note_blind`): what the user marked on a picture whose record
+  says the critic passed it. A **kind** is `category/target`
+  (`fault_kind`: "realism/hand"), never the critic's wording, which
+  differs every time; that and the caps (`KINDS_MAX`, `BLIND_KEPT`,
+  `MARKED_KEPT`) are what keep the file from growing. The critic is a 7B
+  and misreads: what it says must repeat (`RECUR` 3, `LEDGER_MIN` 3 tries)
+  before it changes anything, what the user marks counts at once.
+- **The next picture starts from the ledger.** Four uses, each said in a job
+  note when it acts. (1) `start_denoise`: a redraw starts harder when its
+  default strength mended under half of 3+ tries on this model and a
+  harder one, within `CRITIC_DENOISE_TOP`, mended half or more
+  (`_critic_denoise`; a fix's strength stays the user's). (2) `recurring`
+  -> the critic's question gets WRONG BEFORE, the returning faults to look
+  at first (`FIRST_PROMPT`; not in a fix's check). (3) `prevention` ->
+  `compose` appends the critic's newest fix for a returning fault to the
+  prompt, but only for one person's faults of a `PERSON_BOUND` category
+  (identity, body, clothing): "a broad square jaw" describes her, "five
+  fingers" describes no one and the anatomy text says it already. (4)
+  `blind_checks` -> "; missed before: ..." on that category's line of
+  `CHECKS`, the three most missed.
+- **Fix a spot feeds the ledger with the check off too.** `run_fix` files
+  its spots through `note_marked` (no picture counted: the critic saw no
+  whole picture) and finds the source picture's record by its file name
+  (`record_of_picture`) to tell a blind spot. After a Generate the critic
+  saw everything, so whatever it did not flag it missed; after a fix it
+  saw the spots alone, so it missed only what it had called cleared. The
+  same kind marked on the same picture again (Generate Again on a fix) is
+  not one more picture with the fault. Not built: switching a pass on from
+  the ledger - the hands pass is already on unless unticked, and the
+  user's untick is not overridden.
 - **The record says what happened.** `record["refinement"]` holds the
   intent, final canonical state, the pass history (each pass with the
   `scores` of its fixes, and `taken_back`), every fault's last score
