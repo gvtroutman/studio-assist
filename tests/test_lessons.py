@@ -6,7 +6,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import core.agent as eng
 import core.lessons as lessons
@@ -322,7 +322,8 @@ class TestExecutorLearnsAndAsks(unittest.TestCase):
         ex = self.run_with([answer(text="hi")])
         names = [t["function"]["name"] for t in ex.tools]
         self.assertEqual(names, ["create_comp", "get_comp", "studio_task_update",
-                                 "studio_tool_create", "studio_ask", "studio_remember", "studio_task_recall"])
+                                 "studio_tool_create", "studio_ask", "studio_remember", "studio_task_recall",
+                                 "studio_idea"])
 
     def test_a_question_ends_the_run_and_the_answer_continues_it(self):
         asked = {"question": "Which frame rate?", "options": [
@@ -376,6 +377,24 @@ class TestExecutorLearnsAndAsks(unittest.TestCase):
         ex.notebook = None
         ex.run(self.messages)
         self.assertIn("keeps no notebook", self.messages[3]["content"])
+
+    def test_studio_idea_adds_to_the_users_list_marked_with_the_tab(self):
+        import core.ideas as ideas
+        path = os.path.join(self.dir, "ideas.json")
+        idea = "A tool to set a layer's blend mode; I had to use run_jsx for it."
+        with patch.object(ideas, "ideas_path", lambda: path):
+            ex = self.run_with([answer(call("studio_idea", {"idea": idea})),
+                                answer(call("studio_idea", {"idea": "Another idea, the second."}, "c2"),
+                                       call("studio_idea", {"idea": "A third idea in one task."}, "c3")),
+                                answer(text="Done.")], tab="After Effects")
+            self.assertEqual(ex.run(self.messages), "Done.")
+            book = ideas.Ideas()
+        self.assertEqual([(i["text"], i["by"], i["tab"]) for i in book.items][0],
+                         (idea, "model", "After Effects"))
+        self.assertEqual(len(book.items), 2)                      # two per task, no more
+        self.assertIn("Enough ideas", json.dumps(self.messages))
+        self.assertIn(("sys", "Idea for Studio Assist added: " + idea), self.events)
+        self.assertIn("Added to the user's ideas", self.messages[3]["content"])
 
     def test_validator_refusals_are_collected_and_flag_trouble(self):
         specs = [spec("create_comp", {"type": "object", "additionalProperties": False,
@@ -678,6 +697,46 @@ class TestGuiForms(unittest.TestCase):
         self.assertEqual(str(buttons[0].cget("state")), "disabled")
         buttons[0].invoke()                                       # a dead form sends nothing
         self.assertEqual(len(self.sent), 1)
+
+    def test_the_ideas_window_adds_drops_with_a_why_and_reopens(self):
+        self.app._ideas_window()
+        self.app.update()
+        self.app.ideas_entry.insert(0, "Batch renders from History")
+        self.app.ideas_add()              # what Enter and the Add button call
+        self.app.update()
+        book = self.app.ideas
+        self.assertEqual([i["text"] for i in book.with_status("open")],
+                         ["Batch renders from History"])
+        self.assertTrue(os.path.exists(book.path))
+
+        def pill(label):
+            view = self.app.ideas_view
+            return next(view.nametowidget(n) for n in view.window_names()
+                        if getattr(view.nametowidget(n), "text", None) == label)
+        pill("drop").invoke()
+        self.app.update()
+        self.assertEqual(len(book.with_status("open")), 1)       # asks why first
+        self.app.ideas_why.insert(0, "the queue already does it")
+        self.app.ideas_drop()
+        self.app.update()
+        dropped = book.with_status("dropped")
+        self.assertEqual(dropped[0]["why"], "the queue already does it")
+        self.assertIn("why not: the queue already does it",
+                      self.app.ideas_view.get("1.0", "end"))
+        pill("reopen").invoke()
+        self.assertEqual(len(book.with_status("open")), 1)
+        self.app._copy_ideas()
+        self.assertIn("- Batch renders from History", self.app.clipboard_get())
+        # A tab's model adds one while the window is open: the watch redraws.
+        stamp = self.app._ideas_stamp()
+        self.app.ideas.__class__(book.path).suggest("A tool for blend modes, not run_jsx.",
+                                                    "After Effects")
+        os.utime(book.path, (2, 2))                               # a stamp that surely moved
+        self.app._ideas_watch(self.app.windows["ideas"], stamp)
+        text = self.app.ideas_view.get("1.0", "end")
+        self.assertIn("A tool for blend modes, not run_jsx.", text)
+        self.assertIn("by the After Effects model", text)
+        self.app.windows["ideas"].destroy()
 
     def test_the_studio_brief_is_saved_and_reaches_idle_tabs_now(self):
         self.app._studio_window()

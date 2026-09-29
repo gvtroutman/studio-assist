@@ -423,12 +423,13 @@ from core.chat_ask import ChatAskMixin
 from core.chat_elicit import ChatElicitMixin
 from core.chat_lessons_studio import ChatLessonsMixin
 from core.chat_diagnostics import ChatDiagnosticsMixin
+from core.chat_ideas import ChatIdeasMixin
 
 
 class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
            ChatBridgeDialogMixin, ChatIconsMixin, ChatAskMixin,
            ChatElicitMixin, ChatLessonsMixin, ChatDiagnosticsMixin,
-           tk.Tk):
+           ChatIdeasMixin, tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -736,6 +737,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         m_help.add_command(label="Diagnostics...", command=self._diagnostics_window)
         m_help.add_command(label="Check for updates...",
                            command=lambda: self._check_updates(quiet=False))
+        m_help.add_command(label="Ideas for updates...", command=self._ideas_window)
         m_help.add_separator()
         m_help.add_command(label="About %s" % APP_NAME, command=self._about)
         bar.add_cascade(label="Help", menu=m_help)
@@ -4566,7 +4568,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             executor = tasks.Executor(s.llm or self.llm, s.mcp, s.tools, schemas=s.schemas,
                 record=s.record, cancel=s.cancel, emit=emit, checkpoint=checkpoint,
                 vision=look, library=s.library,
-                readback=s.app.readback, review=s.app.review, notebook=s.notebook)
+                readback=s.app.readback, review=s.app.review, notebook=s.notebook,
+                tab=s.app.name)
             executor.run(s.messages, MAX_STEPS)
             self._learn(s, executor, emit)
         except Exception as e:

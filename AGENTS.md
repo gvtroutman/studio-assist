@@ -852,7 +852,12 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   Faces get seeds s+1, s+2, ... so Generate Again redraws them the same.
 - **The 5090's ComfyUI (2026-09-25)** is ComfyUI v0.37.2 (the 3090's version),
   git-cloned into `D:\ComfyUI` with its own Python 3.12 venv and PyTorch
-  cu128 (Blackwell). The models live in `D:\ComfyUI-models`
+  2.11.0+cu130 (Blackwell; cu128 until 2026-09-29). Keep torch on the CUDA
+  major that onnxruntime-gpu is built for (1.30: CUDA 13): with cu128 torch its
+  CUDA provider could not load `cublasLt64_13.dll` and every InsightFace
+  session asked for CUDA silently ran on the CPU (PuLID's face analysis ~2 s a
+  photo, 35 ms on CUDA). The pre-switch `pip freeze` is
+  `D:\ComfyUI\venv-freeze-cu128-2026-09-29.txt`. The models live in `D:\ComfyUI-models`
   (`extra_model_paths.yaml`), so a reinstall keeps them. It is started by
   `D:\ComfyUI\Start ComfyUI (Image Studio).cmd` on 127.0.0.1:8188, and the app
   does not start it. FLUX files: `flux1-dev.safetensors` (Comfy-Org mirror, the
@@ -942,8 +947,12 @@ degrees. Front and back views worked. Flipping the photo (`ImageFlip`), asking f
 the left twin and flipping the result back did give right-hand views that look like
 her. So `angle_graph` now does that for every view from their right (`mirrored`, two
 `ImageFlip` nodes, a core node both backends have). The words only ever ask for a
-left view. Camera height took four live rounds. "Rotate the camera up and over … to
-a bird's-eye view … zoom out a little" gives a real high angle. "Rotate the camera
+left view. Camera height took six live rounds. "Raise the camera high above this
+person to a bird's-eye view … without changing their pose … their face pointing the
+same way as before" gives a real high angle. "… their head tilted up towards the
+camera" also did, but turned every view from above to face the lens. From above is
+still the weak row: a turn keeps only ~30 degrees, and the side views come out
+nearly frontal. "Rotate the camera
 down to a worm's-eye view … zoom out so they tower over the camera … the ceiling and
 ceiling lights" gives a real low angle ("from near the floor" and "the height of
 their waist" did not). In one edit Kontext does *either* the turn *or* the height.
@@ -951,7 +960,8 @@ So a turned view from above or below is two edits in one graph (`view_steps`): t
 level turn first, then the height on that picture (`KEEP_TURN`, seed + 1). Those
 views take ~36 s rather than ~18 s. Front from above/below and straight above/below
 stay one edit. Straight below comes out oddly posed (leaning over the lens) but is
-seen from beneath. Tests:
+seen from beneath. The final all-26 run on Partner: level and below right on both
+sides; above high but mostly facing the camera. Tests:
 `tests/test_viewcube.py`, and
 `test_angles_asks_on_a_view_cube_and_keeps_the_pick_as_the_preset`.
 
@@ -1603,16 +1613,6 @@ subscription inside OpenCode are against Anthropic's terms; do not wire one in.
   and never saw the lesson in `fresh()`. With it, a trainer lesson reaches the tab's
   next request without a restart.
 
-### The Nodes view: a picture's graph in ComfyUI's own editor
-
-The user asked (2026-09-27) to see the pipeline's nodes and edit specifics "from the app",
-like the Milanote tab, and then for it to live in the ComfyUI tab rather than a tab of
-its own. The ComfyUI tab has a **Chat | Nodes** switch above its transcript
-(`apps.comfyui.nodes_ui.NodesView`, built only for the `comfyui` tab). Nodes puts ComfyUI's
-page where the transcript is, with a backend picker (the Image Studio's backends plus
-the tab's own `COMFYUI_URL`, shown first), a step picker and Reload. Chat puts the
-transcript back. The conversation and its bridge are untouched either way.
-
 ### The phone: chat and pictures as a web page
 
 The user asked (2026-09-29) for "a way for me to use the llm as chat and image gen on my
@@ -1670,6 +1670,16 @@ closed.
   request to LM Studio too.
 - Windows Firewall asks once whether Python may accept connections; without "Allow"
   the phone gets no answer. The server does not touch the firewall.
+
+### The Nodes view: a picture's graph in ComfyUI's own editor
+
+The user asked (2026-09-27) to see the pipeline's nodes and edit specifics "from the app",
+like the Milanote tab, and then for it to live in the ComfyUI tab rather than a tab of
+its own. The ComfyUI tab has a **Chat | Nodes** switch above its transcript
+(`apps.comfyui.nodes_ui.NodesView`, built only for the `comfyui` tab). Nodes puts ComfyUI's
+page where the transcript is, with a backend picker (the Image Studio's backends plus
+the tab's own `COMFYUI_URL`, shown first), a step picker and Reload. Chat puts the
+transcript back. The conversation and its bridge are untouched either way.
 
 - **While Nodes shows, the tab counts as a window.** `Chat._holds_window` (a panel tab,
   or `nodes_view.on`) is what `_select` and `_apply_status` ask. It hides the composer,
@@ -2041,8 +2051,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   `yolox_l.onnx` + `dw-ll_ucoco_384.onnx` from huggingface.co/yzd-v/DWPose in a `dwpose`
   model folder (`D:\ComfyUI-models\dwpose` on the 5090, named in its
   extra_model_paths.yaml). It runs on the CPU on purpose, about a second a photo: the
-  5090's onnxruntime-gpu 1.30 wants CUDA 13 DLLs its cu128 torch does not ship, and the
-  GPU stays the picture's. `fit_pose` (stdlib) then searches the controls and the yaw
+  GPU stays the picture's (since the cu130 torch switch, CUDA would load; not used). `fit_pose` (stdlib) then searches the controls and the yaw
   for the mannequin whose joints, seen front on with no perspective and scaled to fit,
   fall on the photo's points: every facing coarsely on the head, shoulders and hips
   alone (a limb still at rest pulls the torso to make up for it), then each limb from a
@@ -3361,6 +3370,32 @@ one place a run teaches; it never raises.
   already refuses `studio_` names. The Lessons window (`File > Lessons for this
   tab...`) is rebuilt on every forget; a forget while the tab is busy is ignored,
   because the worker may be writing the notebook.
+
+### Ideas for updates: `studio_idea`
+
+The user asked (2026-09-29) for a list of ideas for updates to the app, then for the
+local models to add to it and for Claude Code to read it. `core/ideas.py` keeps
+`ideas.json` beside the settings; `Help > Ideas for updates...` (`core/chat_ideas.py`)
+shows it. An idea is open, done or dropped; dropping asks "why not?" in a field under
+the line, because the why is what stops the idea coming back. Only Delete removes one.
+
+- `studio_idea` is the last of the `INTERNAL_TOOLS` (so adding it changed every tab's
+  tool prefix once) and counts as `BOOKKEEPING`. It is for a limit of *the app* - a
+  missing bridge tool, a workaround - never the user's project. The Executor takes
+  `tab=` (the app's name) so the idea says which model added it, and refuses a third
+  idea in one run (`MODEL_IDEAS_PER_RUN`).
+- `Ideas.suggest` never adds the same idea twice (compared after `normal`), and a
+  model suggesting one the user dropped is told it was turned down and why.
+- The window and each tab's worker hold their own `Ideas`. Every edit re-reads the
+  file under `ideas.LOCK` before writing (`_edit`), otherwise the window would save
+  its old list over an idea a model had just added. A file that could not be
+  *opened* aborts the edit; only one that is not JSON is set aside as `.broken`.
+  The open window checks the file's stamp every 2 s and redraws, but not while a
+  "why not?" field is open.
+- The list is user data, not in the repo, so git and the updater never touch it.
+  Claude Code sessions read it at `%APPDATA%\StudioAssistant\ideas.json`.
+- Tests: `tests/test_ideas.py`, `test_studio_idea_adds_to_the_users_list_marked_with_the_tab`,
+  `test_the_ideas_window_adds_drops_with_a_why_and_reopens`.
 
 ### The studio brief
 

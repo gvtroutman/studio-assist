@@ -43,8 +43,8 @@ _SESSIONS = {}
 def _session(name):
     """One onnxruntime session per model file, kept for the next run. On
     the CPU on purpose: about a second a picture, no VRAM taken from the
-    picture being made, and the 5090's onnxruntime-gpu 1.30 wants CUDA 13
-    DLLs its torch (cu128) does not ship, so CUDA would only fail noisily."""
+    picture being made. (Since the 5090's torch moved to cu130, CUDA would
+    load too; the second is not worth the VRAM.)"""
     if name in _SESSIONS:
         return _SESSIONS[name]
     path = folder_paths.get_full_path(FOLDER, name)

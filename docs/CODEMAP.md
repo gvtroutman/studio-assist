@@ -45,6 +45,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/chat_elicit.py` | 0.2k | A bridge's MCP elicitation, answered by the user, never the model | `ChatElicitMixin`, `_elicit`, `_show_elicit`, `_diff_box` |
 | `core/chat_lessons_studio.py` | 0.1k | The studio brief editor and the per-app lessons window | `ChatLessonsMixin`, `_studio_window`, `_lessons_window` |
 | `core/chat_diagnostics.py` | 0.1k | The Diagnostics window: the same facts `--doctor` prints, read live | `ChatDiagnosticsMixin`, `_diagnostics_window`, `_refresh_diagnostics` |
+| `core/chat_ideas.py`, `core/ideas.py` | 0.4k | Help > Ideas for updates: what to build or fix next in the app, open / done / dropped with a why, added by the user or by a tab's model through `studio_idea` (`IDEA_TOOL`, run in `Executor._call`). Kept in `%APPDATA%\StudioAssistant\ideas.json` - read it before proposing work, and do not propose a dropped idea again | `ChatIdeasMixin._ideas_window`, `Ideas`, `Ideas.suggest` |
 | `core/agent.py` | 1.9k | Engine core: app registry, LLM client, GPU/model fit, OpenCode plumbing. Re-exports the split-out files below, so `core.agent.X` still finds everything | `APPS`, `AppSpec`, `ServerSpec`, `LLM`, `fit_model`, `make_room` |
 | `core/agent_mcp_client.py` | 0.4k | MCP stdio transport: the JSON-RPC client every bridge is built on | `MCPClient`, `sanitize_schema`, `to_openai_tools`, `HostUnreachable` |
 | `core/agent_prompts.py` | 0.7k | Every app's system prompt, and the shared rule blocks - pure string data | `*_PROMPT`, `BASE_RULES`, `CHAT_RULES` |
@@ -96,7 +97,6 @@ Bridge `apps/comfyui/mcp.py`. Nodes view: `apps/comfyui/view.py` (the browser wi
 Milanote: `apps/milanote/milanote.py`. Research (Chat tab: files + web, read-only):
 `apps/research/mcp.py`, run in-process through `core.mcp.Loopback`.
 
-## apps/opencode/, end to end
 ## apps/phone/ (Studio Assist Phone.cmd)
 `apps/phone/server.py` over `apps/phone/page.html` (the whole page: markup, style and
 script). Start at `Phone` (`chat`, `generate`, `state`, `gallery`, `picture`,
@@ -104,6 +104,7 @@ script). Start at `Phone` (`chat`, `generate`, `state`, `gallery`, `picture`,
 `get`, `post`, `chat`), `plan`/`serve`/`main`. `python apps/phone/server.py --check`
 says what it would serve and where. Tests: `tests/test_phone.py`. AGENTS.md "The phone".
 
+## apps/opencode/, end to end
 ```
 Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
    ^  approval card                          |  HTTP + Basic auth (server.key)
