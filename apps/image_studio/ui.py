@@ -543,6 +543,15 @@ class ImageStudio:
             side="left", fill="x", expand=True, padx=(0, self.px(4)))
         self.button(srow, "Image library…", self.image_library).pack(
             side="left", fill="x", expand=True)
+        # Shot on: the camera body the Scene Builder's viewfinder is set to,
+        # so the form says what a scene's pictures are shot on. A click opens
+        # the builder at its Camera section, where it is chosen.
+        self.shot_on = self.label(f, "", "muted", self.host.f_small,
+                                  wraplength=self.px(380))
+        self.shot_on.config(cursor="hand2")
+        self.shot_on.bind("<Button-1>", lambda ev: self.choose_scene_camera())
+        self.shot_on.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
+        self.show_shot_on()
         self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
         # One dropdown for the person, characters and profiles both
@@ -1804,7 +1813,37 @@ class ImageStudio:
                 sb.open(path)
             return sb
         self.scene_builder = studio_scene_ui.SceneBuilder(self, path)
+        self.show_shot_on()
         return self.scene_builder
+
+    def shot_on_text(self):
+        """'Shot on …' for the form: the open Scene Builder's camera body and
+        lens, or why there is none."""
+        sb = self.scene_builder
+        if sb is None:
+            return "Shot on: no scene open (Scene Builder… to choose a camera)"
+        body = sb.camera_body()
+        shot = "%dmm · %d x %d" % ((round(sb.scene["camera"]["lens"]),)
+                                   + studio_scene_ui.sc.frame_size(sb.scene))
+        if not body:
+            return "Shot on: no camera set in the Scene Builder · " + shot
+        return "Shot on %s · %s (Scene Builder)" % (body, shot)
+
+    def show_shot_on(self):
+        label = getattr(self, "shot_on", None)
+        if label is None:
+            return
+        try:
+            label.config(text=self.shot_on_text())
+        except tk.TclError:
+            pass
+
+    def choose_scene_camera(self):
+        """Open the Scene Builder on its Camera section, where the body is picked."""
+        sb = self.build_scene()
+        sb.select(None)
+        sb._inspector_tab("Camera")
+        return sb
 
     def _submit(self, s):
         """Off the UI thread: routing may check a backend's health."""
@@ -3046,6 +3085,7 @@ class ImageStudio:
             ("name", "Name", "text"),
             ("chemistry", "Chemistry (film stock or colour science, in words)", "long"),
             ("lens", "Native lens (mm; sets the scene's lens when chosen)", "number"),
+            ("format", "Frame shape: 1:1 or 3:2 (sets the scene's frame when chosen)", "text"),
             ("image", "Picture of the camera (PNG; the button in Scene Builder)", "path"),
             ("notes", "Notes", "long"),
         ], template={"name": "New camera"})

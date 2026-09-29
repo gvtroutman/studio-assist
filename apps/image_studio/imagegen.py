@@ -412,14 +412,30 @@ def clean_camera_profile(d):
     if not isinstance(d, dict) or not _str(d.get("name")):
         return None
     lens = d.get("lens")
+    cid = slug(d.get("id") or d["name"])
+    # Its frame's shape (`CAMERA_FORMATS`), which the scene's frame follows
+    # when it is chosen. A library saved before formats existed takes the
+    # starter camera's by id.
+    fmt = d.get("format")
+    if fmt is None:
+        fmt = DEFAULT_CAMERA_FORMATS.get(cid, "")
+    fmt = _str(fmt).replace(" ", "").replace("x", ":")
     return {
-        "id": slug(d.get("id") or d["name"]),
+        "id": cid,
         "name": _str(d["name"]),
         "chemistry": _str(d.get("chemistry")),
         "lens": None if lens in (None, "") else _num(lens, float, None, 10, 300),
+        "format": fmt if fmt in CAMERA_FORMATS else "",
         "image": _str(d.get("image")),
         "notes": _str(d.get("notes")),
     }
+
+
+# A camera's frame shape: square (medium format 6x6, an SX-70) or 3:2 (35mm
+# film and full-frame digital), held either way up. "" leaves the frame be.
+CAMERA_FORMATS = ("", "1:1", "3:2")
+DEFAULT_CAMERA_FORMATS = {"digital-5d": "3:2", "leica-m6": "3:2", "hasselblad-500cm": "1:1",
+                          "canon-ae1": "3:2", "sx-70": "1:1", "sony-a7siii": "3:2"}
 
 
 def clean_item_refs(v):
