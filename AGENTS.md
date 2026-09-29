@@ -1613,6 +1613,64 @@ page where the transcript is, with a backend picker (the Image Studio's backends
 the tab's own `COMFYUI_URL`, shown first), a step picker and Reload. Chat puts the
 transcript back. The conversation and its bridge are untouched either way.
 
+### The phone: chat and pictures as a web page
+
+The user asked (2026-09-29) for "a way for me to use the llm as chat and image gen on my
+phone". It is `apps/phone/server.py` and one page, `apps/phone/page.html`, started by
+`Studio Assist Phone.cmd`: a stdlib `ThreadingHTTPServer` on this PC, port 8765. It
+is its own process, not part of the window, and needs the window neither open nor
+closed.
+
+- **The phone is a browser and nothing else.** No app to install but Tailscale. The
+  conversation is kept in the phone's `localStorage`; the server keeps no chat.
+  "Add to Home Screen" makes it look like an app (`/manifest.webmanifest`, and
+  `/icon.png` drawn by `make_icon.render`).
+- **It is the desktop's engine with no window.** `Phone.chat` streams through
+  `eng.LLM.stream` after `eng.fit_model(..., keep=<models mid-reply>)`, so a model
+  that is not loaded goes onto an empty card with a window that fits the
+  conversation, and one already loaded and big enough is left alone: nothing is
+  unloaded for a reply that needs no load. `Phone.generate` is `Studio.submit` on the
+  real library, so routing, the face pass, identities (FaceFusion) and History are the
+  Image Studio's, and a picture made on the phone is in the tab's History.
+  `Studio.make_room` is `Phone.make_room`: LM Studio's models off the shared card,
+  but for one a reply is streaming from.
+- **What the phone server cannot know.** Whether a desktop tab is mid-request. A load
+  it makes beside one cuts that request off, as any load does (see *The window the
+  model is loaded with*); the desktop reloads its own model on its next turn.
+- **The hands pass is asked for on the phone, not assumed.** The form runs it on every
+  Generate. Live on the 3090 a picture of a fox took 348 s, the first minute of it the
+  picture and the rest the hands pass. `hands: true` from the page's "Fix hands" turns
+  it on.
+- **A picture on the 3090 costs the next reply a model load.** The picture clears LM
+  Studio off the shared card, and the next message loads the model again: 110 s for
+  the 30B, measured live, with "Loading ..." shown on the phone. A picture routed to
+  the 5090 costs chat nothing.
+- **Chat has no tools.** Its prompt (`CHAT_PROMPT`) says so, for the reason the Chat
+  tab's does: a model that cannot reach an app must not say it changed one. The page's
+  `system` messages are dropped (`clean_messages`); the prompt is the server's.
+- **Who is served** (`Access`). This PC and any tailnet address (100.64.0.0/10: the
+  user's own signed-in devices, already authenticated by WireGuard) with no question.
+  By default the server listens only on 127.0.0.1 and this PC's tailnet address, so
+  the home network cannot reach it at all. `--lan` listens everywhere, and a private
+  address must then give a six-digit passcode once (kept in
+  `%APPDATA%\StudioAssistant\phone\phone.json`; the cookie's hash is kept, not the
+  cookie; five wrong guesses lock that address out for ten minutes).
+- **A page in the phone's browser must not be able to use it.** A request is refused
+  when its `Host` is a name that is not this PC's (DNS rebinding; an IP address is
+  always taken), when its `Origin` is another site, and when a POST is not JSON (a
+  form cannot send that without asking first).
+- **Pictures are named by record, never by path.** `/picture/<record id>/<n>` reads
+  the History record and serves its file only if it is inside the History folder.
+  Thumbnails are JPEGs made by one PowerShell run (`make_thumbs`) into
+  `phone\thumbs`, not the tab's `.thumb.png` files beside the pictures, which are
+  96 px and the tab's own.
+- **HTTP/1.0 on purpose.** Every answer ends with the connection, so the streamed
+  reply (lines of JSON: `{"note"}`, `{"t"}`, then `{"done"}` or `{"error"}`) needs no
+  chunk framing, and a phone that walks away is seen at the next write, which ends the
+  request to LM Studio too.
+- Windows Firewall asks once whether Python may accept connections; without "Allow"
+  the phone gets no answer. The server does not touch the firewall.
+
 - **While Nodes shows, the tab counts as a window.** `Chat._holds_window` (a panel tab,
   or `nodes_view.on`) is what `_select` and `_apply_status` ask. It hides the composer,
   focuses the window, and disables New chat and History, as on the Milanote tab.
