@@ -404,6 +404,16 @@ class Session:
             self.mcp = None
 
 
+# studio_chat.py runs this module as "__main__" via runpy, so it is never
+# registered under its real dotted name. Each chat_*.py mixin below does
+# `from core.chat import ...`, which otherwise forces Python to import and
+# re-execute this whole file a second time (as "core.chat") to satisfy that -
+# and that second pass hits this same import line while the first mixin
+# module is still mid-import, raising a circular-import ImportError. Alias
+# the in-progress module under its real name first so those imports resolve
+# to what's already built instead of re-running the file.
+sys.modules.setdefault("core.chat", sys.modules[__name__])
+
 from core.chat_theme import ChatThemeMixin
 from core.chat_updates import ChatUpdatesMixin
 from core.chat_widgets import ChatWidgetsMixin
