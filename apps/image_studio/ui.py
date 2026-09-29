@@ -121,6 +121,143 @@ def photo_at(path, side, master):
     return img.subsample(b) if b > 1 else img
 
 
+PEEK = 520                    # px, the hover preview's long edge, before the display's scale
+PEEK_DELAY = 350              # ms the pointer rests on a picture before its preview opens
+
+
+class Peek:
+    """A larger copy of a picture while the pointer rests on its thumbnail.
+    One borderless window per Tk root, opened after PEEK_DELAY beside the
+    pointer and kept on the screen; leaving the picture, clicking or turning
+    the wheel closes it. Wire a widget with `peek(widget, path)`."""
+    GAP = 18                  # px between the pointer and the preview
+
+    def __init__(self, root):
+        self.root = root
+        self.win = None
+        self.source = None        # what the pointer is resting on
+        self.timer = None
+        self.cache = {}           # (path, mtime, side) -> PhotoImage, the last few
+
+    def side(self):
+        scale = self.root.winfo_fpixels("1i") / 96.0
+        return max(64, min(int(PEEK * scale), int(self.root.winfo_screenheight() * 0.8)))
+
+    def image(self, path):
+        """The picture at PEEK, or at its own size where that is smaller:
+        Tk only enlarges by repeating pixels."""
+        try:
+            with open(path, "rb") as f:
+                size = ig.picture_size(f.read(64))
+            side = min(self.side(), max(size)) if size else self.side()
+            key = (path, os.path.getmtime(path), side)
+        except OSError:
+            return None
+        if key not in self.cache:
+            img = photo_at(path, key[2], self.root)
+            if img is None:
+                return None
+            if len(self.cache) >= 8:
+                self.cache.pop(next(iter(self.cache)))
+            self.cache[key] = img
+        return self.cache[key]
+
+    def enter(self, ev, source):
+        if self.source is source and (self.timer or self.shown()):
+            return                # from a thumbnail's frame onto its picture
+        self.hide()
+        self.source = source
+        # On the root, which also cancels it: a widget's own `after` would
+        # leave the command in its list, and its destroy fails deleting it again.
+        widget = ev.widget
+        self.timer = self.root.after(PEEK_DELAY, lambda: self.show(widget))
+
+    def leave(self, ev):
+        try:
+            under = ev.widget.winfo_containing(ev.x_root, ev.y_root)
+        except (tk.TclError, KeyError):
+            under = None
+        if under is None or getattr(under, "_peek", None) is not self.source:
+            self.hide()
+
+    def shown(self):
+        return self.win is not None and self.win.winfo_exists() and \
+            self.win.state() != "withdrawn"
+
+    def show(self, widget):
+        self.timer = None
+        if not widget.winfo_exists():
+            return
+        path = self.source() if callable(self.source) else self.source
+        img = self.image(path) if path else None
+        if img is None:
+            return
+        if self.win is None or not self.win.winfo_exists():
+            self.win = tk.Toplevel(self.root)
+            self.win.withdraw()
+            self.win.overrideredirect(True)
+            try:
+                self.win.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self.win.label = tk.Label(self.win, bd=0, highlightthickness=1,
+                                      highlightbackground="#808080", bg="#000000")
+            self.win.label.pack()
+        self.win.label.config(image=img)
+        self.win.label.image = img
+        self.move(widget.winfo_pointerx(), widget.winfo_pointery())
+        self.win.deiconify()
+        self.win.lift()
+
+    def move(self, x, y):
+        """Right of and centred on the pointer, or left of it where the right
+        runs off the screen."""
+        img = self.win.label.image
+        w, h = img.width() + 2, img.height() + 2
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        left = x + self.GAP
+        if left + w > sw and x < sw:
+            left = x - self.GAP - w
+        top = y - h // 2
+        if 0 <= y < sh:
+            top = max(0, min(top, sh - h))
+        self.win.geometry("+%d+%d" % (left, top))
+
+    def motion(self, ev):
+        if self.shown():
+            self.move(ev.x_root, ev.y_root)
+
+    def hide(self, _ev=None):
+        if self.timer is not None:
+            try:
+                self.root.after_cancel(self.timer)
+            except tk.TclError:
+                pass
+            self.timer = None
+        self.source = None
+        if self.win is not None and self.win.winfo_exists():
+            self.win.withdraw()
+
+
+def peek(widget, path):
+    """Hovering `widget` shows `path` larger in a Peek. `path` may be a
+    callable, read when the preview opens, for a thumbnail whose picture
+    changes; widgets given the same `path` object count as one picture."""
+    root = widget._root()
+    pk = getattr(root, "_studio_peek", None)
+    if pk is None:
+        pk = root._studio_peek = Peek(root)
+    widget._peek = path
+    widget.bind("<Enter>", lambda ev: pk.enter(ev, path), add="+")
+    widget.bind("<Leave>", pk.leave, add="+")
+    widget.bind("<Motion>", pk.motion, add="+")
+    widget.bind("<ButtonPress>", pk.hide, add="+")
+    widget.bind("<MouseWheel>", pk.hide, add="+")
+    widget.bind("<Destroy>", lambda ev: pk.hide() if ev.widget is widget and
+                pk.source is path else None, add="+")
+    return widget
+
+
 class CameraAim:
     """The Camera row's two diagrams. From above, the camera is dragged round
     the person: which side of them it sees. From the side, it is dragged up
@@ -987,7 +1124,7 @@ class ImageStudio:
             img = photo_at(path, side, grid) if path else None
             if img is not None:
                 self.style_photos.append(img)
-                pic = tk.Label(tile, image=img, bd=0)
+                pic = peek(tk.Label(tile, image=img, bd=0), path)
             else:
                 pic = self.frame(tile, "card")
                 pic.config(width=side, height=side)
@@ -1289,7 +1426,8 @@ class ImageStudio:
             img = photo(path, o.px(40)) if path and os.path.isfile(path) else None
             if img is not None:
                 o.keep.append(img)
-                tk.Label(row, image=img, bd=0).pack(side="left", padx=(0, o.px(6)))
+                peek(tk.Label(row, image=img, bd=0), path).pack(side="left",
+                                                                padx=(0, o.px(6)))
             o.label(row, item, "text", width=18).pack(side="left")
             o.label(row, os.path.basename(path) if path else "no picture", "faint",
                     host.f_small).pack(side="left", fill="x", expand=True)
@@ -2076,7 +2214,7 @@ class ImageStudio:
             img = photo(p, side, profile=True)
             if img is not None:
                 self.keep.append(img)
-                lbl = tk.Label(box, image=img, bd=0)
+                lbl = peek(tk.Label(box, image=img, bd=0), p)
             else:
                 lbl = tk.Label(box, text=os.path.basename(p), font=self.host.f_small,
                                wraplength=side - self.px(8))
@@ -2195,10 +2333,15 @@ class ImageStudio:
         box.img = tk.Label(box, bd=0, highlightthickness=0)
         self.skin(box.img, bg="hover")
         box.img.pack(expand=True)
+        box.path = None
+        larger = lambda: box.path
+        peek(box, larger)
+        peek(box.img, larger)
         self.set_thumb(box, path)
         return box
 
     def set_thumb(self, box, path):
+        box.path = path
         img = photo(path, self.px(THUMB)) if path else None
         if img is not None:
             self.keep.append(img)
@@ -3154,6 +3297,7 @@ class ImageLibraryWindow:
         self.picture = o.label(right, "Select an image", "muted", width=30)
         self.picture.config(anchor="center")
         self.picture.pack(fill="both", expand=True)
+        peek(self.picture, lambda: (self.selected() or {}).get("path") if self.image else None)
         self.detail = o.label(right, "", "muted", o.host.f_small, wraplength=o.px(280))
         self.detail.pack(fill="x", pady=o.px(8))
         foot = o.frame(win)
@@ -3251,7 +3395,7 @@ class NewPhotos:
             img = photo(p, o.px(64), profile=True)
             if img is not None:
                 o.keep.append(img)
-                tk.Label(top, image=img, bd=0).pack(side="left", padx=o.px(2))
+                peek(tk.Label(top, image=img, bd=0), p).pack(side="left", padx=o.px(2))
         foot = o.frame(win)
         foot.pack(side="bottom", fill="x", padx=o.px(12), pady=o.px(12))
         o.button(foot, "Add to references", self.add, kind="accent").pack(side="right")
@@ -3349,7 +3493,7 @@ class NewPhotos:
             img = photo(path, side)
             if img is not None:
                 o.keep.append(img)
-                lbl = tk.Label(tile, image=img, bd=0, width=side, height=side)
+                lbl = peek(tk.Label(tile, image=img, bd=0, width=side, height=side), path)
             else:                          # sizes in characters without an image
                 lbl = tk.Label(tile, text="no preview", bd=0, font=host.f_small,
                                width=12, height=6)
@@ -3518,8 +3662,8 @@ class RecordEditor:
                     img = photo(val, o.px(160), profile=self.kind == "identities")
                     if img is not None:
                         o.keep.append(img)
-                        tk.Label(parent, image=img, bd=0).pack(side="top", anchor="w",
-                                                                  pady=o.px(4))
+                        peek(tk.Label(parent, image=img, bd=0), val).pack(
+                            side="top", anchor="w", pady=o.px(4))
             elif kind == "long":
                 t = tk.Text(parent, height=8 if key == "description" else 3, wrap="word", bd=0, highlightthickness=0,
                             font=host.f_ui, padx=o.px(6), pady=o.px(4))
@@ -3647,7 +3791,7 @@ class RecordEditor:
             img = photo(p, side, profile=self.kind == "identities") if os.path.isfile(p) else None
             if img is not None:
                 o.keep.append(img)
-                lbl = tk.Label(tile, image=img, bd=0, width=side, height=side)
+                lbl = peek(tk.Label(tile, image=img, bd=0, width=side, height=side), p)
             else:
                 name = os.path.basename(p) + ("" if os.path.isfile(p) else "\n(missing)")
                 lbl = tk.Label(tile, text=name, bd=0, font=host.f_small,
@@ -5758,6 +5902,9 @@ class AddonsWindow:
             if img is not None:
                 self.images[key] = img
                 lbl.config(image=img, text="")
+                if not hasattr(lbl, "_peek"):
+                    peek(lbl, lambda l=lbl: l.peek_path)
+                lbl.peek_path = path
 
     # ----------------------------------------------------------- installed
     def show_installed(self):
