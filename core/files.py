@@ -44,12 +44,19 @@ def image_dims(path):
                     marker = f.read(2)
                     if len(marker) < 2 or marker[0] != 0xFF:
                         return None
+                    if marker[1] == 0xFF:         # fill byte before a marker
+                        f.seek(-1, 1)
+                        continue
                     if marker[1] in (0xD8, 0x01) or 0xD0 <= marker[1] <= 0xD7:
                         continue
                     size = int.from_bytes(f.read(2), "big")
+                    if size < 2:                  # cut off (or corrupt): seeking back would loop forever
+                        return None
                     if marker[1] in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
                         sof = f.read(5)
+                        if len(sof) < 5:
+                            return None
                         return (int.from_bytes(sof[3:5], "big"), int.from_bytes(sof[1:3], "big"))
                     f.seek(size - 2, 1)
     except (OSError, ValueError, IndexError):
