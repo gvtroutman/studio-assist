@@ -1715,8 +1715,14 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
     where Depth Anything's maps give bodies rounded relief.
   - **Grey frame kept** (`frame_keep`, kind `source`, default 0 = not sent): 1 -
     denoise. 0.1-0.25 pins props and exact framing on top of the maps.
-  A model with neither ControlNet input (Z-Image) gets the frame alone, at
-  `FALLBACK_KEEP` 0.3 kept at least (the old 0.7 denoise). `SceneBuilder.takes()`
+  A model with neither ControlNet input gets the frame alone, at
+  `FALLBACK_KEEP` 0.3 kept at least (the old 0.7 denoise) - its shapes become the
+  picture's, so a lumpy mannequin was drawn as two people stacked. Z-Image takes
+  both maps since 2026-09-29 through Alibaba PAI's Z-Image-Turbo Fun ControlNet
+  Union 2.1 (2602, 8 steps), a *model patch* (`model_patches`, `ModelPatchLoader` +
+  `ZImageFunControlnet`): it patches the model, not the conditioning, so in
+  `zimage_hq` only the first pass samples with it (node 56); the face and refine
+  passes keep node 4 unpatched. `SceneBuilder.takes()`
   reads which of the three a model's workflows have; `check()` refuses only a model
   with none. A backend lacking the ControlNet file is compose's warning, and that
   picture is made from the words. A scene saved with `redraw` opens with the

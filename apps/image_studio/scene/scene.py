@@ -1084,8 +1084,21 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
     k = lambda region, f: f * (1.04 if region in wear else 1.0)    # noqa: E731
     r = lambda rad, ka, kd=None: (rad[0] * ka, rad[1] * (ka if kd is None else kd))  # noqa
     hips = k("hips", 1 + 0.9 * fat)
-    belly = k("belly", 1 + 0.9 * fat)
-    chest = k("chest", (1 + 0.7 * fat + mus) * shape.get("chest", 1.0))
+    # Weight fills a torso out more front to back than across, and chest
+    # size is a bust in front, not a wider ribcage: scaled whole, a heavy
+    # full-chested chest block stood out past the shoulders like a second
+    # pair, and the picture drew two people stacked in it.
+    belly = k("belly", 1 + 1.0 * fat)
+    belly_deep = k("belly", 1 + 1.1 * fat)
+    # The joins between the blocks fill out with weight: drawn in as on a
+    # slim wooden mannequin, a heavy one read as three bodies stacked.
+    join = 1 + 0.4 * max(0.0, fat)
+    chest = k("chest", 1 + 0.45 * fat + mus)
+    chest_deep = k("chest", 1 + 0.7 * fat + mus)
+    bust = shape.get("chest", 1.0) - 1                  # -0.3 .. 0.3
+    pecs = max(0.0, 0.08 + 0.9 * bust) if bust > 0 else 0.08 * (1 + bust / 0.3)
+    # The top of the ribcage stays on the shoulder line, weight or not.
+    top = shape["shoulders"] * (1 + 0.3 * (chest - 1))
     neck = k("neck", 1 + 0.5 * fat + 0.6 * mus) * mq.neck_scale(head)
     upper = k("upper_arm", 1 + 0.7 * fat + 1.3 * mus)
     fore = k("forearm", 1 + 0.5 * fat + 0.8 * mus)
@@ -1121,19 +1134,24 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
              (0.88, 0.152, 0.096, 0.004), (1, 0.13, 0.085, 0.0)], hips * curve, hips)], 20)),
         ("body", "belly", loft(at("spine", (0, 0.015, 0)), at("chest", (0, 0.0, 0)),
                                X("spine"), [
-            (0, (0.12 * belly, 0.082 * belly), 0.0, waist),
-            (0.2, (0.138 * belly, 0.092 * belly), 0.0, waist),
-            (0.55, (0.14 * belly, 0.094 * belly * shape["belly"]),
+            (0, (0.12 * belly * join, 0.082 * belly_deep), 0.0, waist),
+            (0.2, (0.138 * belly, 0.092 * belly_deep), 0.0, waist),
+            (0.55, (0.14 * belly, 0.094 * belly_deep * shape["belly"]),
              -0.006 * shape["belly"] - 0.04 * fat, waist),
-            (1, (0.128 * belly, 0.086 * belly), 0.0, waist)], 20)),
+            # Meets the chest block as at rest, however heavy: a wider belly
+            # top under a narrower chest read as a second waist.
+            (1, (0.128 * chest * join, 0.086 * (belly_deep + chest_deep) / 2), 0.0, waist)],
+                               20)),
         ("body", "chest", loft(at("chest", (0, 0.0, 0)), at("chest", (0, 0.23, 0)),
                                X("chest"), [
-            (0, (0.122 * chest, 0.083 * chest), 0.0, mq.chest(0)),
-            (0.12, (0.15 * chest, 0.096 * chest), -0.002, mq.chest(0.02)),
-            (0.35, (0.162 * chest * wide ** 0.5, 0.1 * chest), -0.008, mq.chest(0.08)),
-            (0.55, (0.172 * chest * wide ** 0.75, 0.102 * chest), -0.01, mq.chest(0.07)),
-            (0.8, (0.18 * chest * wide, 0.094 * chest), -0.004, mq.chest(0.01)),
-            (0.94, (0.158 * chest * wide, 0.074 * chest), 0.004, mq.chest(0)),
+            (0, (0.122 * chest * join, 0.083 * chest_deep), 0.0, mq.chest(0)),
+            (0.12, (0.15 * chest, 0.096 * chest_deep), -0.002, mq.chest(0.25 * pecs)),
+            (0.35, (0.162 * chest * wide ** 0.5, 0.1 * chest_deep * (1 + 0.3 * bust)),
+             -0.008 - 0.06 * max(0.0, bust), mq.chest(pecs)),
+            (0.55, (0.172 * chest * wide ** 0.75, 0.102 * chest_deep * (1 + 0.3 * bust)),
+             -0.01 - 0.05 * max(0.0, bust), mq.chest(0.875 * pecs)),
+            (0.8, (0.18 * top, 0.094 * chest_deep), -0.004, mq.chest(0.125 * pecs)),
+            (0.94, (0.158 * top, 0.074 * chest_deep), 0.004, mq.chest(0)),
             (1, (0.08 * neck, 0.055 * neck), 0.006)], 24)),
         ("head", "neck", loft(at("neck", (0, -0.02, 0)), at("head", (0, 0.04, 0)), X("neck"), [
             (0, r((0.056, 0.054), neck), 0.0), (0.5, r((0.052, 0.05), neck), 0.0),
@@ -1275,9 +1293,10 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
                                               r((0.052, 0.052), shin))))
     # Braces over the chest: two straps down the front, a bar across them.
     if dressed.get("braces"):
-        rgb, fz = dressed["braces"], 0.1 * chest + 0.012
+        rgb, fz = dressed["braces"], 0.1 * chest_deep * (1 + 0.3 * bust) + 0.012
         for sx in (1, -1):
-            out.append(("body", rgb, prism(at("spine", (sx * 0.075, -0.02, 0.095 * belly + 0.012)),
+            out.append(("body", rgb, prism(at("spine", (sx * 0.075, -0.02,
+                                                        0.095 * belly_deep + 0.012)),
                                            at("chest", (sx * 0.085, 0.19, fz)), X("chest"),
                                            (0.018, 0.006), (0.018, 0.006), 4)))
         out.append(("body", rgb, prism(at("chest", (-0.09, 0.1, fz + 0.004)),
@@ -1287,7 +1306,7 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
         # Across the chest, bellows between two ends; the Carrying pose puts
         # the hands on it.
         _, rgb = held["accordion"]
-        z = 0.11 * chest + 0.13
+        z = 0.11 * chest_deep * (1 + 0.3 * bust) + 0.06 * max(0.0, bust) + 0.13
         chest_box = lambda lo, hi: outward([[at("chest", p) for p in f]   # noqa: E731
                                             for f in box(lo, hi)])
         out += [("body", rgb, chest_box((-0.23, -0.2, z - 0.1), (-0.15, 0.12, z + 0.1))),

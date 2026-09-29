@@ -67,7 +67,8 @@ PASTE_NODE = "StudioFacePaste"        # comfy_nodes/studio_facepaste: a person's
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
-               "clip_vision", "style_models", "controlnet", "upscale_models", "diffusers")
+               "clip_vision", "style_models", "controlnet", "upscale_models", "diffusers",
+               "model_patches")
 
 
 def studio_dir():
@@ -3429,7 +3430,8 @@ def dress_lacks(wf, outfit, inventory, nodes):
 FOLDER_WORDS = {"diffusion_models": "diffusion model", "checkpoints": "checkpoint",
                 "text_encoders": "text encoder", "vae": "VAE", "loras": "LoRA",
                 "clip_vision": "CLIP vision model", "style_models": "style model",
-                "controlnet": "ControlNet", "upscale_models": "upscale model"}
+                "controlnet": "ControlNet", "upscale_models": "upscale model",
+                "model_patches": "model patch (a Z-Image ControlNet)"}
 
 
 def _names(when):

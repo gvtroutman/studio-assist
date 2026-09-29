@@ -163,6 +163,25 @@ class TestBodyAndClothes(unittest.TestCase):
             self.assertEqual(len(changed), 1)
         self.assertEqual(sc.body_shape({}), sc.REST_SHAPE)
 
+    def test_a_heavy_full_chest_stays_inside_the_shoulders_and_the_bust_is_in_front(self):
+        # Scaled whole, weight 3 and chest 3 made a chest block half as wide
+        # again as the shoulders: a second pair, and the picture drew two
+        # people stacked. The chest block is the torso's third piece.
+        def chest(**look):
+            shape = sc.body_shape(look)
+            pieces = sc.person_pieces({}, shape=shape)
+            self.assertEqual([p[0] for p in pieces[:3]], ["body"] * 3)
+            pts = [p for f in pieces[2][1] for p in f]
+            span = sc.skeleton({}, shape=shape)["shoulder_l"][0][0]
+            return max(abs(p[0]) for p in pts), max(p[2] for p in pts), span
+        for look in ({}, {"weight": 3}, {"weight": 3, "chest_size": 3},
+                     {"muscle": 3, "chest_size": 3}):
+            half, _, span = chest(**look)
+            self.assertLess(half, span * 1.25, look)
+        flat, full = chest(weight=3, chest_size=-3), chest(weight=3, chest_size=3)
+        self.assertGreater(full[1], flat[1] * 1.3)          # the bust, forward
+        self.assertLess(full[0], flat[0] * 1.1)             # not a wider ribcage
+
     def person(self, **look):
         o = sc.new_object("person")
         o["look"] = look

@@ -2137,8 +2137,10 @@ class ImageStudio:
         self.act_fix.pack(side="right")
         for p in (self.act_again, self.act_fix):
             p.set(state="disabled")
+        # The prompt and settings are in the Queue / History row below, so the
+        # picture takes this card's whole height; the caption shows only when
+        # a face swap failed, with the Retry button (packed in `_select`).
         self.caption = self.label(top, "", "muted", self.host.f_small, bg="card")
-        self.caption.pack(side="bottom", fill="x", padx=self.px(12))
         self.act_retry_faces = self.button(top, "Retry face swap", self._retry_faces, bg="card")
         self.wrap(self.caption, top, self.px(24))
         self.preview = tk.Label(top, bd=0, highlightthickness=0, text="Nothing yet",
@@ -2573,7 +2575,11 @@ class ImageStudio:
         prompt = (rec.get("prompt") or "").replace("\n", " ")
         for text, role, font in ((prompt[:160] + ("\u2026" if len(prompt) > 160 else ""),
                                   "text", None), (self.describe(rec), "faint",
-                                                  self.host.f_small)):
+                                                  self.host.f_small),
+                                 ("; ".join(rec.get("warnings") or []), "faint",
+                                  self.host.f_small)):
+            if not text:
+                continue
             lbl = self.label(right, text, role, font, bg="card")
             lbl.pack(side="top", fill="x")
             self.wrap(lbl, right, self.px(12))
@@ -2612,35 +2618,23 @@ class ImageStudio:
     # ------------------------------------------------------------- selection
     def _select(self, item):
         self.selected = item
-        path, text = None, ""
         if item[0] == "job":
-            job = item[1]
-            path = job.outputs[0] if job.outputs else None
-            if job.record:
-                text = self.clip(job.record["prompt"]) + "\n" + self.describe(job.record)
-            else:
-                text = (job.plan.prompt if job.plan else ig.summary(job.settings)) \
-                    + "\n" + job.status.capitalize() + (": " + job.detail if job.detail
-                                                        else "")
+            path = item[1].outputs[0] if item[1].outputs else None
         else:
-            rec = item[1]
-            path = (rec.get("images") or [None])[0]
-            text = self.clip(rec.get("prompt", "")) + "\n" + self.describe(rec)
-            warn = rec.get("warnings") or []
-            if warn:
-                text += "\n" + "; ".join(warn)
+            path = (item[1].get("images") or [None])[0]
         self.pending_preview = path
         self._repaint_preview()
-        self.caption.config(text=text)
         rec = self._selected_record()
         if rec and (rec.get("finish") or {}).get("profiles") and rec["finish"].get("state") != "complete":
+            error = rec["finish"].get("error")
+            self.caption.config(text="Generated image kept before the final face swap."
+                                + (" " + error if error else ""))
+            self.caption.pack(side="bottom", fill="x", padx=self.px(12), before=self.preview)
             self.act_retry_faces.pack(side="bottom", anchor="w", padx=self.px(12),
                                      pady=self.px(4), before=self.preview)
             self.act_retry_faces.set(state="disabled" if self._face_pass_busy(rec) else "normal")
-            error = rec["finish"].get("error")
-            self.caption.config(text=text + "\nGenerated image kept before the final face swap."
-                                + (" " + error if error else ""))
         else:
+            self.caption.pack_forget()
             self.act_retry_faces.pack_forget()
         self.act_again.set(state="normal" if rec or item[0] == "job" else "disabled")
         self.act_fix.set(state="normal" if path and os.path.isfile(path) else "disabled")
