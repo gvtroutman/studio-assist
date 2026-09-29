@@ -74,12 +74,16 @@ After Effects and Resolve use outside npm servers.
 - **Tab and engine** - `apps/image_studio/ui.py` (tab, 5.9k) over
   `apps/image_studio/imagegen.py` (engine, 6.7k). `python apps/image_studio/imagegen.py --probe`
   is the first diagnostic.
-- **Critic** - `apps/image_studio/critic.py`.
+- **Critic** - `apps/image_studio/critic.py` (`analyze_generated_image`,
+  `plan_next_refinement`; the faults: `user_faults`, `score_fixes`, `carry`, `harder`),
+  run by `Studio._refine` - after Generate, and after a fix with `fix["check"]`.
 - **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`, `tools/`.
-  Angles / Breed (new reference photos by FLUX Kontext): `apps/image_studio/breed.py`
-  (`angle_graph`, `breed_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
+  Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
+  (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
   preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by
-  `RecordEditor._new_photos`. The view cube Angles asks on:
+  `RecordEditor._new_photos`. Blend anywhere (any two pictures, as a job of the
+  queue, kept in History): `blend.submit`, `blend.run_job`, `blend.record`,
+  `blend_words`, under `ui.BlendWindow`, opened by `ImageStudio.blend`. The view cube Angles asks on:
   `apps/image_studio/viewcube.py` (`cells`, `basis`, `facing`, `ViewCube`).
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,

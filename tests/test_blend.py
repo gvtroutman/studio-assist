@@ -1,4 +1,4 @@
-"""Angles and Breed: the Kontext graphs, routing and one run (no ComfyUI)."""
+"""Angles and Blend: the Kontext graphs, routing and one run (no ComfyUI)."""
 import os
 import random
 import struct
@@ -6,8 +6,10 @@ import tempfile
 import unittest
 import zlib
 
-import apps.image_studio.breed as sb
+import apps.image_studio.blend as sb
+import apps.image_studio.imagegen as ig
 from apps.comfyui.mcp import ComfyError
+from tests.test_imagegen import FakeClient as StudioClient, TempStudioMixin, settle
 
 
 def png(path, w, h):
@@ -73,8 +75,8 @@ class TestGraphs(unittest.TestCase):
                     if isinstance(v, list):
                         self.assertIn(v[0], g, name)
 
-    def test_breed_chains_both_parents_onto_an_empty_latent(self):
-        g = sb.breed_graph("a.png", "b.png", (832, 1216), 3)
+    def test_blend_chains_both_photos_onto_an_empty_latent(self):
+        g = sb.blend_graph("a.png", "b.png", (832, 1216), 3)
         self.assertEqual(g["r1_load"]["inputs"]["image"], "a.png")
         self.assertEqual(g["r2_load"]["inputs"]["image"], "b.png")
         self.assertEqual(g["r1_ref"]["inputs"]["conditioning"], ["text", 0])
@@ -86,7 +88,7 @@ class TestGraphs(unittest.TestCase):
 
     def test_every_link_points_at_a_node(self):
         for g in (sb.angle_graph("a.png", "front", 1),
-                  sb.breed_graph("a.png", "b.png", (1024, 1024), 1)):
+                  sb.blend_graph("a.png", "b.png", (1024, 1024), 1)):
             for node in g.values():
                 for v in node["inputs"].values():
                     if isinstance(v, list):
@@ -231,6 +233,133 @@ class TestRun(unittest.TestCase):
     def test_nothing_made_raises(self):
         with self.assertRaises(ComfyError):
             sb.run(FakeClient({"outputs": {}, "status": {}}), {})
+
+
+class KontextClient(StudioClient):
+    """A ComfyUI with FLUX Kontext."""
+
+    def inventory(self):
+        inv = super().inventory()
+        for kind, names in sb.FILES.items():
+            inv[kind] = inv.get(kind, set()) | set(names)
+        return inv
+
+
+class TestWords(unittest.TestCase):
+    def test_a_person_is_kept_and_two_pictures_of_anything_keep_nobody(self):
+        self.assertEqual(sb.blend_words(), sb.BLEND + sb.KEEP)
+        plain = sb.blend_words(False, "at dusk.")
+        self.assertNotIn("person", plain)
+        self.assertTrue(plain.endswith(" at dusk."), plain)
+        g = sb.blend_graph("a.png", "b.png", (1024, 1024), 1, words=plain)
+        self.assertEqual(g["text"]["inputs"]["text"], plain)
+        self.assertEqual(sb.blend_graph("a.png", "b.png", (1024, 1024), 1)[
+            "text"]["inputs"]["text"], sb.BLEND + sb.KEEP)
+
+    def test_a_blend_is_read_whatever_was_kept(self):
+        self.assertEqual(sb.clean_blend(None), {"images": [], "person": False, "words": ""})
+        self.assertEqual(sb.clean_blend({"images": ["a", "", None, "b"], "person": 1,
+                                         "words": "  in \n snow "}),
+                         {"images": ["a", "b"], "person": True, "words": "in snow"})
+
+
+class TestBlendJob(TempStudioMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=KontextClient)
+
+    def pic(self, name, size=(400, 600)):
+        path = os.path.join(self.dir, name + ".png")
+        png(path, *size)
+        return path
+
+    def blend(self, **over):
+        return dict({"mode": "blend", "seed": 11, "backend": "auto",
+                     "blend": {"images": [self.pic("a"), self.pic("b")],
+                               "person": False, "words": "in snow"}}, **over)
+
+    def test_a_blend_runs_on_the_queue_and_lands_in_history(self):
+        jobs = self.studio.submit(self.blend())
+        settle(jobs)
+        job = jobs[0]
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(job.backend["id"], "5090")
+        client = next(c for c in KontextClient.instances if c.graphs)
+        self.assertEqual([os.path.basename(p) for p in client.uploads], ["a.png", "b.png"])
+        g = client.graphs[0]
+        self.assertEqual(g["r1_load"]["inputs"]["image"], "studio_a.png")
+        self.assertEqual(g["r2_load"]["inputs"]["image"], "studio_b.png")
+        self.assertEqual(g["ks"]["inputs"]["seed"], 11)
+        self.assertEqual(g["text"]["inputs"]["text"], sb.blend_words(False, "in snow"))
+        w, h = g["empty"]["inputs"]["width"], g["empty"]["inputs"]["height"]
+        self.assertAlmostEqual(w / h, 400 / 600, places=1)      # the first picture's shape
+        rec = self.studio.history.list()[0]
+        self.assertEqual(rec["prompt"], "Blend: two pictures. in snow")
+        self.assertEqual(rec["settings"]["mode"], "blend")
+        self.assertEqual(list(rec["references"].values()), rec["settings"]["blend"]["images"])
+        self.assertEqual((rec["width"], rec["height"], rec["seed"]), (w, h, 11))
+        self.assertEqual([p["label"] for p in rec["passes"]], ["Blend"])
+        self.assertTrue(os.path.isfile(rec["images"][0]))
+        self.assertEqual(job.outputs, rec["images"])
+        self.assertEqual(ig.summary(rec["settings"]), rec["prompt"])
+        self.assertEqual([k for k, _ in ig.pipeline_stages(self.studio.lib, rec["settings"])],
+                         ["sampling", "decoding", "complete"])
+
+    def test_generate_again_remakes_it_and_a_new_seed_is_another(self):
+        jobs = self.studio.submit(self.blend())
+        settle(jobs)
+        rec = self.studio.history.list()[0]
+        again = ig.again(rec)
+        self.assertEqual((again["seed"], again["prefer_backend"]), (11, "5090"))
+        same = self.studio.submit(again)
+        other = self.studio.submit(ig.again(rec, new_seed=True))
+        settle(same + other)
+        self.assertEqual([j.status for j in same + other], ["complete", "complete"])
+        self.assertEqual(same[0].settings["seed"], 11)
+        self.assertEqual(other[0].settings["seed_mode"], "random")
+        self.assertEqual(len(self.studio.history.list()), 3)
+
+    def test_what_cannot_be_blended_is_refused_in_words(self):
+        a = self.pic("a")
+        for images, says in (([a], "Choose two pictures"), ([a, a], "two different"),
+                             ([a, os.path.join(self.dir, "gone.png")], "Not on this PC")):
+            with self.assertRaises(ComfyError) as e:
+                self.studio.submit(self.blend(blend={"images": images}))
+            self.assertIn(says, str(e.exception))
+        self.assertEqual(self.studio.queue.jobs, [])
+
+    def test_no_backend_with_kontext_says_which_file_is_missing(self):
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=StudioClient)
+        with self.assertRaises(ComfyError) as e:
+            self.studio.submit(self.blend())
+        self.assertIn("lacks " + sb.KONTEXT, str(e.exception))
+
+    def test_a_picture_gone_before_its_turn_fails_the_job(self):
+        s = self.blend()
+        jobs = self.studio.submit(s)
+        settle(jobs)
+        os.remove(s["blend"]["images"][1])
+        job = ig.Job(jobs[0].settings, jobs[0].backend)
+        self.studio.queue.add(job)
+        settle([job])
+        self.assertEqual(job.status, "failed")
+        self.assertIn("Not on this PC", job.detail)
+
+    def test_cancelled_while_it_runs_keeps_nothing(self):
+        import threading
+        KontextClient.hold = threading.Event()
+        StudioClient.hold = KontextClient.hold
+        try:
+            jobs = self.studio.submit(self.blend())
+            self.studio.queue.cancel(jobs[0])
+            settle(jobs)
+        finally:
+            StudioClient.hold = None
+            KontextClient.hold = None
+        self.assertEqual(jobs[0].status, "cancelled")
+        self.assertEqual(self.studio.history.list(), [])
 
 
 if __name__ == "__main__":

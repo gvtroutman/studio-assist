@@ -2618,7 +2618,7 @@ class TestImageStudioTab(unittest.TestCase):
 
     def test_angles_asks_on_a_view_cube_and_keeps_the_pick_as_the_preset(self):
         from unittest.mock import patch
-        import apps.image_studio.breed as sb
+        import apps.image_studio.blend as sb
         import apps.image_studio.ui as ui_mod
         _, ui = self.tab()
         photos = []
@@ -2648,6 +2648,38 @@ class TestImageStudioTab(unittest.TestCase):
             spawn.assert_called_once()
         w.running = False
         w.close()
+
+    def test_blend_is_a_window_of_its_own_that_sends_a_job(self):
+        from unittest.mock import patch
+        import apps.image_studio.ui as ui_mod
+        _, ui = self.tab()
+        a, b = (os.path.join(self.dir, "blend_%s.png" % n) for n in "ab")
+        for p in (a, b):
+            with open(p, "wb") as f:
+                f.write(PNG)
+        w = ui.blend(a)
+        self.addCleanup(lambda: w.win.winfo_exists() and w.win.destroy())
+        self.assertIs(ui.blend(), w)                     # one window, raised
+        with patch.object(ui.host, "_spawn") as spawn:
+            w.start()
+            spawn.assert_not_called()                    # one picture is not a blend
+            self.assertIn("Choose two pictures", w.msg.cget("text"))
+            ui.blend(b)                                  # the next goes in the empty place
+            self.assertEqual(w.paths, [a, b])
+            w.swap()
+            self.assertEqual(w.paths, [b, a])
+            w.words.set("in snow")
+            w.start()
+            sent = spawn.call_args.args[2]
+        self.assertEqual(sent, {"mode": "blend", "seed": -1, "backend": "auto", "blend": {
+            "images": [b, a], "person": False, "words": "in snow"}})
+        self.assertEqual(ui.view, "queue")
+        with patch.object(ui_mod, "ImageLibraryWindow") as library:
+            w.from_library(1)
+            library.call_args.kwargs["pick"](a)          # what the library's chooser calls
+        self.assertEqual(w.paths, [b, a])
+        ui.reuse(dict(sent, blend={"images": [a, b], "person": True, "words": "at dusk"}))
+        self.assertEqual((w.paths, w.person.get(), w.words.get()), ([a, b], True, "at dusk"))
 
     def test_resting_on_a_thumbnail_shows_the_picture_larger(self):
         import apps.image_studio.ui as ui_mod
@@ -2939,6 +2971,40 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(job["fix"]["strength"], "light")
         self.assertEqual(len(job["fix"]["spots"]), 1)
         self.assertGreaterEqual(job["fix"]["spots"][0]["size"], ig.FIX_MIN)
+        self.assertFalse(job["fix"]["check"])     # the critic is asked only when chosen
+
+    def test_fix_a_spot_takes_a_note_on_each_spot_and_asks_the_critic(self):
+        import apps.image_studio.ui as ui_mod
+        s, ui = self.tab()
+        src = os.path.join(self.dir, "fixme.png")
+        with open(src, "wb") as f:
+            f.write(ig.oval_png(256))
+        sent = []
+        ui.host._spawn = lambda sid, fn, arg: sent.append(arg)
+        self.addCleanup(lambda: delattr(ui.host, "_spawn"))
+        fw = ui_mod.FixWindow(ui, src, dict(ig.default_settings(), scene="x"))
+        self.pump(lambda: fw.img is not None)
+
+        class Ev:
+            def __init__(self, px, py):
+                self.x, self.y = fw.ox + int(px * fw.k), fw.oy + int(py * fw.k)
+        fw.note.set("six fingers")                # nothing marked: a note on them all
+        fw._add(Ev(60, 60))
+        self.assertEqual(fw.note.get(), "")       # a new spot, its own note
+        fw.note.set("thumb on the wrong side")
+        fw._add(Ev(190, 190))
+        fw.note.set("too small")
+        fw._remove(Ev(190, 190))                  # back on the spot before
+        self.assertEqual(fw.note.get(), "thumb on the wrong side")
+        fw._add(Ev(190, 60))
+        fw._pick("check", "on")
+        fw._redraw()
+        (job,) = sent
+        fix = ig.clean_fix(job["fix"])
+        self.assertTrue(fix["check"])
+        self.assertEqual(fix["note"], "six fingers")
+        self.assertEqual([sp.get("note") for sp in fix["spots"]],
+                         ["thumb on the wrong side", None])
 
     def test_fix_a_spot_lassos_a_part_and_gives_it_a_photo(self):
         import apps.image_studio.ui as ui_mod

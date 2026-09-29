@@ -2,7 +2,7 @@
 import unittest
 from collections import Counter
 
-import apps.image_studio.breed as sb
+import apps.image_studio.blend as sb
 import apps.image_studio.viewcube as vc
 from core.ui import DARK
 

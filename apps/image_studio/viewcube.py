@@ -5,7 +5,7 @@ look based on a cube like bambu studio has". The cube is the person: the
 front face has a face drawn on it, and "right" and "left" are theirs. Each
 face is cut in three both ways, so a click lands on one of 26 parts - the
 middle of a face, a strip along an edge, a square at a corner - and that part
-is a view (`breed.VIEW_KEYS`): the camera stands out along it. Drag turns the
+is a view (`blend.VIEW_KEYS`): the camera stands out along it. Drag turns the
 cube to reach the far side; a click (a press that barely moved) picks or
 drops that part.
 
@@ -15,7 +15,7 @@ The geometry is plain functions (`cells`, `basis`), the window `ViewCube`.
 import math
 import tkinter as tk
 
-import apps.image_studio.breed as sb
+import apps.image_studio.blend as sb
 from core.ui import blend
 
 INNER = 0.55        # half the width of a face's middle, the cube being -1..1

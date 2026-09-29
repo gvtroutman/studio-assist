@@ -2,26 +2,36 @@
 
 The user, 2026-09-28: "i would like to add breeding to reference images in
 identity" - and then "breed is a seperate step. the angles are something every
-photo has". So two things, both in the identity editor:
+photo has". So two things, both in the identity editor. Breed was renamed
+Blend on 2026-09-29 (his word: "rename breed to blend"):
 
 - Angles: any reference photo -> the same person seen from other angles
   (`ANGLES`), one Kontext edit of that photo per angle (`angle_graph`). The
   angles are the parts of a view cube, picked on one (`viewcube`), and the
   last pick is kept as the preset (`load_views`).
-- Breed: two reference photos -> one new photo that mixes them
-  (`breed_graph`): both go in as Kontext reference latents, the child is drawn
-  on an empty latent at the first parent's shape, so it copies neither.
+- Blend: two reference photos -> one new photo that mixes them
+  (`blend_graph`): both go in as Kontext reference latents, the blend is drawn
+  on an empty latent at the first photo's shape, so it copies neither.
 
 Nothing is scored or kept here: the editor shows the results and the person
 picks which join the references. (`tools/make_variations.py` scores with
 ArcFace; that needs ComfyUI's venv, and a person looking works as well.)
 
+Blend is also a tool of its own, anywhere in the Image Studio (the user,
+2026-09-29: "put real infrastructure behind it", and of what that could be,
+"Blend anywhere"): any two pictures - the library's, History's, a file -
+as a job of the studio's own queue (`submit`, `run_job`), kept in History
+(`record`) with both pictures, the words and the seed, so Generate Again
+remakes it. Those two pictures need not be of a person (`blend_words`).
+
 Stdlib only; the ComfyUI calls go through the studio's own client.
 """
 
+import copy
 import json
 import os
 import random
+import time
 
 import apps.image_studio.imagegen as ig
 from apps.comfyui.mcp import ComfyError, outputs_of
@@ -163,10 +173,31 @@ ANGLES = [(name, " Then: ".join(view_steps(key)))
           for name, key in zip(VIEW_NAMES, VIEW_KEYS)]         # for reading, not sent
 ANGLE_NAMES = VIEW_NAMES
 
-BREED = ("Make one new photograph of the same person who is in both of these pictures. "
+BLEND = ("Make one new photograph of the same person who is in both of these pictures. "
          "Mix the two: take the pose and framing from one and the setting, light and "
          "clothes from the other, or blend them, so the new photo is like neither "
          "picture exactly.")
+# Two pictures of anything (Blend anywhere): nobody to keep.
+BLEND_PICTURES = ("Make one new picture that blends these two pictures. Take the subject "
+                  "and composition from one and the setting, light and colours from the "
+                  "other, or mix them, so the new picture is like neither picture exactly.")
+
+
+def clean_blend(d):
+    """A job's `blend` as it is used: {"images": [paths], "person": whether
+    both pictures are of one person, who is kept, "words": what to add}."""
+    d = d if isinstance(d, dict) else {}
+    images = d.get("images") if isinstance(d.get("images"), (list, tuple)) else []
+    return {"images": [p for p in images if isinstance(p, str) and p],
+            "person": bool(d.get("person")),
+            "words": " ".join(str(d.get("words") or "").split())}
+
+
+def blend_words(person=True, words=""):
+    """What a blend is asked for: a new photo of the person in both
+    pictures, or a blend of two pictures of anything, then `words`."""
+    text = BLEND + KEEP if person else BLEND_PICTURES
+    return text + (" " + words.rstrip(".") + "." if words else "")
 
 
 def angle_prompt(name, step=0):
@@ -212,7 +243,7 @@ def lacks(inventory):
 
 
 def size_for(path, megapixels=MEGAPIXELS):
-    """A child's size: the parent's shape at ~1 MP, multiples of 16."""
+    """A new photo's size: its source's shape at ~1 MP, multiples of 16."""
     w, h = ig.file_size_of(path) or (1024, 1024)
     k = (megapixels * 1e6 / float(w * h)) ** 0.5
     return max(16, int(w * k) // 16 * 16), max(16, int(h * k) // 16 * 16)
@@ -298,12 +329,13 @@ def angle_graph(image, angle, seed, prefix="identity/angle", steps=STEPS,
     return g
 
 
-def breed_graph(image_a, image_b, size, seed, prefix="identity/breed", steps=STEPS,
-                guidance=GUIDANCE):
-    """Two photos (LoadImage names) -> one child of `size` (w, h)."""
+def blend_graph(image_a, image_b, size, seed, prefix="identity/blend", steps=STEPS,
+                guidance=GUIDANCE, words=None):
+    """Two photos (LoadImage names) -> one blend of `size` (w, h), asked for
+    in `words` (`blend_words`; the same person in both when not given)."""
     g = _loaders()
     g["text"] = {"class_type": "CLIPTextEncode", "inputs": {
-        "text": BREED + KEEP, "clip": ["2", 0]}}
+        "text": words or blend_words(), "clip": ["2", 0]}}
     cond, _ = _reference(g, 1, image_a, ["text", 0])
     cond, _ = _reference(g, 2, image_b, cond)
     g["empty"] = {"class_type": "EmptySD3LatentImage", "inputs": {
@@ -311,12 +343,19 @@ def breed_graph(image_a, image_b, size, seed, prefix="identity/breed", steps=STE
     return _finish(g, "text", cond, ["empty", 0], seed, prefix, steps, guidance)
 
 
-def route(studio):
-    """The backend these edits run on: enabled, up, with Kontext; the
-    primary (5090) first. -> (backend or None, why)."""
+def route(studio, settings=None):
+    """The backend these edits run on: enabled, up, with Kontext; the one a
+    job's `settings` name, else the one it was made on (Generate Again),
+    else the primary (5090) first. -> (backend or None, why)."""
+    s = settings or {}
+    if s.get("backend") not in (None, "", "auto"):
+        order = [studio.backend(s["backend"])]
+    else:
+        order = sorted(studio.backends(), key=lambda b: (
+            b["id"] != s.get("prefer_backend"), "primary" not in (b.get("roles") or [])))
     why = []
-    for b in sorted(studio.backends(), key=lambda b: "primary" not in (b.get("roles") or [])):
-        if not b.get("enabled"):
+    for b in order:
+        if b is None or not b.get("enabled"):
             continue
         if not (studio.health.get(b["id"]) or {}).get("ok"):
             studio.check(b)
@@ -351,3 +390,124 @@ def run(client, graph, stop=None, on_progress=None):
     if not files:
         raise ComfyError("; ".join(ig.run_errors(entry, graph)) or "the run made no picture")
     return client.fetch(files[0])
+
+
+# ============================================================ Blend anywhere
+# A blend as a job of the studio's queue: settings {"mode": "blend", "seed",
+# "backend", "blend": {"images": [a, b], "person", "words"}}. `Studio.submit`
+# and `Studio.run_job` hand a job of this mode to `submit` and `run_job` here.
+STAGES = [("sampling", "Sampling"), ("decoding", "Decoding"), ("complete", "Complete")]
+LABEL = "Blend (FLUX Kontext)"
+
+
+def summary(settings):
+    """One line for a blend: its job's row, and its record's prompt."""
+    d = clean_blend(settings.get("blend"))
+    what = "the same person in two photos" if d["person"] else "two pictures"
+    return "Blend: " + what + (". " + d["words"] if d["words"] else "")
+
+
+def problem(blend):
+    """Why these pictures cannot be blended, in words; "" when they can."""
+    images = blend["images"]
+    if len(images) != 2:
+        return "Choose two pictures to blend."
+    if os.path.normcase(os.path.abspath(images[0])) == os.path.normcase(
+            os.path.abspath(images[1])):
+        return "Choose two different pictures to blend."
+    gone = [p for p in images if not os.path.isfile(p)]
+    return "Not on this PC any more: %s." % ", ".join(gone) if gone else ""
+
+
+def submit(studio, settings):
+    """Queue a blend (network I/O: off the UI thread). -> [Job]. Raises
+    ComfyError when the pictures or every backend cannot take it."""
+    s = copy.deepcopy(settings)
+    s["mode"], s["batch"] = "blend", 1
+    s["blend"] = clean_blend(s.get("blend"))
+    if int(s.get("seed", -1)) < 0:
+        s["seed"], s["seed_mode"] = random.randint(0, ig.MAX_SEED), "random"
+    else:
+        s["seed_mode"] = "fixed"
+    wrong = problem(s["blend"])
+    if wrong:
+        raise ComfyError(wrong)
+    for b in studio.backends():
+        if b["enabled"] and (b["id"] not in studio.health or b["id"] not in studio.inventories):
+            studio.check(b)
+    b, why = route(studio, s)
+    if b is None:
+        raise ComfyError(why)
+    job = ig.Job(s, b)
+    studio.queue.add(job)
+    return [job]
+
+
+def run_job(studio, job, client, say):
+    """A blend job, start to finish, on its lane's thread."""
+    b, s = job.backend, job.settings
+    d = clean_blend(s.get("blend"))
+    short = lacks(studio.inventories.get(b["id"]))
+    wrong = problem(d) or ("%s lacks %s." % (b["name"], ", ".join(short)) if short else "")
+    if wrong:
+        return studio.queue._finish(job, "failed", wrong)
+    size = size_for(d["images"][0])
+    if b.get("shares_llm_gpu") and studio.make_room is not None:
+        say(detail="clearing LM Studio off the GPU")
+        try:
+            studio.make_room(b)
+        except Exception as e:
+            job.notes.append("Could not clear the shared GPU (%s); this may be slow." % e)
+    try:
+        say("uploading", "uploading the two pictures", None)
+        names = [client.upload_image(p) for p in d["images"]]
+        graph = blend_graph(names[0], names[1], size, s["seed"],
+                            prefix="ImageStudio/blend_%s" % job.id,
+                            words=blend_words(d["person"], d["words"]))
+        say("loading", "blending on %s" % b["name"], None)
+        files = studio._run_pass(job, client, graph, say, "Blend", status="sampling")
+    except (ComfyError, OSError) as e:
+        if job.cancel.is_set():
+            return studio.queue._finish(job, "cancelled")
+        return studio.queue._finish(job, "failed", "Blend failed on %s: %s" % (b["name"], e))
+    if files is None or job.cancel.is_set():
+        return studio.queue._finish(job, "cancelled")
+    say("decoding", "fetching the picture from %s" % b["name"], None)
+    try:
+        pictures = [(f["filename"], client.fetch(f)) for f in files[:1]]
+    except ComfyError as e:
+        return studio.queue._finish(job, "failed", "The picture was made but could not be "
+                                    "fetched from %s: %s" % (b["name"], e))
+    job.record = studio.history.add(record(job, size), pictures)
+    job.outputs = list(job.record["images"])
+    job.progress = 1.0
+    studio.queue._finish(job, "complete")
+
+
+def record(job, size):
+    """A blend's history record, in the fields a Generate record has. Its
+    graph is its one pass (`passes`), so `graph` stays empty and the Nodes
+    view shows it once."""
+    s, b = job.settings, job.backend
+    now = time.time()
+    a, c = s["blend"]["images"]
+    return {
+        "id": time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + "-" + job.id[:6],
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+        "created_ts": now,
+        "prompt": summary(s), "negative": "", "seed": s.get("seed"),
+        "model": {"id": "blend", "label": LABEL, "file": KONTEXT,
+                  "family": "flux1-kontext",
+                  "files": {kind: list(names) for kind, names in FILES.items()}},
+        "loras": [], "identities": [], "style": None, "preset": "blend",
+        "workflow": "blend", "workflow_label": LABEL,
+        "backend": {"id": b["id"], "name": b["name"], "url": b["url"]},
+        "sampler": "euler", "scheduler": "simple", "steps": STEPS,
+        "guidance": GUIDANCE, "width": size[0], "height": size[1], "denoise": 1.0,
+        "refine": None, "face_detail": None,
+        "references": {"picture 1": a, "picture 2": c},
+        "warnings": [], "notes": list(job.notes),
+        "duration": round(time.time() - job.started, 1),
+        "prompt_id": job.prompt_id, "settings": s,
+        "graph": None, "face_graph": None, "passes": list(job.passes),
+    }

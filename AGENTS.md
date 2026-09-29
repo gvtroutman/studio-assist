@@ -905,21 +905,53 @@ pictures park it. The trigger is the profile's own, else `trigger_for(name)`
 (`lilperson`). This assigns on completion, unlike the recipe tool; completion
 is still not a likeness review. Tests: `tests/test_lora_train.py`.
 
-**Angles and Breed** (identity editor, beside Build LoRA; Sitter 2026-09-28: "add
+**Angles and Blend** (identity editor, beside Build LoRA; Sitter 2026-09-28: "add
 breeding to reference images", then "breed is a seperate step. the angles are
-something every photo has"). Two buttons, two things. Angles: each selected
-photo gets `NewPhotos.PER_PHOTO` (4) random, different `breed.ANGLES`, each a
-single-image FLUX Kontext edit of that photo. Breed: exactly two selected photos
-go in as chained `ReferenceLatent`s and the child is drawn on an empty latent at
-the first parent's shape (~1 MP), so it copies neither; each Again is a new
-child. `apps.image_studio.breed` (stdlib) builds the graphs, routes to an up
+something every photo has"; 2026-09-29: "rename breed to blend", so the button,
+the window, the module and `blend_graph` are all Blend now and nothing is
+called breed). Two buttons, two things. Angles: each selected
+photo gets `NewPhotos.PER_PHOTO` (4) random, different `blend.ANGLES`, each a
+single-image FLUX Kontext edit of that photo. Blend: exactly two selected photos
+go in as chained `ReferenceLatent`s and the blend is drawn on an empty latent at
+the first photo's shape (~1 MP), so it copies neither; each Again is a new
+blend. `apps.image_studio.blend` (stdlib) builds the graphs, routes to an up
 backend with `KONTEXT` (the 5090 first) and runs them through the studio's
 client; `ui.NewPhotos` shows results as they come, and Add sends the picked
 ones through `_import_paths` (Save keeps them). Nothing is scored: measured on
-Partner, breeds kept her (new settings), while angles are hit and miss. Profile
+Partner, blends kept her (new settings), while angles are hit and miss. Profile
 right and over-the-shoulder kept her; one profile left came out as a
 short-haired look-alike, and three-quarter right barely turned. The person picks.
-Refused while a LoRA build holds the GPU. Tests: `tests/test_breed.py`.
+Refused while a LoRA build holds the GPU. Tests: `tests/test_blend.py`.
+
+**Blend anywhere** (Sitter 2026-09-29: "put real infrastructure behind it"; asked
+which - records and the queue, controls, likeness scoring, or blend anywhere - he
+chose "Blend anywhere"). Blend is also a tool of the whole Image Studio, not only
+of a person's references: any two pictures, of anything. It is a job mode like
+Try On's, so it has no queue or record of its own. Settings are `{"mode":
+"blend", "seed", "backend", "blend": {"images": [a, b], "person", "words"}}`;
+`Studio.submit` and `Studio.run_job` hand that mode to `blend.submit` and
+`blend.run_job` (imported inside the call: `blend` imports `imagegen`). The job
+waits its turn in the backend's lane, shows Sampling → Decoding → Complete
+(`blend.STAGES`), and is kept in History by `blend.record` with both pictures
+under `references`, so it is in the Image library too, Generate Again remakes it
+from its seed, and New seed is another. Its graph is its one `_run_pass`
+("Blend"), so the record's `graph` is empty and the Nodes view shows it once.
+`blend_words(person, words)`: with `person` the words are the identity editor's
+(`BLEND` + `KEEP`), without they are `BLEND_PICTURES`, which keeps nobody - two
+landscapes have no face to keep. `blend.problem` refuses, in words, fewer than two
+pictures, the same one twice, and a file that is gone - at submit and again when
+the job's turn comes. `route(studio, settings)` now honours a named backend and
+`prefer_backend`. The window is `ui.BlendWindow` (one, raised when open;
+`ImageStudio.blend(first, settings)`): two places, each filled from Library…
+(`ImageLibraryWindow(pick=…)`, the library as a chooser) or File…, Swap, a switch
+for the same person, and words to add. It opens from Blend… beside Fix a spot,
+"Blend with…" on the picture's menu, Blend… in the Image library, and Reuse
+settings on a blend. Each Blend is a new seed. The new picture takes picture 1's
+shape. Not built, because he did not choose them: a balance between the two
+pictures, what to take from which, more than two, and scoring. The identity
+editor's Blend is unchanged: its results go to the person's references, not to
+History. Tests: `TestBlendJob`, `TestWords` in `tests/test_blend.py`;
+`test_blend_is_a_window_of_its_own_that_sends_a_job` in `tests/test_imagegen.py`.
 
 Angles asks which way to look before it draws (Sitter 2026-09-29: "use angles as a
 preset and ask which way we want it to look based on a cube like bambu studio has").
@@ -929,8 +961,8 @@ RIGHT/LEFT are *theirs*, so seen from in front their right face is on screen lef
 Each face is cut in three both ways, into 26 parts (6 face middles, 12 edge strips,
 8 corners). Each part is a view key `(x, y, z)` in the person's frame: the camera
 stands out along it. A click picks or drops a part; a drag (more than `DRAG` px)
-turns the cube. `breed.view_name` names the key ("front right", "back left from
-above", "straight below") and `breed.view_prompt` words it. Each prompt says where
+turns the cube. `blend.view_name` names the key ("front right", "back left from
+above", "straight below") and `blend.view_prompt` words it. Each prompt says where
 the camera went *and* which edge of the picture they face, because "their left" and
 the picture's left are opposite ways round: with the camera at their right they face
 the picture's right. These are reference photos of a face, so back views have them
@@ -1162,8 +1194,37 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
   the sectioned text (ORIGINAL USER INTENT, CANONICAL ..., PRESERVE,
   CORRECT) to the log; `generator_prompt` is the prose FLUX reads, with a
   close-up head for a crop.
+- **Every pass is scored by the next look** (2026-09-29). What a pass redrew
+  are its *faults* (`as_faults`: numbered, `tries` counted); the next
+  question asks after each by number (`FOLLOWUP_PROMPT`) and the answer's
+  `followups` say CLEARED, PERSISTS, WORSE or UNKNOWN (`score_fixes`; a fault
+  the model skipped is read from its observations by name, else UNKNOWN -
+  never a guess). PERSISTS goes again *harder* (`critic.harder`: +0.15 a
+  try up to `CRITIC_DENOISE_TOP`; a hand's top is its 0.6, so its second try
+  is a new seed and the critic's newer words), with the followup's
+  `correction` as the fix. After `MAX_TRIES` (2) it is `left` to the user and
+  never planned again, even if the critic names it again (`closed`). A pass
+  with a WORSE and no CLEARED is taken back (`went_wrong`): the files before
+  it are the picture again. So there is one look more than passes - the
+  last pass is looked at too, with no redraw after it. This is the only
+  thing that carries from look to look; the corrections still do not.
+- **The user's notes are faults too** (Fix a spot's Wrong field and
+  "Critic checks it": `fix["check"]`, a spot's `note`, the fix's `note` for
+  spots without one). `run_fix` redraws the spots as always, then hands
+  `_refine` `marked` - `critic.user_faults` (confidence 1.0, tried once),
+  `redo` (the fix's own `redraw` closure, on some spots, each with its own
+  prompt and denoise through `face_graph`'s `faces[i]["prompt"]`) and the
+  spots' crops. Then only the marked spots are followed: what else the
+  critic sees is logged, never redrawn, since a fix changes only its
+  squares. The critic is shown up to `CLOSEUPS` (3) spots cut large
+  (`_closeups`: ImageCropV2 -> PreviewImage) *instead of* the references;
+  without them it judges by the whole picture. A note says what is wrong,
+  for the critic; Describe says what to draw, for the model. The note never
+  goes into a prompt, and the critic never rewords it.
 - **The record says what happened.** `record["refinement"]` holds the
-  intent, final canonical state, the pass history and why it stopped;
+  intent, final canonical state, the pass history (each pass with the
+  `scores` of its fixes, and `taken_back`), every fault's last score
+  (`scores`), what was given up (`left`) and why it stopped;
   `image-studio/visual_critic.log` has each pass's matches, mismatches and
   chosen action. Faces are not matched to characters: a face correction
   redraws every face with every character's description.
