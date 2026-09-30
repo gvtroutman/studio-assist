@@ -1040,6 +1040,49 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   recipe, unchanged). FLUX names none and redraws with its own `euler` at
   0.4, as before (not measured there). A sampler typed in Advanced is the
   picture's, not its redraws'.
+- **The face pass, like the hands pass, is for pictures whose words name a
+  person** (2026-09-30). Its prompt draws "a real human face ... natural lips
+  and teeth" on whatever SAM3 calls a face, and a fox's is one to it: High
+  Quality Final on "a red fox in snow" gave the fox a person's mouth.
+  `compose` turns the pass off, with a note, when neither the form, an
+  identity, a scene's people nor the scene's words (`has_person`) name
+  anyone; the rest of the preset (the refine pass) stays.
+- **The Z-Image refine pass enlarges with an upscale model** (a workflow's
+  `refine_model`; `zimage_hq` nodes 46-49; 2026-09-30, the user: "download the
+  upscale model and finish the refine pass"). The pass was ComfyUI's own
+  Z-Image upscaler recipe less its model: lanczos, then a redraw that had a
+  blur to sharpen. `RealESRGAN_x4plus.safetensors` (Comfy-Org's repackaging,
+  BSD-3, 66,857,836 bytes, sha256 37f9a931...9a60bb checked against Hugging
+  Face) is in `D:\ComfyUI-models\upscale_models` on the 5090; ComfyUI listed
+  it without a restart. The picture goes through it (x4), comes down to the
+  size asked (`refine_model_by` = upscale / 4), and is redrawn. Three things
+  were measured rather than taken from the template (five pictures, then
+  three portraits through the engine with the library's LoRAs; ArcFace
+  against the plain enlargement, and the skin's fine texture):
+  - *The redraw is `euler_ancestral`/beta, 5 steps, at 0.2*, not the
+    template's `dpmpp_2m_sde`/beta at 0.33, which left scales and specks on
+    skin and fur and kept 0.59 of a face's likeness (the same with lanczos
+    or the model under it). At 0.2 it keeps 0.82-0.89 and as much fine
+    texture as the base picture had. Lower is nearer still (0.93-0.96 at 0.1)
+    but leaves the model's scratch-like hairs on knitwear; 0.25 and 0.3
+    smooth the skin more, not less, and drift further. So 0.2 is the least
+    that takes the model's artifacts out.
+  - *The model's enlargement is laid half and half with lanczos's*
+    (`refine_blend` 0.5, `ImageBlend`). Alone it smooths skin and oversharpens
+    fur; half and half was nearest on likeness (0.84 against 0.83 alone and
+    0.78 for lanczos at the strength that needs) and kept faint freckles the
+    model alone lost. A small gain, one node.
+  - *Without the model on a backend* (`inventory`, or the two nodes) the
+    pass is lanczos as before, redrawn at 0.25 (`refine_model.without`), and
+    a warning names the file and its folder. It is never a reason to fail,
+    and never part of a model's readiness. The 3090 has no upscale model.
+  The record's `refine` says what ran (`model`, `sampler`, `scheduler`,
+  `steps`, `denoise`), and History's line names the model. 2x on a 1024²
+  picture adds about 10 s on the 5090. FLUX's refine pass is unchanged:
+  tried on three FLUX pictures, the model made little difference there (its
+  pictures are soft-focus by design), and 0.2 against its 0.3 kept faces
+  nearer (0.95 and 0.90 against 0.89 and 0.84) - too few pictures to change
+  it on.
 - **The 5090's ComfyUI (2026-09-25)** is ComfyUI v0.37.2 (the 3090's version),
   git-cloned into `D:\ComfyUI` with its own Python 3.12 venv and PyTorch
   2.11.0+cu130 (Blackwell; cu128 until 2026-09-29). Keep torch on the CUDA

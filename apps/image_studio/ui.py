@@ -2630,8 +2630,10 @@ class ImageStudio:
         if rec.get("guidance") is not None:
             bits.append("guidance %s" % rec["guidance"])
         if rec.get("refine"):
-            bits.append("refined x%s at %s" % (rec["refine"].get("upscale"),
-                                               rec["refine"].get("denoise")))
+            bits.append("refined x%s at %s%s" % (
+                rec["refine"].get("upscale"), rec["refine"].get("denoise"),
+                " (%s)" % os.path.splitext(rec["refine"]["model"])[0]
+                if rec["refine"].get("model") else ""))
         if (rec.get("face_detail") or {}).get("redrawn"):
             bits.append("%d face(s) redrawn at %s" % (rec["face_detail"]["redrawn"],
                                                      rec["face_detail"].get("denoise")))
