@@ -113,10 +113,12 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(len(listed), 1)
         self.assertNotIn('finish', listed[0])
 
-    def finish_job(self, glasses, hands=(), profile=True, tone=False, **settings):
+    def finish_job(self, glasses, hands=(), profile=True, tone=False, masks=None, **settings):
         """Generate (with a face profile, unless `profile` is False) on a
         ComfyUI with SAM3, whose finder at the end sees one face, `glasses`
-        and `hands` [(x, y, w, h)]; `tone`, it has the tone-match node."""
+        and `hands` [(x, y, w, h)] or, with SAM3's score, [(x, y, w, h,
+        score)]; `tone`, it has the tone-match node. `masks` is what the
+        face swap's report says its masks were (none said, before them)."""
         if profile:
             self.profile()
 
@@ -132,8 +134,9 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
                     outputs = {"7": {"text": ["1024"]}, "8": {"text": ["1024"]}}
                     for k in (k for k in graph if k.endswith("t") and k.startswith("p")):
                         outputs[k[:-1] + "v"] = {"text": [json.dumps([[
-                            {"x": x, "y": y, "width": w, "height": h}
-                            for x, y, w, h in said[graph[k]["inputs"]["text"]]]])]}
+                            dict({"x": b[0], "y": b[1], "width": b[2], "height": b[3]},
+                                 **({"score": b[4]} if len(b) > 4 else {}))
+                            for b in said[graph[k]["inputs"]["text"]]]])]}
                     return {"status": {"completed": True}, "outputs": outputs}
                 return super().listen_for_progress(pid, on_event, stop, timeout)
         self.studio.client_factory = FinishClient
@@ -142,9 +145,10 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         s = dict(self.settings(), **settings)
         if not profile:
             s["identities"] = []
+        report = dict({'outside_mask_changed_pixels': 0}, **({'masks': masks} if masks else {}))
         with patch.object(ff, 'available', return_value=True), \
                 patch.object(ff, 'swap', side_effect=lambda *a, **k: (
-                    order.append('swap') or (PNG, {'outside_mask_changed_pixels': 0}))):
+                    order.append('swap') or (PNG, dict(report)))):
             jobs = self.studio.submit(s)
             settle(jobs)
         client = FakeClient.instances[-1]
@@ -230,12 +234,109 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual([label for label, _g in comfy_view.graph_steps(job.record)],
                          ["Picture", "Eye pass", "Hands", "Glasses"])
 
+    def test_a_swap_that_went_behind_the_glasses_leaves_them_as_drawn(self):
+        # Live, 2026-09-29: with FaceFusion's occlusion mask the frames are the
+        # picture's own, to the pixel. Redrawn all the same they came back as
+        # other glasses, and the likeness fell from 0.81 to 0.73.
+        job, client, order = self.finish_job([(460, 272, 60, 22)],
+                                             hands=[(200, 600, 70, 80)],
+                                             masks=list(ff.SWAP_MASKS))
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertIn("occlusion", ff.SWAP_MASKS)
+        find, eyes, hands = client.graphs[-3:]
+        self.assertEqual([find[k]["inputs"]["text"] for k in ("p0t", "p1t")],
+                         ["face:8", ig.HAND_FIND])          # the glasses are not looked for
+        self.assertNotIn("p2t", find)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Eye pass", "Hands"])
+        self.assertTrue(any(n.startswith("No glasses pass") for n in job.record["notes"]),
+                        job.record["notes"])
+        self.assertNotIn(("glasses", "Glasses"),
+                         ig.pipeline_stages(self.studio.lib, job.settings))
+        # Asked for, they are redrawn whatever the swap kept; refused, never.
+        job, client, _ = self.finish_job([(460, 272, 60, 22)], masks=list(ff.SWAP_MASKS),
+                                         glasses_pass=True)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Eye pass", "Glasses"])
+        self.assertIn(("glasses", "Glasses"), ig.pipeline_stages(self.studio.lib, job.settings))
+        job, client, _ = self.finish_job([(460, 272, 60, 22)], glasses_pass=False)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Eye pass"])
+        self.assertFalse(any("glasses" in n.lower() for n in job.record["notes"]),
+                         job.record["notes"])
+
+    def test_the_hands_pass_takes_sam3s_surest_hands_and_leaves_them_as_they_were(self):
+        # What SAM3 said of a carpenter at his bench (live, 2026-09-29): his two
+        # hands, the forearm round each, and a thing a few pixels wide. Taken
+        # biggest first the forearms won, and the hands in them were dropped
+        # as their copies.
+        hands = [(561, 655, 188, 187, 0.86), (316, 619, 165, 180, 0.83),
+                 (448, 879, 30, 18, 0.65), (261, 534, 224, 268, 0.46),
+                 (559, 557, 291, 287, 0.33)]
+        job, client, _ = self.finish_job([], hands=hands, profile=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        graph = client.graphs[-1]
+        self.assertIn("fc2_1", graph)
+        self.assertNotIn("fc3_1", graph)
+        areas = [graph["fc%d_a1" % i]["inputs"] for i in (1, 2)]
+        crops = [graph["fc%d_1" % i]["inputs"]["crop_region"] for i in (1, 2)]
+        for area, crop, (x, y, w, h, _s) in zip(areas, crops, hands[:2]):
+            # The part redrawn is the hand's own box, grown, at the redraw's size.
+            k = ig.FACE_EDIT / float(crop["width"])
+            self.assertAlmostEqual(area["width"] / k, w * (1 + 2 * ig.FIX_AREA_GROW), delta=3)
+        self.assertIn("Hands pass: 2 hands redrawn, denoise 0.4.", job.record["notes"])
+        # A finish: gentle enough to leave a good hand as it was (0.6 took a
+        # ring off, 0.4 did not), and sampled as a redraw is on this model.
+        self.assertEqual(ig.HAND_DENOISE, 0.4)
+        self.assertEqual(graph["fc1_4"]["inputs"]["denoise"], 0.4)
+        self.assertEqual(graph["fc1_4"]["inputs"]["sampler_name"], "euler_ancestral")
+        self.assertEqual(graph["fc1_4"]["inputs"]["scheduler"], "beta")
+        self.assertEqual(graph["fc1_4"]["inputs"]["steps"], 8)
+        # The picture itself is sampled as ever.
+        first = client.graphs[0]
+        self.assertEqual(first["40"]["inputs"]["sampler_name"], "res_multistep")
+
+    def test_real_hands(self):
+        hand, again, arm = (100, 100, 80, 90, "hand", 0.9), (104, 98, 84, 92, "hand", 0.7), \
+            (60, 40, 200, 240, "hand", 0.55)
+        far, unsure = (700, 600, 30, 36, "hand", 0.92), (500, 500, 90, 90, "hand", 0.45)
+        kept = ig.real_hands(1024, 1024, [arm, unsure, again, far, hand])
+        self.assertEqual(kept, [hand])
+        # A hand beside another is its own; on a bigger picture a small one is smaller.
+        other = (400, 100, 80, 90, "hand", 0.8)
+        self.assertEqual(ig.real_hands(1024, 1024, [other, hand]), [hand, other])
+        self.assertEqual(ig.real_hands(600, 600, [far]), [far])
+        self.assertEqual(ig.real_hands(1024, 1024, []), [])
+
+    def test_a_picture_of_no_one_gets_no_hands_pass(self):
+        # SAM3 scored a red fox's paws 0.87 as hands, and the pass redrew
+        # them as "a human hand with four fingers and a thumb".
+        job, client, _ = self.finish_job([], hands=[(380, 900, 74, 51, 0.87)], profile=False,
+                                         scene="A red fox sitting in fresh snow at dawn")
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertFalse(any("p0d" in g for g in client.graphs))      # SAM3 is not asked
+        self.assertEqual(job.record["passes"], [])
+        self.assertIn("No hands pass: the picture's words name no person.",
+                      job.record["notes"])
+        self.assertNotIn(("hands", "Hand pass"),
+                         ig.pipeline_stages(self.studio.lib, job.settings))
+        self.assertIn(("hands", "Hand pass"), ig.pipeline_stages(
+            self.studio.lib, dict(job.settings, scene="A man feeding a fox")))
+        # A person is known by their trade too, and a thing is not a person.
+        for scene in ("A chef plating a dish in a kitchen", "Two climbers on a ridge",
+                      "A bride and groom on the steps", "Grandmother's hands kneading dough",
+                      "The pianist at a grand piano"):
+            self.assertTrue(ig.hand_pass({"scene": scene}), scene)
+        for scene in ("A red bicycle against a white wall", "A lighthouse in a storm",
+                      "A bowl of ramen on a wooden table", "Snow on a mountain pass"):
+            self.assertFalse(ig.hand_pass({"scene": scene}), scene)
+        self.assertTrue(ig.hand_pass({"scene": "A lighthouse", "identities": ["person"]}))
+        self.assertTrue(ig.hand_pass({"scene": "A lighthouse", "subject": "a sailor"}))
+        self.assertFalse(ig.hand_pass({"scene": "A chef", "hand_pass": False}))
+
     def test_the_hands_pass_can_be_turned_off(self):
         job, client, _ = self.finish_job([], hands=[(200, 600, 70, 80)], profile=False,
                                          hand_pass=False)
         self.assertEqual(job.status, 'complete', job.detail)
         self.assertFalse(any("p0d" in g for g in client.graphs))
-        self.assertFalse(any("hand" in n.lower() for n in job.record["notes"]),
+        self.assertFalse(any("hands pass" in n.lower() for n in job.record["notes"]),
                          job.record["notes"])
         # With a swap, the eyes and glasses are still done, and no hands.
         job, client, _ = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)],
