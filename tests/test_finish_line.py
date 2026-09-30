@@ -113,12 +113,14 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(len(listed), 1)
         self.assertNotIn('finish', listed[0])
 
-    def finish_job(self, glasses, hands=(), profile=True, tone=False, masks=None, **settings):
+    def finish_job(self, glasses, hands=(), profile=True, tone=False, masks=None,
+                   enhance=None, **settings):
         """Generate (with a face profile, unless `profile` is False) on a
         ComfyUI with SAM3, whose finder at the end sees one face, `glasses`
         and `hands` [(x, y, w, h)] or, with SAM3's score, [(x, y, w, h,
         score)]; `tone`, it has the tone-match node. `masks` is what the
-        face swap's report says its masks were (none said, before them)."""
+        face swap's report says its masks were (none said, before them),
+        `enhance` the face enhancer it says ran after it."""
         if profile:
             self.profile()
 
@@ -146,6 +148,8 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         if not profile:
             s["identities"] = []
         report = dict({'outside_mask_changed_pixels': 0}, **({'masks': masks} if masks else {}))
+        if enhance:
+            report['enhance'] = enhance
         with patch.object(ff, 'available', return_value=True), \
                 patch.object(ff, 'swap', side_effect=lambda *a, **k: (
                     order.append('swap') or (PNG, dict(report)))):
@@ -261,6 +265,40 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual([p["label"] for p in job.record["passes"]], ["Eye pass"])
         self.assertFalse(any("glasses" in n.lower() for n in job.record["notes"]),
                          job.record["notes"])
+
+    def test_a_swap_the_face_enhancer_sharpened_gets_no_eye_pass(self):
+        # The eye pass is there for the soft eyes a swap leaves. After a face
+        # enhancer it cost likeness for eyes no sharper (live, 2026-09-30).
+        self.assertTrue(ig.eye_pass([{'masks': ['box']}]))
+        self.assertFalse(ig.eye_pass([{'enhance': 'gfpgan_1.4'}]))
+        self.assertTrue(ig.eye_pass([{'enhance': 'gfpgan_1.4'}, {'enhance': None}]))
+        job, client, _ = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)],
+                                         masks=list(ff.SWAP_MASKS), enhance='gfpgan_1.4')
+        self.assertEqual(job.status, 'complete', job.detail)
+        find, hands = client.graphs[-2:]
+        self.assertEqual(find["p0t"]["inputs"]["text"], ig.HAND_FIND)   # no face is looked for
+        self.assertNotIn("p1t", find)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Hands"])
+        self.assertTrue(any(n.startswith("No eye pass: the face enhancer")
+                            for n in job.record["notes"]), job.record["notes"])
+        # Nothing left to do at the end: nothing is looked for at all.
+        job, client, _ = self.finish_job([], masks=list(ff.SWAP_MASKS), enhance='gfpgan_1.4',
+                                         hand_pass=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertFalse(any("p0d" in g for g in client.graphs))
+        self.assertEqual(job.record.get("passes") or [], [])
+        # Glasses asked for: the face is found for them alone.
+        job, client, _ = self.finish_job([(460, 272, 60, 22)], masks=list(ff.SWAP_MASKS),
+                                         enhance='gfpgan_1.4', glasses_pass=True,
+                                         hand_pass=False)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Glasses"])
+        self.assertEqual([client.graphs[-2][k]["inputs"]["text"] for k in ("p0t", "p1t")],
+                         ig.FINISH_FIND)
+        # The strip shows the pass only when it will run.
+        self.assertIn(("eyes", "Eye pass"), ig.pipeline_stages(self.studio.lib, job.settings))
+        with patch.object(ff, 'enhancer', return_value='gfpgan_1.4'):
+            self.assertNotIn(("eyes", "Eye pass"),
+                             ig.pipeline_stages(self.studio.lib, job.settings))
 
     def test_the_hands_pass_takes_sam3s_surest_hands_and_leaves_them_as_they_were(self):
         # What SAM3 said of a carpenter at his bench (live, 2026-09-29): his two
