@@ -1289,8 +1289,21 @@ def has_sam3():
 # the picture as composited so far, so a face redrawn earlier is never pasted
 # over by its neighbour's crop. A face whose crop is already FACE_EDIT or more
 # was drawn at full size and is left alone.
+#
+# The redraw is light and its blend ends inside the head (FACE_DENOISE,
+# FACE_BLEND). At 0.45, which Z-Image's shift of 3 starts at 0.7 of full
+# noise, the face that came back was somebody else - a woman of seventy a man
+# of forty, a grandmother a man of thirty-five - and the oval, reaching the
+# crop's edge, blended in what the redraw had made of the scene's words
+# beside the head (a church where a tree was) and blurred a neighbour's face.
+# Measured on the 5090, 42 faces of six photographs, ArcFace against the face
+# before: 0.24 as it was, 0.44 at 0.3 through this oval. 0.3 is as light as
+# still mends: at 0.25 faces of 30-42 px kept smudged eyes. The scene's words
+# stay in the prompt: without them the grandmother came back a young man at
+# 0.3 too. AGENTS.md, "The face pass is light", has the numbers.
 FACE_PAD = 2.0
-FACE_DENOISE = 0.45
+FACE_DENOISE = 0.3
+FACE_BLEND = (0.75, 0.555)    # oval_png's scale and centre: face and hairline, no further
 FACE_MIN = 16                 # px: a face smaller than this is texture, not a face
 FACE_PROMPT = (
     "A close-up of one person's face from this photograph, in the same light, colour and "
@@ -1308,8 +1321,9 @@ def oval_png(size=256, scale=1.0, centre=0.53):
     """A soft white oval on black as a greyscale PNG: the face and hair of a
     head_square crop at full strength, fading out well inside the crop's
     edge, so a neighbour's face near that edge is never blended over.
-    `scale` shrinks it (Fix a spot's crop is wider than the spot, so the
-    model sees the photo round it); `centre` is its middle's height."""
+    `scale` shrinks it (a new picture's faces, FACE_BLEND; Fix a spot's crop
+    is wider than the spot, so the model sees the photo round it);
+    `centre` is its middle's height."""
     rows = []
     for y in range(size):
         row = bytearray([0])                       # PNG filter: none
@@ -1337,15 +1351,22 @@ def oval_png(size=256, scale=1.0, centre=0.53):
             + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
 
 
-def redraw_faces(g, image, crops, plan, scene, seed, denoise, recipe):
+def redraw_faces(g, image, crops, plan, scene, seed, denoise, recipe, blend=None):
     """Into g: each crop of `image` enlarged to FACE_EDIT, resampled with
     `plan`'s model (a split model with cfg 1) at `denoise`, shrunk and
     blended back through the oval. `scene` describes the picture; `recipe`
     is (steps, sampler, scheduler). Returns the link to the result."""
     if not crops:
         return image
-    res = post_multipart("/upload/image", {"overwrite": "true"}, FACE_OVAL, oval_png())
-    g["21"] = {"class_type": "LoadImage", "inputs": {"image": res.get("name", FACE_OVAL)}}
+    # `blend` is the oval's (scale, centre); without one it is the whole oval,
+    # the head and its hair. Each size is a file of its own on the server, so
+    # a swap's oval is never the one a picture's faces were about to load.
+    name, oval = FACE_OVAL, oval_png()
+    if blend:
+        name = "studio_face_oval_%d_%d.png" % (round(blend[0] * 100), round(blend[1] * 1000))
+        oval = oval_png(scale=blend[0], centre=blend[1])
+    res = post_multipart("/upload/image", {"overwrite": "true"}, name, oval)
+    g["21"] = {"class_type": "LoadImage", "inputs": {"image": res.get("name", name)}}
     model, clip, vae = load_split(g, plan)
     scene = scene.strip()
     scene = scene if scene.endswith(".") else scene + "."
@@ -1368,7 +1389,7 @@ def redraw_faces(g, image, crops, plan, scene, seed, denoise, recipe):
         g[str(n + 5)] = {"class_type": "ImageScale", "inputs": {
             "image": [str(n + 4), 0], "upscale_method": "lanczos", "width": side,
             "height": side, "crop": "disabled"}}
-        # The redrawn face and hair in full, through the soft oval (oval_png).
+        # The redraw through the soft oval (oval_png), as far as `blend` reaches.
         g[str(n + 6)] = {"class_type": "ImageScale", "inputs": {
             "image": ["21", 0], "upscale_method": "bilinear", "width": side,
             "height": side, "crop": "disabled"}}
@@ -1426,7 +1447,7 @@ def face_detail(g, plan, seed, a, header, notes):
     denoise = a.get("face_denoise", FACE_DENOISE)
     k = g["5"]["inputs"]
     last = redraw_faces(g2, ["20", 0], crops, plan, g["2"]["inputs"]["text"], seed, denoise,
-                        (k["steps"], k["sampler_name"], k["scheduler"]))
+                        (k["steps"], k["sampler_name"], k["scheduler"]), blend=FACE_BLEND)
     g2["7"] = {"class_type": "SaveImage", "inputs": {
         "filename_prefix": a.get("filename_prefix", "StudioAssistant"), "images": last}}
     notes = list(notes)
@@ -1817,8 +1838,9 @@ TOOLS = [
          "face_detail": {"type": "boolean", "description": "Default true: every face in "
                          "the finished picture is found and redrawn at full size, which turns "
                          "small, waxy faces into real ones. false only for a quick draft."},
-         "face_denoise": _n("Face detail strength. Default %s; lower keeps the face closer "
-                            "to the first draw." % FACE_DENOISE, minimum=0.2, maximum=0.7),
+         "face_denoise": _n("Face detail strength. Default %s; higher redraws more and "
+                            "strays from who the face was." % FACE_DENOISE,
+                            minimum=0.2, maximum=0.7),
          "checkpoint": _s("All-in-one checkpoint filename from comfy_list_models. Default: "
                           "a split model with a known recipe, else the first checkpoint."),
          "diffusion_model": _s("Split model: filename from comfy_list_models "

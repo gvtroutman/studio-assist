@@ -387,9 +387,11 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   teeth smeared - the detail pass enlarges that, it does not fix it. So with SAM3
   installed `comfy_generate` runs the picture to a preview with SAM3's face boxes
   beside it, then a second run crops each face `FACE_PAD` (2x) its size, enlarges it
-  to 1024, resamples it with the same model at `FACE_DENOISE` (0.45) under
-  `FACE_PROMPT` (the scene's prompt inside a face-specific one) and blends it back
-  through a soft oval (`oval_png`, a greyscale PNG the bridge draws and uploads).
+  to 1024, resamples it with the same model at `FACE_DENOISE` (0.3; it was 0.45)
+  under `FACE_PROMPT` (the scene's prompt inside a face-specific one) and blends it
+  back through a soft oval (`oval_png`, a greyscale PNG the bridge draws and
+  uploads; `FACE_BLEND` sizes it). Why that strong and that wide: "The face pass is
+  light", below.
   Two details matter. Each crop is taken from the picture as composited so far, so a
   neighbour's crop never pastes an old face back. And the blend is the oval, not the
   crop's square: in a row of faces each square holds the next person's face, and a
@@ -403,6 +405,75 @@ recipe; the wrong encoder type or latent gives noise, not an error.
   either off. The pass does not fix skin the prompt asked for: "weathered, ruddy,
   deep lines, visible pores" came back crackled and blotchy at every setting, with
   the pass and without, so the briefing says to name skin once and plainly.
+- **The face pass is light, keeps the scene's words and ends inside the head**
+  (`FACE_DENOISE` 0.3, `FACE_BLEND`, `redraw_faces(blend=)`; 2026-09-29). At 0.45
+  the pass mended eyes and teeth and changed who the face was and what stood
+  beside it. Z-Image's shift of 3 starts a denoise of 0.45 at about 0.7 of full
+  noise (0.57 at 0.3; reckoned from the shift, not read off the sampler), and from
+  there the model draws its own idea of a face: in a wedding party a woman of
+  seventy came back a man of forty, in a family on a beach the grandmother a man
+  of thirty-five. And the oval faded out only at the crop's edge, so whatever the
+  redraw had made of the background went into the picture: a church where a dark
+  tree was and arches in a plain wall (the prompt said "in front of an old stone
+  church"), small figures in the sea behind a head on a beach, and where three
+  friends sat close the largest, sharpest face of the picture blurred by its
+  neighbour's redraw. Measured on the 5090 one thing at a time: seven pictures
+  saved once (1824x1248 after the detail pass) and their 48 faces redrawn from
+  the file with the same seeds - a wedding party (8 faces, 78-108 px high), friends
+  at a table (7, 129-226), three generations on a beach (6, 90-125), colleagues at
+  a window (5, 114-120), hikers far off (8, 39-57), people on a beach further off
+  (8, 30-42) and a watercolour (6, 81-118) - with `euler_ancestral`/`simple`, the
+  `redraw` sampler of commit 6f64a2b. ArcFace (antelopev2) against the face before
+  the redraw, age and sex by InsightFace, both on the face as it lies in the
+  finished picture; eyes and teeth looked at, because mean |Laplacian| round them
+  fell with every redraw (the first draw's grain counts as detail).
+  *Strength.* 34 faces of five photographs, the whole oval: likeness 0.27 at
+  0.45, 0.37 at 0.35, 0.44 at 0.3, 0.53 at 0.25 (0.66 at 0.2 and 0.77 at 0.15 on
+  the 21 faces of three of them); faces ArcFace would call somebody else
+  (under 0.3) 20, 10, 3, 0; years taken off 7.4, 5.8, 5.1, 4.7; sex read otherwise
+  2, 0, 0, 0. Mended at 0.3 on every face, the 30-42 px ones too, which were
+  broken before the pass, eyes garbled and glasses half there. At 0.25 faces of
+  78 px and more are mended as well and the 39-57 px ones nearly, but five of the
+  eight smallest kept smudged eyes or the ghost of their glasses; at 0.2 eyes go
+  soft on the larger faces too. So 0.3: no harder, and no lighter.
+  *Words.* Taking the scene out of the face prompt was the obvious cure for the
+  church, and it cured it - and cost likeness on every picture (0.24 against 0.27
+  at 0.45, 34 faces) and age wherever the prompt says how old people are: the
+  family lost 9.7 years without it and 4.2 with, and at 0.3 the grandmother was a
+  woman with the scene and a man of twenty-seven without. Only the scene's light,
+  only the realism sentence, and a prompt without `FACE_PROMPT`'s list of what a
+  face has all came out as none did (wedding, 0.3-0.45). The crop carries the
+  light; the words carry who the people are. They stay.
+  *Oval.* `FACE_BLEND` is `oval_png`'s scale and centre, 0.75 at 0.555: full
+  strength over the face, nothing beyond 0.35 of the crop from the face's
+  middle. Mean change outside every head (0-255), 21 faces at 0.3: 0.77 through
+  the whole oval, 0.12 at 0.85, 0.02 at 0.75, 0 at 0.65 - where the oval cuts into
+  the face itself (the picture's face 1.27 from its own redraw inside the box,
+  against 0.6-0.8). At 0.45 the church still showed through 0.85 and as a ghost
+  through 0.75; at 0.3 through 0.75 the wall beside a head is the first draw's,
+  stone for stone, and the friend at the table is as sharp as she was drawn. No
+  seam in hair at any size. The face swap's pass keeps the whole oval (it blends
+  a pasted head, hair and all, and was not measured); each size is a file of its
+  own on the server (`studio_face_oval_75_555.png`).
+  *Together*, 42 faces of six photographs, as it was against as it is: likeness
+  0.24 and 0.44, faces under 0.3 28 and 4, ten years younger or more 15 and 9,
+  sex read otherwise 2 and 0, the face's colour moved 5.1 and 3.2 (Lab), change
+  outside heads 0.86 and 0.01. With main's `res_multistep`, which is what samples
+  this pass until 6f64a2b is merged, the same settings keep more and leave the
+  specks that commit is about: 0.62 against 0.44 and 2.4 years against 5.1 (23
+  faces). `comfy_generate` run for real after the change gave the experiment's
+  picture pixel for pixel.
+  Seen and not fixed. The pass still takes six years off a face and ten or more
+  off one in five; the woman of seventy is at 0.3 somebody of fifty who could be
+  either. A strength by size would keep more - 0.25 mends everything from 78 px
+  up, at 0.56 against 0.47 - but where between 57 and 78 px to change over was
+  not measured. A painted picture loses its paint: the watercolour's faces came
+  back smooth at every setting, scene words or none, and through the smaller
+  oval the smooth face now sits in painted surroundings. Faces of 130 px and
+  more were good before the pass, which costs them likeness and gains little.
+  Where heads touch, a neighbour's oval still reaches the face. Not run: the
+  3090, a LoRA, the chat tab's own model calling the tool.
+  Pictures, sheets and scripts: `D:\ComfyUI\output\ImageStudio\_exp\chat_identity`.
 - **Every picture a bridge saved says where** (`_meta.path` on the image block).
   The transcript's preview is shrunk to fit; right-click on it saves, opens,
   shows or copies the full-size file, and a double-click opens it
