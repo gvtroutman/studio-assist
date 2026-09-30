@@ -2603,10 +2603,13 @@ class TestSceneBuilderWindow(unittest.TestCase):
     def test_a_background_crowd_in_the_window(self):
         ui, sb = self.builder()
         # Two people, not twelve: every one is drawn again at each change,
-        # and nothing here counts them.
+        # and nothing here counts them. Stood a metre square where the camera
+        # looks, not 6 x 3 m: two in the wide area, dealt by the shuffle's
+        # random seed, were both out of the frame about one seed in fifty,
+        # and the words rightly left the crowd out.
         real = sc.new_crowd
         self.addCleanup(setattr, sc, "new_crowd", real)
-        sc.new_crowd = lambda: dict(real(), count=2)
+        sc.new_crowd = lambda: dict(real(), count=2, width=1.0, depth=1.0)
         crowd = sb.add("crowd")
         self.assertIn("crowd_count", sb.vars)
         self.assertTrue(sb.canvas.find_withtag("o:" + crowd["id"]))
