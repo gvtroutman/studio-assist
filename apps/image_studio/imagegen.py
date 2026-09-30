@@ -3499,6 +3499,11 @@ FOLDER_WORDS = {"diffusion_models": "diffusion model", "checkpoints": "checkpoin
                 "model_patches": "model patch (a Z-Image ControlNet)"}
 
 
+# The refine pass's enlargement by a super-resolution model (a workflow's
+# `refine_model`): ComfyUI's own nodes.
+REFINE_MODEL_NODES = {"UpscaleModelLoader", "ImageUpscaleWithModel", "ImageBlend"}
+
+
 def _names(when):
     """A node's `_when`: one name or a list of them."""
     return when if isinstance(when, list) else [when]
@@ -4742,6 +4747,39 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         v["upscale"] = round(scale, 3)
         if scale <= 1.05:
             v["refine"] = False
+    # What enlarges the picture before the redraw: a super-resolution model
+    # when the workflow names one (`refine_model`) and the backend has it,
+    # else lanczos, and said - the redraw then sharpens a blur.
+    v.pop("refine_model", None)
+    rm = wf.get("refine_model") or {}
+    var = rm.get("file")
+    name = (v.get(var) or (wf.get("defaults") or {}).get(var)) if var else ""
+    if v.get("refine") and name:
+        folder = (wf.get("files") or {}).get(var, "upscale_models")
+        there = inventory is None or name in inventory.get(folder, ())
+        short = sorted(REFINE_MODEL_NODES - set(nodes)) if nodes is not None else []
+        if there and not short:
+            up = float(v.get("upscale") or (wf.get("defaults") or {}).get("upscale") or 1.5)
+            v[var] = name
+            v["refine_model"] = True
+            v["refine_model_by"] = round(up / float(rm.get("scale") or 4), 6)
+        else:
+            v.pop(var, None)
+            # A blur needs a deeper redraw to become detail than a picture
+            # the model has already sharpened: the workflow's values for the
+            # pass without it, where the user set none.
+            for k, x in (rm.get("without") or {}).items():
+                if s.get(k) in (None, ""):
+                    v[k] = x
+            p.warnings.append(
+                "Refine: %s lacks %s, so the picture is enlarged by lanczos before its "
+                "redraw, which is softer." % (backend["name"], (
+                    "%s (the %s, in ComfyUI/models/%s)" % (
+                        name, FOLDER_WORDS.get(folder, folder), folder) if not there
+                    else "the node%s %s" % ("" if len(short) == 1 else "s",
+                                            ", ".join(short)))))
+    elif var:
+        v.pop(var, None)
 
     # The face pass needs the template's face_detail section, a SAM3
     # checkpoint to find the faces and the stock nodes it is built from. It
@@ -4762,6 +4800,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         v["face_detail"] = False
         p.notes.append("WithAnyone draws the identities together. Face redraw, photo paste "
                        "and automatic refinement are off for this recipe.")
+    # The face pass draws "a real human face ... natural lips and teeth" on
+    # what SAM3 calls a face, and a fox's is one to it: High Quality Final
+    # gave a fox a person's mouth (2026-09-30). Like the hands pass, it is
+    # for pictures whose words name a person.
+    if (v.get("face_detail") and not someone and not form_face
+            and not (s.get("scene_faces") or {}).get("people")):
+        v["face_detail"] = False
+        p.notes.append("No face pass: the picture's words name no person.")
     if v.get("face_detail"):
         asked = (s.get("face_detail") or preset["values"].get("face_detail")
                  or bool(form_face))
@@ -7624,6 +7670,7 @@ class Studio:
         model = self.lib.get("models", s.get("model")) or {}
         style = self.lib.get("styles", s.get("style")) if s.get("style") else None
         v = p.values
+        made = p.workflow.get("defaults") or {}
         now = time.time()
         idents = []
         for sel in s.get("identities") or []:
@@ -7657,8 +7704,16 @@ class Studio:
             "steps": v.get("steps"), "guidance": v.get("guidance"),
             "width": v.get("width"), "height": v.get("height"),
             "denoise": v.get("denoise"),
-            "refine": ({"upscale": v.get("upscale"), "denoise": v.get("refine_denoise"),
-                        "steps": v.get("refine_steps")} if v.get("refine") else None),
+            # What the pass ran with: a value the form left alone is the
+            # workflow's own, which `fill` gave it.
+            "refine": ({"upscale": v.get("upscale", made.get("upscale")),
+                        "denoise": v.get("refine_denoise", made.get("refine_denoise")),
+                        "steps": v.get("refine_steps", made.get("refine_steps")),
+                        "sampler": v.get("refine_sampler", made.get("refine_sampler")),
+                        "scheduler": v.get("refine_scheduler", made.get("refine_scheduler")),
+                        "model": (v.get((p.workflow.get("refine_model") or {}).get("file"))
+                                  if v.get("refine_model") else None)}
+                       if v.get("refine") else None),
             "face_detail": job.face,
             "references": p.references,
             "warnings": p.warnings, "notes": p.notes + job.notes,

@@ -84,6 +84,9 @@ After Effects and Resolve use outside npm servers.
   floor (`CLOTHED`, `COVERED`), `anatomy_text` (a workflow's `"anatomy": false`
   leaves it out), `hold_loras` (a workflow's `lora_budget`). AGENTS.md "What the
   pipeline adds to the user's words is drawn".
+- **The refine pass** - `zimage_hq.json` (`refine_model`, nodes 42-49) and the
+  block after "A refine pass is sized" in `imagegen.compose`. AGENTS.md "The Z-Image
+  refine pass enlarges with an upscale model".
 - **The finish** - `Studio._finish_passes`: `hand_pass`, `real_hands`,
   `glasses_pass`; a redraw's sampler is the workflow's `redraw_sampler`
   (`face_graph`). Tests: `tests/test_finish_line.py`.
