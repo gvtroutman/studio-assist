@@ -1475,12 +1475,29 @@ lips; the skin stays smooth (it does not bring pores or freckles back).
 ArcFace, the swap alone on the five heads: 0.846 without, 0.839 at blend 20,
 0.832 at 40, 0.818 at 60, 0.802 at 80. At the end of the pipeline the eye
 pass redraws the eyes it sharpened, and little shows for the cost: 0.812
-without, 0.797 at 40, 0.786 at 60. So it is off. Two things for the user to
-weigh, not done: with GFPGAN at 60 and NO eye pass the end is 0.818 - above
-today's 0.812 - with crisp eyes in Klein's own colour, where the eye pass
-turned blue-grey eyes brown on one picture of three looked at; and the
-enhancer is only ever run when its model and hash are installed, never
-fetched by the app. `MODELS` is FaceFusion's model folder.
+without, 0.797 at 40, 0.786 at 60. So it is off. The enhancer is only ever
+run when its model and hash are installed, never fetched by the app.
+`MODELS` is FaceFusion's model folder.
+
+**After the enhancer there is no eye pass** (`eye_pass`, in
+`_finish_passes` and `pipeline_stages`; 2026-09-30, the user: "try gfpgan 60
+without the eye pass"). The eye pass is there for the soft eyes a swap
+leaves; after GFPGAN it cost 0.03 for eyes no sharper, so a swap whose
+report names an enhancer (`enhance`) gets none, with a note, and the face is
+not looked for unless the glasses are to be redrawn. The trial itself, end
+to end on the five cases on main's redraw (beta): the swap then the eye
+pass 0.813 (0.815 / 0.813 / 0.789 / 0.826 / 0.821), GFPGAN at 60 and no eye
+pass 0.818 (0.830 / 0.827 / 0.786 / 0.829 / 0.819) - the same likeness, ten
+seconds sooner, one pass fewer to fail (the eye pass failed once in these
+runs on a ComfyUI three sessions were using: "hostbuf_file_reader_read
+failed", and the picture was kept as the swap left it, as it should be).
+Looked at, neither wins. The eye pass draws clear, bright eyes and gets
+their colour wrong on 2 of 5 (brown where Klein had drawn blue-grey: its
+prompt, `EYE_WHAT`, says nothing of the colour). Without it the eyes are
+inswapper's behind the glasses, sharpened: darker, softer, heavy-lidded, in
+Klein's colour on 3 of 5 and one eye darker than the other on 2. So the
+default stays the eye pass with no enhancer. If the eye pass is to be
+bettered, tell it the person's eye colour.
 
 **What the two repairs come to, end to end** (2026-09-29, `Studio.run_job` on
 a copy of the library, Partner's job of 15:09 on 5 seeds: three before a plain
