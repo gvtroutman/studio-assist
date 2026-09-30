@@ -130,6 +130,27 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
         # Below the eyes (0.40 down the swap's crop), above the tip of the nose (0.56).
         self.assertTrue(0.44 < ff.SWAP_LENS_LINE < 0.56)
 
+    def test_the_face_enhancer_runs_only_when_its_model_is_installed(self):
+        models = Path(self.dir) / 'models'
+        models.mkdir()
+        with patch.object(ff, 'MODELS', models), patch.object(ff, 'SWAP_ENHANCE', 'gfpgan_1.4'):
+            self.assertIsNone(ff.enhancer())            # nothing installed: no download
+            self.assertNotIn('--enhance', self.swap_args())
+            (models / 'gfpgan_1.4.onnx').write_bytes(b'x')
+            self.assertIsNone(ff.enhancer())            # no hash file: FaceFusion would fetch
+            (models / 'gfpgan_1.4.hash').write_text('5a6c6364')
+            self.assertEqual(ff.enhancer(), 'gfpgan_1.4')
+            args = self.swap_args()
+            at = args.index('--enhance')
+            self.assertEqual(args[at + 1:at + 4],
+                             ['gfpgan_1.4', '--enhance-blend', str(ff.SWAP_ENHANCE_BLEND)])
+            with patch.object(ff, 'SWAP_ENHANCE', ''):
+                self.assertIsNone(ff.enhancer())
+                self.assertNotIn('--enhance', self.swap_args())
+        # Off as shipped: after the eye pass little of it shows, for 0.015-0.026.
+        self.assertEqual(ff.SWAP_ENHANCE, '')
+        self.assertTrue(0 < ff.SWAP_ENHANCE_BLEND <= 100)
+
     def test_a_failed_swap_says_why_in_the_workers_own_words(self):
         refused = ('[FACEFUSION.CORE] processing step 1 of 1\n'
                    'Traceback (most recent call last):\n'
@@ -342,6 +363,20 @@ class TestKeptSources(unittest.TestCase):
         self.assertAlmostEqual(float(self.tool.under_lenses(
             mask, glasses * 0.5, 0.47, np)[55, 50]), 0.5)
         self.assertIs(self.tool.under_lenses(mask, glasses, 0.0, np), mask)
+
+    def test_the_enhancers_change_comes_through_the_swaps_own_mask(self):
+        np = self.np
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        enhanced = np.full((4, 4, 3), 200, dtype=np.uint8)
+        enhanced[0, 0] = 0
+        soft = np.zeros((4, 4), dtype=np.float32)
+        soft[1, 1], soft[2, 2], soft[0, 0] = 1.0, 0.5, 1.0
+        out = self.tool.through(frame, enhanced, soft, np)
+        self.assertEqual(out.dtype, np.uint8)
+        self.assertEqual(out[1, 1].tolist(), [200, 200, 200])     # inside the swap: enhanced
+        self.assertEqual(out[2, 2].tolist(), [150, 150, 150])     # its soft edge: half
+        self.assertEqual(out[3, 3].tolist(), [100, 100, 100])     # outside: the swap's own
+        self.assertEqual(out[0, 0].tolist(), [0, 0, 0])           # darker is taken too
 
     def test_only_the_newest_sets_are_kept(self):
         refs = self.photos()

@@ -110,6 +110,15 @@ def under_lenses(mask, glasses, line, np):
     return mask * (1 - glasses * below)
 
 
+def through(frame, enhanced, soft, np):
+    """`enhanced` (the face enhancer's frame) taken over `frame` (the swap's)
+    through `soft`, the mask the swap was blended with: outside the swap
+    nothing changes, and at its soft edge the enhancer fades as the swap
+    does."""
+    change = enhanced.astype(np.float32) - frame.astype(np.float32)
+    return np.clip(frame + change * soft[..., None], 0, 255).astype(np.uint8)
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -144,6 +153,11 @@ def main():
                         help='Behind glasses, what lies below this line of the swap\'s own '
                              'crop (0-1 down it; the eyes are at 0.40) stays the picture\'s '
                              'own. 0: all that is behind them is swapped.')
+    parser.add_argument('--enhance', default='',
+                        help='FaceFusion\'s face enhancer model after the swap ("gfpgan_1.4"); '
+                             'none when not given. Its model must be installed already.')
+    parser.add_argument('--enhance-blend', type=int, default=80,
+                        help='How much (0-100) of the enhanced face is taken.')
     parser.add_argument('--deweave', type=float, default=0.0,
                         help='How much (0-1) of pixel boost\'s weave is evened out of the '
                              'swapped face.')
@@ -204,9 +218,14 @@ def main():
         result = paste_back(frame, crop, mask, matrix)
         box, inverse = face_helper.calculate_paste_area(frame, crop, matrix)
         x1, y1, x2, y2 = box
+        soft = cv2.warpAffine(mask, inverse, (x2-x1, y2-y1))
         support = np.zeros(frame.shape[:2], dtype=bool)
-        support[y1:y2, x1:x2] = cv2.warpAffine(mask, inverse, (x2-x1, y2-y1)) > 0
+        support[y1:y2, x1:x2] = soft > 0
         captured['mask'] = captured.get('mask', np.zeros_like(support)) | support
+        # The mask as FaceFusion blended with it, for what comes after the swap.
+        weights = captured.get('soft', np.zeros(frame.shape[:2], dtype=np.float32))
+        weights[y1:y2, x1:x2] = np.maximum(weights[y1:y2, x1:x2], soft.astype(np.float32))
+        captured['soft'] = weights
         captured['frame'] = result.copy()
         captured['count'] = captured.get('count', 0) + 1
         return result
@@ -248,8 +267,23 @@ def main():
         if boost:
             state_manager.set_item('face_swapper_pixel_boost', boost)
             captured['pixel_boost'] = boost
+        captured['target'] = faces[index]
         return [faces[index]]
     swapper.select_faces = select_target
+    # FaceFusion's face enhancer after the swap, on the same face: its change
+    # is taken through the swap's own mask (`soft`), so the teeth, the cheek
+    # behind a lens and everything outside the swap stay the picture's.
+    if args.enhance:
+        from facefusion.processors.modules.face_enhancer import core as enhancer
+        enhance_face = enhancer.enhance_face
+
+        def observe_enhance(face, frame):
+            result = enhance_face(face, frame)
+            captured['enhanced'] = result.copy()
+            return result
+        enhancer.enhance_face = observe_enhance
+        enhancer.select_faces = lambda reference, sources, targets: (
+            [captured['target']] if captured.get('target') is not None else [])
     # The lens line and the weave are FaceFusion's own two steps with one of
     # ours after each. A FaceFusion that has neither under these names swaps
     # as it does, and the report says what was not done.
@@ -301,7 +335,11 @@ def main():
     raw_output = output.with_name(output.stem + '-facefusion.png')
     sys.argv = [str(ff_root / 'facefusion.py'), 'headless-run',
                 '--source-paths', *sources, '--target-path', str(target),
-                '--output-path', str(raw_output), '--processors', 'face_swapper',
+                '--output-path', str(raw_output),
+                '--processors', 'face_swapper', *(['face_enhancer'] if args.enhance else []),
+                *(['--face-enhancer-model', args.enhance,
+                   '--face-enhancer-blend', str(max(0, min(100, args.enhance_blend)))]
+                  if args.enhance else []),
                 '--face-swapper-model', args.model, '--face-selector-mode', 'one',
                 '--face-swapper-weight', str(round(round(args.weight * 20) / 20, 2)),
                 '--face-mask-types', *args.masks,
@@ -324,6 +362,9 @@ def main():
     mask = captured['mask']
     if frame.shape != original.shape:
         raise RuntimeError('FaceFusion changed the dimensions; refusing the result.')
+    enhanced = captured.get('enhanced')
+    if enhanced is not None and enhanced.shape == frame.shape:
+        frame = through(frame, enhanced[:, :, ::-1], captured['soft'], np)
     final = original.copy()
     final[mask] = frame[mask]
     tone = min(1.0, max(0.0, args.tone))
@@ -359,6 +400,8 @@ def main():
               'masks': list(args.masks), 'sources': captured.get('sources'),
               'regions': list(args.regions) if args.regions else None, 'deweave': deweave,
               'lens_line': lens_line,
+              'enhance': args.enhance or None,
+              'enhance_blend': args.enhance_blend if captured.get('enhanced') is not None else None,
               'pixel_boost': captured.get('pixel_boost'),
               'mask_pixels': int(mask.sum()), 'outside_mask_changed_pixels': outside_changes,
               'changed_pixels': int(np.any(check != original, axis=2).sum()),

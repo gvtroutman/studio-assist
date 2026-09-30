@@ -72,6 +72,18 @@ SWAP_LENS_LINE = 0.47
 # How much of pixel boost's weave is evened out (tools/facefusion_swap.py
 # `even`): all of it.
 SWAP_DEWEAVE = 1.0
+# FaceFusion's face enhancer after the swap, on the same face and through
+# the swap's own mask ('gfpgan_1.4'; '' is none), and how much of it is
+# taken (0-100). inswapper's face is soft; GFPGAN 1.4 sharpens the eyes,
+# lashes and lips and leaves the skin smooth. Its likeness cost grows with
+# the blend - the swap alone 0.846 on five heads, 0.839 at 20, 0.832 at 40,
+# 0.818 at 60, 0.802 at 80 - and after the eye pass, which redraws the eyes
+# it sharpened, little of it shows: 0.812 at the end without it, 0.797 at
+# 40, 0.786 at 60 (2026-09-29). So it is off. Sitter's to turn on; it runs
+# only when its model is installed (`enhancer`), never downloaded by the app.
+SWAP_ENHANCE = ''
+SWAP_ENHANCE_BLEND = 60
+MODELS = ROOT / '.runtime/facefusion/.assets/models'
 _SWAP_LOCK = threading.Lock()  # FaceFusion's jobs/temp directories are shared across backend lanes.
 # An error's own line in the worker's log: "RuntimeError: what went wrong".
 _ERROR = re.compile(r'^[A-Za-z_][\w.]*(?:Error|Exception): (.+)$')
@@ -196,6 +208,15 @@ def model(identity):
     return value if value in SWAP_MODELS else SWAP_MODEL
 
 
+def enhancer():
+    """The face enhancer a swap may run after it: SWAP_ENHANCE when its model
+    and hash are installed in FaceFusion's own folder, else None. FaceFusion
+    would download a missing model on its own; it is never asked to."""
+    if SWAP_ENHANCE and all((MODELS / (SWAP_ENHANCE + ext)).is_file() for ext in ('.onnx', '.hash')):
+        return SWAP_ENHANCE
+    return None
+
+
 def swap(data, identity, stop=None, face_index=None, face_count=1):
     while not _SWAP_LOCK.acquire(timeout=0.1):
         if stop and stop():
@@ -258,6 +279,8 @@ def _swap(data, identity, stop=None, face_index=None, face_count=1):
                 '--tone', str(SWAP_TONE), '--masks', *SWAP_MASKS,
                 '--regions', *SWAP_REGIONS, '--lens-line', str(SWAP_LENS_LINE),
                 '--deweave', str(SWAP_DEWEAVE)]
+        if enhancer():
+            args += ['--enhance', enhancer(), '--enhance-blend', str(SWAP_ENHANCE_BLEND)]
         if face_index is not None:
             args += ['--face-index', str(face_index), '--face-count', str(face_count)]
         if identity.get('target_region') is not None:
