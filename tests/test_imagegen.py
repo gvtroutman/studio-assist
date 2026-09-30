@@ -337,7 +337,11 @@ class TestFill(unittest.TestCase):
             ig.fill(wf, {})
 
     def test_every_shipped_template_fills(self):
-        for wf in ig.list_workflows():
+        # Each file by name: list_workflows leaves out one that will not read,
+        # and a broken template must fail here, not be skipped.
+        names = sorted(n[:-5] for n in os.listdir(ig.WORKFLOWS_DIR) if n.endswith(".json"))
+        self.assertTrue(names)
+        for wf in (ig.load_workflow(n) for n in names):
             if wf.get("built_by"):            # finished in code: tested with its builder
                 continue
             vals = {k: "x.safetensors" for k in (wf.get("files") or {})}
@@ -2361,6 +2365,123 @@ class TestErrors(unittest.TestCase):
         self.assertEqual(entry, {"status": None, "outputs": {"9": {}}})
         self.assertIn("busy", [k for k, _ in events])
         self.assertEqual(len(calls), 2)
+
+    def _waiting_client(self, where):
+        """A client whose prompt is never in /history; `where` is a list of
+        what position() answers, one per look (the last one repeats)."""
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9"})
+        c.get_history = lambda pid: None
+        looks = []
+        def position(pid):
+            looks.append(pid)
+            return where[min(len(looks), len(where)) - 1]
+        c.position = position
+        c.cancelled = []
+        c.cancel_job = lambda pid: c.cancelled.append(pid) or True
+        return c, looks
+
+    def test_a_prompt_comfyui_lost_fails_in_seconds_not_at_the_deadline(self):
+        """ComfyUI crashed or restarted mid-job: the prompt is in neither its
+        history nor its queue, and the wait used to run on to JOB_TIMEOUT
+        (30 minutes) saying only "quiet"."""
+        from unittest import mock
+        c, looks = self._waiting_client([-1, -1, None])
+        watch = ig.Watch(None, ig.queue.Queue(), "")
+        with mock.patch.object(ig, "POLL_EVERY", 0.01):
+            with self.assertRaises(ig.ComfyError) as caught:
+                c.listen_for_progress("pid", lambda k, d: None, timeout=30, watch=watch)
+        self.assertIn("no longer has prompt pid", str(caught.exception))
+        self.assertEqual(len(looks), 2 + ig.LOST_AFTER)
+        self.assertEqual(c.cancelled, [])
+
+    def test_a_prompt_seen_nowhere_fewer_times_than_lost_after_is_still_waited_on(self):
+        """A prompt that ends between the /history and the /queue read is in
+        neither once; a running one read again resets the count."""
+        from unittest import mock
+        c, looks = self._waiting_client([None] * (ig.LOST_AFTER - 1) + [-1] +
+                                        [None] * (ig.LOST_AFTER - 1))
+        entry = {"status": {"completed": True}, "outputs": {"9": {}}}
+        c.get_history = lambda pid: entry if len(looks) == 2 * ig.LOST_AFTER - 1 else None
+        watch = ig.Watch(None, ig.queue.Queue(), "")
+        with mock.patch.object(ig, "POLL_EVERY", 0.01):
+            got = c.listen_for_progress("pid", lambda k, d: None, timeout=30, watch=watch)
+        self.assertEqual(got, entry)
+
+    def test_a_wait_past_its_deadline_stops_the_prompt(self):
+        """The deadline used to leave the prompt running on the GPU, so the
+        lane's next job queued behind it and free() would not let go."""
+        from unittest import mock
+        c, _ = self._waiting_client([-1])
+        watch = ig.Watch(None, ig.queue.Queue(), "")
+        with mock.patch.object(ig, "POLL_EVERY", 0.01):
+            with self.assertRaises(ig.ComfyError) as caught:
+                c.listen_for_progress("pid", lambda k, d: None, timeout=0.05, watch=watch)
+        self.assertEqual(c.cancelled, ["pid"])
+        self.assertIn("it was stopped there", str(caught.exception))
+
+    def test_a_quick_run_rides_out_a_busy_poll_and_names_the_failing_node(self):
+        """SAM3's finders: one /history read that timed out while ComfyUI
+        staged the model ended the run; and the error named no node."""
+        from unittest import mock
+        polls = []
+        def get_history(pid):
+            polls.append(pid)
+            if len(polls) == 1:
+                raise ig.Unreachable("Cannot reach X at http://10.0.0.9:8188. (timed out)")
+            return {"status": {"status_str": "error", "messages": [["execution_error", {
+                "node_id": "fd4", "exception_type": "RuntimeError",
+                "exception_message": "no sam3 weights"}]]}}
+        client = mock.Mock(backend={"name": "X"}, get_history=get_history)
+        client.queue_workflow.return_value = "pid"
+        graph = {"fd4": {"class_type": "SAM3Detect", "inputs": {}}}
+        with mock.patch.object(ig.time, "sleep", lambda s: None):
+            with self.assertRaises(ig.ComfyError) as caught:
+                ig.Studio._run_quick(None, client, graph)
+        self.assertEqual(len(polls), 2)
+        self.assertIn("node fd4 (SAM3Detect): RuntimeError: no sam3 weights",
+                      str(caught.exception))
+
+    def test_a_quick_run_fails_at_once_when_refused_and_stops_at_its_deadline(self):
+        from unittest import mock
+        client = mock.Mock(backend={"name": "X"})
+        client.get_history.side_effect = ig.Unreachable("Nothing is answering (refused)")
+        with self.assertRaises(ig.Unreachable):
+            ig.Studio._run_quick(None, client, {})
+        self.assertEqual(client.get_history.call_count, 1)
+        client = mock.Mock(backend={"name": "X"})
+        client.queue_workflow.return_value = "pid"
+        client.cancel_job.return_value = True
+        with self.assertRaises(ig.ComfyError) as caught:
+            ig.Studio._run_quick(None, client, {}, timeout=0)
+        client.cancel_job.assert_called_once_with("pid")
+        self.assertIn("stopped there", str(caught.exception))
+
+    def test_an_upload_answered_with_something_not_json_is_a_comfyerror(self):
+        import io
+        from unittest import mock
+        c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.png")
+            with open(path, "wb") as f:
+                f.write(b"png")
+            with mock.patch.object(c, "_open", lambda req, t=None: io.BytesIO(
+                    b"<html>502 Bad Gateway</html>")):
+                with self.assertRaises(ig.ComfyError) as caught:
+                    c.upload_image(path)
+        self.assertIn("not JSON", str(caught.exception))
+        self.assertEqual(c.uploaded, set())
+
+    def test_a_template_that_will_not_read_is_logged_not_dropped_silently(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in (("good", '{"graph": {}}'), ("bad", '{"graph": {},}')):
+                with open(os.path.join(tmp, name + ".json"), "w", encoding="utf-8") as f:
+                    f.write(text)
+            with mock.patch.object(ig.doctor, "log_error") as log:
+                wfs = ig.list_workflows(tmp)
+        self.assertEqual([w["id"] for w in wfs], ["good"])
+        (text,), _ = log.call_args
+        self.assertIn("bad.json", text)
 
 
 class FakeWeb:

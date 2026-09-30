@@ -67,6 +67,7 @@ PASTE_NODE = "StudioFacePaste"        # comfy_nodes/studio_facepaste: a person's
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
 POLL_EVERY = 2.0              # seconds between looks at /history while a job runs
+LOST_AFTER = 3                # answered looks finding a prompt nowhere before it is lost
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
                "clip_vision", "style_models", "controlnet", "upscale_models", "diffusers",
                "model_patches")
@@ -1380,7 +1381,7 @@ class ComfyUIClient:
             self.url + "/upload/image", data=body, method="POST",
             headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
         with self._open(req, 120) as r:
-            res = json.loads(r.read().decode("utf-8"))
+            res = self._parse(r.read().decode("utf-8"))
         name = res.get("name", name)
         if res.get("subfolder"):
             name = res["subfolder"] + "/" + name
@@ -1438,7 +1439,13 @@ class ComfyUIClient:
         Progress comes over ComfyUI's WebSocket; the end is read from /history
         either way, every two seconds, so a socket that drops or never opens
         costs the step counter and nothing else. A ComfyUI staging a model
-        stops answering HTTP for half a minute: that is "busy", not gone."""
+        stops answering HTTP for half a minute: that is "busy", not gone.
+
+        A prompt that ComfyUI answers for but has nowhere - not in its history,
+        not queued, not running - was lost in a crash or restart: after
+        LOST_AFTER such looks that is a ComfyError, not a wait to the deadline.
+        At the deadline the prompt is stopped there, so the next job does not
+        queue behind it and VRAM can be let go."""
         own = watch is None
         if own:
             watch = self.watch()
@@ -1446,7 +1453,7 @@ class ComfyUIClient:
             on_event("socket", watch.error)
         events = watch.events
         deadline = time.monotonic() + timeout
-        next_poll, silent, started = 0.0, None, False
+        next_poll, silent, started, missing = 0.0, None, False, 0
         heard = time.monotonic()      # the last event, for ("quiet", seconds)
         try:
             while True:
@@ -1457,11 +1464,15 @@ class ComfyUIClient:
                     next_poll = now + POLL_EVERY
                     try:
                         entry = self.get_history(prompt_id)
-                        if not started and not entry:
+                        if not entry:
+                            # Two reads, not one: a prompt that ends between
+                            # them is in neither once, so only LOST_AFTER in a
+                            # row count.
                             ahead = self.position(prompt_id)
-                            if ahead is None or ahead < 0:
-                                started = ahead is not None
-                            else:
+                            missing = missing + 1 if ahead is None else 0
+                            if ahead is not None and ahead < 0:
+                                started = True
+                            elif ahead is not None and not started:
                                 on_event("queued", ahead)
                         silent = None
                     except (Unreachable, ComfyError):
@@ -1477,11 +1488,23 @@ class ComfyUIClient:
                     if entry and (status.get("completed") or entry.get("outputs")
                                   or status.get("status_str") == "error"):
                         return entry
+                    if missing >= LOST_AFTER:
+                        raise ComfyError(
+                            "%s no longer has prompt %s: it is not queued, running or "
+                            "finished there, so ComfyUI restarted or dropped it. Its "
+                            "console says why; run the job again once it is back."
+                            % (self.backend["name"], prompt_id))
                     if started and not watch.error and now - heard > QUIET_AFTER:
                         on_event("quiet", int(now - heard))
                 if now > deadline:
-                    raise ComfyError("%s has not finished prompt %s after %d s; it stays "
-                                     "queued there." % (self.backend["name"], prompt_id, timeout))
+                    try:
+                        stopped = self.cancel_job(prompt_id)
+                    except ComfyError:
+                        stopped = False
+                    raise ComfyError("%s has not finished prompt %s after %d s; %s." % (
+                        self.backend["name"], prompt_id, timeout,
+                        "it was stopped there" if stopped else
+                        "it could not be stopped there and may still be running"))
                 try:
                     msg = events.get(timeout=0.5)
                 except queue.Empty:
@@ -1594,8 +1617,10 @@ def list_workflows(folder=None):
         if name.endswith(".json"):
             try:
                 out.append(load_workflow(name[:-5], folder))
-            except TemplateError:
-                pass
+            except TemplateError as e:
+                # Left out of the menu, but never silently: a hand edit's
+                # stray comma would otherwise just make a preset vanish.
+                doctor.log_error("Image Studio: %s" % e)
     return out
 
 
@@ -5495,17 +5520,28 @@ class Studio:
         pid = client.queue_workflow(graph)
         end = time.time() + timeout
         while time.time() < end:
-            entry = client.get_history(pid)
+            try:
+                entry = client.get_history(pid)
+            except Unreachable as e:
+                # ComfyUI stops answering while it stages a model (SAM3's
+                # first run): busy, as in health() - a refusal is not.
+                if "timed out" not in str(e).lower():
+                    raise
+                entry = None
             if entry:                 # history holds a prompt once it has finished
                 status = entry.get("status") or {}
                 if status.get("status_str") == "error":
                     raise ComfyError("%s: %s" % (client.backend["name"], "; ".join(
-                        str(m[1].get("exception_message", m[0])) for m in
-                        status.get("messages") or [] if m[0] == "execution_error")
-                        or "the run failed"))
+                        run_errors(entry, graph)) or "the run failed"))
                 return entry
             time.sleep(0.5)
-        raise ComfyError("%s took over %d s" % (client.backend["name"], timeout))
+        try:
+            stopped = client.cancel_job(pid)
+        except ComfyError:
+            stopped = False
+        raise ComfyError("%s took over %d s; %s." % (
+            client.backend["name"], timeout, "the run was stopped there" if stopped
+            else "it could not be stopped there and may still be running"))
 
     def look_at(self, path):
         """The picture at `path` as the crop window needs it: dict with
