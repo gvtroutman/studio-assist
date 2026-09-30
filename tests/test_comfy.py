@@ -718,6 +718,69 @@ class ComfyBridgeTest(unittest.TestCase):
         centre, corner = rows[34 * 65 + 1 + 32], rows[1]
         self.assertEqual((centre, corner), (255, 0))
 
+    def test_a_new_pictures_faces_are_redrawn_lightly_and_blended_inside_the_head(self):
+        """At 0.45 the face pass drew somebody else - a woman of seventy came
+        back a man of forty - and its oval reached the crop's edge: the
+        scene's words were painted beside the head (a church where a tree
+        was) and a neighbour's face was blurred. So a new picture's faces
+        are redrawn at 0.3 - no harder, and no lighter, or the smallest stay
+        broken - and blended through an oval that covers the face and ends
+        inside the head. The scene's words stay in the face prompt - without
+        them a grandmother came back a young man - and the face swap's pass
+        keeps the whole oval, under its own name."""
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.running = []
+        self.fake.size = (1824, 1248)
+        self.fake.faces = {"generated": [(300, 400, 60, 70), (700, 410, 58, 66)]}
+
+        def oval(upload, size=256):
+            """(the name it went up under, its value 0-255 at x, y of the crop)."""
+            png = upload[upload.index(bytes([0x89]) + b"PNG"):]
+            rows = zlib.decompress(png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8])
+            self.assertEqual(len(rows), size * (size + 1))
+            name = upload.split(b'filename="', 1)[1].split(b'"', 1)[0].decode()
+            return name, lambda x, y: rows[int(y * size) * (size + 1) + 1 + int(x * size)]
+
+        prompt = "a wedding party in front of an old stone church"
+        res = comfy.call_tool("comfy_generate", {"prompt": prompt, "seed": 5})
+        self.assertFalse(res["isError"], self.text(res))
+        second = self.fake.prompts["p2"]
+        self.assertEqual(comfy.FACE_DENOISE, 0.3)
+        self.assertEqual([n["inputs"]["denoise"] for n in second.values()
+                          if n["class_type"] == "KSampler"], [comfy.FACE_DENOISE] * 2)
+        self.assertIn("denoise %s" % comfy.FACE_DENOISE, self.text(res))
+        self.assertIn(prompt, second["2"]["inputs"]["text"])
+        small, at = oval(self.fake.uploads[-1])
+        # head_square puts a face's middle at 0.5, 0.56 of its crop, the face
+        # itself 0.19 to either side and 0.25 up and down: all of it redrawn.
+        for x, y in ((0.5, 0.56), (0.5, 0.32), (0.5, 0.8), (0.32, 0.56), (0.68, 0.56)):
+            self.assertGreaterEqual(at(x, y), 250, (x, y))
+        # ...and nothing beside the head, above it or at the crop's edge,
+        # where the whole oval was still blending the redraw in.
+        for x, y in ((0.13, 0.56), (0.87, 0.56), (0.5, 0.18), (0.5, 0.95), (0.02, 0.5)):
+            self.assertEqual(at(x, y), 0, (x, y))
+        whole = comfy.oval_png()
+        _, was = oval(b'filename="x"' + whole)
+        self.assertGreater(was(0.13, 0.56), 100)
+
+        # The caller's strength is the caller's.
+        comfy.call_tool("comfy_generate", {"prompt": prompt, "face_denoise": 0.45})
+        self.assertEqual(self.fake.prompts["p4"]["103"]["inputs"]["denoise"], 0.45)
+
+        # The face swap's finishing pass: the whole oval, a file of its own.
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                                      "z_image_turbo_bf16.safetensors"]
+        self.fake.text_encoders = ["qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                                   "qwen_3_4b.safetensors"]
+        self.fake.faces = {"old.png": [(254, 460, 102, 113)], "us.png": [(292, 407, 130, 156)]}
+        res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png"})
+        self.assertFalse(res["isError"], self.text(res))
+        name, at = oval(self.fake.uploads[-1])
+        self.assertEqual(name, comfy.FACE_OVAL)
+        self.assertNotEqual(name, small)
+        self.assertEqual(at(0.13, 0.56), was(0.13, 0.56))
+        self.assertEqual(self.fake.prompts["p8"]["103"]["inputs"]["denoise"], comfy.SWAP_DENOISE)
+
     def test_a_returned_picture_says_where_it_was_saved(self):
         res = comfy.call_tool("comfy_generate", {"prompt": "a fox"})
         image = [i for i in res["content"] if i["type"] == "image"][0]
