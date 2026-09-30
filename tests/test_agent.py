@@ -6,6 +6,7 @@ Offline tests. No network, no creative apps, no model.
 Anything needing a display skips itself when there isn't one.
 """
 
+import gc
 import io
 import json
 import os
@@ -1972,6 +1973,14 @@ class TestGui(unittest.TestCase):
     def setUp(self):
         """Every test starts from every tab open - chat included - looking at
         the first."""
+        # What a test drops (rebuilt buttons, a closed window, a second Chat)
+        # is widgets and Tk variables in cycles, freed by the collector on
+        # whichever thread it next runs. Off this thread, with no mainloop
+        # running, each Tk variable waits 1 s for one ("main thread is not in
+        # main loop"): a later module's job lane stood 60 s freeing 55 of
+        # them (2026-09-30). Registered first, so it runs after the test's
+        # own cleanups have closed its windows: freed here, on Tk's thread.
+        self.addCleanup(gc.collect)
         for app in eng.TABS:
             self.app._add_tab(app.id)      # a tab already open is just selected
         self.app._select(eng.APPS[0].id)
