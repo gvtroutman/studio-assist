@@ -3,6 +3,8 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -34,7 +36,17 @@ SWAP_MODELS = ('inswapper_128', 'hyperswap_1a_256', 'hyperswap_1b_256', 'hypersw
 # pink on a body in a low sun, after a head swap that had the light right
 # (live, 2026-09-29).
 SWAP_TONE = 0.8
+# FaceFusion's face masks. "occlusion" is what is in front of the face: the
+# swap goes behind it. Without it (box and region alone, until 2026-09-29)
+# the new face was painted over glasses frames, which came back mottled and
+# half rubbed out, and over a strand of hair across a cheek. With it the
+# frames are the picture's own, to the pixel, on thin metal and thick frames
+# alike, for 0.02-0.04 of ArcFace likeness (0.87 to 0.84) - the glasses being
+# the picture's, not hers.
+SWAP_MASKS = ('box', 'occlusion', 'region')
 _SWAP_LOCK = threading.Lock()  # FaceFusion's jobs/temp directories are shared across backend lanes.
+# An error's own line in the worker's log: "RuntimeError: what went wrong".
+_ERROR = re.compile(r'^[A-Za-z_][\w.]*(?:Error|Exception): (.+)$')
 
 
 def available():
@@ -166,19 +178,54 @@ def swap(data, identity, stop=None, face_index=None, face_count=1):
         _SWAP_LOCK.release()
 
 
+def failure(log):
+    """Why the worker failed, out of its log: the last error it raised, in
+    its own words and without the traceback above it; else the log's last
+    lines; else that it said nothing."""
+    lines = [x.strip() for x in log.splitlines() if x.strip()]
+    for line in reversed(lines):
+        said = _ERROR.match(line)
+        if said:
+            return said.group(1)
+    return ' '.join(lines[-3:])[-600:] or 'FaceFusion ended without saying why.'
+
+
+def _clear(folder, tries=30, wait=0.1):
+    """Remove a swap's folder, the picture in it and all. On Windows a worker
+    that was stopped lets go of its log a moment after it ends (what it
+    started - ffmpeg - holds the same file), and a removal that fails then
+    must not stand in for why the swap ended: a cancel read "[WinError 32]
+    ... run.log" and left the folder behind (2026-09-29)."""
+    for _ in range(tries):
+        shutil.rmtree(folder, ignore_errors=True)
+        if not os.path.exists(folder):
+            return True
+        time.sleep(wait)
+    return False
+
+
 def _swap(data, identity, stop=None, face_index=None, face_count=1):
     if not available():
         raise RuntimeError('FaceFusion is not installed. The selected face was not applied.')
     refs = identity.get('references') or []
     if not refs or any(not os.path.isfile(p) for p in refs):
         raise RuntimeError('%s needs existing reference photos in Identities.' % identity['name'])
-    with tempfile.TemporaryDirectory(prefix='studio-facefusion-') as folder:
-        target, output = Path(folder) / 'target.png', Path(folder) / 'result.png'
+    folder = tempfile.mkdtemp(prefix='studio-facefusion-')
+    child = None
+    try:
+        # FaceFusion keeps its working copy under .runtime/facefusion-temp in
+        # a folder named after the target file, and clears that folder before
+        # and after a run. Two swaps at once with the same file name - another
+        # Studio process, the phone server's - cleared each other's, and one
+        # ended "copying image failed" (2026-09-29). So the target's name is
+        # this swap's own.
+        target = Path(folder) / (Path(folder).name + '.png')
+        output = Path(folder) / 'result.png'
         target.write_bytes(data)
         args = [str(PYTHON), str(SCRIPT), '--identity', identity['id'], '--sources', *refs,
                 '--target', str(target), '--output', str(output),
                 '--model', model(identity), '--weight', str(strength(identity)),
-                '--tone', str(SWAP_TONE)]
+                '--tone', str(SWAP_TONE), '--masks', *SWAP_MASKS]
         if face_index is not None:
             args += ['--face-index', str(face_index), '--face-count', str(face_count)]
         if identity.get('target_region') is not None:
@@ -189,21 +236,22 @@ def _swap(data, identity, stop=None, face_index=None, face_count=1):
             child = studio_procs.spawn(args, cwd=str(ROOT), stdout=log, stderr=log,
                                        creationflags=studio_procs.NO_WINDOW)
             deadline = time.monotonic() + 300
-            try:
-                while child.proc.poll() is None:
-                    if stop and stop():
-                        raise RuntimeError('Face swap cancelled.')
-                    if time.monotonic() > deadline:
-                        raise RuntimeError('FaceFusion did not finish within five minutes.')
-                    time.sleep(0.1)
-                if child.proc.returncode or not output.is_file():
-                    log.seek(0)
-                    detail = log.read()[-2000:]
-                    raise RuntimeError('%s\'s face swap failed: %s' % (identity['name'], detail))
-                report = json.loads(output.with_suffix('.json').read_text(encoding='utf-8'))
-                if report['outside_mask_changed_pixels'] != 0:
-                    raise RuntimeError('The face swap changed pixels outside its mask.')
-                report = {k: v for k, v in report.items() if k not in ('target', 'output')}
-                return output.read_bytes(), report
-            finally:
-                child.stop(grace=0)
+            while child.proc.poll() is None:
+                if stop and stop():
+                    raise RuntimeError('Face swap cancelled.')
+                if time.monotonic() > deadline:
+                    raise RuntimeError('FaceFusion did not finish within five minutes.')
+                time.sleep(0.1)
+            if child.proc.returncode or not output.is_file():
+                log.seek(0)
+                raise RuntimeError('%s\'s face swap failed: %s' % (identity['name'],
+                                                                  failure(log.read())))
+            report = json.loads(output.with_suffix('.json').read_text(encoding='utf-8'))
+            if report['outside_mask_changed_pixels'] != 0:
+                raise RuntimeError('The face swap changed pixels outside its mask.')
+            report = {k: v for k, v in report.items() if k not in ('target', 'output')}
+            return output.read_bytes(), report
+    finally:
+        if child is not None:
+            child.stop(grace=0)
+        _clear(folder)

@@ -644,9 +644,34 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   not the preset, are what `compose` uses, so the strengths can be nudged before
   Generate. Everything that looked a preset up goes through `preset_info(lib, key)`;
   an unknown key is Standard, and a mix can never take a built-in's key (`mix-`).
-  Stacked LoRAs add up: on Z-Image Turbo (8 steps) keep the total near 1.0-1.5.
   An added row's whole `trigger` goes into the prompt, so a CivitAI "trained words"
   list of alternatives (an expressions LoRA's) must be cleared, not kept.
+- **A LoRA stack is held to what the model takes** (`hold_loras`, a workflow's
+  `lora_budget`; 2026-09-29). Stacked LoRAs add up, and a step-distilled model
+  has little room: on Z-Image Turbo four Always-on LoRAs at the 0.8 each was
+  imported with (3.2 in all - the library as it was that day) made "a red fox
+  in fresh snow at dawn" a night scene with a grid across it, a grey knit
+  sweater a bra under a cardigan, and a Scene Builder picture (pose and depth
+  maps) a smear with no people in it. Each LoRA alone at 0.8 was fine, and so
+  were any two. The same four scaled to a total of 2.0 gave a picture again,
+  dark and oddly dressed; at 1.5 a dim one; at 1.2 a clean one that still
+  had their look; below 1.0 they did little. So `zimage_hq` names
+  `lora_budget` 1.2, and FLUX names none (nothing was measured there). Over
+  the budget **only the Always-on ones are turned down**, all by the same
+  share, into what the others leave: nobody chose their sum - each was
+  switched on alone in Add-ons. A LoRA chosen for the picture (a row of the
+  form, an identity's, a style's) keeps its strength; a sum of those over
+  the budget is said and not changed, and leaves the Always-on ones out. A
+  warning names each and its new strength, and that fewer Always on leaves
+  each stronger. `settings["lora_budget"]` is a picture's own (0: no
+  limit); History keeps the strengths used, so Generate Again is the same.
+  Community advice agrees on the cause and differs on the number ("under
+  1.0" to a normalised 0.7-0.9); 1.2 is what was measured here.
+- **A trigger is said for a LoRA the model is given.** `compose` used to add
+  the trigger of every LoRA in the stack, the ones it then left out too: an
+  Always-on LoRA whose file was not on the 5090 was left out with a warning
+  on every picture while its trained words ("ultra detailed, cinematic, ...
+  detailed skin pore, ...") went into every prompt, a fox's included.
 - **LoRAs come in from CivitAI** (`apps/image_studio/addons/civitai.py`, the LoRA library's *Import
   from CivitAI…*). Paste links (a model page, `modelVersionId`, a download link, an
   AIR, a bare version id) and/or pick `.safetensors` files. A link is read from
@@ -670,24 +695,21 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   hair"), then the scene, then the camera line, then the anatomy constants, then the
   style. It is pure and does no I/O, which is how the form
   shows warnings before Generate.
-- **A no-style prompt gets one light/time phrase and, with a person, one
-  human-error detail** (2026-09-28, the user: prompt richness as a bottleneck).
-  `person_text` is a flat attribute list ("olive skin, slim, green eyes..."),
-  not the photographer's prose the ComfyUI tab's chat system prompt tells its
-  model to write (light, lens, "real-world imperfections that sell it") - so a
-  plain form submission read as a tag list, not a photograph. `compose()` now
-  appends `time_of_day_text` (skipped when `scene` or `camera` already names a
-  time or light, via `LIGHT_TIME`) and, when `has_person`, `imperfection_text`
-  (a flyaway hair, a crease, uneven tan lines...), both picked deterministically
-  from the job's own seed - same seed keeps the same light and flaw, a new seed
-  for "a different take" can bring new ones. Skipped whenever a style is chosen:
-  a named style's own prompt (`_default_styles`) already carries its light and
-  texture, and a second one would fight it. `generator_prompt`'s replay
-  (`critic.py`) is unaffected: it always restates character facts from
-  `canonical_state` as its own flat list rather than parsing them back out of
-  the composed prose, and freezes `original_intent["prompt"]` - including
-  these two phrases - for every refinement pass, which is the desired
-  behaviour (consistent light and flaw across a scene's corrections).
+- **What the pipeline adds to the user's words is drawn, like any other
+  words** (2026-09-29, measured on the 5090, the same seeds, only the added
+  words changed). Every shipped workflow samples at CFG 1: there is no
+  negative prompt, and a thing named to rule it out is a thing named. So what
+  `compose` adds is short, says what is there, and goes on the person it is
+  about - see the clothing floor and the anatomy constants below. **Nothing
+  is added that nobody asked for.** On 2026-09-28 a no-style prompt was to
+  get a light ("golden hour, warm low sun") and a human-error detail ("a
+  loose thread on a sleeve") picked by the seed (`time_of_day_text`,
+  `imperfection_text`). It never ran: it was skipped "whenever a style is
+  chosen", and "No style" is itself a style record, the form's default. Run
+  live before switching it on, it made the flaw the subject - the head cut
+  off to show a sleeve, 6 of 12 pictures - and put a lamp post in a park and
+  a pendant lamp over a kitchen for "a single lamp at night". Both functions
+  are gone. A richer prompt is the user's to write, or a style's.
 - **Pick person cuts one person out of a reference photo.** In the Identities editor,
   the photo is the selected reference, else one chosen from disk. `Studio.look_at`
   sends it through ComfyUI for its size and a PNG (Tk reads no JPEG; no SAM3), and a
@@ -808,23 +830,44 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   Kontext, whose face no longer drifts to the garment model's. `thumbnails`
   (PNGs made by System.Drawing, one PowerShell run; Tk reads no JPEG) stays in
   studio_imagegen for any photo strip. Nothing on the form uses it now.
-- **The anatomy constants** (`ANATOMY`): every picture with a person in it (chosen,
-  described, or named in the scene, `PEOPLE`) says outright that every person has
+- **The anatomy constants** (`ANATOMY`): a picture with a person in it (chosen,
+  described, or named in the scene, `PEOPLE`) says that every person has
   two hands, each with four fingers and a thumb, two feet, two eyes and a
-  proportionate body; diffusion models lose count otherwise. It is a positive
-  sentence on purpose: every shipped workflow samples at CFG 1, which ignores the
-  negative prompt, so the matching negatives are added only for a model that reads
-  one. On by default; the form has a switch (`anatomy`).
-- **Nobody is undressed** (`COVERED`, `is_dressed`): a picture with a person in it
-  whose form Clothes (top, bottom, outerwear) and scene name no garment (`GARMENTS`)
-  says "wearing clothes suited to the scene" after the person. "Natural anatomy" and
-  the chest words alone drew people nude; "plain underwear" was tried first and put
-  people in underwear at Oktoberfest. It is a floor, not a switch: the anatomy switch
-  does not turn it off, and a scene asking for bare skin still gets it. Every
-  picture with a person also gets `CLOTHED` after the scene, dressed or not: "partner
-  in a swimsuit" after "very full chest" was drawn topless on Z-Image Turbo (CFG 1,
-  so the negative does nothing). The anatomy constants no longer say "anatomically"
-  or "natural anatomy" for the same reason.
+  proportionate body. It is a positive sentence on purpose: every shipped
+  workflow samples at CFG 1, which ignores the negative prompt, so the matching
+  negatives are added only for a model that reads one. On by default; the form
+  has a switch (`anatomy`). Two things were found live on 2026-09-29. The
+  sentence began "Drawn correctly:", and that word made photographs
+  illustrations - 2 of 6 on FLUX.1 [dev], 3 of 24 on Z-Image Turbo, none
+  without it - so it is gone. And **a workflow can leave the sentence unsaid**
+  (`"anatomy": false`, `zimage_hq`): Z-Image Turbo, told of hands and fingers,
+  made them the picture - a gardener and a knitter cropped to their hands, the
+  head out of frame, 6 of 9; a runner became an open hand held up to the
+  camera - and untold it drew the same hands well. A job note says so when
+  the switch is on and the workflow leaves it out. FLUX is still told: there
+  the sentence changed nothing else in the picture.
+- **Nobody is undressed** (`COVERED`, `CLOTHED`, `is_dressed`): a picture with a
+  person described (the form's person, an identity) says `CLOTHED`, "fully
+  clothed", after them, and "wearing clothes suited to the scene" too when
+  the form's Clothes (top, bottom, outerwear) and the scene name no garment
+  (`GARMENTS`). A scene that describes its people itself has no one to hang
+  them on: it gets "Fully clothed." after it, a sentence of its own.
+  "Natural anatomy" and the chest words alone drew people nude; "plain
+  underwear" was tried first and put people in underwear at Oktoberfest. It
+  is a floor, not a switch: the anatomy switch does not turn it off, and a
+  scene asking for bare skin still gets it. **The floor names no skin and no
+  swimwear.** Until 2026-09-29 `CLOTHED` was "Every person is clothed, the
+  chest fully covered by their clothing or swimwear", added because "partner in
+  a swimsuit" after "very full chest" was drawn topless. It drew what it
+  named: on the same seeds a man knitting in an armchair sat shirtless in
+  briefs, a runner and a gardener wore swimsuits (9 of 9), and the form's
+  person walking a dog in a park, no garment named, was topless (3 of 3).
+  With "fully clothed" on the person all of them were dressed, and a red
+  swimsuit that was asked for was still a swimsuit, on 3 of 3. And
+  `COVERED` used to open the prompt by itself when nobody was described
+  ("wearing clothes suited to the scene. An elderly man..."), a wearer-less
+  clause where the model weighs words most. The anatomy constants no longer
+  say "anatomically" or "natural anatomy" for the same reason.
 - **Styles are chosen by picture.** The form shows each style as a tile of one cat
   photo in that style (`style_example`): the style's own `example` (a PNG), else
   `style_examples/<id>.png`, else a blank tile with its name. The shipped ones
@@ -963,6 +1006,40 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   second run keeps the first run's picture with the error in the record.
   Identity Portrait and High Quality Final turn it on; the form has a toggle.
   Faces get seeds s+1, s+2, ... so Generate Again redraws them the same.
+- **A redraw is sampled as a redraw** (a workflow's `redraw_sampler`,
+  `redraw_scheduler`, `redraw_steps`; `face_graph`'s KSampler; 2026-09-29).
+  Every part redrawn over what is there - the face pass, the hands, the eyes,
+  the glasses, Fix a spot, the Critic's fixes - used the picture's own
+  sampler. Z-Image Turbo's is `res_multistep`, which adds no noise as it
+  goes, and over an existing picture it leaves dark specks on skin and white
+  beads in beards and hair at every strength from 0.3 to 0.6, with a plain
+  prompt too (`euler` and `gradient_estimation` the same); the detail
+  recipe's `dpmpp_2m_sde`/`beta` left dry, scaly skin and at 0.6 changed
+  who the face was. The ancestral samplers leave skin. **But a redraw that
+  leaves skin drifts further from the face it redrew**: measured by ArcFace
+  on ten faces of 70-250 px, twelve samplers at strength 0.4, likeness to
+  the face before was 0.71 for `res_multistep`/beta, 0.70 `euler`, 0.69
+  `res_multistep`/simple, 0.67 `euler_ancestral`/beta, 0.64
+  `euler_ancestral`/simple, 0.54 `lcm` - the samplers that speckle keep the
+  geometry, the clean ones move it (and ArcFace does not see specks). A
+  first write-up here said `euler_ancestral` "kept the face nearest"; that
+  was by eye, and the chat bridge's own measurement
+  ([[chat-bridge-redraw-sampler]] in the memory notes) found the reverse
+  first. So the redraw is `euler_ancestral` on the **beta** scheduler, which
+  was nearer than simple on 6 pictures of 6 and shifts the age read off a
+  face by -0.1 years against -0.9, and **the Z-Image face pass runs at
+  `face_denoise` 0.3**, not 0.4: likeness 0.775 at 0.3 against 0.670 at 0.4,
+  nearest on 7 faces of 10 - nearer than `res_multistep` at 0.35 - and it
+  still mends the eyes and teeth of 60 px faces. Hands at 0.4 on beta were
+  as good as on simple on 7 pictures (a ring kept, small hands sharpened).
+  The eye pass after the face swap costs the swap's likeness 0.015-0.018
+  with `res_multistep` and 0.03-0.04 with `euler_ancestral` (three
+  pictures); it takes the redraw sampler all the same, for the specks under
+  the eye, and the number is here for whoever wants it back. `zimage_hq`
+  names all three and keeps `res_multistep` for the picture (ComfyUI's own
+  recipe, unchanged). FLUX names none and redraws with its own `euler` at
+  0.4, as before (not measured there). A sampler typed in Advanced is the
+  picture's, not its redraws'.
 - **The 5090's ComfyUI (2026-09-25)** is ComfyUI v0.37.2 (the 3090's version),
   git-cloned into `D:\ComfyUI` with its own Python 3.12 venv and PyTorch
   2.11.0+cu130 (Blackwell; cu128 until 2026-09-29). Keep torch on the CUDA
@@ -1163,6 +1240,52 @@ Tests in `test_facefusion_profiles.py` mock inference; the GUI tests exercise th
 profile menu and editor. Partner's live final-pass result matched the approved
 standalone HyperSwap result byte-for-byte (before the two changes below).
 
+**The swap goes behind what is in front of the face** (`facefusion.SWAP_MASKS`:
+box, occlusion, region; the worker's `--masks`; 2026-09-29). With box and region
+alone the new face was painted over glasses frames - thin metal ones came back
+mottled and half rubbed out, thick ones smeared at the bridge - which is why the
+glasses pass exists. With FaceFusion's occlusion mask the frames are the
+picture's own, to the pixel, on three pictures of three. ArcFace against
+Partner's photos fell 0.02-0.04 (0.87 to 0.84): the glasses are then the
+picture's and not hers. The report says which masks a swap used (`masks`).
+
+**The person's averaged face is kept between runs** (`tools/facefusion_swap.py`:
+`source_key`, `keep_source`, `kept_source`; `.work/facefusion-sources/`).
+FaceFusion reads every reference photo for its face on every run, about a
+second and a half each on the CPU: with Partner's 40 photos, 58 of a swap's 77
+seconds. The average depends on the photos alone, so it is worked out once for
+a set of them - keyed by FaceFusion's version and each photo's path, size and
+time, in order - and read back after: 20 s a swap, and the picture is the same
+file byte for byte (sha256, three runs). Adding, removing, replacing or
+reordering a photo is another key; a kept face that cannot be read, or whose
+first photo is gone, is not used and FaceFusion reads the photos as ever. The
+newest `SOURCES_KEPT` (24) sets are kept. The report says `sources`: `kept` or
+`read`. Two of her 40 photos have no face FaceFusion's finder sees, and three
+score under 0.6 against the rest (a profile, a blue-lit one): the average
+carries them all, as it did.
+
+**A swap that fails says why, and one that is cancelled leaves nothing**
+(`facefusion.failure`, `_clear`; 2026-09-29, from History). Of 57 pictures with
+a face profile in three days, 7 failed and 6 were cancelled. Five failures
+read only "[FACEFUSION.CORE] processing step 1 of 1": FaceFusion's content
+check had refused the picture, which it does without a word. The worker now
+watches that check (it is not changed, and a picture it refuses is not
+swapped) and raises `REFUSED`. Two read as a 2,000-character traceback whose
+last line was the reason - more than one face and no way to tell which -
+and `failure` now gives the worker's last error in its own words. Three
+cancels read "[WinError 32] ... run.log" and left their folders, the picture
+in each, in the temp folder: the stopped worker still held its log while
+`TemporaryDirectory` removed it, and that error replaced "Face swap
+cancelled.". The folder is now removed after the worker is stopped, tried
+again while Windows lets go, and its failure is never the swap's. **And the
+target file's name is the swap's own** (`studio-facefusion-<random>.png`, the
+folder's name): FaceFusion keeps its working copy under
+`.runtime/facefusion-temp/facefusion/<target name>/` and clears that folder
+before and after a run, so two swaps at once from two processes (two
+sessions' scripts that day; in production the app and the phone server) with
+the same `target.png` cleared each other's, and one ended "copying image
+failed". `_SWAP_LOCK` only holds within one process.
+
 **The swap is pushed past neutral, and drawn at the face's own size**
 (2026-09-27, the user: the face swap "isn't as strong as i'd like"). Two FaceFusion
 settings had been left at their defaults. `--face-swapper-weight` (FaceFusion 3.4+)
@@ -1178,6 +1301,8 @@ crop is about that), up to 1024; the report records `weight` and `pixel_boost`.
 Neither has been measured live yet. The eye pass that follows (0.5) redraws the
 eyes from words on the picture's model, and eyes carry much of a likeness: if a
 swap looks right before the finish passes and weaker after, that is the place.
+Measured on 2026-09-29 (two pictures): the eye pass costs 0.03 of ArcFace
+likeness, the glasses pass after it another 0.08 - see the glasses below.
 
 **The head is redrawn before the face is swapped, and the swap is inswapper's**
 (2026-09-29, the user: "i think we need flux klein", then "klein with inswapper seems
@@ -1250,23 +1375,59 @@ section, and on any failure or cancel, the picture stays FaceFusion's and a
 note says why. The local face-only swap (Fix a spot with no spots, Retry face
 swap) has no ComfyUI and gets neither pass.
 
-**Every Generate then has its hands redrawn** (the hands pass, same method).
-The user asked for "a pass with natural hands" to go with the glasses (2026-09-26).
-It runs with or without a face profile, unless "Natural hands pass" under
-Generate is unticked (`settings["hand_pass"]`, on by default and for pictures
-saved before it). `HAND_FIND` joins the same SAM3 run. Each hand it finds is a
-`found_spots` square grown by `FIX_CONTEXT`, and only SAM3's `hand` inside it is
-redrawn, all the hands in one `face_graph` run, at `HAND_DENOISE` 0.6 with
-`HAND_WHAT` ("four fingers and a thumb"). 0.6 is the Critic's `LOCAL_INPAINT`,
-which mends fingers without re-posing them. The reverted per-hand ControlNet pass
-of 2026-09-25 got double hands at 0.85-0.9. The order is eyes, hands, glasses:
-the glasses stay last. Hands tone-match (`FIX_TONE`) when the ComfyUI has
-`StudioMatchTone`; a swapped face does not. Live on the 5090 (Generate through
-`Studio.submit` by script, Partner's meadow settings, 20260926-214549-06a88e):
-FaceFusion, eyes, 2 hands, glasses, 51 s in all. Both hands kept their pose and
-came back with sharper knuckles, creases and nails, and nothing else changed. But
-one nail on the lowered hand came out a pale lilac. With no hands found, a note
-says so and the picture is kept.
+**The glasses are redrawn only when the swap painted over them**
+(`glasses_pass`; 2026-09-29). The pass answers a fault the occlusion mask
+(above) no longer makes. Run all the same, after a swap that had kept the
+frames as drawn, it gave the person other glasses - dark red frames came
+back tortoiseshell - and cost the likeness 0.08 (ArcFace 0.81 with the eye
+pass alone, 0.73 with the glasses after it, two pictures, the redraw sampler
+either way). So the glasses are looked for and redrawn only after a swap
+whose report names no occlusion mask, and a note says when they were left.
+The user asked for the pass by name, so it is his to have back: "Redraw glasses
+after the face swap" under Generate (off; ticked is
+`settings["glasses_pass"]` True, always; unticked is None, the rule above;
+False never). The eye pass stays: it costs 0.03 and the eyes are sharper for
+it.
+
+**A Generate of people then has its hands redrawn** (the hands pass, same
+method). The user asked for "a pass with natural hands" to go with the glasses
+(2026-09-26). It runs with or without a face profile, unless "Natural hands
+pass" under Generate is unticked (`settings["hand_pass"]`, on by default and
+for pictures saved before it). `HAND_FIND` joins the same SAM3 run. Each hand
+is a `found_spots` square grown by `FIX_CONTEXT`, and only SAM3's `hand` inside
+it is redrawn, all the hands in one `face_graph` run, with `HAND_WHAT` ("four
+fingers and a thumb"). The reverted per-hand ControlNet pass of 2026-09-25 got
+double hands at 0.85-0.9. The order is eyes, hands, glasses. Hands tone-match
+(`FIX_TONE`) when the ComfyUI has `StudioMatchTone`; a swapped face does not.
+With no hands found, a note says so and the picture is kept. Three things
+changed on 2026-09-29, each from pictures made that day:
+- **It is a finish, at `HAND_DENOISE` 0.4.** It ran at 0.6, the Critic's
+  strength for a hand that is wrong, on every hand - and Z-Image Turbo draws
+  most hands well. On hands that were fine, 0.6 took the ring off a finger,
+  aged a florist's hand into scales, bent a guitarist's fingers off the frets
+  and gave a knitter a scabbed knuckle; on a small blurred hand in a crowd it
+  did the good it was meant to. 0.4 with the redraw sampler left every good
+  hand as it was and still sharpened the small ones. A hand that is wrong is
+  the Critic's, or Fix a spot's, at their own strengths, unchanged.
+- **The hands are SAM3's surest** (`real_hands`, `parts_found(scores=True)`).
+  SAM3 scores each box, and asked at threshold 0.3 it also gives the forearm
+  round a hand (0.33-0.57), a thing a few pixels wide (0.65) and the field a
+  picture is of (0.48); a hand in plain view scores 0.78-0.97. `found_spots`
+  takes boxes biggest first and drops a box mostly inside a kept one, so the
+  forearm won and the hand in it was dropped as its copy: a carpenter's two
+  hands were redrawn as two forearms and a third thing. They are now taken by
+  score (`HAND_SCORE` 0.5 or more), a box sharing half the smaller with a
+  better one is that hand again (`HAND_SAME`), and one under `HAND_SMALL` of
+  the picture is a passer-by's.
+- **It is for pictures whose words name a person** (`hand_pass`, `has_person`).
+  SAM3 scored a red fox's paws 0.87 as hands, and the pass redrew them as "a
+  human hand with four fingers and a thumb"; on an empty field it redrew the
+  field. No score tells a paw from a hand (SAM3 scored the fox 0.8 as a
+  person too), so the words decide, as they do for the clothing floor. A
+  note says when it was left out for that. `PEOPLE` therefore knows a person
+  by their trade and family as well ("a chef plating a dish" names no man or
+  woman) - only words that can mean nothing else: no "baby", "model" or
+  "player".
 
 ### Family photos with WithAnyone
 

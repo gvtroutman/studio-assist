@@ -3,15 +3,78 @@
 Run with .runtime/facefusion-venv/Scripts/python.exe. FaceFusion stays in
 its separate environment; the Studio Assist/ComfyUI environments are untouched.
 The official pipeline (including its content checks) runs unchanged apart from
-observing its final face mask. Original pixels outside that mask are restored
-and the lossless saved result is checked before success is reported.
+observing its final face mask and whether its content check let the picture
+through. Original pixels outside that mask are restored and the lossless saved
+result is checked before success is reported.
 """
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
+
+# What the worker says, as its last error, of a picture FaceFusion would not take.
+REFUSED = 'FaceFusion\'s content check refused this picture, so no face was swapped.'
+# The person's face, averaged over their reference photos, is kept between
+# runs. FaceFusion reads every photo for its face on every run, about a second
+# and a half each on the CPU: with forty photos 58 of a swap's 77 seconds
+# (2026-09-29). The average depends on the photos alone, so it is worked out
+# once for a set of them and read back after, and the picture that comes of
+# it is the same picture, byte for byte.
+SOURCES = '.work/facefusion-sources'
+SOURCES_KEPT = 24                     # sets of photos; the oldest go
+LANDMARKS = {'5': 'lm_5', '5/68': 'lm_5_68', '68': 'lm_68', '68/5': 'lm_68_5'}
+
+
+def source_key(refs, version):
+    """What a set of reference photos' averaged face depends on: FaceFusion's
+    version, and each photo in order - where it is, how big and how new."""
+    h = hashlib.sha256(('sources 1|%s' % version).encode('utf-8'))
+    for path in refs:
+        s = os.stat(path)
+        h.update(('|%s|%d|%d' % (os.path.normcase(os.path.abspath(path)), s.st_size,
+                                 s.st_mtime_ns)).encode('utf-8'))
+    return h.hexdigest()[:32]
+
+
+def keep_source(path, face, first, np):
+    """The averaged face and the photo its landmarks are from, written whole
+    or not at all."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = {name: np.asarray(face.landmark_set[key])
+              for key, name in LANDMARKS.items() if face.landmark_set.get(key) is not None}
+    meta = {'origin': face.origin, 'angle': int(face.angle), 'gender': face.gender,
+            'race': face.race, 'age': [face.age.start, face.age.stop],
+            'scores': {k: float(v) for k, v in face.score_set.items()}, 'first': first}
+    part = path.with_name(path.name + '.part')
+    with open(part, 'wb') as file:
+        np.savez(file, embedding=np.asarray(face.embedding),
+                 embedding_norm=np.asarray(face.embedding_norm),
+                 bounding_box=np.asarray(face.bounding_box),
+                 meta=np.array(json.dumps(meta)), **arrays)
+    os.replace(part, path)
+    old = sorted(path.parent.glob('*.npz'), key=lambda p: p.stat().st_mtime)
+    for stale in old[:-SOURCES_KEPT]:
+        stale.unlink()
+
+
+def kept_source(path, Face, np):
+    """-> (face, the photo to hand FaceFusion), or None when there is none
+    kept that can be read and whose photo is still there."""
+    with np.load(path, allow_pickle=False) as kept:
+        meta = json.loads(str(kept['meta']))
+        face = Face(origin=meta['origin'], bounding_box=kept['bounding_box'],
+                    score_set=meta['scores'],
+                    landmark_set={key: kept[name] for key, name in LANDMARKS.items()
+                                  if name in kept.files},
+                    angle=meta['angle'], embedding=kept['embedding'],
+                    embedding_norm=kept['embedding_norm'],
+                    age=range(*meta['age']), gender=meta['gender'], race=meta['race'])
+    if face.embedding.shape != face.embedding_norm.shape or not os.path.isfile(meta['first']):
+        return None
+    return face, meta['first']
 
 
 def main():
@@ -33,6 +96,10 @@ def main():
     parser.add_argument('--tone', type=float, default=0.0,
                         help='How far (0-1) the swapped face\'s colour is moved to that of '
                              'the face it replaced, inside the mask.')
+    parser.add_argument('--masks', nargs='+', default=['box', 'occlusion', 'region'],
+                        choices=['box', 'occlusion', 'area', 'region'],
+                        help='FaceFusion\'s face mask types. "occlusion" keeps what is in '
+                             'front of the face - a strand of hair, a hand, a glass.')
     parser.add_argument('--reference', type=int, help='Use just this reference (1-based).')
     parser.add_argument('--provider', default='cpu')
     args = parser.parse_args()
@@ -98,6 +165,18 @@ def main():
         return result
 
     swapper.paste_back = observe_paste
+    # FaceFusion's content check ends the run without a word: the log stops at
+    # "processing step 1 of 1" and the exit code is all there is. It is only
+    # watched here, never answered for: a picture it refuses is not swapped.
+    from facefusion.workflows import image_to_image
+    analyse_image = image_to_image.analyse_image
+
+    def observe_analysis():
+        code = analyse_image()
+        captured['refused'] = bool(code)
+        return code
+
+    image_to_image.analyse_image = observe_analysis
     sys.path.insert(0, str(root))
     from apps.image_studio.facefusion import target_face
     from facefusion.face_creator import get_static_faces
@@ -121,13 +200,43 @@ def main():
             captured['pixel_boost'] = boost
         return [faces[index]]
     swapper.select_faces = select_target
+    # The person's averaged face: read back when this set of photos has been
+    # worked out before, else worked out by FaceFusion as ever and kept. On
+    # any trouble with what is kept, FaceFusion works it out: a swap is never
+    # lost to its own shortcut.
+    from facefusion import metadata
+    from facefusion.types import Face
+    kept_at = root / SOURCES / (source_key(refs, metadata.get('version')) + '.npz')
+    sources, known = refs, None
+    try:
+        known = kept_source(kept_at, Face, np) if kept_at.is_file() else None
+    except Exception as error:
+        print('The kept face could not be read (%s); reading the photos.' % error)
+    extract_source_face = swapper.extract_source_face
+    if known:
+        sources = [known[1]]
+        swapper.extract_source_face = lambda frames: known[0]
+        captured['sources'] = 'kept'
+    else:
+        def observe_source(frames):
+            face = extract_source_face(frames)
+            if face is not None and 'sources' not in captured:
+                captured['sources'] = 'read'
+                try:
+                    first = next(path for path, frame in zip(refs, frames)
+                                 if get_static_faces([frame]))
+                    keep_source(kept_at, face, first, np)
+                except Exception as error:
+                    print('The face could not be kept for the next run (%s).' % error)
+            return face
+        swapper.extract_source_face = observe_source
     raw_output = output.with_name(output.stem + '-facefusion.png')
     sys.argv = [str(ff_root / 'facefusion.py'), 'headless-run',
-                '--source-paths', *refs, '--target-path', str(target),
+                '--source-paths', *sources, '--target-path', str(target),
                 '--output-path', str(raw_output), '--processors', 'face_swapper',
                 '--face-swapper-model', args.model, '--face-selector-mode', 'one',
                 '--face-swapper-weight', str(round(round(args.weight * 20) / 20, 2)),
-                '--face-mask-types', 'box', 'region',
+                '--face-mask-types', *args.masks,
                 '--execution-providers', args.provider, '--execution-thread-count', '4',
                 '--output-image-quality', '100', '--output-image-scale', '1.0',
                 '--jobs-path', str(root / '.runtime/facefusion-jobs'),
@@ -136,6 +245,8 @@ def main():
     try:
         core.cli()
     except SystemExit as exc:
+        if exc.code and captured.get('refused'):
+            raise RuntimeError(REFUSED) from None
         if exc.code:
             raise
     if not captured.get('count'):
@@ -176,6 +287,7 @@ def main():
     report = {'target': str(target), 'output': str(output), 'identity': args.identity,
               'references': refs, 'model': args.model, 'faces_swapped': captured['count'],
               'weight': round(round(args.weight * 20) / 20, 2), 'tone': tone,
+              'masks': list(args.masks), 'sources': captured.get('sources'),
               'pixel_boost': captured.get('pixel_boost'),
               'mask_pixels': int(mask.sum()), 'outside_mask_changed_pixels': outside_changes,
               'changed_pixels': int(np.any(check != original, axis=2).sum()),

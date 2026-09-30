@@ -1,14 +1,17 @@
 {
   "id": "zimage_hq",
   "label": "Z-Image Turbo high quality",
-  "about": "Z-Image Turbo text to image (ComfyUI's own recipe) with model-only LoRAs, an optional source picture, and the upscale-and-refine detail pass the chat tab's bridge uses. A pose (OpenPose stick figure) and a composition (depth map) go through Alibaba PAI's Z-Image-Turbo Fun ControlNet Union, a model patch, depth chained after pose; unlike FLUX's ControlNet it patches the model, not the conditioning, so only the first pass samples with the patched model - the face pass and the refine pass keep node 4, unpatched, as a whole-frame map over a face crop would pull it out of shape.",
+  "about": "Z-Image Turbo text to image (ComfyUI's own recipe) with model-only LoRAs, an optional source picture, and the upscale-and-refine detail pass the chat tab's bridge uses. A pose (OpenPose stick figure) and a composition (depth map) go through Alibaba PAI's Z-Image-Turbo Fun ControlNet Union, a model patch, depth chained after pose; unlike FLUX's ControlNet it patches the model, not the conditioning, so only the first pass samples with the patched model - the face pass and the refine pass keep node 4, unpatched, as a whole-frame map over a face crop would pull it out of shape. A part redrawn over what is there (a face, a hand, the eyes, a fixed spot) is sampled with `redraw_sampler` on `redraw_scheduler`, not the picture's own: a sampler that adds no noise of its own left specks and beads on skin at every strength, and of the clean ones euler_ancestral on beta keeps a face nearest; `face_denoise` 0.3 mends a small face's eyes and teeth and keeps more of the face than 0.4. `lora_budget` is the total LoRA weight this step-distilled model takes before its pictures break up, and `anatomy` false leaves the sentence that counts hands and fingers out of the prompt: it draws them well untold, and told, makes them the subject.",
   "families": ["z-image"],
+  "anatomy": false,
   "defaults": {
     "steps": 8, "guidance": 1.0, "sampler": "res_multistep", "scheduler": "simple",
     "width": 1024, "height": 1024, "denoise": 1.0, "shift": 3.0,
     "encoder_device": "default", "refine": false, "upscale": 1.5,
     "refine_steps": 5, "refine_denoise": 0.33, "refine_sampler": "dpmpp_2m_sde",
     "refine_scheduler": "beta", "filename_prefix": "ImageStudio/zimage",
+    "redraw_sampler": "euler_ancestral", "redraw_scheduler": "beta", "face_denoise": 0.3,
+    "lora_budget": 1.2,
     "model_patch": "Z-Image-Turbo-Fun-Controlnet-Union-2.1-2602-8steps.safetensors",
     "pose_strength": 0.85, "composition_strength": 0.5
   },
