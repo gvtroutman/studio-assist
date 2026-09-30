@@ -1438,8 +1438,9 @@ light to the head's at finer scales (the mask's size / 6 to / 48) changed the
 patch by nothing one can see - it has an edge, it is not a cast - so `--tone`
 is as it was. Putting the head's fine grain back on the swapped skin looks
 better (pores, freckles) and cost 0.03-0.04, with a ghost of the head's own
-brows: not done. NOT tried: FaceFusion's `face_enhancer`; none
-of its models is installed and a download is his to allow. The worker prints
+brows: not done. FaceFusion's `face_enhancer` (GFPGAN 1.4, downloaded at
+Sitter's word 2026-09-29, `.runtime/facefusion/.assets/models/`) is wired
+and off: see "The face enhancer is there and off" below. The worker prints
 the faces it found ("Faces found, left to right"), and the report says
 `regions`, `lens_line` and `deweave`. A FaceFusion without
 `create_region_mask` or `explode_pixel_boost` under those names swaps as it
@@ -1460,6 +1461,26 @@ eye the two are near alike, the higher a little harder. A profile keeps the
 number it was given (Partner's says 1.0) and a strength under 0.5 is as it was;
 the editor's label says what the number does. Any other swap model has no
 peak: none was measured. If the user wants it back, `SWAP_PEAK = {}`.
+
+**The face enhancer is there and off** (`facefusion.SWAP_ENHANCE` '' /
+`SWAP_ENHANCE_BLEND` 60, `enhancer()`; the worker's `--enhance` /
+`--enhance-blend`, `through`; 2026-09-29). The user asked for GFPGAN to be
+tried at a low blend, and allowed the download (gfpgan_1.4.onnx, 340 MB,
+from facefusion-assets `models-3.0.0`, crc32 checked as FaceFusion checks
+it). It runs after the swap on the same face (`captured['target']`), and its
+change is taken through the swap's own soft mask, so the teeth, the cheek
+behind a lens and all outside the swap stay the picture's, and "zero pixels
+outside the mask" still holds. What it does: sharpens the eyes, lashes and
+lips; the skin stays smooth (it does not bring pores or freckles back).
+ArcFace, the swap alone on the five heads: 0.846 without, 0.839 at blend 20,
+0.832 at 40, 0.818 at 60, 0.802 at 80. At the end of the pipeline the eye
+pass redraws the eyes it sharpened, and little shows for the cost: 0.812
+without, 0.797 at 40, 0.786 at 60. So it is off. Two things for the user to
+weigh, not done: with GFPGAN at 60 and NO eye pass the end is 0.818 - above
+today's 0.812 - with crisp eyes in Klein's own colour, where the eye pass
+turned blue-grey eyes brown on one picture of three looked at; and the
+enhancer is only ever run when its model and hash are installed, never
+fetched by the app. `MODELS` is FaceFusion's model folder.
 
 **What the two repairs come to, end to end** (2026-09-29, `Studio.run_job` on
 a copy of the library, Partner's job of 15:09 on 5 seeds: three before a plain
