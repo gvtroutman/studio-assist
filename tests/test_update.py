@@ -5,6 +5,7 @@ pushes. No network."""
 
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,21 +30,44 @@ def commit(cwd, name, text):
     run(cwd, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", name)
 
 
+def remove(path):
+    """rmtree, git's read-only object files included (Windows refuses those)."""
+    def writable(fn, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            fn(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onexc=writable)
+
+
 @unittest.skipUnless(GIT, "git is not installed")
 class UpdateTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # The three repositories as every test starts with them, made once:
+        # a test works in a copy (setUp), which is seven git calls fewer each.
+        cls.made = tempfile.mkdtemp()
+        cls.addClassCleanup(remove, cls.made)
+        origin = os.path.join(cls.made, "start", "origin.git")
+        seed = os.path.join(cls.made, "seed")
+        os.mkdir(os.path.dirname(origin))
+        run(cls.made, "init", "-q", "--bare", "-b", "main", origin)
+        run(cls.made, "init", "-q", "-b", "main", seed)
+        commit(seed, "a.txt", "one\n")
+        run(seed, "push", "-q", origin, "main")
+        run(cls.made, "clone", "-q", origin, os.path.join(cls.made, "start", "pc"))
+        run(cls.made, "clone", "-q", origin, os.path.join(cls.made, "start", "dev"))
+
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        shutil.copytree(os.path.join(self.made, "start"), self.dir, dirs_exist_ok=True)
         origin = os.path.join(self.dir, "origin.git")
-        seed = os.path.join(self.dir, "seed")
         self.pc = os.path.join(self.dir, "pc")
         self.dev = os.path.join(self.dir, "dev")
-        run(self.dir, "init", "-q", "--bare", "-b", "main", origin)
-        run(self.dir, "init", "-q", "-b", "main", seed)
-        commit(seed, "a.txt", "one\n")
-        run(seed, "push", "-q", origin, "main")
-        run(self.dir, "clone", "-q", origin, self.pc)
-        run(self.dir, "clone", "-q", origin, self.dev)
+        for clone in (self.pc, self.dev):           # a clone's origin is a path: this copy's
+            run(clone, "config", "remote.origin.url", origin)
         self._here, self._log = upd.HERE, upd.LOG
         upd.HERE, upd.LOG = self.pc, os.path.join(self.dir, "update.log")
         self.addCleanup(setattr, upd, "HERE", self._here)
