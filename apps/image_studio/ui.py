@@ -449,6 +449,7 @@ class ImageStudio:
         self.auto_refine = tk.BooleanVar(value=False)   # the Visual Critic
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
         self.head_swap = tk.BooleanVar(value=True)      # the head redrawn before the face swap
+        self.glasses_pass = tk.BooleanVar(value=False)  # the glasses redrawn whatever the swap kept
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
         self.lora_build = None        # the identity LoRA being trained (lt.Build)
@@ -801,6 +802,15 @@ class ImageStudio:
         # redraws the whole head from their photo before FaceFusion swaps the face.
         b = tk.Checkbutton(setup, text="Head swap before the face swap",
                            variable=self.head_swap,
+                           anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
+                           wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
+        # The glasses pass (ig.glasses_pass): the face swap now goes behind
+        # the frames, so they are left as drawn unless this is ticked.
+        b = tk.Checkbutton(setup, text="Redraw glasses after the face swap",
+                           variable=self.glasses_pass,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
@@ -1789,6 +1799,8 @@ class ImageStudio:
         s["auto_refine"] = bool(self.auto_refine.get())
         s["hand_pass"] = bool(self.hand_pass.get())
         s["head_swap"] = bool(self.head_swap.get())
+        # Ticked: always. Unticked: only after a swap that painted over them.
+        s["glasses_pass"] = True if self.glasses_pass.get() else None
         for key, _, kind in ADVANCED:
             raw = self.adv[key].get().strip()
             if not raw:
@@ -1851,6 +1863,7 @@ class ImageStudio:
         self.auto_refine.set(bool(s.get("auto_refine")))
         self.hand_pass.set(s.get("hand_pass", True) is not False)
         self.head_swap.set(s.get("head_swap", True) is not False)
+        self.glasses_pass.set(s.get("glasses_pass") is True)
         for r in list(self.loras):
             r["row"].destroy()
         self.loras = []

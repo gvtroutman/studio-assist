@@ -1626,6 +1626,13 @@ class TestIntoCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual((plan.values["width"], plan.values["height"]), (896, 1152))
         self.assertEqual(plan.values["denoise"], round(1 - sc.FALLBACK_KEEP, 3))
         self.assertIn("checking a gauge, hard hat and hi-vis on", plan.prompt)
+        # A scene's people get the clothing floor after the scene's own words,
+        # and on Z-Image Turbo no count of hands and fingers (it made them the
+        # picture); FLUX is still told.
+        self.assertTrue(plan.prompt.endswith(" Fully clothed."), plan.prompt)
+        self.assertNotIn("fingers", plan.prompt)
+        st, _ = self.settings("flux-dev", set())
+        plan = ig.compose(st, self.studio.lib, self.backend("5090"), FLUX_FILES)
         self.assertIn(ig.anatomy_text(), plan.prompt)
 
     def test_the_forms_person_is_not_said_twice(self):
