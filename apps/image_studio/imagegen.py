@@ -4959,6 +4959,7 @@ class Job:
         self.paste_graph = None       # the real-face paste's graph, when it ran
         self.passes = []              # [{"label", "graph"}] each `_run_pass`, in order
         self.facefusion = []          # verified final swaps, after all redraws
+        self.heads = {}               # {(picture, profile id): its face's middle, 0-1} the head swap redrew
         self.real_faces = None        # [{"name", "box", "photos"}] for the paste, from the face pass
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
         self.dress = None             # {"outfit", "passes", "head_crop", ...} when dressed
@@ -6034,7 +6035,9 @@ class Studio:
                         if photo not in photos:
                             photos[photo] = client.upload_image(photo)
                         heads.append({"crop": headswap.head_crop(width, height, face),
-                                      "photo": photos[photo], "name": profile["name"]})
+                                      "photo": photos[photo], "name": profile["name"],
+                                      "id": profile.get("id"),
+                                      "middle": headswap.middle(width, height, face)})
                 if not heads:
                     if not job.cancel.is_set():
                         job.notes.append("SAM3 found no face of a chosen person, so no head "
@@ -6042,13 +6045,15 @@ class Studio:
                     out.append((filename, data))
                     continue
                 graph = headswap.head_graph(image, heads, int(values.get("seed") or 0),
-                                            values["filename_prefix"] + "_head", sam)
+                                            values["filename_prefix"] + "_head", sam,
+                                            size=(width, height))
                 files = self._run_pass(job, client, graph, say, headswap.LABEL,
                                        status=headswap.STATUS)
                 if files is None:         # cancelled: the picture as it was
                     out.append((filename, data))
                     continue
                 out.append((filename, client.fetch(files[0])))
+                job.heads.update({(n, h["id"]): h["middle"] for h in heads})
                 job.notes.append("Head swap before the face swap: %s redrawn from their "
                                  "photo by FLUX.2 Klein." % ", ".join(
                                      "%s's head" % h["name"] for h in heads))
@@ -6059,16 +6064,24 @@ class Studio:
             return pictures
 
     def _apply_profiles(self, job, pictures, profiles, say):
-        """The final face swap, by FaceFusion (`facefusion.SWAP_MODEL`)."""
+        """The final face swap, by FaceFusion (`facefusion.SWAP_MODEL`). The
+        face of a head the head swap has redrawn (`job.heads`) is the one
+        swapped, pointed at by its middle: FaceFusion's own finder may see
+        more faces than SAM3's chosen one - a passer-by Klein drew sharper
+        - and would not choose between them."""
         import apps.image_studio.facefusion as facefusion
         result = []
-        for filename, data in pictures:
+        for n, (filename, data) in enumerate(pictures):
             for index, profile in enumerate(profiles):
                 if job.cancel.is_set():
                     raise RuntimeError("Face swap cancelled.")
                 say("face_swap", "Applying %s's face" % profile["name"], None)
                 options = ({"face_index": index, "face_count": len(profiles)}
                            if len(profiles) > 1 else {})
+                middle = job.heads.get((n, profile.get("id")))
+                if middle and profile.get("target_region") is None \
+                        and profile.get("target_point") is None:
+                    profile = dict(profile, target_point=list(middle))
                 data, report = facefusion.swap(data, profile, stop=job.cancel.is_set, **options)
                 job.facefusion.append(report)
                 job.notes.append("%s: FaceFusion applied; zero pixels changed outside the face mask."
