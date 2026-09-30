@@ -2190,6 +2190,23 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertEqual(jobs[0].status, "failed")
         self.assertIn("Describe the scene", jobs[0].detail)
 
+    def test_a_job_that_crashes_logs_its_traceback(self):
+        """The lane catches everything so it never dies with a job half done;
+        the error log is then the only record, so it gets the whole trace -
+        a bare repr named no line when a job failed on a TypeError."""
+        from unittest import mock
+        def crash(job, notify):
+            raise TypeError("list indices must be integers or slices, not str")
+        with mock.patch.object(ig.doctor, "log_error") as log, \
+                mock.patch.object(self.studio, "run_job", crash):
+            jobs = self.studio.submit(dict(ig.default_settings(), scene="x", backend="5090"))
+            settle(jobs)
+        self.assertEqual(jobs[0].status, "failed")
+        self.assertIn("TypeError: list indices", jobs[0].detail)
+        (text,), _ = log.call_args
+        self.assertIn("Traceback (most recent call last)", text)
+        self.assertIn("in crash", text)
+
 
 class TestFixSpots(unittest.TestCase):
     def test_head_off_centre_in_landscape_frame_is_not_repositioned(self):

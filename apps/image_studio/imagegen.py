@@ -44,6 +44,7 @@ import random
 import re
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -5152,7 +5153,9 @@ class JobQueue:
             except Exception as e:           # never let a lane die with a job half done
                 if job.status not in FINISHED:
                     self._finish(job, "failed", "%s: %s" % (type(e).__name__, e))
-                doctor.log_error("Image Studio job %s failed:\n%r" % (job.id, e))
+                # The trace, not just the repr: a bare "list indices must be
+                # integers" names no line, and this is the only record there is.
+                doctor.log_error("Image Studio job %s failed:\n%s" % (job.id, traceback.format_exc()))
             finally:
                 lane.current = None
             if not lane.waiting and lane.backend.get("release_vram"):
