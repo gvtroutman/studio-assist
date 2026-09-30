@@ -4098,6 +4098,19 @@ folder are exactly that, and their `serve()` loops are gone.
   switched to: same windows, same results, nothing shown. Use it for every run that
   reaches a GUI test, the whole suite included. It is not a test mode: the code under
   test cannot tell, and nothing is skipped.
+- **A GUI test collects its own garbage, on Tk's thread.** A dropped widget holds bound
+  methods of itself, so a closed window, rebuilt buttons or a second Chat is Tk
+  objects in cycles, freed by the collector on whichever thread it next runs. In the
+  app that is harmless: `mainloop` runs, and a free from a worker is handed to it. In
+  the tests nothing runs `mainloop`, so each Tk variable freed off the main thread
+  waits 1 s and gives up ("main thread is not in main loop"). A later module's job lane
+  once stood 60 s freeing 55 of them, and `test_finish_line` failed "jobs did not
+  finish" in full runs only, on a different test each time (2026-09-30; found by
+  dumping every thread where `settle` gave up, and by collecting with
+  `gc.DEBUG_SAVEALL` after each test to see who left Tk objects behind). `TestGui`
+  (test_agent) was the only class that did, and its `setUp` now registers
+  `gc.collect` as its first cleanup. A new test class that builds and drops Tk windows
+  does the same.
 
 ```bash
 python tests/offscreen.py discover -s tests -v   # no network, no apps needed, no windows shown
