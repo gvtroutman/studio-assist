@@ -588,6 +588,116 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(model="flux-dev", scene="x")
         self.assertIn("sx70 photo, polaroid frame", p.prompt)
 
+    def always_on(self, n=4, strength=0.8, missing=()):
+        """`n` Z-Image LoRAs switched to Always on as Add-ons imports them,
+        each with its trigger; those in `missing` are not on the backend.
+        -> the backend's inventory."""
+        lib = self.studio.lib
+        names = ["snapshot", "detail", "instant", "afterdark", "skin", "grain"][:n]
+        lib.save("loras", lib.all("loras") + [
+            {"id": k, "file": k + ".safetensors", "name": k.title(), "family": "z-image",
+             "strength": strength, "always": True, "trigger": "trig_" + k} for k in names])
+        return dict(FLUX_FILES, loras=FLUX_FILES["loras"] | {
+            k + ".safetensors" for k in names if k not in missing})
+
+    def test_always_on_loras_share_what_the_model_takes(self):
+        # Live on the 5090, 2026-09-29: four always-on LoRAs at the 0.8 each
+        # was imported with (3.2) made a fox at dawn a night scene with a grid
+        # across it, and a Scene Builder picture a smear; at 1.2 both were
+        # clean pictures of what was asked.
+        inv = self.always_on(4)
+        p = self.plan(model="z-image-turbo", scene="A fox in snow.", inventory=inv)
+        self.assertEqual(p.errors, [])
+        self.assertEqual(ig.load_workflow("zimage_hq")["defaults"]["lora_budget"], 1.2)
+        self.assertEqual([s for _, s in p.loras], [0.3, 0.3, 0.3, 0.3])
+        self.assertEqual([m["strength"] for m in p.lora_meta], [0.3] * 4)
+        said = [w for w in p.warnings if w.startswith("Always-on LoRAs turned down")]
+        self.assertEqual(len(said), 1, p.warnings)
+        self.assertIn("Snapshot to 0.3, Detail to 0.3, Instant to 0.3 and Afterdark to 0.3",
+                      said[0])
+        self.assertIn("come to 3.2", said[0])
+        self.assertIn("takes about 1.2", said[0])
+        for k in ("snapshot", "afterdark"):
+            self.assertIn("trig_" + k, p.prompt)       # turned down, still given
+        # One, or two that fit, are as the library has them: nothing is said.
+        for n, strength in ((1, 0.8), (2, 0.6), (3, 0.4)):
+            self.setUp()
+            inv = self.always_on(n, strength)
+            p = self.plan(model="z-image-turbo", scene="A fox in snow.", inventory=inv)
+            self.assertEqual([s for _, s in p.loras], [strength] * n)
+            self.assertFalse(any("turned down" in w for w in p.warnings), p.warnings)
+
+    def test_a_lora_chosen_for_the_picture_keeps_its_strength(self):
+        inv = self.always_on(4)
+        p = self.plan(model="z-image-turbo", scene="A fox.", inventory=inv,
+                      loras=[{"id": "snapshot", "strength": 0.9}])
+        by = {m["id"]: (m["strength"], m["why"]) for m in p.lora_meta}
+        self.assertEqual(by["snapshot"], (0.9, "added"))
+        # The other three share what it leaves: 0.3 of 1.2, 0.1 each.
+        self.assertEqual([by[k] for k in ("detail", "instant", "afterdark")],
+                         [(0.1, "always on")] * 3)
+        self.assertAlmostEqual(sum(s for s, _ in by.values()), 1.2, places=2)
+        # Chosen LoRAs over what the model takes are said, not changed, and
+        # leave the always-on ones no room.
+        p = self.plan(model="z-image-turbo", scene="A fox.", inventory=inv,
+                      loras=[{"id": "snapshot", "strength": 0.9},
+                             {"id": "detail", "strength": 0.8}])
+        self.assertEqual(p.loras, [("snapshot.safetensors", 0.9), ("detail.safetensors", 0.8)])
+        self.assertTrue(any(w.startswith("The LoRAs chosen for this picture come to 1.7")
+                            for w in p.warnings), p.warnings)
+        self.assertTrue(any(w.startswith("Always-on LoRAs left out (Instant and Afterdark)")
+                            for w in p.warnings), p.warnings)
+        self.assertNotIn("trig_instant", p.prompt)
+        self.assertIn("trig_snapshot", p.prompt)
+
+    def test_the_budget_is_the_workflows_and_a_pictures_own_to_set(self):
+        inv = self.always_on(4)
+        # FLUX names none: its LoRAs are as they were.
+        lib = self.studio.lib
+        recs = lib.all("loras")
+        for r in recs:
+            if r["id"] in ("sitter", "sx70"):
+                r["always"], r["strength"] = True, 0.9
+        lib.save("loras", recs)
+        p = self.plan(model="flux-dev", scene="x", inventory=inv)
+        self.assertEqual(sorted(s for _, s in p.loras), [0.9, 0.9])
+        self.assertFalse(any("turned down" in w for w in p.warnings), p.warnings)
+        # A picture's own: 0 is no limit, another number is that one.
+        p = self.plan(model="z-image-turbo", scene="x", inventory=inv, lora_budget=0)
+        self.assertEqual([s for _, s in p.loras], [0.8] * 4)
+        p = self.plan(model="z-image-turbo", scene="x", inventory=inv, lora_budget=2.0)
+        self.assertEqual([s for _, s in p.loras], [0.5] * 4)
+
+    def test_hold_loras(self):
+        def stack(*items):
+            return [[{"name": n}, s, why, n + ".safetensors"] for n, s, why in items]
+        a = stack(("A", 0.8, "always on"), ("B", -0.8, "always on"))
+        self.assertEqual(ig.hold_loras(a, 0, "M"), [])                  # no limit
+        self.assertEqual(ig.hold_loras(a, 1.6, "M"), [])                # it fits
+        self.assertEqual([x[1] for x in a], [0.8, -0.8])
+        said = ig.hold_loras(a, 1.2, "M")                               # a slider's minus is kept
+        self.assertEqual([x[1] for x in a], [0.6, -0.6])
+        self.assertEqual(len(said), 1)
+        b = stack(("Id", 1.0, "identity Ann"), ("Style", 0.5, "style S"))
+        said = ig.hold_loras(b, 1.2, "M")
+        self.assertEqual([x[1] for x in b], [1.0, 0.5])                 # chosen: said only
+        self.assertEqual(len(said), 1)
+        self.assertIn("1.5", said[0])
+
+    def test_a_lora_left_out_does_not_leave_its_trigger_behind(self):
+        # Live, 2026-09-29: a LoRA whose file was not on the machine was left
+        # out, and its trained words ("... detailed skin pore ...") went into
+        # the prompt of every picture all the same - a fox's too.
+        inv = self.always_on(2, 0.5, missing=("detail",))
+        p = self.plan(model="z-image-turbo", scene="A fox in snow.", inventory=inv)
+        self.assertEqual(p.loras, [("snapshot.safetensors", 0.5)])
+        self.assertTrue(any("Detail" in w and "left out" in w for w in p.warnings), p.warnings)
+        self.assertEqual(p.prompt, "A fox in snow. trig_snapshot.")
+        # Another family's, added to the form by an old record: the same.
+        p = self.plan(model="z-image-turbo", scene="A fox in snow.", inventory=inv,
+                      loras=[{"id": "sitter", "strength": 0.8}])
+        self.assertNotIn("SITTERPERSON", p.prompt)
+
     def test_a_saved_lora_mix_is_a_preset_on_its_built_in(self):
         lib = self.studio.lib
         lib.save("presets", [
@@ -651,7 +761,9 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(identities=[{"id": "sitter", "strength": 0.9}], style="sx70-authentic",
                       scene="At Munich Oktoberfest, raising a stein.", seed=3)
         self.assertEqual(p.errors, [])
-        self.assertTrue(p.prompt.startswith("SITTERPERSON, wearing clothes suited to the scene. At Munich Oktoberfest"))
+        self.assertTrue(p.prompt.startswith(
+            "SITTERPERSON, fully clothed, wearing clothes suited to the scene. "
+            "At Munich Oktoberfest"), p.prompt)
         self.assertIn("SX-70 instant film", p.prompt)
         self.assertEqual(p.loras, [("sitter.safetensors", 0.9), ("sx70.safetensors", 0.55)])
         self.assertEqual(p.values["seed"], 3)
@@ -662,10 +774,8 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
                       camera="85mm, shallow depth of field", anatomy=False)
         self.assertEqual(p.errors, [])
         self.assertEqual(p.prompt, "a woman in her 30s, slim build, green eyes, auburn hair, "
-                                   "freckles, wearing clothes suited to the scene. On a pier at dusk. "
-                                   "Every person is clothed, the chest fully covered by their "
-                                   "clothing or swimwear. "
-                                   "85mm, shallow depth of field.")
+                                   "freckles, fully clothed, wearing clothes suited to the "
+                                   "scene. On a pier at dusk. 85mm, shallow depth of field.")
 
     def test_attributes_keep_their_own_nouns(self):
         self.assertEqual(ig.person_text({"hair": "long black hair", "eyes": "hazel eyes",
@@ -719,8 +829,10 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
 
     def test_anatomy_constants_for_every_person(self):
         p = self.plan(style="none", subject="a woman", scene="Waving hello.")
-        self.assertIn("every person has exactly two hands, each with four fingers and a "
+        self.assertIn("Every person has exactly two hands, each with four fingers and a "
                       "thumb, two feet, two eyes and a proportionate body", p.prompt)
+        # "Drawn correctly: ..." made photographs illustrations (live, 2026-09-29).
+        self.assertNotIn("drawn", p.prompt.lower())
         self.assertIn("extra fingers", p.negative)
         p = self.plan(style="none", scene="Two dancers on a stage.")
         self.assertIn("four fingers and a thumb", p.prompt)          # the scene names people
@@ -729,9 +841,37 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(style="none", subject="a woman", anatomy=False)
         self.assertNotIn("fingers", p.prompt + p.negative)
 
+    def test_a_workflow_can_leave_the_anatomy_constants_unsaid(self):
+        # Z-Image Turbo: told of hands and fingers, it made them the picture
+        # and cut the head off (live, 2026-09-29). The switch is still there,
+        # so a note says why it did nothing.
+        p = self.plan(model="z-image-turbo", style="none", subject="a woman",
+                      scene="Waving hello.")
+        self.assertEqual(p.errors, [])
+        self.assertNotIn("fingers", p.prompt + p.negative)
+        self.assertTrue(any("anatomy constants" in n for n in p.notes), p.notes)
+        p = self.plan(model="z-image-turbo", style="none", subject="a woman", anatomy=False)
+        self.assertFalse(any("anatomy constants" in n for n in p.notes), p.notes)
+        p = self.plan(model="z-image-turbo", style="none", scene="A red bicycle.")
+        self.assertFalse(any("anatomy constants" in n for n in p.notes), p.notes)
+
+    def test_nothing_is_added_that_the_user_did_not_say(self):
+        # A light and a small flaw, picked by the seed, were to be added to a
+        # no-style prompt (2026-09-28) and never were: "No style" is itself a
+        # style. Run live they cut heads off to show the flaw ("a loose thread
+        # on a sleeve") and put a lamp in the picture ("a single lamp at
+        # night"), so they are gone, with or without a style.
+        for style in ("none", ""):
+            for seed in (11, 22, 33, 44):
+                p = self.plan(style=style, subject="a chef", scene="Plating a dish.",
+                              seed=seed, anatomy=False)
+                self.assertEqual(p.prompt, "a chef, fully clothed, wearing clothes suited "
+                                           "to the scene. Plating a dish.", (style, seed))
+
     def test_identity_joins_the_described_person(self):
         p = self.plan(identities=["sitter"], style="none", hair="grey", scene="Reading.")
-        self.assertTrue(p.prompt.startswith("SITTERPERSON, grey hair, wearing clothes suited to the scene. Reading."), p.prompt)
+        self.assertTrue(p.prompt.startswith("SITTERPERSON, grey hair, fully clothed, wearing "
+                                            "clothes suited to the scene. Reading."), p.prompt)
 
     def test_identity_descriptions_tell_two_undrawn_people_apart(self):
         """Without Scene Builder's own boxes, every person used to be labelled
@@ -750,23 +890,46 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
     def test_a_person_alone_is_enough(self):
         p = self.plan(style="none", subject="an old fisherman", anatomy=False)
         self.assertEqual(p.errors, [])
-        self.assertEqual(p.prompt, "an old fisherman, wearing clothes suited to the scene. " + ig.CLOTHED + ".")
+        self.assertEqual(p.prompt, "an old fisherman, fully clothed, wearing clothes suited "
+                                   "to the scene.")
 
     def test_nobody_is_left_undressed(self):
         p = self.plan(style="none", subject="a woman", chest_size=2, anatomy=False)
-        self.assertIn(ig.COVERED, p.prompt)
+        self.assertIn(ig.CLOTHED + ", " + ig.COVERED, p.prompt)
         p = self.plan(style="none", scene="A nude woman on a beach.", anatomy=False)
-        self.assertIn(ig.COVERED, p.prompt)                     # a floor, not a default
+        self.assertEqual(p.prompt, "A nude woman on a beach. Fully clothed.")   # a floor
         p = self.plan(identities=["sitter"], style="none", scene="Reading.", anatomy=False)
-        self.assertIn(ig.COVERED, p.prompt)
+        self.assertIn("SITTERPERSON, " + ig.CLOTHED + ", " + ig.COVERED, p.prompt)
         for dressed in ({"top": "hoodie"}, {"bottom": "blue jeans"},
                         {"scene": "A woman in a red dress."},
                         {"scene": "A man wearing a wetsuit."}):
             p = self.plan(style="none", subject="a person", anatomy=False, **dressed)
-            self.assertNotIn(ig.COVERED, p.prompt, dressed)
+            self.assertNotIn(ig.COVERED, p.prompt, dressed)     # a garment is named
+            self.assertIn(", " + ig.CLOTHED, p.prompt, dressed)  # and still said to be on
         p = self.plan(style="none", scene="A red bicycle on top of a hill.")
         self.assertNotIn(ig.COVERED, p.prompt)                  # nobody in it
-        self.assertNotIn(ig.CLOTHED, p.prompt)
+        self.assertNotIn("clothed", p.prompt.lower())
+
+    def test_the_clothing_floor_is_said_of_the_person_and_names_no_skin(self):
+        # Live on the 5090, 2026-09-29, the same seeds: the sentence this
+        # replaces ("Every person is clothed, the chest fully covered by their
+        # clothing or swimwear") drew what it named - swimsuits in a garden,
+        # a man knitting in his briefs, a woman walking a dog topless.
+        for p in (self.plan(style="none", subject="a woman", chest_size=3,
+                            scene="Walking a dog in a park.", anatomy=False),
+                  self.plan(style="none", scene="A man knitting in an armchair.",
+                            anatomy=False)):
+            for word in ("chest fully", "swimwear", "covered", "Every person is"):
+                self.assertNotIn(word, p.prompt)
+        # A scene that describes its people itself has no one to hang the
+        # floor on: it follows the scene, a sentence of its own, and no
+        # "wearing..." without a wearer opens the prompt.
+        p = self.plan(style="none", scene="A man knitting in an armchair.", anatomy=False)
+        self.assertEqual(p.prompt, "A man knitting in an armchair. Fully clothed.")
+        p = self.plan(model="z-image-turbo", style="none",
+                      scene="An elderly man knitting a red scarf in an armchair.")
+        self.assertEqual(p.prompt, "An elderly man knitting a red scarf in an armchair. "
+                                   "Fully clothed.")
 
     def test_a_swimsuit_still_covers_the_chest(self):
         # Drawn topless on Z-Image Turbo, 2026-09-27: the swimsuit alone lost
@@ -774,7 +937,8 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         p = self.plan(identities=["sitter"], style="none", subject="a woman", build="curvy",
                       chest_size=3, scene="sitterperson in a swimsuit")
         self.assertNotIn(ig.COVERED, p.prompt)                  # a garment is named
-        self.assertIn(ig.CLOTHED, p.prompt)
+        self.assertIn("very full chest, " + ig.CLOTHED + ". sitterperson in a swimsuit",
+                      p.prompt)
         self.assertNotIn("natural anatomy", p.prompt)
         self.assertNotIn("Anatomically", p.prompt)
 
@@ -812,7 +976,9 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
 
     def test_two_people_in_one_picture(self):
         p = self.plan(identities=["sitter", "partner"], scene="Dancing.")
-        self.assertTrue(p.prompt.startswith("SITTERPERSON and PARTNERPERSON, wearing clothes suited to the scene. Dancing."))
+        self.assertTrue(p.prompt.startswith("SITTERPERSON and PARTNERPERSON, fully clothed, "
+                                            "wearing clothes suited to the scene. Dancing."),
+                        p.prompt)
 
     def test_identity_carries_no_style(self):
         p = self.plan(identities=["sitter"], scene="Portrait.", style="none")
@@ -1149,6 +1315,45 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         g = client.graphs[0]
         self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])   # Z-Image's own encoder
         self.assertEqual(g["fc1_4"]["inputs"]["cfg"], 1.0)
+
+    def test_a_redraw_is_sampled_as_its_workflow_says_a_redraw_is(self):
+        # Z-Image Turbo's own sampler adds no noise as it goes, and over what
+        # is there it leaves specks on skin and beads in beards; of the clean
+        # ones euler_ancestral on beta keeps a face nearest (ArcFace, live
+        # 2026-09-29): its redraws are euler_ancestral's on beta.
+        wf = ig.load_workflow("zimage_hq")
+        self.assertEqual((wf["defaults"]["sampler"], wf["defaults"]["redraw_sampler"],
+                          wf["defaults"]["redraw_scheduler"]),
+                         ("res_multistep", "euler_ancestral", "beta"))
+        job, client, _ = self.fix_job(model="z-image-turbo")
+        k = client.graphs[0]["fc1_4"]["inputs"]
+        self.assertEqual((k["sampler_name"], k["scheduler"], k["steps"]),
+                         ("euler_ancestral", "beta", 8))
+        # A sampler chosen for the picture is the picture's, not its redraws';
+        # the steps are the picture's.
+        values = dict(job.plan.values, sampler="euler", scheduler="simple", steps=9,
+                      face_prompt="a hand", face_denoise=0.4, seed=1)
+        g = ig.face_graph(wf, values, [], "made.png", ig.fix_crops(512, 512, [
+            {"x": 200, "y": 200, "size": 64}]), "oval.png", "out")
+        k = g["fc1_4"]["inputs"]
+        self.assertEqual((k["sampler_name"], k["scheduler"], k["steps"]),
+                         ("euler_ancestral", "beta", 9))
+        # The Z-Image face pass is light: 0.3 keeps more of the face than 0.4
+        # and still mends a 60 px face's eyes and teeth. FLUX keeps its 0.4.
+        self.assertEqual(wf["defaults"]["face_denoise"], 0.3)
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"})
+        for model, strength in (("z-image-turbo", 0.3), ("flux-dev", 0.4)):
+            s = dict(ig.default_settings(), model=model, scene="a woman", preset="hq_final")
+            p = ig.compose(s, self.studio.lib, self.backend("5090"), inv, nodes=FaceClient.NODES)
+            self.assertEqual(p.errors, [])
+            self.assertTrue(p.values["face_detail"])
+            self.assertEqual(p.values["face_denoise"], strength, model)
+        # FLUX names none, and redraws with the picture's as before.
+        self.assertNotIn("redraw_sampler", ig.load_workflow("flux_dev_baseline")["defaults"])
+        job, client, _ = self.fix_job(model="flux-dev")
+        k = client.graphs[0]["fc1_4"]["inputs"]
+        self.assertEqual((k["sampler_name"], k["scheduler"], k["steps"]),
+                         ("euler", "simple", 20))
 
     def test_generate_around_head_keeps_source_position_and_retry(self):
         lock = {"x": 40, "y": 40, "size": 64}
@@ -2924,6 +3129,24 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertFalse(ui.collect()["head_swap"])
         ui.apply({k: v for k, v in ui.collect().items() if k != "head_swap"})
         self.assertTrue(ui.collect()["head_swap"])
+        # The glasses pass is the other way about: left to the swap (None)
+        # unless ticked, and an older picture leaves it so.
+        self.assertIsNone(ui.collect()["glasses_pass"])
+        self.assertFalse(ig.glasses_pass(ui.collect(), [{"masks": ["box", "occlusion"]}]))
+        ui.apply(dict(ui.collect(), glasses_pass=True))
+        self.assertIs(ui.collect()["glasses_pass"], True)
+        self.assertTrue(ig.glasses_pass(ui.collect(), [{"masks": ["box", "occlusion"]}]))
+        ui.apply({k: v for k, v in ui.collect().items() if k != "glasses_pass"})
+        self.assertIsNone(ui.collect()["glasses_pass"])
+        texts = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                if c.winfo_class() == "Checkbutton":
+                    texts.append(c.cget("text"))
+                walk(c)
+        walk(ui.frame_root if hasattr(ui, "frame_root") else self.app)
+        self.assertIn("Redraw glasses after the face swap", texts)
 
     def test_the_picture_card_holds_no_prompt_only_a_failed_face_swap_note(self):
         _, ui = self.tab()
@@ -3869,13 +4092,23 @@ class TestImageStudioTab(unittest.TestCase):
         s, ui = self.tab()
         ui.settings.update(model="flux-dev", backend="5090")
         ui.scene.delete("1.0", "end")
-        ui.scene.insert("1.0", "A fox")
+        ui.scene.insert("1.0", "A man waving from a boat")
         n = len(ui.jobs)
         ui.generate()
         self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status == "complete")
         w = ui.rows[ui.jobs[0].id]
         self.assertEqual([l.cget("text") for l in w["stages"]],
                          ["Sampling", "Decoding", "Hand pass", "Complete"])
+        # The hands pass is for people: a fox's paws are hands to SAM3, and
+        # were redrawn as a hand's (live, 2026-09-29).
+        ui.scene.delete("1.0", "end")
+        ui.scene.insert("1.0", "A fox")
+        n = len(ui.jobs)
+        ui.generate()
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status == "complete")
+        w = ui.rows[ui.jobs[0].id]
+        self.assertEqual([l.cget("text") for l in w["stages"]],
+                         ["Sampling", "Decoding", "Complete"])
 
     def test_a_settled_tab_animates_nothing(self):
         s, ui = self.tab()

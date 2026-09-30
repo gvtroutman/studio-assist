@@ -1853,14 +1853,29 @@ EYE_WHAT = ("clear, detailed eyes with round irises, dark pupils and lashes, bot
 GLASSES_DENOISE = 0.45
 GLASSES_WHAT = ("thin metal glasses frames with perfectly clear, transparent lenses and no "
                 "glare, the eyes sharp behind them")
-# Every Generate then has its hands redrawn (the user, 2026-09-26: "a pass with
-# natural hands"), before the glasses, which stay last. Only what SAM3 finds
-# as a hand in each crop changes. 0.6 is the Critic's LOCAL_INPAINT: it mends
-# the fingers without re-posing them; 0.85-0.9 left double hands.
+# Every Generate of people then has its hands redrawn (the user, 2026-09-26: "a
+# pass with natural hands"), before the glasses, which stay last. Only what
+# SAM3 finds as a hand in each crop changes. It is a finish, so it must not
+# cost a hand that was drawn well, and most are: on Z-Image Turbo 0.6 (the
+# Critic's LOCAL_INPAINT, this pass's strength until 2026-09-29) took a ring
+# off a finger, aged a florist's hand into scales and bent a guitarist's
+# fingers off the frets, where 0.4 left each hand as it was and sharpened the
+# small ones. A hand that is wrong is the Critic's or Fix a spot's, at 0.6.
 HAND_FIND = "hand:8"
-HAND_DENOISE = 0.6
+HAND_DENOISE = 0.4
 HAND_WHAT = ("a natural, relaxed human hand with four fingers and a thumb, each finger "
              "separate and jointed, with clear knuckles and nails")
+# Which of SAM3's hands are hands. It gives each box a score, and asked at
+# 0.3 it also gives the forearm round a hand (0.33-0.57), a thing a few pixels
+# wide (0.65) and the field a picture is of (0.48); a hand in plain view
+# scores 0.78-0.97. Taken biggest first, the forearm won and the hand inside
+# it was dropped as its copy: so they are taken by score, and a box that
+# shares half the smaller of the two with a better one is that hand again.
+# A fox's paws score as a hand's do (0.87), so the pass is for pictures whose
+# words name a person (`has_person`), not for what SAM3 calls one.
+HAND_SCORE = 0.5
+HAND_SAME = 0.5
+HAND_SMALL = 0.04                     # of the picture's longer side: a passer-by's hand
 # A spot can be a freehand outline (the Fix a spot window's drag): only
 # inside it changes. ComfyUI has no polygon mask node, so the outline is
 # drawn here as a mask picture at the crop's size (`outline_png`) and
@@ -2106,6 +2121,26 @@ def found_spots(width, height, boxes, kind):
     return out[:FIX_MAX_SPOTS]
 
 
+def real_hands(width, height, boxes):
+    """SAM3's hands, each (x, y, w, h, word, score) -> those worth a redraw,
+    the surest first: scored HAND_SCORE or more, not smaller than HAND_SMALL
+    of the picture, and not a better hand's box again (HAND_SAME)."""
+    small = HAND_SMALL * max(width, height)
+    kept = []
+    for b in sorted(boxes, key=lambda b: -b[5]):
+        x, y, w, h = b[:4]
+        if b[5] < HAND_SCORE or (w * h) ** 0.5 < small:
+            continue
+
+        def same(k):
+            ix = max(0, min(x + w, k[0] + k[2]) - max(x, k[0]))
+            iy = max(0, min(y + h, k[1] + k[3]) - max(y, k[1]))
+            return ix * iy >= HAND_SAME * min(w * h, k[2] * k[3])
+        if not any(same(k) for k in kept):
+            kept.append(b)
+    return kept
+
+
 def swapped_faces(width, height, boxes, profiles):
     """The faces (x, y, w, h) FaceFusion swapped for `profiles`, chosen as
     it chooses them (studio_facefusion.target_face over the faces left to
@@ -2211,10 +2246,11 @@ def faces_found(entry, n):
     return said
 
 
-def parts_found(entry, n, words=None):
+def parts_found(entry, n, words=None, scores=False):
     """What parts_graph said about its `n` prompts -> (width, height,
     [(x, y, w, h)]), or None when it said nothing. With `words` (one per
-    prompt) each box ends with the word that found it."""
+    prompt) each box ends with the word that found it, and with `scores`
+    too, with SAM3's score after the word (1.0 from a SAM3 that gives none)."""
     out = entry.get("outputs") or {}
 
     def text(node):
@@ -2231,6 +2267,7 @@ def parts_found(entry, n, words=None):
     for b, word in zip(said, words or [None] * n):
         b = b[0] if b and isinstance(b[0], list) else b or []
         boxes += [(x["x"], x["y"], x["width"], x["height"]) + ((word,) if word else ())
+                  + ((_num(x.get("score"), float, 1.0),) if word and scores else ())
                   for x in b if max(x["width"], x["height"]) >= 12]
     return int(width), int(height), boxes
 
@@ -2766,9 +2803,18 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
                 "strength": face.get("depth_strength") or FACE_DEPTH_STRENGTH,
                 "start_percent": 0.0, "end_percent": FACE_DEPTH_END, "vae": links["vae"]}}
             positive, negative = [n + "dc", 0], [n + "dc", 1]
+        # A redraw over what is there takes the workflow's `redraw_sampler`
+        # and `redraw_scheduler` when it names them. Z-Image Turbo's own
+        # (res_multistep) adds no noise as it goes, and at every strength
+        # from 0.3 to 0.6 it left specks and beads on skin; euler_ancestral
+        # leaves skin, and drifts further from the face it redrew - least on
+        # the beta scheduler (ArcFace, 2026-09-29; AGENTS.md "A redraw is
+        # sampled as a redraw").
         g[n + "4"] = {"class_type": "KSampler", "inputs": {
-            "seed": (seed + i + 1) % (MAX_SEED + 1), "steps": values["steps"], "cfg": 1.0,
-            "sampler_name": values["sampler"], "scheduler": values["scheduler"],
+            "seed": (seed + i + 1) % (MAX_SEED + 1),
+            "steps": values.get("redraw_steps") or values["steps"], "cfg": 1.0,
+            "sampler_name": values.get("redraw_sampler") or values["sampler"],
+            "scheduler": values.get("redraw_scheduler") or values["scheduler"],
             "denoise": face.get("denoise") or values["face_denoise"], "model": model,
             "positive": positive, "negative": negative,
             "latent_image": latent}}
@@ -3520,6 +3566,7 @@ def default_settings():
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
             "face_detail": None, "batch": 1, "pose": None, "composition": None,
             "auto_refine": False, "refine_passes": 3, "hand_pass": True, "head_swap": True,
+            "glasses_pass": None, "lora_budget": None,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -3776,53 +3823,22 @@ def random_looks(rng=random, sections=None):
     return out
 
 
-# The two things a plain "no style" composition never says on its own, because
-# nothing in the form has a slot for them: what time and light the scene is in,
-# and the small human-error detail a real photograph has and a form-built list
-# of attributes does not - a flyaway hair, a crease, an uneven tan line. Left
-# out, a no-style picture reads as a tag list rendered flat, not a photograph.
-# Skipped whenever a style is chosen: its own prompt already carries this
-# (see _default_styles), and a second, contradictory light or texture fights it.
-TIME_OF_DAY = [
-    "soft morning light", "golden hour, warm low sun", "overcast daylight, soft shadows",
-    "harsh midday sun", "hazy late afternoon light", "blue hour twilight",
-    "neon light at night", "a single lamp at night",
-]
-IMPERFECTIONS = [
-    "a flyaway strand of hair", "a faint crease in the fabric", "a slightly untucked shirt",
-    "asymmetrical shoulders", "a small skin blemish", "windswept hair",
-    "a scuff on the shoes", "uneven tan lines", "a loose thread on a sleeve",
-    "slightly chapped lips",
-]
-# A scene or camera field that already names a time or light of its own: do
-# not add a second, possibly contradictory one on top of the user's words.
-LIGHT_TIME = re.compile(
-    r"\b(morning|noon|midday|afternoon|evening|dusk|dawn|night|sunset|sunrise|"
-    r"daylight|golden hour|blue hour|overcast|backlit|lit by|lamp|neon|moonlit|"
-    r"twilight)\b", re.I)
-
-
-def time_of_day_text(settings, seed):
-    """A light/time phrase for a no-style photograph, or "" when the scene or
-    camera already names one. Deterministic from `seed`: the same seed keeps
-    the same light; a new seed for "a different take" can bring a new one."""
-    if LIGHT_TIME.search(_field(settings, "scene")) or LIGHT_TIME.search(_field(settings, "camera")):
-        return ""
-    return random.Random(int(seed or 0) + 104729).choice(TIME_OF_DAY)
-
-
-def imperfection_text(seed):
-    """One human-error detail for a no-style photograph of a person, picked
-    the same deterministic way as time_of_day_text."""
-    return random.Random(int(seed or 0) + 224737).choice(IMPERFECTIONS)
-
+# What the pipeline adds to the user's words is drawn, like any other words.
+# Every shipped workflow samples at CFG 1: there is no negative prompt, and a
+# thing named to rule it out is a thing named. Measured on the 5090
+# (2026-09-29, the same seeds, only the added words changed): a sentence about
+# the chest and swimwear dressed a gardener in a swimsuit, "Drawn correctly:"
+# made photographs into illustrations, a sentence counting fingers made the
+# hands the picture and cut the head off, and "a loose thread on a sleeve" made
+# the sleeve the picture. So what is added is short, says what is there, and
+# goes on the person it is about.
 
 # The constants: what every person in every picture has, whoever they are
-# and whatever the creator says about them. Diffusion models lose count of
-# fingers and limbs, so the prompt says it outright. (part, positive,
-# negative). Every shipped workflow samples at CFG 1, which ignores the
-# negative prompt, so the positive sentence is what does the work there; the
-# negative is for a model that reads one.
+# and whatever the creator says about them. (part, positive, negative). A
+# workflow whose model draws hands well without being told, and makes them
+# the subject when it is told, leaves the sentence out (`"anatomy": false`:
+# Z-Image Turbo). Every shipped workflow samples at CFG 1, which ignores the
+# negative prompt; the negative is for a model that reads one.
 ANATOMY = [
     ("Hands", "two hands, each with four fingers and a thumb",
      "extra fingers, missing fingers, fused fingers, six fingers, extra hands, "
@@ -3833,18 +3849,39 @@ ANATOMY = [
      "extra limbs, extra arms, disproportionate body, elongated neck, deformed body"),
 ]
 # A scene with nobody described still gets the constants when it names a person.
-PEOPLE = re.compile(r"\b(wom[ae]n|m[ae]n|person|people|girls?|boys?|lady|ladies|guys?|"
-                    r"kids?|child(ren)?|he|she|they|his|her|portrait|selfie|couple|"
-                    r"crowd|dancers?|athletes?|workers?|someone|figure)\b", re.I)
+# It also decides whether the hands pass runs (`hand_pass`), so it knows a
+# person by their trade, their family and what they are doing, where the word
+# can mean nothing else: "a chef plating a dish" names no man or woman.
+PEOPLE = re.compile(
+    r"\b(wom[ae]n|m[ae]n|person|people|girls?|boys?|lady|ladies|guys?|"
+    r"kids?|child(ren)?|he|she|they|his|her|portrait|selfie|couple|"
+    r"crowd|dancers?|athletes?|workers?|someone|figure|"
+    r"toddlers?|teenagers?|adults?|mothers?|fathers?|parents?|grand(mother|father|parent)s?|"
+    r"daughters?|sons?|brothers?|sisters?|husbands?|wife|wives|brides?|grooms?|friends?|"
+    r"famil(y|ies)|chefs?|farmers?|fisherm[ae]n|carpenters?|mechanics?|doctors?|nurses?|"
+    r"teachers?|students?|soldiers?|sailors?|musicians?|pianists?|guitarists?|violinists?|"
+    r"drummers?|singers?|actors?|actress(es)?|florists?|bakers?|barbers?|waiters?|"
+    r"waitress(es)?|runners?|swimmers?|climbers?|cyclists?|hikers?|skiers?|surfers?|"
+    r"tourists?|photographers?|scientists?|engineers?|astronauts?|firefighters?|"
+    r"police(m[ae]n|wom[ae]n)|pedestrians?|commuters?|shoppers?|spectators?)\b", re.I)
 
 
 # What a person wears when nothing names a garment: never nothing. The body
 # and chest words alone read to FLUX as undressed. A scene that asks for bare
-# skin gets the floor too; only a named garment replaces it.
+# skin gets the floor too; only a named garment replaces it. It is said of
+# the person described, after them; with nobody described (the scene's own
+# words are the person) there is no one to hang it on, and CLOTHED stands.
 COVERED = "wearing clothes suited to the scene"
 # ...and said for every person, dressed or not: "in a swimsuit" after "very
 # full chest" was drawn topless on Z-Image Turbo (CFG 1: no negative prompt).
-CLOTHED = "Every person is clothed, the chest fully covered by their clothing or swimwear"
+# Two words on the person, or a sentence of their own after a scene that
+# describes its people itself. Until 2026-09-29 it was "Every person is
+# clothed, the chest fully covered by their clothing or swimwear", which drew
+# what it named: a man knitting in an armchair shirtless in briefs, a runner
+# and a gardener in swimsuits (9 of 9 pictures), and a woman walking a dog
+# topless (3 of 3). With these two words all of them came out dressed, and a
+# swimsuit that was asked for was still a swimsuit.
+CLOTHED = "fully clothed"
 GARMENTS = re.compile(
     r"\b(wear(s|ing)?|dressed|clothe[sd]|clothing|outfits?|uniforms?|costumes?|"
     r"(t-?)?shirts?|blouses?|(tank|crop) tops?|sweaters?|jumpers?|hoodies?|cardigans?|vests?|"
@@ -3861,8 +3898,10 @@ def is_dressed(settings):
 
 
 def anatomy_text():
+    # Not "Drawn correctly: ...": on FLUX.1 [dev] and Z-Image Turbo alike the
+    # word made a photograph an illustration (2026-09-29).
     parts = [pos for _, pos, _ in ANATOMY]
-    return "Drawn correctly: every person has exactly " + _and(parts)
+    return "Every person has exactly " + _and(parts)
 
 
 def anatomy_negative():
@@ -4272,6 +4311,55 @@ def chest_control_kind(look):
     return "chest_female" if female and not male else "chest_male" if male and not female else ""
 
 
+def hold_loras(applied, budget, label):
+    """Hold a LoRA stack to `budget`: the total weight the model takes before
+    its pictures break up (a workflow's `lora_budget`; 0 is no limit).
+    `applied` is [[record, strength, why, file]], changed in place. -> the
+    warnings to give.
+
+    Only the "always on" ones are turned down, all by the same share, into
+    what the others leave of the budget: nobody chose their sum, each was
+    switched on alone in Add-ons at the strength it was imported with. A LoRA
+    chosen for this picture (a row of the form, an identity's, a style's)
+    keeps its strength, and a sum of those over the budget is said, not
+    changed. With no room left the always-on ones are left out.
+
+    Measured on the 5090 (2026-09-29, Z-Image Turbo, four always-on LoRAs,
+    the same seeds): at 0.8 each (3.2) a fox at dawn was a night scene with a
+    grid across it and a grey sweater was underwear; a Scene Builder picture
+    (pose and depth maps) was a smear. At 2.0 it was a picture again, at 1.2
+    a clean one."""
+    total = sum(abs(a[1]) for a in applied)
+    if not budget or total <= budget + 1e-9:
+        return []
+    always = [a for a in applied if a[2] == "always on"]
+    chosen = sum(abs(a[1]) for a in applied if a[2] != "always on")
+    said = []
+    if chosen > budget + 1e-9:
+        said.append("The LoRAs chosen for this picture come to %.3g, and %s takes about "
+                    "%.3g before its pictures break up. Lower their strengths if this one "
+                    "comes out dark, gridded or not as described." % (chosen, label, budget))
+    if not always:
+        return said
+    names = _and([a[0]["name"] for a in always])
+    room = budget - chosen
+    if room <= 1e-9:
+        applied[:] = [a for a in applied if a[2] != "always on"]
+        said.append("Always-on LoRAs left out (%s): the LoRAs chosen for this picture "
+                    "already come to %.3g, and %s takes about %.3g." % (
+                        names, chosen, label, budget))
+        return said
+    share = room / sum(abs(a[1]) for a in always)
+    for a in always:
+        a[1] = round(a[1] * share, 3)
+    said.append("Always-on LoRAs turned down to fit (%s): at full strength the LoRAs come "
+                "to %.3g, and %s takes about %.3g before its pictures break up. Fewer "
+                "always on (Add-ons) leaves each one stronger."
+                % (_and(["%s to %.3g" % (a[0]["name"], a[1]) for a in always]), total,
+                   label, budget))
+    return said
+
+
 def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflow,
             nodes=None):
     """The form's settings -> a Plan for `backend`. `inventory` is that
@@ -4382,6 +4470,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         stack = []
     seen = set()
     have = (inventory or {}).get("loras")
+    applied = []                      # [record, strength, why, file]: what the model is given
     for rec, strength, why in stack:
         if rec["id"] in seen:
             p.warnings.append("%s is enabled twice; used once." % rec["name"])
@@ -4404,9 +4493,15 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             p.warnings.append("%s (%s) is not on %s; left out." % (rec["name"], fname,
                                                                   backend["name"]))
             continue
-        p.loras.append((fname, round(float(strength), 3)))
+        applied.append([rec, float(strength), why, fname])
+    budget = s.get("lora_budget")
+    if budget in (None, ""):
+        budget = (wf.get("defaults") or {}).get("lora_budget")
+    p.warnings.extend(hold_loras(applied, _num(budget, float, 0.0, 0.0), model["label"]))
+    for rec, strength, why, fname in applied:
+        p.loras.append((fname, round(strength, 3)))
         p.lora_meta.append({"id": rec["id"], "name": rec["name"], "file": fname,
-                            "strength": round(float(strength), 3), "category": rec["category"],
+                            "strength": round(strength, 3), "category": rec["category"],
                             "why": why})
 
     # ----------------------------------------------------------- prompt
@@ -4423,13 +4518,14 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                   else "")
     if body_words and body_words in scene:
         body_words = ""
+    # The clothing floor is said of the person described, in their own
+    # sentence; a scene that describes its people itself gets it after.
+    described = bool(named or person)
     parts = [x for x in (view_text(s.get("view"), posed),
-                         ", ".join(x for x in (named, person, covered) if x), scene,
-                         CLOTHED if someone else "", _field(s, "camera"), body_words) if x]
-    if not style:
-        parts.append(time_of_day_text(s, s.get("seed")))
-        if someone:
-            parts.append(imperfection_text(s.get("seed")))
+                         ", ".join(x for x in (named, person, CLOTHED if described else "",
+                                               covered if described else "") if x), scene,
+                         CLOTHED.capitalize() if someone and not described else "",
+                         _field(s, "camera"), body_words) if x]
     descriptions = identity_description_text(s, lib, idents)
     parts.extend(descriptions)
     if descriptions:
@@ -4454,13 +4550,20 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         p.notes.append("Drawn against faults seen before: %s." % "; ".join(
             "%s (%s)" % (v, k) for k, v in against))
     anatomy = s.get("anatomy") is not False and has_person(s, bool(idents))
+    if anatomy and wf.get("anatomy") is False:
+        anatomy = False
+        p.notes.append("The anatomy constants are not said to %s: it draws hands well "
+                       "untold, and told, made them the subject of the picture."
+                       % model["label"])
     if anatomy:
         parts.append(anatomy_text())
     if style:
         extra = " ".join(x for x in (style["trigger"], style["prompt"]) if x)
         if extra:
             parts.append(extra)
-    for rec, _, why in stack:
+    # A trigger is said for a LoRA the model is given, never for one left out
+    # (not on this machine, another family's): its words alone are no LoRA.
+    for rec, _, why, _ in applied:
         if why in ("added", "always on") and rec["trigger"] and rec["trigger"] not in " ".join(parts):
             parts.append(rec["trigger"])
     p.prompt = ". ".join(x.rstrip(" .") for x in parts if x) + ("." if parts else "")
@@ -4783,6 +4886,31 @@ def stage_of(wf, graph, node_id):
     return ""
 
 
+def hand_pass(settings):
+    """Whether Generate ends with the hands pass: unless it is unticked, for
+    a picture whose words name a person. A red fox's paws are hands to SAM3
+    (scored 0.87), and were redrawn as a human hand's."""
+    return (settings.get("hand_pass", True) is not False
+            and has_person(settings, bool(settings.get("identities"))))
+
+
+def glasses_pass(settings, reports=None):
+    """Whether the glasses are redrawn after the face swap. The pass is there
+    because the swap painted the new face over the frames (2026-09-26). With
+    its occlusion mask (`facefusion.SWAP_MASKS`) it goes behind them and they
+    stay as drawn, to the pixel; redrawn all the same they came back as other
+    glasses (dark red frames as tortoiseshell) and cost the likeness 0.08
+    (ArcFace 0.81 to 0.73, 2026-09-29). So: only after a swap that did not
+    keep them (`reports`, the swaps' own; None before there are any), or
+    when settings["glasses_pass"] says so either way."""
+    import apps.image_studio.facefusion as facefusion
+    if settings.get("glasses_pass") in (True, False):
+        return settings["glasses_pass"]
+    masks = ([r.get("masks") or () for r in reports] if reports
+             else [facefusion.SWAP_MASKS])
+    return not all("occlusion" in m for m in masks)
+
+
 def pipeline_stages(lib, settings):
     """The stops a job's pipeline strip shows, in the order Generate runs
     them: the two ComfyUI stages every job goes through, then each optional
@@ -4804,9 +4932,9 @@ def pipeline_stages(lib, settings):
             stages.append(("head_swap", "Head swap"))
         stages.append(("face_swap", "Face swap"))
         stages.append(("eyes", "Eye pass"))
-    if settings.get("hand_pass", True) is not False:
+    if hand_pass(settings):
         stages.append(("hands", "Hand pass"))
-    if profiles:
+    if profiles and glasses_pass(settings):
         stages.append(("glasses", "Glasses"))
     stages.append(("complete", "Complete"))
     return stages
@@ -6004,16 +6132,24 @@ class Studio:
     def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
         """The end of Generate, on the lane's thread, by the fix machinery on
         the picture's own model: after FaceFusion (`profiles`) each swapped
-        face's eyes (EYE_WHAT); then every hand SAM3 finds (HAND_WHAT; the
-        hands pass, unless settings["hand_pass"] is off); then the swapped
-        faces' glasses last (GLASSES_WHAT), so nothing is drawn over them.
+        face's eyes (EYE_WHAT); then the hands of a picture of people
+        (HAND_WHAT, `real_hands`; the hands pass, unless
+        settings["hand_pass"] is off); then the swapped faces' glasses last
+        (GLASSES_WHAT), so nothing is drawn over them - when the swap
+        painted over them (`glasses_pass`).
         -> the pictures; those given when a pass cannot run, fails or is
         cancelled - the picture is never lost to its finish."""
-        hands = job.settings.get("hand_pass", True) is not False
+        hands = hand_pass(job.settings)
+        if job.settings.get("hand_pass", True) is not False and not hands:
+            job.notes.append("No hands pass: the picture's words name no person.")
+        specs = bool(profiles) and glasses_pass(job.settings, job.facefusion)
+        if profiles and not specs and job.settings.get("glasses_pass") is not False:
+            job.notes.append("No glasses pass: the face swap went behind what was in front "
+                             "of the face, so glasses are as they were drawn.")
         if not profiles and not hands:
             return pictures
         kinds = (["eye"] if profiles else []) + (["hands"] if hands else []) + (
-            ["glasses"] if profiles else [])
+            ["glasses"] if specs else [])
         named = "%s pass%s" % (", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1
                                else kinds[0], " after the face swap" if profiles else "")
         b = job.backend
@@ -6034,10 +6170,12 @@ class Studio:
         if why:
             job.notes.append("No %s: %s." % (named, why))
             return pictures
-        find = (FINISH_FIND if profiles else []) + ([HAND_FIND] if hands else [])
-        words = (FINISH_WORDS if profiles else []) + (["hand"] if hands else [])
+        asked = list(zip(FINISH_FIND, FINISH_WORDS))
+        asked = ([a for a in asked if specs or a[1] != "glasses"] if profiles else []) + (
+            [(HAND_FIND, "hand")] if hands else [])
+        find, words = [a[0] for a in asked], [a[1] for a in asked]
         looking = (["eyes"] if profiles else []) + (["hands"] if hands else []) + (
-            ["glasses"] if profiles else [])
+            ["glasses"] if specs else [])
         v = dict(values, sam3=sam, match_tone=None)
         # A hand keeps the picture's grade; a swapped face gets no curves,
         # which posterize its skin.
@@ -6060,7 +6198,7 @@ class Studio:
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
                                                    stop=job.cancel.is_set)
-                said = parts_found(entry or {}, len(find), words)
+                said = parts_found(entry or {}, len(find), words, scores=True)
                 if said is None:
                     if not job.cancel.is_set():
                         job.notes.append("SAM3 said nothing about the picture, so no %s was "
@@ -6081,8 +6219,8 @@ class Studio:
                         job.notes.append("SAM3 found no swapped face, so no eye or glasses "
                                          "pass was made.")
                 if hands:
-                    found_hands = found_spots(width, height,
-                                              [x for x in boxes if x[4] == "hand"], "hand")
+                    found_hands = found_spots(width, height, real_hands(
+                        width, height, [x for x in boxes if x[4] == "hand"]), "hand")
                     if found_hands:
                         crops = fix_crops(width, height, [
                             dict(sp, size=int(sp["size"] * FIX_CONTEXT)) for sp in found_hands])
@@ -6090,7 +6228,7 @@ class Studio:
                                        HAND_WHAT, "_hands", hand_tone))
                     else:
                         job.notes.append("SAM3 found no hands, so no hands pass was made.")
-                if faces:
+                if faces and specs:
                     glasses = glasses_spots(width, height,
                                             [x for x in boxes if x[4] == "glasses"], faces)
                     if glasses:

@@ -80,7 +80,16 @@ After Effects and Resolve use outside npm servers.
   Its ledger (`critic_ledger.json`: `note_fixes`, `note_picture`, `note_marked`; read
   back by `start_denoise`, `recurring`, `prevention`, `blind_checks`) is written by
   `Studio._learn` and read in `_refine` and `compose`.
-- **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`, `tools/`.
+- **What a prompt and a LoRA stack come to** - in `imagegen.compose`: the clothing
+  floor (`CLOTHED`, `COVERED`), `anatomy_text` (a workflow's `"anatomy": false`
+  leaves it out), `hold_loras` (a workflow's `lora_budget`). AGENTS.md "What the
+  pipeline adds to the user's words is drawn".
+- **The finish** - `Studio._finish_passes`: `hand_pass`, `real_hands`,
+  `glasses_pass`; a redraw's sampler is the workflow's `redraw_sampler`
+  (`face_graph`). Tests: `tests/test_finish_line.py`.
+- **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`
+  (`swap`, `SWAP_MASKS`, `failure`, `_clear`), `tools/` (`facefusion_swap.py`: the
+  worker, and the averaged face it keeps - `source_key`, `keep_source`).
   The head swap before the final face swap (FLUX.2 Klein):
   `apps/image_studio/headswap.py` (`lacks`, `targets`, `head_crop`, `head_graph`),
   run by `Studio._head_swap` inside `finish_profiles`; the swap model is
