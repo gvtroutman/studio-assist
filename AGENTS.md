@@ -4048,8 +4048,16 @@ folder are exactly that, and their `serve()` loops are gone.
 - Repeat seed uses current library records and model files. Do not describe it as
   exact recipe replay. `tests/test_finish_line.py` covers the recovery boundaries offline.
 
+- **Run the tests unseen.** The GUI tests open real Tk windows (a Chat, a Scene
+  Builder, consoles); run as plain `python -m unittest` on the user's PC, every one
+  appears over their work and takes the keyboard. `python tests/offscreen.py <unittest
+  arguments>` runs the same tests on a Windows desktop of their own that is never
+  switched to: same windows, same results, nothing shown. Use it for every run that
+  reaches a GUI test, the whole suite included. It is not a test mode: the code under
+  test cannot tell, and nothing is skipped.
+
 ```bash
-python -m unittest discover -s tests -v      # no network, no apps needed
+python tests/offscreen.py discover -s tests -v   # no network, no apps needed, no windows shown
 python core/agent.py --list-groups         # registry sanity, no bridge started
 python core/agent.py --app resolve --list-tools   # needs the Resolve venv
 python core/agent.py --app comfyui --list-tools   # no ComfyUI needed for the list

@@ -66,6 +66,7 @@ POSE_NODE = "StudioDWPoseKeypoints"   # comfy_nodes/studio_dwpose: a photo's pos
 PASTE_NODE = "StudioFacePaste"        # comfy_nodes/studio_facepaste: a person's own face
 HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
+POLL_EVERY = 2.0              # seconds between looks at /history while a job runs
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
                "clip_vision", "style_models", "controlnet", "upscale_models", "diffusers",
                "model_patches")
@@ -1453,7 +1454,7 @@ class ComfyUIClient:
                     return None
                 now = time.monotonic()
                 if now >= next_poll:
-                    next_poll = now + 2.0
+                    next_poll = now + POLL_EVERY
                     try:
                         entry = self.get_history(prompt_id)
                         if not started and not entry:

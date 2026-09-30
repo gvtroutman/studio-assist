@@ -2192,6 +2192,7 @@ class TestErrors(unittest.TestCase):
         connection); a malformed body wrapped as ComfyError, or a history
         entry whose status is JSON null rather than missing, used to crash
         the polling thread instead of being read as busy-not-gone."""
+        from unittest import mock
         c = ig.ComfyUIClient({"id": "x", "name": "X", "url": "http://127.0.0.1:9"})
         calls = []
         def get_history(prompt_id):
@@ -2203,8 +2204,9 @@ class TestErrors(unittest.TestCase):
         c.position = lambda pid: None
         events = []
         watch = ig.Watch(None, ig.queue.Queue(), "")
-        entry = c.listen_for_progress("pid", lambda k, d: events.append((k, d)),
-                                      timeout=10, watch=watch)
+        with mock.patch.object(ig, "POLL_EVERY", 0.01):    # the second look, not 2 s on
+            entry = c.listen_for_progress("pid", lambda k, d: events.append((k, d)),
+                                          timeout=10, watch=watch)
         self.assertEqual(entry, {"status": None, "outputs": {"9": {}}})
         self.assertIn("busy", [k for k, _ in events])
         self.assertEqual(len(calls), 2)

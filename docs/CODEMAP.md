@@ -167,5 +167,7 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
 
 ## Tests and ledgers
 `tests/test_<module>.py` per module (named after the old flat module name);
-`python -m unittest tests.test_<module>`.
+`python tests/offscreen.py tests.test_<module>` - `tests/offscreen.py` is
+`python -m unittest` on a Windows desktop of its own (`run_unseen`), so the GUI
+tests' windows never appear over the user's work. Run tests through it.
 `tests/VERIFIED.md` - what already passed (don't re-test); `tests/LIVE_ACCEPTANCE.md`.

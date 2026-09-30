@@ -835,8 +835,9 @@ class TestRoom(unittest.TestCase):
         # Looking straight down on the origin: x = 0 is the picture's left
         # edge, so just right of the middle is red and just left, a copy's
         # right half, is blue.
-        self.assertEqual(pixel(s, 470, 576), (200, 0, 0))
-        self.assertEqual(pixel(s, 426, 576), (0, 0, 200))
+        rgb = sc.rasterise(sc.render(s, 896, 1152), 896, 1152)   # drawn once, read twice
+        self.assertEqual(tuple(rgb[(576 * 896 + 470) * 3:][:3]), (200, 0, 0))
+        self.assertEqual(tuple(rgb[(576 * 896 + 426) * 3:][:3]), (0, 0, 200))
         flat = sc.rasterise(sc.render(s), 896, 1152, flat=True)
         self.assertEqual(tuple(flat[(576 * 896 + 470) * 3:][:3]), (100, 0, 100))   # the mean
 
@@ -1783,9 +1784,28 @@ def picture_of(people, distance=5.0, eye_y=1.6, lens=35.0, size=(1344, 768)):
     return {"width": w, "height": h, "people": folk}
 
 
+_FITS = {}
+
+
+def fit_once(points, shape=None, box=None, fit=sc.fit_pose):
+    """`sc.fit_pose`, searched once for each person it is asked about and
+    remembered: the search takes seconds, its answer for the same points is
+    always the same, and the tests of a scene from a picture hand it the same
+    three people again and again. Each caller gets a copy of its own."""
+    key = repr((points, shape, box))
+    if key not in _FITS:
+        _FITS[key] = fit(points, shape, box)
+    f = _FITS[key]
+    return sc.PoseFit(dict(f.controls), f.yaw, f.error, list(f.unseen), f.scale, f.pelvis)
+
+
 class TestSceneFromPicture(unittest.TestCase):
     TRUTH = [(-1.0, 0.0, "standing", 0), (1.2, -2.0, "walking", 40),
              (0.2, 1.0, "pointing", -30)]
+
+    def setUp(self):
+        self.addCleanup(setattr, sc, "fit_pose", sc.fit_pose)
+        sc.fit_pose = fit_once
 
     def test_everyone_stands_where_they_were_turned_as_they_were(self):
         scene, notes = sc.picture_scene(picture_of(self.TRUTH))
@@ -1913,6 +1933,8 @@ class TestSceneFromPicture(unittest.TestCase):
             sc.picture_scene(few)
 
     def test_past_the_limit_the_smaller_people_are_left_out_and_said(self):
+        self.addCleanup(setattr, sc, "PICTURE_PEOPLE", sc.PICTURE_PEOPLE)
+        sc.PICTURE_PEOPLE = 2                  # each person kept is seconds of fitting
         crowd = [(-4 + i * 0.8, -1.0 - (i % 3), "standing", 0)
                  for i in range(sc.PICTURE_PEOPLE + 2)]
         scene, notes = sc.picture_scene(picture_of(crowd, distance=9.0))
@@ -2221,6 +2243,8 @@ class TestSceneBuilderWindow(unittest.TestCase):
         real = ui.studio.find_poses
         ui.studio.find_poses = lambda path, stop=None: (answer, {"name": "5090"})
         self.addCleanup(setattr, ui.studio, "find_poses", real)
+        self.addCleanup(setattr, sc, "fit_pose", sc.fit_pose)
+        sc.fit_pose = fit_once                  # the same photo is read three times
 
         class Eyes:
             asked = []
@@ -2578,6 +2602,11 @@ class TestSceneBuilderWindow(unittest.TestCase):
 
     def test_a_background_crowd_in_the_window(self):
         ui, sb = self.builder()
+        # Two people, not twelve: every one is drawn again at each change,
+        # and nothing here counts them.
+        real = sc.new_crowd
+        self.addCleanup(setattr, sc, "new_crowd", real)
+        sc.new_crowd = lambda: dict(real(), count=2)
         crowd = sb.add("crowd")
         self.assertIn("crowd_count", sb.vars)
         self.assertTrue(sb.canvas.find_withtag("o:" + crowd["id"]))

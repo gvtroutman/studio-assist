@@ -666,7 +666,7 @@ class TestElicitation(unittest.TestCase):
         try:
             def slow_user(params):
                 self.assertEqual(params["_meta"]["studio/approval"]["kind"], "edit")
-                time.sleep(2.5)                          # longer than the call's timeout
+                time.sleep(1.5)                          # longer than the call's timeout
                 return {"action": "accept", "content": {"decision": "no"}}
             client.on_elicit = slow_user
             client.initialize(timeout=30)
@@ -726,7 +726,7 @@ sys.path.insert(0, %r)
 import core.mcp as mcp
 
 def slow(a):
-    for _ in range(8):                    # 4s if nothing interrupts it
+    for _ in range(%d):                   # half a second each, if nothing interrupts it
         if mcp.cancelled():
             return mcp.result("stopped mid-work")
         mcp.progress("still working")
@@ -741,7 +741,7 @@ sys.exit(mcp.main(mcp.Server("slow", "1", tools)))
 class TestClientCancellation(unittest.TestCase):
     def test_stop_ends_a_slow_call_promptly_instead_of_waiting_it_out(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        client = eng.MCPClient(sys.executable, ["-c", SLOW % here], quiet=True)
+        client = eng.MCPClient(sys.executable, ["-c", SLOW % (here, 8)], quiet=True)
         try:
             client.initialize(timeout=30)
             cancel = threading.Event()
@@ -758,7 +758,9 @@ class TestClientCancellation(unittest.TestCase):
 
     def test_without_a_cancel_event_a_call_runs_to_completion_as_before(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        client = eng.MCPClient(sys.executable, ["-c", SLOW % here], quiet=True)
+        # Three steps, 1.5s: past one of the client's one-second polls, and
+        # three progress reports on the way; the 4s is only the Stop test's.
+        client = eng.MCPClient(sys.executable, ["-c", SLOW % (here, 3)], quiet=True)
         try:
             client.initialize(timeout=30)
             res = client.call_tool("slow", {})
