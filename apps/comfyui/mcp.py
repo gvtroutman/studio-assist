@@ -106,11 +106,14 @@ ENCODER_TYPES = ["lumina2", "krea2", "qwen_image", "flux2", "chroma", "sd3", "wa
 # family installed, so the most photographic model leads. `edit` models take a
 # picture and an instruction; they are never the text-to-image default - the
 # Qwen edit model was, and made every "draw a duck" a slow, soft 20-step
-# double-CFG render. `hires` is the detail pass (see build_graph).
+# double-CFG render. `hires` is the detail pass (see build_graph). `redraw` is
+# what a face is redrawn with over the finished picture (see redraw_recipe);
+# a family that names none redraws with the picture's own sampler.
 FAMILIES = [
     ("z_image", {"label": "Z-Image Turbo", "encoder_type": "lumina2", "encoder": "qwen_3",
                  "vae": "ae.safetensors", "shift": 3.0, "steps": 8, "cfg": 1.0,
                  "sampler": "res_multistep", "scheduler": "simple",
+                 "redraw": {"sampler": "euler_ancestral", "scheduler": "simple"},
                  "latent": "EmptySD3LatentImage", "photo": True,
                  "hires": {"scale": 1.5, "denoise": 0.33, "steps": 5,
                            "sampler": "dpmpp_2m_sde", "scheduler": "beta"}}),
@@ -1351,11 +1354,30 @@ def oval_png(size=256, scale=1.0, centre=0.53):
             + chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b""))
 
 
+def redraw_recipe(plan, steps=None, sampler=None, scheduler=None):
+    """(steps, sampler, scheduler) for a face redrawn over a finished picture:
+    the family's `redraw` where it names one, else what the picture itself
+    was drawn with (the arguments), else the family's own.
+
+    Z-Image's res_multistep adds no noise as it goes, and over a picture that
+    is already there it left dark specks on skin and white beads in beards
+    and hair; plain euler, which adds none either, left the same ones, and
+    the detail pass's dpmpp_2m_sde/beta more. euler_ancestral left clean
+    skin. It costs likeness: it strays further from the face it is given,
+    and takes years off an old one (see t_face_swap, which does not use it).
+    A sampler the caller names is the picture's, not its redraws'."""
+    r = plan.get("redraw") or {}
+    return (r.get("steps") or steps or plan["steps"],
+            r.get("sampler") or sampler or plan["sampler"],
+            r.get("scheduler") or scheduler or plan["scheduler"])
+
+
 def redraw_faces(g, image, crops, plan, scene, seed, denoise, recipe, blend=None):
     """Into g: each crop of `image` enlarged to FACE_EDIT, resampled with
     `plan`'s model (a split model with cfg 1) at `denoise`, shrunk and
     blended back through the oval. `scene` describes the picture; `recipe`
-    is (steps, sampler, scheduler). Returns the link to the result."""
+    is (steps, sampler, scheduler), redraw_recipe's for a picture just
+    drawn. Returns the link to the result."""
     if not crops:
         return image
     # `blend` is the oval's (scale, centre); without one it is the whole oval,
@@ -1446,14 +1468,15 @@ def face_detail(g, plan, seed, a, header, notes):
     g2 = {"20": {"class_type": "LoadImage", "inputs": {"image": name}}}
     denoise = a.get("face_denoise", FACE_DENOISE)
     k = g["5"]["inputs"]
+    recipe = redraw_recipe(plan, k["steps"], k["sampler_name"], k["scheduler"])
     last = redraw_faces(g2, ["20", 0], crops, plan, g["2"]["inputs"]["text"], seed, denoise,
-                        (k["steps"], k["sampler_name"], k["scheduler"]), blend=FACE_BLEND)
+                        recipe, blend=FACE_BLEND)
     g2["7"] = {"class_type": "SaveImage", "inputs": {
         "filename_prefix": a.get("filename_prefix", "StudioAssistant"), "images": last}}
     notes = list(notes)
     if crops:
-        notes.append("face detail: %d face(s) redrawn at %d px, denoise %s"
-                     % (len(crops), FACE_EDIT, denoise))
+        notes.append("face detail: %d face(s) redrawn at %d px, denoise %s, sampler %s/%s"
+                     % (len(crops), FACE_EDIT, denoise, recipe[1], recipe[2]))
     elif boxes:
         notes.append("face detail: faces already drawn at full size, left as they were")
     return run(g2, dict(a, wait=True), header, notes, started=started, before=(free, total))
@@ -1626,6 +1649,11 @@ def t_face_swap(a):
         "%s/%s" % (f["subfolder"], f["filename"]) if f.get("subfolder") else f["filename"])
         + " [temp]"}}}
     denoise = a.get("face_denoise", SWAP_DENOISE)
+    # With the recipe's own sampler, not redraw_recipe(z): here the likeness
+    # is the point, and euler_ancestral strays further from the face it is
+    # given. ArcFace against the person swapped in, two faces at 0.3: 0.75
+    # and 0.57 before this pass, 0.47 and 0.45 after it with res_multistep,
+    # 0.41 and 0.42 with euler_ancestral, which also took six years off them.
     out = redraw_faces(g3, ["20", 0], small, z, "A photograph of people.", seed, denoise,
                        (z["steps"], z["sampler"], z["scheduler"]))
     g3["9"] = dict(save, inputs=dict(save["inputs"], images=out))

@@ -710,6 +710,64 @@ class ComfyBridgeTest(unittest.TestCase):
                                             "face_detail": False})
         self.assertEqual(self.fake.prompts["p7"]["9"]["class_type"], "SaveImage")
 
+    def test_a_face_is_redrawn_with_the_redraw_sampler_and_the_picture_keeps_its_own(self):
+        """Z-Image's res_multistep adds no noise as it goes: over a face that
+        is already there it left specks on skin and beads in beards. The
+        picture is still drawn with it; the faces are redrawn with the
+        family's `redraw` sampler, whatever sampler the caller names for the
+        picture. A family that names none redraws as it draws, and the face
+        swap's finishing pass keeps the recipe's: there the likeness is the
+        point, and euler_ancestral strays further from it."""
+        self.fake.checkpoints = ["sam3.1_multiplex_fp16.safetensors"]
+        self.fake.running = []
+        self.fake.size = (1824, 1248)
+        self.fake.faces = {"generated": [(300, 400, 60, 70), (700, 410, 58, 66)]}
+
+        def samplers(graph):
+            return [(n["inputs"]["steps"], n["inputs"]["sampler_name"], n["inputs"]["scheduler"])
+                    for _, n in sorted(graph.items(), key=lambda kv: int(kv[0]))
+                    if n["class_type"] == "KSampler"]
+
+        res = comfy.call_tool("comfy_generate", {"prompt": "a wedding party", "seed": 5})
+        self.assertFalse(res["isError"], self.text(res))
+        first, second = self.fake.prompts["p1"], self.fake.prompts["p2"]
+        self.assertEqual(samplers(first)[0], (8, "res_multistep", "simple"))
+        self.assertEqual(samplers(second), [(8, "euler_ancestral", "simple")] * 2)
+        self.assertEqual(second["103"]["inputs"]["denoise"], comfy.FACE_DENOISE)
+        self.assertIn("sampler: res_multistep/simple", self.text(res))
+        self.assertIn("sampler euler_ancestral/simple", self.text(res))
+
+        # A sampler the caller names is the picture's, not its redraws'.
+        comfy.call_tool("comfy_generate", {"prompt": "a wedding party", "sampler": "dpmpp_2m",
+                                           "scheduler": "beta", "steps": 10})
+        first, second = self.fake.prompts["p3"], self.fake.prompts["p4"]
+        self.assertEqual(samplers(first)[0], (10, "dpmpp_2m", "beta"))
+        self.assertEqual(samplers(second), [(10, "euler_ancestral", "simple")] * 2)
+
+        # Only Z-Image names one: every other family redraws as it draws.
+        self.assertEqual([k for k, fam in comfy.FAMILIES if fam.get("redraw")], ["z_image"])
+        self.fake.diffusion_models = ["krea2_turbo_int8_convrot.safetensors"]
+        self.fake.text_encoders = ["qwen3vl_4b_fp8_scaled.safetensors"]
+        comfy.call_tool("comfy_generate", {"prompt": "a wedding party"})
+        first, second = self.fake.prompts["p5"], self.fake.prompts["p6"]
+        self.assertEqual(samplers(first)[0], (8, "euler", "simple"))
+        self.assertEqual(samplers(second), [(8, "euler", "simple")] * 2)
+        comfy.call_tool("comfy_generate", {"prompt": "a wedding party", "sampler": "heun"})
+        self.assertEqual(samplers(self.fake.prompts["p8"]), [(8, "heun", "simple")] * 2)
+
+        # The face swap's finishing pass: Z-Image's own sampler, lightly.
+        self.fake.diffusion_models = ["qwen_image_edit_2509_fp8_e4m3fn.safetensors",
+                                      "z_image_turbo_bf16.safetensors"]
+        self.fake.text_encoders = ["qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                                   "qwen_3_4b.safetensors"]
+        self.fake.faces = {"old.png": [(254, 460, 102, 113)], "us.png": [(292, 407, 130, 156)]}
+        res = comfy.call_tool("comfy_face_swap", {"image": "old.png", "faces": "us.png"})
+        self.assertFalse(res["isError"], self.text(res))
+        polish = self.fake.prompts["p12"]
+        self.assertEqual(polish["1"]["inputs"]["unet_name"], "z_image_turbo_bf16.safetensors")
+        self.assertEqual(samplers(polish), [(8, "res_multistep", "simple")])
+        self.assertEqual(polish["103"]["inputs"]["denoise"], comfy.SWAP_DENOISE)
+
     def test_the_face_oval_is_a_valid_greyscale_png(self):
         png = comfy.oval_png(64)
         self.assertTrue(png.startswith(bytes([0x89]) + b"PNG"))
