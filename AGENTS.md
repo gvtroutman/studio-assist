@@ -4205,6 +4205,15 @@ folder are exactly that, and their `serve()` loops are gone.
   interruption on a worker, and let the UI show Cancelling until the job settles.
 - Repeat seed uses current library records and model files. Do not describe it as
   exact recipe replay. `tests/test_finish_line.py` covers the recovery boundaries offline.
+- **A test that starts a lane collects first.** Tk things an earlier test left in a
+  cycle are freed by whichever thread the collector next runs on. On a lane's thread
+  that is a Tk call off the UI thread (`tkinter.Variable.__del__`), and the lane stops
+  where it stands: one job left "queued" for good, in a full run only and on the same
+  test every time, because where the collector runs follows how much was allocated
+  before it (2026-09-30; found with `faulthandler.dump_traceback(all_threads=True)`
+  where `settle` gave up). `TempStudioMixin.setUp` calls `gc.collect()` on the test's
+  own thread before its Studio starts one. The app has the same trap only if a Tk
+  object is dropped in a cycle; see "Nothing is held on the `Pill` class".
 
 ```bash
 python -m unittest discover -s tests -v      # no network, no apps needed
