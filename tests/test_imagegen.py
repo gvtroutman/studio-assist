@@ -730,11 +730,41 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(ig.default_settings()["model"], "z-image-turbo")
 
     def test_the_face_pass_needs_sam3_and_says_so(self):
-        p = self.plan(model="flux-dev", scene="x", preset="hq_final")
+        p = self.plan(model="flux-dev", scene="a woman", preset="hq_final")
         self.assertFalse(p.values["face_detail"])
         self.assertTrue(any("no SAM3 checkpoint" in w for w in p.warnings), p.warnings)
-        p = self.plan(model="flux-dev", scene="x")              # not asked: not said
+        p = self.plan(model="flux-dev", scene="a woman")        # not asked: not said
         self.assertFalse(any("SAM3" in w for w in p.warnings), p.warnings)
+
+    def test_the_face_pass_is_for_pictures_of_people(self):
+        # High Quality Final on "a red fox in snow": SAM3 found the fox's face
+        # and the pass, which draws "a real human face ... natural lips and
+        # teeth", gave it a person's mouth (live, 2026-09-30).
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"})
+        for model in ("z-image-turbo", "flux-dev"):
+            p = self.plan(model=model, scene="A red fox sitting in fresh snow at dawn.",
+                          preset="hq_final", inventory=inv, nodes=FaceClient.NODES)
+            self.assertEqual(p.errors, [])
+            self.assertFalse(p.values["face_detail"], model)
+            self.assertNotIn("sam3", p.values)
+            self.assertIn("No face pass: the picture's words name no person.", p.notes)
+            self.assertFalse(any("SAM3" in w or "face" in w.lower() for w in p.warnings),
+                             p.warnings)
+            self.assertTrue(p.values["refine"])                 # the rest of the preset stays
+            for scene in ("A man feeding a fox.", "A chef plating a dish."):
+                p = self.plan(model=model, scene=scene, preset="hq_final", inventory=inv,
+                              nodes=FaceClient.NODES)
+                self.assertTrue(p.values["face_detail"], (model, scene))
+        # Someone chosen on the form is a person, whatever the scene says.
+        p = self.plan(model="flux-dev", scene="In the snow.", subject="a woman",
+                      preset="hq_final", inventory=inv, nodes=FaceClient.NODES)
+        self.assertTrue(p.values["face_detail"])
+        p = self.plan(model="flux-dev", scene="In the snow.", identities=["sitter"],
+                      preset="identity", inventory=inv, nodes=FaceClient.NODES)
+        self.assertTrue(p.values["face_detail"])
+        # Not asked for: nothing is said.
+        p = self.plan(model="flux-dev", scene="A red fox.", inventory=inv)
+        self.assertFalse(any("face pass" in n.lower() for n in p.notes), p.notes)
 
     def test_the_face_pass_is_planned_with_the_person_in_its_prompt(self):
         inv = dict(FLUX_FILES, checkpoints={"sam3.pt"})
@@ -1154,6 +1184,94 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertLess(p.values["upscale"], 2.0)
         self.assertTrue(any("megapixels" in n for n in p.notes))
 
+    ESRGAN = "RealESRGAN_x4plus.safetensors"
+
+    def test_the_refine_pass_enlarges_with_the_upscale_model_a_backend_has(self):
+        # ComfyUI's own Z-Image upscaler recipe: RealESRGAN x4, then down to
+        # the size asked, then the redraw. Lanczos alone gave the redraw a
+        # blur to sharpen; the model alone smoothed skin and drew hairs on
+        # knitwear, so the two are laid half and half (live, 2026-09-30).
+        wf = ig.load_workflow("zimage_hq")
+        self.assertEqual(wf["defaults"]["upscale_model"], self.ESRGAN)
+        self.assertEqual(wf["defaults"]["refine_blend"], 0.5)
+        inv = dict(FLUX_FILES, upscale_models={self.ESRGAN})
+        p = self.plan(model="z-image-turbo", scene="x", preset="hq_final", inventory=inv,
+                      nodes=FaceClient.NODES | ig.REFINE_MODEL_NODES)
+        self.assertEqual(p.errors, [])
+        self.assertFalse(any("Refine" in w for w in p.warnings), p.warnings)
+        self.assertEqual((p.values["refine_model"], p.values["upscale_model"],
+                          p.values["upscale"], p.values["refine_model_by"]),
+                         (True, self.ESRGAN, 2.0, 0.5))
+        g = ig.fill(p.workflow, p.values)
+        self.assertEqual(g["46"]["inputs"], {"model_name": self.ESRGAN})
+        self.assertEqual(g["47"]["inputs"], {"upscale_model": ["46", 0], "image": ["41", 0]})
+        self.assertEqual((g["48"]["inputs"]["image"], g["48"]["inputs"]["scale_by"]),
+                         (["47", 0], 0.5))
+        self.assertEqual((g["42"]["inputs"]["image"], g["42"]["inputs"]["scale_by"]),
+                         (["41", 0], 2.0))                          # lanczos's, beside it
+        self.assertEqual(g["49"], {"class_type": "ImageBlend", "inputs": {
+            "image1": ["48", 0], "image2": ["42", 0], "blend_factor": 0.5,
+            "blend_mode": "normal"}})
+        self.assertEqual(g["43"]["inputs"]["pixels"], ["49", 0])
+        self.assertEqual(g["9"]["inputs"]["images"], ["45", 0])
+        for nid in ("46", "47", "48", "49"):           # shown as "refining detail"
+            self.assertIn(nid, p.workflow["stages"]["refining"])
+        # The size a card holds still caps it, and the model's share follows.
+        p = self.plan(backend="3090", model="z-image-turbo", scene="x", preset="hq_final",
+                      width=1344, height=1344, inventory=inv)
+        self.assertLess(p.values["upscale"], 2.0)
+        self.assertEqual(p.values["refine_model_by"], round(p.values["upscale"] / 4, 6))
+        # What the backend has is not known yet: asked for, as a pose's ControlNet is.
+        p = self.plan(model="z-image-turbo", scene="x", preset="hq_final", inventory=None)
+        self.assertTrue(p.values["refine_model"])
+        # A preset that names no size of its own takes the workflow's (x1.5).
+        p = self.plan(model="z-image-turbo", scene="a woman", preset="identity",
+                      identities=["partner"], inventory=inv)
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.values["refine_model_by"], 0.375)
+        g = ig.fill(p.workflow, p.values)
+        self.assertEqual(g["48"]["inputs"]["scale_by"], 0.375)
+        # The redraw after it is light and clean: measured live (2026-09-30),
+        # the recipe's own dpmpp_2m_sde at 0.33 left scales on skin and kept
+        # 0.59 of a face's likeness where euler_ancestral at 0.2 kept 0.84.
+        k = g["44"]["inputs"]
+        self.assertEqual((k["sampler_name"], k["scheduler"], k["steps"], k["denoise"]),
+                         ("euler_ancestral", "beta", 5, 0.2))
+
+    def test_without_the_upscale_model_the_refine_pass_is_lanczos_and_says_so(self):
+        p = self.plan(model="z-image-turbo", scene="x", preset="hq_final")
+        self.assertEqual(p.errors, [])                  # a finish, never a reason to fail
+        self.assertTrue(p.values["refine"])
+        self.assertNotIn("refine_model", p.values)
+        self.assertNotIn("upscale_model", p.values)
+        said = [w for w in p.warnings if w.startswith("Refine:")]
+        self.assertEqual(len(said), 1, p.warnings)
+        self.assertIn(self.ESRGAN, said[0])
+        self.assertIn("ComfyUI/models/upscale_models", said[0])
+        g = ig.fill(p.workflow, p.values)
+        self.assertEqual(g["42"]["inputs"]["scale_by"], 2.0)
+        self.assertEqual(g["43"]["inputs"]["pixels"], ["42", 0])
+        for nid in ("46", "47", "48", "49"):
+            self.assertNotIn(nid, g)
+        # A blur takes a deeper redraw to become detail - unless the form says.
+        self.assertEqual(g["44"]["inputs"]["denoise"], 0.25)
+        p = self.plan(model="z-image-turbo", scene="x", preset="hq_final", refine_denoise=0.15)
+        self.assertEqual(ig.fill(p.workflow, p.values)["44"]["inputs"]["denoise"], 0.15)
+        # A ComfyUI without the nodes: the same, naming them.
+        inv = dict(FLUX_FILES, upscale_models={self.ESRGAN})
+        p = self.plan(model="z-image-turbo", scene="x", preset="hq_final", inventory=inv,
+                      nodes=FaceClient.NODES)
+        self.assertNotIn("refine_model", p.values)
+        self.assertTrue(any("ImageUpscaleWithModel" in w for w in p.warnings), p.warnings)
+        # No refine pass: nothing of it, and nothing said.
+        p = self.plan(model="z-image-turbo", scene="x")
+        self.assertNotIn("refine_model", p.values)
+        self.assertNotIn("upscale_model", p.values)
+        self.assertFalse(any("Refine" in w for w in p.warnings), p.warnings)
+        # The model's readiness never waits on it.
+        self.assertEqual(ig.missing_for(self.studio.lib.get("models", "z-image-turbo"),
+                                        self.backend("5090"), FLUX_FILES), ([], []))
+
     def test_identity_preset_wants_a_person(self):
         self.assertTrue(self.plan(preset="identity", scene="x").errors)
 
@@ -1232,6 +1350,39 @@ class TestRouting(TempStudioMixin, unittest.TestCase):
 
 
 class TestJobs(TempStudioMixin, unittest.TestCase):
+    def test_a_refined_picture_says_what_enlarged_it_and_how_it_was_redrawn(self):
+        esrgan = "RealESRGAN_x4plus.safetensors"
+
+        class UpscaleClient(FakeClient):
+            def inventory(self):
+                return dict(super().inventory(), upscale_models={esrgan})
+
+            def node_types(self):
+                return super().node_types() | ig.REFINE_MODEL_NODES
+        self.studio.client_factory = UpscaleClient
+        jobs = self.studio.submit(dict(ig.default_settings(), scene="A lighthouse",
+                                       backend="5090", model="z-image-turbo",
+                                       preset="hq_final", face_detail=False, seed=7))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        graph = FakeClient.instances[-1].graphs[0]
+        self.assertEqual(graph["46"]["class_type"], "UpscaleModelLoader")
+        self.assertEqual(graph["43"]["inputs"]["pixels"], ["49", 0])
+        self.assertEqual(self.studio.history.list()[0]["refine"], {
+            "upscale": 2.0, "denoise": 0.2, "steps": 5, "sampler": "euler_ancestral",
+            "scheduler": "beta", "model": esrgan})
+        # On a ComfyUI without the model: lanczos, the deeper redraw, and no model named.
+        self.studio.client_factory = FakeClient
+        self.studio.clients, self.studio.inventories, self.studio.nodes = {}, {}, {}
+        jobs = self.studio.submit(dict(ig.default_settings(), scene="A lighthouse",
+                                       backend="5090", model="z-image-turbo",
+                                       preset="hq_final", face_detail=False, seed=7))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        rec = self.studio.history.list()[0]
+        self.assertEqual((rec["refine"]["model"], rec["refine"]["denoise"]), (None, 0.25))
+        self.assertTrue(any(w.startswith("Refine:") for w in rec["warnings"]), rec["warnings"])
+
     def test_a_job_runs_and_lands_in_history(self):
         room = []
         self.studio.make_room = room.append
