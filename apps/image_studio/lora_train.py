@@ -1,18 +1,27 @@
-"""Build LoRA: an identity's reference photos -> a FLUX identity LoRA.
+"""Build LoRA: an identity's reference photos -> a FLUX.2 Klein 4B LoRA of
+their head, for the head swap (`headswap`, `Studio._head_swap`).
+
+Klein is what redraws a person's head before the face swap, and the weak
+stage: without a LoRA it drew a look-alike (ArcFace 0.39 against Partner's
+photos); with one trained on her face crops, 0.66, in about 6 minutes on the
+5090 (2026-09-30; a FLUX.1 build took 90 and reached no picture made with
+Z-Image).
 
 The training itself is ai-toolkit's, in its own venv on this PC
-(`D:\\ai-toolkit`), on the FLUX.1-dev weights ComfyUI already has, converted
-once to diffusers form by `tools/prepare_identity_lora.py` into
-`models/flux-local-studio`. Nothing is downloaded.
+(`D:\\ai-toolkit`), on Klein's undistilled base (the LoRA then loads on the
+distilled Klein ComfyUI runs), with ComfyUI's own Qwen3-4B as the text
+encoder and its FLUX.2 VAE converted to ai-toolkit's layout -
+`tools/prepare_klein_lora.py` sets those up once. The training itself
+downloads nothing.
 
 This module is stdlib only: it plans the run (`plan`, `config`), checks that
 the toolkit is there (`problem`), and runs `tools/train_identity_lora.py` in
-the toolkit's venv as a contained child (`run`), reading the `STEP`/`DONE`/
-`ERROR` lines that script prints. That script prepares the photos (PIL, which
-the app does not have) and starts ai-toolkit's `run.py`.
+the toolkit's venv as a contained child (`run`), reading the `KEPT`/`STEP`/
+`DONE`/`ERROR` lines that script prints. That script crops the photos to the
+head (OpenCV and PIL, which the app does not have) and starts ai-toolkit.
 
 The finished file is copied into the 5090's LoRA folder; the caller adds it
-to the library and to the person.
+to the library and makes it the person's `head_lora`.
 """
 
 if __package__ in (None, ""):  # run as a script: import from the checkout
@@ -29,12 +38,17 @@ import time
 import core.procs as studio_procs
 
 MIN_PHOTOS = 20
-STEPS = 2000
+# Checkpoints of Partner's build scored the same from 500 steps to 1500 (head
+# swap ArcFace 0.645 / 0.658 / 0.634 / 0.621 / 0.647 at 500-1500 by 250);
+# 750 had the best mean and the best worst picture.
+STEPS = 750
 SAVE_EVERY = 250
+RESOLUTION = 512
+FAMILY = "flux2"                # the library's family for Klein (`imagegen.FAMILIES`)
+ARCH = "flux2_klein_4b"         # ai-toolkit's name for it
 TOOLKIT = os.environ.get("STUDIO_AI_TOOLKIT", r"D:\ai-toolkit")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCRIPT = os.path.join(ROOT, "tools", "train_identity_lora.py")
-BASE_PARTS = ("transformer", "text_encoder", "text_encoder_2", "vae")
 
 
 def python_exe(toolkit=TOOLKIT):
@@ -43,7 +57,26 @@ def python_exe(toolkit=TOOLKIT):
 
 
 def base_model(toolkit=TOOLKIT):
-    return os.path.join(toolkit, "models", "flux-local-studio")
+    """The folder of Klein's undistilled base (ai-toolkit's `name_or_path`)."""
+    return os.path.join(toolkit, "models", "flux2-klein-base-4b")
+
+
+def text_encoder(toolkit=TOOLKIT):
+    """Qwen3-4B in Hugging Face form: ComfyUI's weights, Qwen's config."""
+    return os.path.join(toolkit, "models", "qwen3-4b-te")
+
+
+def vae(toolkit=TOOLKIT):
+    """ComfyUI's FLUX.2 VAE in the layout ai-toolkit loads."""
+    return os.path.join(toolkit, "models", "flux2-vae-bfl", "ae.safetensors")
+
+
+def parts(toolkit=TOOLKIT):
+    """Each file a build reads from the toolkit's models folder."""
+    te = text_encoder(toolkit)
+    return [os.path.join(base_model(toolkit), "flux-2-klein-base-4b.safetensors"),
+            os.path.join(te, "config.json"), os.path.join(te, "tokenizer.json"),
+            os.path.join(te, "model.safetensors"), vae(toolkit)]
 
 
 def problem(toolkit=TOOLKIT):
@@ -52,12 +85,11 @@ def problem(toolkit=TOOLKIT):
         return "ai-toolkit is not installed at %s (its venv is missing)." % toolkit
     if not os.path.isfile(os.path.join(toolkit, "run.py")):
         return "ai-toolkit at %s has no run.py." % toolkit
-    base = base_model(toolkit)
-    missing = [p for p in BASE_PARTS if not os.path.isfile(os.path.join(base, p, ".complete"))]
+    missing = [p for p in parts(toolkit) if not os.path.isfile(p)]
     if missing:
-        return ("The FLUX training copy at %s is incomplete (%s). Run "
-                "tools/prepare_identity_lora.py in the ai-toolkit venv first."
-                % (base, ", ".join(missing)))
+        return ("ai-toolkit at %s lacks Klein's training files (%s). Run "
+                "tools/prepare_klein_lora.py in the ai-toolkit venv first."
+                % (toolkit, ", ".join(os.path.relpath(p, toolkit) for p in missing)))
     return None
 
 
@@ -84,18 +116,22 @@ def plan(identity, lora_dir, toolkit=TOOLKIT, when=None):
         raise ValueError("No LoRA folder on this PC to put the LoRA in.")
     stamp = time.strftime("%Y%m%d-%H%M", time.localtime(when))
     rid = re.sub(r"[^a-z0-9]+", "-", (identity.get("id") or "person").lower()).strip("-")
-    name = "%s_identity_%s" % (rid.replace("-", "_") or "person", stamp.replace("-", "_"))
-    work = os.path.join(toolkit, "output", "%s-lora-%s" % (rid or "person", stamp))
+    name = "%s_head_klein_%s" % (rid.replace("-", "_") or "person", stamp.replace("-", "_"))
+    work = os.path.join(toolkit, "output", "%s-klein-%s" % (rid or "person", stamp))
     return {
         "identity": identity.get("id"),
         "person": identity.get("name") or rid,
         "name": name,
         "trigger": identity.get("trigger") or trigger_for(identity.get("name")),
         "photos": photos,
+        "min_photos": MIN_PHOTOS,   # the script checks it again on the photos it can read
         "steps": STEPS,
         "work": work,
         "toolkit": toolkit,
         "base": base_model(toolkit),
+        "text_encoder": text_encoder(toolkit),
+        "vae": vae(toolkit),
+        "resolution": RESOLUTION,
         "lora_out": os.path.join(lora_dir, name + ".safetensors"),
     }
 
@@ -105,8 +141,8 @@ def caption(spec):
 
 
 def config(spec):
-    """ai-toolkit's job for `spec`: its own FLUX example's settings (rank 16,
-    lr 1e-4, 512/768/1024 buckets), on the local FLUX copy, no sampling."""
+    """ai-toolkit's job for `spec`: Klein 4B in bf16 (it fits whole; nothing
+    quantized), rank 16, lr 1e-4, face crops at 512 only, no sampling."""
     return {"job": "extension", "config": {"name": spec["name"], "process": [{
         "type": "sd_trainer",
         "training_folder": os.path.join(spec["work"], "output"),
@@ -118,7 +154,7 @@ def config(spec):
         "datasets": [{"folder_path": os.path.join(spec["work"], "dataset"),
                       "caption_ext": "txt", "caption_dropout_rate": 0.05,
                       "shuffle_tokens": False, "cache_latents_to_disk": True,
-                      "resolution": [512, 768, 1024],
+                      "resolution": [spec["resolution"]],
                       # Windows: worker processes re-import the trainer and fail.
                       "num_workers": 0, "cache_latents_num_workers": 0}],
         "train": {"batch_size": 1, "steps": spec["steps"], "gradient_accumulation_steps": 1,
@@ -127,8 +163,8 @@ def config(spec):
                   "optimizer": "adamw8bit", "lr": 1e-4, "dtype": "bf16",
                   "skip_first_sample": True, "disable_sampling": True,
                   "cache_text_embeddings": True, "unload_text_encoder": True},
-        "model": {"name_or_path": spec["base"], "is_flux": True, "quantize": True,
-                  "quantize_te": True, "low_vram": False},
+        "model": {"arch": ARCH, "name_or_path": spec["base"], "vae_path": spec["vae"],
+                  "quantize": False, "quantize_te": False, "low_vram": False},
     }]}, "meta": {"name": spec["name"], "version": "1.0"}}
 
 
@@ -145,12 +181,12 @@ def write_spec(spec):
 
 
 def parse(line):
-    """One line from the script -> ("step", (n, total)) | ("done", path) |
-    ("error", text) | ("note", text)."""
+    """One line from the script -> ("step", (n, total)) | ("kept", (n, total)) |
+    ("faces", (n, total)) | ("done", path) | ("error", text) | ("note", text)."""
     line = line.strip()
-    m = re.match(r"^STEP (\d+) (\d+)$", line)
+    m = re.match(r"^(STEP|KEPT|FACES) (\d+) (\d+)$", line)
     if m:
-        return "step", (int(m.group(1)), int(m.group(2)))
+        return m.group(1).lower(), (int(m.group(2)), int(m.group(3)))
     if line.startswith("DONE "):
         return "done", line[5:].strip()
     if line.startswith("ERROR "):
@@ -199,6 +235,10 @@ class Build:
                 if self.started is None or value[0] <= 1:
                     self.started = time.time()
                 self.step = value
+            elif kind == "kept":
+                self.spec["kept"] = value[0]    # what the LoRA was built from
+            elif kind == "faces":
+                self.spec["faces"] = value[0]   # of those, cut to the head
             elif kind == "done":
                 done = value
             elif kind == "error":
@@ -222,14 +262,18 @@ class Build:
             self.child.kill()
 
 
-def lora_record(spec, family="flux1"):
-    """The library's record for the finished file (`Library.import_lora`)."""
+def lora_record(spec):
+    """The library's record for the finished file (`Library.import_lora`).
+    Its trigger is what the head swap says for the person
+    (`headswap.head_graph`)."""
     return {"file": os.path.basename(spec["lora_out"]),
-            "name": "%s identity" % spec["person"],
-            "category": "Identity", "family": family, "trigger": spec["trigger"],
+            "name": "%s head (Klein)" % spec["person"],
+            "category": "Identity", "family": FAMILY, "trigger": spec["trigger"],
             "strength": 1.0,
-            "notes": "Built from %d photos, %d steps, ai-toolkit (%s)." % (
-                len(spec["photos"]), spec["steps"], spec["work"])}
+            "notes": "Klein 4B head-swap LoRA. Built from %d photos (%s cut to the head), "
+                     "%d steps, ai-toolkit (%s)."
+                     % (spec.get("kept", len(spec["photos"])), spec.get("faces", "?"),
+                        spec["steps"], spec["work"])}
 
 
 if __name__ == "__main__":

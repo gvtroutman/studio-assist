@@ -60,6 +60,15 @@ PROMPT = ("The person in image 1 now has the head of the person in image 2: the 
           "clothes, with no clothing, fabric, necklace or jewellery taken from image 2.")
 
 
+def prompt_for(trigger=None):
+    """PROMPT, naming the person of image 2 by their LoRA's trigger word when
+    they have one (`head_graph`'s "lora")."""
+    if not trigger:
+        return PROMPT
+    return PROMPT.replace("the head of the person in image 2",
+                          "the head of %s, the person in image 2" % trigger, 1)
+
+
 def lacks(inventory, nodes=None):
     """What a backend is missing for a head swap: model files, then nodes.
     An inventory not read yet is a backend that cannot: the pass is an
@@ -118,7 +127,9 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
     """In `image` (a LoadImage name) each of `heads` ([{"crop": head_crop,
     "photo": a LoadImage name}]) is cut out, enlarged to SIDE, redrawn by
     Klein with the photo beside it (cut to "photo_crop" when a head gives
-    one), shrunk back, its colour moved `tone` of the way to the crop's
+    one) - through the person's own Klein LoRA when the head names one
+    ("lora": file, "strength", "trigger": said in the prompt, `prompt_for`;
+    Build LoRA's, 0.39 -> 0.66 ArcFace on Partner, 2026-09-30) - shrunk back, its colour moved `tone` of the way to the crop's
     (ColorTransfer, reinhard_lab; TONE), and blended in - through the head
     and hair alone: SAM3's `words` (WORDS) in the crop before and after
     (the new hair may be bigger or smaller than the old), grown and
@@ -166,6 +177,18 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
             "image": photo, "upscale_method": "lanczos", "megapixels": 1.0,
             "resolution_steps": 1}}
         cond = {"pos": ["pos", 0], "neg": ["neg", 0]}
+        model = ["unet", 0]
+        if head.get("lora"):
+            g[n + "lora"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+                "model": model, "lora_name": head["lora"],
+                "strength_model": float(head.get("strength", 1.0))}}
+            model = [n + "lora", 0]
+        if head.get("trigger"):
+            g[n + "text"] = {"class_type": "CLIPTextEncode", "inputs": {
+                "clip": ["clip", 0], "text": prompt_for(head["trigger"])}}
+            g[n + "zero"] = {"class_type": "ConditioningZeroOut", "inputs": {
+                "conditioning": [n + "text", 0]}}
+            cond = {"pos": [n + "text", 0], "neg": [n + "zero", 0]}
         for k, pixels in (("1", [n + "big", 0]), ("2", [n + "fit", 0])):
             g[n + "lat" + k] = {"class_type": "VAEEncode", "inputs": {
                 "pixels": pixels, "vae": ["vae", 0]}}
@@ -174,7 +197,7 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
                     "conditioning": cond[side_of], "latent": [n + "lat" + k, 0]}}
                 cond[side_of] = [n + side_of + k, 0]
         g[n + "guide"] = {"class_type": "CFGGuider", "inputs": {
-            "model": ["unet", 0], "positive": cond["pos"], "negative": cond["neg"], "cfg": 1.0}}
+            "model": model, "positive": cond["pos"], "negative": cond["neg"], "cfg": 1.0}}
         g[n + "noise"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed) + i}}
         g[n + "ks"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
             "noise": [n + "noise", 0], "guider": [n + "guide", 0], "sampler": ["sampler", 0],

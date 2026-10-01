@@ -90,7 +90,10 @@ After Effects and Resolve use outside npm servers.
 - **The finish** - `Studio._finish_passes`: `hand_pass`, `real_hands`,
   `glasses_pass`; a redraw's sampler is the workflow's `redraw_sampler`
   (`face_graph`). Tests: `tests/test_finish_line.py`.
-- **Identity** - `apps/image_studio/lora_train.py`, `apps/image_studio/facefusion.py`
+- **Identity** - `apps/image_studio/lora_train.py` (Build LoRA: a Klein head LoRA,
+  `plan`/`config`/`Build`; worker `tools/train_identity_lora.py`, one-time setup
+  `tools/prepare_klein_lora.py`; used by the head swap through `imagegen.head_lora`),
+  `apps/image_studio/facefusion.py`
   (`swap`, `SWAP_MASKS`, `failure`, `_clear`), `tools/` (`facefusion_swap.py`: the
   worker, and the averaged face it keeps - `source_key`, `keep_source`).
   The head swap before the final face swap (FLUX.2 Klein):

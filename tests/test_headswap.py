@@ -1,6 +1,7 @@
 """The Klein head swap before the final face swap; no apps, models or network."""
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -104,6 +105,52 @@ class TestHeadSwapParts(unittest.TestCase):
         self.assertEqual([g["h%d_noise" % k]["inputs"]["noise_seed"] for k in (1, 2)], [7, 8])
         self.assertEqual(g["save"]["inputs"]["images"], ["h2_put", 0])
         self.assertEqual(json.loads(json.dumps(g)), g)
+
+    def test_a_head_with_its_own_lora_is_drawn_through_it_and_named_by_its_trigger(self):
+        heads = [{"crop": {"x": 300, "y": 100, "width": 270, "height": 270}, "photo": "a.png",
+                  "lora": "partner_head_klein.safetensors", "strength": 0.9, "trigger": "partner"},
+                 {"crop": {"x": 600, "y": 120, "width": 240, "height": 240}, "photo": "b.png"}]
+        g = hs.head_graph("picture.png", heads, 7, "x", "sam3.pt")
+        lora = g["h1_lora"]["inputs"]
+        self.assertEqual((lora["model"], lora["lora_name"], lora["strength_model"]),
+                         (["unet", 0], "partner_head_klein.safetensors", 0.9))
+        self.assertEqual(g["h1_guide"]["inputs"]["model"], ["h1_lora", 0])
+        self.assertIn("the head of partner, the person in image 2", g["h1_text"]["inputs"]["text"])
+        self.assertEqual(g["h1_zero"]["inputs"]["conditioning"], ["h1_text", 0])
+        self.assertEqual(g["h1_pos1"]["inputs"]["conditioning"], ["h1_text", 0])
+        self.assertEqual(g["h1_neg1"]["inputs"]["conditioning"], ["h1_zero", 0])
+        # The other person: Klein as it is, the shared prompt, no trigger.
+        self.assertNotIn("h2_lora", g)
+        self.assertEqual(g["h2_guide"]["inputs"]["model"], ["unet", 0])
+        self.assertEqual(g["h2_pos1"]["inputs"]["conditioning"], ["pos", 0])
+        self.assertEqual(g["pos"]["inputs"]["text"], hs.PROMPT)
+        self.assertEqual(hs.prompt_for(None), hs.PROMPT)
+        self.assertNotEqual(hs.prompt_for("partner"), hs.PROMPT)
+        self.assertEqual(json.loads(json.dumps(g)), g)
+
+    def test_a_profiles_head_lora_is_used_only_when_it_can_be(self):
+        with tempfile.TemporaryDirectory() as d:
+            lib = ig.Library(d)
+            rec, _ = lib.import_lora({"file": "p_head.safetensors", "name": "P head",
+                                      "category": "Identity", "family": "flux2",
+                                      "trigger": "pperson", "strength": 1.0})
+            other, _ = lib.import_lora({"file": "p_flux1.safetensors", "name": "P flux",
+                                        "category": "Identity", "family": "flux1"})
+            p = {"name": "P", "head_lora": rec["id"]}
+            inv = {"loras": {"p_head.safetensors"}}
+            self.assertEqual(ig.head_lora(lib, p, "5090", inv),
+                             ({"lora": "p_head.safetensors", "strength": 1.0,
+                               "trigger": "pperson"}, None))
+            self.assertEqual(ig.head_lora(lib, {"name": "P"}, "5090", inv), ({}, None))
+            for profile, inventory, why in (
+                    (dict(p, head_lora="gone"), inv, "not in the LoRA library"),
+                    (dict(p, head_lora=other["id"]), inv, "not FLUX.2 Klein"),
+                    (p, {"loras": set()}, "not on this backend")):
+                own, note = ig.head_lora(lib, profile, "5090", inventory)
+                self.assertEqual(own, {})
+                self.assertIn(why, note)
+        self.assertEqual(ig.clean_identity({"name": "X", "head_lora": "h"})["head_lora"], "h")
+        self.assertEqual(ig.clean_identity({"name": "X"})["head_lora"], "")
 
     def test_the_swap_model_is_inswapper_unless_the_profile_names_another(self):
         self.assertEqual(ff.SWAP_MODEL, "inswapper_128")
@@ -210,6 +257,40 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         # The checkpoint kept before the faces is the picture as it was generated.
         kept = [r for r in self.studio.history.list() if r["id"].endswith("-generated")]
         self.assertFalse(kept)                # finished: the checkpoint became the result
+
+    def test_the_persons_head_lora_draws_their_head_and_stays_out_of_the_picture(self):
+        rec, _ = self.studio.lib.import_lora({
+            "file": "person_head_klein.safetensors", "name": "Person head",
+            "category": "Identity", "family": "flux2", "trigger": "perperson",
+            "strength": 1.0})
+        self.studio.lib.save("loras")
+        ident = self.studio.lib.get("identities", "person")
+        ident["head_lora"] = rec["id"]
+        self.studio.lib.save("identities")
+
+        class WithLora(KleinClient):
+            def inventory(self):
+                inv = super().inventory()
+                inv["loras"] = set(inv.get("loras") or ()) | {"person_head_klein.safetensors"}
+                return inv
+        job, client, swapped = self.generate(client=WithLora)
+        self.assertEqual(job.status, "complete", job.detail)
+        head = self.heads(client)[0]
+        self.assertEqual(head["h1_lora"]["inputs"]["lora_name"], "person_head_klein.safetensors")
+        self.assertEqual(head["h1_guide"]["inputs"]["model"], ["h1_lora", 0])
+        self.assertIn("the head of perperson", head["h1_text"]["inputs"]["text"])
+        self.assertIn("Head swap before the face swap: Person's head (with their head LoRA) "
+                      "redrawn from their photo by FLUX.2 Klein.", job.record["notes"])
+        # A Klein LoRA is the head swap's alone: never in the picture's own stack.
+        self.assertNotIn("person_head_klein", json.dumps(client.graphs[0]))
+        self.assertNotIn("perperson", json.dumps(client.graphs[0]))
+        # Not on the backend: Klein as it is, and the note says why.
+        self.studio.inventories.clear()       # the next check reads the plain backend
+        job, client, swapped = self.generate()
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertNotIn("h1_lora", self.heads(client)[0])
+        self.assertIn("Person's head LoRA person_head_klein.safetensors is not on this backend.",
+                      job.record["notes"])
 
     def test_a_failed_head_swap_leaves_the_face_swap_the_generated_picture(self):
         KleinClient.fail_head = True
