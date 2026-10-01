@@ -146,7 +146,7 @@ class ChatElicitMixin:
                        height=min(max(len(lines), 1), max_lines), width=90,
                        padx=self._px(8), pady=self._px(6), highlightthickness=0,
                        cursor="arrow")
-        self._skin(text, bg="bg", fg="code", insertbackground="bg")
+        self._selectable(self._skin(text, bg="bg", fg="code", insertbackground="bg"))
 
         def colour():
             text.tag_configure("add", foreground=self.C["ok"])

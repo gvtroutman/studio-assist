@@ -686,8 +686,8 @@ class ImageStudio:
         self.scene = tk.Text(shell, height=5, wrap="word", bd=0, highlightthickness=0,
                              font=self.host.f_ui, padx=self.px(8), pady=self.px(6),
                              undo=True)
-        self.skin(self.scene, bg="card", fg="text", insertbackground="accent",
-                  selectbackground="sel")
+        self.skin(self.scene, bg="card", fg="text", insertbackground="accent")
+        self.host._selectable(self.scene, editable=True)
         self.scene.pack(fill="x")
         self.scene.bind("<KeyRelease>", lambda ev: self._recheck())
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
@@ -3790,6 +3790,7 @@ class BuildView:
         self.log = tk.Text(body, height=10, wrap="none", bd=0, highlightthickness=0,
                            font=host.f_mono, padx=o.px(6), pady=o.px(4))
         o.skin(self.log, bg="card", fg="code")
+        host._selectable(self.log, editable=True)
         self.log.pack(side="top", fill="both", expand=True)
         self.shown = None
         self._paint()
@@ -4216,6 +4217,7 @@ class RecordEditor:
                 t = tk.Text(parent, height=8 if key == "description" else 3, wrap="word", bd=0, highlightthickness=0,
                             font=host.f_ui, padx=o.px(6), pady=o.px(4))
                 o.skin(t, bg="card", fg="text", insertbackground="accent")
+                host._selectable(t, editable=True)
                 t.insert("1.0", val or "")
                 t.pack(side="top", fill="x")
                 self.widgets[key] = (kind, t)
@@ -4297,6 +4299,7 @@ class RecordEditor:
                 t = tk.Text(parent, height=5, wrap="none", bd=0, highlightthickness=0,
                             font=host.f_mono, padx=o.px(6), pady=o.px(4))
                 o.skin(t, bg="card", fg="text", insertbackground="accent")
+                host._selectable(t, editable=True)
                 t.insert("1.0", "\n".join("%s = %s" % kv for kv in (val or {}).items()))
                 t.pack(side="top", fill="x")
                 self.widgets[key] = ("kv", t)
@@ -4322,6 +4325,7 @@ class RecordEditor:
                     t = tk.Text(row, height=3, wrap="none", bd=0, highlightthickness=0,
                                 font=host.f_mono, padx=o.px(6), pady=o.px(4))
                     o.skin(t, bg="card", fg="text", insertbackground="accent")
+                    host._selectable(t, editable=True)
                     t.insert("1.0", "\n".join("%s = %s" % kv for kv in (over or {}).items()))
                     t.pack(side="left", fill="x", expand=True)
                     per[b["id"]] = (absent, t)
@@ -6083,6 +6087,7 @@ class ModelSourceSettings:
         self.links = tk.Text(body, height=3, wrap="word", bd=0,
                              font=owner.host.f_ui, highlightthickness=0)
         owner.skin(self.links, bg="card", fg="text", insertbackground="accent")
+        owner.host._selectable(self.links, editable=True)
         self.links.pack(fill="x", pady=(owner.px(6), owner.px(12)))
         self.links.insert("1.0", "\n".join(data["links"]))
         owner.label(body, "API key", "muted").pack(anchor="w")
@@ -6296,6 +6301,7 @@ class LoraImport:
         self.links = tk.Text(body, height=4, wrap="none", bd=0, highlightthickness=0,
                              font=host.f_ui, padx=o.px(6), pady=o.px(4))
         o.skin(self.links, bg="card", fg="text", insertbackground="accent")
+        host._selectable(self.links, editable=True)
         self.links.pack(side="top", fill="x", pady=(o.px(2), 0))
         pasted = self._clipboard_link()
         if pasted:

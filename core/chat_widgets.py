@@ -576,4 +576,45 @@ class ChatWidgetsMixin:
                        activeforeground=self.C["accent_fg"], bd=0,
                        activeborderwidth=0)
 
+    def _selectable(self, view, editable=False):
+        """Text the user can highlight and copy. Tk already selects by dragging
+        in a disabled Text, and a click gives it the focus Ctrl+C needs - what
+        was missing is seeing it: `sel` is a hover grey, nearly the page's own
+        colour in Light, and Windows' default selected text is white on it.
+        So: the I-beam, `hilite` under `text`, kept while the menu is up, a
+        right-click Copy / Select all, and Ctrl+A for all of it (Tk's own
+        Ctrl+A goes to the start of the line). An `editable` Text keeps its
+        own Cut / Paste and Ctrl+A, and only takes the colours."""
+        roles = dict(self.skin.get(view, {}))
+        roles.update(selectbackground="hilite", inactiveselectbackground="hilite",
+                     selectforeground="text")
+        self._skin(view, **roles)
+        if editable:
+            return view
+        view.config(cursor="xterm")
+
+        def select_all(_ev=None):
+            view.tag_add("sel", "1.0", "end-1c")
+            view.mark_set("insert", "1.0")
+            return "break"
+
+        def copy():
+            view.event_generate("<<Copy>>")
+
+        def menu(ev):
+            view.focus_set()                  # <<Copy>> reads the focused Text
+            m = self._menu()
+            m.add_command(label="Copy", accelerator="Ctrl+C", command=copy,
+                          state="normal" if view.tag_ranges("sel") else "disabled")
+            m.add_command(label="Select all", accelerator="Ctrl+A", command=select_all)
+            try:
+                m.tk_popup(ev.x_root, ev.y_root)
+            finally:
+                m.grab_release()
+            return "break"
+
+        view.bind("<Button-3>", menu, add="+")
+        view.bind("<Control-a>", select_all)
+        return view
+
     # ---------------------------------------------------------------- tab strip
