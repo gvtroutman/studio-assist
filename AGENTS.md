@@ -672,6 +672,10 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   Always-on LoRA whose file was not on the 5090 was left out with a warning
   on every picture while its trained words ("ultra detailed, cinematic, ...
   detailed skin pore, ...") went into every prompt, a fox's included.
+  Since 2026-10-01 the same holds for an identity's and a style's trigger
+  (`trigger` in `compose`): a person's FLUX.1 LoRA on Z-Image is left out,
+  and so is their word. An identity or style with no LoRA keeps its
+  trigger, as words; a style's `prompt` is always said.
 - **LoRAs come in from CivitAI** (`apps/image_studio/addons/civitai.py`, the LoRA library's *Import
   from CivitAI…*). Paste links (a model page, `modelVersionId`, a download link, an
   AIR, a bare version id) and/or pick `.safetensors` files. A link is read from
@@ -973,8 +977,12 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   Reuse Settings loads `settings` back. **Generate Again makes the same
   picture** (`again(record)`): the recorded seed, the sampler values it resolved
   to, and the backend it ran on when that can still take it (`prefer_backend`;
-  another GPU may differ slightly, and the route line says so). New Seed is
-  the variation. Measured on the 5090: the pixels match exactly, but the PNG
+  another GPU may differ slightly, and the route line says so), and since
+  2026-10-01 the record's own prompt (`replay_prompt`, a Generate's only):
+  `compose` adds what the critic learned since (critic_memory.json,
+  critic_ledger.json), so composing again gave the same seed other words.
+  `fix_base` drops it - a fix starts from the settings. New Seed is
+  the variation, composed afresh. Measured on the 5090: the pixels match exactly, but the PNG
   bytes do not, because ComfyUI embeds the graph, and the output name in it
   differs per job.
 - **FLUX runs the baseline, with layers that leave it alone when off**
@@ -1100,6 +1108,10 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `procs` child), so ComfyUI keeps running when the app closes and its log stays
   readable; `ImageStudio._wait_started` polls health for up to `START_WAIT`
   (180 s) and says "is up" or where to look. The app never starts it unasked.
+  Past that wait Start shows again while ComfyUI may still be loading, so
+  `Studio.start` keeps the console's Popen (`started`) and refuses while it
+  is open - a second ComfyUI on the same port fails over the first. A crash
+  ends at the .cmd's `pause`, console open: closing it allows Start again.
   The UI tests build the tab with the real 5090 entry, whose file exists on this
   PC: a test that presses Start must patch `imagegen.subprocess.Popen`. FLUX files: `flux1-dev.safetensors` (Comfy-Org mirror, the
   same file as BFL's), `clip_l`, `t5xxl_fp16`, `ae`. Measured: 1024², 20 steps,
@@ -1218,7 +1230,11 @@ refined on each picture's best-matching face - a mean of every face in a
 crowd is nobody. A face is theirs at `SAME` 0.42 or more (her 135 photos:
 other people's best 0.34 at most, hers 0.53 at least). Faces read are cached
 by file size and time in `face-cache.json` beside the library (embeddings as
-base64 float16). Two uses:
+base64 float16); `Reader.save` writes it through a temp file named for its
+process (workers run at once - Rate photos beside an import), and a cache
+that will not save is a note, never the job's failure. `faces.Job.run`
+believes only a worker that said `DONE` (it says it once result.json is
+whole), and kills the worker in a `finally`, as `Build.run` does. Two uses:
 - **Build LoRA** (`Build.find_faces`, when the spec has `face_cache`): before
   training, each photo's face as `[x, y, w, h]` in the spec's `faces` - the
   square the cascade would have drawn (`HAAR_SCALE` 1.27 of InsightFace's
@@ -1931,7 +1947,11 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
   goes into a prompt, and the critic never rewords it.
 - **The scores add up in a ledger** (2026-09-29):
   `image-studio/critic_ledger.json`, pure logic in `critic.py`, read and
-  written by `Studio._learn` under `CRITIC_LEDGER_LOCK`. Three things are
+  written by `Studio._learn` under `CRITIC_LEDGER_LOCK`, through
+  `change_kept` (critic_memory.json too): the loaders read a broken file as
+  {}, so a writer must not - one that will not open is not written, one that
+  will not parse is set aside as `.broken`, and each write has a temp file
+  of its own (the phone server writes them too). Three things are
   filed. *Fixes* (`note_fixes`): model -> kind of fault -> `ACTION@denoise`
   -> tried / cleared / worse, one entry per scored redraw; UNKNOWN files
   nothing. *Faults* (`note_picture`): per model, per person (only a
@@ -4441,8 +4461,26 @@ folder are exactly that, and their `serve()` loops are gone.
   the final face swap; failure leaves that checkpoint available in History.
 - `JobQueue.cancel()` may be called by Tk: set its event immediately, send network
   interruption on a worker, and let the UI show Cancelling until the job settles.
-- Repeat seed uses current library records and model files. Do not describe it as
-  exact recipe replay. `tests/test_finish_line.py` covers the recovery boundaries offline.
+- Repeat seed uses current library records and model files, and the record's own
+  prompt. Do not describe it as exact recipe replay. `tests/test_finish_line.py`
+  covers the recovery boundaries offline.
+- **A finishing step keeps what it finished** (2026-10-01). `_head_swap` and
+  `_finish_passes` catch every error (an unplanned one is logged with its
+  traceback), and on a failure return the pictures already done plus the rest
+  as they came - not every original - dropping the failed picture's notes and
+  `job.passes` back to its last finished pass (or its start, when that pass's
+  result can no longer be fetched). The record never claims a pass the
+  picture lacks.
+- **Build LoRA holds its backend** (`Studio.held`, set by `build_lora`,
+  cleared in `finished`): Auto routing (`routable`, `dress_route`,
+  `blend.route`) passes it by, and naming it by hand is refused with the
+  reason - a FLUX loaded beside the training runs it out of VRAM. Jobs
+  already waiting on that lane are not held.
+- **An Angles/Blend round (`NewPhotos.start`) does what a lane does**: it
+  bypasses the queue, so it calls `make_room` on a `shares_llm_gpu` backend,
+  `free()`s after when `release_vram` and the lane is idle, and posts
+  `done` from a `finally` - else Make answered "Still making the last
+  round" until the window was reopened.
 - **A test that starts a lane collects first.** Tk things an earlier test left in a
   cycle are freed by whichever thread the collector next runs on. On a lane's thread
   that is a Tk call off the UI thread (`tkinter.Variable.__del__`), and the lane stops

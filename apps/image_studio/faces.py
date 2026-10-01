@@ -98,23 +98,36 @@ class Job:
                 stdin=subprocess.DEVNULL, env=env, creationflags=studio_procs.NO_WINDOW)
             if self.stopped:
                 self.child.kill()
-            error, tail = None, []
-            for raw in iter(self.child.proc.stdout.readline, b""):
-                kind, value = parse(raw.decode("utf-8", "replace"))
-                if kind == "face":
-                    on(kind, value)
-                elif kind == "error":
-                    error = value
-                elif kind == "note" and value:
-                    tail = (tail + [value])[-3:]
-            self.child.proc.wait()
-            self.child.kill()
+            error, tail, done = None, [], False
+            try:
+                for raw in iter(self.child.proc.stdout.readline, b""):
+                    kind, value = parse(raw.decode("utf-8", "replace"))
+                    if kind == "face":
+                        on(kind, value)
+                    elif kind == "done":
+                        done = True
+                    elif kind == "error":
+                        error = value
+                    elif kind == "note" and value:
+                        tail = (tail + [value])[-3:]
+                self.child.proc.wait()
+            finally:
+                # Also when `on` raised: nothing reads the worker after this,
+                # and it would hold InsightFace on the GPU unwatched (as
+                # Build.run).
+                self.child.kill()
             if self.stopped:
                 raise RuntimeError("Stopped.")
-            if error or not os.path.isfile(self.job["result"]):
-                raise RuntimeError(error or "the face finder stopped: %s" % " | ".join(tail))
-            with open(self.job["result"], encoding="utf-8") as f:
-                return json.load(f)
+            # DONE, not the file: the worker says it only once its answer is
+            # whole; a worker that died writing it leaves half a file.
+            if error or not done:
+                raise RuntimeError(error or "the face finder stopped: %s"
+                                   % (" | ".join(tail) or "it said nothing"))
+            try:
+                with open(self.job["result"], encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError) as e:
+                raise RuntimeError("the face finder's answer could not be read (%s)" % e)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
