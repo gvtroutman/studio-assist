@@ -26,11 +26,15 @@ DARK = {
     "accent_dk": "#939e84", "accent_fg": "#16150f", "ok": "#5fb87f",
     "warn": "#e0a458", "err": "#e0685c", "sel": "#3d3b37", "code": "#d7d1c9",
     "asst": "#8fb0c9", "strip": "#0b0b0a", "strip_hi": "#1e1e1c",
+    "hilite": "#505649",
 }
 
 # `strip` is the band the tabs sit in, a step off `bg` so the selected tab -
 # which is `bg`, the page's own colour - reads as part of the page below it;
-# `strip_hi` is an unselected tab under the pointer.
+# `strip_hi` is an unselected tab under the pointer. `hilite` is highlighted
+# text, under the theme's own `text`: the accent faded 60% into `bg` (`palette`
+# derives it again from a picked accent). `sel` is a hover grey - in Light it
+# is nearly the page, and a selection drawn in it could not be seen.
 # Neutral, not warm: a near-white canvas with true white surfaces on it, and the
 # sage as the one colour in the window. The earlier beige greys read as dated.
 # The sage is darkened here: #abb899 itself is too pale to read on white.
@@ -41,6 +45,7 @@ LIGHT = {
     "accent_dk": "#565c4c", "accent_fg": "#ffffff", "ok": "#2f7d52",
     "warn": "#96650f", "err": "#b23b30", "sel": "#e4e4ea", "code": "#3f3f46",
     "asst": "#2c6a91", "strip": "#dfe3da", "strip_hi": "#ebeee7",
+    "hilite": "#bcbfb8",
 }
 
 THEMES = {"dark": DARK, "light": LIGHT}
@@ -65,6 +70,7 @@ def palette(name, accent=None):
         p["accent"] = accent
         p["accent_dk"] = blend(accent, "#000000", 0.14)
         p["accent_fg"] = "#16150f" if light else "#ffffff"
+        p["hilite"] = blend(accent, p["bg"], 0.6)
     return p
 
 
