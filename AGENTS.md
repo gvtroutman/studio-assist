@@ -1150,10 +1150,12 @@ exist on disk, saves the profile, and runs `tools/train_identity_lora.py` in
 ai-toolkit's venv (`D:\ai-toolkit`) as a `core.procs` child, so closing the
 app stops it. The script cuts each photo upright to a square round the head
 (`head_square`: 2.4 faces wide, a little below the face's centre, made smaller
-and slid inside the photo - padding it with white taught white bars), the face
-found by OpenCV's cascades (frontal, then profile either way: 30-31 of Partner's
-40 against InsightFace's 38; the rest go in whole and the tab says how many),
-captions it "a photo of <trigger>", and trains Klein 9B's undistilled base
+and slid inside the photo - padding it with white taught white bars), round
+the person's own face (below: "The person's own face"; without the finder, the
+biggest face OpenCV's cascades find, frontal then profile either way, and a
+photo with none goes in whole), captions it "a photo of <trigger>" - so
+anything else in the square, another face or a cut-out's white, is learned
+as part of them - and trains Klein 9B's undistilled base
 (`ARCH` flux2_klein_9b, rank 16, lr 1e-4, 512 px, bf16; only the text encoder
 quantized, since Qwen3-8B in bf16 beside the 9B's 18 GB would not fit 32 GB
 while the captions are encoded); the LoRA then loads on the distilled Klein
@@ -1191,6 +1193,45 @@ drawn without it. The trigger is the profile's own, else `trigger_for(name)`
 is still not a likeness review. A build that dies any way at all still frees
 the button (`finished` from a `finally`). Tests: `tests/test_lora_train.py`,
 `tests/test_headswap.py`.
+
+**The person's own face** (2026-10-01; the user: "crop as they import and fix the
+trainer"). Partner's identity took 126 wedding photos of 6720 x 4480, mostly
+group shots of ~10 faces. Rated by what Build LoRA did with each, 84 of the
+101 then in her list failed on the trainer, not the photo: OpenCV's cascades
+skip any face under a twelfth of the short side (373 px there), so 49 went in
+whole with her face ~20 px of 768; and the biggest face it did find was
+someone else's in 27 more. `apps.image_studio.faces` (stdlib) runs
+`tools/identity_faces.py` in ComfyUI's venv (`STUDIO_COMFYUI`, default
+`D:\ComfyUI`; InsightFace and antelopev2 are ComfyUI's, for PuLID - the
+worker refuses a root without `glintr100.onnx` rather than let FaceAnalysis
+download 360 MB) as a `core.procs` child. Who the person is: the mean ArcFace
+embedding of their faces, seeded by pictures holding exactly one face, then
+refined on each picture's best-matching face - a mean of every face in a
+crowd is nobody. A face is theirs at `SAME` 0.42 or more (her 135 photos:
+other people's best 0.34 at most, hers 0.53 at least). Faces read are cached
+by file size and time in `face-cache.json` beside the library (embeddings as
+base64 float16). Two uses:
+- **Build LoRA** (`Build.find_faces`, when the spec has `face_cache`): before
+  training, each photo's face as `[x, y, w, h]` in the spec's `faces` - the
+  square the cascade would have drawn (`HAAR_SCALE` 1.27 of InsightFace's
+  width, median of 103 faces both found), so `head_square`'s 2.4 is unchanged.
+  The script cuts round that box; a photo with `null` does not show them and
+  is left out (`LEFT n total`, said in the tab; a floor miss names them).
+  Without the finder the tab says so ("warn") and the biggest face is used as
+  before. Live on her 135: 62 s cold, 123 found and the 12 others left out,
+  agreeing photo for photo with the ArcFace rating; the 83 the cascades had
+  got wrong all now square on her.
+- **Import** (`crop_for_import`, from `RecordEditor._import_paths` and
+  `_add_character_photo`): each photo from disk is cut to the person's head
+  and shoulders (`keep_box`: `KEEP_W` x `KEEP_H` 4 x 5 face widths, one above
+  the face for the hair, slid inside the photo) before it is copied in; one
+  they already fill (`KEEP_WHOLE` 0.8 of it) and one they are not found in
+  stay whole, and the status counts each. The references are the person's
+  other photos. Angles/Blend results are not cut (`crop=False`). Without the
+  finder, photos go in whole and the status says why. Live: 6 wedding photos
+  cut to ~700-1100 x 900-1400, a group shot where her face was too small to
+  tell kept whole.
+Tests: `tests/test_faces.py`.
 
 **Angles and Blend** (identity editor, beside Build LoRA; Sitter 2026-09-28: "add
 breeding to reference images", then "breed is a seperate step. the angles are

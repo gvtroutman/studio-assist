@@ -3257,7 +3257,8 @@ class TestImageStudioTab(unittest.TestCase):
         rec = next(r for r in ui.studio.lib.all("identities") if r["name"] == "New Face")
         try:
             with patch.object(ui_mod.filedialog, "askopenfilenames", return_value=(src,)), \
-                    patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()):
+                    patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()), \
+                    patch.object(ui_mod.face_finder, "problem", return_value="off in tests"):
                 ui._add_character_photo(rec)
                 self.pump(lambda: ui.studio.lib.get("identities", rec["id"])["references"])
             added = ui.studio.lib.get("identities", rec["id"])["references"]

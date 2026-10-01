@@ -4,12 +4,15 @@ worker.
 Run in the ai-toolkit venv by `lora_train.Build` with a spec.json written by
 `lora_train.write_spec`. The source photos are never changed: each is copied
 into <work>/dataset as an upright RGB PNG cut to a square round the head
-(`head_square`; OpenCV finds the face), with a one-line caption. A photo with
-no face it can find goes in whole. Then ai-toolkit trains on <work>/train.json
-and its final .safetensors is copied to `lora_out`.
+(`head_square`), with a one-line caption. The face is the person's own, from
+the spec's `faces` (tools/identity_faces.py, by ArcFace; a photo without them
+is left out); without that, the biggest face OpenCV finds, and a photo with
+none goes in whole. Then ai-toolkit trains on <work>/train.json and its final
+.safetensors is copied to `lora_out`.
 
-Prints, one per line, for the app: `KEPT n total` (the photos that could be
-read), `FACES n total` (those cut to the head), `STEP n total`, then
+Prints, one per line, for the app: `LEFT n total` (with `faces`: photos
+without the person, left out), `KEPT n total` (the photos in the dataset),
+`FACES n total` (those cut to the head), `STEP n total`, then
 `DONE <path>` or `ERROR <words>`. Fewer readable photos than the spec's
 `min_photos` is an ERROR before any training. Everything ai-toolkit says goes
 to <work>/train.log.
@@ -70,17 +73,27 @@ def find_face(im):
 
 
 def prepare(spec, dataset, find=None):
-    """-> (photos in the dataset, those cut to the head, paths that could not be read).
-    `find` is `find_face` unless given."""
+    """-> (photos in the dataset, those cut to the head, paths that could not
+    be read, paths left out as not showing the person).
+
+    The spec's `faces` ({photo: [x, y, w, h] | null}, from
+    tools/identity_faces.py) is the person's own face in each photo; a photo
+    it has no face for does not show them and is left out. Without it, `find`
+    (`find_face` unless given) takes the biggest face, or none."""
     from PIL import Image, ImageOps
     find = find or find_face
+    boxes = spec.get('faces')
     dataset.mkdir(parents=True, exist_ok=True)
-    kept, faces, skipped = 0, 0, []
+    kept, faces, skipped, left = 0, 0, [], []
     for i, src in enumerate(spec['photos'], 1):
+        if boxes is not None and src in boxes and not boxes[src]:
+            say('%s not found, left out: %s' % (spec.get('person') or 'the person', src))
+            left.append(src)
+            continue
         try:
             with Image.open(src) as im:
                 im = ImageOps.exif_transpose(im).convert('RGB')
-                face = find(im)
+                face = boxes[src] if boxes is not None and src in boxes else find(im)
                 if face is not None:
                     im = im.crop(head_square(im.size[0], im.size[1], face))
                 im.thumbnail((LONGEST, LONGEST), Image.LANCZOS)
@@ -94,7 +107,7 @@ def prepare(spec, dataset, find=None):
         (dataset / ('photo%03d.txt' % i)).write_text(spec['caption'], encoding='utf-8')
         kept += 1
         faces += face is not None
-    return kept, faces, skipped
+    return kept, faces, skipped, left
 
 
 def train(spec, work):
@@ -139,17 +152,21 @@ def aitk(job, text_encoder):
 def main():
     spec = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
     work = Path(spec['work'])
-    kept, faces, skipped = prepare(spec, work / 'dataset')
+    kept, faces, skipped, left = prepare(spec, work / 'dataset')
+    if spec.get('faces') is not None:
+        say('LEFT %d %d' % (len(left), len(spec['photos'])))
     say('KEPT %d %d' % (kept, len(spec['photos'])))
     say('FACES %d %d' % (faces, kept))
     need = max(1, int(spec.get('min_photos', 1)))
     if kept < need:
-        names = [Path(p).name for p in skipped]
-        if len(names) > 5:
-            names = names[:5] + ['%d more' % (len(names) - 5)]
-        say('ERROR Only %d of %d photos could be read; a LoRA needs at least %d.%s'
+        def named(paths):
+            names = [Path(p).name for p in paths]
+            return names[:5] + ['%d more' % (len(names) - 5)] if len(names) > 5 else names
+        say('ERROR Only %d of %d photos could be used; a LoRA needs at least %d.%s%s'
             % (kept, len(spec['photos']), need,
-               ' Unreadable: %s.' % ', '.join(names) if names else ''))
+               ' Unreadable: %s.' % ', '.join(named(skipped)) if skipped else '',
+               ' %s not found in: %s.' % (spec.get('person') or 'The person',
+                                          ', '.join(named(left))) if left else ''))
         return 1
     say('STEP 0 %d' % spec['steps'])
     code = train(spec, work)

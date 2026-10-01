@@ -329,6 +329,7 @@ class ButtonTests(unittest.TestCase):
                                                     'lora_dir': d}]
             studio.studio.lib.get.return_value = {'id': 'partner', 'name': 'Partner',
                                                   'references': photos(d, 20)}
+            studio.studio.lib.root = d          # the face cache sits beside the library
             spawned = []
             studio.host._spawn = lambda _id, work: spawned.append(work)
             with mock.patch.object(lt, 'problem', return_value=None), \
