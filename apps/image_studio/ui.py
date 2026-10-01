@@ -4075,6 +4075,12 @@ class RecordEditor:
                     o.button(actions, "Build LoRA" + ELLIPSIS,
                              lambda: self.owner.build_lora(self)).pack(
                         side="left", padx=(o.px(4), 0))
+                    o.button(actions, "Rate photos",
+                             lambda p=pics: self._rate_paths(p)).pack(
+                        side="left", padx=(o.px(4), 0))
+                    o.button(actions, "Remove duplicates" + ELLIPSIS,
+                             lambda p=pics: self._remove_duplicates(p)).pack(
+                        side="left", padx=(o.px(4), 0))
                     o.button(actions, "Angles" + ELLIPSIS,
                              lambda p=pics: self._new_photos(p, "angles")).pack(
                         side="left", padx=(o.px(4), 0))
@@ -4084,10 +4090,12 @@ class RecordEditor:
                     o.label(parent, "Use clear photos of the same person, one face per photo.\n"
                             "Choose a clear front view as Primary. Enable pooling to let the "
                             "other photos guide identity too. Build LoRA trains the "
-                            "person's own FLUX LoRA from %d or more photos.\n"
+                            "person's own FLUX LoRA from %d or more photos; Rate photos "
+                            "scores each as its training data (★ the best %d, hover for "
+                            "why) and finds the duplicates.\n"
                             "Angles draws the selected photos from the sides you pick on "
                             "a view cube; Blend mixes two selected photos into a new "
-                            "one." % lt.MIN_PHOTOS,
+                            "one." % (lt.MIN_PHOTOS, face_finder.TOP),
                             "muted", host.f_small).pack(
                                 side="top", anchor="w")
                 o.button(row, "Remove", lambda p=pics: self._remove_paths(p),
@@ -4162,12 +4170,92 @@ class RecordEditor:
             lbl.pack()
             if self.kind == "identities" and i == 0:
                 o.label(tile, "Primary", "accent", host.f_small).pack()
-            for w in (tile, lbl):
+            hits = [tile, lbl]
+            r = (pics.get("ratings") or {}).get(p)
+            if r is not None:
+                text, role = (("0 · left out", "err") if r["score"] == 0 else
+                              ("duplicate · %d" % r["score"], "warn") if r["dup_of"] else
+                              ("★ %d" % r["score"], "ok") if r["top"] else
+                              ("%d" % r["score"], "muted"))
+                badge = o.label(tile, text, role, host.f_small, bg="card")
+                badge.pack()
+                hits.append(badge)
+                for w in hits:
+                    w.bind("<Enter>", lambda ev, r=r: self.status(face_finder.detail(r)),
+                           add="+")
+            for w in hits:
                 w.bind("<Button-1>", lambda ev, i=i: self._toggle_path(pics, i))
 
     def _toggle_path(self, pics, i):
         pics["sel"] ^= {i}
         self._draw_paths(pics)
+
+    def _rate_paths(self, pics, then=None):
+        """Rate the photos as Build LoRA's training data (`faces.Job("rate")`
+        in ComfyUI's venv, scored by `faces.rate`) on a worker: each tile then
+        shows its score, the best TOP starred, duplicates and photos the
+        person is not found in marked; hovering one says why. `then(rated)`
+        follows on the UI thread."""
+        if pics.get("rating"):
+            return self.status("Already rating the photos" + ELLIPSIS)
+        paths = [p for p in pics["paths"] if os.path.isfile(p)]
+        if not paths:
+            return self.status("No photos to rate.")
+        why = face_finder.problem()
+        if why:
+            return self.status("Cannot rate the photos: %s" % why, "err")
+        pics["rating"] = True
+        cache = os.path.join(self.owner.studio.lib.root, face_finder.CACHE)
+        self.status("Rating %d photos" % len(paths) + ELLIPSIS)
+
+        def progress(kind, value):
+            self.owner._post("call", lambda: self.win.winfo_exists() and self.status(
+                "Rating the photos: reading %d of %d" % value + ELLIPSIS))
+
+        def done(found, error):
+            pics["rating"] = False
+            if not self.win.winfo_exists() or not pics["grid"].winfo_exists():
+                return
+            if error:
+                return self.status("Rating failed: %s" % error, "err")
+            rated = face_finder.rate(found, paths)
+            pics.setdefault("ratings", {}).update(rated)
+            self._draw_paths(pics)
+            self.status(face_finder.summary(rated))
+            if then is not None:
+                then(rated)
+
+        def work():
+            found, error = None, None
+            try:
+                found = face_finder.Job("rate", [], paths, cache=cache).run(progress)
+            except (RuntimeError, OSError) as e:
+                error = str(e)
+            self.owner._post("call", lambda: done(found, error))
+        self.owner.host._spawn(self.owner.s.event_id, work)
+
+    def _remove_duplicates(self, pics):
+        """Take every photo `faces.rate` found a better twin of out of the
+        list (the files stay; Save keeps it), rating them first when the
+        list has photos not rated yet."""
+        if not pics["grid"].winfo_exists():
+            return
+        rated = pics.get("ratings") or {}
+        if any(p not in rated for p in pics["paths"] if os.path.isfile(p)):
+            return self._rate_paths(pics, then=lambda _r: self._remove_duplicates(pics))
+        dups = {p for p in pics["paths"] if (rated.get(p) or {}).get("dup_of")}
+        if not dups:
+            return self.status("No duplicates among the photos.", "ok")
+        if not messagebox.askyesno("Remove duplicates", (
+                "Remove %d duplicate photo%s from the references? The best photo of "
+                "each set stays, and the files stay on disk. Save keeps the change.")
+                % (len(dups), "" if len(dups) == 1 else "s"), parent=self.win):
+            return
+        pics["paths"] = [p for p in pics["paths"] if p not in dups]
+        pics["sel"] = set()
+        self._draw_paths(pics)
+        self.status("Removed %d duplicate%s. Save keeps the change." % (
+            len(dups), "" if len(dups) == 1 else "s"), "ok")
 
     def _remove_paths(self, pics):
         pics["paths"] = [p for i, p in enumerate(pics["paths"]) if i not in pics["sel"]]
