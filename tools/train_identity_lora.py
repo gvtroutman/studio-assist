@@ -124,14 +124,14 @@ def train(spec, work):
 
 
 def aitk(job, text_encoder):
-    """ai-toolkit's run.py on `job`, in this process, with Klein 4B's text
+    """ai-toolkit's run.py on `job`, in this process, with Klein 9B's text
     encoder at `text_encoder` and the Hugging Face hub offline."""
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
     toolkit = os.getcwd()
     sys.path.insert(0, toolkit)
     import extensions_built_in.diffusion_models.flux2.flux2_klein_model as klein
-    klein.Flux2Klein4BModel.flux2_klein_te_path = text_encoder
+    klein.Flux2Klein9BModel.flux2_klein_te_path = text_encoder
     sys.argv = ['run.py', job]
     runpy.run_path(os.path.join(toolkit, 'run.py'), run_name='__main__')
 

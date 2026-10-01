@@ -122,6 +122,7 @@ FAMILIES = {
     "flux1": "FLUX.1",
     "flux1-kontext": "FLUX.1 Kontext",
     "flux2": "FLUX.2",
+    "flux2-klein9b": "FLUX.2 Klein 9B",
     "sdxl": "SDXL",
     "sd15": "SD 1.5",
     "z-image": "Z-Image",
@@ -185,6 +186,8 @@ def guess_family(filename):
     n = filename.lower()
     if "kontext" in n:
         return "flux1-kontext"
+    if "klein" in n and re.search(r"(^|[^0-9])9b", n):
+        return "flux2-klein9b"
     if re.search(r"flux[._-]?2", n):
         return "flux2"
     if "flux" in n:
@@ -4063,16 +4066,20 @@ def lora_file(lora, backend_id):
 def head_lora(lib, profile, backend_id, inventory):
     """A profile's Klein LoRA for the head swap (`head_lora`, made by Build
     LoRA) as `headswap.head_graph` takes it -> ({"lora", "strength",
-    "trigger"} or {}, a note when it names one that cannot be used)."""
+    "trigger"} or {}, a note when it names one that cannot be used). A
+    LoRA made for Klein 4B (family "flux2", Build LoRA before 2026-10-01)
+    is refused: the 9B's layers are another shape."""
+    import apps.image_studio.headswap as headswap
     rid = profile.get("head_lora")
     if not rid:
         return {}, None
     rec = lib.get("loras", rid)
     if rec is None:
         return {}, "%s's head LoRA %r is not in the LoRA library." % (profile["name"], rid)
-    if compatibility(rec["family"], "flux2") is False:
-        return {}, "%s's head LoRA %s is for %s, not FLUX.2 Klein." % (
-            profile["name"], rec["name"], FAMILIES.get(rec["family"], rec["family"]))
+    if compatibility(rec["family"], headswap.FAMILY) is False:
+        return {}, "%s's head LoRA %s is for %s, not %s: rebuild it with Build LoRA." % (
+            profile["name"], rec["name"], FAMILIES.get(rec["family"], rec["family"]),
+            FAMILIES[headswap.FAMILY])
     name = lora_file(rec, backend_id)
     if inventory is not None and name not in (inventory.get("loras") or ()):
         return {}, "%s's head LoRA %s is not on this backend." % (profile["name"], name)
@@ -5058,6 +5065,7 @@ class Job:
         self.dress = None             # {"outfit", "passes", "head_crop", ...} when dressed
         self.refinement = None        # the Visual Critic's passes, when it ran
         self.notes = []               # things said on the way (no live progress, ...)
+        self.license = ""             # a model's terms the picture carries (`headswap.LICENSE_NOTE`)
         self.cancel = threading.Event()
 
     @property
@@ -5208,6 +5216,20 @@ def run_errors(entry, graph=None):
     return out
 
 
+def png_text(data, key, text):
+    """`data` with a tEXt chunk `key`: `text` after its header (Latin-1, as
+    PNG's tEXt is); anything not a PNG is handed back as it was."""
+    import struct
+    import zlib
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return data
+    body = key.encode("latin-1") + b"\0" + text.encode("latin-1", "replace")
+    chunk = (struct.pack(">I", len(body)) + b"tEXt" + body
+             + struct.pack(">I", zlib.crc32(b"tEXt" + body) & 0xFFFFFFFF))
+    end = 8 + 12 + struct.unpack(">I", data[8:12])[0]       # after IHDR
+    return data[:end] + chunk + data[end:]
+
+
 class History:
     """Every finished job: its pictures and a JSON record beside them under
     history/<date>/. The record holds the settings exactly as submitted, so
@@ -5220,13 +5242,17 @@ class History:
         return os.path.join(self.root, time.strftime("%Y-%m-%d", time.localtime(when)))
 
     def add(self, record, pictures):
-        """record: dict; pictures: [(filename, bytes)]. -> the record, saved."""
+        """record: dict; pictures: [(filename, bytes)]. -> the record, saved.
+        A record's `license` is written into each PNG as its Comment, so
+        the terms go wherever the file goes."""
         folder = self.folder_for(record["created_ts"])
         os.makedirs(folder, exist_ok=True)
         record["images"] = []
         for i, (name, data) in enumerate(pictures):
             ext = os.path.splitext(name)[1] or ".png"
             path = os.path.join(folder, "%s_%d%s" % (record["id"], i + 1, ext))
+            if record.get("license"):
+                data = png_text(data, "Comment", record["license"])
             with open(path, "wb") as f:
                 f.write(data)
             record["images"].append(path)
@@ -6159,10 +6185,11 @@ class Studio:
                     continue
                 out.append((filename, client.fetch(files[0])))
                 job.notes.append("Head swap before the face swap: %s redrawn from their "
-                                 "photo by FLUX.2 Klein." % ", ".join(
+                                 "photo by FLUX.2 Klein 9B." % ", ".join(
                                      "%s's head%s" % (h["name"], " (with their head LoRA)"
                                                       if h.get("lora") else "")
                                      for h in heads))
+                job.license = headswap.LICENSE_NOTE
             return out
         except (ComfyError, Unreachable, OSError) as e:
             job.notes.append("The head swap before the face swap could not run (%s); the "
@@ -7781,6 +7808,7 @@ class Studio:
             "face_detail": job.face,
             "references": p.references,
             "warnings": p.warnings, "notes": p.notes + job.notes,
+            "license": job.license,
             "duration": round(time.time() - job.started, 1),
             "prompt_id": job.prompt_id,
             "settings": s,

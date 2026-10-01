@@ -2609,7 +2609,8 @@ class ImageStudio:
                                   "text", None), (self.describe(rec), "faint",
                                                   self.host.f_small),
                                  ("; ".join(rec.get("warnings") or []), "faint",
-                                  self.host.f_small)):
+                                  self.host.f_small),
+                                 (rec.get("license") or "", "faint", self.host.f_small)):
             if not text:
                 continue
             lbl = self.label(right, text, role, font, bg="card")
@@ -2971,7 +2972,7 @@ class ImageStudio:
         self.host._spawn(self.s.event_id, work)
 
     def head_lora_choices(self):
-        """The LoRAs a head swap can take: FLUX.2 (Klein) ones, or unknown."""
+        """The LoRAs a head swap can take: Klein 9B ones, or unknown."""
         return [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
                                  for r in self.studio.lib.all("loras")
                                  if ig.compatibility(r["family"], lt.FAMILY) is not False]
@@ -2987,7 +2988,7 @@ class ImageStudio:
             ("avatar", "Profile picture (optional; a generated picture is fine)", "path"),
             ("face_swap", "Final FaceFusion swap (not used by WithAnyone)", "bool"),
             ("swap_strength", "Face swap strength (0.5 gentle, 1 strongest)", "number"),
-            ("head_lora", "Head swap LoRA (FLUX.2 Klein; Build LoRA makes it)",
+            ("head_lora", "Head swap LoRA (FLUX.2 Klein 9B; Build LoRA makes it)",
              ("choice", self.head_lora_choices())),
             ("notes", "Notes", "long"),
             ("lora", "Identity LoRA", ("choice", loras)),
@@ -3046,11 +3047,11 @@ class ImageStudio:
         except ValueError as e:
             return editor.status(str(e), "err")
         if not messagebox.askokcancel("Build LoRA", (
-                "Train a head LoRA for %s from %d photos?\n\nIt takes about 6 minutes "
+                "Train a head LoRA for %s from %d photos?\n\nIt takes about 9 minutes "
                 "and uses the GPU: ComfyUI's models are unloaded first, and pictures "
                 "on %s should wait until it is done. Keep Studio Assist open; closing it "
                 "stops the training.\n\nWhen it finishes it becomes %s's head swap LoRA "
-                "(FLUX.2 Klein, trigger word \"%s\"): the head swap before the face swap "
+                "(FLUX.2 Klein 9B, trigger word \"%s\"): the head swap before the face swap "
                 "draws them with it.") % (
                     spec["person"], len(spec["photos"]), folders[0]["name"],
                     spec["person"], spec["trigger"]), parent=editor.win):

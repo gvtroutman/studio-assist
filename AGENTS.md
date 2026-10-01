@@ -1122,8 +1122,19 @@ its captions/source ordering must not be reused for another person.
 
 **Build LoRA** (identity editor, beside Use as primary; Sitter 2026-09-27: "a
 simple build lora into the images of an identity. it needs at least 20 pics").
-**It builds a FLUX.2 Klein 4B LoRA of the person's head, for the head swap -
-not a FLUX.1 LoRA for the picture** (2026-09-30, the user: "right now it's just
+**It builds a FLUX.2 Klein 9B LoRA of the person's head, for the head swap -
+not a FLUX.1 LoRA for the picture.** It trained Klein 4B until the head swap
+moved to the 9B on 2026-10-01 (the user chose "9B + Build LoRA on 9B"); a 4B LoRA
+does not load on the 9B, so a LoRA's family says which (`flux2-klein9b`, "FLUX.2
+Klein 9B"; the 4B's were `flux2`) and `imagegen.head_lora` refuses a 4B one
+with "rebuild it with Build LoRA". On the bench below, Partner's 9B LoRA built
+by the app's own code (9.0 minutes, about 21 GB of the 5090) scored 0.723
+in the head swap, 12 of 12 at 0.5 or more and the worst 0.56 - against the
+9B alone 0.555 and her 4B LoRA 0.647 (worst 0.35); after the face swap 0.876,
+the 4B LoRA's 0.875. By eye one consistent person on all 12; the stranger's
+lighter wavy hair still survives on the dinner and beach pictures. The rest
+of the numbers here are the 4B's
+(2026-09-30, the user: "right now it's just
 not a strong enough face swap", then "train a klein lora instead"). Measured
 first, through the app's own head swap on 12 FLUX pictures of a stranger,
 ArcFace against Partner's 23 real photos (her own photos score 0.80 against each
@@ -1142,12 +1153,16 @@ app stops it. The script cuts each photo upright to a square round the head
 and slid inside the photo - padding it with white taught white bars), the face
 found by OpenCV's cascades (frontal, then profile either way: 30-31 of Partner's
 40 against InsightFace's 38; the rest go in whole and the tab says how many),
-captions it "a photo of <trigger>", and trains Klein's undistilled base (rank
-16, lr 1e-4, 512 px, bf16, nothing quantized); the LoRA then loads on the
-distilled Klein ComfyUI runs. `tools/prepare_klein_lora.py` sets ai-toolkit up
-once: Klein's base downloaded (7.75 GB, Apache 2.0), ComfyUI's own
-`qwen_3_4b.safetensors` hard-linked in as Qwen3-4B with Qwen's config and
-tokenizer (12 MB), and ComfyUI's FLUX.2 VAE (diffusers layout: ai-toolkit
+captions it "a photo of <trigger>", and trains Klein 9B's undistilled base
+(`ARCH` flux2_klein_9b, rank 16, lr 1e-4, 512 px, bf16; only the text encoder
+quantized, since Qwen3-8B in bf16 beside the 9B's 18 GB would not fit 32 GB
+while the captions are encoded); the LoRA then loads on the distilled Klein
+ComfyUI runs. `tools/prepare_klein_lora.py` sets ai-toolkit up once (in its
+venv, with `huggingface_hub` and the saved token): Qwen3-8B from
+Qwen/Qwen3-8B (16.4 GB, Apache 2.0; ComfyUI's copy is fp8, which ai-toolkit
+cannot train with), Klein 9B's base from black-forest-labs/FLUX.2-klein-base-9B
+(18.2 GB; gated by its own licence page, separate from the distilled 9B's - the
+script says where to accept it), and ComfyUI's FLUX.2 VAE (diffusers layout: ai-toolkit
 fails on `decoder.up.0.block.0.conv1.bias`) converted by ai-toolkit's own
 `convert_diffusers_state_dict`. ai-toolkit's Klein class names the Hugging Face
 repo for its text encoder, so the worker's `--aitk` mode starts run.py with
@@ -1162,12 +1177,12 @@ any skipped photo is said in the tab ("warn"). The library record's "Built from
 N photos" counts the kept ones.
 Progress (`STEP n total`, parsed from tqdm) shows in the tab's note. The file
 lands in the local backend's `lora_dir`, joins the library as an Identity
-LoRA (family flux2, its trigger on the record), and becomes the person's
+LoRA (family flux2-klein9b, its trigger on the record), and becomes the person's
 `head_lora` - in the open editor's copy too, so a later Save keeps it ("Head
 swap LoRA" in the editor). **Not `lora`**: an identity's `lora` joins every
 picture's own LoRA stack and its trigger is said in the prompt; a Klein LoRA
 is the head swap's alone. `Studio._head_swap` takes it through
-`imagegen.head_lora` (in the library, a FLUX.2 family, the file on the
+`imagegen.head_lora` (in the library, the Klein 9B family, the file on the
 backend - else Klein as before, and the record's notes say why) and
 `headswap.head_graph` puts it on that head's Klein with its trigger in that
 head's prompt (`prompt_for`); another person's head in the same picture is
@@ -1395,14 +1410,25 @@ checkpoint kept before the faces is still the picture as generated) runs
 `apps.image_studio.headswap`: one SAM3 run (`FIND`, faces), `targets` picks each
 profile's face by FaceFusion's own `target_face` rule, `head_crop` cuts a square
 `CROP` (4) faces wide round the face, and `head_graph` has
-FLUX.2 Klein 4B redraw it at 1024 px from an empty latent with two
+FLUX.2 Klein 9B (fp8) redraw it at 1024 px from an empty latent with two
 `ReferenceLatent`s - the crop, then the profile's FIRST photo - in 4 steps at cfg 1
 (ComfyUI's own Klein template). Its colour is moved `TONE` (0.5) of the way to the
 crop's (ColorTransfer). It is blended back through the head and hair alone:
 SAM3's `WORDS` (`head:1`, `hair:1`) in the crop before and after, grown, inside a
-soft square. Klein 4B is
-Apache 2.0 and shares Z-Image's `qwen_3_4b` encoder (CLIPLoader type `flux2`); the
-9B is gated and non-commercial and is not used. `settings["head_swap"]` (on by
+soft square. **Klein 9B since 2026-10-01** (the user: "id would like to try flux
+klein 9B", then the 4B's weights removed): on the 12 stranger pictures of
+Partner's LoRA bench, with no LoRA, the 4B scored 0.386 (3 of 12 at 0.5 or more)
+and the 9B 0.555 (8 of 12); after the face swap 0.849 and 0.860. By eye the
+9B keeps the picture's expression, clothes and light where the 4B pasted in
+the photo's smile and top. About 8 s a head on the 5090. Its files:
+`flux-2-klein-9b-fp8.safetensors` (black-forest-labs/FLUX.2-klein-9b-fp8,
+gated), its own encoder `qwen_3_8b_fp8mixed.safetensors` (Comfy-Org/flux2-klein-9B;
+CLIPLoader type `flux2`) and the shared `flux2-vae`. **The 9B is under the
+FLUX Non-Commercial License, so every picture it touched says so** (the user:
+"attach a note to images"): `Job.license` = `headswap.LICENSE_NOTE`, kept as
+the record's `license`, shown on its History row, and written into each PNG
+as a tEXt `Comment` by `History.add` (`png_text`), so the terms go wherever
+the file goes. `settings["head_swap"]` (on by
 default and for pictures saved before it; "Head swap before the face swap" under
 Generate) turns it off. A backend without SAM3, Klein's three files or its nodes,
 a failed run and a cancel all leave the picture as it was generated, with a note:
