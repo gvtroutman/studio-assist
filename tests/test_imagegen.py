@@ -1301,6 +1301,42 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertIsNone(ig.preview_graph(self.plan(preset="identity", scene="x")))
 
 
+class TestStartBackend(TempStudioMixin, unittest.TestCase):
+    """Start runs a backend's own start file - never the real one here."""
+
+    def test_only_a_file_on_this_pc_can_be_started(self):
+        cmd = os.path.join(self.dir, "Start ComfyUI.cmd")
+        with open(cmd, "w") as f:
+            f.write("@echo off\n")
+        self.assertEqual(ig.Studio.start_file({"start": cmd}), cmd)
+        self.assertEqual(ig.Studio.start_file({"start": '"%s"' % cmd}), cmd)
+        self.assertIsNone(ig.Studio.start_file(
+            {"start": "Start ComfyUI on the LLM PC with --listen."}))
+        self.assertIsNone(ig.Studio.start_file({"start": cmd + ".gone"}))
+        self.assertIsNone(ig.Studio.start_file({}))
+
+    def test_a_cmd_starts_in_a_console_of_its_own_beside_itself(self):
+        from unittest.mock import patch
+        cmd = os.path.join(self.dir, "Start ComfyUI.cmd")
+        with open(cmd, "w") as f:
+            f.write("@echo off\n")
+        b = dict(self.backend("5090"), start=cmd)
+        with patch.object(ig.subprocess, "Popen") as popen:
+            self.studio.start(b)
+        args, kw = popen.call_args
+        self.assertEqual(args[0], ["cmd", "/c", cmd])
+        self.assertEqual(kw["cwd"], self.dir)
+        self.assertEqual(kw["creationflags"], getattr(ig.subprocess, "CREATE_NEW_CONSOLE", 0))
+
+    def test_advice_is_not_run(self):
+        from unittest.mock import patch
+        with patch.object(ig.subprocess, "Popen") as popen:
+            with self.assertRaises(ig.ComfyError) as caught:
+                self.studio.start(self.backend("3090"))
+        popen.assert_not_called()
+        self.assertIn("--listen", str(caught.exception))
+
+
 class TestRouting(TempStudioMixin, unittest.TestCase):
     def test_role_decides_and_falls_back(self):
         bs = self.studio.backends()
@@ -3369,6 +3405,68 @@ class TestImageStudioTab(unittest.TestCase):
         s = self.app.sessions["image-studio"]
         self.assertIsNotNone(s.images)
         return s, s.images
+
+    def test_an_offline_backend_on_this_pc_has_a_start_button(self):
+        """Offline + a start file here: Start launches it (patched - nothing
+        real starts), the row says starting, and ready once it answers."""
+        from unittest.mock import patch
+        import apps.image_studio.ui as ui_mod
+        import core.ui as core_ui
+        _, ui = self.tab()
+        cmd = os.path.join(self.dir, "Start ComfyUI.cmd")
+        with open(cmd, "w") as f:
+            f.write("@echo off\n")
+        b = dict(ui.studio.backend("5090"), start=cmd)
+        other = ui.studio.backend("3090")
+
+        def words(cell):
+            out = []
+            for w in cell.winfo_children():
+                try:
+                    out.append(w.cget("text"))   # a Label, or a Pill's own cget
+                except ui_mod.tk.TclError:
+                    pass                         # the dot
+            return out
+
+        def texts():
+            return [t for cell in ui.health_row.winfo_children() for t in words(cell)]
+
+        FakeClient.down = {"5090", "3090"}
+        polls = []
+
+        def poll(*a, **k):
+            polls.append(1)
+            if len(polls) >= 2:
+                FakeClient.down = set()   # it comes up on the second look
+            return real_check(*a, **k)
+        real_check = ui.studio.check
+        try:
+            with patch.object(ui.studio, "backends", return_value=[b, other]), \
+                    patch.object(ui.studio, "backend", side_effect=lambda bid: b if bid == "5090" else other):
+                ui.studio.check(b, full=False)
+                ui.studio.check(other, full=False)
+                ui._paint_health()
+                starts = [w for cell in ui.health_row.winfo_children()
+                          for w in cell.winfo_children() if isinstance(w, core_ui.Pill)
+                          and w.cget("text") == "Start"]
+                # The 3090's `start` is advice: no button for it.
+                self.assertEqual(len(starts), 1)
+                with patch.object(ig.subprocess, "Popen") as popen, \
+                        patch.object(ui, "START_POLL", 0.01), \
+                        patch.object(ui.studio, "check", side_effect=poll):
+                    starts[0].command()
+                    self.assertEqual(popen.call_args.args[0], ["cmd", "/c", cmd])
+                    self.assertIn("starting", " ".join(texts()))
+                    self.assertNotIn("Start", texts())
+                    starts[0].command()             # a second click starts nothing more
+                    self.assertEqual(popen.call_count, 1)
+                    self.pump(lambda: not ui.starting and "ready" in " ".join(texts()))
+                self.assertEqual(texts().count("Start"), 0)
+                self.assertIn("is up", ui.note.cget("text"))
+        finally:
+            FakeClient.down = set()
+            ui.studio.check_all()
+            ui._paint_health()
 
     def test_generate_stays_visible_and_advanced_keeps_loras(self):
         _, ui = self.tab()
