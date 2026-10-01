@@ -2717,7 +2717,7 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             "height": FACE_EDIT, "crop": "disabled"}}
         g["fh4"] = {"class_type": "ImageToMask", "inputs": {"image": ["fh3", 0],
                                                             "channel": "red"}}
-    if any(f and f.get("image") for f in faces):
+    if any(f and (f.get("images") or f.get("image")) for f in faces):
         g["pl1"] = {"class_type": "PulidFluxModelLoader", "inputs": {"pulid_file": pulid_file}}
         g["pl2"] = {"class_type": "PulidFluxEvaClipLoader", "inputs": {}}
         g["pl3"] = {"class_type": "PulidFluxInsightFaceLoader", "inputs": {"provider": "CUDA"}}
@@ -7075,7 +7075,8 @@ class Studio:
         except (ComfyError, OSError) as e:
             plan.warnings.append("A face picture could not be sent (%s); the faces are "
                                  "redrawn from the words alone." % e)
-            faces = [dict(f, image=None, denoise=None) if f else None for f in faces]
+            faces = [dict(f, image=None, images=[], denoise=None) if f else None
+                     for f in faces]
             faces += [None] * (len(crops) - len(faces))
         job.face = {"found": len(boxes), "redrawn": len(crops),
                     "denoise": values.get("face_denoise"),
