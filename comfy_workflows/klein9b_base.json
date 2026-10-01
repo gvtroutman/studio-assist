@@ -1,0 +1,26 @@
+{
+  "id": "klein9b_base",
+  "label": "FLUX.2 Klein 9B",
+  "about": "FLUX.2 [klein] base 9B text to image: the undistilled model a Build LoRA head LoRA is trained on, so an identity LoRA acts at full strength here (on the 4-step distilled 9B it barely shows; live on Partner, 2026-10-01). Real CFG with a written negative, 50 steps, ~40 s at 896x1152 on the 5090. Model-only LoRAs. No refine pass, face pass or source picture yet. Under the FLUX Non-Commercial License (the model's `license`).",
+  "families": ["flux2-klein9b"],
+  "defaults": {"steps": 50, "guidance": 4.0, "sampler": "euler", "width": 1024, "height": 1024,
+               "negative": "", "encoder_device": "default", "filename_prefix": "ImageStudio/klein9b"},
+  "files": {"model": "diffusion_models", "encoder": "text_encoders", "vae": "vae"},
+  "lora_chain": {"model": ["1", 0]},
+  "stages": {"loading": ["1", "2", "3"], "sampling": ["40"], "decoding": ["41", "9"]},
+  "graph": {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "{{model}}", "weight_dtype": "default"}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "{{encoder}}", "type": "flux2", "device": "{{encoder_device}}"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+    "10": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["2", 0]}},
+    "12": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{negative}}", "clip": ["2", 0]}},
+    "6": {"class_type": "CFGGuider", "inputs": {"model": "{{model_out}}", "positive": ["10", 0], "negative": ["12", 0], "cfg": "{{guidance}}"}},
+    "20": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
+    "8": {"class_type": "Flux2Scheduler", "inputs": {"steps": "{{steps}}", "width": "{{width}}", "height": "{{height}}"}},
+    "5": {"class_type": "RandomNoise", "inputs": {"noise_seed": "{{seed}}"}},
+    "30": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "{{sampler}}"}},
+    "40": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["5", 0], "guider": ["6", 0], "sampler": ["30", 0], "sigmas": ["8", 0], "latent_image": ["20", 0]}},
+    "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
+    "9": {"class_type": "SaveImage", "inputs": {"images": ["41", 0], "filename_prefix": "{{filename_prefix}}"}}
+  }
+}
