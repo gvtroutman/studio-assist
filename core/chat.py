@@ -873,8 +873,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s.view = tk.Text(s.frame, font=self.f_body, wrap="word", bd=0, padx=22,
                          pady=16, yscrollcommand=bar.set, state="disabled",
                          cursor="arrow", highlightthickness=0)
-        self._skin(s.view, bg="bg", fg="text", selectbackground="sel",
-                   insertbackground="text")
+        self._skin(s.view, bg="bg", fg="text", insertbackground="text")
+        self._selectable(s.view)
+        s.view.bind("<Key>", self._type_to_composer)
         s.view.pack(side="left", fill="both", expand=True)
         bar.config(command=s.view.yview)
         self._tags(s.view)
@@ -882,6 +883,16 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self._welcome(s)
         if s.app.id == "comfyui":
             s.nodes_view = nodes_ui.NodesView(self, s)
+
+    def _type_to_composer(self, ev):
+        """A key typed in the transcript - which a click to select some of it
+        leaves focused - starts a message: it goes to the composer, as it would
+        have before the click. Ctrl keys (Ctrl+C, Ctrl+A) stay here."""
+        if ev.state & 0x4 or not (ev.char and ev.char.isprintable()):
+            return None
+        self.input.focus_set()
+        self.input.insert("insert", ev.char)
+        return "break"
 
     def _holds_window(self, s):
         """The tab shows another program's window, not a conversation: a panel
@@ -941,7 +952,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         v.tag_configure("tool_body_step", lmargin1=54, lmargin2=54)
         v.tag_bind("call_head", "<Button-1>", self._on_call_click)
         v.tag_bind("call_head", "<Enter>", lambda e: e.widget.config(cursor="hand2"))
-        v.tag_bind("call_head", "<Leave>", lambda e: e.widget.config(cursor="arrow"))
+        v.tag_bind("call_head", "<Leave>", lambda e: e.widget.config(cursor="xterm"))
         v.tag_configure("err", foreground=C["err"], lmargin1=16, lmargin2=16,
                         rmargin=40, spacing3=10)
         v.tag_configure("sys", foreground=C["muted"], lmargin1=16, lmargin2=16,
@@ -1728,7 +1739,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         view = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=18, pady=14,
                        yscrollcommand=bar.set, state="disabled", cursor="arrow",
                        highlightthickness=0)
-        self._skin(view, bg="bg", fg="text", selectbackground="sel")
+        self._selectable(self._skin(view, bg="bg", fg="text"))
         view.pack(side="left", fill="both", expand=True)
         bar.config(command=view.yview)
         self.tool_views[app_id] = view
@@ -1832,8 +1843,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self.row.pack(fill="x")
         self.input = tk.Text(self.row, height=2, font=self.f_body, wrap="word", bd=0,
                              padx=12, pady=10, highlightthickness=0)
-        self._skin(self.input, bg="card", fg="text", insertbackground="accent",
-                   selectbackground="sel")
+        self._skin(self.input, bg="card", fg="text", insertbackground="accent")
+        self._selectable(self.input, editable=True)
         self.input.pack(fill="both", expand=True)
         self.input.bind("<Return>", self._on_return)
         self.input.focus_set()
@@ -3209,7 +3220,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         scroll.pack(side="right", fill="y")
         view = tk.Text(win, font=self.f_mono, wrap="word", bd=0, padx=14, pady=10,
                        yscrollcommand=scroll.set, state="disabled", highlightthickness=0)
-        self._skin(view, bg="bg", fg="text", selectbackground="sel")
+        self._selectable(self._skin(view, bg="bg", fg="text"))
         view.pack(side="left", fill="both", expand=True)
         scroll.config(command=view.yview)
         self._log_tags(view)
@@ -4146,7 +4157,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         view = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=18, pady=14,
                        yscrollcommand=bar.set, state="disabled", cursor="arrow",
                        highlightthickness=0)
-        self._skin(view, bg="bg", fg="text", selectbackground="sel")
+        self._selectable(self._skin(view, bg="bg", fg="text"))
         view.pack(side="left", fill="both", expand=True)
         bar.config(command=view.yview)
         self._tool_tags(view)
@@ -4251,8 +4262,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             record = {"status": "No saved progress yet."}
         win = tk.Toplevel(self)
         win.title("Task progress — " + s.app.tab)
-        view = self._skin(tk.Text(win, wrap="word", font=self.f_body,
-                                  width=75, height=28), bg="bg", fg="text")
+        view = self._selectable(self._skin(tk.Text(win, wrap="word", font=self.f_body,
+                                                   width=75, height=28), bg="bg", fg="text"))
         view.pack(fill="both", expand=True)
         view.insert("end", str(record.get("status", "No saved progress yet.")) + "\n\n")
         for key, label in (("briefs", "Your requests"), ("plan", "Plan"), ("issues", "Open issues")):

@@ -38,7 +38,8 @@ class ChatLessonsMixin:
         editor = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=14, pady=12,
                          undo=True, yscrollcommand=bar.set, highlightthickness=0,
                          insertwidth=2)
-        self._skin(editor, bg="card", fg="text", insertbackground="text", selectbackground="sel")
+        self._skin(editor, bg="card", fg="text", insertbackground="text")
+        self._selectable(editor, editable=True)
         editor.pack(fill="both", expand=True, padx=self._px(16), pady=self._px(12))
         bar.config(command=editor.yview)
         editor.insert("1.0", self.studio or eng.STUDIO_TEMPLATE)
@@ -98,7 +99,7 @@ class ChatLessonsMixin:
         view = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=18, pady=14,
                        yscrollcommand=bar.set, state="disabled", cursor="arrow",
                        highlightthickness=0)
-        self._skin(view, bg="bg", fg="text", selectbackground="sel")
+        self._selectable(self._skin(view, bg="bg", fg="text"))
         view.pack(side="left", fill="both", expand=True)
         bar.config(command=view.yview)
         self._tool_tags(view)

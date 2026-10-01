@@ -3461,6 +3461,20 @@ to be repainted rather than reconfigured, which is what `dot_role` and `marks` a
 for. A role missing from either palette is a `KeyError` mid-switch; a test compares
 the two.
 
+**Text you can read is text you can copy.** Every read-only `tk.Text` (the
+transcript, Log, History, Diagnostics, Ideas, lessons, a tool list, an approval's
+diff, the Terminal mirror) goes through `Chat._selectable`: the I-beam, a
+right-click Copy / Select all, Ctrl+A. Tk already selects by dragging in a
+*disabled* Text and copies on Ctrl+C - the click gives it focus on Windows - so what
+had been missing was seeing it: selected text was drawn in `sel`, a hover grey
+nearly the page's colour in Light, and Windows' default `selectforeground` is white,
+so a selection there vanished and looked impossible. Highlights use the `hilite`
+role (the accent faded into `bg`, derived again from a picked accent) under `text`.
+Editable fields pass `editable=True` and take only the colours. A key typed in the
+transcript goes to the composer (`_type_to_composer`), since a click to select leaves
+the focus there. `tk.Label`s and the drawn user bubble are not selectable; the
+`bubble-menu` branch gives the bubble a right-click Copy.
+
 **Fonts scale with the display, pixel counts do not.** Tk sizes fonts from the
 screen's DPI, so on this 150% workstation every label is half again as wide while
 `width=236` stays 236. That combination clipped the sidebar. Anything measured in

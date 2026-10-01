@@ -561,8 +561,8 @@ class SceneBuilder:
         t = tk.Text(shell, height=height, wrap="word", bd=0, highlightthickness=0,
                     font=self.host.f_ui, padx=self.owner.px(8), pady=self.owner.px(6),
                     undo=True)
-        self.owner.skin(t, bg="card", fg="text", insertbackground="accent",
-                        selectbackground="sel")
+        self.owner.skin(t, bg="card", fg="text", insertbackground="accent")
+        self.host._selectable(t, editable=True)
         t.insert("1.0", value)
         t.pack(fill="x")
         t.bind("<KeyRelease>", lambda ev: on_change(t.get("1.0", "end").rstrip("\n")))
