@@ -2754,7 +2754,12 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual(sb.check(), "")
         self.assertEqual(sb.takes("no-such-model"), set())
 
-        sb._set_model("z-image-turbo")                      # the frame alone
+        # Z-Image takes the pose and depth maps too (its Fun ControlNet, since
+        # 2026-09-29); the grey frame is not sent at the default keep of 0.
+        # The frame alone, for a model with no ControlNet, is held headless in
+        # test_generation_carries_size_strengths_and_the_scene.
+        sb._set_model("z-image-turbo")
+        self.assertEqual(sb.takes("z-image-turbo"), set(sc.MAP_KINDS))
         ui.random_seed.set(False)
         ui.adv["seed"].set("77")
         n = len(ui.jobs)
@@ -2763,12 +2768,13 @@ class TestSceneBuilderWindow(unittest.TestCase):
         job = ui.jobs[0]
         self.assertEqual(job.status, "complete", job.detail)
         st = job.settings
-        self.assertTrue(os.path.isfile(st["references"]["source"]))
-        with open(st["references"]["source"], "rb") as f:
-            self.assertEqual(png_size(f.read()), (896, 1152))
-        self.assertEqual((st["width"], st["height"], st["denoise"]),
-                         (896, 1152, round(1 - sc.FALLBACK_KEEP, 3)))
-        self.assertEqual((st["pose"], st["composition"]), (None, None))
+        self.assertEqual(sorted(st["references"]), ["composition", "pose"])
+        with open(st["references"]["pose"], "rb") as f:          # the frame's shape
+            self.assertEqual(png_size(f.read()), (796, 1024))    # at pose.RENDER_EDGE
+        self.assertTrue(os.path.isfile(st["references"]["composition"]))
+        self.assertEqual((st["width"], st["height"]), (896, 1152))
+        self.assertEqual((st["pose"], st["composition"]),
+                         ({"strength": sc.POSE_STRENGTH}, {"strength": sc.DEPTH_STRENGTH}))
         self.assertIn("welding a beam; helmet down, leather gloves", st["scene"])
         self.assertIn("Workbench (", st["scene"])
         self.assertEqual(st["scene_file"], path)
