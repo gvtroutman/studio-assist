@@ -137,6 +137,69 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'boom'):
                     faces.Job('find', [], ['a.jpg'], comfy=d).run()
 
+    def test_only_a_worker_that_said_done_is_believed(self):
+        # Idea f3bdb67ae72e: result.json was read whenever it existed; a
+        # worker that died writing it left half a file, and json's ValueError
+        # escaped the editor's (RuntimeError, OSError) catch.
+        with tempfile.TemporaryDirectory() as d:
+            with self.fake(d, '''
+                    import json, sys
+                    job = json.load(open(sys.argv[1]))
+                    open(job['result'], 'w').write('{"a.jpg": {"bo')
+                    print('No space left on device')
+                    '''):
+                with self.assertRaisesRegex(RuntimeError, 'No space left'):
+                    faces.Job('find', [], ['a.jpg'], comfy=d).run()
+            with self.fake(d, '''
+                    import json, sys
+                    job = json.load(open(sys.argv[1]))
+                    open(job['result'], 'w').write('{"a.jpg": {"bo')
+                    print('DONE')
+                    '''):
+                with self.assertRaisesRegex(RuntimeError, 'could not be read'):
+                    faces.Job('find', [], ['a.jpg'], comfy=d).run()
+
+    def test_a_callback_that_raises_ends_the_worker(self):
+        # Idea 1af7eaa19d24: as Build.run since 76ab938 - else InsightFace
+        # stays on the GPU with nobody reading it.
+        with tempfile.TemporaryDirectory() as d:
+            with self.fake(d, '''
+                    import time
+                    print('FACE 1 2', flush=True)
+                    time.sleep(60)
+                    '''):
+                job = faces.Job('find', [], ['a.jpg', 'b.jpg'], comfy=d)
+
+                def on(kind, value):
+                    raise KeyError('the window went')
+                with self.assertRaises(KeyError):
+                    job.run(on)
+            job.child.proc.wait(timeout=10)     # ended, not left sleeping
+            self.assertIsNotNone(job.child.proc.poll())
+
+    def test_the_cache_saves_through_a_temp_file_of_its_own_and_never_fails_the_job(self):
+        # Idea 01ca34c6805f: one fixed face-cache.json.tmp for every worker;
+        # Rate photos beside an import failed os.replace (WinError 5), and
+        # save() was unguarded, so the whole job failed over a cache.
+        w = load('identity_faces')
+        with tempfile.TemporaryDirectory() as d:
+            reader = w.Reader.__new__(w.Reader)
+            reader.cache_path, reader.cache = os.path.join(d, 'face-cache.json'), {'k': 1}
+            replaced = []
+            real = os.replace
+            with mock.patch.object(w.os, 'replace',
+                                   side_effect=lambda a, b: replaced.append(a) or real(a, b)):
+                reader.save()
+            self.assertEqual(replaced, [reader.cache_path + '.%d.tmp' % os.getpid()])
+            self.assertEqual(json.loads(Path(reader.cache_path).read_text()), {'k': 1})
+            reader.cache = {'k': 2}
+            with mock.patch.object(w.os, 'replace', side_effect=PermissionError(5, 'Access denied')), \
+                    mock.patch.object(w, 'say') as said:
+                reader.save()                    # a note, not a raise
+            self.assertIn('was not saved', said.call_args[0][0])
+            self.assertEqual(json.loads(Path(reader.cache_path).read_text()), {'k': 1})
+            self.assertEqual(os.listdir(d), ['face-cache.json'])     # no temp left behind
+
 
 class ImportTests(unittest.TestCase):
     def answer(self, paths, scratch):

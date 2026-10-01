@@ -4190,14 +4190,57 @@ def load_critic_memory(lib):
 
 
 def save_critic_memory(lib, memory):
-    path = os.path.join(lib.root, CRITIC_MEMORY)
+    _save_kept(os.path.join(lib.root, CRITIC_MEMORY), memory)
+
+
+def _save_kept(path, data):
+    """One of the critic's files, written whole. Its temp file is this
+    writer's own: the app and the phone server both write these, and a
+    shared .tmp name let one os.replace the other's half-written file."""
+    tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex[:8])
     try:
-        os.makedirs(lib.root, exist_ok=True)
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(memory, f, indent=1, ensure_ascii=False)
-        os.replace(path + ".tmp", path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1, ensure_ascii=False)
+        os.replace(tmp, path)
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def change_kept(lib, name, change):
+    """Read one of the critic's files (CRITIC_MEMORY, CRITIC_LEDGER), change
+    it (`change`: dict -> dict) and write it back. The loaders read a file
+    that will not read as {} - right for a reader, but saving that would
+    erase all the critic learned. So, as core/ideas.py does: a file that
+    will not open (held for an instant by the other process) is not
+    written; one that opens but will not parse is set aside as .broken and
+    the change starts afresh. Call it under the file's lock."""
+    path = os.path.join(lib.root, name)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            doctor.log_error("%s could not be read (%s); what the critic learned this "
+                             "time is not saved." % (name, e))
+            return
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as e:
+            try:
+                os.replace(path, path + ".broken")
+            except OSError:
+                return
+            doctor.log_error("%s would not read (%s); set aside as %s.broken and "
+                             "started afresh." % (name, e, name))
+            data = {}
+    _save_kept(path, change(data))
 
 
 # What the critic's scores add up to (studio_critic's ledger): which redraw
@@ -4220,14 +4263,7 @@ def load_critic_ledger(lib):
 
 
 def save_critic_ledger(lib, ledger):
-    path = os.path.join(lib.root, CRITIC_LEDGER)
-    try:
-        os.makedirs(lib.root, exist_ok=True)
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(ledger, f, indent=1, ensure_ascii=False)
-        os.replace(path + ".tmp", path)
-    except OSError:
-        pass
+    _save_kept(os.path.join(lib.root, CRITIC_LEDGER), ledger)
 
 
 def record_of_picture(path):
@@ -4583,7 +4619,15 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                             "why": why})
 
     # ----------------------------------------------------------- prompt
-    who = [i["trigger"] for i, _ in idents if i["trigger"]]
+    # A trigger is said for a LoRA the model is given, never for one left out
+    # (not on this machine, another family's, a workflow with no LoRAs): its
+    # words alone are no LoRA. An identity or style with no LoRA keeps its
+    # trigger, as words.
+    given = {rec["id"] for rec, _, _, _ in applied}
+
+    def trigger(word, lora):
+        return word if word and (not lora or lora in given) else ""
+    who = [t for t in (trigger(i["trigger"], i["lora"]) for i, _ in idents) if t]
     scene = _field(s, "scene")
     person = person_text(s)
     named = " and ".join(t for t in who if t not in scene)
@@ -4612,17 +4656,22 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         p.warnings.append("The drawn pose decides the framing and which way the person "
                           "faces; the Camera gives only its height. Zoom the figure "
                           "(mouse wheel in Draw…) to frame closer.")
+    # Generate Again replays the words the picture was made with (`again`);
+    # nothing learned since is said, or noted as said.
+    replay = _str(s.get("replay_prompt"))
     # What the Visual Critic kept from earlier pictures of this person and
     # scene (critic_memory.json): every picture starts from it, so they agree.
-    learned = critic.recall(load_critic_memory(lib), [i["id"] for i, _ in idents],
-                            scene, [k for k in SLOTS if _field(s, k)] + ["scene", "camera"])
+    learned = [] if replay else critic.recall(
+        load_critic_memory(lib), [i["id"] for i, _ in idents],
+        scene, [k for k in SLOTS if _field(s, k)] + ["scene", "camera"])
     if learned:
         parts.append(", ".join(v for _, v in learned))
         p.notes.append("Kept from earlier pictures: %s." % "; ".join(
             "%s %s" % (k.replace("_", " "), v) for k, v in learned))
     # And against what keeps going wrong in this person's pictures (the
     # critic's ledger): the fix that was asked for, said before it is needed.
-    against = critic.prevention(load_critic_ledger(lib), [i["id"] for i, _ in idents])
+    against = [] if replay else critic.prevention(load_critic_ledger(lib),
+                                                  [i["id"] for i, _ in idents])
     if against:
         parts.append(", ".join(v for _, v in against))
         p.notes.append("Drawn against faults seen before: %s." % "; ".join(
@@ -4636,17 +4685,19 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     if anatomy:
         parts.append(anatomy_text())
     if style:
-        extra = " ".join(x for x in (style["trigger"], style["prompt"]) if x)
+        extra = " ".join(x for x in (trigger(style["trigger"], style["lora"]),
+                                     style["prompt"]) if x)
         if extra:
             parts.append(extra)
-    # A trigger is said for a LoRA the model is given, never for one left out
-    # (not on this machine, another family's): its words alone are no LoRA.
     for rec, _, why, _ in applied:
         if why in ("added", "always on") and rec["trigger"] and rec["trigger"] not in " ".join(parts):
             parts.append(rec["trigger"])
     p.prompt = ". ".join(x.rstrip(" .") for x in parts if x) + ("." if parts else "")
     if chest_prompt and any(m["why"] == "chest size" for m in p.lora_meta):
         p.prompt += " " + chest_prompt + "."
+    if replay:
+        p.prompt = replay
+        p.notes.append("Generate Again: the prompt the picture was made with, replayed.")
     if s.get("prompt_override"):
         # The Visual Critic's regeneration: its compiled prompt, built round
         # the prompt above (studio_critic.generator_prompt), in its place.
@@ -5376,6 +5427,12 @@ def again(record, new_seed=False):
     seed = record.get("seed", s.get("seed"))
     if seed is not None and int(seed) >= 0:
         s["seed"], s["seed_mode"] = int(seed), "fixed"
+    if record.get("prompt") and not s.get("mode"):
+        # A Generate's words, not composed again: compose adds what
+        # the critic has learned since (critic_memory, critic_ledger), and
+        # the same seed on other words is another picture. A new seed is a
+        # variation and composes afresh.
+        s["replay_prompt"] = record["prompt"]
     for k in AGAIN_PINNED:
         if s.get(k) in (None, "") and record.get(k) not in (None, ""):
             s[k] = record[k]
@@ -5529,10 +5586,18 @@ class Studio:
         self.health = {}              # backend id -> health dict (+ "at")
         self.inventories = {}         # backend id -> {kind: set}
         self.nodes = {}               # backend id -> set of node classes
+        # backend id -> why no job may go there now: Build LoRA has its GPU,
+        # and a FLUX loaded beside the training runs it out of VRAM.
+        self.held = {}
+        self.started = {}             # backend id -> the Popen of its last `start`
         self.queue = JobQueue(self, notify)
 
     def backends(self):
         return self.lib.all("backends")
+
+    def routable(self):
+        """The backends Auto may send a job to: all but those `held`."""
+        return [b for b in self.backends() if b["id"] not in self.held]
 
     def backend(self, bid):
         return self.lib.get("backends", bid)
@@ -5576,16 +5641,25 @@ class Studio:
         own - the same window it had when started by hand, where its log and
         a crash's last words can be read (the 5090's .cmd ends in `pause`).
         Not a `procs` child: ComfyUI is the user's, and must not end when
-        this window closes. Returns at once; `check` says when it answers."""
+        this window closes. Returns at once; `check` says when it answers.
+        Refused while the console of the last Start is open: past the UI's
+        wait a ComfyUI may still be loading, and a second one on the same
+        port fails over it (or, ended at its `pause`, it says why)."""
         path = self.start_file(backend)
         if path is None:
             raise ComfyError("%s has no start file on this PC. %s"
                              % (backend["name"], backend.get("start") or
                                 "Set one in Backends (Start command)."))
+        last = self.started.get(backend["id"])
+        if last is not None and last.poll() is None:
+            raise ComfyError("The console of %s's last Start is still open: ComfyUI is "
+                             "still loading there, or it stopped and that window says why. "
+                             "Close it to start again." % backend["name"])
         args = (["cmd", "/c", path] if path.lower().endswith((".cmd", ".bat"))
                 else [path])
-        subprocess.Popen(args, cwd=os.path.dirname(path), close_fds=True,
-                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        self.started[backend["id"]] = subprocess.Popen(
+            args, cwd=os.path.dirname(path), close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
     def check_all(self, full=True):
         threads = [threading.Thread(target=self.check, args=(b, full), daemon=True)
@@ -5782,11 +5856,13 @@ class Studio:
             b = self.backend(settings["backend"])
             if b is None:
                 return None, "No backend called %r." % settings["backend"]
+            if b["id"] in self.held:
+                return None, self.held[b["id"]]
             return b, "%s (chosen by hand)." % b["name"]
         role = preset_info(self.lib, settings.get("preset"))["role"]
         if int(settings.get("batch") or 1) > 1 and role == "interactive":
             role = "batch"
-        order = route(role, self.backends(), self.health,
+        order = route(role, self.routable(), self.health,
                       self.has_model(settings.get("model")), load)
         if not order:
             return None, self.why_no_backend(settings)
@@ -5828,6 +5904,8 @@ class Studio:
             b = self.backend(settings["backend"])
             if b is None:
                 raise ComfyError("No backend called %r." % settings["backend"])
+            if b["id"] in self.held:
+                raise ComfyError(self.held[b["id"]])
             return [b] * count
         for b in self.backends():
             h = self.health.get(b["id"])
@@ -5844,7 +5922,7 @@ class Studio:
                 return [b]
             role = preset_info(self.lib, settings.get("preset"))["role"]
             role = "batch" if role == "interactive" else role
-            order = route(role, self.backends(), self.health,
+            order = route(role, self.routable(), self.health,
                           self.has_model(settings.get("model")), load)
             if not order:
                 raise ComfyError(self.why_no_backend(settings))
@@ -5863,6 +5941,8 @@ class Studio:
             problems, lacking = self.missing(model, b)
             if not b["enabled"]:
                 lines.append("%s is disabled" % b["name"])
+            elif b["id"] in self.held:
+                lines.append(self.held[b["id"]].rstrip("."))
             elif problems:
                 lines.append(" ".join(problems).rstrip("."))
             elif not h.get("ok"):
@@ -6201,10 +6281,12 @@ class Studio:
             return pictures
         folder = os.path.join(self.lib.root, "finish")
         out = []
+        passes = len(job.passes)
         try:
             os.makedirs(folder, exist_ok=True)
             photos = {}
             for n, (filename, data) in enumerate(pictures):
+                passes = len(job.passes)
                 if job.cancel.is_set():
                     out.append((filename, data))
                     continue
@@ -6255,10 +6337,19 @@ class Studio:
                                      for h in heads))
                 job.license = headswap.LICENSE_NOTE
             return out
-        except (ComfyError, Unreachable, OSError) as e:
+        except Exception as e:            # an extra: whatever it is, the pictures go on
+            if not isinstance(e, (ComfyError, OSError)):
+                doctor.log_error("Image Studio head swap, job %s:\n%s"
+                                 % (job.id, traceback.format_exc()))
+            # The pictures already swapped keep their swap (and the notes,
+            # heads and licence that say so); the rest go on as generated,
+            # and the failed run's graph is not listed as a pass made.
+            del job.passes[passes:]
             job.notes.append("The head swap before the face swap could not run (%s); the "
-                             "faces are swapped on the picture as it was generated." % e)
-            return pictures
+                             "faces are swapped on %s as generated."
+                             % (e, "the pictures after the first %d" % len(out) if out
+                                else "the picture"))
+            return out + pictures[len(out):]
 
     def _apply_profiles(self, job, pictures, profiles, say):
         """The final face swap, by FaceFusion (`facefusion.SWAP_MODEL`). The
@@ -6324,7 +6415,8 @@ class Studio:
         """The settings a fix redraws with: the picture's own, less what made
         the picture and is not wanted in a close-up (references, pose, the
         face pass, the critic)."""
-        s = {k: v for k, v in (settings or {}).items() if k not in ("mode", "fix")}
+        s = {k: v for k, v in (settings or {}).items()
+             if k not in ("mode", "fix", "replay_prompt")}
         s.update(references={}, item_refs={}, pose=None, composition=None,
                  face_detail=False, auto_refine=False, batch=1)
         return s
@@ -6397,10 +6489,14 @@ class Studio:
         hand_tone = FIX_TONE if TONE_NODE in types else None
         folder = os.path.join(self.lib.root, "finish")
         out = []
+        start = upto = (len(job.notes), len(job.passes))   # this picture's notes and passes
+        done = None
         try:
             os.makedirs(folder, exist_ok=True)
             oval = self._fix_oval(client)
             for n, (filename, data) in enumerate(pictures):
+                start = upto = (len(job.notes), len(job.passes))
+                done = None
                 if job.cancel.is_set():
                     out.append((filename, data))
                     continue
@@ -6476,13 +6572,35 @@ class Studio:
                         "_glasses": (len(glasses), "Glasses redrawn last: %d pair%s, "
                                                    "denoise %s.")}[tag]
                     job.notes.append(said % (count, "" if count == 1 else "s", denoise))
+                    upto = (len(job.notes), len(job.passes))
                 if done is not None:
                     data = client.fetch(done)
                 out.append((filename, data))
-        except (ComfyError, TemplateError, OSError) as e:
-            job.notes.append("The %s failed (%s); the picture is kept as it was before it."
-                             % (named, e))
-            return pictures
+        except Exception as e:            # the picture is never lost to its finish
+            if not isinstance(e, (ComfyError, TemplateError, OSError)):
+                doctor.log_error("Image Studio finish passes, job %s:\n%s"
+                                 % (job.id, traceback.format_exc()))
+            # Pictures already finished keep theirs. This one keeps the passes
+            # finished before the one that failed, if their result can still
+            # be fetched; if not, it goes on as it came and the notes and
+            # passes it made are dropped, so the record claims nothing the
+            # picture lacks.
+            kept = None
+            if len(out) < len(pictures):
+                filename, data = pictures[len(out)]
+                if done is not None:
+                    try:
+                        kept = client.fetch(done)
+                    except Exception:
+                        kept = None
+                mark = upto if kept is not None else start
+                del job.notes[mark[0]:]
+                del job.passes[mark[1]:]
+                out.append((filename, data if kept is None else kept))
+            job.notes.append("The %s failed (%s); %s." % (
+                named, e, "the passes finished before it are kept" if kept is not None
+                else "the picture is kept as it was before it"))
+            return out + pictures[len(out):]
         return out
 
     def _outline_masks(self, job, client, crops, tag):
@@ -6946,6 +7064,9 @@ class Studio:
         for b in order:
             if b is None or not b["enabled"]:
                 continue
+            if b["id"] in self.held:
+                why.append(self.held[b["id"]].rstrip("."))
+                continue
             h = self.health.get(b["id"]) or {}
             if not h.get("ok"):
                 why.append("%s is offline" % b["name"])
@@ -7401,8 +7522,8 @@ class Studio:
                 # can both be refining at once, and the second save must not
                 # overwrite what the first just learned.
                 with CRITIC_MEMORY_LOCK:
-                    save_critic_memory(self.lib, critic.remember(
-                        load_critic_memory(self.lib), canonical, promoted,
+                    change_kept(self.lib, CRITIC_MEMORY, lambda memory: critic.remember(
+                        memory, canonical, promoted,
                         [i["id"] for i in idents], s.get("scene") or ""))
             text = critic.log_text(n, result, nxt, scored)
             log.append(text)
@@ -7473,9 +7594,10 @@ class Studio:
 
     def _learn(self, change):
         """The ledger changed by `change` (ledger -> ledger) and saved. Two
-        backends' lanes can both be learning: read, change and write as one."""
+        backends' lanes can both be learning: read, change and write as one.
+        A ledger that will not read is never saved over (`change_kept`)."""
         with CRITIC_LEDGER_LOCK:
-            save_critic_ledger(self.lib, change(load_critic_ledger(self.lib)))
+            change_kept(self.lib, CRITIC_LEDGER, change)
 
     def _critic_denoise(self, action, values, ledger=None, model="", marked=None):
         """The strength of one planned redraw: its kind's own, or where the
