@@ -97,9 +97,13 @@ After Effects and Resolve use outside npm servers.
   (`swap`, `SWAP_MASKS`, `failure`, `_clear`), `tools/` (`facefusion_swap.py`: the
   worker, and the averaged face it keeps - `source_key`, `keep_source`).
   The head swap before the final face swap (FLUX.2 Klein 9B; `LICENSE_NOTE` -> `Job.license` -> `png_text`):
-  `apps/image_studio/headswap.py` (`lacks`, `targets`, `head_crop`, `head_graph`),
+  `apps/image_studio/headswap.py` (`lacks`, `targets`, `head_crop`, `middle`,
+  `head_graph`; what is blended: `WORDS`, `STRANDS`, `EDGE`),
   run by `Studio._head_swap` inside `finish_profiles`; the swap model is
-  `facefusion.SWAP_MODEL` / `model`.
+  `facefusion.SWAP_MODEL` / `model`. What of a face the swap changes:
+  `facefusion.SWAP_REGIONS`, `SWAP_LENS_LINE`, `SWAP_DEWEAVE`, done in the worker
+  by `under_lenses` and `even`; `Studio._apply_profiles` points it at the head
+  redrawn (`job.heads`).
   Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
   (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
   preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by

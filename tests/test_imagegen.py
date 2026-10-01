@@ -3,6 +3,7 @@ library on disk, the job queue and history against a fake ComfyUI, and the tab
 itself built in process. Nothing here touches the network or a GPU."""
 
 import base64
+import gc
 import json
 import os
 import shutil
@@ -167,6 +168,12 @@ def settle(jobs, seconds=5):
 
 class TempStudioMixin:
     def setUp(self):
+        # Tk things an earlier test left in a cycle are freed by whichever
+        # thread the collector next runs on. On a lane's thread that is a Tk
+        # call off the UI thread, and the lane stops there: a job left
+        # "queued" for good, in a full run only (2026-09-30). Freed here,
+        # on this thread, before a lane is started.
+        gc.collect()
         self.dir = tempfile.mkdtemp()
         FakeClient.instances, FakeClient.down, FakeClient.hold = [], set(), None
         self.notified = []
