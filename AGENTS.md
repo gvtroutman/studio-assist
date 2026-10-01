@@ -1122,21 +1122,60 @@ its captions/source ordering must not be reused for another person.
 
 **Build LoRA** (identity editor, beside Use as primary; Sitter 2026-09-27: "a
 simple build lora into the images of an identity. it needs at least 20 pics").
+**It builds a FLUX.2 Klein 4B LoRA of the person's head, for the head swap -
+not a FLUX.1 LoRA for the picture** (2026-09-30, the user: "right now it's just
+not a strong enough face swap", then "train a klein lora instead"). Measured
+first, through the app's own head swap on 12 FLUX pictures of a stranger,
+ArcFace against Partner's 23 real photos (her own photos score 0.80 against each
+other): Klein without a LoRA drew a look-alike, 0.39 (3 of 12 at 0.5 or more);
+with her LoRA, 0.65 (10 of 12), better on all 12; after the face swap 0.85 ->
+0.875, the worst 0.78 -> 0.83 (inswapper is trained on ArcFace's features, so
+those last numbers flatter it). Checkpoints scored alike from 500 steps to
+1500 (0.645 / 0.658 / 0.634 / 0.621 / 0.647), so `STEPS` is 750: about 6
+minutes on the 5090. The FLUX.1 build it replaced took 2.7 s a step (90
+minutes) and reached no picture made with Z-Image.
 `apps.image_studio.lora_train` (stdlib) refuses fewer than `MIN_PHOTOS` (20) photos that
 exist on disk, saves the profile, and runs `tools/train_identity_lora.py` in
 ai-toolkit's venv (`D:\ai-toolkit`) as a `core.procs` child, so closing the
-app stops it. The script copies each photo upright as RGB PNG (max 1536 px),
-captions it "a photo of <trigger>", and trains ai-toolkit's FLUX example
-settings (rank 16, lr 1e-4, 2000 steps, 512/768/1024) on the diffusers copy
-that `prepare_identity_lora.py` made in `models/flux-local-studio`; `problem()`
-names any missing part. Nothing is downloaded. ComfyUI's models are freed first.
+app stops it. The script cuts each photo upright to a square round the head
+(`head_square`: 2.4 faces wide, a little below the face's centre, made smaller
+and slid inside the photo - padding it with white taught white bars), the face
+found by OpenCV's cascades (frontal, then profile either way: 30-31 of Partner's
+40 against InsightFace's 38; the rest go in whole and the tab says how many),
+captions it "a photo of <trigger>", and trains Klein's undistilled base (rank
+16, lr 1e-4, 512 px, bf16, nothing quantized); the LoRA then loads on the
+distilled Klein ComfyUI runs. `tools/prepare_klein_lora.py` sets ai-toolkit up
+once: Klein's base downloaded (7.75 GB, Apache 2.0), ComfyUI's own
+`qwen_3_4b.safetensors` hard-linked in as Qwen3-4B with Qwen's config and
+tokenizer (12 MB), and ComfyUI's FLUX.2 VAE (diffusers layout: ai-toolkit
+fails on `decoder.up.0.block.0.conv1.bias`) converted by ai-toolkit's own
+`convert_diffusers_state_dict`. ai-toolkit's Klein class names the Hugging Face
+repo for its text encoder, so the worker's `--aitk` mode starts run.py with
+that pointed at the local folder and the hub offline: a missing file fails,
+nothing is fetched. `problem()` names any missing file. ComfyUI's models are
+freed first.
+The 20 are checked again on the photos the script can actually read (the spec's
+`min_photos`): an unreadable file used to be skipped as a note nobody saw, and
+training went on with as few as one. It prints `KEPT n total`; fewer than
+`min_photos` is an ERROR naming the unreadable files, before any training, and
+any skipped photo is said in the tab ("warn"). The library record's "Built from
+N photos" counts the kept ones.
 Progress (`STEP n total`, parsed from tqdm) shows in the tab's note. The file
 lands in the local backend's `lora_dir`, joins the library as an Identity
-LoRA (family flux1), and becomes the person's `lora` and `trigger` - in the
-open editor's copy too, so a later Save keeps it. It is a FLUX LoRA: Z-Image
-pictures park it. The trigger is the profile's own, else `trigger_for(name)`
+LoRA (family flux2, its trigger on the record), and becomes the person's
+`head_lora` - in the open editor's copy too, so a later Save keeps it ("Head
+swap LoRA" in the editor). **Not `lora`**: an identity's `lora` joins every
+picture's own LoRA stack and its trigger is said in the prompt; a Klein LoRA
+is the head swap's alone. `Studio._head_swap` takes it through
+`imagegen.head_lora` (in the library, a FLUX.2 family, the file on the
+backend - else Klein as before, and the record's notes say why) and
+`headswap.head_graph` puts it on that head's Klein with its trigger in that
+head's prompt (`prompt_for`); another person's head in the same picture is
+drawn without it. The trigger is the profile's own, else `trigger_for(name)`
 (`lilperson`). This assigns on completion, unlike the recipe tool; completion
-is still not a likeness review. Tests: `tests/test_lora_train.py`.
+is still not a likeness review. A build that dies any way at all still frees
+the button (`finished` from a `finally`). Tests: `tests/test_lora_train.py`,
+`tests/test_headswap.py`.
 
 **Angles and Blend** (identity editor, beside Build LoRA; Sitter 2026-09-28: "add
 breeding to reference images", then "breed is a seperate step. the angles are

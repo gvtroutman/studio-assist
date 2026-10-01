@@ -366,6 +366,9 @@ def clean_identity(d):
         "lora": _str(d.get("lora")),
         "trigger": _str(d.get("trigger")),
         "strength": _num(d.get("strength", 0.85), float, 0.85, -2.0, 2.0),
+        # A Klein LoRA of their head (Build LoRA) for the head swap alone; never
+        # in a picture's own LoRA stack, which is `lora`'s (`head_lora`).
+        "head_lora": _str(d.get("head_lora")),
         "references": _strs(d.get("references")),
         "avatar": _str(d.get("avatar")),
         "face_swap": d.get("face_swap", True) is not False,
@@ -4057,6 +4060,25 @@ def lora_file(lora, backend_id):
     return lora["files"].get(backend_id) or lora["file"]
 
 
+def head_lora(lib, profile, backend_id, inventory):
+    """A profile's Klein LoRA for the head swap (`head_lora`, made by Build
+    LoRA) as `headswap.head_graph` takes it -> ({"lora", "strength",
+    "trigger"} or {}, a note when it names one that cannot be used)."""
+    rid = profile.get("head_lora")
+    if not rid:
+        return {}, None
+    rec = lib.get("loras", rid)
+    if rec is None:
+        return {}, "%s's head LoRA %r is not in the LoRA library." % (profile["name"], rid)
+    if compatibility(rec["family"], "flux2") is False:
+        return {}, "%s's head LoRA %s is for %s, not FLUX.2 Klein." % (
+            profile["name"], rec["name"], FAMILIES.get(rec["family"], rec["family"]))
+    name = lora_file(rec, backend_id)
+    if inventory is not None and name not in (inventory.get("loras") or ()):
+        return {}, "%s's head LoRA %s is not on this backend." % (profile["name"], name)
+    return {"lora": name, "strength": rec["strength"], "trigger": rec["trigger"]}, None
+
+
 class Plan:
     """What `compose` decided for one job on one backend."""
 
@@ -6116,8 +6138,12 @@ class Studio:
                         photo = profile["references"][0]
                         if photo not in photos:
                             photos[photo] = client.upload_image(photo)
-                        heads.append({"crop": headswap.head_crop(width, height, face),
-                                      "photo": photos[photo], "name": profile["name"]})
+                        own, why = head_lora(self.lib, profile, b["id"],
+                                             self.inventories.get(b["id"]))
+                        if why and why not in job.notes:
+                            job.notes.append(why)
+                        heads.append(dict(own, crop=headswap.head_crop(width, height, face),
+                                          photo=photos[photo], name=profile["name"]))
                 if not heads:
                     if not job.cancel.is_set():
                         job.notes.append("SAM3 found no face of a chosen person, so no head "
@@ -6134,7 +6160,9 @@ class Studio:
                 out.append((filename, client.fetch(files[0])))
                 job.notes.append("Head swap before the face swap: %s redrawn from their "
                                  "photo by FLUX.2 Klein." % ", ".join(
-                                     "%s's head" % h["name"] for h in heads))
+                                     "%s's head%s" % (h["name"], " (with their head LoRA)"
+                                                      if h.get("lora") else "")
+                                     for h in heads))
             return out
         except (ComfyError, Unreachable, OSError) as e:
             job.notes.append("The head swap before the face swap could not run (%s); the "

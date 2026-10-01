@@ -2970,6 +2970,12 @@ class ImageStudio:
             self.host.q.put(("images", self.s.event_id, ("editor-reload", editor)))
         self.host._spawn(self.s.event_id, work)
 
+    def head_lora_choices(self):
+        """The LoRAs a head swap can take: FLUX.2 (Klein) ones, or unknown."""
+        return [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
+                                 for r in self.studio.lib.all("loras")
+                                 if ig.compatibility(r["family"], lt.FAMILY) is not False]
+
     def edit_identities(self):
         loras = [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
                                   for r in self.studio.lib.all("loras")]
@@ -2981,6 +2987,8 @@ class ImageStudio:
             ("avatar", "Profile picture (optional; a generated picture is fine)", "path"),
             ("face_swap", "Final FaceFusion swap (not used by WithAnyone)", "bool"),
             ("swap_strength", "Face swap strength (0.5 gentle, 1 strongest)", "number"),
+            ("head_lora", "Head swap LoRA (FLUX.2 Klein; Build LoRA makes it)",
+             ("choice", self.head_lora_choices())),
             ("notes", "Notes", "long"),
             ("lora", "Identity LoRA", ("choice", loras)),
             ("trigger", "Trigger token", "text"),
@@ -3001,11 +3009,11 @@ class ImageStudio:
 
     # ------------------------------------------------------------ Build LoRA
     def build_lora(self, editor):
-        """The person's saved photos -> their own FLUX LoRA
-        (`studio_lora_train`), trained by ai-toolkit on this PC's GPU in the
+        """The person's saved photos -> their own FLUX.2 Klein LoRA of their
+        head (`lora_train`), trained by ai-toolkit on this PC's GPU in the
         background. One build at a time; a second click offers to stop it.
         When done, the file goes into this PC's LoRA folder, joins the
-        library, and becomes the person's Identity LoRA."""
+        library, and becomes the person's head swap LoRA (`head_lora`)."""
         run = self.lora_build
         if run is not None:
             n, total = run.step
@@ -3038,11 +3046,12 @@ class ImageStudio:
         except ValueError as e:
             return editor.status(str(e), "err")
         if not messagebox.askokcancel("Build LoRA", (
-                "Train a LoRA for %s from %d photos?\n\nIt takes about 1-2 hours and "
-                "uses the whole GPU: ComfyUI's models are unloaded first, and pictures "
+                "Train a head LoRA for %s from %d photos?\n\nIt takes about 6 minutes "
+                "and uses the GPU: ComfyUI's models are unloaded first, and pictures "
                 "on %s should wait until it is done. Keep Studio Assist open; closing it "
-                "stops the training.\n\nWhen it finishes it becomes %s's Identity LoRA "
-                "(trigger word \"%s\"; FLUX models only).") % (
+                "stops the training.\n\nWhen it finishes it becomes %s's head swap LoRA "
+                "(FLUX.2 Klein, trigger word \"%s\"): the head swap before the face swap "
+                "draws them with it.") % (
                     spec["person"], len(spec["photos"]), folders[0]["name"],
                     spec["person"], spec["trigger"]), parent=editor.win):
             return
@@ -3053,7 +3062,16 @@ class ImageStudio:
         editor.status("LoRA build started; progress shows under Generate.")
 
         def progress(kind, value):
-            if kind == "step":
+            if kind == "kept" and value[0] < value[1]:
+                self._post("said", ("Building %s's LoRA: %d of %d photos could not be read; "
+                                    "training on the other %d." % (
+                                        spec["person"], value[1] - value[0], value[1],
+                                        value[0]), "warn"))
+            elif kind == "faces" and value[0] < value[1]:
+                self._post("said", ("Building %s's LoRA: no face found in %d of %d photos; "
+                                    "those train whole." % (
+                                        spec["person"], value[1] - value[0], value[1]), "muted"))
+            elif kind == "step":
                 n, total = value
                 left = lt.eta(run.started, n, total) if run.started else ""
                 text = ("Building %s's LoRA: step %d of %d" % (spec["person"], n, total)
@@ -3066,20 +3084,24 @@ class ImageStudio:
                 return self.say("LoRA for %s not built: %s" % (spec["person"], error),
                                 "muted" if run.stopped else "err")
             self._attach_lora(spec, editor)
-            self.say("%s's LoRA is ready and set as their Identity LoRA (%s)."
+            self.say("%s's head LoRA is ready and set as their head swap LoRA (%s)."
                      % (spec["person"], os.path.basename(path)), "ok")
             self.refresh_backends()      # ComfyUI's LoRA list now has the file
 
         def work():
+            path, error = None, "the build stopped unexpectedly"
             try:
-                self.studio.client(backend).free()
-            except Exception:
-                pass                     # offline: nothing is holding the GPU
-            try:
+                try:
+                    self.studio.client(backend).free()
+                except Exception:
+                    pass                 # offline: nothing is holding the GPU
                 path, error = run.run(progress), None
             except (RuntimeError, OSError) as e:
-                path, error = None, str(e)
-            self._post("call", lambda: finished(path, error))
+                error = str(e)
+            finally:
+                # Always: a build that died any other way must not leave
+                # `lora_build` set, or Build LoRA offers to stop it until a restart.
+                self._post("call", lambda: finished(path, error))
         self.host._spawn(self.s.event_id, work)
 
     def _attach_lora(self, spec, editor):
@@ -3090,12 +3112,13 @@ class ImageStudio:
         lib.save("loras")
         ident = lib.get("identities", spec["identity"])
         if ident is not None:
-            ident["lora"], ident["trigger"] = rec["id"], spec["trigger"]
+            ident["head_lora"] = rec["id"]
             lib.save("identities")
         if editor.win.winfo_exists():
-            choices = [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
-                                        for r in lib.all("loras")]
-            editor.fields = [(k, label, ("choice", choices) if k == "lora" else kind)
+            choices = {"lora": [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
+                                                 for r in lib.all("loras")],
+                       "head_lora": self.head_lora_choices()}
+            editor.fields = [(k, label, ("choice", choices[k]) if k in choices else kind)
                              for k, label, kind in editor.fields]
             shown = (editor.current is not None and
                      editor.records[editor.current].get("id") == spec["identity"])
@@ -3103,7 +3126,7 @@ class ImageStudio:
                 editor._store()
             for r in editor.records:
                 if r.get("id") == spec["identity"]:
-                    r["lora"], r["trigger"] = rec["id"], spec["trigger"]
+                    r["head_lora"] = rec["id"]
             if shown:
                 editor._build_form()
         self._saved("loras")
