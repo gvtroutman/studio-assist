@@ -2987,7 +2987,8 @@ class ImageStudio:
             ("pool_photos", "Pool photos for WithAnyone (experimental)", "bool"),
             ("avatar", "Profile picture (optional; a generated picture is fine)", "path"),
             ("face_swap", "Final FaceFusion swap (not used by WithAnyone)", "bool"),
-            ("swap_strength", "Face swap strength (0.5 gentle, 1 strongest)", "number"),
+            ("swap_strength", "Face swap strength (0.5 is their face in full; more adds "
+                              "nothing, less keeps some of the drawn face)", "number"),
             ("head_lora", "Head swap LoRA (FLUX.2 Klein 9B; Build LoRA makes it)",
              ("choice", self.head_lora_choices())),
             ("notes", "Notes", "long"),

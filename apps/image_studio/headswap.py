@@ -50,9 +50,31 @@ RISE = 0.0                                # how much of a face the crop sits abo
 FIND = "face:8"
 # SAM3's words for what is blended back. "head" alone stops at the jaw: hair
 # that Klein took off the shoulders came back from the picture underneath.
-WORDS = ["head:1", "hair:1"]
+# The words are bare. ComfyUI's SAM3 encoder takes the count off "face:8" but
+# reads a lone "hair:1" as that text, colon and all, and SAM3 answered it with
+# the whole person on one picture (so the body was Klein's too, and a pendant
+# gone), the glasses on a second and the glasses and a wine bottle on a third
+# (live, 2026-09-29). One is the count of a bare word already.
+# "necklace": Klein draws the whole of one where the old hair hid part of it,
+# a few px off the picture's own, and at the edge of the hair the cord forked
+# (2 pictures of 5). Where there is a necklace it is Klein's from end to end.
+WORDS = ["head", "hair", "necklace"]
+OLD_HAIR = "hair"                         # the word of WORDS whose mask before is the old hair
 TONE = 0.5                                # how far Klein's colour moves to the crop's
 GROW = 12                                 # px round the head, at the crop's size
+# Loose strands lie outside SAM3's hair: round wavy hair they stayed in the
+# air as pale curls beside a head whose hair is now pulled back. 32 px left
+# the furthest of them, 48 none, on 5 pictures of 5; 64 began to take a
+# pendant.
+STRANDS = 48                              # px round the OLD hair, at the crop's size
+# A thin thing's mask is thin, and the blend's soft edge eats it from both
+# sides: GROW round a cord left the picture's own cord showing faintly
+# beside Klein's.
+CORD = 24
+# How far round a word's mask the blend reaches when that is further than
+# GROW: {word: (px round it before, px round it after)}, at the crop's size.
+# The old hair's reach is `strands`.
+REACH = {"necklace": (CORD, CORD)}
 EDGE = 0.08                               # the soft square's margin, of the crop's side
 BLUR_MAX = 31                             # ImageBlur's largest radius
 STATUS = "head_swap"
@@ -62,15 +84,22 @@ LABEL = "Head swap"
 # person's long blonde hair under a darker crown, on every seed: Klein holds
 # on to image 1's hair until it is told to take it off, and where. Saying
 # whose light falls on the head is what stopped a studio photo's flat pink
-# face in a low sun. The last sentence is against the photo's own top and
-# necklace, which Klein draws where the hair was; it lessens that, no more.
+# face in a low sun. The last two sentences are for what Klein draws where the
+# hair was. "...with no clothing, fabric, necklace or jewellery taken from
+# image 2" took image 1's own necklace off as well, which a blend through the
+# head and hair alone shows as a pendant on a cord cut short (9 runs of 9),
+# and still copied the photo's floral top on 2 of 9. Saying first what image 1
+# keeps, then what is not copied: the cord whole on 9 of 9, nothing of the
+# photo's on 9 of 9 (3 pictures x 3 seeds, 2026-09-29).
 PROMPT = ("The person in image 1 now has the head of the person in image 2: the same face, "
           "the same glasses, and the same hair as image 2 in colour, length and style. "
           "Remove the hair of image 1 completely, including any of it lying on the neck, "
-          "shoulders and chest. The head is lit by the light of image 1, with the same "
-          "skin tone as the body in image 1. Keep the head angle, expression, pose and "
-          "background of image 1. Below the neck everything is image 1: exactly its "
-          "clothes, with no clothing, fabric, necklace or jewellery taken from image 2.")
+          "shoulders and chest, and every loose strand of it. The head is lit by the light "
+          "of image 1, with the same skin tone as the body in image 1. Keep the head angle, "
+          "expression, pose and background of image 1. Below the neck everything is image "
+          "1, unchanged: its clothes, and the necklace or jewellery image 1 wears, if any. "
+          "Nothing that is worn in image 2 - clothing, fabric, necklace, jewellery - is "
+          "copied.")
 
 
 def prompt_for(trigger=None):
@@ -124,6 +153,13 @@ def targets(width, height, boxes, profiles):
     return out
 
 
+def middle(width, height, face):
+    """The middle of a face, 0-1 across and down the picture: where the face
+    swap is pointed after its head was redrawn (a profile's `target_point`)."""
+    x, y, w, h = face
+    return (round((x + w / 2.0) / float(width), 4), round((y + h / 2.0) / float(height), 4))
+
+
 def head_crop(width, height, face, crop=None, rise=None):
     """The square round a face that Klein redraws: CROP faces wide, RISE of
     a face higher than centred, kept inside the picture."""
@@ -136,20 +172,25 @@ def head_crop(width, height, face, crop=None, rise=None):
     return {"x": left, "y": top, "width": side, "height": side}
 
 
-def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
+def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=None,
+               strands=None):
     """In `image` (a LoadImage name) each of `heads` ([{"crop": head_crop,
     "photo": a LoadImage name}]) is cut out, enlarged to SIDE, redrawn by
     Klein with the photo beside it (cut to "photo_crop" when a head gives
     one) - through the person's own Klein LoRA when the head names one
     ("lora": file, "strength", "trigger": said in the prompt, `prompt_for`;
-    Build LoRA's, 0.39 -> 0.66 ArcFace on Partner, 2026-09-30) - shrunk back, its colour moved `tone` of the way to the crop's
-    (ColorTransfer, reinhard_lab; TONE), and blended in - through the head
-    and hair alone: SAM3's `words` (WORDS) in the crop before and after
-    (the new hair may be bigger or smaller than the old), grown and
-    softened, inside a soft square. Klein draws the whole crop again, so
-    nothing outside that is kept from it. Each head is drawn on the
-    picture the last left; head n is seeded seed+n. Saved under `prefix`
-    by node "save"."""
+    Build LoRA's) - shrunk back, its colour moved `tone` of the way to the crop's
+    (ColorTransfer, reinhard_lab; TONE), and blended in - through the head,
+    hair and necklace alone: SAM3's `words` (WORDS) in the crop before and
+    after (the new hair may be bigger or smaller than the old), grown and
+    softened, with the old hair (OLD_HAIR, before) grown `strands`
+    (STRANDS) further for its loose strands and a word of REACH as far as
+    that says, inside a soft square that has
+    no margin where the crop ends at the edge of the picture (`size`, its
+    width and height; without it every side has one). Klein draws the
+    whole crop again, so nothing outside that is kept from it. Each head
+    is drawn on the picture the last left; head n is seeded seed+n. Saved
+    under `prefix` by node "save"."""
     g = {
         "unet": {"class_type": "UNETLoader", "inputs": {
             "unet_name": KLEIN, "weight_dtype": "default"}},
@@ -168,6 +209,7 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
     }
     words = list(WORDS if words is None else words)
     tone = TONE if tone is None else tone
+    strands = STRANDS if strands is None else strands
     for w, word in enumerate(words):
         g["word%d" % w] = {"class_type": "CLIPTextEncode", "inputs": {
             "text": word, "clip": ["sam", 1]}}
@@ -228,13 +270,18 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
                 "strength": float(tone)}}
             drawn = [n + "tone", 0]
         # Each of WORDS, before and after, at the crop's own size.
-        found = None
+        found, far = None, []
         for w in range(len(words)):
-            for k, src in (("a", [n + "cut", 0]), ("b", [n + "small", 0])):
+            name = words[w].split(":")[0].strip()
+            for at, (k, src) in enumerate((("a", [n + "cut", 0]), ("b", [n + "small", 0]))):
                 key = "%sm%d%s" % (n, w, k)
                 g[key] = {"class_type": "SAM3_Detect", "inputs": {
                     "model": ["sam", 0], "image": src, "conditioning": ["word%d" % w, 0],
                     "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+                reach = (strands if name == OLD_HAIR and k == "a"
+                         else REACH.get(name, (0, 0))[at])
+                if reach:
+                    far.append((key, int(reach)))
                 if found is not None:
                     g[key + "_or"] = {"class_type": "MaskComposite", "inputs": {
                         "destination": found, "source": [key, 0], "x": 0, "y": 0,
@@ -242,20 +289,41 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None):
                     found = [key + "_or", 0]
                 else:
                     found = [key, 0]
+        grow = max(2, GROW * side // SIDE)
         g[n + "m4"] = {"class_type": "GrowMask", "inputs": {
-            "mask": found, "expand": max(2, GROW * side // SIDE),
-            "tapered_corners": True}}
+            "mask": found, "expand": grow, "tapered_corners": True}}
+        through = [n + "m4", 0]
+        for f, (key, reach) in enumerate(far):
+            # What reaches further (the old hair's loose strands, a cord):
+            # round, not tapered, so a curl out to one side is reached as
+            # far as one above.
+            g["%sf%d" % (n, f)] = {"class_type": "GrowMask", "inputs": {
+                "mask": [key, 0], "expand": max(grow, reach * side // SIDE),
+                "tapered_corners": False}}
+            g["%sf%d_or" % (n, f)] = {"class_type": "MaskComposite", "inputs": {
+                "destination": through, "source": ["%sf%d" % (n, f), 0], "x": 0, "y": 0,
+                "operation": "or"}}
+            through = ["%sf%d_or" % (n, f), 0]
         # The soft square: no head reaches the crop's edge with a hard line.
+        # Where the crop's edge is the picture's there is no line to hide,
+        # and a margin there kept the top of the old hair.
         pad = max(1, int(side * EDGE))
+        left, top, right, bottom = pad, pad, pad, pad
+        if size:
+            left = 0 if crop["x"] <= 0 else pad
+            top = 0 if crop["y"] <= 0 else pad
+            right = 0 if crop["x"] + side >= size[0] else pad
+            bottom = 0 if crop["y"] + side >= size[1] else pad
         g[n + "q0"] = {"class_type": "SolidMask", "inputs": {
             "value": 0.0, "width": side, "height": side}}
         g[n + "q1"] = {"class_type": "SolidMask", "inputs": {
-            "value": 1.0, "width": max(1, side - 2 * pad), "height": max(1, side - 2 * pad)}}
+            "value": 1.0, "width": max(1, side - left - right),
+            "height": max(1, side - top - bottom)}}
         g[n + "q2"] = {"class_type": "MaskComposite", "inputs": {
-            "destination": [n + "q0", 0], "source": [n + "q1", 0], "x": pad, "y": pad,
+            "destination": [n + "q0", 0], "source": [n + "q1", 0], "x": left, "y": top,
             "operation": "or"}}
         g[n + "m5"] = {"class_type": "MaskComposite", "inputs": {
-            "destination": [n + "m4", 0], "source": [n + "q2", 0], "x": 0, "y": 0,
+            "destination": through, "source": [n + "q2", 0], "x": 0, "y": 0,
             "operation": "multiply"}}
         radius = min(BLUR_MAX, max(1, side // 50))
         g[n + "b0"] = {"class_type": "MaskToImage", "inputs": {"mask": [n + "m5", 0]}}

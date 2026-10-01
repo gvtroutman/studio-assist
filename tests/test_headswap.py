@@ -85,15 +85,33 @@ class TestHeadSwapParts(unittest.TestCase):
         self.assertEqual(g["h1_ks"]["inputs"]["latent_image"], ["empty", 0])
         # Drawn at SIDE, put back at the crop's own size and place, through the head.
         self.assertEqual(g["h1_small"]["inputs"]["width"], 270)
-        # The head and the hair, each before and after, all four as one mask.
-        self.assertEqual([g["word%d" % w]["inputs"]["text"] for w in (0, 1)],
-                         ["head:1", "hair:1"])
+        # The head, the hair and a necklace, each before and after, as one mask.
+        self.assertEqual([g["word%d" % w]["inputs"]["text"] for w in (0, 1, 2)],
+                         ["head", "hair", "necklace"])
         self.assertEqual([(g["h1_m%d%s" % (w, k)]["inputs"]["conditioning"][0],
                            g["h1_m%d%s" % (w, k)]["inputs"]["image"][0])
-                          for w in (0, 1) for k in "ab"],
+                          for w in (0, 1, 2) for k in "ab"],
                          [("word0", "h1_cut"), ("word0", "h1_small"),
-                          ("word1", "h1_cut"), ("word1", "h1_small")])
-        self.assertEqual(g["h1_m4"]["inputs"]["mask"], ["h1_m1b_or", 0])
+                          ("word1", "h1_cut"), ("word1", "h1_small"),
+                          ("word2", "h1_cut"), ("word2", "h1_small")])
+        self.assertEqual(g["h1_m4"]["inputs"]["mask"], ["h1_m2b_or", 0])
+        # The old hair - the hair before, not Klein's - reaches further, for
+        # its loose strands, and round: a curl to the side as one above.
+        strands = g["h1_f0"]["inputs"]
+        self.assertEqual((strands["mask"], strands["expand"], strands["tapered_corners"]),
+                         (["h1_m1a", 0], hs.STRANDS * 270 // hs.SIDE, False))
+        self.assertGreater(strands["expand"], g["h1_m4"]["inputs"]["expand"])
+        self.assertEqual((g["h1_f0_or"]["inputs"]["destination"],
+                          g["h1_f0_or"]["inputs"]["source"],
+                          g["h1_f0_or"]["inputs"]["operation"]),
+                         (["h1_m4", 0], ["h1_f0", 0], "or"))
+        # A cord is thin: the picture's and Klein's, each further than the head.
+        self.assertEqual([(g["h1_f%d" % f]["inputs"]["mask"], g["h1_f%d" % f]["inputs"]["expand"])
+                          for f in (1, 2)],
+                         [(["h1_m2a", 0], hs.CORD * 270 // hs.SIDE),
+                          (["h1_m2b", 0], hs.CORD * 270 // hs.SIDE)])
+        self.assertNotIn("h1_f3", g)              # Klein's own hair: no further
+        self.assertEqual(g["h1_m5"]["inputs"]["destination"], ["h1_f2_or", 0])
         # Its colour moved towards the picture's, then put back.
         tone = g["h1_tone"]["inputs"]
         self.assertEqual((tone["image_target"], tone["image_ref"], tone["strength"]),
@@ -106,6 +124,12 @@ class TestHeadSwapParts(unittest.TestCase):
         self.assertNotIn("h1_tone", plain)
         self.assertEqual(plain["h1_put"]["inputs"]["source"], ["h1_small", 0])
         self.assertEqual(plain["h1_m4"]["inputs"]["mask"], ["h1_m0b_or", 0])
+        # No hair asked for, or no reach: the head's mask alone.
+        self.assertNotIn("h1_f0", plain)
+        self.assertEqual(plain["h1_m5"]["inputs"]["destination"], ["h1_m4", 0])
+        bare = hs.head_graph("picture.png", heads[:1], 7, "x", "sam3.pt",
+                             words=["head", "hair"], strands=0)
+        self.assertNotIn("h1_f0", bare)
         # A photo cut to its head, when the head says where.
         cut = hs.head_graph("picture.png", [dict(heads[0], photo_crop={
             "x": 1, "y": 2, "width": 30, "height": 30})], 7, "x", "sam3.pt")
@@ -169,6 +193,42 @@ class TestHeadSwapParts(unittest.TestCase):
                 self.assertIn(why, note)
         self.assertEqual(ig.clean_identity({"name": "X", "head_lora": "h"})["head_lora"], "h")
         self.assertEqual(ig.clean_identity({"name": "X"})["head_lora"], "")
+
+    def test_sam3_is_asked_in_bare_words(self):
+        # ComfyUI's SAM3 encoder reads a lone "hair:1" as that text, and SAM3
+        # answered it with the whole person, or the glasses and a bottle.
+        for word in hs.WORDS:
+            self.assertNotIn(":", word)
+        self.assertIn(hs.OLD_HAIR, hs.WORDS)
+        # A count on the word is still the old hair's.
+        g = hs.head_graph("picture.png", [{"crop": {"x": 0, "y": 0, "width": 512,
+                                                    "height": 512}, "photo": "a.png"}],
+                          7, "x", "sam3.pt", words=["head:2", "hair:2"])
+        self.assertEqual(g["h1_f0"]["inputs"]["mask"], ["h1_m1a", 0])
+
+    def test_the_soft_square_has_no_margin_where_the_crop_ends_at_the_pictures_edge(self):
+        def square(crop, size=None):
+            g = hs.head_graph("picture.png", [{"crop": crop, "photo": "a.png"}], 7, "x",
+                              "sam3.pt", size=size)
+            return (g["h1_q1"]["inputs"]["width"], g["h1_q1"]["inputs"]["height"],
+                    g["h1_q2"]["inputs"]["x"], g["h1_q2"]["inputs"]["y"])
+        pad = int(1000 * hs.EDGE)
+        inside = {"x": 200, "y": 300, "width": 1000, "height": 1000}
+        self.assertEqual(square(inside, (2000, 2000)),
+                         (1000 - 2 * pad, 1000 - 2 * pad, pad, pad))
+        # A close-up: the crop is the whole picture, and the top of the old
+        # hair was kept by a margin there.
+        whole = {"x": 0, "y": 0, "width": 1000, "height": 1000}
+        self.assertEqual(square(whole, (1000, 1000)), (1000, 1000, 0, 0))
+        corner = {"x": 0, "y": 500, "width": 1000, "height": 1000}
+        self.assertEqual(square(corner, (1600, 1500)), (1000 - pad, 1000 - pad, 0, pad))
+        # A caller that does not say how big the picture is: a margin all round.
+        self.assertEqual(square(whole), (1000 - 2 * pad, 1000 - 2 * pad, pad, pad))
+
+    def test_klein_is_told_what_the_picture_keeps_before_what_is_not_copied(self):
+        keeps = hs.PROMPT.index("the necklace or jewellery image 1 wears")
+        self.assertLess(keeps, hs.PROMPT.index("Nothing that is worn in image 2"))
+        self.assertIn("every loose strand", hs.PROMPT)
 
     def test_the_swap_model_is_inswapper_unless_the_profile_names_another(self):
         self.assertEqual(ff.SWAP_MODEL, "inswapper_128")
@@ -241,13 +301,14 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
     def generate(self, client=KleinClient, **settings):
         self.studio.client_factory = client
         self.studio.clients = {}
-        swapped = []
+        swapped, self.pointed = [], []
         s = dict(ig.default_settings(), model="z-image-turbo", backend="5090",
                  scene="A portrait", identities=["person"], auto_refine=False,
                  hand_pass=False, **settings)
         with patch.object(ff, "available", return_value=True), \
-                patch.object(ff, "swap", side_effect=lambda data, *a, **k: (
-                    swapped.append(data) or (PNG, {"outside_mask_changed_pixels": 0}))):
+                patch.object(ff, "swap", side_effect=lambda data, who, **k: (
+                    swapped.append(data) or self.pointed.append(who.get("target_point"))
+                    or (PNG, {"outside_mask_changed_pixels": 0}))):
             jobs = self.studio.submit(s)
             settle(jobs)
         return jobs[0], FakeClient.instances[-1], swapped
@@ -256,7 +317,8 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         return [g for g in client.graphs if "h1_ks" in g]
 
     def test_the_head_is_redrawn_from_the_photo_before_the_face_is_swapped(self):
-        job, client, swapped = self.generate()
+        with patch.object(hs, "head_graph", wraps=hs.head_graph) as asked:
+            job, client, swapped = self.generate()
         self.assertEqual(job.status, "complete", job.detail)
         find, head = client.graphs[1:3]
         self.assertEqual(find["p0t"]["inputs"]["text"], hs.FIND)
@@ -266,8 +328,16 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(head["h1_photo"]["inputs"]["image"], "studio_reference.png")
         self.assertIn(self.photo, client.uploads)
         self.assertNotIn("h2_ks", head)
-        # FaceFusion swaps the face on Klein's head, not on the generated one.
+        # The graph is told how big the picture is, for its edges.
+        self.assertEqual(asked.call_args.kwargs.get("size"), (1024, 1024))
+        # FaceFusion swaps the face on Klein's head, not on the generated one,
+        # and is pointed at it: its own finder may see a passer-by as well.
         self.assertEqual(swapped, [HEAD_PNG])
+        self.assertEqual(self.pointed, [[0.4785, 0.2881]])      # (450 + 40, 250 + 45) / 1024
+        self.assertEqual(hs.middle(1024, 1024, (450, 250, 80, 90)),
+                         tuple(self.pointed[0]))
+        # The library's own record of the person is not pointed anywhere.
+        self.assertNotIn("target_point", self.studio.lib.get("identities", "person"))
         self.assertIn("Head swap", [p["label"] for p in job.record["passes"]])
         self.assertIn("Head swap before the face swap: Person's head redrawn from their "
                       "photo by FLUX.2 Klein 9B.", job.record["notes"])
@@ -320,6 +390,8 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(job.status, "complete", job.detail)
         self.assertEqual(len(self.heads(client)), 1)
         self.assertEqual(swapped, [PNG])
+        # No head was redrawn: the face is found as it ever was.
+        self.assertEqual(self.pointed, [None])
         self.assertTrue(any(n.startswith("The head swap before the face swap could not run")
                             for n in job.record["notes"]), job.record["notes"])
 
@@ -336,6 +408,7 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(job.status, "complete", job.detail)
         self.assertEqual(self.heads(client), [])
         self.assertEqual(swapped, [PNG])
+        self.assertEqual(self.pointed, [None])
         self.assertFalse(any("head swap" in n.lower() for n in job.record["notes"]),
                          job.record["notes"])
         # No Klein 9B in the picture, so no licence on it.

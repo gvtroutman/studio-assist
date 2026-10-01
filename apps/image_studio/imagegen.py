@@ -5012,6 +5012,20 @@ def glasses_pass(settings, reports=None):
     return not all("occlusion" in m for m in masks)
 
 
+def eye_pass(reports=None):
+    """Whether the eyes are redrawn after the face swap. The pass is there
+    because the swap left the eyes soft (2026-09-26). A face enhancer run
+    after the swap (`facefusion.SWAP_ENHANCE`) sharpens them itself, and the
+    pass after it cost 0.03 of likeness for eyes no sharper, and turned
+    blue-grey eyes brown on one picture of three (2026-09-30). So: only after
+    a swap whose report names no enhancer (`reports`, the swaps' own; None
+    before there are any: whether one would run)."""
+    import apps.image_studio.facefusion as facefusion
+    if reports:
+        return not all(r.get("enhance") for r in reports)
+    return facefusion.enhancer() is None
+
+
 def pipeline_stages(lib, settings):
     """The stops a job's pipeline strip shows, in the order Generate runs
     them: the two ComfyUI stages every job goes through, then each optional
@@ -5032,7 +5046,8 @@ def pipeline_stages(lib, settings):
         if settings.get("head_swap", True) is not False:
             stages.append(("head_swap", "Head swap"))
         stages.append(("face_swap", "Face swap"))
-        stages.append(("eyes", "Eye pass"))
+        if eye_pass():
+            stages.append(("eyes", "Eye pass"))
     if hand_pass(settings):
         stages.append(("hands", "Hand pass"))
     if profiles and glasses_pass(settings):
@@ -5060,6 +5075,7 @@ class Job:
         self.paste_graph = None       # the real-face paste's graph, when it ran
         self.passes = []              # [{"label", "graph"}] each `_run_pass`, in order
         self.facefusion = []          # verified final swaps, after all redraws
+        self.heads = {}               # {(picture, profile id): its face's middle, 0-1} the head swap redrew
         self.real_faces = None        # [{"name", "box", "photos"}] for the paste, from the face pass
         self.face = None              # {"found", "redrawn", "denoise"} when it ran
         self.dress = None             # {"outfit", "passes", "head_crop", ...} when dressed
@@ -6169,7 +6185,9 @@ class Studio:
                         if why and why not in job.notes:
                             job.notes.append(why)
                         heads.append(dict(own, crop=headswap.head_crop(width, height, face),
-                                          photo=photos[photo], name=profile["name"]))
+                                          photo=photos[photo], name=profile["name"],
+                                          id=profile.get("id"),
+                                          middle=headswap.middle(width, height, face)))
                 if not heads:
                     if not job.cancel.is_set():
                         job.notes.append("SAM3 found no face of a chosen person, so no head "
@@ -6177,13 +6195,15 @@ class Studio:
                     out.append((filename, data))
                     continue
                 graph = headswap.head_graph(image, heads, int(values.get("seed") or 0),
-                                            values["filename_prefix"] + "_head", sam)
+                                            values["filename_prefix"] + "_head", sam,
+                                            size=(width, height))
                 files = self._run_pass(job, client, graph, say, headswap.LABEL,
                                        status=headswap.STATUS)
                 if files is None:         # cancelled: the picture as it was
                     out.append((filename, data))
                     continue
                 out.append((filename, client.fetch(files[0])))
+                job.heads.update({(n, h["id"]): h["middle"] for h in heads})
                 job.notes.append("Head swap before the face swap: %s redrawn from their "
                                  "photo by FLUX.2 Klein 9B." % ", ".join(
                                      "%s's head%s" % (h["name"], " (with their head LoRA)"
@@ -6197,16 +6217,24 @@ class Studio:
             return pictures
 
     def _apply_profiles(self, job, pictures, profiles, say):
-        """The final face swap, by FaceFusion (`facefusion.SWAP_MODEL`)."""
+        """The final face swap, by FaceFusion (`facefusion.SWAP_MODEL`). The
+        face of a head the head swap has redrawn (`job.heads`) is the one
+        swapped, pointed at by its middle: FaceFusion's own finder may see
+        more faces than SAM3's chosen one - a passer-by Klein drew sharper
+        - and would not choose between them."""
         import apps.image_studio.facefusion as facefusion
         result = []
-        for filename, data in pictures:
+        for n, (filename, data) in enumerate(pictures):
             for index, profile in enumerate(profiles):
                 if job.cancel.is_set():
                     raise RuntimeError("Face swap cancelled.")
                 say("face_swap", "Applying %s's face" % profile["name"], None)
                 options = ({"face_index": index, "face_count": len(profiles)}
                            if len(profiles) > 1 else {})
+                middle = job.heads.get((n, profile.get("id")))
+                if middle and profile.get("target_region") is None \
+                        and profile.get("target_point") is None:
+                    profile = dict(profile, target_point=list(middle))
                 data, report = facefusion.swap(data, profile, stop=job.cancel.is_set, **options)
                 job.facefusion.append(report)
                 job.notes.append("%s: FaceFusion applied; zero pixels changed outside the face mask."
@@ -6270,7 +6298,8 @@ class Studio:
     def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
         """The end of Generate, on the lane's thread, by the fix machinery on
         the picture's own model: after FaceFusion (`profiles`) each swapped
-        face's eyes (EYE_WHAT); then the hands of a picture of people
+        face's eyes (EYE_WHAT) - unless a face enhancer sharpened them
+        (`eye_pass`); then the hands of a picture of people
         (HAND_WHAT, `real_hands`; the hands pass, unless
         settings["hand_pass"] is off); then the swapped faces' glasses last
         (GLASSES_WHAT), so nothing is drawn over them - when the swap
@@ -6280,13 +6309,17 @@ class Studio:
         hands = hand_pass(job.settings)
         if job.settings.get("hand_pass", True) is not False and not hands:
             job.notes.append("No hands pass: the picture's words name no person.")
+        eyes = bool(profiles) and eye_pass(job.facefusion)
+        if profiles and not eyes:
+            job.notes.append("No eye pass: the face enhancer sharpened the eyes after the "
+                             "face swap.")
         specs = bool(profiles) and glasses_pass(job.settings, job.facefusion)
         if profiles and not specs and job.settings.get("glasses_pass") is not False:
             job.notes.append("No glasses pass: the face swap went behind what was in front "
                              "of the face, so glasses are as they were drawn.")
-        if not profiles and not hands:
+        if not eyes and not specs and not hands:
             return pictures
-        kinds = (["eye"] if profiles else []) + (["hands"] if hands else []) + (
+        kinds = (["eye"] if eyes else []) + (["hands"] if hands else []) + (
             ["glasses"] if specs else [])
         named = "%s pass%s" % (", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1
                                else kinds[0], " after the face swap" if profiles else "")
@@ -6309,10 +6342,10 @@ class Studio:
             job.notes.append("No %s: %s." % (named, why))
             return pictures
         asked = list(zip(FINISH_FIND, FINISH_WORDS))
-        asked = ([a for a in asked if specs or a[1] != "glasses"] if profiles else []) + (
-            [(HAND_FIND, "hand")] if hands else [])
+        asked = [a for a in asked if (a[1] == "face" and (eyes or specs))
+                 or (a[1] == "glasses" and specs)] + ([(HAND_FIND, "hand")] if hands else [])
         find, words = [a[0] for a in asked], [a[1] for a in asked]
-        looking = (["eyes"] if profiles else []) + (["hands"] if hands else []) + (
+        looking = (["eyes"] if eyes else []) + (["hands"] if hands else []) + (
             ["glasses"] if specs else [])
         v = dict(values, sam3=sam, match_tone=None)
         # A hand keeps the picture's grade; a swapped face gets no curves,
@@ -6331,7 +6364,7 @@ class Studio:
                 with open(path, "wb") as fh:
                     fh.write(data)
                 image = client.upload_image(path)
-                say("eyes" if profiles else "hands",
+                say("eyes" if eyes else ("hands" if hands else "glasses"),
                     "Finding the %s" % " and ".join(looking), None)
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
@@ -6345,17 +6378,18 @@ class Studio:
                     continue
                 width, height, boxes = said
                 passes, faces, found_hands, glasses = [], [], [], []
-                if profiles:
+                if eyes or specs:
                     faces = swapped_faces(width, height,
                                           [x[:4] for x in boxes if x[4] == "face"], profiles)
-                    if faces:
-                        eyes = eye_spots(faces)
-                        passes.append(("Eye pass", fix_areas(fix_crops(width, height, eyes),
-                                                             eyes),
+                    if faces and eyes:
+                        spots = eye_spots(faces)
+                        passes.append(("Eye pass", fix_areas(fix_crops(width, height, spots),
+                                                             spots),
                                        EYE_DENOISE, EYE_WHAT, "_eyes", None))
-                    else:
-                        job.notes.append("SAM3 found no swapped face, so no eye or glasses "
-                                         "pass was made.")
+                    elif not faces:
+                        job.notes.append("SAM3 found no swapped face, so no %s pass was made."
+                                         % ("eye or glasses" if eyes and specs else
+                                            "eye" if eyes else "glasses"))
                 if hands:
                     found_hands = found_spots(width, height, real_hands(
                         width, height, [x for x in boxes if x[4] == "hand"]), "hand")

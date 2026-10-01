@@ -1391,7 +1391,8 @@ identity is extrapolated away from the face being replaced, so less of the
 generated person survives. `apps.image_studio.facefusion.SWAP_STRENGTH` is 0.8, and a
 profile's own **Face swap strength** (`swap_strength`, 0-1, shown beside the Final
 face swap switch) wins; FaceFusion only takes multiples of 0.05, so `strength()`
-rounds. And `--face-swapper-pixel-boost` was 256: HyperSwap draws at 256 px, so a
+rounds (and since 2026-09-29 holds it to the swap model's peak, `SWAP_PEAK`:
+see "With inswapper a strength over 0.5 is held to 0.5" below). And `--face-swapper-pixel-boost` was 256: HyperSwap draws at 256 px, so a
 bigger face came back as a soft 256 px face scaled up. `select_target` now sets
 the boost to the smallest size at least 1.5x the chosen face's box (its warped
 crop is about that), up to 1024; the report records `weight` and `pixel_boost`.
@@ -1414,8 +1415,8 @@ FLUX.2 Klein 9B (fp8) redraw it at 1024 px from an empty latent with two
 `ReferenceLatent`s - the crop, then the profile's FIRST photo - in 4 steps at cfg 1
 (ComfyUI's own Klein template). Its colour is moved `TONE` (0.5) of the way to the
 crop's (ColorTransfer). It is blended back through the head and hair alone:
-SAM3's `WORDS` (`head:1`, `hair:1`) in the crop before and after, grown, inside a
-soft square. **Klein 9B since 2026-10-01** (the user: "id would like to try flux
+SAM3's `WORDS` (`head`, `hair`, `necklace`; bare words, see "The old hair is taken off
+whole" below) in the crop before and after, grown, inside a soft square. **Klein 9B since 2026-10-01** (the user: "id would like to try flux
 klein 9B", then the 4B's weights removed): on the 12 stranger pictures of
 Partner's LoRA bench, with no LoRA, the 4B scored 0.386 (3 of 12 at 0.5 or more)
 and the 9B 0.555 (8 of 12); after the face swap 0.849 and 0.860. By eye the
@@ -1463,6 +1464,163 @@ from the photo - a thin necklace on 3 seeds of 3, a floral trim on the blouse on
 not help with a photo that is mostly head already. The colour match is a modest
 change, not a relight; a cheek keeps some pink. The seed matters: one close-up
 scored 0.23 and 0.35 on two seeds. Tests: `tests/test_headswap.py`.
+
+**The old hair is taken off whole** (2026-09-29, seen live: pale wisps of the
+generated wavy hair in the air round a head whose hair Klein had pulled back).
+Three causes, found by saving the head swap's masks and Klein's own crop beside
+its result, and one thing the repair brought with it.
+- **SAM3 was not asked for the hair.** ComfyUI's SAM3 encoder
+  (`comfy/text_encoders/sam3_clip.py`) takes the count off a word when there are
+  several words or the count is over one - `face:8` is "face", up to 8 - and
+  hands a lone `hair:1` on as that text, colon and digit and all. SAM3 answered
+  "hair:1" with the whole person on one picture, the glasses on a second, the
+  glasses and a wine bottle on a third; bare "hair" is the hair on all of them.
+  So the blend went through the whole body where it found the person (the
+  sweater was Klein's, the pendant gone) and through the head alone where it
+  found the glasses. `WORDS` are bare: one is the count of a bare word already.
+  **Never write `word:1` for SAM3.**
+- **Loose strands lie outside SAM3's hair.** The old hair - `OLD_HAIR`, the
+  hair in the crop BEFORE, not Klein's - is grown `STRANDS` (48 px at the
+  crop's 1024) and round (`tapered_corners` off: GrowMask's tapered growth is a
+  diamond, half as far to a corner), and joined to the rest. 32 px left the
+  furthest strands, 48 none on 5 pictures of 5, 64 began to take a pendant.
+- **The soft square kept the top of the old hair in a close-up.** A face a
+  quarter of the picture wide makes the crop the whole picture, and the
+  square's margin (`EDGE`) then ran along the picture's own edge, under the
+  crown. `head_graph(size=)` is the picture's width and height, and a side of
+  the crop that is the picture's edge has no margin.
+- **A necklace under the old hair was cut.** Through the head and hair alone
+  the body is the picture's again, and with it a pendant on a cord that ended
+  where the old hair began: `PROMPT`'s "no ... necklace or jewellery taken from
+  image 2" had Klein take image 1's own necklace off too (9 runs of 9), and
+  copy the photo's floral top all the same (2 of 9). It now says first what
+  image 1 keeps ("the necklace or jewellery image 1 wears, if any"), then what
+  is not copied: the cord whole on 9 of 9, nothing of the photo's on 9 of 9
+  (3 pictures x 3 Klein seeds). A wording between the two left a second
+  necklace and a floral top on 1 of 9 each. Klein's cord is a few px off the
+  picture's, and where the old hair ended the cord forked (2 pictures of 5):
+  `necklace` is the third of `WORDS`, so a necklace is Klein's from end to
+  end, and `REACH` takes it `CORD` (24 px) round, before and after. At `GROW`
+  the blend's soft edge ate the thin mask from both sides and the picture's
+  own cord showed faintly beside Klein's.
+Klein may draw a passer-by near the old hair sharper than they were, and
+FaceFusion's own finder then sees two faces where it saw one and will not
+choose (a cafe, live). `_head_swap` keeps the middle of each face it redrew
+(`job.heads`, `headswap.middle`), and `_apply_profiles` points the swap at it
+(the profile's `target_point`, on a copy; a profile with a region or point of
+its own keeps it). Still open, and Klein's, not the mask's: on some seeds it
+leaves the face the generated one (ArcFace 0.09 on one of five) or draws the
+person with long hair (one of five); the swap after it still carries the
+likeness there (0.79 and 0.82 at the end). And SAM3's head has small holes
+at the eyes behind glasses on one picture of five, where the blend is the
+generated picture's; the swap and the eye pass draw over them.
+
+**The swap is a finish on the head: no weave, no teeth, no cheek behind a lens**
+(2026-09-29, seen live: a pink patch on a cheek and a strained, yellowed smile
+where Klein's head had looked natural). Looked at three times enlarged, the
+swapped face had three faults, each inswapper's and each with its own cause.
+- **The weave.** Pixel boost swaps a face bigger than inswapper's 128 px as
+  N x N faces of 128, each every Nth pixel of it, and weaves them back. The
+  model does not draw them quite alike, so the weave shows as a comb of
+  streaks N px apart down a cheek and a grid behind the glasses, at every
+  boost over 128 (256 to 1024 tried). `tools/facefusion_swap.py` `even`
+  (`--deweave`, `facefusion.SWAP_DEWEAVE` 1.0) averages the woven face over a
+  box as wide as the weave, which takes out what repeats every N px and
+  nothing coarser: ArcFace 0.887 before and after. Boost 128 has no weave
+  and is soft (0.859).
+- **The teeth.** Drawn at 128 px they came back as yellowed blocks.
+  `facefusion.SWAP_REGIONS` is FaceFusion's face mask regions without `mouth`
+  (the inside of it; the lips are swapped): the teeth stay the picture's.
+  0.887 with them swapped, 0.886 without. Without the lips too, 0.876.
+- **The cheek behind a lens.** inswapper paints a bare cheek where the picture
+  has one seen through a lens: a pink patch with a hard edge under each eye.
+  Behind glasses the eyes are swapped and what lies below
+  `facefusion.SWAP_LENS_LINE` (0.47 down the swap's own crop, where the face is
+  upright, the eyes at 0.40 and the tip of the nose at 0.56) is left
+  (`under_lenses`, `--lens-line`; the glasses are FaceFusion's own face
+  parser's). Leaving all that is behind the glasses cost 0.05 (the eyes are
+  most of a likeness), the line 0.01-0.03; at 0.44 it cut the lower lids.
+  It applies with or without a head swap.
+Not the cause, tried and left: the colour. Matching the swap's colour and
+light to the head's at finer scales (the mask's size / 6 to / 48) changed the
+patch by nothing one can see - it has an edge, it is not a cast - so `--tone`
+is as it was. Putting the head's fine grain back on the swapped skin looks
+better (pores, freckles) and cost 0.03-0.04, with a ghost of the head's own
+brows: not done. FaceFusion's `face_enhancer` (GFPGAN 1.4, downloaded at
+Sitter's word 2026-09-29, `.runtime/facefusion/.assets/models/`) is wired
+and off: see "The face enhancer is there and off" below. The worker prints
+the faces it found ("Faces found, left to right"), and the report says
+`regions`, `lens_line` and `deweave`. A FaceFusion without
+`create_region_mask` or `explode_pixel_boost` under those names swaps as it
+does and the report says 0 for what was not done.
+
+**With inswapper a strength over 0.5 is held to 0.5** (`facefusion.SWAP_PEAK`,
+in `strength()`; 2026-09-29). This reverses, for this model, what the user asked
+for on 2026-09-27 ("isn't as strong as i'd like", above) - the model then was
+HyperSwap. FaceFusion's weight 0.5 hands the model the person's face as it
+is; above it the face is pushed past theirs, away from the face replaced, to
+take the last of the stranger out. With inswapper it took the person out.
+ArcFace against Partner's photos, the swap alone, same picture and settings but
+for the weight: on five heads Klein had drawn 0.848 at 0.5, 0.831 at 0.8,
+0.813 at 1.0; on two generated faces with no head swap 0.836 at 0.5 and 0.798
+at 1.0 - lower at the higher weight on every one of the seven, in every arm
+tried (as shipped, without the weave and teeth, with the lens line). To the
+eye the two are near alike, the higher a little harder. A profile keeps the
+number it was given (Partner's says 1.0) and a strength under 0.5 is as it was;
+the editor's label says what the number does. Any other swap model has no
+peak: none was measured. If the user wants it back, `SWAP_PEAK = {}`.
+
+**The face enhancer is there and off** (`facefusion.SWAP_ENHANCE` '' /
+`SWAP_ENHANCE_BLEND` 60, `enhancer()`; the worker's `--enhance` /
+`--enhance-blend`, `through`; 2026-09-29). The user asked for GFPGAN to be
+tried at a low blend, and allowed the download (gfpgan_1.4.onnx, 340 MB,
+from facefusion-assets `models-3.0.0`, crc32 checked as FaceFusion checks
+it). It runs after the swap on the same face (`captured['target']`), and its
+change is taken through the swap's own soft mask, so the teeth, the cheek
+behind a lens and all outside the swap stay the picture's, and "zero pixels
+outside the mask" still holds. What it does: sharpens the eyes, lashes and
+lips; the skin stays smooth (it does not bring pores or freckles back).
+ArcFace, the swap alone on the five heads: 0.846 without, 0.839 at blend 20,
+0.832 at 40, 0.818 at 60, 0.802 at 80. At the end of the pipeline the eye
+pass redraws the eyes it sharpened, and little shows for the cost: 0.812
+without, 0.797 at 40, 0.786 at 60. So it is off. The enhancer is only ever
+run when its model and hash are installed, never fetched by the app.
+`MODELS` is FaceFusion's model folder.
+
+**After the enhancer there is no eye pass** (`eye_pass`, in
+`_finish_passes` and `pipeline_stages`; 2026-09-30, the user: "try gfpgan 60
+without the eye pass"). The eye pass is there for the soft eyes a swap
+leaves; after GFPGAN it cost 0.03 for eyes no sharper, so a swap whose
+report names an enhancer (`enhance`) gets none, with a note, and the face is
+not looked for unless the glasses are to be redrawn. The trial itself, end
+to end on the five cases on main's redraw (beta): the swap then the eye
+pass 0.813 (0.815 / 0.813 / 0.789 / 0.826 / 0.821), GFPGAN at 60 and no eye
+pass 0.818 (0.830 / 0.827 / 0.786 / 0.829 / 0.819) - the same likeness, ten
+seconds sooner, one pass fewer to fail (the eye pass failed once in these
+runs on a ComfyUI three sessions were using: "hostbuf_file_reader_read
+failed", and the picture was kept as the swap left it, as it should be).
+Looked at, neither wins. The eye pass draws clear, bright eyes and gets
+their colour wrong on 2 of 5 (brown where Klein had drawn blue-grey: its
+prompt, `EYE_WHAT`, says nothing of the colour). Without it the eyes are
+inswapper's behind the glasses, sharpened: darker, softer, heavy-lidded, in
+Klein's colour on 3 of 5 and one eye darker than the other on 2. So the
+default stays the eye pass with no enhancer. If the eye pass is to be
+bettered, tell it the person's eye colour.
+
+**What the two repairs come to, end to end** (2026-09-29, `Studio.run_job` on
+a copy of the library, Partner's job of 15:09 on 5 seeds: three before a plain
+wall, a park, a busy cafe; every picture looked at whole and at the face).
+Before: the old hair left on 5 of 5 (loose strands on 3, whole locks on 2),
+the pendant gone on 2 and a floral top from her photo on 1, teeth in
+yellowed blocks or a ragged line of them between the lips on 5, pink under
+the lenses on 5. After: none of these on any of the five, and the necklace
+whole on 5; on one Klein drew her hair long and on one left a few loose
+strands of its own by the ears. ArcFace against her photos, mean of the
+five: generated 0.07, Klein's head 0.32, the swap 0.85, the end (after the
+eye pass) 0.81 - against 0.83 at the end before. The 0.02 is the lens
+line's; the strength held at 0.5 gave back 0.03 (0.79 at the end with her
+profile's 1.0 handed on as it was). The eye pass costs 0.03, as it did, and
+is not changed here. 33-87 s a picture on a free card, as before.
 
 **The eyes and then the glasses are redrawn after the swap** (Generate only;
 `Studio._finish_passes`). FaceFusion pastes the new face over the frames,
@@ -4155,6 +4313,15 @@ folder are exactly that, and their `serve()` loops are gone.
   interruption on a worker, and let the UI show Cancelling until the job settles.
 - Repeat seed uses current library records and model files. Do not describe it as
   exact recipe replay. `tests/test_finish_line.py` covers the recovery boundaries offline.
+- **A test that starts a lane collects first.** Tk things an earlier test left in a
+  cycle are freed by whichever thread the collector next runs on. On a lane's thread
+  that is a Tk call off the UI thread (`tkinter.Variable.__del__`), and the lane stops
+  where it stands: one job left "queued" for good, in a full run only and on the same
+  test every time, because where the collector runs follows how much was allocated
+  before it (2026-09-30; found with `faulthandler.dump_traceback(all_threads=True)`
+  where `settle` gave up). `TempStudioMixin.setUp` calls `gc.collect()` on the test's
+  own thread before its Studio starts one. The app has the same trap only if a Tk
+  object is dropped in a cycle; see "Nothing is held on the `Pill` class".
 
 - **Run the tests unseen.** The GUI tests open real Tk windows (a Chat, a Scene
   Builder, consoles); run as plain `python -m unittest` on the user's PC, every one

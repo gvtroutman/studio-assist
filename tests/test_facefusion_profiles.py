@@ -56,16 +56,32 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
         self.assertEqual(len(ff.selected(self.studio.lib, {'identities': ['partner', 'partner']})), 1)
 
     def test_swap_strength_defaults_strong_and_follows_the_profile(self):
-        profile = self.profile()
+        profile = dict(self.profile(), swap_model='hyperswap_1a_256')
         self.assertEqual(profile['swap_strength'], ff.SWAP_STRENGTH)
         self.assertGreater(ff.strength(profile), 0.5)   # 0.5 is FaceFusion's neutral
         self.assertEqual(ff.strength(dict(profile, swap_strength=0.62)), 0.6)
         self.assertEqual(ff.strength(dict(profile, swap_strength=7)), 1.0)
-        self.assertEqual(ff.strength({'swap_strength': 'lots'}), ff.SWAP_STRENGTH)
+        self.assertEqual(ff.strength({'swap_strength': 'lots', 'swap_model': 'hyperswap_1a_256'}),
+                         ff.SWAP_STRENGTH)
         self.assertEqual(ig.clean_identity({'name': 'X', 'swap_strength': 3})['swap_strength'], 1.0)
 
+    def test_a_strength_is_held_to_its_models_peak(self):
+        # inswapper's likeness fell past 0.5 on every picture (2026-09-29).
+        self.assertEqual(ff.SWAP_MODEL, 'inswapper_128')
+        profile = self.profile()                        # no model of its own: inswapper
+        self.assertEqual(ff.strength(profile), 0.5)
+        self.assertEqual(ff.strength(dict(profile, swap_strength=1.0)), 0.5)
+        self.assertEqual(ff.strength(dict(profile, swap_strength=0.3)), 0.3)     # less is less
+        self.assertEqual(ff.strength({'swap_strength': 'lots'}), 0.5)
+        self.assertEqual(ff.strength(dict(profile, swap_strength=1.0,
+                                          swap_model='hyperswap_1a_256')), 1.0)
+        # The profile keeps the number it was given.
+        self.assertEqual(profile['swap_strength'], ff.SWAP_STRENGTH)
+        args = self.swap_args(swap_strength=1.0)
+        self.assertEqual(args[args.index('--weight') + 1], '0.5')
+
     def test_swap_hands_facefusion_the_profile_strength(self):
-        profile = dict(self.profile(), swap_strength=0.95)
+        profile = dict(self.profile(), swap_strength=0.95, swap_model='hyperswap_1a_256')
         seen = []
         def spawn(args, **kw):
             seen.append(args)
@@ -80,6 +96,60 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
         # came back mottled without it, live 2026-09-29).
         at = args.index('--masks')
         self.assertEqual(args[at + 1:at + 4], ['box', 'occlusion', 'region'])
+
+    def swap_args(self, **profile):
+        seen = []
+        def spawn(args, **kw):
+            seen.append(args)
+            raise RuntimeError('stop here')
+        with patch.object(ff, 'available', return_value=True), \
+                patch.object(ff.studio_procs, 'spawn', side_effect=spawn):
+            with self.assertRaisesRegex(RuntimeError, 'stop here'):
+                ff.swap(PNG, dict(self.profile(), **profile))
+        return seen[0]
+
+    def test_the_teeth_stay_the_pictures_own_and_the_weave_is_evened_out(self):
+        # Live, 2026-09-29: inswapper's teeth were yellowed blocks, and pixel
+        # boost's weave a comb of streaks down a cheek.
+        args = self.swap_args()
+        at = args.index('--regions')
+        said = args[at + 1:args.index('--lens-line')]
+        self.assertEqual(said, list(ff.SWAP_REGIONS))
+        self.assertNotIn('mouth', said)
+        for part in ('skin', 'nose', 'upper-lip', 'lower-lip', 'left-eye', 'right-eye',
+                     'glasses'):
+            self.assertIn(part, said)
+        self.assertEqual(args[args.index('--deweave') + 1], str(ff.SWAP_DEWEAVE))
+        self.assertEqual(ff.SWAP_DEWEAVE, 1.0)
+
+    def test_behind_glasses_the_eyes_are_swapped_and_the_cheek_under_them_is_not(self):
+        # Live, 2026-09-29: a pink patch with a hard edge under each eye.
+        args = self.swap_args()
+        self.assertEqual(args[args.index('--lens-line') + 1], str(ff.SWAP_LENS_LINE))
+        self.assertIn('glasses', ff.SWAP_REGIONS)
+        # Below the eyes (0.40 down the swap's crop), above the tip of the nose (0.56).
+        self.assertTrue(0.44 < ff.SWAP_LENS_LINE < 0.56)
+
+    def test_the_face_enhancer_runs_only_when_its_model_is_installed(self):
+        models = Path(self.dir) / 'models'
+        models.mkdir()
+        with patch.object(ff, 'MODELS', models), patch.object(ff, 'SWAP_ENHANCE', 'gfpgan_1.4'):
+            self.assertIsNone(ff.enhancer())            # nothing installed: no download
+            self.assertNotIn('--enhance', self.swap_args())
+            (models / 'gfpgan_1.4.onnx').write_bytes(b'x')
+            self.assertIsNone(ff.enhancer())            # no hash file: FaceFusion would fetch
+            (models / 'gfpgan_1.4.hash').write_text('5a6c6364')
+            self.assertEqual(ff.enhancer(), 'gfpgan_1.4')
+            args = self.swap_args()
+            at = args.index('--enhance')
+            self.assertEqual(args[at + 1:at + 4],
+                             ['gfpgan_1.4', '--enhance-blend', str(ff.SWAP_ENHANCE_BLEND)])
+            with patch.object(ff, 'SWAP_ENHANCE', ''):
+                self.assertIsNone(ff.enhancer())
+                self.assertNotIn('--enhance', self.swap_args())
+        # Off as shipped: after the eye pass little of it shows, for 0.015-0.026.
+        self.assertEqual(ff.SWAP_ENHANCE, '')
+        self.assertTrue(0 < ff.SWAP_ENHANCE_BLEND <= 100)
 
     def test_a_failed_swap_says_why_in_the_workers_own_words(self):
         refused = ('[FACEFUSION.CORE] processing step 1 of 1\n'
@@ -254,6 +324,59 @@ class TestKeptSources(unittest.TestCase):
         path.write_bytes(b'not a kept face')
         with self.assertRaises(Exception):
             self.tool.kept_source(path, self.Face, self.np)   # main() reads the photos then
+
+    def test_pixel_boosts_weave_is_evened_out_and_nothing_coarser(self):
+        np, total = self.np, 6
+        ys, xs = np.mgrid[0:96, 0:96]
+        # A face that changes slowly, and on it what 6 x 6 swaps that are not
+        # quite alike leave: each its own offset, every sixth pixel.
+        face = np.repeat((100 + ys * 0.5 + xs * 0.25)[..., None], 3, axis=2)
+        offsets = np.random.RandomState(7).uniform(-12, 12, (total, total))
+        offsets -= offsets.mean()
+        woven = face + offsets[ys % total, xs % total][..., None]
+        self.assertGreater(np.abs(woven - face).max(), 8)
+        evened = self.tool.even(woven, total, 1.0, np)
+        inner = (slice(total, -total), slice(total, -total))
+        # The box is half a pixel off centre: a slope of 0.75 a pixel at most.
+        self.assertLess(np.abs(evened - face)[inner].max(), 0.5)
+        self.assertEqual(evened.shape, woven.shape)
+        half = self.tool.even(woven, total, 0.5, np)
+        self.assertTrue(np.allclose(half, (woven + evened) / 2))
+        # Nothing asked, or a face swapped in one piece: as it was.
+        self.assertIs(self.tool.even(woven, total, 0.0, np), woven)
+        self.assertIs(self.tool.even(woven, 1, 1.0, np), woven)
+
+    def test_under_the_lens_line_what_is_behind_glasses_is_left(self):
+        np = self.np
+        mask = np.ones((100, 100), dtype=np.float32)
+        glasses = np.zeros((100, 100), dtype=np.float32)
+        glasses[30:60, 10:90] = 1.0               # frames and lenses, eyes and cheek
+        left = self.tool.under_lenses(mask, glasses, 0.47, np)
+        self.assertEqual(left.shape, mask.shape)
+        self.assertTrue((left[30:44, 10:90] == 1.0).all())      # the eyes: swapped
+        self.assertTrue((left[51:60, 10:90] == 0.0).all())      # the cheek under them: left
+        self.assertTrue((left[60:, :] == 1.0).all())            # below the glasses: swapped
+        self.assertTrue((left[:, :10] == 1.0).all())            # beside them
+        band = left[44:51, 50]
+        self.assertTrue((np.diff(band) <= 0).all() and band[0] > band[-1])   # a soft edge
+        # Glasses half seen are half left; no line asked is no change.
+        self.assertAlmostEqual(float(self.tool.under_lenses(
+            mask, glasses * 0.5, 0.47, np)[55, 50]), 0.5)
+        self.assertIs(self.tool.under_lenses(mask, glasses, 0.0, np), mask)
+
+    def test_the_enhancers_change_comes_through_the_swaps_own_mask(self):
+        np = self.np
+        frame = np.full((4, 4, 3), 100, dtype=np.uint8)
+        enhanced = np.full((4, 4, 3), 200, dtype=np.uint8)
+        enhanced[0, 0] = 0
+        soft = np.zeros((4, 4), dtype=np.float32)
+        soft[1, 1], soft[2, 2], soft[0, 0] = 1.0, 0.5, 1.0
+        out = self.tool.through(frame, enhanced, soft, np)
+        self.assertEqual(out.dtype, np.uint8)
+        self.assertEqual(out[1, 1].tolist(), [200, 200, 200])     # inside the swap: enhanced
+        self.assertEqual(out[2, 2].tolist(), [150, 150, 150])     # its soft edge: half
+        self.assertEqual(out[3, 3].tolist(), [100, 100, 100])     # outside: the swap's own
+        self.assertEqual(out[0, 0].tolist(), [0, 0, 0])           # darker is taken too
 
     def test_only_the_newest_sets_are_kept(self):
         refs = self.photos()
