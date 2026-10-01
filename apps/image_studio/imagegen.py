@@ -329,6 +329,7 @@ def clean_model(d):
         "values": {k: v for k, v in values.items() if isinstance(v, (str, int, float))},
         "backends": backends,
         "defaults": {k: v for k, v in defaults.items() if isinstance(v, (str, int, float, bool))},
+        "license": _str(d.get("license")),     # the model's terms, carried by each picture
         "notes": _str(d.get("notes")),
     }
 
@@ -699,6 +700,10 @@ def _default_outfits():
     ]
 
 
+KLEIN_LICENSE = ("Made with FLUX.2 [klein] 9B, under the FLUX Non-Commercial License: "
+                 "not for commercial use.")
+
+
 def _default_models():
     # Filenames are the ones ComfyUI's own FLUX template downloads
     # (flux_dev_full_text_to_image); a machine with other names says so in its
@@ -734,6 +739,17 @@ def _default_models():
                       "scheduler": "simple", "width": 1024, "height": 1024},
          "notes": "Fast photographic model and the default: the 5090 when it has the "
                   "files, else the 3090."},
+        {"id": "klein-9b", "label": "FLUX.2 Klein 9B", "family": "flux2-klein9b",
+         "workflow": "klein9b_base",
+         "values": {"model": "flux-2-klein-base-9b.safetensors",
+                    "encoder": "qwen_3_8b_fp8mixed.safetensors", "vae": "flux2-vae.safetensors"},
+         "backends": {"3090": None},
+         "defaults": {"steps": 50, "guidance": 4.0, "sampler": "euler",
+                      "width": 1024, "height": 1024},
+         "license": KLEIN_LICENSE,
+         "notes": "The undistilled Klein 9B a Build LoRA head LoRA is trained on, so a "
+                  "person's LoRA shows here. About 40 s a picture on the 5090. "
+                  "Non-commercial."},
     ]
 
 
@@ -7842,7 +7858,9 @@ class Studio:
             "face_detail": job.face,
             "references": p.references,
             "warnings": p.warnings, "notes": p.notes + job.notes,
-            "license": job.license,
+            # The model's own terms, and a pass's (the head swap's Klein) after them.
+            "license": " ".join(dict.fromkeys(t for t in (model.get("license"), job.license)
+                                              if t)),
             "duration": round(time.time() - job.started, 1),
             "prompt_id": job.prompt_id,
             "settings": s,
