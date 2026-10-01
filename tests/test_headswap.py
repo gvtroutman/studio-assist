@@ -94,7 +94,9 @@ class TestHeadSwapParts(unittest.TestCase):
                          [("word0", "h1_cut"), ("word0", "h1_small"),
                           ("word1", "h1_cut"), ("word1", "h1_small"),
                           ("word2", "h1_cut"), ("word2", "h1_small")])
-        self.assertEqual(g["h1_m4"]["inputs"]["mask"], ["h1_m2b_or", 0])
+        # ...then what the head wears, before and after (test below).
+        self.assertEqual(g["h1_wha_or"]["inputs"]["destination"], ["h1_m2b_or", 0])
+        self.assertEqual(g["h1_m4"]["inputs"]["mask"], ["h1_whb_or", 0])
         # The old hair - the hair before, not Klein's - reaches further, for
         # its loose strands, and round: a curl to the side as one above.
         strands = g["h1_f0"]["inputs"]
@@ -111,7 +113,8 @@ class TestHeadSwapParts(unittest.TestCase):
                          [(["h1_m2a", 0], hs.CORD * 270 // hs.SIDE),
                           (["h1_m2b", 0], hs.CORD * 270 // hs.SIDE)])
         self.assertNotIn("h1_f3", g)              # Klein's own hair: no further
-        self.assertEqual(g["h1_m5"]["inputs"]["destination"], ["h1_f2_or", 0])
+        self.assertEqual(g["h1_m6"]["inputs"]["mask"], ["h1_f2_or", 0])
+        self.assertEqual(g["h1_m5"]["inputs"]["destination"], ["h1_m6", 0])
         # Its colour moved towards the picture's, then put back.
         tone = g["h1_tone"]["inputs"]
         self.assertEqual((tone["image_target"], tone["image_ref"], tone["strength"]),
@@ -123,10 +126,11 @@ class TestHeadSwapParts(unittest.TestCase):
                               words=["head:1"], tone=0)
         self.assertNotIn("h1_tone", plain)
         self.assertEqual(plain["h1_put"]["inputs"]["source"], ["h1_small", 0])
-        self.assertEqual(plain["h1_m4"]["inputs"]["mask"], ["h1_m0b_or", 0])
+        self.assertEqual(plain["h1_m4"]["inputs"]["mask"], ["h1_whb_or", 0])
+        self.assertEqual(plain["h1_wnb"]["inputs"]["mask"], ["h1_m0b", 0])   # near the head alone
         # No hair asked for, or no reach: the head's mask alone.
         self.assertNotIn("h1_f0", plain)
-        self.assertEqual(plain["h1_m5"]["inputs"]["destination"], ["h1_m4", 0])
+        self.assertEqual(plain["h1_m6"]["inputs"]["mask"], ["h1_m4", 0])
         bare = hs.head_graph("picture.png", heads[:1], 7, "x", "sam3.pt",
                              words=["head", "hair"], strands=0)
         self.assertNotIn("h1_f0", bare)
@@ -193,6 +197,59 @@ class TestHeadSwapParts(unittest.TestCase):
                 self.assertIn(why, note)
         self.assertEqual(ig.clean_identity({"name": "X", "head_lora": "h"})["head_lora"], "h")
         self.assertEqual(ig.clean_identity({"name": "X"})["head_lora"], "")
+
+    def test_what_the_head_wears_goes_with_it_only_near_the_head(self):
+        # A flower crown outside SAM3's head and hair stayed as a ghost round
+        # the new head; "headwear" also found a lily and a lace collar.
+        head = {"crop": {"x": 0, "y": 0, "width": 1344, "height": 1344}, "photo": "a.png"}
+        g = hs.head_graph("picture.png", [head], 7, "x", "sam3.pt")
+        self.assertEqual(g["worn"]["inputs"]["text"], hs.WORN)
+        self.assertNotIn(":", hs.WORN)
+        near = int(1344 / hs.CROP * hs.WORN_NEAR)
+        for k, src in (("a", "h1_cut"), ("b", "h1_small")):
+            self.assertEqual((g["h1_w" + k]["inputs"]["image"],
+                              g["h1_w" + k]["inputs"]["conditioning"]), ([src, 0], ["worn", 0]))
+            # Near that picture's own head and hair, before and after alike.
+            anchor = g["h1_w%sa1" % k]["inputs"]
+            self.assertEqual((anchor["destination"], anchor["source"], anchor["operation"]),
+                             (["h1_m0" + k, 0], ["h1_m1" + k, 0], "or"))
+            self.assertEqual((g["h1_wn" + k]["inputs"]["mask"], g["h1_wn" + k]["inputs"]["expand"],
+                              g["h1_wn" + k]["inputs"]["tapered_corners"]),
+                             (["h1_w%sa1" % k, 0], near, False))
+            only = g["h1_wh" + k]["inputs"]
+            self.assertEqual((only["destination"], only["source"], only["operation"]),
+                             (["h1_w" + k, 0], ["h1_wn" + k, 0], "multiply"))
+        # Neither head nor hair asked for: nothing to be near, no headwear.
+        alone = hs.head_graph("picture.png", [head], 7, "x", "sam3.pt", words=["necklace"])
+        self.assertNotIn("worn", alone)
+        self.assertNotIn("h1_wa", alone)
+        self.assertEqual(json.loads(json.dumps(g)), g)
+
+    def test_the_blends_edge_is_wide_and_leaves_all_it_covers_klein_s(self):
+        # Klein's background is a few levels off the picture's: a 26 px edge
+        # showed the old crown's outline in it.
+        head = {"crop": {"x": 0, "y": 0, "width": 1344, "height": 1344}, "photo": "a.png"}
+        g = hs.head_graph("picture.png", [head], 7, "x", "sam3.pt")
+        wide = int(1344 * hs.FEATHER)
+        grow = g["h1_m6"]["inputs"]
+        self.assertEqual((grow["mask"], grow["expand"]), (["h1_f2_or", 0], wide))
+        self.assertEqual(g["h1_bs"]["inputs"]["scale_by"], 1.0 / hs.SHRINK)
+        blur = g["h1_b1"]["inputs"]
+        self.assertEqual(blur["image"], ["h1_bs", 0])
+        self.assertLessEqual(blur["blur_radius"], hs.BLUR_MAX)
+        self.assertLessEqual(blur["sigma"], 10.0)
+        # Two sigmas (at full size) in from the grown edge: what was covered
+        # is still Klein's.
+        self.assertGreaterEqual(wide, 2 * blur["sigma"] * hs.SHRINK - 1)
+        self.assertEqual((g["h1_bu"]["inputs"]["width"], g["h1_bu"]["inputs"]["height"]),
+                         (1344, 1344))
+        self.assertEqual(g["h1_b2"]["inputs"]["image"], ["h1_bu", 0])
+        # No feather: the short blur at full size, as before.
+        flat = hs.head_graph("picture.png", [head], 7, "x", "sam3.pt", feather=0)
+        self.assertNotIn("h1_m6", flat)
+        self.assertNotIn("h1_bs", flat)
+        self.assertEqual(flat["h1_b1"]["inputs"]["image"], ["h1_b0", 0])
+        self.assertEqual(flat["h1_b2"]["inputs"]["image"], ["h1_b1", 0])
 
     def test_sam3_is_asked_in_bare_words(self):
         # ComfyUI's SAM3 encoder reads a lone "hair:1" as that text, and SAM3
