@@ -207,6 +207,35 @@ def parse(line):
     return "note", line
 
 
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+BAR = re.compile(r"^(.*?)\s*\d+%\|")    # tqdm's "Loading weights:  42%|####"
+
+
+def log_tail(path, lines=12, size=16384):
+    """The last `lines` lines of ai-toolkit's train.log, as the Build LoRA
+    window shows them: a tqdm bar redrawn in place (`\\r`) is one line, its
+    latest, and a run of bars with the same label is its last. [] while the
+    log is not there yet."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - size))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out = []
+    for line in re.split(r"[\r\n]+", ANSI.sub("", text)):
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        bar = BAR.match(line)
+        if bar and out and BAR.match(out[-1]) and BAR.match(out[-1]).group(1) == bar.group(1):
+            out[-1] = line
+        else:
+            out.append(line)
+    return out[-lines:]
+
+
 def eta(started, step, total, now=None):
     """Words for the time left, from the pace so far; "" before it is known."""
     if step < 5 or step >= total:
@@ -269,26 +298,31 @@ class Build:
         if self.stopped:            # stop() came while starting
             self.child.kill()
         done, error, tail = None, None, []
-        for raw in iter(self.child.proc.stdout.readline, b""):
-            kind, value = parse(raw.decode("utf-8", "replace"))
-            if kind == "step":
-                if self.started is None or value[0] <= 1:
-                    self.started = time.time()
-                self.step = value
-            elif kind == "kept":
-                self.spec["kept"] = value[0]    # what the LoRA was built from
-            elif kind == "faces":
-                self.spec["faces"] = value[0]   # of those, cut to the head
-            elif kind == "done":
-                done = value
-            elif kind == "error":
-                error = value
-            elif value:
-                tail = (tail + [value])[-5:]
-                continue
-            on(kind, value)
-        self.child.proc.wait()
-        self.child.kill()
+        try:
+            for raw in iter(self.child.proc.stdout.readline, b""):
+                kind, value = parse(raw.decode("utf-8", "replace"))
+                if kind == "step":
+                    if self.started is None or value[0] <= 1:
+                        self.started = time.time()
+                    self.step = value
+                elif kind == "kept":
+                    self.spec["kept"] = value[0]    # what the LoRA was built from
+                elif kind == "faces":
+                    self.spec["faces"] = value[0]   # of those, cut to the head
+                elif kind == "done":
+                    done = value
+                elif kind == "error":
+                    error = value
+                elif value:
+                    tail = (tail + [value])[-5:]
+                    continue
+                on(kind, value)
+            self.child.proc.wait()
+        finally:
+            # Also when `on` raised: nothing reads the child after this, and
+            # an unwatched ai-toolkit kept 25 GB and the GPU while the button
+            # offered a second build beside it (2026-10-01).
+            self.child.kill()
         if self.stopped:
             raise RuntimeError("Stopped.")
         if done and os.path.isfile(done):

@@ -91,7 +91,8 @@ After Effects and Resolve use outside npm servers.
   `glasses_pass`; a redraw's sampler is the workflow's `redraw_sampler`
   (`face_graph`). Tests: `tests/test_finish_line.py`.
 - **Identity** - `apps/image_studio/lora_train.py` (Build LoRA: a Klein 9B head LoRA,
-  `plan`/`config`/`Build`; worker `tools/train_identity_lora.py`, one-time setup
+  `plan`/`config`/`Build`, `log_tail`; its window `ui.BuildView`, started by
+  `ImageStudio.build_lora`; worker `tools/train_identity_lora.py`, one-time setup
   `tools/prepare_klein_lora.py`; used by the head swap through `imagegen.head_lora`),
   the person's own face in photos `apps/image_studio/faces.py` (`Job`, `problem`,
   `crop_for_import` - called by `RecordEditor._import_paths` and
