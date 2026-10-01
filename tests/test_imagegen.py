@@ -1967,6 +1967,51 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertTrue(any("Sitter's face was not found" in n for n in rec["notes"]))
         self.assertTrue(any("Likeness: Partner" in n for n in rec["notes"]), rec["notes"])
 
+    def test_a_face_picture_that_will_not_send_leaves_the_faces_to_their_words(self):
+        # Two people: Partner's photo goes up for the face pass, Sitter's does not.
+        # What is left must be the redraw the warning promises - from the words,
+        # with no PuLID step pointing at loaders the graph does not have.
+        class TwoFaces(PulidClient):
+            def upload_image(self, path):
+                if self.graphs and path.endswith("sitter.png"):
+                    raise ig.ComfyError("upload refused")
+                return super().upload_image(path)
+
+            def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                entry = super().listen_for_progress(pid, on_event, stop, timeout)
+                if "fd4" in entry["outputs"]:
+                    entry["outputs"]["fd4"] = {"text": [json.dumps([[
+                        {"x": 400, "y": 300, "width": 90, "height": 110},
+                        {"x": 700, "y": 300, "width": 90, "height": 110}]])]}
+                return entry
+        self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                client_factory=TwoFaces)
+        FaceClient.fail_pass = False
+        photos = []
+        for name in ("partner", "sitter"):
+            photos.append(os.path.join(self.dir, name + ".png"))
+            with open(photos[-1], "wb") as f:
+                f.write(PNG)
+        faces = self.scene_faces(photos[0])
+        faces["people"][1].update(face=photos[1], at=[0.73, 0.35],
+                                  region=[0.65, 0.25, 0.8, 0.45])
+        jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev", scene="x",
+                                       backend="5090", seed=5, face_detail=True, hand_pass=False,
+                                       scene_faces=faces))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        rec = self.studio.history.list()[0]
+        self.assertTrue(any("could not be sent" in w for w in rec["warnings"]), rec["warnings"])
+        second = TwoFaces.instances[-1].graphs[-1]
+        self.assertIn("fs", second)                       # the face pass ran
+        self.assertFalse([k for k, n in second.items() if n["class_type"] == "ApplyPulidFlux"])
+        for nid, node in second.items():
+            for value in node["inputs"].values():
+                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) \
+                        and isinstance(value[1], int):
+                    self.assertIn(value[0], second, "%s links to a missing node" % nid)
+        self.assertEqual(rec["face_detail"]["likeness"], [])
+
     def test_a_face_facefusion_will_swap_is_not_also_drawn_with_pulid(self):
         from unittest.mock import patch
         self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
@@ -2232,6 +2277,23 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         settle(jobs)
         self.assertEqual(jobs[0].status, "failed")
         self.assertIn("Describe the scene", jobs[0].detail)
+
+    def test_a_job_that_crashes_logs_its_traceback(self):
+        """The lane catches everything so it never dies with a job half done;
+        the error log is then the only record, so it gets the whole trace -
+        a bare repr named no line when a job failed on a TypeError."""
+        from unittest import mock
+        def crash(job, notify):
+            raise TypeError("list indices must be integers or slices, not str")
+        with mock.patch.object(ig.doctor, "log_error") as log, \
+                mock.patch.object(self.studio, "run_job", crash):
+            jobs = self.studio.submit(dict(ig.default_settings(), scene="x", backend="5090"))
+            settle(jobs)
+        self.assertEqual(jobs[0].status, "failed")
+        self.assertIn("TypeError: list indices", jobs[0].detail)
+        (text,), _ = log.call_args
+        self.assertIn("Traceback (most recent call last)", text)
+        self.assertIn("in crash", text)
 
 
 class TestFixSpots(unittest.TestCase):
