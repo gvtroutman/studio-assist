@@ -1092,8 +1092,16 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   photo, 35 ms on CUDA). The pre-switch `pip freeze` is
   `D:\ComfyUI\venv-freeze-cu128-2026-09-29.txt`. The models live in `D:\ComfyUI-models`
   (`extra_model_paths.yaml`), so a reinstall keeps them. It is started by
-  `D:\ComfyUI\Start ComfyUI (Image Studio).cmd` on 127.0.0.1:8188, and the app
-  does not start it. FLUX files: `flux1-dev.safetensors` (Comfy-Org mirror, the
+  `D:\ComfyUI\Start ComfyUI (Image Studio).cmd` on 127.0.0.1:8188 - by hand, or by
+  the **Start** button beside an offline backend in Image Studio's header (2026-10-01).
+  Start appears only when the backend's `start` (Backends > Start command) names a
+  file on this PC; the 3090's `start` is advice, so it never gets one.
+  `Studio.start` runs the file in a console of its own (`CREATE_NEW_CONSOLE`, not a
+  `procs` child), so ComfyUI keeps running when the app closes and its log stays
+  readable; `ImageStudio._wait_started` polls health for up to `START_WAIT`
+  (180 s) and says "is up" or where to look. The app never starts it unasked.
+  The UI tests build the tab with the real 5090 entry, whose file exists on this
+  PC: a test that presses Start must patch `imagegen.subprocess.Popen`. FLUX files: `flux1-dev.safetensors` (Comfy-Org mirror, the
   same file as BFL's), `clip_l`, `t5xxl_fp16`, `ae`. Measured: 1024², 20 steps,
   ~2.6 it/s, 11-12 s end to end including the model load. The 3090 has no FLUX
   files (its entry expects `t5xxl_fp8_e4m3fn_scaled` and fp8 weights), so Auto

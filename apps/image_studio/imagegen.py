@@ -42,6 +42,7 @@ import os
 import queue
 import random
 import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -5558,6 +5559,30 @@ class Studio:
             except ComfyError as e:
                 h["detail"] += "; its node list would not load (%s)" % e
         return h
+
+    @staticmethod
+    def start_file(backend):
+        """The script or program a backend's `start` names, when it is a file
+        on this PC - so the app can start that ComfyUI itself. None for a
+        `start` that is advice ("Start ComfyUI on the LLM PC...")."""
+        path = os.path.expandvars((backend.get("start") or "").strip().strip('"'))
+        return path if path and os.path.isfile(path) else None
+
+    def start(self, backend):
+        """Start a backend's ComfyUI from its `start` file, in a console of its
+        own - the same window it had when started by hand, where its log and
+        a crash's last words can be read (the 5090's .cmd ends in `pause`).
+        Not a `procs` child: ComfyUI is the user's, and must not end when
+        this window closes. Returns at once; `check` says when it answers."""
+        path = self.start_file(backend)
+        if path is None:
+            raise ComfyError("%s has no start file on this PC. %s"
+                             % (backend["name"], backend.get("start") or
+                                "Set one in Backends (Start command)."))
+        args = (["cmd", "/c", path] if path.lower().endswith((".cmd", ".bat"))
+                else [path])
+        subprocess.Popen(args, cwd=os.path.dirname(path), close_fds=True,
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
 
     def check_all(self, full=True):
         threads = [threading.Thread(target=self.check, args=(b, full), daemon=True)

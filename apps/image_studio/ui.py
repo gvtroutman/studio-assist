@@ -622,6 +622,7 @@ class ImageStudio:
             self.source_buttons[source] = button
         self.health_row = self.frame(head)
         self.health_row.pack(side="left", fill="x", expand=True)
+        self.starting = set()             # backends whose ComfyUI Start launched, not yet up
 
         self.note = self.label(root, "", "muted")
         self.note.pack(side="top", fill="x", padx=self.px(20), pady=(0, self.px(4)))
@@ -2129,6 +2130,8 @@ class ImageStudio:
                 busy = self.studio.queue.load().get(b["id"], 0)
                 if busy or h.get("queue"):
                     text += " · %d queued" % max(busy, h.get("queue", 0))
+            elif b["id"] in self.starting:
+                role, text = "warn", "starting" + ELLIPSIS
             else:
                 role, text = "err", "offline"
             cell = self.frame(self.health_row)
@@ -2146,6 +2149,52 @@ class ImageStudio:
             if h is not None and not h.get("ok"):
                 lbl.bind("<Button-1>", lambda ev, d=h.get("detail", ""): self.say(d, "err"))
                 lbl.config(cursor="hand2")
+            # Down, on this PC, with a start file: one click starts it, instead
+            # of finding the .cmd in Explorer.
+            if (b["enabled"] and not (h or {}).get("ok") and b["id"] not in self.starting
+                    and self.studio.start_file(b)):
+                self.button(cell, "Start", lambda b=b: self.start_backend(b),
+                            kind="accent", font=self.host.f_small, padx=self.px(8),
+                            pady=0).pack(side="left", padx=(self.px(6), 0))
+
+    START_WAIT = 180          # seconds: a cold ComfyUI with custom nodes takes a minute or two
+    START_POLL = 3
+
+    def start_backend(self, b):
+        """Start a backend's ComfyUI and watch until it answers: the row says
+        starting, then ready (or how long it waited and where to look)."""
+        if b["id"] in self.starting:
+            return
+        try:
+            self.studio.start(b)
+        except (ig.ComfyError, OSError) as e:
+            self.say("Could not start %s: %s" % (b["name"], e), "err")
+            return
+        self.starting.add(b["id"])
+        self._paint_health()
+        self.say("Starting ComfyUI for %s - its console window shows the load." % b["name"],
+                 "muted")
+        self.host._spawn(self.s.event_id, self._wait_started, b)
+
+    def _wait_started(self, b):
+        deadline = time.time() + self.START_WAIT
+        h = {}
+        try:
+            while time.time() < deadline and not self.s.closed:
+                time.sleep(self.START_POLL)
+                h = self.studio.check(b, full=False)
+                if h.get("ok"):
+                    self.studio.check(b)       # its models and nodes, for the form
+                    break
+        finally:
+            self._post("call", lambda: self.starting.discard(b["id"]))
+            self._post("health")
+        if h.get("ok"):
+            self._post("said", ("%s is up." % b["name"], "ok"))
+        else:
+            self._post("said", ("%s did not answer within %d s. Its console window says why "
+                                "(or it is still loading - Check connections when it is "
+                                "done)." % (b["name"], self.START_WAIT), "err"))
 
     # ============================================================ right side
     def _build_right(self, right):
@@ -2891,6 +2940,7 @@ class ImageStudio:
             ("name", "Name", "text"),
             ("url", "ComfyUI API URL", "text"),
             ("ws_url", "WebSocket URL (blank: derived)", "text"),
+            ("start", "Start command (a .cmd on this PC gets a Start button)", "text"),
             ("enabled", "Enabled", "bool"),
             ("roles", "Roles (what Auto sends here)", ("multi", ig.ROLES)),
             ("shares_llm_gpu", "Shares its GPU with LM Studio (clear it before a job)", "bool"),
