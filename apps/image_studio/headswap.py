@@ -75,8 +75,29 @@ CORD = 24
 # GROW: {word: (px round it before, px round it after)}, at the crop's size.
 # The old hair's reach is `strands`.
 REACH = {"necklace": (CORD, CORD)}
-EDGE = 0.08                               # the soft square's margin, of the crop's side
+# What the head wears is blended with it. A flower crown the generated person
+# wore (her profile's "flower crown") lay outside SAM3's head and hair: Klein
+# drew her head without it, and the blend's edge left the old crown as a grey
+# ghost round the new head, on 8 runs of 8 with her head LoRA (2 pictures x
+# 4 seeds, 2026-10-01). SAM3 masks a crown alike for "headwear", "hat",
+# "flower crown", "tiara" and "headband". On the 12 bench pictures with
+# nothing on any head it also found hair, a lace collar and a lily, so it
+# counts only within WORN_NEAR faces of that picture's own head and hair:
+# before, so the old crown goes whole; after, so a hat Klein drew from the
+# photo is not cut at the hair.
+WORN = "headwear"
+WORN_NEAR = 0.5                           # faces round the head and hair (crop side / CROP)
+EDGE = 0.08                              # the soft square's margin, of the crop's side
 BLUR_MAX = 31                             # ImageBlur's largest radius
+# The blend's soft edge, as a share of the crop's side. Klein's background
+# is a few levels off the picture's, so wherever the mask's edge crosses
+# plain background its shape shows: past the old crown it was a grey crown
+# round the new head (2026-10-01), a 26 px blur being too short to hide an
+# outline. The mask is grown by FEATHER first, so all it covers is still
+# Klein's, then blurred over as far again - at a quarter of the size, as
+# ImageBlur stops at BLUR_MAX.
+FEATHER = 0.08
+SHRINK = 4                                # the wide blur runs at 1/SHRINK of the crop
 STATUS = "head_swap"
 LABEL = "Head swap"
 
@@ -173,7 +194,7 @@ def head_crop(width, height, face, crop=None, rise=None):
 
 
 def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=None,
-               strands=None):
+               strands=None, feather=None):
     """In `image` (a LoadImage name) each of `heads` ([{"crop": head_crop,
     "photo": a LoadImage name}]) is cut out, enlarged to SIDE, redrawn by
     Klein with the photo beside it (cut to "photo_crop" when a head gives
@@ -210,9 +231,15 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=Non
     words = list(WORDS if words is None else words)
     tone = TONE if tone is None else tone
     strands = STRANDS if strands is None else strands
+    feather = FEATHER if feather is None else feather
     for w, word in enumerate(words):
         g["word%d" % w] = {"class_type": "CLIPTextEncode", "inputs": {
             "text": word, "clip": ["sam", 1]}}
+    names = [word.split(":")[0].strip() for word in words]
+    anchors = [w for w, name in enumerate(names) if name in ("head", OLD_HAIR)]
+    if anchors:
+        g["worn"] = {"class_type": "CLIPTextEncode", "inputs": {
+            "text": WORN, "clip": ["sam", 1]}}
     last = ["image", 0]
     for i, head in enumerate(heads):
         n, crop = "h%d_" % (i + 1), head["crop"]
@@ -289,6 +316,30 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=Non
                     found = [key + "_or", 0]
                 else:
                     found = [key, 0]
+        # What the head wears (WORN), where it is near that picture's own
+        # head and hair: the old crown goes whole, a new hat stays whole.
+        near = max(2, int(side / CROP * WORN_NEAR))
+        for k, src in (("a", [n + "cut", 0]), ("b", [n + "small", 0])):
+            if not anchors:
+                break
+            anchor = ["%sm%d%s" % (n, anchors[0], k), 0]
+            for w in anchors[1:]:
+                g["%sw%sa%d" % (n, k, w)] = {"class_type": "MaskComposite", "inputs": {
+                    "destination": anchor, "source": ["%sm%d%s" % (n, w, k), 0],
+                    "x": 0, "y": 0, "operation": "or"}}
+                anchor = ["%sw%sa%d" % (n, k, w), 0]
+            g[n + "w" + k] = {"class_type": "SAM3_Detect", "inputs": {
+                "model": ["sam", 0], "image": src, "conditioning": ["worn", 0],
+                "threshold": 0.3, "refine_iterations": 2, "individual_masks": False}}
+            g[n + "wn" + k] = {"class_type": "GrowMask", "inputs": {
+                "mask": anchor, "expand": near, "tapered_corners": False}}
+            g[n + "wh" + k] = {"class_type": "MaskComposite", "inputs": {
+                "destination": [n + "w" + k, 0], "source": [n + "wn" + k, 0],
+                "x": 0, "y": 0, "operation": "multiply"}}
+            g[n + "wh" + k + "_or"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": found, "source": [n + "wh" + k, 0], "x": 0, "y": 0,
+                "operation": "or"}}
+            found = [n + "wh" + k + "_or", 0]
         grow = max(2, GROW * side // SIDE)
         g[n + "m4"] = {"class_type": "GrowMask", "inputs": {
             "mask": found, "expand": grow, "tapered_corners": True}}
@@ -322,16 +373,36 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=Non
         g[n + "q2"] = {"class_type": "MaskComposite", "inputs": {
             "destination": [n + "q0", 0], "source": [n + "q1", 0], "x": left, "y": top,
             "operation": "or"}}
+        # The soft edge: grown by `feather` so the blur leaves all that was
+        # covered at nearly 1 (two sigmas in), then blurred out as far again.
+        wide = int(side * feather)
+        if wide >= 2 * SHRINK:
+            g[n + "m6"] = {"class_type": "GrowMask", "inputs": {
+                "mask": through, "expand": wide, "tapered_corners": True}}
+            through = [n + "m6", 0]
         g[n + "m5"] = {"class_type": "MaskComposite", "inputs": {
             "destination": through, "source": [n + "q2", 0], "x": 0, "y": 0,
             "operation": "multiply"}}
-        radius = min(BLUR_MAX, max(1, side // 50))
         g[n + "b0"] = {"class_type": "MaskToImage", "inputs": {"mask": [n + "m5", 0]}}
-        g[n + "b1"] = {"class_type": "ImageBlur", "inputs": {
-            "image": [n + "b0", 0], "blur_radius": radius,
-            "sigma": min(10.0, max(0.1, radius / 2.0))}}
+        if wide >= 2 * SHRINK:
+            sigma = min(10.0, wide / 2.0 / SHRINK)
+            g[n + "bs"] = {"class_type": "ImageScaleBy", "inputs": {
+                "image": [n + "b0", 0], "upscale_method": "area", "scale_by": 1.0 / SHRINK}}
+            g[n + "b1"] = {"class_type": "ImageBlur", "inputs": {
+                "image": [n + "bs", 0], "blur_radius": min(BLUR_MAX, max(1, int(2 * sigma + 1))),
+                "sigma": sigma}}
+            g[n + "bu"] = {"class_type": "ImageScale", "inputs": {
+                "image": [n + "b1", 0], "upscale_method": "bilinear", "width": side,
+                "height": side, "crop": "disabled"}}
+            blurred = [n + "bu", 0]
+        else:                             # a crop too small to need it: as before
+            radius = min(BLUR_MAX, max(1, side // 50))
+            g[n + "b1"] = {"class_type": "ImageBlur", "inputs": {
+                "image": [n + "b0", 0], "blur_radius": radius,
+                "sigma": min(10.0, max(0.1, radius / 2.0))}}
+            blurred = [n + "b1", 0]
         g[n + "b2"] = {"class_type": "ImageToMask", "inputs": {
-            "image": [n + "b1", 0], "channel": "red"}}
+            "image": blurred, "channel": "red"}}
         g[n + "put"] = {"class_type": "ImageCompositeMasked", "inputs": {
             "destination": last, "source": drawn, "x": crop["x"], "y": crop["y"],
             "resize_source": False, "mask": [n + "b2", 0]}}

@@ -1515,6 +1515,40 @@ likeness there (0.79 and 0.82 at the end). And SAM3's head has small holes
 at the eyes behind glasses on one picture of five, where the blend is the
 generated picture's; the swap and the eye pass draw over them.
 
+**No ghost of what the old head wore** (2026-10-01, the user: "fix the flower
+crown ghost"). Partner's profile carries "flower crown" from earlier pictures;
+Klein drew her head without it, and a grey crown stayed round the new head -
+on 8 runs of 8 with her head LoRA (2 pictures x 4 seeds). Found by saving each
+stage of the head swap (crop, Klein raw and toned, every mask): the
+composite is exactly crop x (1 - mask) + Klein x mask, so the ghost was two
+things.
+- **The crown lay outside SAM3's head and hair**, and only the blend's soft
+  edge reached its outer flowers, which came through faded. `WORN`
+  ("headwear") is masked before and after; SAM3 masks a crown alike for
+  "headwear", "hat", "flower crown", "tiara" and "headband". On the 12 bench
+  pictures, where no head wears anything, it also found hair, a lace collar
+  and a lily, so it counts only within `WORN_NEAR` (half a face, crop side /
+  `CROP`) of that same picture's head and hair. Before, the old crown goes
+  whole; after, a hat Klein draws from the photo is not cut at the hair line.
+  On the bench it changes no pixel.
+- **The soft edge showed the mask's own outline.** Klein's background is a
+  few levels off the picture's; with the crown in the mask, the edge ran
+  round the crown and its shape still showed on the dark window. The blur was
+  26 px (ImageBlur stops at radius 31, sigma 10). Now the mask is grown
+  `FEATHER` (0.08 of the crop's side) first, so everything it covered is
+  still Klein's, then blurred over as far again at 1/`SHRINK` of the size and
+  scaled back. 0.05 still left a faint outline on the dark side; 0.08 none,
+  on 8 of 8.
+Bench with her 9B LoRA (12 pictures, ArcFace): today's main 0.723 before the
+face swap / 0.876 after; the identity-finish merge alone 0.594 (three heads
+at 0.30, the narrow edge keeping part of the generated face) / 0.873; with
+both of the above 0.688 (12 of 12 at 0.5 or more) / 0.886. The cost: 32% of
+a picture changed on average against 27%, most in close-ups, where the crop
+is the whole picture and the wider edge lets more of Klein's clothes through
+(the floral top her LoRA brings from her photos). Seen on the bench and not
+from this change: the identity-finish merge adds a thin necklace Klein drew
+on the dinner picture, which today's main does not.
+
 **The swap is a finish on the head: no weave, no teeth, no cheek behind a lens**
 (2026-09-29, seen live: a pink patch on a cheek and a strained, yellowed smile
 where Klein's head had looked natural). Looked at three times enlarged, the
