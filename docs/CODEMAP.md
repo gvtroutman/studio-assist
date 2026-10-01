@@ -93,6 +93,10 @@ After Effects and Resolve use outside npm servers.
 - **Identity** - `apps/image_studio/lora_train.py` (Build LoRA: a Klein 9B head LoRA,
   `plan`/`config`/`Build`; worker `tools/train_identity_lora.py`, one-time setup
   `tools/prepare_klein_lora.py`; used by the head swap through `imagegen.head_lora`),
+  the person's own face in photos `apps/image_studio/faces.py` (`Job`, `problem`,
+  `crop_for_import` - called by `RecordEditor._import_paths` and
+  `_add_character_photo`; `Build.find_faces`), worker `tools/identity_faces.py`
+  (ComfyUI's venv: `person`, `theirs`, `haar_square`, `keep_box`, `Reader`),
   `apps/image_studio/facefusion.py`
   (`swap`, `SWAP_MASKS`, `failure`, `_clear`), `tools/` (`facefusion_swap.py`: the
   worker, and the averaged face it keeps - `source_key`, `keep_source`).

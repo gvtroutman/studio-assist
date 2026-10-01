@@ -39,6 +39,7 @@ import apps.image_studio.facefusion as ff
 import apps.image_studio.blend as sb
 import apps.image_studio.viewcube as viewcube
 import apps.image_studio.lora_train as lt
+import apps.image_studio.faces as face_finder
 import apps.image_studio.scene.pose as sp
 import apps.image_studio.scene.ui as studio_scene_ui
 
@@ -2371,10 +2372,17 @@ class ImageStudio:
                  "muted")
 
         def work():
+            scratch, note = tempfile.mkdtemp(prefix="studio-import-"), ""
             try:
-                result = self.studio.lib.import_identity_photos(paths, owner, existing)
+                # cut to the person first, as the identity editor's import does
+                picked, note = face_finder.crop_for_import(
+                    paths, existing, os.path.join(self.studio.lib.root, face_finder.CACHE),
+                    scratch, owner)
+                result = self.studio.lib.import_identity_photos(picked, owner, existing)
             except OSError as e:
                 result = {"added": [], "duplicates": 0, "errors": [str(e)]}
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
 
             def done():
                 # save() replaces every record with a freshly-cleaned copy, so
@@ -2397,6 +2405,8 @@ class ImageStudio:
                     self.say("Added %d, %d unreadable: %s" % (
                         len(result["added"]), len(result["errors"]),
                         "; ".join(result["errors"][:2])), "warn")
+                elif note:
+                    self.say("Added %d: %s." % (len(result["added"]), note), "muted")
             self._post("call", done)
         self.host._spawn(self.s.event_id, work)
 
@@ -3044,7 +3054,8 @@ class ImageStudio:
             return
         ident = self.studio.lib.get("identities", editor.records[editor.current]["id"])
         try:
-            spec = lt.plan(ident, folders[0]["lora_dir"])
+            spec = lt.plan(ident, folders[0]["lora_dir"],
+                           face_cache=os.path.join(self.studio.lib.root, face_finder.CACHE))
         except ValueError as e:
             return editor.status(str(e), "err")
         if not messagebox.askokcancel("Build LoRA", (
@@ -3063,12 +3074,27 @@ class ImageStudio:
                                                               len(spec["photos"])) + ELLIPSIS)
         editor.status("LoRA build started; progress shows under Generate.")
 
+        left = [0]
+
         def progress(kind, value):
-            if kind == "kept" and value[0] < value[1]:
+            if kind == "finding":
+                self._post("said", ("Building %s's LoRA: finding their face, photo %d of %d"
+                                    % (spec["person"], value[0], value[1]), "muted"))
+            elif kind == "finder":
+                self._post("said", ("Building %s's LoRA: their face could not be looked for "
+                                    "(%s); the biggest face in each photo is used." % (
+                                        spec["person"], value), "warn"))
+            elif kind == "left":
+                left[0] = value[0]
+                if value[0]:
+                    self._post("said", ("Building %s's LoRA: they were not found in %d of %d "
+                                        "photos; those are left out." % (
+                                            spec["person"], value[0], value[1]), "warn"))
+            elif kind == "kept" and value[0] + left[0] < value[1]:
                 self._post("said", ("Building %s's LoRA: %d of %d photos could not be read; "
                                     "training on the other %d." % (
-                                        spec["person"], value[1] - value[0], value[1],
-                                        value[0]), "warn"))
+                                        spec["person"], value[1] - value[0] - left[0],
+                                        value[1], value[0]), "warn"))
             elif kind == "faces" and value[0] < value[1]:
                 self._post("said", ("Building %s's LoRA: no face found in %d of %d photos; "
                                     "those train whole." % (
@@ -3850,7 +3876,7 @@ class NewPhotos:
             return self.status("Click the photos to keep first.")
         if not self.pics["grid"].winfo_exists():
             return self.status("The person's form was closed; open it again.", "err")
-        self.editor._import_paths(self.pics, picked)
+        self.editor._import_paths(self.pics, picked, crop=False)    # made of them already
         self.made = [m for i, m in enumerate(self.made) if i not in self.sel]
         self.sel = set()
         self.draw()
@@ -4179,7 +4205,11 @@ class RecordEditor:
         if folder:
             self._import_paths(pics, folder=folder)
 
-    def _import_paths(self, pics, paths=(), folder=None):
+    def _import_paths(self, pics, paths=(), folder=None, crop=True):
+        """Copy photos into the person's references on a worker. With `crop`
+        (photos from disk, not ones made here), each is first cut to the
+        person's head and shoulders (`faces.crop_for_import`): a whole group
+        or wedding photo teaches a LoRA the crowd."""
         if pics.get("importing") or (not paths and not folder):
             return
         rec = self.records[self.current]
@@ -4188,6 +4218,7 @@ class RecordEditor:
         pics["importing"] = True
         self._imports = getattr(self, "_imports", 0) + 1
         self.status("Importing reference photos" + ELLIPSIS)
+        note = [""]
 
         def done(result):
             pics["importing"] = False
@@ -4204,8 +4235,9 @@ class RecordEditor:
                         rec["references"] = list(dict.fromkeys(rec["references"] + refs))
                         self._build_form()
                     self.status("Import finished for %s: %d added, %d duplicates, %d unreadable."
-                                " Save to keep the changes." % (owner, len(result["added"]),
-                                result["duplicates"], len(result["errors"])))
+                                "%s Save to keep the changes." % (owner, len(result["added"]),
+                                result["duplicates"], len(result["errors"]),
+                                " %s." % note[0] if note[0] else ""))
                 return
             for path in result["added"]:
                 if path not in pics["paths"]:
@@ -4213,11 +4245,18 @@ class RecordEditor:
             self._draw_paths(pics)
             message = "%d added · %d duplicates · %d unreadable" % (
                 len(result["added"]), result["duplicates"], len(result["errors"]))
+            if note[0]:
+                message += "\n" + note[0]
             if result["errors"]:
                 message += "\n" + "\n".join(result["errors"][:3])
             self.status(message, "err" if result["errors"] else "muted")
 
+        def cutting(kind, value):
+            self.owner._post("call", lambda: self.win.winfo_exists() and self.status(
+                "Finding %s in the photos: %d of %d" % (owner, value[0], value[1]) + ELLIPSIS))
+
         def work():
+            scratch = None
             try:
                 candidates = paths
                 if folder:
@@ -4226,9 +4265,18 @@ class RecordEditor:
                             and os.path.splitext(e.name)[1].lower() in
                             (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")),
                             key=lambda p: (p.casefold(), p))
+                if crop and candidates:
+                    scratch = tempfile.mkdtemp(prefix="studio-import-")
+                    candidates, note[0] = face_finder.crop_for_import(
+                        candidates, existing,
+                        os.path.join(self.owner.studio.lib.root, face_finder.CACHE),
+                        scratch, owner, cutting)
                 result = self.owner.studio.lib.import_identity_photos(candidates, owner, existing)
             except OSError as exc:
                 result = {"added": [], "duplicates": 0, "errors": [str(exc)]}
+            finally:
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
             self.owner._post("call", lambda: done(result))
         self.owner.host._spawn(self.owner.s.event_id, work)
 

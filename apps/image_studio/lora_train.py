@@ -19,10 +19,12 @@ ComfyUI's FLUX.2 VAE converted to ai-toolkit's layout -
 downloads nothing.
 
 This module is stdlib only: it plans the run (`plan`, `config`), checks that
-the toolkit is there (`problem`), and runs `tools/train_identity_lora.py` in
-the toolkit's venv as a contained child (`run`), reading the `KEPT`/`STEP`/
-`DONE`/`ERROR` lines that script prints. That script crops the photos to the
-head (OpenCV and PIL, which the app does not have) and starts ai-toolkit.
+the toolkit is there (`problem`), finds the person's own face in every photo
+(`faces.find`, ArcFace in ComfyUI's venv - the biggest face in a group shot
+is often someone else's), and runs `tools/train_identity_lora.py` in the
+toolkit's venv as a contained child (`run`), reading the `LEFT`/`KEPT`/
+`STEP`/`DONE`/`ERROR` lines that script prints. That script crops the photos
+to the head (PIL, which the app does not have) and starts ai-toolkit.
 
 The finished file is copied into the 5090's LoRA folder; the caller adds it
 to the library and makes it the person's `head_lora`.
@@ -40,6 +42,7 @@ import sys
 import time
 
 import core.procs as studio_procs
+from apps.image_studio import faces as face_finder
 
 MIN_PHOTOS = 20
 # Checkpoints of Partner's build scored the same from 500 steps to 1500 (head
@@ -109,9 +112,11 @@ def usable(paths):
     return [p for p in dict.fromkeys(paths or ()) if p and os.path.isfile(p)]
 
 
-def plan(identity, lora_dir, toolkit=TOOLKIT, when=None):
+def plan(identity, lora_dir, toolkit=TOOLKIT, when=None, face_cache=None):
     """Everything one build needs, decided up front -> a spec dict. Raises
-    ValueError, in words, when the person cannot be trained yet."""
+    ValueError, in words, when the person cannot be trained yet. With
+    `face_cache` (the library's), the build finds the person's own face in
+    each photo first (`Build.run`)."""
     photos = usable(identity.get("references"))
     if len(photos) < MIN_PHOTOS:
         raise ValueError("%s has %d usable photos; a LoRA needs at least %d."
@@ -137,6 +142,7 @@ def plan(identity, lora_dir, toolkit=TOOLKIT, when=None):
         "vae": vae(toolkit),
         "resolution": RESOLUTION,
         "lora_out": os.path.join(lora_dir, name + ".safetensors"),
+        "face_cache": face_cache,
     }
 
 
@@ -188,9 +194,10 @@ def write_spec(spec):
 
 def parse(line):
     """One line from the script -> ("step", (n, total)) | ("kept", (n, total)) |
-    ("faces", (n, total)) | ("done", path) | ("error", text) | ("note", text)."""
+    ("faces", (n, total)) | ("left", (n, total)) | ("done", path) |
+    ("error", text) | ("note", text)."""
     line = line.strip()
-    m = re.match(r"^(STEP|KEPT|FACES) (\d+) (\d+)$", line)
+    m = re.match(r"^(STEP|KEPT|FACES|LEFT) (\d+) (\d+)$", line)
     if m:
         return m.group(1).lower(), (int(m.group(2)), int(m.group(3)))
     if line.startswith("DONE "):
@@ -213,18 +220,45 @@ def eta(started, step, total, now=None):
 
 class Build:
     """One training run as a contained child. `run()` blocks (a worker
-    thread's), calling `on(kind, value)` with parse()'s kinds, and returns the
-    LoRA's path or raises RuntimeError in words. `stop()` from any thread ends
-    the whole tree - ai-toolkit's run.py included."""
+    thread's), calling `on(kind, value)` with parse()'s kinds - and, while
+    the person's face is found first, ("finding", (n, total)), or
+    ("finder", words) when it could not be - and returns the LoRA's path or
+    raises RuntimeError in words. `stop()` from any thread ends the whole
+    tree - ai-toolkit's run.py included."""
 
     def __init__(self, spec):
         self.spec = spec
         self.child = None
+        self.finder = None
         self.stopped = False
         self.step = (0, spec["steps"])
         self.started = None
 
+    def find_faces(self, on):
+        """The person's own face in each photo into the spec (`faces`), by
+        ArcFace; when that cannot run, the script falls back on the biggest
+        face and `on("finder", why)` says so."""
+        why = face_finder.problem()
+        if why is None:
+            self.finder = face_finder.Job("find", [], self.spec["photos"],
+                                          cache=self.spec["face_cache"])
+            try:
+                found = self.finder.run(lambda kind, value: on("finding", value))
+            except (RuntimeError, OSError) as e:
+                if self.stopped:
+                    raise RuntimeError("Stopped.")
+                why = str(e)
+            else:
+                self.spec["faces"] = {p: (found.get(p) or {}).get("box")
+                                      for p in self.spec["photos"]}
+                return
+        on("finder", why)
+
     def run(self, on=lambda kind, value: None):
+        if self.spec.get("face_cache") and not self.stopped:
+            self.find_faces(on)
+        if self.stopped:
+            raise RuntimeError("Stopped.")
         spec_path = write_spec(self.spec)
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         self.child = studio_procs.spawn(
@@ -264,6 +298,8 @@ class Build:
 
     def stop(self):
         self.stopped = True
+        if self.finder is not None:
+            self.finder.stop()
         if self.child is not None:
             self.child.kill()
 
