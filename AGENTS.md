@@ -1231,6 +1231,29 @@ base64 float16). Two uses:
   finder, photos go in whole and the status says why. Live: 6 wedding photos
   cut to ~700-1100 x 900-1400, a group shot where her face was too small to
   tell kept whole.
+- **Rate photos / Remove duplicates** (identity editor, beside Build LoRA;
+  The user: "a set of criteria that rates the images on best candidacy for lora",
+  "i want the ui to show me the ratings also", "and remove duplicates"). The
+  worker's `rate` mode adds what each photo's training square holds; the
+  cache (`VERSION` 2) keeps per face its pose (`landmark_3d_68`), sharpness
+  (Laplacian variance at 256 px wide), light and a dHash, and per picture its
+  size and `kind` - "cutout" or "generated" from the ComfyUI graph in its PNG.
+  `faces.score` (stdlib) rates 0-100: likeness 25, resolution 20 (the square
+  against `TRAIN_SIDE` 512), sharpness 20, clean 15 (other faces in the
+  square), light 10, real 10 (a cut-out's white and a Kontext edit's look are
+  learned as the person's) - and 0 where the person is not found, as Build
+  LoRA leaves those out. `faces.rate`: of each set of twins (`DUP_SAME` 0.95
+  ArcFace - an Angles/variations picture beside its source - or `DUP_SIM` 0.90
+  with face dHashes `DUP_HASH` 16 bits or fewer apart - a burst; ~0.88 is
+  another moment of the day, kept) the best stays, the Primary always; `TOP`
+  30 starred, best first with a bonus for a head angle the set has few of
+  (`ANGLES`, left/right as seen in the picture). Each tile shows "★ 91" /
+  "64" / "duplicate · 80" / "0 · left out"; hovering it puts `faces.detail`
+  in the status. Remove duplicates rates first if it must, asks, and takes
+  the twins out of the list only (files stay; Save keeps it). Live on
+  Partner's 135: 17 s cold, 1 s cached; 43 duplicates (by eye, all bursts or
+  one face re-backgrounded), 12 left out, scores 57-100, 30 starred over all
+  five angles.
 Tests: `tests/test_faces.py`.
 
 **Angles and Blend** (identity editor, beside Build LoRA; Sitter 2026-09-28: "add

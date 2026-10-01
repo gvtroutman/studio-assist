@@ -22,6 +22,7 @@ if __package__ in (None, ""):  # run as a script: import from the checkout
     _sys.path[0] = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", ".."))
 
 import json
+import math
 import os
 import re
 import shutil
@@ -163,6 +164,130 @@ def crop_for_import(paths, refs, cache, scratch, name="the person", on=lambda k,
         parts.append("%d kept whole (%s)" % (len(missing), ", ".join(
             "%s: %d" % kv for kv in sorted(counts.items()))))
     return out, "; ".join(parts)
+
+
+# --------------------------------------------------------- LoRA ratings
+# How good each photo is as Build LoRA's training data, judged on the head
+# square the worker trains on (2026-10-01, the user: "a set of criteria that
+# rates the images on best candidacy for lora", then "i want the ui to show
+# me the ratings also" and "remove duplicates"). A photo the person is not
+# found in scores 0: the build leaves it out.
+WEIGHTS = {"likeness": 25, "resolution": 20, "sharpness": 20, "clean": 15,
+           "light": 10, "real": 10}
+# A cut-out's white and a Kontext edit's look are learned as the person's.
+REAL = {"photo": 1.0, "cutout": 0.4, "generated": 0.5}
+TRAIN_SIDE = 512        # lora_train.RESOLUTION: a smaller square is enlarged
+# Twins (measured on Partner's 123): 0.95+ is the same face - an Angles or
+# variations picture beside its source, only the background changed; 0.90
+# with faces whose dHashes are 16 bits or fewer apart is a burst a moment
+# apart; ~0.88 is another moment of the same day, worth keeping.
+DUP_SAME, DUP_SIM, DUP_HASH = 0.95, 0.90, 16
+TOP = 30                # the suggested set
+ANGLES = ((-45, "profile left"), (-15, "three-quarter left"), (15, "front"),
+          (45, "three-quarter right"), (999, "profile right"))
+
+
+def _clip(v):
+    return max(0.0, min(1.0, float(v)))
+
+
+def angle(yaw):
+    return next(name for edge, name in ANGLES if yaw <= edge)
+
+
+def score(m):
+    """One photo's rating from the worker's `rate` answer `m` -> {"score":
+    0-100, "parts": {criterion: 0-1}, "flags": [words]}."""
+    if not m.get("box"):
+        return {"score": 0, "parts": {}, "flags": ["%s: left out of a LoRA" % (
+            m.get("why") or "not found")]}
+    flags = []
+    like = _clip((m.get("sim", 0) - 0.35) / 0.4)
+    side = m.get("side") or 0
+    res = _clip((side - 160) / float(TRAIN_SIDE - 160))
+    if side < 300:
+        flags.append("small face: enlarged %.1fx to train" % (TRAIN_SIDE / float(max(side, 1))))
+    lap = max(m.get("sharp") or 0, 1.0)
+    sharp = _clip((math.log10(lap) - 1.4) / 1.0)
+    if sharp < 0.35:
+        flags.append("soft face")
+    others = m.get("others") or []
+    clean = 1.0 if not others else _clip(0.5 - 0.5 * max(others))
+    if others:
+        flags.append("%d other face%s in the square" % (len(others), "" if len(others) == 1
+                                                         else "s"))
+    luma, clipped = m.get("luma", 0.5), m.get("clip", 0)
+    light = _clip(1 - abs(luma - 0.5) / 0.35) * _clip(1 - clipped * 4)
+    if light < 0.4:
+        flags.append("face too dark" if luma < 0.5 else "face too bright")
+    kind = m.get("kind") or "photo"
+    real = REAL.get(kind, 1.0)
+    if kind == "cutout":
+        flags.append("cut out on white")
+    elif kind == "generated":
+        flags.append("made here, not a photo")
+    parts = {"likeness": like, "resolution": res, "sharpness": sharp, "clean": clean,
+             "light": light, "real": real}
+    total = sum(WEIGHTS[k] * v for k, v in parts.items())
+    return {"score": int(round(total)), "parts": {k: round(v, 2) for k, v in parts.items()},
+            "flags": flags}
+
+
+def twins(m):
+    """The photos the worker found to be `m`'s duplicate (see DUP_*)."""
+    return [other for other, sim, apart in m.get("near") or ()
+            if sim >= DUP_SAME or (sim >= DUP_SIM and apart <= DUP_HASH)]
+
+
+def rate(found, paths):
+    """Every photo in `paths` rated -> {path: score() + {"dup_of": path or
+    None, "top": bool, "angle": words}}. Of each set of duplicates the best
+    stays and the rest are `dup_of` it; the first photo (the Primary) always
+    stays. `top` is the suggested TOP: best first, with a bonus for a head
+    angle the set has few of."""
+    out = {p: dict(score(found.get(p) or {}), dup_of=None, top=False,
+                   angle=angle((found.get(p) or {}).get("yaw") or 0)
+                   if (found.get(p) or {}).get("box") else "")
+           for p in paths}
+    order = sorted(paths, key=lambda p: (p != paths[0], -out[p]["score"]))
+    kept = set()
+    for p in order:
+        if out[p]["score"] == 0:
+            continue
+        twin = next((q for q in twins(found.get(p) or {}) if q in kept), None)
+        if twin is not None:
+            out[p]["dup_of"] = twin
+            out[p]["flags"].append("duplicate of a better photo")
+        else:
+            kept.add(p)
+    pool = [p for p in paths if p in kept]
+    counts = {}
+    for _ in range(min(TOP, len(pool))):
+        best = max(pool, key=lambda p: out[p]["score"] + 12.0 / (1 + counts.get(out[p]["angle"], 0)))
+        pool.remove(best)
+        out[best]["top"] = True
+        counts[out[best]["angle"]] = counts.get(out[best]["angle"], 0) + 1
+    return out
+
+
+def summary(rated):
+    """Words for the editor's status after a rating."""
+    n = len(rated)
+    left = sum(1 for r in rated.values() if r["score"] == 0)
+    dups = sum(1 for r in rated.values() if r["dup_of"])
+    top = sum(1 for r in rated.values() if r["top"])
+    return ("Rated %d photos: the best %d for a LoRA are marked ★; %d duplicate%s; "
+            "%d left out (not found). Hover a photo for its details."
+            % (n, top, dups, "" if dups == 1 else "s", left))
+
+
+def detail(r):
+    """One photo's rating in words, for the status line on hover."""
+    if r["score"] == 0:
+        return "0 · " + "; ".join(r["flags"])
+    parts = " · ".join("%s %.2f" % kv for kv in r["parts"].items())
+    return "%d%s · %s · %s%s" % (r["score"], " ★" if r["top"] else "", r["angle"], parts,
+                                 (" · " + "; ".join(r["flags"])) if r["flags"] else "")
 
 
 if __name__ == "__main__":

@@ -95,8 +95,10 @@ After Effects and Resolve use outside npm servers.
   `tools/prepare_klein_lora.py`; used by the head swap through `imagegen.head_lora`),
   the person's own face in photos `apps/image_studio/faces.py` (`Job`, `problem`,
   `crop_for_import` - called by `RecordEditor._import_paths` and
-  `_add_character_photo`; `Build.find_faces`), worker `tools/identity_faces.py`
-  (ComfyUI's venv: `person`, `theirs`, `haar_square`, `keep_box`, `Reader`),
+  `_add_character_photo`; `Build.find_faces`; LoRA ratings `score`, `twins`,
+  `rate`, `detail` - shown by `RecordEditor._rate_paths`, `_remove_duplicates`,
+  `_draw_paths`), worker `tools/identity_faces.py` (ComfyUI's venv: `person`,
+  `theirs`, `haar_square`, `keep_box`, `Reader`, `measure`, `rated`, `kind_of`),
   `apps/image_studio/facefusion.py`
   (`swap`, `SWAP_MASKS`, `failure`, `_clear`), `tools/` (`facefusion_swap.py`: the
   worker, and the averaged face it keeps - `source_key`, `keep_source`).

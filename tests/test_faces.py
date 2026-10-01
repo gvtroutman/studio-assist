@@ -344,5 +344,209 @@ class TrainerUsesTheFaceTests(unittest.TestCase):
         self.assertIn('Partner not found in: p01.png, p02.png', error)
 
 
+class MeasureHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.w = load('identity_faces')
+
+    def test_share_inside_and_hash_distance(self):
+        self.assertEqual(self.w.share_inside((0, 0, 100, 100), (50, 50, 150, 150)), 0.25)
+        self.assertEqual(self.w.share_inside((0, 0, 100, 100), (200, 0, 300, 50)), 0)
+        self.assertEqual(self.w.hamming('ff00', 'ff01'), 1)
+        self.assertEqual(self.w.hamming('0' * 16, 'f' * 16), 64)
+
+    def test_what_made_a_picture_is_read_from_its_graph(self):
+        cut = json.dumps({'1': {'class_type': 'LoadImage'}, '5': {'class_type': 'SAM3_Detect'},
+                          '6': {'class_type': 'EmptyImage'},
+                          '7': {'class_type': 'ImageCompositeMasked'}})
+        edit = json.dumps({'1': {'class_type': 'ReferenceLatent'}})
+        self.assertEqual(self.w.kind_of(cut), 'cutout')
+        self.assertEqual(self.w.kind_of(edit), 'generated')
+        self.assertEqual(self.w.kind_of(None), 'photo')
+        self.assertEqual(self.w.kind_of('not json'), 'photo')
+
+
+def good(**kw):
+    """A worker `rate` answer for a clear, close, real photo of the person."""
+    m = {'box': [1, 1, 9, 9], 'sim': 0.8, 'side': 700, 'sharp': 300.0, 'luma': 0.5,
+         'clip': 0.0, 'others': [], 'kind': 'photo', 'yaw': 0.0}
+    m.update(kw)
+    return m
+
+
+class ScoreTests(unittest.TestCase):
+    def test_a_clear_close_real_photo_scores_near_full(self):
+        r = faces.score(good())
+        self.assertGreaterEqual(r['score'], 95)
+        self.assertEqual(r['flags'], [])
+        self.assertEqual(set(r['parts']), set(faces.WEIGHTS))
+
+    def test_a_photo_they_are_not_found_in_is_left_out(self):
+        r = faces.score({'box': None, 'why': 'not found'})
+        self.assertEqual(r['score'], 0)
+        self.assertIn('not found: left out of a LoRA', r['flags'])
+
+    def test_each_fault_costs_and_is_named(self):
+        base = faces.score(good())['score']
+        for fault, words in ((dict(side=200), 'enlarged 2.6x'), (dict(sharp=20.0), 'soft face'),
+                             (dict(others=[0.9]), '1 other face in the square'),
+                             (dict(luma=0.08), 'face too dark'),
+                             (dict(kind='cutout'), 'cut out on white'),
+                             (dict(kind='generated'), 'made here')):
+            r = faces.score(good(**fault))
+            self.assertLess(r['score'], base, fault)
+            self.assertTrue(any(words in f for f in r['flags']), (fault, r['flags']))
+
+    def test_twins_are_the_same_face_or_a_burst(self):
+        m = {'near': [['same', 0.97, 30], ['burst', 0.91, 9], ['moment', 0.91, 25],
+                      ['day', 0.88, 5]]}
+        self.assertEqual(faces.twins(m), ['same', 'burst'])
+
+    def test_of_each_set_of_twins_the_best_stays_and_the_primary_always(self):
+        found = {'primary': good(sharp=40.0, near=[['sharp', 0.97, 3]]),
+                 'sharp': good(near=[['primary', 0.97, 3], ['soft', 0.96, 4]]),
+                 'soft': good(sharp=30.0, near=[['sharp', 0.96, 4]]),
+                 'burst': good(side=400, near=[['other', 0.91, 8]]),
+                 'other': good(near=[['burst', 0.91, 8]]),
+                 'gone': {'box': None, 'why': 'not found'}}
+        paths = list(found)
+        rated = faces.rate(found, paths)
+        self.assertIsNone(rated['primary']['dup_of'])           # the Primary stays
+        self.assertEqual(rated['sharp']['dup_of'], 'primary')
+        self.assertEqual(rated['soft']['dup_of'], None)          # its twin went, so it stays
+        self.assertEqual(rated['burst']['dup_of'], 'other')     # the smaller face goes
+        self.assertIsNone(rated['other']['dup_of'])
+        self.assertIsNone(rated['gone']['dup_of'])
+        self.assertTrue(rated['other']['top'])
+        self.assertFalse(rated['sharp']['top'] or rated['gone']['top'])
+        self.assertIn('2 duplicates', faces.summary(rated))
+        self.assertIn('1 left out', faces.summary(rated))
+
+    def test_the_top_set_spreads_over_head_angles(self):
+        found = {'f%d' % i: good(sim=0.80 + i / 1000.0) for i in range(40)}
+        found['left'] = good(sim=0.70, yaw=-30.0)
+        with mock.patch.object(faces, 'TOP', 5):
+            rated = faces.rate(found, list(found))
+        self.assertTrue(rated['left']['top'])
+        self.assertEqual(rated['left']['angle'], 'three-quarter left')
+        self.assertEqual(sum(r['top'] for r in rated.values()), 5)
+
+    def test_details_in_words(self):
+        rated = faces.rate({'a': good(side=200)}, ['a'])['a']
+        text = faces.detail(rated)
+        self.assertTrue(text.startswith('%d ★ · front · likeness' % rated['score']))
+        self.assertIn('enlarged', text)
+        self.assertEqual(faces.detail(faces.rate({'b': {'box': None, 'why': 'no face'}},
+                                                 ['b'])['b']),
+                         '0 · no face: left out of a LoRA')
+
+
+class EditorRatingTests(unittest.TestCase):
+    """RecordEditor's Rate photos and Remove duplicates, without Tk."""
+
+    def editor(self, d, paths):
+        from apps.image_studio.ui import RecordEditor
+        editor = RecordEditor.__new__(RecordEditor)
+        editor.status, editor._draw_paths = mock.Mock(), mock.Mock()
+        editor.win = mock.Mock(winfo_exists=lambda: True)
+        editor.owner = mock.Mock(studio=mock.Mock(lib=mock.Mock(root=d)),
+                                 _post=lambda kind, fn: fn(),
+                                 host=mock.Mock(_spawn=lambda _id, fn: fn()))
+        pics = {'paths': paths, 'sel': {1}, 'grid': mock.Mock(winfo_exists=lambda: True)}
+        return editor, pics
+
+    def test_rating_marks_the_tiles_and_says_how_it_went(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = [str(p) for p in (Path(d, 'a.png'), Path(d, 'b.png'))]
+            for p in paths:
+                Path(p).write_bytes(b'x')
+            editor, pics = self.editor(d, paths)
+            found = {paths[0]: good(), paths[1]: good(near=[[paths[0], 0.99, 2]])}
+            then = mock.Mock()
+            with mock.patch.object(faces, 'problem', return_value=None), \
+                    mock.patch.object(faces.Job, 'run', autospec=True,
+                                      side_effect=lambda job, on: found) as run:
+                editor._rate_paths(pics, then=then)
+            job = run.call_args[0][0].job
+            self.assertEqual((job['mode'], job['photos'], job['cache']),
+                             ('rate', paths, os.path.join(d, faces.CACHE)))
+            self.assertEqual(pics['ratings'][paths[1]]['dup_of'], paths[0])
+            editor._draw_paths.assert_called_with(pics)
+            self.assertIn('Rated 2 photos', editor.status.call_args[0][0])
+            then.assert_called_once()
+            self.assertFalse(pics['rating'])
+
+    def test_without_the_finder_it_says_why(self):
+        editor, pics = self.editor('D', [__file__])
+        with mock.patch.object(faces, 'problem', return_value='InsightFace is missing.'):
+            editor._rate_paths(pics)
+        self.assertIn('InsightFace is missing', editor.status.call_args[0][0])
+        self.assertNotIn('rating', pics)
+
+    def test_remove_duplicates_takes_out_the_twins_after_asking(self):
+        editor, pics = self.editor('D', [__file__, 'b', 'c'])
+        pics['ratings'] = {__file__: {'dup_of': None}, 'b': {'dup_of': __file__},
+                           'c': {'dup_of': None}}
+        with mock.patch('apps.image_studio.ui.messagebox.askyesno', return_value=False):
+            editor._remove_duplicates(pics)
+        self.assertEqual(pics['paths'], [__file__, 'b', 'c'])
+        with mock.patch('apps.image_studio.ui.messagebox.askyesno', return_value=True) as ask:
+            editor._remove_duplicates(pics)
+        self.assertIn('Remove 1 duplicate photo ', ask.call_args[0][1])
+        self.assertEqual(pics['paths'], [__file__, 'c'])
+        self.assertEqual(pics['sel'], set())
+        self.assertIn('Removed 1 duplicate.', editor.status.call_args[0][0])
+
+    def test_remove_duplicates_rates_first_when_photos_are_not_rated(self):
+        editor, pics = self.editor('D', [__file__])
+        editor._rate_paths = mock.Mock()
+        editor._remove_duplicates(pics)
+        editor._rate_paths.assert_called_once()
+        self.assertIsNotNone(editor._rate_paths.call_args[1]['then'])
+
+
+sys.path.insert(0, os.path.dirname(__file__))
+import test_imagegen as ti      # the module, so its TestCases are not collected here
+
+
+class RatingsInTheEditor(unittest.TestCase):
+    """The real identity editor (Tk, fake ComfyUI): the tiles' badges."""
+    setUpClass = ti.TestImageStudioTab.__dict__['setUpClass']
+    tearDownClass = ti.TestImageStudioTab.__dict__['tearDownClass']
+    tab = ti.TestImageStudioTab.tab
+
+    def texts(self, widget):
+        for w in widget.winfo_children():
+            try:
+                yield w.cget('text')
+            except Exception:
+                pass
+            yield from self.texts(w)
+
+    def test_each_rated_photo_shows_its_score(self):
+        _, ui = self.tab()
+        paths = []
+        for i in range(4):
+            p = os.path.join(self.dir, 'rated%d.png' % i)
+            with open(p, 'wb') as f:
+                f.write(ti.PNG)
+            paths.append(p)
+        ui.studio.lib.save('identities', [{'id': 'p', 'name': 'P', 'references': paths}])
+        ed = ui.edit_identities()
+        self.addCleanup(ed.win.destroy)
+        self.app.update()
+        pics = ed.widgets['references'][1]
+        pics['ratings'] = {paths[0]: {'score': 91, 'dup_of': None, 'top': True},
+                           paths[1]: {'score': 64, 'dup_of': None, 'top': False},
+                           paths[2]: {'score': 80, 'dup_of': paths[0], 'top': False},
+                           paths[3]: {'score': 0, 'dup_of': None, 'top': False}}
+        ed._draw_paths(pics)
+        self.app.update()
+        shown = list(self.texts(pics['grid']))
+        for text in ('★ 91', '64', 'duplicate · 80', '0 · left out'):
+            self.assertIn(text, shown)
+        names = [t for t in self.texts(ed.form) if t in ('Rate photos', 'Remove duplicates…')]
+        self.assertEqual(len(names), 2)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -5,7 +5,7 @@ LoRA's head squares (`faces.find`).
 Run in ComfyUI's venv (InsightFace with antelopev2, PIL, numpy, OpenCV - the
 app has none of them) by `apps.image_studio.faces` with a job.json:
 
-    {"mode": "find" | "crop", "refs": [...], "photos": [...],
+    {"mode": "find" | "crop" | "rate", "refs": [...], "photos": [...],
      "insightface": <root holding models/antelopev2>, "cache": <json>,
      "out": <folder for crops>, "result": <json written at the end>}
 
@@ -22,7 +22,12 @@ the other people's best faces scored 0.34 at most, hers 0.53 at least.
 would have drawn round it (HAAR_SCALE), so Build LoRA's head square (2.4 of
 those, tuned on the cascade) is unchanged. `crop` cuts each photo to the
 person's head and shoulders (KEEP_W x KEEP_H faces), slid inside the photo;
-a photo they already fill (KEEP_WHOLE) is left whole.
+a photo they already fill (KEEP_WHOLE) is left whole. `rate` gives what
+`faces.score` rates a photo on as LoRA training data: the training square's
+side, the face's sharpness and light, its head angle, the other faces in the
+square, whether the picture was made here (a cut-out on white, a Kontext
+edit - from the graph in its PNG), and its near twins (`near`: ArcFace
+similarity and the distance between the faces' dHashes).
 """
 import base64
 import json
@@ -36,6 +41,9 @@ KEEP_W, KEEP_H = 4.0, 5.0   # the crop, in face widths: head, hair, shoulders
 KEEP_ABOVE = 1.0    # face widths above the face's top kept for the hair
 KEEP_WHOLE = 0.8    # a crop this much of the photo or more: keep the photo whole
 MIN_SCORE = 0.5     # detector confidence
+MARGIN = 2.4        # train_identity_lora's head square, in cascade squares
+NEAR = 0.88         # rate: twins worth reporting (faces.DUP_* decide)
+VERSION = 2         # cache entries: 2 adds size, kind and each face's measures
 
 
 def say(text):
@@ -108,10 +116,40 @@ def keep_box(width, height, box):
     return int(left), int(top), int(left + w), int(top + h)
 
 
+def share_inside(square, box):
+    """How much of `box` (x0, y0, x1, y1) lies inside `square` (same form)."""
+    ix = max(0.0, min(square[2], box[2]) - max(square[0], box[0]))
+    iy = max(0.0, min(square[3], box[3]) - max(square[1], box[1]))
+    return ix * iy / max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
+
+
+def hamming(a, b):
+    """Bits apart of two hex dHashes."""
+    return bin(int(a, 16) ^ int(b, 16)).count("1")
+
+
+def kind_of(prompt):
+    """A picture's ComfyUI graph (its PNG "prompt" text) -> "cutout" (a
+    person cut out onto white), "generated" (any other graph, e.g. a Kontext
+    edit), or "photo" when it has none."""
+    if not prompt:
+        return "photo"
+    try:
+        types = {n.get("class_type") for n in json.loads(prompt).values()}
+    except (ValueError, AttributeError):
+        return "photo"
+    if {"SAM3_Detect", "ImageCompositeMasked", "EmptyImage"} <= types:
+        return "cutout"
+    return "generated"
+
+
 # ------------------------------------------------------ the face reader
 class Reader:
     """InsightFace's faces in a picture, through a cache keyed by the file's
-    size and time: [{"box": [x0, y0, x1, y1], "emb": [512 floats]}]."""
+    size and time: [{"box": [x0, y0, x1, y1], "emb": [512 floats], "pose":
+    [pitch, yaw, roll], "sharp": Laplacian variance at 256 px wide, "luma",
+    "clip": share near black or white, "dhash": 16 hex}]; `meta(path)` is
+    the picture's {"size": [w, h], "kind"}."""
 
     def __init__(self, root, cache_path):
         model = os.path.join(root, "models", "antelopev2", "glintr100.onnx")
@@ -132,7 +170,8 @@ class Reader:
         if self.app is None:
             from insightface.app import FaceAnalysis
             self.app = FaceAnalysis(name="antelopev2", root=self.root,
-                                    allowed_modules=["detection", "recognition"],
+                                    allowed_modules=["detection", "recognition",
+                                                     "landmark_3d_68"],     # pose
                                     providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
             self.app.prepare(ctx_id=0, det_size=(640, 640))
         return self.app
@@ -142,23 +181,38 @@ class Reader:
         st = os.stat(path)
         return [st.st_size, st.st_mtime_ns]
 
-    def faces(self, path, image=None):
+    @staticmethod
+    def key(path):
+        return os.path.normcase(os.path.abspath(path))
+
+    def faces(self, path):
         import numpy as np
-        key = os.path.normcase(os.path.abspath(path))
-        hit = self.cache.get(key)
-        if hit and hit.get("stamp") == self.stamp(path):
-            return [{"box": f["box"], "emb": np.frombuffer(base64.b64decode(f["emb"]),
-                                                            np.float16).astype(float).tolist()}
+        hit = self.cache.get(self.key(path))
+        if hit and hit.get("stamp") == self.stamp(path) and hit.get("v") == VERSION:
+            return [dict(f, emb=np.frombuffer(base64.b64decode(f["emb"]),
+                                              np.float16).astype(float).tolist())
                     for f in hit["faces"]]
-        im = image if image is not None else upright(path)
-        bgr = np.ascontiguousarray(np.asarray(im)[:, :, ::-1])
-        found = self.detect(bgr)
-        out = [{"box": [float(v) for v in f.bbox],
-                "emb": [float(v) for v in f.normed_embedding]} for f in found]
-        self.cache[key] = {"stamp": self.stamp(path), "faces": [
-            {"box": f["box"], "emb": base64.b64encode(
-                np.asarray(f["emb"], np.float16).tobytes()).decode()} for f in out]}
+        im, prompt = upright(path, with_prompt=True)
+        rgb = np.asarray(im)
+        found = self.detect(np.ascontiguousarray(rgb[:, :, ::-1]))
+        gray = np.asarray(im.convert("L"))
+        out = []
+        for f in found:
+            box = [float(v) for v in f.bbox]
+            pose = getattr(f, "pose", None)
+            out.append(dict(measure(gray, box), box=box,
+                            emb=[float(v) for v in f.normed_embedding],
+                            pose=None if pose is None else [round(float(v), 1) for v in pose]))
+        self.cache[self.key(path)] = {
+            "v": VERSION, "stamp": self.stamp(path), "size": list(im.size),
+            "kind": kind_of(prompt),
+            "faces": [dict(f, emb=base64.b64encode(np.asarray(f["emb"], np.float16)
+                                                   .tobytes()).decode()) for f in out]}
         return out
+
+    def meta(self, path):
+        hit = self.cache.get(self.key(path)) or {}
+        return {"size": hit.get("size"), "kind": hit.get("kind", "photo")}
 
     def detect(self, bgr):
         """Faces at 640, else at 1280 (small faces in a big photo), else with
@@ -192,10 +246,38 @@ class Reader:
         os.replace(tmp, self.cache_path)
 
 
-def upright(path):
+def upright(path, with_prompt=False):
+    """The picture upright as RGB (and, `with_prompt`, its PNG's ComfyUI
+    graph text or None)."""
     from PIL import Image, ImageOps
     with Image.open(path) as im:
-        return ImageOps.exif_transpose(im).convert("RGB")
+        prompt = im.info.get("prompt")
+        im = ImageOps.exif_transpose(im).convert("RGB")
+    return (im, prompt) if with_prompt else im
+
+
+def measure(gray, box):
+    """Sharpness, light and a dHash of the face `box` in a grey picture."""
+    import cv2
+    import numpy as np
+    h, w = gray.shape[:2]
+    x0, y0 = max(0, int(box[0])), max(0, int(box[1]))
+    x1, y1 = min(w, int(box[2])), min(h, int(box[3]))
+    face = gray[y0:y1, x0:x1]
+    if face.size == 0:
+        return {"sharp": 0.0, "luma": 0.0, "clip": 1.0, "dhash": "0" * 16}
+    fh = max(1, int(round(256.0 * face.shape[0] / face.shape[1])))
+    small = cv2.resize(face, (256, fh), interpolation=cv2.INTER_AREA
+                       if face.shape[1] > 256 else cv2.INTER_CUBIC)
+    luma = small.astype(np.float32) / 255.0
+    m = 0.2 * (x1 - x0)                       # a little round the face for the hash
+    around = gray[max(0, int(y0 - m)):min(h, int(y1 + m)), max(0, int(x0 - m)):min(w, int(x1 + m))]
+    tiny = cv2.resize(around, (9, 8), interpolation=cv2.INTER_AREA).astype(np.int16)
+    bits = (tiny[:, 1:] > tiny[:, :-1]).flatten()
+    return {"sharp": round(float(cv2.Laplacian(small, cv2.CV_64F).var()), 1),
+            "luma": round(float(luma.mean()), 3),
+            "clip": round(float(((luma > 0.98) | (luma < 0.02)).mean()), 3),
+            "dhash": "%016x" % int("".join("1" if b else "0" for b in bits), 2)}
 
 
 def run(job):
@@ -218,7 +300,7 @@ def run(job):
         got = read.get(p)
         return [f["emb"] for f in got] if isinstance(got, list) else []
     c = person([embs(p) for p in refs], [embs(p) for p in photos])
-    out = {}
+    out, mine = {}, {}
     for p in photos:
         got = read.get(p)
         if not isinstance(got, list):
@@ -236,8 +318,37 @@ def run(job):
             r["box"] = haar_square(got[k]["box"])
             if job["mode"] == "crop":
                 r["crop"] = cut(p, got[k]["box"], job["out"], len(out))
+            elif job["mode"] == "rate":
+                r.update(rated(reader.meta(p), got, k, r["box"]))
+                mine[p] = got[k]
         out[p] = r
+    if job["mode"] == "rate":         # near twins of the person's face, both ways
+        names = list(mine)
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                sim = dot(mine[a]["emb"], mine[b]["emb"])
+                if sim >= NEAR:
+                    apart = hamming(mine[a]["dhash"], mine[b]["dhash"])
+                    out[a].setdefault("near", []).append([b, round(sim, 3), apart])
+                    out[b].setdefault("near", []).append([a, round(sim, 3), apart])
     return out
+
+
+def rated(meta, faces, k, square):
+    """What `faces.score` needs of the person's face `faces[k]` in a picture
+    of `meta`, whose cascade-sized square is `square`."""
+    from train_identity_lora import head_square
+    w, h = meta["size"]
+    left, top, right, bottom = head_square(w, h, square)
+    me = faces[k]
+    width = me["box"][2] - me["box"][0]
+    others = [round((f["box"][2] - f["box"][0]) / max(width, 1.0), 2)
+              for j, f in enumerate(faces)
+              if j != k and share_inside((left, top, right, bottom), f["box"]) > 0.25]
+    pitch, yaw = (me["pose"] or [0.0, 0.0])[:2]
+    return {"size": [w, h], "kind": meta["kind"], "side": right - left,
+            "sharp": me["sharp"], "luma": me["luma"], "clip": me["clip"],
+            "yaw": yaw, "pitch": pitch, "others": others}
 
 
 def cut(path, box, folder, index):
