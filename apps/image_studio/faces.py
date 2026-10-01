@@ -239,17 +239,18 @@ def twins(m):
             if sim >= DUP_SAME or (sim >= DUP_SIM and apart <= DUP_HASH)]
 
 
-def rate(found, paths):
+def rate(found, paths, keep_first=True):
     """Every photo in `paths` rated -> {path: score() + {"dup_of": path or
     None, "top": bool, "angle": words}}. Of each set of duplicates the best
-    stays and the rest are `dup_of` it; the first photo (the Primary) always
-    stays. `top` is the suggested TOP: best first, with a bonus for a head
-    angle the set has few of."""
+    stays and the rest are `dup_of` it; with `keep_first`, the first photo
+    (the Primary) always stays. `top` is the suggested TOP: best first, with
+    a bonus for a head angle the set has few of."""
     out = {p: dict(score(found.get(p) or {}), dup_of=None, top=False,
                    angle=angle((found.get(p) or {}).get("yaw") or 0)
                    if (found.get(p) or {}).get("box") else "")
            for p in paths}
-    order = sorted(paths, key=lambda p: (p != paths[0], -out[p]["score"]))
+    order = sorted(paths, key=lambda p: (not (keep_first and p == paths[0]),
+                                         -out[p]["score"]))
     kept = set()
     for p in order:
         if out[p]["score"] == 0:
@@ -268,6 +269,23 @@ def rate(found, paths):
         out[best]["top"] = True
         counts[out[best]["angle"]] = counts.get(out[best]["angle"], 0) + 1
     return out
+
+
+def best_first(rated, paths):
+    """`paths` sorted for the editor after a rating (the user: "it should auto
+    sort them for the best pic to set as the primary"): first the Primary -
+    the best-scoring front view, since the Primary is the face the picture
+    is matched to, else the best of any angle - then the other usable photos
+    best first, then the duplicates, then the photos the person is not found
+    in. Ties keep their order."""
+    def rank(p):
+        r = rated[p]
+        return (r["score"] == 0, bool(r["dup_of"]), -r["score"])
+    usable = [p for p in paths if rated[p]["score"] and not rated[p]["dup_of"]]
+    front = [p for p in usable if rated[p]["angle"] == "front"]
+    first = max(front or usable, key=lambda p: rated[p]["score"], default=None)
+    rest = sorted((p for p in paths if p != first), key=rank)
+    return ([first] if first else []) + rest
 
 
 def summary(rated):

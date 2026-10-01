@@ -430,6 +430,29 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(rated['left']['angle'], 'three-quarter left')
         self.assertEqual(sum(r['top'] for r in rated.values()), 5)
 
+    def test_best_first_puts_the_best_front_view_first_and_the_rest_after(self):
+        found = {'old primary': good(sharp=30.0),
+                 'best profile': good(yaw=-70.0),
+                 'best front': good(side=450),
+                 'twin': good(side=300, near=[['best front', 0.97, 2]]),
+                 'gone': {'box': None, 'why': 'not found'},
+                 'fine': good(side=350)}
+        paths = list(found)
+        rated = faces.rate(found, paths, keep_first=False)
+        self.assertEqual(faces.best_first(rated, paths),
+                         ['best front', 'best profile', 'fine', 'old primary', 'twin', 'gone'])
+        # no front view at all: the best of any angle leads
+        found = {'a': good(yaw=50.0, side=300), 'b': good(yaw=-60.0)}
+        self.assertEqual(faces.best_first(faces.rate(found, ['a', 'b']), ['a', 'b']), ['b', 'a'])
+        # nobody found: the order stays
+        none = {'a': {'box': None}, 'b': {'box': None}}
+        self.assertEqual(faces.best_first(faces.rate(none, ['a', 'b']), ['a', 'b']), ['a', 'b'])
+
+    def test_without_keep_first_the_old_primary_can_be_a_duplicate(self):
+        found = {'p': good(side=300, near=[['q', 0.97, 2]]), 'q': good(near=[['p', 0.97, 2]])}
+        self.assertIsNone(faces.rate(found, ['p', 'q'])['p']['dup_of'])
+        self.assertEqual(faces.rate(found, ['p', 'q'], keep_first=False)['p']['dup_of'], 'q')
+
     def test_details_in_words(self):
         rated = faces.rate({'a': good(side=200)}, ['a'])['a']
         text = faces.detail(rated)
@@ -472,8 +495,25 @@ class EditorRatingTests(unittest.TestCase):
             self.assertEqual(pics['ratings'][paths[1]]['dup_of'], paths[0])
             editor._draw_paths.assert_called_with(pics)
             self.assertIn('Rated 2 photos', editor.status.call_args[0][0])
+            self.assertIn('the best front view is Primary', editor.status.call_args[0][0])
             then.assert_called_once()
             self.assertFalse(pics['rating'])
+            self.assertEqual(pics['sel'], set())
+
+    def test_rating_sorts_the_photos_best_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = [str(Path(d, n)) for n in ('soft.png', 'sharp.png', 'gone.png')]
+            for p in paths:
+                Path(p).write_bytes(b'x')
+            editor, pics = self.editor(d, list(paths) + ['added while rating.png'])
+            found = {paths[0]: good(sharp=25.0), paths[1]: good(),
+                     paths[2]: {'box': None, 'why': 'not found'}}
+            with mock.patch.object(faces, 'problem', return_value=None), \
+                    mock.patch.object(faces.Job, 'run', autospec=True,
+                                      side_effect=lambda job, on: found):
+                editor._rate_paths(pics)
+            self.assertEqual(pics['paths'], [paths[1], paths[0], paths[2],
+                                             'added while rating.png'])
 
     def test_without_the_finder_it_says_why(self):
         editor, pics = self.editor('D', [__file__])
@@ -546,6 +586,34 @@ class RatingsInTheEditor(unittest.TestCase):
             self.assertIn(text, shown)
         names = [t for t in self.texts(ed.form) if t in ('Rate photos', 'Remove duplicates…')]
         self.assertEqual(len(names), 2)
+
+    def test_a_persons_photos_are_big_tiles_as_many_a_row_as_fit(self):
+        from apps.image_studio import ui as ui_mod
+        _, ui = self.tab()
+        paths = []
+        for i in range(6):
+            p = os.path.join(self.dir, 'big%d.png' % i)
+            with open(p, 'wb') as f:
+                f.write(ti.PNG)
+            paths.append(p)
+        ui.studio.lib.save('identities', [{'id': 'p', 'name': 'P', 'references': paths}])
+        ed = ui.edit_identities()
+        self.addCleanup(ed.win.destroy)
+        self.app.update()
+        pics = ed.widgets['references'][1]
+        tiles = pics['grid'].winfo_children()
+        self.assertEqual(len(tiles), 6)
+        image = tiles[0].winfo_children()[0]
+        self.assertEqual(int(image.cget('width')), ui_mod.IDENTITY_TILE)
+        # the row fits the form: a narrow form takes two, a wide one more
+        with mock.patch.object(ed.form, 'winfo_width', return_value=500):
+            self.assertEqual(ed._path_cols(ui_mod.IDENTITY_TILE), 2)
+        with mock.patch.object(ed.form, 'winfo_width', return_value=1000):
+            self.assertEqual(ed._path_cols(ui_mod.IDENTITY_TILE), 4)
+        with mock.patch.object(ed.form, 'winfo_width', return_value=500):
+            ed._refit_paths(pics)
+        self.assertEqual(pics['cols'], 2)
+        self.assertEqual(max(int(t.grid_info()['column']) for t in pics['grid'].winfo_children()), 1)
 
 
 if __name__ == '__main__':
