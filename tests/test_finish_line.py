@@ -238,6 +238,57 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual([label for label, _g in comfy_view.graph_steps(job.record)],
                          ["Picture", "Eye pass", "Hands", "Glasses"])
 
+    def fail_hands(self, failure, fetch_fails=False):
+        """finish_job with eyes and hands, where the hands pass raises
+        `failure` (after it is listed, as `_run_pass` lists a run); with
+        `fetch_fails`, the eye pass's result cannot be fetched either."""
+        real = ig.Studio._run_pass
+
+        def run_pass(studio, job, client, graph, say, label, status="refining"):
+            if label != "Hands":
+                return real(studio, job, client, graph, say, label, status=status)
+            job.passes.append({"label": label, "graph": graph})
+            if fetch_fails:
+                client.fetch = Mock(side_effect=ig.ComfyError("ComfyUI went away"))
+            raise failure
+        with patch.object(ig.Studio, "_run_pass", run_pass), \
+                patch.object(ig.doctor, "log_error") as logged:
+            job, client, _ = self.finish_job([], hands=[(200, 600, 70, 80)])
+        return job, logged
+
+    def test_a_pass_failing_after_the_eyes_keeps_the_eyes_and_says_only_what_was_done(self):
+        # Idea 3b7e25aaa3b1: the eye pass done, the hands erroring, the
+        # untouched picture came back with the "Eye pass" note and graph kept.
+        job, logged = self.fail_hands(ig.ComfyError("boom"))
+        self.assertEqual(job.status, 'complete', job.detail)
+        notes = job.record["notes"]
+        self.assertTrue(any(n.startswith("Eye pass after the face swap") for n in notes), notes)
+        self.assertFalse(any(n.startswith("Hands pass:") for n in notes), notes)
+        self.assertTrue(any(n.endswith("pass after the face swap failed (boom); the passes "
+                                       "finished before it are kept.") for n in notes), notes)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Eye pass"])
+        self.assertFalse(logged.called)
+
+    def test_a_pass_failing_whose_earlier_result_is_gone_drops_its_notes(self):
+        job, _ = self.fail_hands(ig.ComfyError("boom"), fetch_fails=True)
+        self.assertEqual(job.status, 'complete', job.detail)
+        notes = job.record["notes"]
+        self.assertFalse(any(n.startswith("Eye pass after the face swap") for n in notes), notes)
+        self.assertTrue(any(n.endswith("pass after the face swap failed (boom); the picture "
+                                       "is kept as it was before it.") for n in notes), notes)
+        self.assertEqual(job.record["passes"], [])
+
+    def test_an_unexpected_error_in_a_pass_still_saves_the_picture(self):
+        # Idea 442b63523b89: only ComfyError/TemplateError/OSError were
+        # caught; a KeyError failed the job and skipped History.
+        job, logged = self.fail_hands(KeyError("parts"))
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(len(self.studio.history.list()), 1)
+        self.assertNotIn('finish', self.studio.history.list()[0])     # no checkpoint left pending
+        self.assertTrue(any("failed (" in n for n in job.record["notes"]), job.record["notes"])
+        self.assertIn("Traceback", logged.call_args.args[0])
+        self.assertIn("KeyError", logged.call_args.args[0])
+
     def test_a_swap_that_went_behind_the_glasses_leaves_them_as_drawn(self):
         # Live, 2026-09-29: with FaceFusion's occlusion mask the frames are the
         # picture's own, to the pixel. Redrawn all the same they came back as

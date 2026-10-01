@@ -709,6 +709,30 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
                       loras=[{"id": "sitter", "strength": 0.8}])
         self.assertNotIn("SITTERPERSON", p.prompt)
 
+    def test_an_identitys_or_styles_trigger_goes_with_its_lora(self):
+        # Idea 553c1022fa02: only added and always-on LoRAs lost their trigger
+        # when left out; a person's FLUX LoRA on Z-Image still had its word said.
+        lib = self.studio.lib
+        styles = lib.all("styles")
+        for st in styles:
+            if st["id"] == "sx70-authentic":
+                st["trigger"] = "sx70 frame"
+        lib.save("styles", styles)
+        chosen = dict(identities=[{"id": "sitter", "strength": 0.9}], style="sx70-authentic",
+                      scene="On a pier.")
+        p = self.plan(model="z-image-turbo", **chosen)      # both LoRAs are FLUX.1's
+        self.assertEqual(p.loras, [])
+        self.assertNotIn("SITTERPERSON", p.prompt)
+        self.assertNotIn("sx70 frame", p.prompt)
+        self.assertIn("SX-70 instant film", p.prompt)       # a style's words are words
+        p = self.plan(model="flux-dev", **chosen)           # given: said
+        self.assertIn("SITTERPERSON", p.prompt)
+        self.assertIn("sx70 frame", p.prompt)
+        # An identity with no LoRA keeps its trigger, as words.
+        p = self.plan(model="z-image-turbo", identities=[{"id": "partner", "strength": 0.8}],
+                      scene="On a pier.")
+        self.assertIn("PARTNERPERSON", p.prompt)
+
     def test_a_saved_lora_mix_is_a_preset_on_its_built_in(self):
         lib = self.studio.lib
         lib.save("presets", [
@@ -1328,6 +1352,27 @@ class TestStartBackend(TempStudioMixin, unittest.TestCase):
         self.assertEqual(kw["cwd"], self.dir)
         self.assertEqual(kw["creationflags"], getattr(ig.subprocess, "CREATE_NEW_CONSOLE", 0))
 
+    def test_no_second_start_while_the_first_console_is_open(self):
+        # Idea 5902f8b35f18: after the UI's 180 s wait the Start button is
+        # back while the first ComfyUI may still be loading; a second one on
+        # the same port would fail over it.
+        from unittest.mock import Mock, patch
+        cmd = os.path.join(self.dir, "Start ComfyUI.cmd")
+        with open(cmd, "w") as f:
+            f.write("@echo off\n")
+        b = dict(self.backend("5090"), start=cmd)
+        console = Mock()
+        console.poll.return_value = None                   # still open
+        with patch.object(ig.subprocess, "Popen", return_value=console) as popen:
+            self.studio.start(b)
+            with self.assertRaises(ig.ComfyError) as caught:
+                self.studio.start(b)
+            self.assertEqual(popen.call_count, 1)
+            self.assertIn("still open", str(caught.exception))
+            console.poll.return_value = 1                  # closed: start again
+            self.studio.start(b)
+            self.assertEqual(popen.call_count, 2)
+
     def test_advice_is_not_run(self):
         from unittest.mock import patch
         with patch.object(ig.subprocess, "Popen") as popen:
@@ -1357,6 +1402,31 @@ class TestRouting(TempStudioMixin, unittest.TestCase):
         self.assertEqual(sorted({j.backend["id"] for j in jobs}), ["3090", "5090"])
         self.assertEqual([j.settings["seed"] for j in jobs],
                          list(range(jobs[0].settings["seed"], jobs[0].settings["seed"] + 4)))
+
+    def test_a_held_backend_takes_no_job_until_let_go(self):
+        # Idea 575729b8a187: Build LoRA has the 5090's GPU; Generate, Fix and
+        # Again must not load a FLUX beside the training.
+        why = "5090 Workstation's GPU is building P's LoRA; send pictures there when it is done."
+        self.studio.held["5090"] = why
+        jobs = self.studio.submit(dict(ig.default_settings(), scene="x", batch=3))
+        settle(jobs)
+        self.assertEqual({j.backend["id"] for j in jobs}, {"3090"})
+        with self.assertRaises(ig.ComfyError) as cm:                  # named by hand
+            self.studio.submit(dict(ig.default_settings(), scene="x", backend="5090"))
+        self.assertEqual(str(cm.exception), why)
+        self.assertEqual(self.studio.plan_route(dict(ig.default_settings(), backend="5090")),
+                         (None, why))
+        FakeClient.down = {"3090"}                                     # nowhere else to go
+        self.studio.check_all()
+        with self.assertRaises(ig.ComfyError) as cm:
+            self.studio.submit(dict(ig.default_settings(), scene="x"))
+        self.assertIn("building P's LoRA", str(cm.exception))
+        FakeClient.down = set()
+        self.studio.check_all()
+        del self.studio.held["5090"]
+        jobs = self.studio.submit(dict(ig.default_settings(), scene="x", backend="5090"))
+        settle(jobs)
+        self.assertEqual(jobs[0].backend["id"], "5090")
 
     def test_nothing_online_says_why(self):
         FakeClient.down = {"5090", "3090"}
@@ -3231,6 +3301,41 @@ class TestImageStudioTab(unittest.TestCase):
             w.start()
             spawn.assert_called_once()
         w.running = False
+        w.close()
+
+    def test_an_angles_round_clears_the_card_frees_kontext_and_always_ends(self):
+        # Ideas 634988cde86d and c94e9a01ed0b: a round bypasses the queue, so
+        # it never cleared LM Studio off a shared card nor freed Kontext after;
+        # and an error other than ComfyError/OSError skipped done(), leaving
+        # Make answering "Still making the last round" until reopened.
+        from unittest.mock import Mock, patch
+        import apps.image_studio.blend as sb
+        import apps.image_studio.ui as ui_mod
+        _, ui = self.tab()
+        photo = os.path.join(self.dir, "angle_src.png")
+        with open(photo, "wb") as f:
+            f.write(PNG)
+        editor = type("Editor", (), {})()
+        editor.owner, editor.win = ui, ui_mod.tk.Toplevel(self.app)
+        self.addCleanup(editor.win.destroy)
+        backend = {"id": "kontext", "name": "Kontext PC", "url": "http://127.0.0.1:1",
+                   "shares_llm_gpu": True, "release_vram": True}
+        client = FakeClient(backend)
+        room = Mock()
+        with patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()), \
+                patch.object(sb, "route", return_value=(backend, "")), \
+                patch.object(ui.studio, "client", return_value=client), \
+                patch.object(ui.studio, "make_room", room), \
+                patch.object(sb, "run", side_effect=KeyError("images")), \
+                patch.object(ui_mod.doctor, "log_error") as logged:
+            w = ui_mod.NewPhotos(editor, {"paths": [photo], "sel": {0}}, "angles", [photo])
+            w.cube.set_chosen(["front"])
+            w.start()
+            self.pump(lambda: not w.running)
+        room.assert_called_once_with(backend)
+        self.assertEqual(client.freed, 1)
+        self.assertIn("KeyError", w.msg.cget("text"))
+        self.assertIn("Traceback", logged.call_args.args[0])
         w.close()
 
     def test_blend_is_a_window_of_its_own_that_sends_a_job(self):

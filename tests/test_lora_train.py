@@ -360,8 +360,10 @@ class ButtonTests(unittest.TestCase):
             editor = self.editor(photos(d, 20))
             editor.records = [{'id': 'partner', 'name': 'Partner'}]
             editor.win = mock.Mock()
-            studio.studio.backends.return_value = [{'name': '5090', 'url': 'http://127.0.0.1:8188',
+            studio.studio.backends.return_value = [{'id': '5090', 'name': '5090',
+                                                    'url': 'http://127.0.0.1:8188',
                                                     'lora_dir': d}]
+            studio.studio.held = {}
             studio.studio.lib.get.return_value = {'id': 'partner', 'name': 'Partner',
                                                   'references': photos(d, 20)}
             studio.studio.lib.root = d          # the face cache sits beside the library
@@ -373,12 +375,15 @@ class ButtonTests(unittest.TestCase):
                     mock.patch.object(lt.Build, 'run', side_effect=KeyError('surprise')):
                 studio.build_lora(editor)
                 self.assertIsNotNone(studio.lora_build)
+                # Idea 575729b8a187: while it builds, no job is routed to its GPU.
+                self.assertIn("building Partner's LoRA", studio.studio.held['5090'])
                 with self.assertRaises(KeyError):
                     spawned[0]()
         calls = [v for k, v in posted if k == 'call']
         self.assertEqual(len(calls), 1)
         calls[0]()
         self.assertIsNone(studio.lora_build)
+        self.assertEqual(studio.studio.held, {})      # and the backend is let go
         self.assertIn('not built', studio.say.call_args[0][0])
 
     def test_every_kind_of_progress_reaches_the_line_and_the_window(self):
@@ -402,8 +407,10 @@ class ButtonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             editor = self.editor(photos(d, 20))
             editor.win = mock.Mock()
-            studio.studio.backends.return_value = [{'name': '5090', 'url': 'http://127.0.0.1:8188',
+            studio.studio.backends.return_value = [{'id': '5090', 'name': '5090',
+                                                    'url': 'http://127.0.0.1:8188',
                                                     'lora_dir': d}]
+            studio.studio.held = {}
             studio.studio.lib.get.return_value = {'id': 'partner', 'name': 'Partner',
                                                   'references': photos(d, 20)}
             studio.studio.lib.root = d

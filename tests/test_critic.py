@@ -758,6 +758,35 @@ class LearningTest(TempStudioMixin, unittest.TestCase):
         job, client = self.generate([self.FINE])          # a picture of no one known
         self.assertNotIn("a broad square jaw", client.graphs[0]["10"]["inputs"]["text"])
 
+    def test_generate_again_replays_the_words_the_picture_was_made_with(self):
+        # Idea 8ff4376dcd06: Again composed the prompt anew, and compose adds
+        # what the critic learned since - the same seed on other words.
+        job, _ = self.generate([self.FINE], preset="identity", identities=["sitter"])
+        made = job.record["prompt"]
+        led = {}
+        jaw = ob("jaw", "MISMATCH", target="face", correction="a broad square jaw")
+        for n in range(3):
+            led = critic.note_picture(led, "flux-dev", ["sitter"], "", [jaw])
+        ig.save_critic_ledger(self.studio.lib, led)
+        client = FaceClient.instances[-1]             # the backend's one client, reused
+        sent = len(client.graphs)
+        jobs = self.studio.submit(ig.again(job.record))
+        settle(jobs)
+        self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+        self.assertEqual(client.graphs[sent]["10"]["inputs"]["text"], made)
+        self.assertNotIn("a broad square jaw", made)
+        self.assertFalse(any("Drawn against" in n for n in jobs[0].record["notes"]))
+        self.assertTrue(any("replayed" in n for n in jobs[0].record["notes"]))
+        # A new seed is a variation: composed afresh, with what was learned
+        # (the ledger again as it was: the replay's own clean picture is in it).
+        ig.save_critic_ledger(self.studio.lib, led)
+        sent = len(client.graphs)
+        jobs = self.studio.submit(ig.again(job.record, new_seed=True))
+        settle(jobs)
+        self.assertIn("a broad square jaw", client.graphs[sent]["10"]["inputs"]["text"])
+        # Fix a spot starts from the picture's settings, not its replayed words.
+        self.assertNotIn("replay_prompt", self.studio.fix_base(ig.again(job.record)))
+
     def test_a_mark_on_a_picture_the_critic_passed_goes_into_its_checks(self):
         made, _ = self.generate([self.FINE])
         src = made.record["images"][0]
@@ -813,6 +842,52 @@ class MemoryTest(unittest.TestCase):
         state = {"characters": {"character_a": {"jacket": "x"}}, "scene": {}, "camera": {}}
         self.assertEqual(critic.remember({}, state, ["characters.character_a.jacket"],
                                          ["a", "b"]), {})
+
+
+class KeptFileTest(unittest.TestCase):
+    """Idea 943100ef2622: a ledger or memory that would not read loaded as {}
+    and was saved over - everything the critic had learned, gone."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.lib = ig.Library(self.dir)
+        self.path = os.path.join(self.dir, ig.CRITIC_LEDGER)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_change_is_read_changed_and_written(self):
+        ig.change_kept(self.lib, ig.CRITIC_LEDGER, lambda led: dict(led, a=1))
+        ig.change_kept(self.lib, ig.CRITIC_LEDGER, lambda led: dict(led, b=2))
+        self.assertEqual(ig.load_critic_ledger(self.lib), {"a": 1, "b": 2})
+        self.assertEqual(os.listdir(self.dir), [ig.CRITIC_LEDGER])   # no temp left
+
+    def test_a_file_that_will_not_parse_is_set_aside_not_written_over(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('{"fixes": {"flux-dev": ')             # cut off
+        from unittest.mock import patch
+        with patch.object(ig.doctor, "log_error") as logged:
+            ig.change_kept(self.lib, ig.CRITIC_LEDGER, lambda led: dict(led, a=1))
+        with open(self.path + ".broken", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"fixes": {"flux-dev": ')
+        self.assertEqual(ig.load_critic_ledger(self.lib), {"a": 1})
+        self.assertIn(".broken", logged.call_args.args[0])
+
+    def test_a_file_that_will_not_open_is_left_alone(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"kept": True}, f)
+        from unittest.mock import patch
+        real = open
+
+        def held(path, *a, **k):                     # the other process has it
+            if os.path.abspath(str(path)) == os.path.abspath(self.path) and "r" in (a[:1] or ("r",))[0]:
+                raise PermissionError(13, "in use")
+            return real(path, *a, **k)
+        with patch("builtins.open", held), patch.object(ig.doctor, "log_error"):
+            ig.change_kept(self.lib, ig.CRITIC_LEDGER, lambda led: {"erased": True})
+        self.assertEqual(ig.load_critic_ledger(self.lib), {"kept": True})
+        self.assertFalse(os.path.exists(self.path + ".broken"))
 
 
 if __name__ == "__main__":

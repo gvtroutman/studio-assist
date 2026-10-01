@@ -452,6 +452,44 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertTrue(any(n.startswith("The head swap before the face swap could not run")
                             for n in job.record["notes"]), job.record["notes"])
 
+    def test_a_head_swap_failing_on_the_second_picture_keeps_the_first(self):
+        # Idea 69c4e1054c3a: the except returned every original picture, yet
+        # the first one's note, heads and licence stayed - History claimed a
+        # swap the picture lacked.
+        for failure in (ig.ComfyError("gone"), KeyError("box")):
+            with self.subTest(failure=type(failure).__name__):
+                class FailSecond(KleinClient):
+                    runs = 0
+
+                    def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                        if "h1_ks" in self.graphs[int(pid[3:]) - 1]:
+                            FailSecond.runs += 1
+                            if FailSecond.runs == 2:
+                                raise failure
+                        return super().listen_for_progress(pid, on_event, stop, timeout)
+                backend = self.backend("5090")
+                client = FailSecond(backend)
+                self.studio.inventories[backend["id"]] = client.inventory()
+                job = ig.Job(dict(ig.default_settings(), backend="5090"), backend)
+                with patch.object(ig.doctor, "log_error") as logged:
+                    out = self.studio._head_swap(
+                        job, client, {"seed": 1, "filename_prefix": "x"},
+                        [("a.png", PNG), ("b.png", PNG)],
+                        [self.studio.lib.get("identities", "person")], lambda *a: None)
+                self.assertEqual(out, [("a.png", HEAD_PNG), ("b.png", PNG)])
+                self.assertEqual(set(job.heads), {(0, "person")})
+                self.assertEqual(job.license, hs.LICENSE_NOTE)
+                # The failed run is not listed as a pass made.
+                self.assertEqual([p["label"] for p in job.passes], ["Head swap"])
+                self.assertEqual(sum(n.startswith("Head swap before the face swap: ")
+                                     for n in job.notes), 1, job.notes)
+                self.assertTrue(any("could not run" in n and "after the first 1" in n
+                                    for n in job.notes), job.notes)
+                # Only an error nobody planned for gets its traceback logged.
+                self.assertEqual(logged.called, isinstance(failure, KeyError))
+                if logged.called:
+                    self.assertIn("Traceback", logged.call_args.args[0])
+
     def test_a_backend_without_klein_swaps_the_face_alone_and_says_so(self):
         job, client, swapped = self.generate(client=FaceClient)
         self.assertEqual(job.status, "complete", job.detail)

@@ -238,12 +238,24 @@ class Reader:
         return faces
 
     def save(self):
+        """The cache to disk. A temp file of this worker's own: Rate photos
+        beside an import or Build LoRA's face find run workers at once, and
+        a shared name failed one's os.replace (WinError 5). A cache that will
+        not save is a note - the faces are read again next time - never the
+        job's failure."""
         if not self.cache_path:
             return
-        tmp = self.cache_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.cache, f)
-        os.replace(tmp, self.cache_path)
+        tmp = "%s.%d.tmp" % (self.cache_path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.cache, f)
+            os.replace(tmp, self.cache_path)
+        except OSError as exc:
+            say("The face cache was not saved (%s); its faces are read again next time." % exc)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def upright(path, with_prompt=False):
@@ -376,11 +388,13 @@ def main():
         if job.get("out"):
             os.makedirs(job["out"], exist_ok=True)
         out = run(job)
+        # Inside the try: a full disk is an ERROR, not half an answer
+        # followed by a traceback. DONE only once the file is whole.
+        with open(job["result"], "w", encoding="utf-8") as f:
+            json.dump(out, f)
     except Exception as exc:
         say("ERROR %s" % exc)
         return 1
-    with open(job["result"], "w", encoding="utf-8") as f:
-        json.dump(out, f)
     say("DONE")
     return 0
 

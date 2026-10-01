@@ -23,9 +23,12 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+import core.doctor as doctor
 
 import apps.image_studio.addons.catalog as catalog
 import apps.image_studio.addons.hub as hub
@@ -3118,6 +3121,11 @@ class ImageStudio:
         run = self.lora_build = lt.Build(spec)
         view = self.build_view = BuildView(self, run)
         backend = folders[0]
+        # Generate, Fix and Again route round it until the build ends: a FLUX
+        # loaded beside the training runs it out of VRAM.
+        self.studio.held[backend["id"]] = (
+            "%s's GPU is building %s's LoRA; send pictures there when it is done."
+            % (backend["name"], spec["person"]))
         self.say("Building %s's LoRA: preparing %d photos" % (spec["person"],
                                                               len(spec["photos"])) + ELLIPSIS)
         view.update("Freeing the GPU and finding %s's face in %d photos" % (
@@ -3160,6 +3168,7 @@ class ImageStudio:
 
         def finished(path, error):
             self.lora_build = None
+            self.studio.held.pop(backend["id"], None)
             if error:
                 text = "LoRA for %s not built: %s" % (spec["person"], error)
                 view.finish("Stopped." if run.stopped else text,
@@ -3973,12 +3982,31 @@ class NewPhotos:
         def say(text, role="muted"):
             self.owner._post("call", lambda: self.status(text, role))
 
+        def done(error):
+            self.running = False
+            if error:
+                self.status(error, "err")
+            elif self.stop.is_set():
+                self.status("Stopped.")
+            else:
+                self.status("Click the ones to keep, then Add to references.", "ok")
+
         def work():
-            error = None
+            # A round bypasses the queue, so it does for itself what a job's
+            # lane does (blend.run_job, JobQueue._work): clear LM Studio off a
+            # shared card first, free Kontext after, and always end - else
+            # `running` stays set and Make refuses until the window is reopened.
+            error, backend, client = None, None, None
             try:
                 backend, why = sb.route(studio)
                 if backend is None:
                     raise ig.ComfyError(why)
+                if backend.get("shares_llm_gpu") and studio.make_room is not None:
+                    say("Clearing LM Studio off the GPU" + ELLIPSIS)
+                    try:
+                        studio.make_room(backend)
+                    except Exception as e:
+                        say("Could not clear the shared GPU (%s); this may be slow." % e)
                 client = studio.client(backend)
                 names = {p: client.upload_image(p) for p in self.parents}
                 size = sb.size_for(self.parents[0])
@@ -4005,16 +4033,17 @@ class NewPhotos:
                     self.owner._post("call", lambda p=path, l=label: self.arrived(p, l))
             except (ig.ComfyError, OSError) as e:
                 error = str(e)
-
-            def done():
-                self.running = False
-                if error:
-                    self.status(error, "err")
-                elif self.stop.is_set():
-                    self.status("Stopped.")
-                else:
-                    self.status("Click the ones to keep, then Add to references.", "ok")
-            self.owner._post("call", done)
+            except Exception as e:
+                error = "%s: %s" % (type(e).__name__, e)
+                doctor.log_error("Image Studio %s round:\n%s" % (self.mode, traceback.format_exc()))
+            finally:
+                try:
+                    if client is not None and backend.get("release_vram") \
+                            and not studio.queue.load().get(backend["id"]):
+                        client.free()
+                except Exception:
+                    pass              # a free is housekeeping; the round is what counts
+                self.owner._post("call", lambda: done(error))
         self.owner.host._spawn(self.owner.s.event_id, work)
 
     def arrived(self, path, label):

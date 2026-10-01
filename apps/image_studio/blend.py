@@ -357,6 +357,10 @@ def route(studio, settings=None):
     for b in order:
         if b is None or not b.get("enabled"):
             continue
+        held = getattr(studio, "held", {}).get(b["id"])
+        if held:                      # Build LoRA has its GPU
+            why.append(held.rstrip("."))
+            continue
         if not (studio.health.get(b["id"]) or {}).get("ok"):
             studio.check(b)
         if not (studio.health.get(b["id"]) or {}).get("ok"):
