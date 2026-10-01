@@ -75,8 +75,7 @@ class TerminalsView:
         self.text = tk.Text(body, font=h.f_mono, wrap="none", bd=0, padx=12, pady=10,
                             state="disabled", highlightthickness=0,
                             yscrollcommand=ybar.set, xscrollcommand=xbar.set)
-        h._skin(self.text, bg="card", fg="text", selectbackground="sel",
-                insertbackground="text")
+        h._selectable(h._skin(self.text, bg="card", fg="text", insertbackground="text"))
         self.text.pack(side="left", fill="both", expand=True)
         ybar.config(command=self.text.yview)
         xbar.config(command=self.text.xview)

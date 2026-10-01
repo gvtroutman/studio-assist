@@ -19,6 +19,7 @@ import threading
 import time
 import logging
 import tkinter as tk
+import types
 import unittest
 import urllib.error
 
@@ -1824,6 +1825,12 @@ class TestPrefs(unittest.TestCase):
         self.assertEqual(deep["accent_fg"], "#ffffff")
         self.assertNotEqual(deep["accent_dk"], deep["accent"])
         self.assertEqual(ui.palette("light", "nope")["accent"], ui.LIGHT["accent"])
+        # The text highlight is the accent faded into the page: the themes'
+        # own, and a picked accent's.
+        for name, p in ui.THEMES.items():
+            with self.subTest(theme=name):
+                self.assertEqual(p["hilite"], ui.blend(p["accent"], p["bg"], 0.6))
+        self.assertEqual(deep["hilite"], ui.blend("#2255aa", ui.LIGHT["bg"], 0.6))
 
 
 class TestErrorLog(unittest.TestCase):
@@ -4727,6 +4734,84 @@ class TestGui(unittest.TestCase):
             self.app.update()
             with self.subTest(tab=sid):
                 self.assertTrue(self.app.btn_log.winfo_ismapped())
+
+    def _transcript(self):
+        s = next(s for s in self.app.sessions.values() if s.view is not None)
+        self.app._select(s.id)
+        self.app._write(s, "A reply worth keeping for later.\n", "asst")
+        for _ in range(5):
+            self.app.update()
+        return s, s.view
+
+    def test_a_reply_can_be_highlighted_and_copied(self):
+        """Dragging over a reply selects it in a colour that can be seen -
+        `sel` was nearly the page in Light, under white text - and Ctrl+C
+        puts it on the clipboard."""
+        s, v = self._transcript()
+        self.assertEqual(v.cget("cursor"), "xterm")
+        self.assertEqual(str(v.cget("selectbackground")), self.app.C["hilite"])
+        self.assertEqual(str(v.cget("selectforeground")), self.app.C["text"])
+        start = v.search("A reply worth", "1.0")
+        end = "%s+7c" % start
+        v.see(start)
+        self.app.update()
+        (x0, y0, _w, h0), (x1, y1, _w1, _h1) = v.bbox(start), v.bbox(end)
+        v.event_generate("<Button-1>", x=x0 + 1, y=y0 + h0 // 2)
+        v.event_generate("<B1-Motion>", x=x1 + 1, y=y1 + h0 // 2)
+        v.event_generate("<ButtonRelease-1>", x=x1 + 1, y=y1 + h0 // 2)
+        self.app.update()
+        self.assertEqual(v.get("sel.first", "sel.last"), "A reply")
+        self.app.clipboard_clear()
+        v.event_generate("<<Copy>>")
+        self.assertEqual(self.app.clipboard_get(), "A reply")
+        v.tag_remove("sel", "1.0", "end")
+
+    def test_right_click_offers_copy_and_select_all(self):
+        s, v = self._transcript()
+        posted = []
+        real = tk.Menu.tk_popup
+        tk.Menu.tk_popup = lambda menu, x, y, entry="": posted.append(menu)
+        self.addCleanup(setattr, tk.Menu, "tk_popup", real)
+        v.event_generate("<Button-3>", x=5, y=5)
+        menu = posted[-1]
+        labels = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+        self.assertEqual(labels, ["Copy", "Select all"])
+        self.assertEqual(menu.entrycget(0, "state"), "disabled")   # nothing selected yet
+        menu.invoke(1)
+        self.assertEqual(v.get("sel.first", "sel.last"), v.get("1.0", "end-1c"))
+        v.event_generate("<Button-3>", x=5, y=5)
+        self.assertEqual(posted[-1].entrycget(0, "state"), "normal")
+        self.app.clipboard_clear()
+        posted[-1].invoke(0)
+        self.assertIn("A reply worth keeping for later.", self.app.clipboard_get())
+        v.tag_remove("sel", "1.0", "end")
+        v.event_generate("<Control-a>")                 # Tk's own is start-of-line
+        self.assertEqual(v.get("sel.first", "sel.last"), v.get("1.0", "end-1c"))
+        v.tag_remove("sel", "1.0", "end")
+
+    def test_typing_in_the_transcript_goes_to_the_composer(self):
+        """A click to select leaves the transcript focused; the next key typed
+        is still the start of a message. Ctrl+C stays with the transcript."""
+        s, v = self._transcript()
+        self.app.input.delete("1.0", "end")
+        self.addCleanup(self.app.input.delete, "1.0", "end")
+        key = types.SimpleNamespace
+        self.assertEqual(self.app._type_to_composer(key(state=0, char="h")), "break")
+        self.assertEqual(self.app.input.get("1.0", "end-1c"), "h")
+        self.assertIsNone(self.app._type_to_composer(key(state=0x4, char="\x03")))
+        self.assertIsNone(self.app._type_to_composer(key(state=0, char="")))
+        self.assertEqual(self.app.input.get("1.0", "end-1c"), "h")
+
+    def test_the_highlight_follows_a_theme_switch(self):
+        s, v = self._transcript()
+        was = self.app.prefs.get("theme")
+        self.addCleanup(self.app._theme, was)
+        for name in ("dark", "light"):
+            self.app._theme(name)
+            with self.subTest(theme=name):
+                self.assertEqual(str(v.cget("selectbackground")), self.app.C["hilite"])
+                self.assertEqual(str(self.app.input.cget("selectbackground")),
+                                 self.app.C["hilite"])
 
 
 class TestSingleInstance(unittest.TestCase):

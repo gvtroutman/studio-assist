@@ -53,7 +53,7 @@ class ChatDiagnosticsMixin:
             view = tk.Text(win, font=self.f_body, wrap="word", bd=0, padx=18,
                            pady=14, yscrollcommand=bar.set, state="disabled",
                            cursor="arrow", highlightthickness=0)
-            self._skin(view, bg="bg", fg="text", selectbackground="sel")
+            self._selectable(self._skin(view, bg="bg", fg="text"))
             view.pack(side="left", fill="both", expand=True)
             bar.config(command=view.yview)
             self._diag_tags(view)
