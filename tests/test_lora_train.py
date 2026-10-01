@@ -54,8 +54,9 @@ class PlanTests(unittest.TestCase):
                 'vae': 'V', 'resolution': 512}
         proc = lt.config(spec)['config']['process'][0]
         self.assertEqual((proc['model']['arch'], proc['model']['name_or_path'],
-                          proc['model']['vae_path']), ('flux2_klein_4b', 'B', 'V'))
+                          proc['model']['vae_path']), ('flux2_klein_9b', 'B', 'V'))
         self.assertFalse(proc['model']['quantize'])
+        self.assertTrue(proc['model']['quantize_te'])     # Qwen3-8B beside the 9B on 32 GB
         self.assertEqual(proc['train']['steps'], 750)
         self.assertEqual(proc['datasets'][0]['resolution'], [512])
         self.assertEqual(proc['datasets'][0]['folder_path'], os.path.join('W', 'dataset'))
@@ -69,7 +70,7 @@ class PlanTests(unittest.TestCase):
             exe.parent.mkdir(parents=True)
             exe.write_bytes(b'')
             Path(d, 'run.py').write_text('')
-            self.assertIn('flux-2-klein-base-4b', lt.problem(d))
+            self.assertIn('flux-2-klein-base-9b', lt.problem(d))
             self.assertIn('prepare_klein_lora', lt.problem(d))
             for part in lt.parts(d)[:-1]:
                 Path(part).parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +144,7 @@ class BuildTests(unittest.TestCase):
             self.assertIn(('faces', (15, 18)), seen)
             record = lt.lora_record(spec)
             self.assertIn('Built from 18 photos (15 cut to the head)', record['notes'])
-            self.assertEqual((record['family'], record['trigger']), ('flux2', 't'))
+            self.assertEqual((record['family'], record['trigger']), ('flux2-klein9b', 't'))
 
 
 class WorkerTests(unittest.TestCase):
@@ -297,7 +298,7 @@ class ButtonTests(unittest.TestCase):
             studio._attach_lora(spec, editor)
             rec = lib.lora_by_file('partner_head_klein_x.safetensors')
             self.assertEqual((rec['category'], rec['family'], rec['trigger']),
-                             ('Identity', 'flux2', 'lilperson'))
+                             ('Identity', 'flux2-klein9b', 'lilperson'))
             saved = ig.Library(os.path.join(d, 'lib')).get('identities', 'partner')
             self.assertEqual(saved['head_lora'], rec['id'])
             # The picture's own identity LoRA and trigger are left as they were.

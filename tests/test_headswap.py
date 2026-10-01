@@ -23,6 +23,19 @@ class TestHeadSwapParts(unittest.TestCase):
         # An inventory never read is a backend that cannot, not one that may.
         self.assertEqual(hs.lacks(None), [hs.KLEIN])
 
+    def test_a_klein_9b_lora_is_known_by_its_name_and_fits_only_the_9b(self):
+        self.assertEqual(ig.guess_family("partner_klein-9b_head.safetensors"), hs.FAMILY)
+        self.assertEqual(ig.guess_family("flux-2-klein-4b-lora.safetensors"), "flux2")
+        self.assertIs(ig.compatibility("flux2", hs.FAMILY), False)
+        self.assertIs(ig.compatibility(hs.FAMILY, hs.FAMILY), True)
+
+    def test_a_licence_is_written_into_a_png_and_nothing_else(self):
+        out = ig.png_text(PNG, "Comment", "Not for commercial use.")
+        self.assertEqual(out[:8], PNG[:8])
+        self.assertIn(b"tEXtComment\0Not for commercial use.", out)
+        self.assertLess(out.index(b"tEXt"), out.index(b"IDAT") if b"IDAT" in out else len(out))
+        self.assertEqual(ig.png_text(b"\xff\xd8 jpeg", "Comment", "x"), b"\xff\xd8 jpeg")
+
     def test_each_head_is_the_face_facefusion_will_swap(self):
         with patch.object(hs.os.path, "isfile", return_value=True):
             small, big, right = (100, 100, 40, 40), (300, 100, 90, 100), (700, 100, 60, 60)
@@ -132,10 +145,13 @@ class TestHeadSwapParts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             lib = ig.Library(d)
             rec, _ = lib.import_lora({"file": "p_head.safetensors", "name": "P head",
-                                      "category": "Identity", "family": "flux2",
+                                      "category": "Identity", "family": "flux2-klein9b",
                                       "trigger": "pperson", "strength": 1.0})
             other, _ = lib.import_lora({"file": "p_flux1.safetensors", "name": "P flux",
                                         "category": "Identity", "family": "flux1"})
+            # Made for Klein 4B by Build LoRA before 2026-10-01: not the 9B's shape.
+            four, _ = lib.import_lora({"file": "p_head_4b.safetensors", "name": "P 4B",
+                                       "category": "Identity", "family": "flux2"})
             p = {"name": "P", "head_lora": rec["id"]}
             inv = {"loras": {"p_head.safetensors"}}
             self.assertEqual(ig.head_lora(lib, p, "5090", inv),
@@ -144,7 +160,9 @@ class TestHeadSwapParts(unittest.TestCase):
             self.assertEqual(ig.head_lora(lib, {"name": "P"}, "5090", inv), ({}, None))
             for profile, inventory, why in (
                     (dict(p, head_lora="gone"), inv, "not in the LoRA library"),
-                    (dict(p, head_lora=other["id"]), inv, "not FLUX.2 Klein"),
+                    (dict(p, head_lora=other["id"]), inv, "not FLUX.2 Klein 9B"),
+                    (dict(p, head_lora=four["id"]), inv,
+                     "is for FLUX.2, not FLUX.2 Klein 9B: rebuild it with Build LoRA"),
                     (p, {"loras": set()}, "not on this backend")):
                 own, note = ig.head_lora(lib, profile, "5090", inventory)
                 self.assertEqual(own, {})
@@ -252,7 +270,11 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(swapped, [HEAD_PNG])
         self.assertIn("Head swap", [p["label"] for p in job.record["passes"]])
         self.assertIn("Head swap before the face swap: Person's head redrawn from their "
-                      "photo by FLUX.2 Klein.", job.record["notes"])
+                      "photo by FLUX.2 Klein 9B.", job.record["notes"])
+        # The 9B's licence goes with the picture: on its record and in the file.
+        self.assertEqual(job.record["license"], hs.LICENSE_NOTE)
+        with open(job.record["images"][0], "rb") as f:
+            self.assertIn(b"tEXtComment\0" + hs.LICENSE_NOTE.encode("latin-1"), f.read())
         self.assertIn(("head_swap", "Head swap"), ig.pipeline_stages(self.studio.lib, job.settings))
         # The checkpoint kept before the faces is the picture as it was generated.
         kept = [r for r in self.studio.history.list() if r["id"].endswith("-generated")]
@@ -261,7 +283,7 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
     def test_the_persons_head_lora_draws_their_head_and_stays_out_of_the_picture(self):
         rec, _ = self.studio.lib.import_lora({
             "file": "person_head_klein.safetensors", "name": "Person head",
-            "category": "Identity", "family": "flux2", "trigger": "perperson",
+            "category": "Identity", "family": "flux2-klein9b", "trigger": "perperson",
             "strength": 1.0})
         self.studio.lib.save("loras")
         ident = self.studio.lib.get("identities", "person")
@@ -280,7 +302,7 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(head["h1_guide"]["inputs"]["model"], ["h1_lora", 0])
         self.assertIn("the head of perperson", head["h1_text"]["inputs"]["text"])
         self.assertIn("Head swap before the face swap: Person's head (with their head LoRA) "
-                      "redrawn from their photo by FLUX.2 Klein.", job.record["notes"])
+                      "redrawn from their photo by FLUX.2 Klein 9B.", job.record["notes"])
         # A Klein LoRA is the head swap's alone: never in the picture's own stack.
         self.assertNotIn("person_head_klein", json.dumps(client.graphs[0]))
         self.assertNotIn("perperson", json.dumps(client.graphs[0]))
@@ -316,6 +338,10 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(swapped, [PNG])
         self.assertFalse(any("head swap" in n.lower() for n in job.record["notes"]),
                          job.record["notes"])
+        # No Klein 9B in the picture, so no licence on it.
+        self.assertEqual(job.record["license"], "")
+        with open(job.record["images"][0], "rb") as f:
+            self.assertNotIn(b"tEXt", f.read())
         self.assertNotIn(("head_swap", "Head swap"),
                          ig.pipeline_stages(self.studio.lib, job.settings))
 

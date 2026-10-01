@@ -14,17 +14,30 @@ BFS on Qwen-Image-Edit 0.03, Klein alone 0.23-0.35, inswapper_128 alone
 0.78-0.81, Klein then inswapper_128 0.77-0.85 - and a sharper face than
 inswapper's alone. inswapper was trained on the ArcFace that scores it, so
 its numbers flatter it; the user judged the pictures ("klein with inswapper
-seems to work well enough"). About 4 s a head on the 5090. The seed matters:
-one close-up scored 0.23 and 0.35 on two seeds.
+seems to work well enough"). The seed matters: one close-up scored 0.23 and
+0.35 on two seeds.
+
+Klein 9B since 2026-10-01 (the user: "id would like to try flux klein 9B", then
+the 4B removed). On the 12 stranger pictures of Partner's LoRA bench, with no
+LoRA: 4B 0.386 (3 of 12 at 0.5 or more), 9B 0.555 (8 of 12); her 4B LoRA
+0.647. After the face swap 0.849 / 0.860 / 0.875. By eye the 9B keeps the
+picture's expression, clothes and light where the 4B pasted in the photo's
+smile and top. About 8 s a head on the 5090. The 9B is under the FLUX
+Non-Commercial License, so every picture it touched says so (`LICENSE_NOTE`).
 """
 import os
 
 import apps.image_studio.facefusion as facefusion
 
-KLEIN = "flux-2-klein-4b.safetensors"     # Apache 2.0; the 9B is non-commercial and gated
+KLEIN = "flux-2-klein-9b-fp8.safetensors"   # black-forest-labs/FLUX.2-klein-9b-fp8, gated
 FILES = {"diffusion_models": [KLEIN],
-         "text_encoders": ["qwen_3_4b.safetensors"],     # Z-Image's encoder, as type flux2
+         "text_encoders": ["qwen_3_8b_fp8mixed.safetensors"],   # Comfy-Org/flux2-klein-9B
          "vae": ["flux2-vae.safetensors"]}
+# The library's family for a LoRA this Klein takes (`imagegen.FAMILIES`): a
+# 4B LoRA ("flux2") does not fit the 9B's layers.
+FAMILY = "flux2-klein9b"
+LICENSE_NOTE = ("Made in part with FLUX.2 [klein] 9B (the head swap), under the FLUX "
+                "Non-Commercial License: not for commercial use.")
 NODES = {"ReferenceLatent", "Flux2Scheduler", "EmptyFlux2LatentImage", "CFGGuider",
          "SamplerCustomAdvanced", "RandomNoise", "KSamplerSelect", "ImageScaleToTotalPixels",
          "ImageCropV2", "ImageCompositeMasked", "SAM3_Detect", "ColorTransfer"}
