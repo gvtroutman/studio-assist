@@ -1249,7 +1249,17 @@ base64 float16). Two uses:
   30 starred, best first with a bonus for a head angle the set has few of
   (`ANGLES`, left/right as seen in the picture). Each tile shows "★ 91" /
   "64" / "duplicate · 80" / "0 · left out"; hovering it puts `faces.detail`
-  in the status. Remove duplicates rates first if it must, asks, and takes
+  in the status. A rating then sorts the list (`faces.best_first`; the user: "it
+  should auto sort them for the best pic to set as the primary"): Primary is
+  the best-scoring front view (it is the face a picture is matched to), else
+  the best of any angle; then the usable photos best first, the duplicates,
+  the left-out ones - so this rating does not protect the old Primary
+  (`rate(keep_first=False)`). Save keeps the order. A person's tiles are
+  `IDENTITY_TILE` 220 px, unscaled ("can you make the thumbnails larger"):
+  their previews are 220 px and Tk shrinks only by whole factors, so the old
+  110-px tile showed them at half; the identity editor opens wide enough for
+  four a row and `_refit_paths` redraws on a resize when a row fits more or
+  fewer (`_path_cols`). Remove duplicates rates first if it must, asks, and takes
   the twins out of the list only (files stay; Save keeps it). Live on
   Partner's 135: 17 s cold, 1 s cached; 43 duplicates (by eye, all bursts or
   one face re-backgrounded), 12 left out, scores 57-100, 30 starred over all

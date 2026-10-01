@@ -44,6 +44,7 @@ import apps.image_studio.scene.pose as sp
 import apps.image_studio.scene.ui as studio_scene_ui
 
 THUMB = 72                    # px, before the display's scale
+IDENTITY_TILE = 220           # px, not scaled: a person's photo previews are 220 px
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
 CAMERA_CARD = 150             # px, the Shot on card's long edge, before the display's scale
 HISTORY_PAGE = 40
@@ -3908,7 +3909,13 @@ class RecordEditor:
         win.title(title)
         win.transient(host)
         host._skin(win, bg="bg")
-        win.geometry("%dx%d" % (host._px(820), host._px(620)))
+        if kind == "identities":         # room for four big photo tiles a row
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry("%dx%d" % (min(host._px(300) + 4 * (IDENTITY_TILE + host._px(10))
+                                        + host._px(60), int(sw * 0.9)),
+                                    min(host._px(820), int(sh * 0.85))))
+        else:
+            win.geometry("%dx%d" % (host._px(820), host._px(620)))
         left = owner.frame(win)
         left.pack(side="left", fill="y", padx=owner.px(12), pady=owner.px(12))
         self.lb = tk.Listbox(left, width=30, bd=0, highlightthickness=0, activestyle="none",
@@ -4059,6 +4066,12 @@ class RecordEditor:
                 pics = {"paths": list(val or []), "sel": set(), "grid": o.frame(parent)}
                 pics["grid"].pack(side="top", fill="x")
                 self._draw_paths(pics)
+                if self.kind == "identities":
+                    self._tile_pics = pics          # the form's own; refit on resize
+                    if not getattr(self, "_refit_bound", False):
+                        self._refit_bound = True
+                        self.form.bind("<Configure>",
+                                       lambda ev: self._refit_paths(self._tile_pics), add="+")
                 row = o.frame(parent)
                 row.pack(side="top", fill="x", pady=(o.px(4), 0))
                 o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
@@ -4141,12 +4154,19 @@ class RecordEditor:
         if path:
             var.set(path)
 
-    def _draw_paths(self, pics, cols=4):
+    def _draw_paths(self, pics, cols=None):
         """The photos of a `paths` field as a grid of tiles; the selected ones
         framed in the accent colour. Tk previews PNG and GIF only, so any
-        other file shows as its name on a blank tile."""
+        other file shows as its name on a blank tile. A person's photos are
+        big (`IDENTITY_TILE`: their 220 px previews whole - Tk shrinks only
+        by whole factors, so a smaller tile halved them to 110), as many to
+        a row as the form is wide."""
         o, host = self.owner, self.owner.host
-        grid, side = pics["grid"], o.px(110)
+        grid = pics["grid"]
+        side = IDENTITY_TILE if self.kind == "identities" else o.px(110)
+        if cols is None:
+            cols = self._path_cols(side) if self.kind == "identities" else 4
+        pics["cols"] = cols
         for w in grid.winfo_children():
             w.destroy()
         if not pics["paths"]:
@@ -4186,6 +4206,21 @@ class RecordEditor:
             for w in hits:
                 w.bind("<Button-1>", lambda ev, i=i: self._toggle_path(pics, i))
 
+    def _path_cols(self, side):
+        """How many tiles of `side` px fit the form's width (4 before it is
+        laid out)."""
+        width = self.form.winfo_width() if hasattr(self, "form") else 1
+        if width <= 1:
+            return 4
+        return max(2, (width - self.owner.px(24)) // (side + self.owner.px(10)))
+
+    def _refit_paths(self, pics):
+        """On a resize: redraw the tiles when a row now fits more or fewer."""
+        if not pics["grid"].winfo_exists():
+            return
+        if self._path_cols(IDENTITY_TILE) != pics.get("cols"):
+            self._draw_paths(pics)
+
     def _toggle_path(self, pics, i):
         pics["sel"] ^= {i}
         self._draw_paths(pics)
@@ -4218,10 +4253,16 @@ class RecordEditor:
                 return
             if error:
                 return self.status("Rating failed: %s" % error, "err")
-            rated = face_finder.rate(found, paths)
+            rated = face_finder.rate(found, paths, keep_first=False)
             pics.setdefault("ratings", {}).update(rated)
+            # Best first, the best front view as Primary; photos added or
+            # missing since the rating began keep their place at the end.
+            ranked = [p for p in face_finder.best_first(rated, paths) if p in pics["paths"]]
+            pics["paths"] = ranked + [p for p in pics["paths"] if p not in rated]
+            pics["sel"] = set()
             self._draw_paths(pics)
-            self.status(face_finder.summary(rated))
+            self.status(face_finder.summary(rated) + " Sorted best first; the best front "
+                        "view is Primary. Save keeps the order.")
             if then is not None:
                 then(rated)
 
