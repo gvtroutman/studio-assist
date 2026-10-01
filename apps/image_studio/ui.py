@@ -455,6 +455,7 @@ class ImageStudio:
         self.adv_open = False
         self.scene_builder = None     # the Scene Builder window, while it is open
         self.lora_build = None        # the identity LoRA being trained (lt.Build)
+        self.build_view = None        # its window (BuildView), kept after it ends
         self._build(session.frame)
         for problem in self.studio.lib.problems:
             self.say(problem, "warn")
@@ -3024,17 +3025,12 @@ class ImageStudio:
     def build_lora(self, editor):
         """The person's saved photos -> their own FLUX.2 Klein LoRA of their
         head (`lora_train`), trained by ai-toolkit on this PC's GPU in the
-        background. One build at a time; a second click offers to stop it.
+        background, its progress in a window of its own (`BuildView`). One
+        build at a time; a second click shows that window, which can stop it.
         When done, the file goes into this PC's LoRA folder, joins the
         library, and becomes the person's head swap LoRA (`head_lora`)."""
-        run = self.lora_build
-        if run is not None:
-            n, total = run.step
-            if messagebox.askyesno("Build LoRA", "A LoRA for %s is being built (step %d of "
-                                   "%d). Stop it?" % (run.spec["person"], n, total),
-                                   parent=editor.win):
-                run.stop()
-            return
+        if self.lora_build is not None:
+            return self.build_view.show()
         if editor.current is None:
             return
         w = editor.widgets.get("references")
@@ -3070,51 +3066,60 @@ class ImageStudio:
                     spec["person"], spec["trigger"]), parent=editor.win):
             return
         run = self.lora_build = lt.Build(spec)
+        view = self.build_view = BuildView(self, run)
         backend = folders[0]
         self.say("Building %s's LoRA: preparing %d photos" % (spec["person"],
                                                               len(spec["photos"])) + ELLIPSIS)
-        editor.status("LoRA build started; progress shows under Generate.")
+        view.update("Freeing the GPU and finding %s's face in %d photos" % (
+            spec["person"], len(spec["photos"])) + ELLIPSIS)
+        view.show()
+        editor.status("LoRA build started; Build LoRA shows its progress again.")
 
         left = [0]
 
+        def say(text, role="muted", fraction=None):
+            """A line under Generate and the window's words, from the worker."""
+            self._post("said", ("Building %s's LoRA: %s" % (spec["person"], text), role))
+            self._post("call", lambda: view.update(text[:1].upper() + text[1:], fraction, role))
+
         def progress(kind, value):
             if kind == "finding":
-                self._post("said", ("Building %s's LoRA: finding their face, photo %d of %d"
-                                    % (spec["person"], value[0], value[1]), "muted"))
+                say("finding their face, photo %d of %d" % value, fraction=value[0] / value[1])
             elif kind == "finder":
-                self._post("said", ("Building %s's LoRA: their face could not be looked for "
-                                    "(%s); the biggest face in each photo is used." % (
-                                        spec["person"], value), "warn"))
+                say("their face could not be looked for (%s); the biggest face in each "
+                    "photo is used." % value, "warn")
             elif kind == "left":
                 left[0] = value[0]
                 if value[0]:
-                    self._post("said", ("Building %s's LoRA: they were not found in %d of %d "
-                                        "photos; those are left out." % (
-                                            spec["person"], value[0], value[1]), "warn"))
+                    say("they were not found in %d of %d photos; those are left out."
+                        % value, "warn")
             elif kind == "kept" and value[0] + left[0] < value[1]:
-                self._post("said", ("Building %s's LoRA: %d of %d photos could not be read; "
-                                    "training on the other %d." % (
-                                        spec["person"], value[1] - value[0] - left[0],
-                                        value[1], value[0]), "warn"))
+                say("%d of %d photos could not be read; training on the other %d." % (
+                    value[1] - value[0] - left[0], value[1], value[0]), "warn")
             elif kind == "faces" and value[0] < value[1]:
-                self._post("said", ("Building %s's LoRA: no face found in %d of %d photos; "
-                                    "those train whole." % (
-                                        spec["person"], value[1] - value[0], value[1]), "muted"))
+                say("no face found in %d of %d photos; those train whole."
+                    % (value[1] - value[0], value[1]))
             elif kind == "step":
                 n, total = value
-                left = lt.eta(run.started, n, total) if run.started else ""
-                text = ("Building %s's LoRA: step %d of %d" % (spec["person"], n, total)
-                        + (" · " + left if left else ""))
-                self._post("said", (text, "muted"))
+                if n == 0:
+                    return say("loading Klein 9B and its text encoder (a few minutes "
+                               "before step 1)" + ELLIPSIS, fraction=0.0)
+                rest = lt.eta(run.started, n, total) if run.started else ""
+                say("step %d of %d" % (n, total) + (" · " + rest if rest else ""),
+                    fraction=n / total)
 
         def finished(path, error):
             self.lora_build = None
             if error:
-                return self.say("LoRA for %s not built: %s" % (spec["person"], error),
-                                "muted" if run.stopped else "err")
+                text = "LoRA for %s not built: %s" % (spec["person"], error)
+                view.finish("Stopped." if run.stopped else text,
+                            "muted" if run.stopped else "err")
+                return self.say(text, "muted" if run.stopped else "err")
             self._attach_lora(spec, editor)
-            self.say("%s's head LoRA is ready and set as their head swap LoRA (%s)."
-                     % (spec["person"], os.path.basename(path)), "ok")
+            text = ("%s's head LoRA is ready and set as their head swap LoRA (%s)."
+                    % (spec["person"], os.path.basename(path)))
+            view.finish(text, "ok")
+            self.say(text, "ok")
             self.refresh_backends()      # ComfyUI's LoRA list now has the file
 
         def work():
@@ -3680,6 +3685,130 @@ class BlendWindow:
                     "Blend again for another.", "ok")
         o._show_list("queue")
         o.host._spawn(o.s.event_id, o._submit, s)
+
+
+class BuildView:
+    """Build LoRA's window, one per build (`ImageStudio.build_view`): what the
+    build is doing in words, a bar, and the last lines ai-toolkit wrote to its
+    train.log, read once a second - the worker itself reports only photo
+    counts and steps, and Klein loads and quantizes for minutes before step
+    1. Closing the window leaves the build running; Build LoRA shows it again
+    (`show`), from the state kept here. Stop asks first."""
+    POLL = 1000                   # ms between reads of train.log
+
+    def __init__(self, owner, run):
+        self.owner, self.run = owner, run
+        self.text, self.role, self.fraction = "Starting" + ELLIPSIS, "muted", 0.0
+        self.over = False
+        self.win = None
+        self.shown = None             # the log lines on screen
+        self.ticking = False          # a read of the log is scheduled
+
+    def alive(self):
+        return self.win is not None and self.win.winfo_exists()
+
+    def show(self):
+        if self.alive():
+            self.win.deiconify()
+            self.win.lift()
+            return
+        o, host = self.owner, self.owner.host
+        win = self.win = tk.Toplevel(host)
+        win.title("Build LoRA - %s" % self.run.spec["person"])
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(680), host._px(400)))
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(14), pady=(0, o.px(12)))
+        o.button(foot, "Close", win.destroy).pack(side="right")
+        self.stop_button = o.button(foot, "Stop build", self.stop, kind="ghost")
+        if not self.over:
+            self.stop_button.pack(side="right", padx=(0, o.px(4)))
+        o.button(foot, "Open folder", self.open_folder, kind="ghost").pack(side="left")
+        body = o.frame(win)
+        body.pack(side="top", fill="both", expand=True, padx=o.px(14), pady=(o.px(12), o.px(8)))
+        o.label(body, "%s's head LoRA" % self.run.spec["person"], "text",
+                host.f_title).pack(side="top", anchor="w")
+        self.head = o.label(body, "", "muted", host.f_ui, wraplength=o.px(640))
+        self.head.pack(side="top", fill="x", pady=(o.px(4), o.px(8)))
+        self.bar = tk.Canvas(body, height=o.px(8), highlightthickness=0, bd=0)
+        o.skin(self.bar, bg="bg")
+        self.bar.pack(side="top", fill="x")
+        self.bar.bind("<Configure>", lambda ev: self._paint())
+        o.label(body, "ai-toolkit's log (train.log)", "faint", host.f_small).pack(
+            side="top", anchor="w", pady=(o.px(12), o.px(2)))
+        self.log = tk.Text(body, height=10, wrap="none", bd=0, highlightthickness=0,
+                           font=host.f_mono, padx=o.px(6), pady=o.px(4))
+        o.skin(self.log, bg="card", fg="code")
+        self.log.pack(side="top", fill="both", expand=True)
+        self.shown = None
+        self._paint()
+        self.poll()
+
+    def update(self, text, fraction=None, role="muted"):
+        """New words for the build, and the bar's share of the current stage."""
+        self.text, self.role = text, role
+        if fraction is not None:
+            self.fraction = max(0.0, min(1.0, fraction))
+        self._paint()
+
+    def finish(self, text, role):
+        self.over = True
+        self.update(text, 1.0 if role == "ok" else None, role)
+        if role == "err":
+            self.show()               # the log is what says why
+        if self.alive():
+            self.stop_button.pack_forget()
+            self.poll()
+
+    def _paint(self):
+        if not self.alive():
+            return
+        self.head.config(text=self.text)
+        self.owner.skin(self.head, bg="bg", fg=self.role)
+        C, bar = self.owner.host.C, self.bar
+        bar.delete("all")
+        w, h = bar.winfo_width(), bar.winfo_height()
+        bar.create_rectangle(0, 0, w, h, fill=C["border"], width=0)
+        fill = C["err"] if self.role == "err" else C["ok"] if self.role == "ok" else C["accent"]
+        bar.create_rectangle(0, 0, int(w * self.fraction), h, fill=fill, width=0)
+
+    def poll(self):
+        """The log now, and again in a second while the build runs and the
+        window is open - one chain of reads, however often it is reopened."""
+        if not self.alive():
+            return
+        lines = lt.log_tail(os.path.join(self.run.spec["work"], "train.log")) or [
+            "Nothing yet: ai-toolkit starts once the photos are cut to the head."]
+        if lines != self.shown:
+            self.shown = lines
+            self.log.config(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.insert("end", "\n".join(lines))
+            self.log.see("end")
+            self.log.config(state="disabled")
+        if not self.over and not self.ticking:
+            self.ticking = True
+            # On the main window: one scheduled on `win` is a dead Tcl command
+            # once the window is closed, and Tk says so on stderr.
+            self.owner.host.after(self.POLL, self._tick)
+
+    def _tick(self):
+        self.ticking = False
+        self.poll()
+
+    def open_folder(self):
+        work = self.run.spec["work"]
+        if os.path.isdir(work):
+            os.startfile(work)            # noqa - Windows only, like the rest of the app
+
+    def stop(self):
+        if self.over or not messagebox.askyesno(
+                "Build LoRA", "Stop building %s's LoRA? What it has trained so far is "
+                "thrown away." % self.run.spec["person"], parent=self.win):
+            return
+        self.run.stop()
+        self.update("Stopping" + ELLIPSIS)
 
 
 class NewPhotos:

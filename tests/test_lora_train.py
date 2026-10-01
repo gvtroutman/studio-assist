@@ -80,6 +80,24 @@ class PlanTests(unittest.TestCase):
             Path(lt.vae(d)).touch()
             self.assertIsNone(lt.problem(d))
 
+    def test_the_log_tail_shows_each_progress_bar_once_at_its_latest(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, 'train.log')
+            self.assertEqual(lt.log_tail(log), [])            # not written yet
+            Path(log).write_bytes(
+                b'Loading Flux2 model\nLoading Qwen3\n\n'
+                b'Loading weights:   0%|          | 0/399\r'
+                b'Loading weights: 100%|##########| 399/399\n'
+                b'Quantizing (qfloat8)\n\x1b[32m - quantizing 36 blocks\x1b[0m\n'
+                b'  3%|3         | 1/36\n  6%|6         | 2/36\n 89%|######### | 32/36\n')
+            self.assertEqual(lt.log_tail(log), [
+                'Loading Flux2 model', 'Loading Qwen3',
+                'Loading weights: 100%|##########| 399/399',
+                'Quantizing (qfloat8)', ' - quantizing 36 blocks',
+                ' 89%|######### | 32/36'])
+            self.assertEqual(lt.log_tail(log, lines=2),
+                             [' - quantizing 36 blocks', ' 89%|######### | 32/36'])
+
     def test_lines_and_time_left(self):
         self.assertEqual(lt.parse('STEP 12 2000\n'), ('step', (12, 2000)))
         self.assertEqual(lt.parse('KEPT 18 20'), ('kept', (18, 20)))
@@ -126,6 +144,23 @@ class BuildTests(unittest.TestCase):
             with self.fake(d, "print('ERROR out of memory'); raise SystemExit(1)"):
                 with self.assertRaisesRegex(RuntimeError, 'out of memory'):
                     lt.Build(self.spec(d)).run()
+
+    def test_a_callback_that_raises_ends_the_training_too(self):
+        # 2026-10-01: progress() raised on KEPT, run() returned, and ai-toolkit
+        # trained on unwatched while the button started a second build.
+        with tempfile.TemporaryDirectory() as d:
+            with self.fake(d, '''
+                    import time
+                    print('KEPT 20 20', flush=True)
+                    time.sleep(60)
+                    '''):
+                build = lt.Build(self.spec(d))
+
+                def on(kind, value):
+                    raise NameError('bug in the window')
+                with self.assertRaises(NameError):
+                    build.run(on)
+            self.assertIsNotNone(build.child.proc.wait(timeout=10))
 
     def test_the_photos_kept_are_reported_and_named_in_the_record(self):
         with tempfile.TemporaryDirectory() as d:
@@ -334,6 +369,7 @@ class ButtonTests(unittest.TestCase):
             studio.host._spawn = lambda _id, work: spawned.append(work)
             with mock.patch.object(lt, 'problem', return_value=None), \
                     mock.patch('apps.image_studio.ui.messagebox.askokcancel', return_value=True), \
+                    mock.patch('apps.image_studio.ui.BuildView'), \
                     mock.patch.object(lt.Build, 'run', side_effect=KeyError('surprise')):
                 studio.build_lora(editor)
                 self.assertIsNotNone(studio.lora_build)
@@ -344,6 +380,61 @@ class ButtonTests(unittest.TestCase):
         calls[0]()
         self.assertIsNone(studio.lora_build)
         self.assertIn('not built', studio.say.call_args[0][0])
+
+    def test_every_kind_of_progress_reaches_the_line_and_the_window(self):
+        # `left` was both the photos left out and, in the step branch, the
+        # time left - so Python took it as local and KEPT raised (2026-10-01).
+        studio = ImageStudio.__new__(ImageStudio)
+        studio.lora_build = None
+        posted = []
+        studio._post = lambda kind, value: posted.append((kind, value))
+        studio.say = mock.Mock()
+        studio.studio = mock.Mock()
+        spawned = []
+        studio.host = mock.Mock(_spawn=lambda _id, work: spawned.append(work))
+        studio.s = mock.Mock(event_id=1)
+
+        def run(self, on):
+            for kind, value in [('finding', (1, 20)), ('left', (1, 20)), ('kept', (18, 20)),
+                                ('faces', (17, 18)), ('step', (0, 750)), ('step', (10, 750))]:
+                on(kind, value)
+            raise RuntimeError('ai-toolkit stopped')
+        with tempfile.TemporaryDirectory() as d:
+            editor = self.editor(photos(d, 20))
+            editor.win = mock.Mock()
+            studio.studio.backends.return_value = [{'name': '5090', 'url': 'http://127.0.0.1:8188',
+                                                    'lora_dir': d}]
+            studio.studio.lib.get.return_value = {'id': 'partner', 'name': 'Partner',
+                                                  'references': photos(d, 20)}
+            studio.studio.lib.root = d
+            with mock.patch.object(lt, 'problem', return_value=None), \
+                    mock.patch('apps.image_studio.ui.messagebox.askokcancel', return_value=True), \
+                    mock.patch('apps.image_studio.ui.BuildView') as View, \
+                    mock.patch.object(lt.Build, 'run', run):
+                studio.build_lora(editor)
+                spawned[0]()
+            view = View.return_value
+            view.show.assert_called_once()
+            said = [v[0] for k, v in posted if k == 'said']
+            self.assertTrue(any('not found in 1 of 20' in s for s in said))
+            self.assertTrue(any('1 of 20 photos could not be read' in s for s in said))
+            self.assertTrue(any('loading Klein 9B' in s for s in said))
+            self.assertTrue(any('step 10 of 750' in s for s in said))
+            for kind, value in posted:
+                if kind == 'call':
+                    value()
+            words = [c.args[0] for c in view.update.call_args_list]
+            self.assertTrue(any(w.startswith('Step 10 of 750') for w in words))
+            self.assertIn(mock.call('Step 10 of 750', 10 / 750, 'muted'),
+                          view.update.call_args_list)
+            view.finish.assert_called_once()
+            self.assertIn('ai-toolkit stopped', view.finish.call_args[0][0])
+            self.assertEqual(view.finish.call_args[0][1], 'err')
+            self.assertIsNone(studio.lora_build)
+            # A second click while one builds shows its window instead of a second build.
+            studio.lora_build, studio.build_view = mock.Mock(), view
+            studio.build_lora(editor)
+            self.assertEqual(view.show.call_count, 2)
 
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -374,6 +465,35 @@ class ButtonInTheEditor(unittest.TestCase):
             button.invoke()
         self.assertIn('at least 20', ed.msg.cget('text'))
         self.assertIsNone(ui.lora_build)
+
+    def test_the_build_window_shows_the_words_the_bar_and_the_log(self):
+        from apps.image_studio.ui import BuildView
+        _, ui = self.tab()
+        work = os.path.join(self.dir, 'build-work')
+        os.makedirs(work, exist_ok=True)
+        run = mock.Mock()
+        run.spec = {'person': 'Partner', 'work': work}
+        view = BuildView(ui, run)
+        view.update('Step 10 of 750', 10 / 750)
+        view.show()
+        self.addCleanup(lambda: view.alive() and view.win.destroy())
+        self.app.update()
+        self.assertEqual(view.head.cget('text'), 'Step 10 of 750')
+        self.assertIn('Nothing yet', view.log.get('1.0', 'end'))
+        Path(work, 'train.log').write_text('Loading Flux2 model\nLoading transformer\n')
+        view.poll()
+        self.assertIn('Loading transformer', view.log.get('1.0', 'end'))
+        self.assertTrue(view.stop_button.winfo_ismapped())
+        # Closed, then shown again: the same words, from the state kept.
+        view.win.destroy()
+        view.update('Step 20 of 750', 20 / 750)
+        view.show()
+        self.app.update()
+        self.assertEqual(view.head.cget('text'), 'Step 20 of 750')
+        view.finish('LoRA for Partner not built: out of memory', 'err')
+        self.app.update()
+        self.assertFalse(view.stop_button.winfo_ismapped())
+        self.assertIn('out of memory', view.head.cget('text'))
 
 
 if __name__ == '__main__':
