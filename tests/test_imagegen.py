@@ -1583,7 +1583,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             f.write(PNG)
         w, h = ig.file_size_of(src)
         s = self.studio.fix_base(dict(ig.default_settings(), model=model, scene="On a pier.",
-                                      backend="5090", face_detail=True, auto_refine=True))
+                                      backend="5090", face_detail=True, critic_notes=True))
         s.update(mode="fix", seed=5, fix=dict({"image": src, "target": "hand",
                                                "spots": [{"x": w // 2, "y": h // 2,
                                                           "size": 64}]}, **fix))
@@ -3527,7 +3527,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(sent["fix"]["spots"], [])
         self.assertEqual(sent["fix"]["face_swap"], "")
         self.assertEqual(sent["identities"], [])
-        self.assertFalse(sent["auto_refine"])
+        self.assertFalse(sent["critic_notes"])
         self.assertFalse(sent["hand_pass"])
 
     def test_image_library_is_past_generations_search_and_use_reaches_settings(self):

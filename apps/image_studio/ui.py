@@ -453,7 +453,7 @@ class ImageStudio:
         self.refine_set = False       # the user touched it; the preset no longer decides
         self.faces = tk.BooleanVar(value=False)
         self.faces_set = False        # likewise for the face pass
-        self.auto_refine = tk.BooleanVar(value=False)   # the Visual Critic
+        self.critic_notes = tk.BooleanVar(value=False)  # the Visual Critic's notes
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
         self.head_swap = tk.BooleanVar(value=True)      # the head redrawn before the face swap
         self.glasses_pass = tk.BooleanVar(value=False)  # the glasses redrawn whatever the swap kept
@@ -797,9 +797,9 @@ class ImageStudio:
         grow.pack(side="top", fill="x", pady=(self.px(10), self.px(18)), **pad)
         self.go = self.button(grow, "Generate", self.generate, kind="accent")
         self.go.pack(side="top", fill="x")
-        # The Visual Critic (studio_critic): the vision model checks the
-        # picture and the faults it finds are redrawn, up to three passes.
-        b = tk.Checkbutton(setup, text="Automatic refinement", variable=self.auto_refine,
+        # The Visual Critic (studio_critic): the vision model looks at the
+        # finished picture and files what is wrong; it redraws nothing.
+        b = tk.Checkbutton(setup, text="Critic takes notes", variable=self.critic_notes,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
@@ -1892,7 +1892,7 @@ class ImageStudio:
         s["view"] = self.aim.get()
         s["refine"] = bool(self.refine.get())
         s["face_detail"] = bool(self.faces.get())
-        s["auto_refine"] = bool(self.auto_refine.get())
+        s["critic_notes"] = bool(self.critic_notes.get())
         s["hand_pass"] = bool(self.hand_pass.get())
         s["head_swap"] = bool(self.head_swap.get())
         # Ticked: always. Unticked: only after a swap that painted over them.
@@ -1958,7 +1958,7 @@ class ImageStudio:
         self.refine_set = True
         self.faces.set(bool(s.get("face_detail")))
         self.faces_set = True
-        self.auto_refine.set(bool(s.get("auto_refine")))
+        self.critic_notes.set(bool(s.get("critic_notes")))
         self.hand_pass.set(s.get("hand_pass", True) is not False)
         self.head_swap.set(s.get("head_swap", True) is not False)
         self.glasses_pass.set(s.get("glasses_pass") is True)

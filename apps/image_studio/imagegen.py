@@ -1844,18 +1844,6 @@ FACE_DEPTH_STRENGTH = 0.5      # a face's own head depth map, in its redraw (`fa
 FACE_DEPTH_END = 0.5           # ... over the first half of the steps: the shape, not the skin
 
 
-# The Visual Critic's redraws (Studio._refine). A hand at 0.6 kept its shape
-# in the reverted hand pass of 2026-09-25, and 0.85-0.9 left double hands, so
-# a local fix stays at 0.6: it mends fingers, it does not re-pose them.
-CRITIC_DENOISE = {"FACE_CORRECTION": 0.45, "LOCAL_INPAINT": 0.6,
-                  "OBJECT_CORRECTION": 0.6, "GLOBAL_REFINEMENT": 0.2}
-# How far a redraw may rise when the one before left the fault there
-# (critic.harder). A hand's does not: past 0.6 it doubles, so its second try
-# is a new seed and the critic's newer words, no more.
-CRITIC_DENOISE_TOP = {"FACE_CORRECTION": 0.6, "LOCAL_INPAINT": 0.75,
-                      "OBJECT_CORRECTION": 0.75, "GLOBAL_REFINEMENT": 0.3, "hand": 0.6}
-REGION_PAD = 1.6
-
 
 # Fix a spot: the user clicks the parts of a finished picture to redraw (a
 # hand, most often). Each spot is a square round the click, redrawn by the
@@ -2054,7 +2042,7 @@ def clean_fix(fix):
     in last ("" for none). A spot's `note`, or the fix's for the spots
     without one, is what the user says is wrong there; with `check` the
     Visual Critic looks at the result and what is still wrong is redrawn
-    again (`Studio._refine`)."""
+    again (`Studio._check_fix`)."""
     fix = fix if isinstance(fix, dict) else {}
     spots = _spots(fix.get("spots"), FIX_MAX_SPOTS)
     locks = _spots(fix.get("locks"), 16)
@@ -2362,13 +2350,6 @@ def fix_prompt(fix, prompt):
     f = clean_fix(fix)
     what = ", ".join(x for x in (f["words"], FIX_TARGETS[f["target"]]) if x) or "this detail"
     return FIX_PROMPT % what
-
-
-def png_size(raw):
-    """(width, height) from a PNG's header, or None."""
-    if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
-        return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
-    return None
 
 
 def _is_link(x):
@@ -3662,7 +3643,7 @@ def default_settings():
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
             "face_detail": None, "batch": 1, "pose": None, "composition": None,
-            "auto_refine": False, "refine_passes": 3, "hand_pass": True, "head_swap": True,
+            "critic_notes": False, "refine_passes": 3, "hand_pass": True, "head_swap": True,
             "glasses_pass": None, "lora_budget": None,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
@@ -4250,27 +4231,6 @@ def plan_items(p, s, wf, v, backend, short, nodes, inventory=None):
         [i["name"] for i in items]))
 
 
-CRITIC_MEMORY = "critic_memory.json"
-CRITIC_MEMORY_LOCK = threading.Lock()  # two backends' lanes can both _refine at once
-
-
-def load_critic_memory(lib):
-    """The Visual Critic's kept details (studio_critic.remember), or {}."""
-    root = getattr(lib, "root", None)
-    if not root:
-        return {}
-    try:
-        with open(os.path.join(root, CRITIC_MEMORY), encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_critic_memory(lib, memory):
-    _save_kept(os.path.join(lib.root, CRITIC_MEMORY), memory)
-
-
 def _save_kept(path, data):
     """One of the critic's files, written whole. Its temp file is this
     writer's own: the app and the phone server both write these, and a
@@ -4289,8 +4249,8 @@ def _save_kept(path, data):
 
 
 def change_kept(lib, name, change):
-    """Read one of the critic's files (CRITIC_MEMORY, CRITIC_LEDGER), change
-    it (`change`: dict -> dict) and write it back. The loaders read a file
+    """Read one of the critic's files (CRITIC_LEDGER), change it
+    (`change`: dict -> dict) and write it back. The loaders read a file
     that will not read as {} - right for a reader, but saving that would
     erase all the critic learned. So, as core/ideas.py does: a file that
     will not open (held for an instant by the other process) is not
@@ -4321,8 +4281,8 @@ def change_kept(lib, name, change):
     _save_kept(path, change(data))
 
 
-# What the critic's scores add up to (studio_critic's ledger): which redraw
-# mended what, which faults keep coming back, what the critic had passed.
+# What the critic's notes add up to (studio_critic's ledger): which faults
+# keep coming back, what the critic had passed, what a fix's redraws mended.
 CRITIC_LEDGER = "critic_ledger.json"
 CRITIC_LEDGER_LOCK = threading.Lock()
 
@@ -4734,26 +4694,8 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         p.warnings.append("The drawn pose decides the framing and which way the person "
                           "faces; the Camera gives only its height. Zoom the figure "
                           "(mouse wheel in Draw…) to frame closer.")
-    # Generate Again replays the words the picture was made with (`again`);
-    # nothing learned since is said, or noted as said.
+    # Generate Again replays the words the picture was made with (`again`).
     replay = _str(s.get("replay_prompt"))
-    # What the Visual Critic kept from earlier pictures of this person and
-    # scene (critic_memory.json): every picture starts from it, so they agree.
-    learned = [] if replay else critic.recall(
-        load_critic_memory(lib), [i["id"] for i, _ in idents],
-        scene, [k for k in SLOTS if _field(s, k)] + ["scene", "camera"])
-    if learned:
-        parts.append(", ".join(v for _, v in learned))
-        p.notes.append("Kept from earlier pictures: %s." % "; ".join(
-            "%s %s" % (k.replace("_", " "), v) for k, v in learned))
-    # And against what keeps going wrong in this person's pictures (the
-    # critic's ledger): the fix that was asked for, said before it is needed.
-    against = [] if replay else critic.prevention(load_critic_ledger(lib),
-                                                  [i["id"] for i, _ in idents])
-    if against:
-        parts.append(", ".join(v for _, v in against))
-        p.notes.append("Drawn against faults seen before: %s." % "; ".join(
-            "%s (%s)" % (v, k) for k, v in against))
     anatomy = s.get("anatomy") is not False and has_person(s, bool(idents))
     if anatomy and wf.get("anatomy") is False:
         anatomy = False
@@ -4776,10 +4718,6 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     if replay:
         p.prompt = replay
         p.notes.append("Generate Again: the prompt the picture was made with, replayed.")
-    if s.get("prompt_override"):
-        # The Visual Critic's regeneration: its compiled prompt, built round
-        # the prompt above (studio_critic.generator_prompt), in its place.
-        p.prompt = s["prompt_override"]
     if not p.prompt:
         p.errors.append("Describe the scene or the person, or choose a person.")
     p.negative = ", ".join(x for x in (s["negative"].strip(),
@@ -4999,8 +4937,8 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                                   who["name"], wf.get("label", wid)))
     if wf.get("multi_identity"):
         v["face_detail"] = False
-        p.notes.append("WithAnyone draws the identities together. Face redraw, photo paste "
-                       "and automatic refinement are off for this recipe.")
+        p.notes.append("WithAnyone draws the identities together. Face redraw and photo "
+                       "paste are off for this recipe.")
     # The face pass draws "a real human face ... natural lips and teeth" on
     # what SAM3 calls a face, and a fox's is one to it: High Quality Final
     # gave a fox a person's mouth (2026-09-30). Like the hands pass, it is
@@ -5185,8 +5123,6 @@ def pipeline_stages(lib, settings):
     stages = [("sampling", "Sampling")]
     if faces_of(settings):
         stages.append(("face", "Face pass"))
-    if settings.get("auto_refine"):
-        stages.append(("critic", "Critic"))
     stages.append(("decoding", "Decoding"))
     worn = outfit_of(settings)
     if worn["clothes"] or worn["accessories"]:
@@ -5202,6 +5138,8 @@ def pipeline_stages(lib, settings):
         stages.append(("hands", "Hand pass"))
     if profiles and glasses_pass(settings):
         stages.append(("glasses", "Glasses"))
+    if settings.get("critic_notes"):
+        stages.append(("critic", "Critic notes"))
     stages.append(("complete", "Complete"))
     return stages
 
@@ -5509,10 +5447,9 @@ def again(record, new_seed=False):
     if seed is not None and int(seed) >= 0:
         s["seed"], s["seed_mode"] = int(seed), "fixed"
     if record.get("prompt") and not s.get("mode"):
-        # A Generate's words, not composed again: compose adds what
-        # the critic has learned since (critic_memory, critic_ledger), and
-        # the same seed on other words is another picture. A new seed is a
-        # variation and composes afresh.
+        # A Generate's words, not composed again: compose may say it
+        # differently since, and the same seed on other words is another
+        # picture. A new seed is a variation and composes afresh.
         s["replay_prompt"] = record["prompt"]
     for k in AGAIN_PINNED:
         if s.get(k) in (None, "") and record.get(k) not in (None, ""):
@@ -6267,9 +6204,6 @@ class Studio:
                 job.face_graph = graph2
                 if job.real_faces and not profiles and not job.cancel.is_set():
                     files = self._real_faces(job, client, plan, values, files, say)
-        if (job.settings.get("auto_refine") and not plan.workflow.get("multi_identity")
-                and not job.cancel.is_set()):
-            files = self._refine(job, client, plan, values, files, say)
         if job.cancel.is_set():
             return self.queue._finish(job, "cancelled")
         say("decoding", "fetching the picture from %s" % b["name"], None)
@@ -6288,6 +6222,9 @@ class Studio:
                 return
         if not plan.workflow.get("multi_identity"):
             pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+        # Last, on the picture as it is kept: notes, never a redraw.
+        if job.settings.get("critic_notes") and pictures and not job.cancel.is_set():
+            self._take_notes(job, plan, pictures, say)
         self.save_result(job, self.record_for(job, graph), pictures)
         job.progress = 1.0
         self.queue._finish(job, "complete",
@@ -6601,7 +6538,7 @@ class Studio:
         s = {k: v for k, v in (settings or {}).items()
              if k not in ("mode", "fix", "replay_prompt")}
         s.update(references={}, item_refs={}, wearing=[], pose=None, composition=None,
-                 face_detail=False, auto_refine=False, batch=1)
+                 face_detail=False, critic_notes=False, batch=1)
         return s
 
     def _fix_oval(self, client):
@@ -7030,7 +6967,7 @@ class Studio:
         if fix["check"] and marks:
             # The user's spots are faults the critic is asked after, their
             # notes what was wrong; what is still there is redrawn again.
-            files = self._refine(job, client, plan, values, files, say, marked={
+            files = self._check_fix(job, client, plan, values, files, say, marked={
                 "faults": marks, "redo": redraw if plain else None,
                 "strength": fix["strength"],
                 "crops": fix_crops(size[0], size[1], fix["spots"])})
@@ -7585,36 +7522,9 @@ class Studio:
         return files2, graph
 
     # ------------------------------------------------------ Visual Critic
-    def _refine(self, job, client, plan, values, files, say, marked=None):
-        """Automatic refinement, on the lane's thread: the vision model looks
-        at the picture (studio_critic), what it finds right is left alone,
-        and what it finds wrong is redrawn with the tool the fault calls for -
-        the face pass's crop-redraw-blend for faces, hands and objects, the
-        same at low denoise over the whole picture for a touch-up, and a new
-        picture only for a structural failure. Up to `refine_passes` passes,
-        stopping as soon as the critic finds nothing meaningful. Never loses
-        the picture: any failure keeps the last good one. -> files.
-
-        Every look after a pass scores it (`critic.score_fixes`): a fault
-        still there is redrawn again, harder; after `critic.MAX_TRIES` it is
-        left to the user; a pass that damaged the picture and mended nothing
-        is taken back. So the last pass is looked at too, a look with no
-        redraw after it.
-
-        `marked` is Fix a spot's check: {"faults" (`critic.user_faults`, each
-        redrawn once by the fix), "redo" (picture, faults, n) -> graph, "crops"
-        per spot}. Then only the user's spots are followed; what else the
-        critic finds is logged and left alone."""
-        s = job.settings
-        try:
-            vision = self.vision() if self.vision else None
-        except Exception:
-            vision = None
-        if vision is None:
-            plan.warnings.append("%s needs a vision model on the LLM host and none is "
-                                 "served; the picture is as made."
-                                 % ("The critic's check" if marked else "Automatic refinement"))
-            return files
+    def _critic_brief(self, s, plan):
+        """What the critic is told a picture should be: (identities, intent,
+        canonical state, reference photos)."""
         idents = [self.lib.get("identities", x.get("id") if isinstance(x, dict) else x)
                   for x in s.get("identities") or []]
         idents = [i for i in idents if i]
@@ -7622,37 +7532,89 @@ class Studio:
         intent = critic.intent_from(s, plan.prompt)
         canonical = critic.initial_canonical(s, SLOTS, [i["name"] for i in idents],
                                              style["name"] if style else None)
-        # Details kept from earlier pictures are known too, so the critic
-        # checks them rather than inventing again (not locked: a better look
-        # may replace them).
-        memory = load_critic_memory(self.lib)
-        for k, v in critic.recall(memory, [i["id"] for i in idents]):
-            canonical["characters"].setdefault("character_a", {}).setdefault(k, v)
-        for k, v in critic.recall(memory, (), s.get("scene") or ""):
-            canonical["scene"].setdefault(k, v)
-        refs =[plan.references["face"]] if plan.references.get("face") else []
+        refs = [plan.references["face"]] if plan.references.get("face") else []
         refs += [i["references"][0] for i in idents if i.get("references")
                  and i["references"][0] not in refs]
-        passes = max(0, min(int(s.get("refine_passes") or critic.MAX_PASSES), 6))
-        history = [{"pass": 0, "type": "fix" if marked else "initial_generation",
-                    "image": files[0]["filename"]}]
-        log, stop = [], "pass limit reached"
-        faults = list(marked["faults"]) if marked else []   # redrawn, not yet looked at
-        next_id = len(faults) + 1
-        before = None                 # the picture before the last pass, to go back to
-        scores, left = {}, []         # each fault's last score; those given up
-        # What earlier pictures taught (the ledger): what to look at first,
-        # what the critic had passed, and the strength a redraw starts at.
+        return idents, intent, canonical, refs
+
+    def _vision_or_none(self):
+        try:
+            return self.vision() if self.vision else None
+        except Exception:
+            return None
+
+    def _take_notes(self, job, plan, pictures, say):
+        """The Visual Critic's notes, on the lane's thread: the vision model
+        looks at the finished picture - after the face swap and every finish
+        pass - and what it finds wrong is filed in the ledger by model,
+        person and scene (`critic.note_picture`) and kept on the record
+        (`job.refinement`). Nothing is redrawn and nothing it learns goes into
+        a prompt: it is there to learn what the pipeline keeps getting wrong,
+        not to mend this picture. Never fails the job."""
+        s = job.settings
+        vision = self._vision_or_none()
+        if vision is None:
+            plan.warnings.append("The critic's notes need a vision model on the LLM host "
+                                 "and none is served; this picture was not noted.")
+            return
+        idents, intent, canonical, refs = self._critic_brief(s, plan)
         ledger, model = load_critic_ledger(self.lib), _str(s.get("model"))
         who, where = [i["id"] for i in idents], s.get("scene") or ""
-        first = [] if marked else critic.recurring(ledger, model, who, where)
+        first = critic.recurring(ledger, model, who, where)
+        say("critic", "Taking notes...", None)
+        filename, raw = pictures[0]
+        try:
+            result = critic.analyze_generated_image(vision, raw, intent, canonical, refs,
+                                                    first=first,
+                                                    missed=critic.blind_checks(ledger))
+        except Exception as e:
+            plan.warnings.append("The Visual Critic could not read the picture (%s); it was "
+                                 "not noted." % e)
+            return
+        found = critic.noted(result)
+        self._critic_log(job, critic.notes_text(result, found))
+        job.refinement = {"intent": dict(intent), "canonical": canonical,
+                          "history": [{"pass": 0, "type": "notes", "image": filename}],
+                          "summary": result["summary"],
+                          "found": critic.score_records(found)}
+        plan.notes.append("Visual Critic noted: %s." % (
+            _and([f["feature"] for f in found]) if found else "nothing wrong"))
+        self._learn(lambda led: critic.note_picture(led, model, who, where, found))
+
+    def _check_fix(self, job, client, plan, values, files, say, marked):
+        """Fix a spot's check ("Afterwards: Critic checks it"), on the lane's
+        thread: the vision model looks at the user's marked spots after the
+        fix, and a spot still wrong is redrawn again, harder, by the fix's own
+        `redo`. Up to `refine_passes` redraws; never loses the picture: any
+        failure keeps the last good one. -> files.
+
+        Every look scores the last redraw (`critic.score_fixes`): a spot
+        still wrong goes again; after `critic.MAX_TRIES` it is left to the
+        user; a redraw that damaged the picture and mended nothing is taken
+        back. So the last redraw is looked at too, with none after it.
+
+        `marked` is {"faults" (`critic.user_faults`, each redrawn once by the
+        fix), "redo" (picture, faults, n) -> graph, "strength", "crops" per
+        spot}. Only the user's spots are followed; what else the critic finds
+        is logged and left alone."""
+        s = job.settings
+        vision = self._vision_or_none()
+        if vision is None:
+            plan.warnings.append("The critic's check needs a vision model on the LLM host and "
+                                 "none is served; the picture is as made.")
+            return files
+        _, intent, canonical, refs = self._critic_brief(s, plan)
+        passes = max(0, min(int(s.get("refine_passes") or critic.MAX_PASSES), 6))
+        history = [{"pass": 0, "type": "fix", "image": files[0]["filename"]}]
+        log, stop = [], "pass limit reached"
+        faults = list(marked["faults"])   # redrawn, not yet looked at
+        before = None                     # the picture before the last redraw, to go back to
+        scores, left = {}, []             # each fault's last score; those given up
+        ledger, model = load_critic_ledger(self.lib), _str(s.get("model"))
         missed = critic.blind_checks(ledger)
-        if first:
-            plan.notes.append("Visual Critic looked first at what went wrong before: %s." %
-                              _and([r["kind"] for r in first]))
-        tried, found, looked = [], [], False   # for the ledger: redraws scored, faults found
+        tried, looked = [], False         # for the ledger: redraws scored
         for n in range(1, passes + 2):
-            closing = n > passes      # the look at the last pass: nothing is redrawn after
+            closing = n > passes          # the look at the last redraw: none after it
             if closing and not faults:
                 break
             if job.cancel.is_set():
@@ -7661,10 +7623,10 @@ class Studio:
             say("critic", "Analyzing result" + ("" if n == 1 else " again") + "...", None)
             try:
                 raw = client.fetch(files[0])
-                close = self._closeups(job, client, files[0], marked, faults) if marked else []
+                close = self._closeups(job, client, files[0], marked, faults)
                 result = critic.analyze_generated_image(vision, raw, intent, canonical, refs,
                                                         faults=faults, closeups=close,
-                                                        first=first, missed=missed)
+                                                        missed=missed)
             except Exception as e:
                 plan.warnings.append("The Visual Critic could not read the picture (%s); "
                                      "it is kept as it was." % e)
@@ -7678,41 +7640,25 @@ class Studio:
                 history[-1]["scores"] = critic.score_records(scored)
             if before is not None and critic.went_wrong(scored):
                 files, history[-1]["taken_back"] = before, True
-                plan.notes.append("Visual Critic: pass %d made the picture worse and mended "
+                plan.notes.append("Visual Critic: redraw %d made the picture worse and mended "
                                   "nothing, so it was taken back." % (n - 1))
             carried, gone = critic.carry(scored)
             left += gone
             faults = []
-            # A fix follows the user's spots alone.
-            look = dict(result, observations=[], needs_refinement=False) if marked else result
-            nxt = critic.plan_next_refinement(look, canonical, carried=carried,
-                                              closed=[f["feature"] for f in scored])
-            if marked and nxt["needs_pass"]:
+            # Only the user's spots: what else the critic sees is not planned.
+            nxt = critic.plan_next_refinement(
+                dict(result, observations=[], needs_refinement=False), canonical,
+                carried=carried, closed=[f["feature"] for f in scored])
+            if nxt["needs_pass"]:
                 nxt["actions"] = [{"type": "LOCAL_INPAINT", "target": "marked spot%s" % (
                     "" if len(carried) == 1 else "s"), "faults": carried,
                     "corrections": nxt["correct"],
                     "tries": max(f["tries"] for f in carried)}]
-            if nxt["needs_pass"]:
-                found += [o for a in nxt["actions"] for o in a["faults"] if not o.get("tries")]
-                for a in nxt["actions"]:
-                    a["denoise"], why = self._critic_denoise(a, values, ledger, model, marked)
-                    if why and not a.get("tries"):
-                        plan.notes.append("Visual Critic redrew the %s at %s from the start: "
-                                          "%s." % (a["target"] or "picture", a["denoise"], why))
-            canonical, promoted = critic.merge_canonical(canonical, nxt["promote"])
-            if promoted:
-                # Read-modify-write on one shared file: two backends' lanes
-                # can both be refining at once, and the second save must not
-                # overwrite what the first just learned.
-                with CRITIC_MEMORY_LOCK:
-                    change_kept(self.lib, CRITIC_MEMORY, lambda memory: critic.remember(
-                        memory, canonical, promoted,
-                        [i["id"] for i in idents], s.get("scene") or ""))
             text = critic.log_text(n, result, nxt, scored)
             log.append(text)
             self._critic_log(job, text)
             if closing:
-                left += carried       # no pass is left to redraw them in
+                left += carried           # no redraw is left to mend them in
                 break
             if not nxt["needs_pass"]:
                 stop = "faults left to the user" if left else "no meaningful problems left"
@@ -7725,33 +7671,27 @@ class Studio:
                 if job.cancel.is_set():
                     break
                 say("critic", critic.progress_text(action) + "...", None)
+                f = files[0]
                 try:
-                    if marked:
-                        f = files[0]
-                        got = self._run_pass(job, client, marked["redo"](
-                            "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
-                                           f["filename"], f.get("type") or "output"),
-                            action["faults"], n), say, critic.progress_text(action),
-                            status="critic")
-                    else:
-                        got = self._correct(job, client, plan, values, files, raw, action,
-                                            intent, canonical, n, say)
+                    got = self._run_pass(job, client, marked["redo"](
+                        "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
+                                       f["filename"], f.get("type") or "output"),
+                        action["faults"], n), say, critic.progress_text(action),
+                        status="critic")
                 except (ComfyError, TemplateError, OSError, ValueError) as e:
                     errors.append("%s: %s" % (action["type"], e))
                     continue
                 if got:
                     files = got
                     done.append(action)
-            faults = critic.as_faults([dict(o, action="FIX" if marked else a["type"],
-                                            denoise=self._fault_denoise(a, o, marked))
-                                       for a in done for o in a["faults"]], next_id)
-            next_id = max([next_id] + [f["id"] + 1 for f in faults])
+            faults = critic.as_faults([dict(o, action="FIX", denoise=critic.harder(
+                marked["strength"], o.get("tries"), FIX_STRENGTHS["strong"]))
+                for a in done for o in a["faults"]], len(marked["faults"]) + 1)
             history.append({"pass": n, "type": " + ".join(a["type"].lower() for a in done)
                             or "none", "changes": [c for a in done for c in a["corrections"]],
-                            "promoted": promoted, "errors": errors,
-                            "image": files[0]["filename"]})
+                            "errors": errors, "image": files[0]["filename"]})
             for e in errors:
-                plan.warnings.append("Refinement pass %d could not run %s" % (n, e))
+                plan.warnings.append("The critic's redraw %d could not run %s" % (n, e))
             if not done:
                 stop = "nothing could be corrected"
                 break
@@ -7760,19 +7700,17 @@ class Studio:
                           "scores": critic.score_records(scores.values()),
                           "left": [f["feature"] for f in left]}
         made = [h for h in history[1:] if h["type"] != "none"]
-        plan.notes.append("Visual Critic: %d refinement pass%s; stopped: %s." % (
-            len(made), "" if len(made) == 1 else "es", stop))
+        plan.notes.append("Visual Critic: %d redraw%s after the fix; stopped: %s." % (
+            len(made), "" if len(made) == 1 else "s", stop))
         if scores:
-            plan.notes.append("Visual Critic's fixes: %s." % "; ".join(
+            plan.notes.append("Visual Critic's checks: %s." % "; ".join(
                 critic.score_lines(scores.values())))
         if left:
             plan.notes.append("Still wrong, and left to you (Fix a spot): %s." % _and(
                 [f["feature"] for f in left]))
         if looked:
-            # A fix's picture is filed by run_fix: the critic saw only its spots.
-            self._learn(lambda led: critic.note_fixes(led, model, tried) if marked else
-                        critic.note_picture(critic.note_fixes(led, model, tried), model,
-                                            who, where, found))
+            # The fix's picture is filed by run_fix: the critic saw only its spots.
+            self._learn(lambda led: critic.note_fixes(led, model, tried))
         return files
 
     def _learn(self, change):
@@ -7781,31 +7719,6 @@ class Studio:
         A ledger that will not read is never saved over (`change_kept`)."""
         with CRITIC_LEDGER_LOCK:
             change_kept(self.lib, CRITIC_LEDGER, change)
-
-    def _critic_denoise(self, action, values, ledger=None, model="", marked=None):
-        """The strength of one planned redraw: its kind's own, or where the
-        ledger says redraws of this fault start to mend on this model, and
-        harder for each try that left the fault there. -> (denoise, why) -
-        why "" unless the ledger moved the start. A fix's spots are redrawn
-        at the strength the user chose, each as hard as its own tries ask."""
-        kind, target = action["type"], action["target"]
-        if marked or kind not in CRITIC_DENOISE:       # a fix; a new picture
-            return (None if marked else 1.0), ""
-        base = CRITIC_DENOISE[kind] if kind != "FACE_CORRECTION" else max(
-            CRITIC_DENOISE[kind], float(values.get("face_denoise") or 0))
-        top = CRITIC_DENOISE_TOP["hand" if target == "hand" else kind]
-        why = ""
-        if action.get("faults"):
-            base, why = critic.start_denoise(ledger, model, critic.fault_kind(
-                action["faults"][0]), kind, base, top)
-        return critic.harder(base, action.get("tries"), top), why
-
-    def _fault_denoise(self, action, fault, marked):
-        """The strength one fault was just redrawn at, for the ledger."""
-        if marked:
-            return critic.harder(marked["strength"], fault.get("tries"),
-                                 FIX_STRENGTHS["strong"])
-        return action.get("denoise")
 
     def _closeups(self, job, client, f, marked, faults):
         """The marked spots of `faults`, each cut from the picture `f` for
@@ -7843,83 +7756,6 @@ class Studio:
                                                 job.id, text))
         except OSError:
             pass
-
-    def _correct(self, job, client, plan, values, files, raw, action, intent, canonical,
-                 n, say):
-        """One planned correction on the current picture. -> the new files, or
-        None when there was nothing to redraw (no face or hand found)."""
-        kind, target, fixes = action["type"], action["target"], action["corrections"]
-        b, wf = job.backend, plan.workflow
-        if kind == "FULL_REGENERATION":
-            return self._regenerate(job, client, critic.generator_prompt(
-                intent, canonical, fixes), n, say)
-        if not wf.get("face_detail"):
-            raise ValueError("the %s workflow has no redraw section" % wf.get("label"))
-        f = files[0]
-        image = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
-                                f["filename"], f.get("type") or "output")
-        v = dict(values, seed=(int(values["seed"]) + 1000 * n) % (MAX_SEED + 1))
-        if kind == "GLOBAL_REFINEMENT":
-            w, h = png_size(raw) or (int(values["width"]), int(values["height"]))
-            scale = min(1.0, (1.05e6 / float(w * h)) ** 0.5)
-            crops = [{"x": 0, "y": 0, "width": w, "height": h, "mask": False,
-                      "edit": (max(256, int(w * scale) // 16 * 16),
-                               max(256, int(h * scale) // 16 * 16))}]
-            v["face_prompt"] = critic.generator_prompt(intent, canonical, fixes)
-        else:
-            sam3 = self._sam3_of(b)
-            if not sam3:
-                raise ValueError("%s has no SAM3 checkpoint to find the %s"
-                                 % (b["name"], target))
-            found = face_boxes(self._run_quick(client, add_face_finder(
-                {"fi": {"class_type": "LoadImage", "inputs": {"image": image}}}, sam3,
-                ["fi", 0], ("face:8" if kind == "FACE_CORRECTION" else "%s:4" % target))))
-            if not found or not found[2]:
-                return None
-            w, h, boxes = found
-            if kind == "FACE_CORRECTION":
-                crops = [head_square(bx, w, h, FACE_PAD) for bx in boxes]
-                v["face_prompt"] = FACE_PROMPT % critic.generator_prompt(intent, canonical,
-                                                                         fixes)
-            else:
-                crops = [dict(head_square(bx, w, h, REGION_PAD), head=False)
-                         for bx in boxes[:4]]
-                v["face_prompt"] = critic.generator_prompt(intent, canonical, fixes,
-                                                           focus=target) + (
-                    " " + anatomy_text() if target == "hand" else "")
-            crops = [c for c in crops if c["width"] >= 64]
-            if not crops:
-                return None
-        # A fault the last redraw left there is redrawn harder, not the same.
-        v["face_denoise"] = action.get("denoise") or self._critic_denoise(action, values)[0]
-        oval = os.path.join(self.lib.root, "face_oval.png")
-        if not os.path.isfile(oval):
-            os.makedirs(self.lib.root, exist_ok=True)
-            with open(oval, "wb") as fh:
-                fh.write(oval_png())
-        graph = face_graph(wf, v, plan.loras, image, crops, client.upload_image(oval),
-                           "%s_pass%d_%s" % (values["filename_prefix"], n, kind.lower()))
-        return self._run_pass(job, client, graph, say, critic.progress_text(action),
-                              status="critic")
-
-    def _regenerate(self, job, client, prompt, n, say):
-        """A new picture from the compiled prompt and a new seed, for a
-        structural failure only. The face pass is left to the critic."""
-        b = job.backend
-        s = copy.deepcopy(job.settings)
-        s.update(prompt_override=prompt, face_detail=False, auto_refine=False,
-                 seed=(int(s.get("seed") or 0) + 7919 * n) % (MAX_SEED + 1))
-        p = compose(s, self.lib, b, self.inventories.get(b["id"]), self.workflow_loader,
-                    self.nodes.get(b["id"]))
-        if p.errors:
-            raise ValueError(" ".join(p.errors))
-        v = dict(p.values)
-        for var, path in p.images.items():
-            v[var] = client.upload_image(path)
-        v["filename_prefix"] = "ImageStudio/%s_%s_regen%d" % (
-            p.workflow.get("id", "job"), job.id, n)
-        return self._run_pass(job, client, fill(p.workflow, v, p.loras), say,
-                              "Regenerating the picture", status="critic")
 
     def _sam3_of(self, backend):
         inv = self.inventories.get(backend["id"]) or {}

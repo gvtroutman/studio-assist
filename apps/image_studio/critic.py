@@ -1,33 +1,31 @@
-"""The Visual Critic: a vision model looks at a picture the Image Studio just
-made, says what is right and what is wrong, and the next pass fixes only what
-is wrong. No tkinter and no network of its own: the vision model is handed in
-(`studio_agent.Vision`), and `Studio._refine` in studio_imagegen runs the
-passes with the tools the Image Studio already has.
+"""The Visual Critic: a vision model looks at a picture the Image Studio
+made and says what is right and what is wrong. It is not a step of the
+pipeline. After Generate it only takes notes (`noted`), so that what the
+models, the people's pictures and the scenes keep getting wrong is learned
+over many pictures; nothing it learns is drawn or put into a prompt. Only
+Fix a spot's check redraws, and only the user's marked spots. No tkinter and
+no network of its own: the vision model is handed in (`studio_agent.Vision`),
+and `Studio._take_notes` / `Studio._check_fix` in studio_imagegen run it.
 
 Three kinds of state, kept apart on purpose:
 
 - the **original intent** - what was asked, frozen (`intent_from`). Nothing the
   critic says is ever written into it;
 - the **canonical state** - what is known about the picture: the people, the
-  scene, the camera. It starts from the form and may take a detail the
-  generator invented if the critic likes it (`merge_canonical`), one value per
-  key, so it grows sideways, never by appending;
-- the **corrections** - what the next pass fixes. Replaced after every look.
+  scene, the camera, as the form states them (`initial_canonical`);
+- the **corrections** - what a fix's next redraw mends. Replaced after every look.
 
-And one thing carried from look to look, the **faults**: what the last pass
-redrew, each with a number. The next look says what became of each
-(`score_fixes`), so a fault that is still there is redrawn harder, not the
-same way again, one that was tried `MAX_TRIES` times is left to the user, and
-a redraw that made things worse is taken back. The user's own notes on a
-picture (Fix a spot) are faults too (`user_faults`): certain, never guessed.
+And one thing carried from look to look of a fix, the **faults**: the user's
+marked spots (`user_faults`), each with a number. The next look says what
+became of each (`score_fixes`), so a spot still wrong is redrawn harder, one
+tried `MAX_TRIES` times is left to the user, and a redraw that made things
+worse is taken back.
 
-What outlives the job, beside the memory of good details, is the **ledger**
-(`note_fixes`, `note_picture`, `note_blind`): which redraw mended which kind of
-fault on which model, which faults keep coming back for a person, a scene or
-a model, and what the user marked that the critic had passed. The next
-picture starts from it: the redraw's strength (`start_denoise`), what the
-critic looks at first (`recurring`), words against a person's returning
-faults (`prevention`), and the critic's own checklist (`blind_checks`).
+What outlives the job is the **ledger** (`note_picture`, `note_blind`,
+`note_fixes`): which faults keep coming back for a model, a person or a scene,
+what the user marked that the critic had passed - its own blind spots - and
+which of a fix's redraws mended what. It steers only the critic: what it
+looks at first (`recurring`) and its own checklist (`blind_checks`).
 """
 
 import base64
@@ -48,8 +46,6 @@ HARDER = 0.15                 # denoise added for each redraw that left the faul
 CLOSEUPS = 3                  # marked spots shown to the critic large, beside the picture
 # The ledger. The critic is a small model and misreads, so what it found
 # counts once and must repeat; what the user marked is believed at once.
-LEDGER_MIN = 3                # tries before a strength's record is believed
-MENDS = 0.5                   # cleared of tried, from which a strength is one that works
 USER_WEIGHT = 3               # a fault the user marked weighs this many of the critic's
 RECUR = 3                     # the weight from which a fault is one that keeps coming back
 WEIGHT_TOP = 9                # so a few good pictures unlearn an old fault
@@ -57,8 +53,7 @@ KINDS_MAX = 12                # kinds of fault kept for one person, scene or mod
 BLIND_MAX = 3                 # missed things added to one category's checks
 BLIND_KEPT = 8                # ... of those kept
 MARKED_KEPT = 60              # pictures' marks remembered, so a retried fix is not a new fault
-PERSON_BOUND = ("identity", "body", "clothing")   # faults words about the person can prevent
-MIN_CONFIDENCE = 0.6          # below this a mismatch is noted, never corrected
+MIN_CONFIDENCE = 0.6          # below this a mismatch is neither filed nor corrected
 PROMOTE_CONFIDENCE = 0.75     # and below this an invented detail is not kept
 # What one picture costs the vision model at most: LM Studio scales a large
 # photo down before qwen2.5-vl reads it, and a 4.9 MB reference came to 4,082
@@ -462,6 +457,14 @@ def fault_text(f):
     return "%s: %s" % (f["feature"], _fix_text(f)) if _fix_text(f) != "." else f["feature"]
 
 
+def noted(critic_result, min_confidence=MIN_CONFIDENCE):
+    """A look at a finished picture -> what it found wrong: each confident
+    mismatch, numbered. A note, not a fault to redraw (`tries` 0)."""
+    wrong = [o for o in critic_result["observations"]
+             if o["status"] == "MISMATCH" and o["confidence"] >= min_confidence]
+    return [dict(o, id=i, source="critic", tries=0) for i, o in enumerate(wrong, 1)]
+
+
 def user_faults(spots, target="other", note=""):
     """Fix a spot's spots -> the faults they are, numbered from 1 in the
     spots' order. A spot's own `note` says what is wrong with it, else the
@@ -599,31 +602,6 @@ def note_fixes(ledger, model, scored):
     return ledger
 
 
-def start_denoise(ledger, model, kind, action, default, top):
-    """The strength a redraw of this kind starts at on this model: `default`,
-    unless its own record says it seldom mends (under MENDS of at least
-    LEDGER_MIN tries) and a harder one's, no higher than `top`, says it does.
-    -> (denoise, why) - why "" when it is the default."""
-    known = {}
-    for key, r in (((ledger or {}).get("fixes") or {}).get(model) or {}).get(kind, {}).items():
-        a, _, d = key.partition("@")
-        try:
-            if a == action and r["tried"] >= LEDGER_MIN:
-                known[float(d)] = r
-        except (KeyError, TypeError, ValueError):
-            continue
-    mine = known.get(round(default, 2))
-    if mine is None or mine["cleared"] >= MENDS * mine["tried"]:
-        return default, ""
-    works = [d for d, r in known.items()
-             if default < d <= top and r["cleared"] >= MENDS * r["tried"]]
-    if not works:
-        return default, ""
-    d = min(works)
-    return d, "%s mended %d of %d before, %s %d of %d" % (
-        default, mine["cleared"], mine["tried"], d, known[d]["cleared"], known[d]["tried"])
-
-
 def note_picture(ledger, model, identity_ids, scene, found, looked=True):
     """`ledger` with one picture's faults filed for its model, its person
     (only when it had exactly one) and its scene. A kind found gains weight
@@ -687,17 +665,6 @@ def first_line(r):
         "; last: " + r["said"] if r.get("said") else "")
 
 
-def prevention(ledger, identity_ids=()):
-    """Words for the prompt against one person's returning faults: the
-    critic's newest fix for each kind that is about the person (PERSON_BOUND),
-    since a hand or the light is not theirs to describe. -> [(kind, words)]."""
-    ids = list(identity_ids or ())
-    if len(ids) != 1:
-        return []
-    return [(r["kind"], r["fix"]) for r in recurring(ledger, "", ids)
-            if r.get("fix") and r["kind"].partition("/")[0] in PERSON_BOUND]
-
-
 def note_blind(ledger, faults, refinement):
     """`ledger` with what the user marked on a picture the critic had
     passed: a blind spot, by category. `refinement` is that picture's
@@ -709,7 +676,8 @@ def note_blind(ledger, faults, refinement):
         return ledger
     ledger = copy.deepcopy(ledger or {})
     scores = [x for x in refinement.get("scores") or [] if isinstance(x, dict)]
-    flagged = {fault_kind(x) for x in scores if x.get("outcome") != "CLEARED"}
+    flagged = {fault_kind(x) for x in scores if x.get("outcome") != "CLEARED"} | {
+        fault_kind(x) for x in refinement.get("found") or [] if isinstance(x, dict)}
     cleared = {fault_kind(x) for x in scores if x.get("outcome") == "CLEARED"}
     whole = ((refinement.get("history") or [{}])[0] or {}).get("type") != "fix"
     for f in faults:
@@ -764,72 +732,6 @@ def _detail_path(o):
     return "%s.%s" % ("camera" if o["category"] in ("camera", "lighting") else "scene", feature)
 
 
-def merge_canonical(canonical_state, promotions):
-    """A copy of the state with each promoted detail set at its one key. A
-    key the user set is never replaced; a key the generator set before is
-    (the newer look was the one judged good). -> (state, [paths set])."""
-    state = copy.deepcopy(canonical_state)
-    locked = set(state.get("locked") or ())
-    changed = []
-    for o in promotions:
-        path = _detail_path(o)
-        if path in locked:
-            continue
-        parts = path.split(".")
-        where = state
-        for p in parts[:-1]:
-            where = where.setdefault(p, {})
-        if where.get(parts[-1]) != o["value"]:
-            where[parts[-1]] = o["value"]
-            changed.append(path)
-    return state, changed
-
-
-# ================================================================ the memory
-# What the critic promoted outlives the job: a person's kept details go with
-# that identity, a scene's with its words, and every later picture of either
-# is drawn with them, so the next picture starts where this one ended rather
-# than inventing afresh. {"identities": {id: {key: value}}, "scenes": {scene
-# key: {key: value}}}. The caller reads and writes the file.
-
-def remember(memory, canonical_state, changed, identity_ids=(), scene=""):
-    """A copy of `memory` with the promoted paths in `changed` filed. A
-    person's detail is filed only when the picture had one identity:
-    with two, character_a is not one of them."""
-    memory = copy.deepcopy(memory or {})
-    ids = list(identity_ids)
-    for path in changed:
-        parts = path.split(".")
-        if parts[0] == "characters":
-            if len(ids) != 1 or parts[1] != "character_a":
-                continue
-            value = (canonical_state["characters"].get("character_a") or {}).get(parts[2])
-            bucket = memory.setdefault("identities", {}).setdefault(ids[0], {})
-        else:
-            skey = _key(scene)
-            if not skey:
-                continue
-            value = (canonical_state.get(parts[0]) or {}).get(parts[1])
-            bucket = memory.setdefault("scenes", {}).setdefault(skey, {})
-        if value:
-            bucket[parts[-1]] = value
-    return memory
-
-
-def recall(memory, identity_ids=(), scene="", set_keys=()):
-    """The remembered details for a picture of these people in this scene,
-    leaving out any key the form sets this time. -> [(key, value)]."""
-    memory = memory or {}
-    skip = {_key(k) for k in set_keys}
-    out = []
-    ids = list(identity_ids)
-    if len(ids) == 1:
-        out += sorted((memory.get("identities") or {}).get(ids[0], {}).items())
-    if _key(scene):
-        out += sorted((memory.get("scenes") or {}).get(_key(scene), {}).items())
-    return [(k, v) for k, v in out if k not in skip and v]
-
-
 # ======================================================== the prompt compiler
 
 def build_refinement_instructions(original_intent, canonical_state, preserve, corrections):
@@ -853,28 +755,6 @@ def build_refinement_instructions(original_intent, canonical_state, preserve, co
         "%s:\n%s" % (h, body) for h, body in sections if body)
 
 
-def generator_prompt(original_intent, canonical_state, corrections, focus=None):
-    """What the diffusion model reads, from the same sections: prose, since
-    FLUX reads no headings and samples at CFG 1, where "keep X" is not a
-    control. What is kept is kept by what is left undrawn - the tool choice.
-    `focus` ("face", "hand", an object) makes it a close-up's prompt."""
-    known = []
-    for cid, c in sorted((canonical_state.get("characters") or {}).items()):
-        known.append("%s: %s" % (cid.replace("_", " "),
-                                 ", ".join(str(v) for k, v in c.items()
-                                           if k != "identity_reference")))
-    for part in ("scene", "camera"):
-        vals = [str(v) for k, v in (canonical_state.get(part) or {}).items()
-                if str(v) not in original_intent["prompt"]]
-        if vals:
-            known.append(", ".join(vals))
-    fixes = " ".join(c for c in corrections)
-    head = ("A close-up of the %s from this photograph, in the same light, colour, focus "
-            "and film texture as the rest of it. " % focus) if focus else ""
-    return " ".join(x.strip() for x in (head, original_intent["prompt"], ". ".join(known)
-                                        + ("." if known else ""), fixes) if x.strip())
-
-
 # ================================================================== the log
 
 def log_text(n, critic_result, plan, scored=()):
@@ -893,11 +773,28 @@ def log_text(n, critic_result, plan, scored=()):
         "Matches:", lines(plan["preserve"]), "",
         "Mismatches:", lines(mism), "",
         "Uncertain:", lines(o["feature"] for o in obs if o["status"] == "UNCERTAIN"), "",
-        "New useful details kept:", lines("%s: %s" % (o["feature"], o["value"])
-                                          for o in plan["promote"]), "",
         "Ignored (low confidence):", lines(plan["ignored"]), "",
         "Selected action:",
         " + ".join(sorted({a["type"] for a in plan["actions"]}, key=ACTIONS.index)), ""])
+
+
+def notes_text(critic_result, found):
+    """The log's block for the notes on a finished picture: what was filed,
+    and what was seen but not filed."""
+    obs = critic_result["observations"]
+
+    def lines(items):
+        return "\n".join("- " + x for x in items) or "- (none)"
+    return "\n".join([
+        "VISUAL CRITIC NOTES", "",
+        "Summary: " + (critic_result["summary"] or "-"), "",
+        "Filed (wrong):", lines("%s (%s, %.2f): %s" % (f["feature"], fault_kind(f),
+                                                       f["confidence"], f["observation"])
+                                for f in found), "",
+        "Right:", lines(o["feature"] for o in obs if o["status"] == "MATCH"), "",
+        "Not filed (unsure or low confidence):", lines(
+            o["feature"] for o in obs if o["status"] in ("UNCERTAIN", "MISMATCH")
+            and not any(f["feature"] == o["feature"] for f in found)), ""])
 
 
 PROGRESS = {"FACE_CORRECTION": "Refining faces", "LOCAL_INPAINT": "Correcting %s",
