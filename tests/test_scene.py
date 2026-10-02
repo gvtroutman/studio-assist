@@ -143,6 +143,42 @@ class TestLookAt(unittest.TestCase):
 
 
 class TestBodyAndClothes(unittest.TestCase):
+    def test_spatula_moves_rigidly_with_the_gripping_hand(self):
+        dressed = sc.outfit({"accessories": "silver spatula"})
+        controls = sc.gripped(sc.pose_controls("standing"), dressed["held"])
+        self.assertGreater(controls["fingers_r_curl"], 50)
+        self.assertIn("right hand gripping a spatula",
+                      sc.hand_words(controls, dressed["held"]))
+        def utensil(ctl):
+            bare = sc.person_pieces(ctl, sc.IDENTITY, dressed={})
+            wearing = sc.person_pieces(ctl, sc.IDENTITY, dressed=dressed)
+            # Accessories add pieces to the hand, while all other geometry stays.
+            n = sum(p == "hand_r" for p, _, _ in bare)
+            parts = [fs for p, fs, _ in wearing if p == "hand_r"][n:]
+            wp, wm = sc.skeleton(ctl)["wrist_r"]
+            return [tuple(sc.dot(sc.sub(v, wp), sc.column(wm, i)) for i in range(3))
+                    for fs in parts for f in fs for v in f]
+        before = utensil(controls)
+        after = utensil(dict(controls, arm_r_raise=65, arm_r_bend=80, wrist_r_bend=25))
+        self.assertTrue(before)
+        self.assertEqual(len(before), len(after))
+        for a, b in zip(before, after):
+            for x, y in zip(a, b):
+                self.assertAlmostEqual(x, y)
+
+    def test_frying_pan_has_an_open_bowl_and_stands_on_its_base(self):
+        pan = sc.new_object("frying_pan")
+        lo, hi = sc.bounds(pan)
+        self.assertAlmostEqual(lo[1], 0)
+        self.assertAlmostEqual(hi[1], pan["scale"][1])
+        self.assertAlmostEqual(hi[0] - lo[0], pan["scale"][0])
+        # No face closes the top over the centre of the bowl.
+        for faces, _ in sc.MESHES["frying_pan"]:
+            for f in faces:
+                if all(abs(v[1] - 1) < 1e-8 for v in f):
+                    centre = tuple(sum(v[i] for v in f) / len(f) for i in range(3))
+                    self.assertGreater(math.hypot(centre[0], centre[2] + 0.18), 0.25)
+
     def test_chest_size_changes_only_the_chest_for_both_subjects(self):
         for subject in ("a man", "a woman"):
             meshes = []

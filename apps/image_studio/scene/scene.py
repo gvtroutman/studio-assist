@@ -631,6 +631,7 @@ HEEL = 0.065                     # m a heel lifts the heel of the foot
 # first match wins, so "hard hat" is not read as a plain "hat". The kinds
 # are shapes (`HAT_SHAPES`); the words say the rest.
 HATS = [
+    ("chef", ("chef hat", "chef's hat", "chefs hat", "toque", "toque blanche")),
     ("crown", ("flower crown", "floral crown", "flower wreath", "floral wreath",
                "crown of flowers", "wreath of flowers", "flower headband", "blumenkranz")),
     ("hard hat", ("hard hat", "hardhat", "helmet", "safety helmet")),
@@ -654,6 +655,9 @@ GLASSES = [
 # radii or None; metres in the head's frame, where the head is an ellipsoid at
 # y 0.11, 0.115 m tall: the band sits above the eyes. A dome is three rings.
 HAT_SHAPES = {
+    "chef": ([(0.15, (0.092, 0.107)), (0.23, (0.092, 0.107)),
+              (0.25, (0.105, 0.12)), (0.45, (0.108, 0.123)),
+              (0.46, (0.095, 0.11))], None),
     "hard hat": ([(0.14, (0.102, 0.12)), (0.2, (0.096, 0.112)), (0.245, (0.07, 0.083)),
                   (0.262, (0.03, 0.036))], (0.118, 0.142)),
     "top hat": ([(0.15, (0.092, 0.107)), (0.36, (0.094, 0.109))], (0.13, 0.145)),
@@ -671,6 +675,7 @@ CROWN_LEAVES = "#4f7d4a"
 # Things carried, from the Accessories slot: (kind, the words that name it).
 # The words are sent as written; this only puts something in the hands.
 HELD = [
+    ("spatula", ("spatula", "fish slice", "slotted turner")),
     ("accordion", ("accordion", "accordian", "squeezebox", "concertina")),
     ("stein", ("beer stein", "beer steins", "stein", "steins", "beer mug", "beer mugs",
                "tankard", "tankards", "masskrug", "maßkrug", "maß", "pint of beer",
@@ -683,6 +688,7 @@ HELD = [
 # fingers ready for the keys (right) and flat for the bass end (left).
 GRIP_KEYS = ("wrist_%s_bend", "fingers_%s_curl", "fingers_%s_spread", "thumb_%s_curl")
 GRIPS = {"stein": (0, 55, 0, 60), "pretzel": (0, 35, 6, 70),
+         "spatula": (0, 65, 0, 65),
          "accordion_r": (0, 30, 8, 15), "accordion_l": (0, 12, 4, 0)}
 
 
@@ -694,7 +700,7 @@ def gripped(controls, held):
         if any(float(out.get(k % side, 0) or 0) for k in GRIP_KEYS):
             continue
         kind = "accordion_" + side if "accordion" in held else next(
-            (k for k in ("stein", "pretzel") if side in held.get(k, ((),))[0]), None)
+            (k for k in ("stein", "pretzel", "spatula") if side in held.get(k, ((),))[0]), None)
         if kind:
             out.update({k % side: float(v) for k, v in zip(GRIP_KEYS, GRIPS[kind])})
     return out
@@ -849,6 +855,8 @@ def outfit(look=None):
             rgb = cloth_colour(item, "hat")
             if kind == "hard hat" and not _has_colour(item):
                 rgb = hex_rgb("#e2c23c")          # a hard hat unsaid is site yellow
+            elif kind == "chef" and not _has_colour(item):
+                rgb = cloth_colour("white", "hat")
             elif kind == "alpine" and not _has_colour(item):
                 rgb = hex_rgb(CLOTH_DEFAULT["alpine"])    # loden green
             elif kind == "crown" and not _has_colour(item):
@@ -1329,6 +1337,23 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
             deep = 0.085 if i % 2 else 0.07
             out.append(("body", (42, 37, 34) if i % 2 else tuple(int(c * 0.45) for c in rgb),
                         chest_box((x0, -0.18, z - deep), (x0 + 0.3 / 8, 0.1, z + deep))))
+    if "spatula" in held:
+        sides, rgb = held["spatula"]
+        for side in sides:
+            # Handle inside the curled palm; blade extends along the fingers.
+            def utensil_box(lo, hi):
+                return outward([[at("wrist_" + side, p) for p in f] for f in box(lo, hi)])
+            out.append(("hand_" + side, (48, 44, 40), utensil_box(
+                (-0.014, -0.18, 0.022), (0.014, -0.035, 0.05))))
+            out.append(("hand_" + side, rgb, utensil_box(
+                (-0.009, -0.3, 0.03), (0.009, -0.17, 0.042))))
+            # Three open slots between four metal tines, joined at both ends.
+            for x in (-0.042, -0.016, 0.01, 0.036):
+                out.append(("hand_" + side, rgb, utensil_box(
+                    (x, -0.415, 0.03), (x + 0.006, -0.285, 0.036))))
+            for y in (-0.415, -0.295):
+                out.append(("hand_" + side, rgb, utensil_box(
+                    (-0.042, y, 0.03), (0.042, y + 0.01, 0.036))))
     if "stein" in held:
         sides, rgb = held["stein"]
         for side in sides:
@@ -1394,6 +1419,9 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
 # geometry, so a scene keeps opening when the geometry improves. `group` is
 # where the library lists it.
 ASSETS = [
+    {"id": "frying_pan", "label": "Frying pan", "kind": "prop", "group": "prop",
+     "name": "Frying pan", "colour": "#343638", "scale": [0.42, 0.055, 0.68],
+     "about": "An open shallow frying pan with a long handle towards +Z. Place it on a stove."},
     {"id": "person", "label": "Person", "kind": "person", "group": "people",
      "name": "Person", "colour": "#c9b8a6", "scale": [1.0, 1.0, 1.0],
      "about": "A posable mannequin, 1.8 m. Describe who they are and what they are doing."},
@@ -1595,8 +1623,28 @@ def _bush():
     return out
 
 
+def _frying_pan():
+    # Bowl and handle fit the same unit box as every other prop. Each rim
+    # segment is convex, so normals stay outward on the open inner wall too.
+    out = [(prism((0, 0, -0.18), (0, 0.16, -0.18), (1, 0, 0),
+                  (0.46, 0.28), (0.46, 0.28), 24), None)]
+    for i in range(24):
+        a, b = 2 * math.pi * i / 24, 2 * math.pi * (i + 1) / 24
+        pts = [(rx * math.cos(t), y, -0.18 + rz * math.sin(t))
+               for y in (0.16, 1.0) for rx, rz, t in (
+                   (0.5, 0.32, a), (0.5, 0.32, b),
+                   (0.455, 0.275, b), (0.455, 0.275, a))]
+        out.append((outward([[pts[j] for j in f] for f in (
+            (0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+            (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0))]), None))
+    out.append((_slab(-0.04, 0.45, 0.09, 0.04, 0.7, 0.25), "#9a9c9e"))
+    out.append((_slab(-0.05, 0.4, 0.23, 0.05, 0.8, 0.5), "#302c28"))
+    return out
+
+
 # Each shape and prop: [(faces, colour or None for the object's own)].
 MESHES = {
+    "frying_pan": _frying_pan(),
     "box": [(_slab(-0.5, 0, -0.5, 0.5, 1, 0.5), None)],
     "cylinder": [(cylinder(), None)],
     "sphere": [(ellipsoid((0, 0.5, 0), IDENTITY, (0.5, 0.5, 0.5), 14, 9), None)],
@@ -4447,6 +4495,7 @@ def _arm(sk, side, bent, hip_y):
 
 
 HELD_WORDS = {"stein": "fingers wrapped round the beer stein",
+              "spatula": "gripping a spatula",
               "pretzel": "pinching the pretzel between thumb and fingers"}
 
 
