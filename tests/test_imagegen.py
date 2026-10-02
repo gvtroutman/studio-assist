@@ -2241,6 +2241,48 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
         self.assertTrue(any("FaceFusion applied" in n for n in rec["notes"]), rec["notes"])
         self.assertTrue(any("Partner not drawn with PuLID" in n for n in rec["notes"]), rec["notes"])
 
+    def test_a_face_the_head_swap_redraws_is_left_out_of_the_face_pass(self):
+        """The head swap redraws the whole head after the face pass, so the
+        face pass's redraw of that face would be thrown away: it is not
+        made. With the head swap off, it is."""
+        from unittest.mock import patch
+        face = os.path.join(self.dir, "partner.png")
+        with open(face, "wb") as f:
+            f.write(PNG)
+
+        def run(head_swap):
+            self.studio = ig.Studio(root=self.dir, notify=self.notified.append,
+                                    client_factory=FaceClient)
+            FaceClient.fail_pass = False
+            self.studio.lib.save("identities", [
+                {"id": "partner", "name": "Partner", "references": [face]}])
+            scene_faces = dict(self.scene_faces(""))
+            scene_faces["people"] = [dict(scene_faces["people"][0], identity="partner"),
+                                     scene_faces["people"][1]]
+            with patch("apps.image_studio.facefusion.available", return_value=True), \
+                    patch("apps.image_studio.facefusion.swap",
+                          return_value=(PNG, {"outside_mask_changed_pixels": 0})), \
+                    patch("apps.image_studio.headswap.lacks", return_value=[]), \
+                    patch.object(ig.Studio, "_head_swap",
+                                 lambda self, job, client, values, pictures, *a: pictures):
+                jobs = self.studio.submit(dict(ig.default_settings(), model="flux-dev",
+                                               scene="x", backend="5090", seed=5,
+                                               face_detail=True, hand_pass=False,
+                                               head_swap=head_swap, scene_faces=scene_faces))
+                settle(jobs)
+            self.assertEqual(jobs[0].status, "complete", jobs[0].detail)
+            graphs = FaceClient.instances[-1].graphs
+            return [g for g in graphs if "fs" in g], self.studio.history.list()[0]
+
+        passes, rec = run(True)
+        self.assertEqual(passes, [])                    # no face pass run at all
+        self.assertTrue(any("1 face left to the head swap" in n for n in rec["notes"]),
+                        rec["notes"])
+        self.assertTrue(any("FaceFusion applied" in n for n in rec["notes"]), rec["notes"])
+        passes, rec = run(False)
+        self.assertEqual(len(passes), 1)
+        self.assertFalse(any("left to the head swap" in n for n in rec["notes"]), rec["notes"])
+
     def test_a_characters_face_photos_draw_the_forms_person(self):
         """The plain form: the character's photos are its one person's face -
         in the picture itself over the whole frame, on the biggest face in
