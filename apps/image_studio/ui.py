@@ -39,6 +39,7 @@ import apps.image_studio.addons.discovery as discovery
 import apps.image_studio.addons.nodes as addons
 import apps.comfyui.view as comfy_view
 import apps.image_studio.imagegen as ig
+import apps.image_studio.codex_finish as codex_finish
 import apps.image_studio.facefusion as ff
 import apps.image_studio.blend as sb
 import apps.image_studio.viewcube as viewcube
@@ -75,12 +76,14 @@ ADVANCED = [                  # (setting, label, kind)
     ("batch", "Batch size", "int"),
 ]
 STATUS_ROLE = {"queued": "muted", "uploading": "accent", "loading": "accent",
+               "awaiting_codex": "accent",
                "sampling": "accent", "decoding": "accent", "running": "accent",
                "refining": "accent", "face": "accent", "critic": "accent",
                "items": "accent", "head_swap": "accent", "face_swap": "accent", "eyes": "accent",
                "beard": "accent", "hands": "accent",
                "glasses": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
 STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "items": "Item pass",
+               "awaiting_codex": "Waiting for Codex",
                "head_swap": "Head swap",
                "face_swap": "Face swap",
                "eyes": "Eye pass", "beard": "Beard pass", "hands": "Hand pass",
@@ -89,6 +92,7 @@ STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "items": "Item pass",
 # lights up. Queued/uploading/loading run before the strip's first stop, so
 # nothing is lit yet.
 STAGE_KEY = {"queued": None, "uploading": None, "loading": None, "running": "sampling",
+             "awaiting_codex": "codex",
              "sampling": "sampling", "face": "face", "critic": "critic",
              "decoding": "decoding", "items": "items", "head_swap": "head_swap", "face_swap": "face_swap",
              "eyes": "eyes", "beard": "beard",
@@ -423,6 +427,198 @@ class CameraAim:
         self.cv.create_polygon(*lens, fill=colour, outline=colour)
 
 
+class CodexFinishWindow:
+    """User-directed export/edit/import; file work returns through the UI pump."""
+    def __init__(self, owner, record, path):
+        self.owner, self.record, self.path = owner, record, path
+        self.handoff, self.busy = None, False
+        self.regions = codex_finish.face_regions(record)
+        for h in (record.get("codex_handoff") or {}).get("handoffs") or []:
+            if h.get("source") == os.path.abspath(path):
+                self.handoff = h
+                break
+        self.win = tk.Toplevel(owner.host)
+        self.win.title("Finish with Codex")
+        self.win.transient(owner.host)
+        owner.skin(self.win, bg="bg")
+        body = owner.frame(self.win)
+        body.pack(fill="both", expand=True, padx=owner.px(16), pady=owner.px(16))
+        owner.label(body, "1. Describe the finish and click Copy handoff.\n"
+                    "2. Paste it into Codex; only the covered image is supplied.\n"
+                    "3. Import the finished picture to save a new History entry.",
+                    wraplength=owner.px(560)).pack(fill="x")
+        self.brief = tk.Text(body, width=64, height=7, wrap="word", font=owner.host.f_ui)
+        owner.skin(self.brief, bg="card", fg="text", insertbackground="text")
+        self.brief.insert("1.0", codex_finish.DEFAULT_BRIEF)
+        self.brief.pack(fill="both", expand=True, pady=owner.px(12))
+        owner.label(body, "Protected heads: drag to add a box; right-click a box to remove it.\n"
+                    "Every face to keep private must be fully inside a box, including hair and edges.",
+                    wraplength=owner.px(560)).pack(fill="x")
+        self.picture = photo(path, owner.px(560))
+        if self.picture is not None:
+            self.canvas = tk.Canvas(body, width=self.picture.width(), height=self.picture.height(),
+                                    highlightthickness=0)
+            self.canvas.pack(pady=owner.px(8))
+            self.canvas.create_image(0, 0, image=self.picture, anchor="nw")
+            self.canvas.bind("<Button-1>", self.begin_region)
+            self.canvas.bind("<B1-Motion>", self.move_region)
+            self.canvas.bind("<ButtonRelease-1>", self.end_region)
+            self.canvas.bind("<Button-3>", self.remove_region)
+            self.draw_regions()
+        self.note = owner.label(body, "Boxed faces are covered before export and restored locally on import.", "muted",
+                                wraplength=owner.px(560))
+        self.note.pack(fill="x", pady=(0, owner.px(10)))
+        actions = owner.frame(body)
+        actions.pack(fill="x")
+        self.export_button = owner.button(actions, "Copy handoff", self.export)
+        self.export_button.pack(side="left")
+        self.import_button = owner.button(actions, "Import finished image", self.take)
+        self.import_button.pack(side="left", padx=owner.px(6))
+        owner.button(actions, "Close", self.win.destroy).pack(side="right")
+
+    def status(self, text, role="muted"):
+        self.note.config(text=text)
+        self.owner.skin(self.note, fg=role)
+
+    def point(self, event):
+        return (min(1, max(0, event.x / self.picture.width())),
+                min(1, max(0, event.y / self.picture.height())))
+
+    def draw_regions(self, temporary=None):
+        self.canvas.delete("region")
+        for r in self.regions + ([temporary] if temporary else []):
+            self.canvas.create_rectangle(r[0] * self.picture.width(), r[1] * self.picture.height(),
+                                         r[2] * self.picture.width(), r[3] * self.picture.height(),
+                                         outline="#38b878", width=2, tags="region")
+
+    def begin_region(self, event):
+        if not self.busy:
+            self.start = self.point(event)
+
+    def move_region(self, event):
+        if self.busy or not getattr(self, "start", None):
+            return
+        x, y = self.point(event)
+        sx, sy = self.start
+        self.draw_regions([min(x, sx), min(y, sy), max(x, sx), max(y, sy)])
+
+    def end_region(self, event):
+        if self.busy or not getattr(self, "start", None):
+            return
+        x, y = self.point(event)
+        sx, sy = self.start
+        r = [min(x, sx), min(y, sy), max(x, sx), max(y, sy)]
+        if codex_finish.valid_region(r):
+            self.regions.append(r)
+        self.start = None
+        self.draw_regions()
+
+    def remove_region(self, event):
+        if self.busy:
+            return
+        x, y = self.point(event)
+        for i in range(len(self.regions) - 1, -1, -1):
+            a, b, c, d = self.regions[i]
+            if a <= x <= c and b <= y <= d:
+                self.regions.pop(i)
+                break
+        self.draw_regions()
+
+    def working(self, on):
+        self.busy = on
+        for button in (self.export_button, self.import_button):
+            button.set(state="disabled" if on else "normal")
+
+    def work(self, operation, done):
+        self.working(True)
+        def worker():
+            try:
+                result, error = operation(), None
+            except Exception as exc:
+                result, error = None, str(exc)
+            def arrived():
+                if self.win.winfo_exists():
+                    self.working(False)
+                    if error:
+                        self.status(error, "err")
+                    else:
+                        done(result)
+                elif result and result.get("images"):
+                    self.owner.say("Codex finish saved in History.", "ok")
+            self.owner._post("call", arrived)
+        self.owner.host._spawn(self.owner.s.event_id, worker)
+
+    def export(self):
+        if self.busy:
+            return
+        brief = self.brief.get("1.0", "end").strip()
+        def done(handoff):
+            self.handoff = handoff
+            for job in self.owner.jobs:
+                if (job.record or {}).get("id") == self.record.get("id"):
+                    job.record = self.record
+                    job.settings["codex_finish"] = True
+                    if job.id in self.owner.rows:
+                        self.owner._fill_strip(self.owner.rows[job.id], job)
+                    self.owner.studio.queue._finish(job, "complete")
+            self.owner.host.clipboard_clear()
+            self.owner.host.clipboard_append(handoff["request"])
+            covered = photo(handoff["redacted_image"], self.owner.px(560))
+            if covered is not None and self.picture is not None:
+                self.picture = covered
+                self.canvas.delete("all")
+                self.canvas.create_image(0, 0, image=self.picture, anchor="nw")
+                self.draw_regions()
+            self.status("Copied. Preview shows the covered image supplied to Codex. Saved in "
+                        + handoff["folder"] + ".", "ok")
+        def operation():
+            handoff = codex_finish.export(self.owner.studio.lib.root, self.record,
+                                          self.path, brief, list(self.regions))
+            state = self.record.setdefault("codex_handoff", {})
+            handoffs = [h for h in state.get("handoffs") or [] if h.get("source") != handoff["source"]]
+            state.update(state="pending", handoffs=handoffs + [handoff])
+            self.owner.studio.history.update(self.record)
+            return handoff
+        self.work(operation, done)
+
+    def take(self):
+        if self.busy:
+            return
+        handoff = self.handoff
+        manifest = handoff["manifest"] if handoff else filedialog.askopenfilename(
+            parent=self.win, title="Choose the saved Codex handoff.json",
+            initialdir=os.path.join(self.owner.studio.lib.root, "codex-private"),
+            filetypes=[("Codex handoff", "*.json")])
+        if not manifest:
+            return
+        try:
+            folder = codex_finish.output_folder(manifest)
+        except (OSError, ValueError) as error:
+            return self.status(str(error), "err")
+        path = filedialog.askopenfilename(
+            parent=self.win, title="Choose the finished image from Codex",
+            initialdir=folder, initialfile="finished.png",
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp *.bmp *.gif")])
+        if not path:
+            return
+        def done(record):
+            for job in self.owner.jobs:
+                if (job.record or {}).get("id") == record["codex_finish"]["source_id"]:
+                    job.outputs = record["codex_finish"].get("pipeline_results") or list(record["images"])
+                    if record["codex_finish"].get("remaining", 0):
+                        job.detail = "Import the remaining Codex finishes to complete this batch."
+                        self.owner._job_changed(job)
+                    else:
+                        job.record = record
+                        job.progress = 1.0
+                        self.owner.studio.queue._finish(job, "complete", "Codex finish imported; original faces protected.")
+            self.owner._show_list("history")
+            self.owner._select(("record", record))
+            self.status("Finished image saved in History. The original is kept.", "ok")
+        self.work(lambda: codex_finish.import_finished(self.owner.studio.history,
+                                                       manifest, path), done)
+
+
 class ImageStudio:
     def __init__(self, host, session):
         self.host, self.s = host, session
@@ -461,6 +657,7 @@ class ImageStudio:
         self.faces_set = False        # likewise for the face pass
         self.critic_notes = tk.BooleanVar(value=False)  # the Visual Critic's notes
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
+        self.codex_finish = tk.BooleanVar(value=False)
         self.scene_details_pass = tk.BooleanVar(value=True)
         self.smile_pass = tk.BooleanVar(value=True)
         self.head_swap = tk.BooleanVar(value=True)      # the head redrawn before the face swap
@@ -824,6 +1021,12 @@ class ImageStudio:
         b = tk.Checkbutton(setup, text="Natural hands pass", variable=self.hand_pass,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
+        b = tk.Checkbutton(setup, text="Codex finish (faces covered for handoff)",
+                           variable=self.codex_finish, anchor="w", font=self.host.f_small,
+                           bd=0, highlightthickness=0, wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
                   activeforeground="text")
         b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
@@ -1946,6 +2149,7 @@ class ImageStudio:
         s["face_detail"] = bool(self.faces.get())
         s["critic_notes"] = bool(self.critic_notes.get())
         s["hand_pass"] = bool(self.hand_pass.get())
+        s["codex_finish"] = bool(self.codex_finish.get())
         s["scene_details_pass"] = bool(self.scene_details_pass.get())
         s["smile_pass"] = bool(self.smile_pass.get())
         s["head_swap"] = bool(self.head_swap.get())
@@ -2014,6 +2218,7 @@ class ImageStudio:
         self.faces_set = True
         self.critic_notes.set(bool(s.get("critic_notes")))
         self.hand_pass.set(s.get("hand_pass", True) is not False)
+        self.codex_finish.set(bool(s.get("codex_finish")))
         self.scene_details_pass.set(s.get("scene_details_pass", True) is not False)
         self.smile_pass.set(s.get("smile_pass", True) is not False)
         self.head_swap.set(s.get("head_swap", True) is not False)
@@ -2361,7 +2566,7 @@ class ImageStudio:
         top.grid(row=0, column=0, sticky="nsew")
         acts = self.frame(top, "card")
         acts.pack(side="bottom", fill="x", padx=self.px(10), pady=(self.px(4), self.px(10)))
-        self.act_again = self.button(acts, "Generate again  ▾", self._again_menu, bg="card")
+        self.act_again = self.button(acts, "Image actions  ▾", self._again_menu, bg="card")
         self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
         self.act_blend = self.button(acts, "Blend" + ELLIPSIS, self._blend_selected, bg="card")
         self.act_again.pack(side="left")
@@ -2419,6 +2624,7 @@ class ImageStudio:
         self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
         menu.add_command(label="Open", command=self._open_selected)
         menu.add_command(label="Fix a spot" + ELLIPSIS, command=self._fix_selected)
+        menu.add_command(label="Finish with Codex" + ELLIPSIS, command=self._finish_codex_selected)
         menu.add_command(label="Blend with" + ELLIPSIS, command=self._blend_selected)
         if self._selected_steps()[0]:
             menu.add_command(label="Show nodes", command=self._show_nodes)
@@ -2825,7 +3031,8 @@ class ImageStudio:
         right.pack(side="left", fill="both", expand=True, pady=self.px(6))
         btns = self.frame(right, "card")
         btns.pack(side="top", fill="x")
-        self.button(btns, "Repeat seed", lambda: self._again(rec), bg="card").pack(
+        self.button(btns, "Finish again" if rec.get("codex_finish") else "Repeat seed",
+                    lambda: self._again(rec), bg="card").pack(
             side="right", padx=(0, self.px(6)))
         self.button(btns, "Reuse", lambda: self.reuse(rec["settings"]), bg="card").pack(
             side="right", padx=(0, self.px(4)))
@@ -2847,6 +3054,9 @@ class ImageStudio:
             w.bind("<Button-1>", lambda ev: self._select(("record", rec)))
 
     def describe(self, rec):
+        if rec.get("codex_finish"):
+            return "Finished with Codex imagegen · %sx%s · source %s" % (
+                rec.get("width"), rec.get("height"), rec["codex_finish"].get("source_id", ""))
         if rec.get("workflow") == "facefusion":
             return "Face swap on this PC" + (" · %ss" % rec["duration"] if rec.get("duration") else "")
         bits = [(rec.get("model") or {}).get("label") or "?",
@@ -2938,6 +3148,8 @@ class ImageStudio:
 
     def _again(self, rec, new_seed=False):
         """Repeat saved parameters; library entries and backend files remain live."""
+        if rec.get("codex_finish"):
+            return CodexFinishWindow(self, rec, (rec.get("images") or [None])[0])
         s = ig.again(rec, new_seed)
         self.say(("Same settings, new seed" if new_seed else
                   "Repeating seed %s" % s.get("seed")) +
@@ -2968,8 +3180,15 @@ class ImageStudio:
         button rather than three pills fighting the row for space."""
         menu = tk.Menu(self.act_again, tearoff=0)
         self.skin(menu, bg="card", fg="text", activebackground="sel", activeforeground="text")
-        menu.add_command(label="Repeat seed", command=self._again_selected)
-        menu.add_command(label="New seed", command=lambda: self._again_selected(True))
+        menu.add_command(label="Finish with Codex" + ELLIPSIS,
+                         command=self._finish_codex_selected,
+                         state="normal" if self._selected_record() and self.pending_preview else "disabled")
+        menu.add_separator()
+        if (self._selected_record() or {}).get("codex_finish"):
+            menu.add_command(label="Finish again with Codex", command=self._finish_codex_selected)
+        else:
+            menu.add_command(label="Repeat seed", command=self._again_selected)
+            menu.add_command(label="New seed", command=lambda: self._again_selected(True))
         menu.add_command(label="Reuse settings", command=self._reuse_selected)
         menu.tk_popup(self.act_again.winfo_rootx(),
                       self.act_again.winfo_rooty() + self.act_again.winfo_height())
@@ -3005,6 +3224,15 @@ class ImageStudio:
         if not path or not os.path.isfile(path) or s is None:
             return self.say("Choose a finished picture to fix.", "warn")
         FixWindow(self, path, s)
+
+    def _finish_codex_selected(self):
+        record, path = self._selected_record(), self.pending_preview
+        if not record or not path or not os.path.isfile(path):
+            return self.say("Choose a finished picture to send to Codex.", "warn")
+        if any((j.record or {}).get("id") == record.get("id") and j.status not in ig.FINISHED
+               for j in self.jobs):
+            return self.say("Let the local identity and repair passes finish before the Codex handoff.", "warn")
+        CodexFinishWindow(self, record, path)
 
     def _blend_selected(self):
         """Blend, with the picture shown (if there is one) as its first."""

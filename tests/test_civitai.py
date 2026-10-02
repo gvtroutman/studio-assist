@@ -107,7 +107,8 @@ class TestLinks(unittest.TestCase):
 
     def test_what_is_not_civitai_is_none(self):
         for text in ("", "https://huggingface.co/models/123", "hello",
-                     "https://civitai.com/user/someone", "https://notcivitai.com/models/1"):
+                     "https://civitai.com/user/someone", "https://notcivitai.com/models/1",
+                     "[[0, 0, 0.5, 0.5]]", "https://[broken", "Use only these protected rectangles: [[0, 0, 1, 1]]"):
             with self.subTest(text=text):
                 self.assertIsNone(civitai.parse_link(text))
 

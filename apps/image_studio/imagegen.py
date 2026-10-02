@@ -4148,7 +4148,7 @@ def default_settings():
             "face_detail": None, "batch": 1, "pose": None, "composition": None,
             "critic_notes": False, "refine_passes": 3, "hand_pass": True, "head_swap": True,
             "glasses_pass": None, "lora_budget": None, "scene_details_pass": True,
-            "smile_pass": True,
+            "smile_pass": True, "codex_finish": False,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -5566,7 +5566,7 @@ STATUSES = ("queued", "uploading", "loading", "sampling", "decoding", "running",
             "face", "critic", "items", "head_swap", "face_swap", "eyes", "beard", "hands",
             "glasses",
             "complete", "failed", "cancelled")
-FINISHED = ("complete", "failed", "cancelled")
+FINISHED = ("complete", "failed", "cancelled", "awaiting_codex")
 # The stages a job is shown moving through. "running" and "refining" are what
 # a node no stage names reports; "uploading" counts as queued.
 STAGES = ("queued", "loading", "sampling", "decoding", "complete")
@@ -5685,6 +5685,8 @@ def pipeline_stages(lib, settings, plan=None):
         stages.append((details.STATUS, details.LABEL))
     if not swap_only and settings.get("critic_notes"):
         stages.append(("critic", "Critic notes"))
+    if settings.get("codex_finish"):
+        stages.append(("codex", "Codex finish"))
     stages.append(("complete", "Complete"))
     return stages
 
@@ -5803,6 +5805,8 @@ class JobQueue:
                 lane.cv.notify_all()
 
     def _finish(self, job, status, detail=""):
+        if status == "complete" and (job.record or {}).get("codex_handoff", {}).get("state") == "pending":
+            status, detail = "awaiting_codex", "Local passes saved. Finish with Codex, then import the result."
         job.status, job.detail = status, detail
         job.finished = time.time()
         if job.started is None:
@@ -5999,6 +6003,9 @@ def again(record, new_seed=False):
     with, the sampler values it resolved to (so a changed model default does
     not change it), and the backend it ran on, preferred when it can still
     take it. `new_seed` is the variation: everything the same but the seed."""
+    if record.get("codex_finish"):
+        raise ComfyError("This picture was finished with Codex imagegen. Finish it with "
+                         "Codex again, or reuse its source settings to generate a new base.")
     s = copy.deepcopy(record.get("settings") or {})
     s["batch"] = 1
     s.pop("batch_of", None)
@@ -6958,6 +6965,16 @@ class Studio:
         checkpoint = job.record
         job.record = self.history.add(record, pictures)
         job.outputs = list(job.record["images"])
+        if job.settings.get("codex_finish") and job.outputs:
+            from apps.image_studio import codex_finish
+            handoffs = []
+            try:
+                for picture in job.outputs:
+                    handoffs.append(codex_finish.export(self.lib.root, job.record, picture))
+            except (ValueError, OSError) as error:
+                job.record.setdefault("notes", []).append("Codex handoff: %s" % error)
+            job.record["codex_handoff"] = {"state": "pending", "handoffs": handoffs}
+            self.history.update(job.record)
         if checkpoint and checkpoint.get("finish"):
             checkpoint["finish"].update(state="complete", results=list(job.outputs))
             self._update_checkpoint(checkpoint)
