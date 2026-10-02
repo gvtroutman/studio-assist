@@ -256,11 +256,9 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         report = dict({'outside_mask_changed_pixels': 0}, **({'masks': masks} if masks else {}))
         if enhance:
             report['enhance'] = enhance
-        self.graphs_at_swap = []          # how many graphs ComfyUI had run at each swap
         with patch.object(ff, 'available', return_value=True), \
                 patch.object(ff, 'swap', side_effect=lambda *a, **k: (
-                    order.append('swap') or self.graphs_at_swap.append(
-                        len(FakeClient.instances[-1].graphs)) or (PNG, dict(report)))):
+                    order.append('swap') or (PNG, dict(report)))):
             jobs = self.studio.submit(s)
             settle(jobs)
         client = FakeClient.instances[-1]
@@ -590,21 +588,17 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         return {"prompt": "closely cropped dense auburn short beard, high cheek coverage",
                 "mask_path": path, "person_id": "p1", "kind": "facial_hair"}
 
-    def test_a_scene_beard_is_redrawn_before_the_face_swap_inside_its_mask(self):
+    def test_a_scene_beard_is_redrawn_after_the_eyes_inside_its_mask(self):
         region = self.beard_region()
         job, client, order = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)],
                                              character_regions=[region])
         self.assertEqual(job.status, 'complete', job.detail)
         self.assertEqual(order, ['swap'])
-        first, beard, find, eyes, hands, glasses = client.graphs[-6:]
-        # The beard pass is done when FaceFusion swaps (the user, 2026-10-02).
-        self.assertEqual(self.graphs_at_swap, [len(client.graphs) - 4])
-        self.assertEqual(first["p0t"]["inputs"]["text"], "face:8")
-        self.assertEqual([k for k in first if k.endswith("t") and k.startswith("p")], ["p0t"])
+        find, eyes, beard, hands, glasses = client.graphs[-5:]
         self.assertEqual(find["p0t"]["inputs"]["text"], "face:8")
         self.assertEqual(eyes["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
-        # The beard on the picture before the swap, redrawn only inside the scene's mask.
-        self.assertEqual(beard["fi"]["inputs"]["image"], first["1"]["inputs"]["image"])
+        # The beard on the eye pass's picture, redrawn only inside the scene's mask.
+        self.assertEqual(beard["fi"]["inputs"]["image"], "ImageStudio/faces_00001_.png [output]")
         self.assertTrue(beard["fc1_a0"]["inputs"]["image"].startswith("studio_%s_0_beard0"
                                                                       % job.id))
         self.assertNotIn("fc1_s0", beard)           # the mask is the scene's, not SAM3's
@@ -617,12 +611,10 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(hands["fc1_s0"]["inputs"]["text"], "hand")
         self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
         self.assertEqual([p["label"] for p in job.record["passes"]],
-                         ["Beard", "Eye pass", "Hands", "Glasses"])
-        self.assertIn("Beard pass before the face swap: 1 beard redrawn in its mask, "
-                      "denoise %s." % ig.BEARD_DENOISE, job.record["notes"])
-        stages = [k for k, _ in ig.pipeline_stages(self.studio.lib, job.settings)]
-        self.assertLess(stages.index("beard"), stages.index("face_swap"))
-        self.assertLess(stages.index("face_swap"), stages.index("eyes"))
+                         ["Eye pass", "Beard", "Hands", "Glasses"])
+        self.assertIn("Beard pass: 1 beard redrawn in its mask, denoise %s."
+                      % ig.BEARD_DENOISE, job.record["notes"])
+        self.assertIn(("beard", "Beard pass"), ig.pipeline_stages(self.studio.lib, job.settings))
 
     def test_a_scene_beard_without_a_face_swap_and_its_switch(self):
         region = self.beard_region()
