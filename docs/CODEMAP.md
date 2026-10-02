@@ -88,7 +88,8 @@ After Effects and Resolve use outside npm servers.
 - **The refine pass** - `zimage_hq.json` (`refine_model`, nodes 42-49) and the
   block after "A refine pass is sized" in `imagegen.compose`. AGENTS.md "The Z-Image
   refine pass enlarges with an upscale model".
-- **The finish** - `Studio._finish_passes`: `hand_pass`, `real_hands`,
+- **The finish** - `Studio._finish_passes`: `eye_pass`, the beard pass
+  (`beard_regions`, `beard_spots`, `beard_shape_png`), `hand_pass`, `real_hands`,
   `glasses_pass`; a redraw's sampler is the workflow's `redraw_sampler`
   (`face_graph`). Tests: `tests/test_finish_line.py`.
 - **Identity** - `apps/image_studio/lora_train.py` (Build LoRA: a Klein 9B head LoRA,
