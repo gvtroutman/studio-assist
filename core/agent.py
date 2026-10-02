@@ -1214,7 +1214,8 @@ class ServerSpec(AppSpec):
     ends when the window does, like a bridge - and the probe is its loopback
     port. What keeps it in check is its config, not a sandbox: it works in
     one folder, reads freely, and every edit, command and fetch waits for the
-    user (see `opencode_config`).
+    user (see `opencode_config`) - or, with the user's Agentic switch on
+    (`agentic`), is answered by the bridge when it stays inside a task's copy.
     """
 
     served = True
@@ -1224,6 +1225,7 @@ class ServerSpec(AppSpec):
         self.workspace = workspace
         self.state_dir = state_dir            # config, password, log - never the workspace
         self.child = None
+        self._agentic = None                  # the switch, once read (see `agentic`)
 
     @property
     def remote(self):
@@ -1289,6 +1291,34 @@ class ServerSpec(AppSpec):
     def key_path(self):
         return os.path.join(self.state_dir, "server.key")
 
+    @property
+    def agentic_path(self):
+        """The user's Agentic switch, where the bridge reads it on every look
+        (apps/opencode/mcp.py `agentic`). A file, so it holds across restarts;
+        written by the window only, so no tool - and no model - sets it."""
+        return os.path.join(self.state_dir, OPENCODE_AGENTIC)
+
+    def agentic(self):
+        """Whether the user has Agentic on: in a task's copy OpenCode's edits
+        and test runs go through without a card. Read from the file once and
+        kept - this window is the only writer, and the header asks on every
+        status change."""
+        if self._agentic is None:
+            try:
+                with open(self.agentic_path, encoding="utf-8") as f:
+                    self._agentic = json.load(f).get("on") is True
+            except (OSError, ValueError, AttributeError):
+                self._agentic = False
+        return self._agentic
+
+    def set_agentic(self, on):
+        os.makedirs(self.state_dir, exist_ok=True)
+        tmp = self.agentic_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"on": bool(on), "since": time.strftime("%Y-%m-%d %H:%M")}, f)
+        os.replace(tmp, self.agentic_path)
+        self._agentic = bool(on)
+
     def write_config(self, host, model, ids, context=None):
         os.makedirs(self.state_dir, exist_ok=True)
         # The general brief goes to every folder; this repo adds its own.
@@ -1330,6 +1360,9 @@ class ServerSpec(AppSpec):
         env = dict(os.environ, OPENCODE_CONFIG=self.config_path,
                    OPENCODE_SERVER_PASSWORD=key)
         env.pop("OPENCODE_CONFIG_CONTENT", None)
+        # The tests OpenCode runs leave no __pycache__ in a task's copy: in a
+        # folder with no .gitignore they were checkpointed and would be merged.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         if own_repo(self.workspace):
             env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"   # not the 60k-token AGENTS.md
         port = urllib.parse.urlsplit(OPENCODE_URL).port or 4096
@@ -1508,6 +1541,10 @@ OPENCODE_PERMISSIONS = {
     "edit": "ask", "bash": "ask", "webfetch": "ask", "websearch": "ask",
     "doom_loop": "ask", "external_directory": "deny",
 }
+# The user's Agentic switch, a file in the state folder (ServerSpec.agentic).
+# It loosens nothing above: OpenCode still asks, and with the switch on the
+# bridge answers what stays inside a task's copy instead of showing a card.
+OPENCODE_AGENTIC = "agentic.json"
 
 
 def load_addons(state_dir):
@@ -1689,7 +1726,7 @@ APPS = [
             "Run the OpenCode bridge's tests and fix what fails",
         ],
         launch_note="It works in this app's own folder, reads freely, and asks you "
-                    "before every edit, command and fetch.",
+                    "before every edit, command and fetch - unless you turn Agentic on.",
         docs=[("OpenCode documentation", "https://opencode.ai/docs/")],
     ),
     AppSpec(

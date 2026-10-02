@@ -1208,6 +1208,9 @@ class TestAppRegistry(unittest.TestCase):
             with open(oc.key_path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), env["OPENCODE_SERVER_PASSWORD"])
             self.assertGreaterEqual(len(env["OPENCODE_SERVER_PASSWORD"]), 24)
+            # Seen live: the tests OpenCode ran left .pyc files in the task's
+            # copy, and the checkpoint took them.
+            self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
             with open(oc.config_path, encoding="utf-8") as f:
                 cfg = json.load(f)
             self.assertEqual(cfg["model"], "lmstudio/m1")
@@ -1228,6 +1231,36 @@ class TestAppRegistry(unittest.TestCase):
         finally:
             (eng.studio_procs.spawn, eng.opencode_exe, eng.probe_models,
              eng.context_window, oc.workspace, oc.state_dir, oc.child) = real
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_agentic_is_the_windows_to_switch_and_the_bridge_reads_it(self):
+        """The switch is a file in the state folder: off until the user turns
+        it on, kept across restarts, and read by the bridge in its own
+        process. OpenCode's config is not loosened by it - it still asks."""
+        import apps.opencode.mcp as bridge
+        oc = eng.APPS_BY_ID["opencode"]
+        tmp = tempfile.mkdtemp()
+        real = (oc.state_dir, oc._agentic, bridge.STATE_DIR)
+        oc.state_dir = bridge.STATE_DIR = os.path.join(tmp, "state")
+        oc._agentic = None
+        try:
+            self.assertFalse(oc.agentic(), "off until the user turns it on")
+            self.assertFalse(bridge.agentic())
+            oc.set_agentic(True)
+            self.assertTrue(oc.agentic())
+            self.assertTrue(bridge.agentic())
+            self.assertEqual(os.path.dirname(oc.agentic_path), oc.state_dir)
+            oc._agentic = None                # the app closed and opened again
+            self.assertTrue(oc.agentic())
+            oc.set_agentic(False)
+            self.assertFalse(bridge.agentic())
+            cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"])
+            self.assertEqual(cfg["permission"]["edit"], "ask")
+            self.assertEqual(cfg["permission"]["bash"], "ask")
+            self.assertIn("Agentic", oc.system_prompt)
+            self.assertIn("No tool turns Agentic on or off", oc.system_prompt)
+        finally:
+            oc.state_dir, oc._agentic, bridge.STATE_DIR = real
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_comfy_bridge_is_the_stdlib_server_beside_the_engine(self):
@@ -3941,7 +3974,7 @@ class TestGui(unittest.TestCase):
         calls, emitted = [], []
 
         class Bridge:
-            def call_tool(self, name, args):
+            def call_tool(self, name, args, cancel=None):
                 calls.append((name, args))
                 return {"content": [{"type": "text", "text": "Session ses_1 is done."}]}
         saved = (s.mcp, list(s.messages), s.record.status)
@@ -3956,6 +3989,109 @@ class TestGui(unittest.TestCase):
             self.assertTrue(s.record.status.startswith("response complete"))
         finally:
             s.mcp, s.messages[:], s.record.status = saved[0], saved[1], saved[2]
+
+    def test_direct_follows_work_that_outlasts_a_call_and_stop_ends_it(self):
+        """No model is there to call opencode_wait: a call that hands back with
+        OpenCode still at work, or with work left, is followed on from here."""
+        s = self.app.cur()
+        calls, emitted = [], []
+
+        def at(state, text, error=True):
+            return {"content": [{"type": "text", "text": text}], "isError": error,
+                    "_meta": {"studio/opencode": {"session": "ses_7", "state": state}}}
+
+        class Bridge:
+            answers = []
+
+            def call_tool(self, name, args, cancel=None):
+                calls.append((name, args, cancel))
+                answer = self.answers.pop(0)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        saved = (s.mcp, list(s.messages), s.record.status)
+        s.mcp = Bridge()
+        emit = lambda kind, payload: emitted.append((kind, payload))
+        try:
+            Bridge.answers = [at("working", "still working"), at("unfinished", "work left"),
+                              at("done", "Session ses_7 is done.", error=False)]
+            s.messages.append({"role": "user", "content": "rename x to y"})
+            self.app._direct_turn(s, emit)
+            self.assertEqual([(n, a) for n, a, _ in calls],
+                             [("opencode_ask", {"prompt": "rename x to y"}),
+                              ("opencode_wait", {"session_id": "ses_7"}),
+                              ("opencode_wait", {"session_id": "ses_7"})])
+            self.assertTrue(all(c is s.cancel for _, _, c in calls), "Stop reaches each call")
+            self.assertEqual(s.messages[-1]["content"], "Session ses_7 is done.")
+            self.assertEqual([p for k, p in emitted if k == "token"],
+                             ["Session ses_7 is done."], "only the last report is the reply")
+            self.assertTrue(s.record.status.startswith("response complete"))
+            # It does not follow for ever.
+            del calls[:]
+            Bridge.answers = [at("working", "still working")] * (self.mod.DIRECT_WAITS + 3)
+            s.messages.append({"role": "user", "content": "again"})
+            self.app._direct_turn(s, emit)
+            self.assertEqual(len(calls), 1 + self.mod.DIRECT_WAITS)
+            self.assertTrue(s.record.status.startswith("needs attention"))
+            # Stop while a call is in flight: said in words, not raised.
+            del calls[:]
+            Bridge.answers = [at("working", "still working"),
+                              eng.Cancelled("the user pressed Stop")]
+            s.messages.append({"role": "user", "content": "and again"})
+            self.app._direct_turn(s, emit)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(s.messages[-1]["content"].startswith("Stopped."))
+            # A stopped or finished call is not followed.
+            del calls[:]
+            Bridge.answers = [at("stopped", "The user stopped OpenCode")]
+            s.messages.append({"role": "user", "content": "once more"})
+            self.app._direct_turn(s, emit)
+            self.assertEqual(len(calls), 1)
+        finally:
+            s.mcp, s.messages[:], s.record.status = saved[0], saved[1], saved[2]
+
+    def test_agentic_is_a_button_on_opencodes_tab_that_the_user_switches(self):
+        oc = eng.APPS_BY_ID["opencode"]
+        tmp = tempfile.mkdtemp()
+        real = (oc.state_dir, oc._agentic)
+        oc.state_dir, oc._agentic = os.path.join(tmp, "state"), None
+        try:
+            self.app._select(eng.APPS[0].id)
+            self.app.update()
+            self.assertFalse(self.app.btn_agentic.winfo_ismapped(), "OpenCode's tab only")
+            s = self.app.sessions["opencode"]
+            self.app._select(s.id)
+            self.app.update()
+            self.assertTrue(self.app.btn_agentic.winfo_ismapped())
+            self.assertEqual(self.app.btn_agentic.cget("text"), "Agentic: off")
+            self.app.btn_agentic.invoke()
+            self.app.update()
+            self.assertEqual(self.app.btn_agentic.cget("text"), "Agentic: on")
+            self.assertTrue(oc.agentic())
+            with open(oc.agentic_path, encoding="utf-8") as f:
+                self.assertIs(json.load(f)["on"], True)
+            body = s.view.get("1.0", "end")
+            self.assertIn("Agentic is on", body)
+            self.assertIn("until you merge", body)
+            # Not while the tab is working: the run under way keeps its rules.
+            s.busy = True
+            self.app._apply_status()
+            self.app._toggle_agentic()
+            self.assertTrue(oc.agentic())
+            s.busy = False
+            self.app._apply_status()
+            self.app.btn_agentic.invoke()
+            self.app.update()
+            self.assertEqual(self.app.btn_agentic.cget("text"), "Agentic: off")
+            self.assertFalse(oc.agentic())
+            self.assertIn("Agentic is off", s.view.get("1.0", "end"))
+        finally:
+            s = self.app.sessions["opencode"]
+            s.busy = False
+            oc.state_dir, oc._agentic = real
+            self.app._clear_view(s)
+            self.app._apply_status()
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_a_remember_message_is_kept_without_the_model(self):
         """Live 2026-09-27: handed to the model, "remember run tests with pytest
