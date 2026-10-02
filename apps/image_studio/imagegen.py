@@ -5772,11 +5772,12 @@ class JobQueue:
             try:
                 self.studio.run_job(job, self.notify)
             except Exception as e:           # never let a lane die with a job half done
-                if job.status not in FINISHED:
-                    self._finish(job, "failed", "%s: %s" % (type(e).__name__, e))
                 # The trace, not just the repr: a bare "list indices must be
                 # integers" names no line, and this is the only record there is.
+                # Logged before the finish, so anyone woken by the finish finds it.
                 doctor.log_error("Image Studio job %s failed:\n%s" % (job.id, traceback.format_exc()))
+                if job.status not in FINISHED:
+                    self._finish(job, "failed", "%s: %s" % (type(e).__name__, e))
             finally:
                 lane.current = None
             if not lane.waiting and lane.backend.get("release_vram"):
