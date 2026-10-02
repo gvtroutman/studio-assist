@@ -2653,15 +2653,6 @@ class ImageStudio:
         self.wrap(meta, right, self.px(12))
         strip = self.frame(right, "card")
         strip.pack(side="top", fill="x", pady=(self.px(3), 0))
-        stages, stage_keys = [], []
-        for i, (key, label) in enumerate(ig.pipeline_stages(self.studio.lib, s)):
-            if i:
-                self.label(strip, "→", "faint", self.host.f_small, bg="card").pack(
-                    side="left", padx=self.px(3))
-            lbl = self.label(strip, label, "faint", self.host.f_small, bg="card")
-            lbl.pack(side="left")
-            stages.append(lbl)
-            stage_keys.append(key)
         bar = tk.Canvas(right, height=self.px(4), highlightthickness=0, bd=0)
         self.skin(bar, bg="card")
         bar.pack(side="top", fill="x", pady=(self.px(4), 0), padx=(0, self.px(8)))
@@ -2670,7 +2661,7 @@ class ImageStudio:
         self.wrap(detail, right, self.px(12))
         widgets = {"row": row, "thumb": thumb, "status": status, "elapsed": elapsed,
                    "bar": bar, "detail": detail, "cancel": cancel, "meta": meta,
-                   "stages": stages, "stage_keys": stage_keys, "strip": strip,
+                   "strip": strip,
                    "base": "%s · %s · %s · seed %s" % (
                        preset, model.get("label", s.get("model")), job.backend["name"],
                        s.get("seed")) if s.get("mode") not in ("dress", "blend") else
@@ -2682,12 +2673,36 @@ class ImageStudio:
         for w in (row, right, thumb, thumb.img, status, meta, detail):
             w.bind("<Button-1>", lambda ev: self._select(("job", job)))
         self.rows[job.id] = widgets
+        self._fill_strip(widgets, job)
         self._paint_job(job)
+
+    def _fill_strip(self, w, job):
+        """The job's pipeline strip, from its settings until its plan is
+        composed and then from the plan (a workflow without a face pass has
+        no Face pass stop), drawn again only when the stops change."""
+        w["planned"] = job.plan
+        stops = ig.pipeline_stages(self.studio.lib, job.settings, job.plan)
+        if [k for k, _ in stops] == w.get("stage_keys"):
+            return
+        strip = w["strip"]
+        for child in strip.winfo_children():
+            child.destroy()
+        w["stages"], w["stage_keys"] = [], []
+        for i, (key, label) in enumerate(stops):
+            if i:
+                self.label(strip, "→", "faint", self.host.f_small, bg="card").pack(
+                    side="left", padx=self.px(3))
+            lbl = self.label(strip, label, "faint", self.host.f_small, bg="card")
+            lbl.pack(side="left")
+            w["stages"].append(lbl)
+            w["stage_keys"].append(key)
 
     def _paint_job(self, job):
         w = self.rows.get(job.id)
         if w is None:
             return
+        if job.plan is not w.get("planned"):
+            self._fill_strip(w, job)
         cancelling = job.cancel.is_set() and job.status not in ig.FINISHED
         w["status"].config(text="Cancelling…" if cancelling else
                            STATUS_TEXT.get(job.status, job.status.capitalize()))
