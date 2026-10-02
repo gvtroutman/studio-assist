@@ -55,6 +55,22 @@ class HuggingFace(unittest.TestCase):
                              {"rfilename": "README.md", "size": 50}]}
         self.assertEqual(hub.hf_pick_file(info), ("big.safetensors", 5, "ab"))
         self.assertIsNone(hub.hf_pick_file({"siblings": []}))
+        # Nothing that would leave the LoRA folder, however large.
+        info["siblings"] += [{"rfilename": "..\\up.safetensors", "size": 999},
+                             {"rfilename": "x.safetensors:s", "size": 999}]
+        self.assertEqual(hub.hf_pick_file(info), ("big.safetensors", 5, "ab"))
+
+    def test_a_download_cut_off_is_not_kept(self):
+        # Idea e9aa56ba1d45: with no hash, a stream cut off ended like a whole one.
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "x.safetensors")
+            with self.assertRaisesRegex(hub.HubError, "cut off"):
+                hub._download("https://huggingface.co/f", dest, "", 100, "",
+                              lambda t: None, None, opener({"/f": b"0123456789"}))
+            self.assertFalse(os.listdir(d))
+            hub._download("https://huggingface.co/f", dest, "", 10, "",
+                          lambda t: None, None, opener({"/f": b"0123456789"}))
+            self.assertEqual(os.path.getsize(dest), 10)
 
     def test_download_checks_hash(self):
         body = b"lora bytes"
