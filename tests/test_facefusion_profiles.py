@@ -20,24 +20,23 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
             'references': [path], 'use_references': False, 'avatar': 'generated-avatar.png'}])
         return self.studio.lib.get('identities', 'partner')
 
-    def test_selected_profile_applies_after_refinement_and_is_recorded(self):
+    def test_selected_profile_applies_and_the_critic_notes_the_swapped_picture(self):
         profile = self.profile()
         order = []
-        def refine(job, client, plan, values, files, say):
-            order.append('refine')
-            return files
+        def notes(job, plan, pictures, say):
+            order.append('notes')
         def swap(data, who, **kw):
             order.append('swap')
             self.assertEqual(who['references'], profile['references'])
             self.assertNotIn(who['avatar'], who['references'])
             return PNG, {'outside_mask_changed_pixels': 0, 'identity': who['id']}
-        with patch.object(self.studio, '_refine', refine), patch.object(ff, 'available', return_value=True), \
+        with patch.object(self.studio, '_take_notes', notes), patch.object(ff, 'available', return_value=True), \
                 patch.object(ff, 'swap', side_effect=swap):
             jobs = self.studio.submit(dict(ig.default_settings(), scene='Dancing',
-                model='z-image-turbo', backend='5090', identities=[{'id': 'partner'}], auto_refine=True))
+                model='z-image-turbo', backend='5090', identities=[{'id': 'partner'}], critic_notes=True))
             settle(jobs)
         self.assertEqual(jobs[0].status, 'complete', jobs[0].detail)
-        self.assertEqual(order, ['refine', 'swap'])
+        self.assertEqual(order, ['swap', 'notes'])        # the critic looks last
         self.assertEqual(jobs[0].record['facefusion'][0]['identity'], 'partner')
 
     def test_missing_facefusion_fails_before_rendering(self):

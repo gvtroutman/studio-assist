@@ -79,7 +79,7 @@ def run(recipe, stage, output, portrait_report=None):
             settings = dict(ig.default_settings(), model='flux-dev', identities=['subject'],
                 scene=prompt, seed=seed, seed_mode='fixed', steps=25, guidance=4.0,
                 width=768, height=768, anatomy=False, face_detail=False,
-                auto_refine=False, hand_pass=False, refine=False)
+                critic_notes=False, hand_pass=False, refine=False)
             plan = studio.preview(settings, backend)
             if plan.errors or (candidate['file'] and not any(
                     item[0] == candidate['file'] for item in plan.loras)):

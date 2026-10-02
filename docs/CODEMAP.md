@@ -74,12 +74,13 @@ After Effects and Resolve use outside npm servers.
 - **Tab and engine** - `apps/image_studio/ui.py` (tab, 5.9k) over
   `apps/image_studio/imagegen.py` (engine, 6.7k). `python apps/image_studio/imagegen.py --probe`
   is the first diagnostic.
-- **Critic** - `apps/image_studio/critic.py` (`analyze_generated_image`,
-  `plan_next_refinement`; the faults: `user_faults`, `score_fixes`, `carry`, `harder`),
-  run by `Studio._refine` - after Generate, and after a fix with `fix["check"]`.
-  Its ledger (`critic_ledger.json`: `note_fixes`, `note_picture`, `note_marked`; read
-  back by `start_denoise`, `recurring`, `prevention`, `blind_checks`) is written by
-  `Studio._learn` and read in `_refine` and `compose`.
+- **Critic** - `apps/image_studio/critic.py` (`analyze_generated_image`, `noted`;
+  the faults: `user_faults`, `score_fixes`, `carry`, `harder`). Not a pipeline step:
+  `Studio._take_notes` looks at the finished picture last and only files notes;
+  `Studio._check_fix` is Fix a spot's check (`fix["check"]`), the one thing that
+  redraws. Its ledger (`critic_ledger.json`: `note_picture`, `note_marked`,
+  `note_fixes`; read back by `recurring`, `blind_checks` for the critic's own
+  question only) is written by `Studio._learn`.
 - **What a prompt and a LoRA stack come to** - in `imagegen.compose`: the clothing
   floor (`CLOTHED`, `COVERED`), `anatomy_text` (a workflow's `"anatomy": false`
   leaves it out), `hold_loras` (a workflow's `lora_budget`). AGENTS.md "What the
