@@ -977,6 +977,35 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   the variation. Measured on the 5090: the pixels match exactly, but the PNG
   bytes do not, because ComfyUI embeds the graph, and the output name in it
   differs per job.
+- **What jobs leave behind is tidied away** (2026-09-30, the user: "the folders keep
+  growing is an issue"). Every pass of every job saves a picture in ComfyUI's
+  `output/ImageStudio`, and every picture sent to it stays in its `input`;
+  History keeps its own copy of what was made, so those were only ever left:
+  2 GB and 386 MB on the 5090 in six days. ComfyUI has no call that removes a
+  file, so the app removes them itself, and only where it can and was told to:
+  a backend whose URL is this PC's and whose **`folder`** (Backends: "ComfyUI's
+  folder, if it is on this PC") names ComfyUI's own folder (`comfy_folder`; never
+  guessed from `start`, so a test or a fresh library touches nothing). After a
+  lane's last job, at most every `TIDY_EVERY` (6 h), `Studio.upkeep` runs
+  `Studio.tidy`: files directly in `output/ImageStudio` named as a job's
+  (`MADE`: `<workflow>_<12 hex job id>[_<pass>]_00001_.png`) and files directly
+  in `input` named as an upload (`SENT`: `studio_<16 hex>.<ext>`), last written
+  more than the backend's **`keep_days`** ago (7; 0 keeps everything), are
+  deleted - `os.remove`, not the Recycle Bin, since the point is the space. A
+  subfolder (`_exp`, `_lab`), a picture under any other name, and a file that
+  will not go are left. What this costs: the Nodes view cannot run an old
+  record's passes once the pictures they load are gone. The 3090's folders are
+  on the LLM PC and are not reached. **An upload is believed for `UPLOAD_TTL`
+  (6 h), not for the client's life** (`ComfyUIClient.uploaded` is name -> when):
+  the phone's server lives for weeks, and a name it sent last week may have
+  been tidied away by the app; sent again, the file is new there. Keep
+  `UPLOAD_TTL` under a day, the least `keep_days` can be. The library's own
+  temporary pictures are gone too: `_upload_made` writes a picture under
+  `finish/` or `fix_shapes/` only for the upload and removes it (`_head_swap`,
+  `_finish_passes`, `_outline_masks` left 53 files, 69 MB, in four days), and
+  `tidy` removes what a job that died in between left there after a day. A tidy
+  that fails is logged (`doctor.log_error`) and costs no job; what it removed is
+  one line in the activity log. Tests: `tests/test_upkeep.py`.
 - **FLUX runs the baseline, with layers that leave it alone when off**
   (`flux_dev_baseline.json`): ComfyUI's own `flux_dev_full_text_to_image`
   recipe plus FluxGuidance. Layered on it, one at a time (2026-09-25): a
@@ -1325,7 +1354,8 @@ default and for pictures saved before it; "Head swap before the face swap" under
 Generate) turns it off. A backend without SAM3, Klein's three files or its nodes,
 a failed run and a cancel all leave the picture as it was generated, with a note:
 the head swap is an extra and never costs the picture. The local face-only swap
-(Fix a spot, Retry face swap) has no ComfyUI and gets none.
+(Fix a spot) has no ComfyUI and gets none. **Retry face swap gets it** - see
+"A retry finishes the picture" below.
 `facefusion.SWAP_MODEL` is now `inswapper_128` (a profile's `swap_model` wins;
 HyperSwap 1a was the first recipe). Measured on Partner, ArcFace against her photos,
 on the two pictures of the FaceFusion and BFS trials: no swap 0.11-0.17, HyperSwap
@@ -1372,8 +1402,31 @@ Live on Partner: at 0.6 the frames came back crisp but the lenses went milky
 over the new eyes. At 0.45, with glare-free lenses in the prompt, the eyes show
 through. Both runs take about 13 s on the 5090. Without SAM3 or a `face_detail`
 section, and on any failure or cancel, the picture stays FaceFusion's and a
-note says why. The local face-only swap (Fix a spot with no spots, Retry face
-swap) has no ComfyUI and gets neither pass.
+note says why. The local face-only swap (Fix a spot with no spots) has no
+ComfyUI and gets neither pass.
+
+**A retry finishes the picture** (2026-09-30, the user: "the retry face swap needs
+fixed"). When the face swap fails, the picture kept in History is the one as
+generated - before the head swap. Retry face swap used to run FaceFusion on it
+alone, on this PC: the face went onto the generated stranger's head, with no eye,
+hand or glasses pass, and nothing said so. Now `retry_faces(record)` hands a
+Generate's kept picture back with its own settings (plus `mode: "faces"`) and
+`face_finish["backend"]`, the backend it was made on. `pick_backends` puts the
+retry on that backend's lane when it answers (`finish_backend`), and
+`run_profile_swap` composes those settings there (`_retry_finish`) and runs what
+`run_job` would have: `_head_swap` as `finish_profiles`' `before`, FaceFusion,
+then `_finish_passes`. The record saved is the job's own - its prompt, model,
+the kept record's `graph`, every pass in `passes`, `settings` without `mode` and
+`face_finish` - so Generate Again on it makes the picture, not another retry.
+When the backend does not answer, or the settings no longer compose there (a
+model since removed), the swap still runs alone, as before, and the job's last
+line and the record's notes say what it went without and why: a retry never
+fails for want of the extras. A kept picture whose own settings have a `mode`
+(Fix a spot's face swap, an earlier face-only swap) was never owed more and is
+retried as the swap it was. The job's strip (`pipeline_stages`) shows what a
+face swap on a kept picture runs - Face swap alone, or Head swap, Face swap and
+the passes for a retry on its backend - and no Sampling or Decoding, which it
+never does. Tests: `tests/test_headswap.py`.
 
 **The glasses are redrawn only when the swap painted over them**
 (`glasses_pass`; 2026-09-29). The pass answers a fault the occlusion mask
@@ -1592,7 +1645,9 @@ at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
   `scores` of its fixes, and `taken_back`), every fault's last score
   (`scores`), what was given up (`left`) and why it stopped;
   `image-studio/visual_critic.log` has each pass's matches, mismatches and
-  chosen action. Faces are not matched to characters: a face correction
+  chosen action - rolled over to a single `.1` past `CRITIC_LOG_MAX` (the
+  error log's 512 KB; `_critic_log`), since it grew 300 KB in a day of refining
+  and nothing cut it. Faces are not matched to characters: a face correction
   redraws every face with every character's description.
 
 ### Fix a spot: the user clicks what to redraw

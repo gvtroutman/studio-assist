@@ -93,7 +93,9 @@ After Effects and Resolve use outside npm servers.
   The head swap before the final face swap (FLUX.2 Klein):
   `apps/image_studio/headswap.py` (`lacks`, `targets`, `head_crop`, `head_graph`),
   run by `Studio._head_swap` inside `finish_profiles`; the swap model is
-  `facefusion.SWAP_MODEL` / `model`.
+  `facefusion.SWAP_MODEL` / `model`. Retry face swap (a kept picture finished as
+  its job would have): `retry_faces`, `Studio.finish_backend`, `_retry_finish`,
+  `run_profile_swap`.
   Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
   (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
   preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by
@@ -101,6 +103,11 @@ After Effects and Resolve use outside npm servers.
   queue, kept in History): `blend.submit`, `blend.run_job`, `blend.record`,
   `blend_words`, under `ui.BlendWindow`, opened by `ImageStudio.blend`. The view cube Angles asks on:
   `apps/image_studio/viewcube.py` (`cells`, `basis`, `facing`, `ViewCube`).
+- **Housekeeping** - what jobs leave in a local ComfyUI's `output/ImageStudio` and
+  `input`, and in the library's `finish/`: `Studio.upkeep` (from `JobQueue._work`),
+  `Studio.tidy`, `comfy_folder`, `remove_stale`, `_upload_made`; a backend's `folder`
+  and `keep_days`. The critic's log rolls over in `_critic_log`. Tests:
+  `tests/test_upkeep.py`.
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,
   `scene/pose.py`.
