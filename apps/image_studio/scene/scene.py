@@ -1648,6 +1648,185 @@ STAND_INS = [
     ("Tree crown", "sphere", "Tree crown", [2.5, 2.2, 2.5], "#4f7a3c"),
 ]
 
+# ==================================================================== dressing
+# A prop's details: what is on it, hung from it or painted on it - the
+# maypole's wreath and its flags. Each is words, said after the prop's
+# description, and unless it has no body of its own ("none": paint, carving,
+# wear) simple pieces drawn on the prop, so the maps carry it as well. A piece
+# is sized in metres, not by the prop's scale (a 20 m pole does not make a
+# 20 m flag), and stands at a height on the prop, `at`, hugging its outline
+# there (`girth`), so resizing the prop keeps the wreath at its top.
+DRESS_PARTS = {               # part: (one, several) as the inspector says it
+    "ring": ("a ring round it", "%d rings round it"),
+    "flag": ("a flag standing out from it", "%d flags standing out from it"),
+    "banner": ("a banner hanging down it", "%d banners hanging down it"),
+    "sign": ("a board on its side", "%d boards on its sides"),
+    "ball": ("a ball", "%d balls"), "box": ("a block", "%d blocks"),
+    "cylinder": ("a cylinder", "%d cylinders"), "cone": ("a cone", "%d cones"),
+    "none": ("", ""),
+}
+DRESS_AT = {"top": 1.0, "upper": 0.8, "middle": 0.5, "lower": 0.25, "base": 0.0,
+            "along": None}           # along: spread up its length, side to side
+DRESS_AT_WORDS = {"top": "at the top", "upper": "near the top", "middle": "halfway up",
+                  "lower": "low down", "base": "at the foot", "along": "up its length"}
+DRESS_SIZE = {"ring": [1.0, 0.15, 0.15], "flag": [0.6, 0.4, 0.02],
+              "banner": [0.3, 1.5, 0.02], "sign": [0.5, 0.35, 0.04],
+              "ball": [0.2, 0.2, 0.2], "box": [0.3, 0.3, 0.3],
+              "cylinder": [0.2, 0.3, 0.2], "cone": [0.3, 0.4, 0.3]}
+DRESS_COLOUR = "#d9d2c3"      # a piece the model gave no colour
+DRESS_KEEP = 8                # details on one prop, at most
+DRESS_COUNT = 12              # pieces of one detail, at most
+DRESS_CHARS = 240
+_GIRTH = {}
+_SQ2 = math.sqrt(2)           # a 4-sided prism's corners are at 45 degrees
+
+
+def new_dressing(text, part="none", at="top", count=1, size=None, colour=""):
+    return {"text": text, "part": part, "at": at, "count": count,
+            "size": list(size or DRESS_SIZE.get(part) or [0.3, 0.3, 0.3]), "colour": colour}
+
+
+def clean_dressing(items):
+    """A prop's saved details made safe: words kept, the rest within reach."""
+    out = []
+    for d in items if isinstance(items, list) else []:
+        if not isinstance(d, dict) or not isinstance(d.get("text"), str) \
+                or not d["text"].strip():
+            continue
+        part = d.get("part") if d.get("part") in DRESS_PARTS else "none"
+        size = d.get("size")
+        real = lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool)  # noqa: E731
+                          and math.isfinite(v))
+        if not (isinstance(size, list) and len(size) == 3 and all(real(v) for v in size)):
+            size = None
+        count = int(round(d["count"])) if real(d.get("count")) else 1
+        out.append(new_dressing(
+            d["text"].strip()[:DRESS_CHARS], part,
+            d.get("at") if d.get("at") in DRESS_AT else "top",
+            min(max(count, 1), DRESS_COUNT),
+            [min(max(float(v), 0.02), 8.0) for v in size] if size else None,
+            d["colour"].lower() if HEX.match(str(d.get("colour") or "")) else ""))
+    return out[:DRESS_KEEP]
+
+
+def described(obj):
+    """An object's description with its details after it, each as written."""
+    words = obj["description"].strip()
+    for d in obj.get("dressing") or []:
+        text = d["text"].strip()
+        if text:
+            words = (words + (" " if words.endswith((".", "!", "?")) else ". ") + text
+                     if words else text)
+    return words
+
+
+def dressing_label(d):
+    """How the inspector says a detail is drawn: 'Drawn as 4 flags standing
+    out from it, near the top', or 'Words only'."""
+    one, many = DRESS_PARTS[d["part"]]
+    if not one:
+        return "Words only"
+    return "Drawn as %s, %s" % (one if d["count"] == 1 else many % d["count"],
+                                DRESS_AT_WORDS[d["at"]])
+
+
+def girth(asset, t):
+    """(x, z) half-widths of a prop's mesh in its unit box at height t (0 its
+    foot, 1 its top): where its faces cross that height. The whole mesh's
+    widest where nothing is there."""
+    key = (asset, round(t, 3))
+    if key not in _GIRTH:
+        xs, zs = [], []
+        for f in UNIT[asset]:
+            for p, q in zip(f, f[1:] + f[:1]):
+                if abs(p[1] - t) < 0.005:
+                    xs.append(abs(p[0]))
+                    zs.append(abs(p[2]))
+                elif (p[1] - t) * (q[1] - t) < 0:
+                    k = (t - p[1]) / (q[1] - p[1])
+                    xs.append(abs(p[0] + (q[0] - p[0]) * k))
+                    zs.append(abs(p[2] + (q[2] - p[2]) * k))
+        if not xs:
+            pts = [p for f in UNIT[asset] for p in f]
+            xs, zs = [abs(p[0]) for p in pts], [abs(p[2]) for p in pts]
+        _GIRTH[key] = (max(xs), max(zs))
+    return _GIRTH[key]
+
+
+def _reach(gx, gz, u):
+    """How far out the prop's outline (an ellipse of half-widths gx, gz) is
+    along the level direction u."""
+    if gx < 1e-6 or gz < 1e-6:
+        return max(gx, gz)
+    return 1.0 / math.sqrt((u[0] / gx) ** 2 + (u[2] / gz) ** 2)
+
+
+def dressing_pieces(obj):
+    """A prop's details as [(faces, '#rrggbb')] in its own frame, before it
+    is turned: metres, its foot at y 0, its middle at x = z = 0."""
+    sx, sy, sz = obj["scale"]
+    out = []
+    for d in obj.get("dressing") or []:
+        part, n = d["part"], d["count"]
+        if part == "none":
+            continue
+        w, h, dp = d["size"]
+        colour = d["colour"] or DRESS_COLOUR
+        radial = part == "flag"
+        if d["at"] == "along":          # up its length, side to side
+            spots = [(0.3 + 0.6 * (i + 0.5) / n,
+                      math.pi / 2 + math.pi * i if radial else 0.0) for i in range(n)]
+        else:                           # round it at one height; one flag flies sideways
+            first = math.pi / 2 if radial and n == 1 else 0.0
+            spots = [(DRESS_AT[d["at"]], first + 2 * math.pi * i / n) for i in range(n)]
+        if part == "ring":              # one ring a height, however many were asked
+            spots = list(dict((t, (t, 0.0)) for t, _ in spots).values())
+        for t, a in spots:
+            u, v = (math.sin(a), 0.0, math.cos(a)), (math.cos(a), 0.0, -math.sin(a))
+            tall = h if part in ("ring", "flag", "sign") else 0.0
+            y = min(max(t * sy, tall / 2), sy - tall / 2) if tall < sy else sy / 2
+            gx, gz = girth(obj["asset"], y / sy)
+            gx, gz = gx * sx, gz * sz
+            r = _reach(gx, gz, u)
+            if part == "ring":
+                rx, rz = max(gx + dp / 2, w / 2 - dp / 2), max(gz + dp / 2, w / 2 - dp / 2)
+                seg = 16
+                ring = [(rx * math.cos(2 * math.pi * i / seg), y,
+                         rz * math.sin(2 * math.pi * i / seg)) for i in range(seg)]
+                for p, q in zip(ring, ring[1:] + ring[:1]):
+                    grow = mul(sub(q, p), 0.06)       # a little long, so no gap shows
+                    out.append((prism(sub(p, grow), add(q, grow), (0, 1, 0),
+                                      (h / 2 * _SQ2, dp / 2 * _SQ2),
+                                      (h / 2 * _SQ2, dp / 2 * _SQ2), 4), colour))
+            elif part == "flag":
+                out.append((prism(add(mul(u, r), (0, y, 0)), add(mul(u, r + w), (0, y, 0)),
+                                  (0, 1, 0), (h / 2 * _SQ2, dp / 2 * _SQ2),
+                                  (h / 2 * _SQ2, dp / 2 * _SQ2), 4), colour))
+            elif part in ("banner", "sign"):
+                top = (min(max(t * sy, h), sy) if part == "banner"
+                       else min(max(t * sy + h / 2, h), sy))
+                at = mul(u, r + dp / 2)
+                out.append((prism(add(at, (0, max(top - h, 0.0), 0)), add(at, (0, top, 0)),
+                                  v, (w / 2 * _SQ2, dp / 2 * _SQ2),
+                                  (w / 2 * _SQ2, dp / 2 * _SQ2), 4), colour))
+            else:                       # a solid: on top, or round it at that height
+                if d["at"] == "top" and n == 1:
+                    mid, foot = (0.0, 0.0, 0.0), sy
+                else:
+                    mid = mul(u, r + max(w, dp) / 2)
+                    foot = 0.0 if d["at"] == "base" else min(max(t * sy - h / 2, 0.0), sy)
+                lo, hi = add(mid, (0, foot, 0)), add(mid, (0, foot + h, 0))
+                if part == "ball":
+                    out.append((ellipsoid(add(mid, (0, foot + h / 2, 0)), IDENTITY,
+                                          (w / 2, h / 2, dp / 2), 10, 6), colour))
+                elif part == "box":
+                    out.append((prism(lo, hi, v, (w / 2 * _SQ2, dp / 2 * _SQ2),
+                                      (w / 2 * _SQ2, dp / 2 * _SQ2), 4), colour))
+                else:
+                    tip = (0.004, 0.004) if part == "cone" else (w / 2, dp / 2)
+                    out.append((prism(lo, hi, v, (w / 2, dp / 2), tip, 12), colour))
+    return out
+
 
 def painted_pieces(obj):
     """An object's faces in the world: [(part, faces, rgb)], standing on its
@@ -1675,6 +1854,9 @@ def painted_pieces(obj):
                      for f in mesh]
             pieces.append(("body", [t for f in faces for t in tiles(f)],
                            hex_rgb(rgb) if rgb else own))
+        for mesh, rgb in dressing_pieces(obj):
+            faces = [[apply(rot, p) for p in f] for f in mesh]
+            pieces.append(("body", [t for f in faces for t in tiles(f)], hex_rgb(rgb)))
     low = min(p[1] for _, faces, _ in pieces for f in faces for p in f)
     x, y, z = obj["position"]
     shift = (x, y - low, z)
@@ -2208,6 +2390,9 @@ def clean_object(d, taken=()):
     o["scale"] = _vec(d.get("scale"), base["scale"], 0.05, 20)
     if "picture" in base:
         o["picture"] = str(d.get("picture") or "")
+        dressing = clean_dressing(d.get("dressing"))
+        if dressing:
+            o["dressing"] = dressing
     if "pose" in base:
         pose = d.get("pose") if isinstance(d.get("pose"), dict) else {}
         preset = pose.get("preset") if pose.get("preset") in POSE_VALUES else ""
@@ -2332,7 +2517,7 @@ OBJECT_CHANGES = [             # (field, how the step is named), first match win
     ("look_at", "Point %s's eyes"), ("pose", "Pose %s"), ("look", "Change %s's look"), ("character", "Change %s's look"),
     ("crowd", "Change the crowd %s"), ("colour", "Colour %s"), ("position", "Move %s"),
     ("rotation", "Turn %s"), ("scale", "Size %s"), ("name", "Rename %s"),
-    ("description", "Describe %s"),
+    ("description", "Describe %s"), ("dressing", "Change %s's details"),
 ]
 SCENE_CHANGES = [("camera", "Move the camera"), ("room", "Change the floor and walls"),
                  ("frame", "Change the frame"), ("details", "Edit the scene details"),
@@ -2632,7 +2817,7 @@ def picture_settings(obj, model, backend="auto"):
     object, so the finished job finds its way back to the builder."""
     import apps.image_studio.imagegen as ig
     name = obj["name"].strip() or ASSET[obj["asset"]]["label"]
-    desc = obj["description"].strip().rstrip(" .")
+    desc = described(obj).rstrip(" .")
     s = ig.default_settings()
     s.update(model=model, backend=backend,
              scene=PICTURE_WORDS % ("%s: %s" % (name, desc) if desc else name),
@@ -4327,7 +4512,7 @@ def _scene_parts(scene):
             posture = posture[:1].upper() + posture[1:]
         line = "%s (%s)" % (obj["name"].strip() or ASSET[obj["asset"]]["label"],
                             ", ".join(about))
-        desc = obj["description"].strip()
+        desc = described(obj)
         look = look_text(obj) if obj["asset"] == "person" else ""
         said = ". ".join(x for x in (look, posture, desc) if x)
         char = obj.get("character") if obj["asset"] == "person" else None
@@ -4883,6 +5068,100 @@ def enrich_answer(scene, detail, answer):
     e = scene.setdefault("enrich", new_enrich())
     key = {"add": "added", "placed": "placed", "skip": "seen", "never": "never"}[answer]
     e[key] = (e.get(key, []) + [detail.strip()[:ENRICH_CHARS]])[-ENRICH_KEEP:]
+
+
+# A prop's details from the model (the Details box under a prop's
+# description): what the user says it needs, or what would make it read as
+# the real thing, each with how to block it out on the prop (`dressing_pieces`).
+DRESS_SYSTEM = """You help stage a photograph. The user has picked one object in a \
+scene blocked out in 3D and wants it dressed with the details that make it read as \
+the real thing.
+
+Rules:
+- Details OF this object: what is on it, hung from it, fixed to it or painted on it, \
+and its wear. Never a new object beside it, never people.
+- If the user says what it needs, give exactly those, each made concrete. If not, \
+suggest the one to three that matter most for this kind of object.
+- Be concrete and visual: materials, colours, state. Each detail is 8 to 30 words, \
+written as a line of an image prompt, not advice, and names the object.
+- Nothing it already has.
+
+Each detail is also blocked out on the object:
+- "part": "ring" (a wreath, garland, hoop or band round it), "flag" (a flag or a \
+board standing out from it), "banner" (cloth, ribbons or streamers hanging down it), \
+"sign" (a plaque, board or picture flat on its side), "ball", "box", "cylinder", \
+"cone" (a lantern, a knob, a crown, a finial), or "none" for what has no body of its \
+own (paint, carving, stripes, rust, light).
+- "at": "top", "upper", "middle", "lower", "base", or "along" (several spaced up its \
+length, side to side).
+- "count": how many pieces, 1 to %d.
+- "size": [width, height, depth] of ONE piece in metres, true to life (a maypole \
+wreath about [1.2, 0.25, 0.25], a flag [0.9, 0.6, 0.02]).
+- "colour": its main colour as #rrggbb.
+
+Answer with JSON only: {"details": [{"detail": "<the prompt line>", "part": "...", \
+"at": "...", "count": 1, "size": [w, h, d], "colour": "#rrggbb"}]}""" % DRESS_COUNT
+
+
+def dress_messages(scene, obj, ask=""):
+    sx, sy, sz = obj["scale"]
+    has = [d["text"] for d in obj.get("dressing") or []]
+    lines = ["The object: %s, blocked out as a %s %.2g m wide, %.2g m tall, %.2g m deep."
+             % (obj["name"].strip() or ASSET[obj["asset"]]["label"],
+                ASSET[obj["asset"]]["label"].lower(), sx, sy, sz)]
+    if obj["description"].strip():
+        lines.append("Its description: %s" % obj["description"].strip())
+    if has:
+        lines.append("Details it already has:\n%s" % "\n".join("- " + x for x in has))
+    if scene.get("details", "").strip():
+        lines.append("The scene: %s" % scene["details"].strip())
+    lines.append("The user asks for: %s" % ask.strip() if ask.strip() else
+                 "The user has not said what it needs: suggest what it is missing.")
+    return [{"role": "system", "content": DRESS_SYSTEM},
+            {"role": "user", "content": "\n\n".join(lines)}]
+
+
+def read_dressing(text):
+    """-> [details] (`new_dressing`'s keys) from the model's reply: the JSON
+    asked for, a bare list, or one detail; failing that the first real
+    line of prose, as words only. [] when there is nothing."""
+    text = re.sub(r"(?s)<think>.*?(</think>|$)", "", text or "").strip()
+    m = re.search(r"(?s)[\[{].*[\]}]", text)
+    d = None
+    if m:
+        try:
+            d = json.loads(m.group(0))
+        except ValueError:
+            d = None
+    if isinstance(d, dict):
+        d = d.get("details") if isinstance(d.get("details"), list) else [d]
+    if isinstance(d, list):
+        got = [dict(x, text=_tidy(x["detail"])) for x in d
+               if isinstance(x, dict) and isinstance(x.get("detail"), str)]
+        for x in got:              # said after a full stop in the prop's line
+            x["text"] = x["text"][:1].upper() + x["text"][1:]
+        got = clean_dressing(got)
+        if got:
+            return got
+    for line in text.splitlines():
+        line = _tidy(line)
+        if len(line) > 12 and not line.startswith(("{", "}", "[", "]", "```")):
+            return [new_dressing(line[:DRESS_CHARS])]
+    return []
+
+
+def suggest_dressing(scene, obj, llm, ask=""):
+    """-> the details `llm` offers for `obj`, none it already has. Raises
+    RuntimeError when nothing usable came back."""
+    reply = llm.chat(dress_messages(scene, obj, ask), max_tokens=900)
+    msg = ((reply.get("choices") or [{}])[0].get("message") or {})
+    has = [d["text"] for d in obj.get("dressing") or []]
+    got = [d for d in read_dressing(msg.get("content") or "")
+           if not any(_same(d["text"], x) for x in has)]
+    if not got:
+        raise RuntimeError("The model offered no new details for %s. Say what it needs "
+                           "and ask again." % (obj["name"].strip() or "it"))
+    return got
 
 
 # ==================================================================== pose from a photo

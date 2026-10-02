@@ -117,6 +117,9 @@ class SceneBuilder:
         self.shape_drag = None        # {"i": the dot, "dots": all of them} while one is dragged
         self.suggestion = None        # what Enrich offered (sc.new_suggestion), awaiting an answer
         self.enriching = False
+        self.dress_offer = None       # {"scene", "id", "items"}: details offered for a prop
+        self.dressing = False         # the LLM PC is thinking of a prop's details
+        self.dress_ask = {}           # prop id -> what its Details box says it needs
 
         win = self.win = tk.Toplevel(host)
         win.title("Scene Builder")
@@ -1209,6 +1212,7 @@ class SceneBuilder:
             self._crowd_controls(obj)
 
         if a["kind"] == "prop":
+            self._dressing_controls(obj)
             self._picture_controls(obj)
         pictured = bool(sc.texture(obj.get("picture")))
 
@@ -1268,6 +1272,141 @@ class SceneBuilder:
                 scale[:] = [x, x, x]
             self._slider(p, "size", "Size", lambda: scale[0], uniform, 0.5, 1.3, 0.01)
         self._words_box()
+
+    def _dressing_controls(self, obj):
+        """A prop's details: those it has, each removable, then a box for what
+        it needs and what the LLM PC offers for it (for whatever it is missing
+        when the box is empty)."""
+        o, p = self.owner, self.panel
+        o.cap(p, "Details")
+        pictured = bool(sc.texture(obj.get("picture")))
+
+        def drawn(d):
+            if pictured and d["part"] != "none":
+                return "Words only while its picture stands in for its shape"
+            return sc.dressing_label(d)
+        for i, d in enumerate(obj.get("dressing") or []):
+            row = o.frame(p, "card")
+            row.pack(side="top", fill="x", pady=(0, o.px(3)))
+            o.button(row, "×", lambda i=i: self._undress(i), kind="ghost",
+                     bg="card").pack(side="right", anchor="n")
+            o.label(row, d["text"], "text", self.host.f_small, bg="card",
+                    wraplength=o.px(270)).pack(side="top", fill="x", padx=o.px(8),
+                                               pady=(o.px(4), 0))
+            o.label(row, drawn(d), "faint", self.host.f_small,
+                    bg="card").pack(side="top", anchor="w", padx=o.px(8), pady=(0, o.px(4)))
+        ask = tk.StringVar(value=self.dress_ask.get(obj["id"], ""))
+        row = o.frame(p)
+        row.pack(side="top", fill="x", pady=(o.px(2), o.px(4)))
+        o.button(row, "Asking…" if self.dressing else "Suggest",
+                 lambda: self.dress(obj["id"]), kind="quiet").pack(side="right",
+                                                                   padx=(o.px(4), 0))
+        e = self.host._entry(row, ask)
+        e.master.pack(side="left", fill="x", expand=True)
+
+        def typed(_ev=None):
+            self.dress_ask[obj["id"]] = ask.get()
+        e.bind("<KeyRelease>", typed)
+        e.bind("<Return>", lambda _ev: self.dress(obj["id"]))
+        offer = self.dress_offer
+        if offer and offer["scene"] is self.scene and offer["id"] == obj["id"]:
+            for i, d in enumerate(offer["items"]):
+                card = o.frame(p, "card")
+                card.pack(side="top", fill="x", pady=(0, o.px(3)))
+                o.label(card, d["text"], "text", self.host.f_ui, bg="card",
+                        wraplength=o.px(300)).pack(side="top", fill="x", padx=o.px(8),
+                                                   pady=(o.px(6), 0))
+                o.label(card, drawn(d), "faint", self.host.f_small,
+                        bg="card").pack(side="top", anchor="w", padx=o.px(8))
+                r = o.frame(card, "card")
+                r.pack(side="top", fill="x", padx=o.px(8), pady=o.px(6))
+                o.button(r, "Add", lambda i=i: self._dress_answer(i, True), kind="accent",
+                         bg="card").pack(side="left")
+                o.button(r, "Skip", lambda i=i: self._dress_answer(i, False),
+                         bg="card").pack(side="left", padx=(o.px(4), 0))
+            if len(offer["items"]) > 1:
+                o.button(p, "Add all", lambda: self._dress_answer(None, True),
+                         kind="ghost").pack(side="top", anchor="w")
+        o.label(p, "Say what it needs - \"a wreath on top and flags\" - and Suggest, or "
+                "leave the box empty for ideas. A detail added is said after the "
+                "description and drawn on it in simple shapes, so the picture puts it "
+                "there.", "faint", self.host.f_small,
+                wraplength=o.px(310)).pack(side="top", fill="x")
+
+    def dress(self, oid):
+        """Ask the LLM PC for details of one prop, off the UI thread."""
+        obj = self.obj()
+        if self.dressing or obj is None or obj["id"] != oid:
+            return
+        self.dressing, self.dress_offer = True, None
+        ask = self.dress_ask.get(oid, "")
+        self._inspect()
+        self.status("Asking the LLM PC for details of %s…" % obj["name"], "muted")
+        mine, scene, box = self.scene, copy.deepcopy(self.scene), {}
+        target = next(o for o in scene["objects"] if o["id"] == oid)
+
+        def work():
+            try:
+                box["got"] = sc.suggest_dressing(scene, target, self._llm(), ask)
+            except Exception as ex:      # the host's errors are all worth saying
+                box["error"] = ex
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+
+        def wait():
+            if worker.is_alive():
+                self.win.after(150, wait)
+                return
+            self.dressing = False
+            if self.scene is not mine:       # New or Open while it thought
+                return
+            if "error" in box:
+                self.status("Details: %s" % box["error"], "err")
+            else:
+                self.dress_offer = {"scene": mine, "id": oid, "items": box["got"]}
+                n = len(box["got"])
+                self.status("%d detail%s for %s - Add or Skip." % (
+                    n, "" if n == 1 else "s", target["name"]), "muted")
+            if self.sel == oid:
+                self._inspect()
+        self.win.after(150, wait)
+
+    def _dress_answer(self, i, add):
+        """Add or skip offered detail i (None: add them all)."""
+        offer, obj = self.dress_offer, self.obj()
+        if not offer or obj is None or offer["scene"] is not self.scene \
+                or obj["id"] != offer["id"]:
+            return
+        items = list(offer["items"]) if i is None else offer["items"][i:i + 1]
+        offer["items"] = [] if i is None else offer["items"][:i] + offer["items"][i + 1:]
+        if not offer["items"]:
+            self.dress_offer = None
+        if not add:
+            self._inspect()
+            return
+        have = obj.get("dressing") or []
+        room = max(sc.DRESS_KEEP - len(have), 0)
+        obj["dressing"] = have + items[:room]
+        if len(items) > room:
+            self.status("%s keeps at most %d details: take one off with × first."
+                        % (obj["name"], sc.DRESS_KEEP), "err")
+        else:
+            self.status("Added to %s: drawn on it and said after its description."
+                        % obj["name"], "ok")
+        if not obj["dressing"]:
+            del obj["dressing"]
+        self._inspect()
+        self.changed()
+
+    def _undress(self, i):
+        obj = self.obj()
+        have = (obj or {}).get("dressing") or []
+        if 0 <= i < len(have):
+            have.pop(i)
+            if not have:
+                del obj["dressing"]
+            self._inspect()
+            self.changed()
 
     def _inspector_tab(self, name):
         self.inspector_section = name
