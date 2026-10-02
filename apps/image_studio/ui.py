@@ -461,6 +461,8 @@ class ImageStudio:
         self.faces_set = False        # likewise for the face pass
         self.critic_notes = tk.BooleanVar(value=False)  # the Visual Critic's notes
         self.hand_pass = tk.BooleanVar(value=True)      # the hands redrawn last
+        self.scene_details_pass = tk.BooleanVar(value=True)
+        self.smile_pass = tk.BooleanVar(value=True)
         self.head_swap = tk.BooleanVar(value=True)      # the head redrawn before the face swap
         self.glasses_pass = tk.BooleanVar(value=False)  # the glasses redrawn whatever the swap kept
         self.adv_open = False
@@ -820,6 +822,22 @@ class ImageStudio:
         # The hands pass (Studio._finish_passes): every hand SAM3 finds is
         # redrawn at the end of Generate, before the glasses.
         b = tk.Checkbutton(setup, text="Natural hands pass", variable=self.hand_pass,
+                           anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
+                           wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
+        # Requested smiles are refined after the face swap.
+        b = tk.Checkbutton(setup, text="Natural smile pass (when requested)",
+                           variable=self.smile_pass,
+                           anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
+                           wraplength=self.px(380), justify="left")
+        self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
+                  activeforeground="text")
+        b.pack(side="top", fill="x", pady=(0, self.px(4)), **pad)
+        # Small background designs get their own enlarged, masked edit.
+        b = tk.Checkbutton(setup, text="Flag patterns and sign lettering",
+                           variable=self.scene_details_pass,
                            anchor="w", font=self.host.f_small, bd=0, highlightthickness=0,
                            wraplength=self.px(380), justify="left")
         self.skin(b, bg="bg", fg="muted", activebackground="bg", selectcolor="card",
@@ -1928,6 +1946,8 @@ class ImageStudio:
         s["face_detail"] = bool(self.faces.get())
         s["critic_notes"] = bool(self.critic_notes.get())
         s["hand_pass"] = bool(self.hand_pass.get())
+        s["scene_details_pass"] = bool(self.scene_details_pass.get())
+        s["smile_pass"] = bool(self.smile_pass.get())
         s["head_swap"] = bool(self.head_swap.get())
         # Ticked: always. Unticked: only after a swap that painted over them.
         s["glasses_pass"] = True if self.glasses_pass.get() else None
@@ -1994,6 +2014,8 @@ class ImageStudio:
         self.faces_set = True
         self.critic_notes.set(bool(s.get("critic_notes")))
         self.hand_pass.set(s.get("hand_pass", True) is not False)
+        self.scene_details_pass.set(s.get("scene_details_pass", True) is not False)
+        self.smile_pass.set(s.get("smile_pass", True) is not False)
         self.head_swap.set(s.get("head_swap", True) is not False)
         self.glasses_pass.set(s.get("glasses_pass") is True)
         for r in list(self.loras):

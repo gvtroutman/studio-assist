@@ -218,6 +218,36 @@ class TempStudioMixin:
 
 
 class TestFill(unittest.TestCase):
+    def test_klein_redraw_keeps_crop_schedule_masks_and_loras(self):
+        wf = ig.load_workflow("klein9b_base")
+        values = dict(wf["defaults"], model="klein", encoder="qwen", vae="vae",
+                      prompt="a portrait", face_prompt="a face", negative="blur",
+                      seed=ig.MAX_SEED, face_denoise=0.4, redraw_steps=20)
+        crops = [{"x": 0, "y": 0, "width": 128, "height": 256,
+                  "edit": (512, 1024), "head": False},
+                 {"x": 128, "y": 0, "width": 128, "height": 256,
+                  "edit": (768, 1024), "head": False}]
+        for denoise, total, trim in ((0.4, 50, 30), (1.0, 20, 0), (0.0, 20, 20)):
+            with self.subTest(denoise=denoise):
+                g = ig.face_graph(wf, values, [("person.safetensors", 0.8)],
+                    "made.png", crops, "oval.png", "out",
+                    faces=[{"denoise": denoise}, {"denoise": denoise}])
+                for i, width in ((1, 512), (2, 768)):
+                    n = "fc%d_" % i
+                    self.assertEqual(g[n + "sigmas"]["inputs"], {
+                        "steps": total, "width": width, "height": 1024})
+                    self.assertEqual(g[n + "trim"]["inputs"]["step"], trim)
+                    self.assertEqual(g[n + "noise"]["inputs"]["noise_seed"], i - 1)
+                    k = g[n + "4"]["inputs"]
+                    self.assertEqual(k["latent_image"], [n + "3n", 0])
+                    guider = g[n + "guider"]["inputs"]
+                    adapter = g[guider["model"][0]]["inputs"]
+                    self.assertEqual(adapter["lora_name"], "person.safetensors")
+                    self.assertEqual(adapter["strength_model"], 0.8)
+                    self.assertEqual(guider["negative"], ["12", 0])
+                    self.assertEqual(guider["cfg"], 4.0)
+                self.assertEqual(g["fc2_1"]["inputs"]["image"], ["fc1_9", 0])
+
     def wf(self):
         return ig.load_workflow("flux_hq")
 
@@ -1186,6 +1216,26 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["54"]["inputs"]["positive"], ["11", 0])
         self.assertEqual(g["40"]["inputs"]["positive"], ["54", 0])
 
+    def test_on_klein_a_swapped_persons_face_is_from_their_photos_not_a_warning(self):
+        # Klein takes no PuLID, but the head swap and face swap still put the
+        # person's photos on after drawing: the plan said "the face comes from
+        # the words" on a picture that went through both (2026-10-02).
+        inv = dict(FLUX_FILES, diffusion_models={"flux-2-klein-base-9b.safetensors"},
+                   text_encoders={"qwen_3_8b_fp8mixed.safetensors"},
+                   vae={"flux2-vae.safetensors"})
+        form = dict(model="klein-9b", inventory=inv, scene="a chef",
+                    face_photos=[__file__], face_name="Partner")
+        p = self.plan(identities=["partner"], **form)
+        self.assertFalse(any("Face:" in w for w in p.warnings), p.warnings)
+        self.assertIn("Face: Partner, from their photos by the head swap and face swap "
+                      "after drawing.", p.notes)
+        p = self.plan(identities=["partner"], head_swap=False, **form)
+        self.assertIn("Face: Partner, from their photos by the face swap after drawing.",
+                      p.notes)
+        # No one to swap: the face really is the words, and that is said.
+        p = self.plan(**form)
+        self.assertTrue(any("comes from the words" in w for w in p.warnings), p.warnings)
+
     def test_klein_takes_a_pose_as_a_reference_picture_with_words_to_copy_it(self):
         # Klein has no ControlNet: the pose map is a reference latent on both
         # sides of its CFG, and the words before the prompt say to copy it.
@@ -1653,7 +1703,7 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             self.assertEqual(p.values["face_denoise"], strength, model)
         # Klein, base and distilled, has a face pass: one section, each
         # model's guidance its CFG (the base's real one, the distilled's 1),
-        # the written negative, the simple scheduler; the base redraws in
+        # the written negative, the native Flux2 scheduler; the base redraws in
         # 20 steps, not its 50.
         klein = ig.load_workflow("klein9b_base")
         inv = dict(FLUX_FILES, checkpoints={"sam3.pt"},
@@ -1661,7 +1711,8 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
                                      "flux-2-klein-9b-fp8.safetensors"},
                    text_encoders={"qwen_3_8b_fp8mixed.safetensors"},
                    vae={"flux2-vae.safetensors"})
-        nodes = set(FaceClient.NODES) | {n["class_type"] for n in klein["graph"].values()}
+        nodes = ig.face_nodes(klein) | set(FaceClient.NODES) | {
+            n["class_type"] for n in klein["graph"].values()}
         for model, want in (("klein-9b", (20, 4.0)), ("klein-9b-distilled", (4, 1.0))):
             s = dict(ig.default_settings(), model=model, scene="a woman", preset="hq_final")
             p = ig.compose(s, self.studio.lib, self.backend("5090"), inv, nodes=nodes)
@@ -1671,11 +1722,24 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             values = dict(p.values, face_prompt="a face", face_denoise=0.4)
             g = ig.face_graph(klein, values, [], "made.png", ig.fix_crops(512, 512, [
                 {"x": 200, "y": 200, "size": 64}]), "oval.png", "out")
-            k = g["fc1_4"]["inputs"]
-            self.assertEqual((k["steps"], k["cfg"]), want, model)
-            self.assertEqual((k["sampler_name"], k["scheduler"]), ("euler", "simple"))
+            k = g["fc1_guider"]["inputs"]
+            self.assertEqual(k["cfg"], want[1], model)
+            self.assertEqual(g["fc1_sigmas"]["inputs"], {
+                "steps": int(want[0] / 0.4), "width": ig.FACE_EDIT, "height": ig.FACE_EDIT})
+            self.assertEqual(g["fc1_trim"]["inputs"]["step"], int(want[0] / 0.4) - want[0])
+            self.assertEqual(g["fc1_sampler"]["inputs"]["sampler_name"], "euler")
             self.assertEqual(k["negative"], ["12", 0])
+            self.assertEqual(g["fc1_4"]["class_type"], "SamplerCustomAdvanced")
+            self.assertEqual(g["fc1_4"]["inputs"]["latent_image"], ["fc1_3n", 0])
+            self.assertEqual(g["fc1_4"]["inputs"]["sigmas"], ["fc1_trim", 1])
             self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])
+            # A backend missing the crop scheduler split still makes the
+            # initial picture, with a warning instead of a failed face pass.
+            missing = ig.compose(s, self.studio.lib, self.backend("5090"), inv,
+                                 nodes=nodes - {"SplitSigmas"})
+            self.assertEqual(missing.errors, [])
+            self.assertFalse(missing.values["face_detail"])
+            self.assertTrue(any("SplitSigmas" in w for w in missing.warnings))
         # FLUX names none, and redraws with the picture's as before.
         self.assertNotIn("redraw_sampler", ig.load_workflow("flux_dev_baseline")["defaults"])
         job, client, _ = self.fix_job(model="flux-dev")
@@ -3732,6 +3796,16 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertTrue(ui.collect()["hand_pass"])     # an older picture: it was on
         # The head swap before the face swap, likewise.
         self.assertTrue(ui.collect()["head_swap"])
+        self.assertTrue(ui.collect()["scene_details_pass"])
+        self.assertTrue(ui.collect()["smile_pass"])
+        ui.apply(dict(ui.collect(), smile_pass=False))
+        self.assertFalse(ui.collect()["smile_pass"])
+        ui.apply({k: v for k, v in ui.collect().items() if k != "smile_pass"})
+        self.assertTrue(ui.collect()["smile_pass"])
+        ui.apply(dict(ui.collect(), scene_details_pass=False))
+        self.assertFalse(ui.collect()["scene_details_pass"])
+        ui.apply({k: v for k, v in ui.collect().items() if k != "scene_details_pass"})
+        self.assertTrue(ui.collect()["scene_details_pass"])
         ui.apply(dict(ui.collect(), head_swap=False))
         self.assertFalse(ui.collect()["head_swap"])
         ui.apply({k: v for k, v in ui.collect().items() if k != "head_swap"})
