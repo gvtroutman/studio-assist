@@ -22,6 +22,9 @@ SIGNS = re.compile(r"\b(?:signs?|signage|banners?|lettering|inscriptions?)\b", r
 BAVARIAN = re.compile(r"\b(?:oktoberfest|bavarian|bavaria|bayern)\b", re.I)
 OTHER_FLAG = re.compile(r"\b(?:german|american|british|french|italian|european|rainbow)\s+"
                         r"(?:flags?|bunting|pennants?)\b", re.I)
+# The flag pattern redraw is off (2026-10-02, the user: "it's unnecessary"):
+# flags are left as the picture drew them; lettering is still repaired.
+FLAG_PATTERN = False
 QUOTES = re.compile(r'["“]([^"”\n]{1,64})["”]|[\'‘]([^\'’\n]{1,64})[\'’]')
 
 
@@ -48,7 +51,8 @@ def requests(settings):
                      if isinstance(d, dict))
     context = " ".join(texts)
     out = []
-    if FLAGS.search(context) and BAVARIAN.search(context) and not OTHER_FLAG.search(context):
+    if (FLAG_PATTERN and FLAGS.search(context) and BAVARIAN.search(context)
+            and not OTHER_FLAG.search(context)):
         out.append({"noun": "flag", "pattern": "bavarian", "text": ""})
     # Scene Builder's flattened prompt repeats the prop descriptions. Read
     # their original fields for lettering rather than assigning that repeat

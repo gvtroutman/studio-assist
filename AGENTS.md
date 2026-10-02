@@ -1559,6 +1559,17 @@ the likeness pass on that face was pure waste. `_face_pass` now asks
 scene's own `person_id`) and leaves those faces' redraw to words only, no
 photo; FaceFusion still does the identity work, once.
 
+**A face the head swap redraws is not in the face pass at all** (2026-10-02,
+the user: "the image generation should decide if it needs to use the whole
+pipeline, not run it every time"). Those faces were still redrawn from words,
+to fix the waxy look, and then Klein redrew the whole head over them. Now
+`_face_pass` asks `Studio._heads_redrawn`, which uses the same checks as
+`_head_swap` (on, profiles chosen, SAM3, `headswap.lacks`) and
+`headswap.targets` over the finder's boxes, and drops those crops. It notes
+"N face(s) left to the head swap". With the head swap off or impossible, the
+face is still redrawn. If the head swap fails at run time, that face goes on
+as drawn and FaceFusion still swaps it.
+
 `apps/image_studio/facefusion.py` is a stdlib adapter to the isolated environment in
 `.runtime/facefusion-venv`; it uses `core.procs` for cancellation and process
 containment. `tools/facefusion_swap.py` runs the official pipeline, captures its
@@ -3269,8 +3280,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   the default strength still need checking when the render backend is idle.
 - **Flags and lettering get a local finishing pass** (2026-10-02).
   `scene.details.requests` reads the scene's own prop descriptions and dressing,
-  or a form's scene words. Bavarian/Oktoberfest flags get a clean repeating
-  blue-and-white diamond swatch as Klein 9B's second reference. Signs and banners
+  or a form's scene words. Bavarian/Oktoberfest flags got a clean repeating
+  blue-and-white diamond swatch as Klein 9B's second reference; that flag
+  pattern is now off (`details.FLAG_PATTERN`, 2026-10-02, the user: "it's
+  unnecessary"), so flags stay as drawn. The code and its tests (run with the
+  switch on) are kept. Signs and banners
   use one crop reference and explicit quoted text; without a quotation an
   Oktoberfest sign uses "Oktoberfest". Conflicting wording for several signs of
   the same kind is skipped, not assigned by detection order. SAM3 finds visible
