@@ -1857,6 +1857,25 @@ Klein's colour on 3 of 5 and one eye darker than the other on 2. So the
 default stays the eye pass with no enhancer. If the eye pass is to be
 bettered, tell it the person's eye colour.
 
+**The eye pass is told the eye colour, and drawn again over a green blob**
+(2026-10-02). Each swapped face (`swapped_pairs` says whose) is redrawn with
+its own prompt, `EYE_COLOURED`, naming the colour of its character's "eyes"
+look (`profile_eyes`, `eye_colour`: the job's own character when it is that
+identity, else that identity's characters when they agree; a lone profile
+with no character takes the form's "eyes"). No colour known, `EYE_WHAT` as
+before. Replayed on ComfyUI, the pass drew blue eyes brown on 4 of 4 seeds;
+told "blue", blue on 4 of 4. The blob: a person's green eye makeup, brought
+by the head swap and smeared into the eye by FaceFusion, came back from the
+pass as a blocky green patch over the iris - drawn by the model inside its
+mask, not a blending seam, on 3 of 6 seeds. So after the pass `new_green`
+counts the pixels newly green in each eye band (stdlib PNG reading, ~1.6 s),
+and `_eye_tries` draws it again on another seed (`EYE_RESEED`) while a band
+has more than `EYE_GREEN_MAX`, at most `EYE_TRIES`, keeping the try with the
+least and only its graph in the record; a later try that fails keeps the
+best before it. Eyes said green or hazel (`EYE_GREEN_OK`) are not checked.
+On the 109 eye passes in ComfyUI's output it flags the 6 blobs (41-62 px)
+and none of the other 103 (0-8). Tests: `tests/test_finish_line.py`.
+
 **What the two repairs come to, end to end** (2026-09-29, `Studio.run_job` on
 a copy of the library, Partner's job of 15:09 on 5 seeds: three before a plain
 wall, a park, a busy cafe; every picture looked at whole and at the face).
