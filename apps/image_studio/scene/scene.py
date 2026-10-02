@@ -4538,6 +4538,7 @@ def generation(scene, maps, characters=None, identities=None):
         extra.update({k: 0 for k in ig.SLIDER_KEYS})
         extra["character"] = ""
         extra["item_refs"] = {}
+        extra["wearing"] = []
         extra["face_photos"], extra["face_name"] = [], ""
         idents = []
         for o in folks:
