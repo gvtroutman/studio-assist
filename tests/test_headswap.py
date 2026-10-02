@@ -282,6 +282,48 @@ class TestHeadSwapParts(unittest.TestCase):
         # A caller that does not say how big the picture is: a margin all round.
         self.assertEqual(square(whole), (1000 - 2 * pad, 1000 - 2 * pad, pad, pad))
 
+    def test_a_photo_is_cut_to_the_head_nearest_its_middle(self):
+        middle, edge = (450, 300, 100, 120), (20, 40, 150, 180)       # the edge one is bigger
+        cut = hs.photo_cut(1000, 1200, [edge, middle])
+        self.assertEqual(cut, hs.head_crop(1000, 1200, middle, crop=hs.PHOTO_CROP,
+                                           rise=hs.PHOTO_RISE))
+        self.assertEqual(cut["width"], int(120 * hs.PHOTO_CROP))      # the face's longer side
+        # Above centre, for the hair; the chin and a little collar inside.
+        self.assertLess(cut["y"] + cut["height"] / 2.0, 300 + 60)
+        self.assertGreater(cut["y"] + cut["height"], 300 + 120)
+        # SAM3's boxes may carry a word; none found: the photo is used whole.
+        self.assertEqual(hs.photo_cut(1000, 1200, [middle + ("face",)]), cut)
+        self.assertIsNone(hs.photo_cut(1000, 1200, []))
+        # Inside the photo, however near its edge the face is.
+        c = hs.photo_cut(400, 400, [(300, 0, 100, 100)])
+        self.assertTrue(0 <= c["x"] and c["x"] + c["width"] <= 400 and c["y"] >= 0)
+
+    def test_glasses_are_named_only_for_a_person_who_wears_them(self):
+        self.assertIn(hs.GLASSES[0], hs.PROMPT)
+        self.assertEqual(hs.prompt_for(), hs.PROMPT)
+        bare = hs.prompt_for(glasses=False)
+        self.assertNotIn("glasses", bare)
+        self.assertIn("the same face and the same hair as image 2", bare)
+        self.assertIn("the head of partner, the person", hs.prompt_for("partner", True))
+        self.assertIn("glasses", hs.prompt_for("partner", True))
+        self.assertNotIn("glasses", hs.prompt_for("sitter", False))
+        head = {"crop": {"x": 0, "y": 0, "width": 512, "height": 512}, "photo": "a.png"}
+        # A head that does not say keeps the shared prompt, glasses and all.
+        g = hs.head_graph("picture.png", [head], 7, "x", "sam3.pt")
+        self.assertNotIn("h1_text", g)
+        self.assertEqual(g["h1_pos1"]["inputs"]["conditioning"], ["pos", 0])
+        g = hs.head_graph("picture.png", [dict(head, glasses=True)], 7, "x", "sam3.pt")
+        self.assertNotIn("h1_text", g)
+        # One who wears none gets a prompt of its own without them.
+        g = hs.head_graph("picture.png", [dict(head, glasses=False)], 7, "x", "sam3.pt")
+        self.assertEqual(g["h1_text"]["inputs"]["text"], bare)
+        self.assertEqual(g["h1_pos1"]["inputs"]["conditioning"], ["h1_text", 0])
+        self.assertEqual(g["h1_neg1"]["inputs"]["conditioning"], ["h1_zero", 0])
+        # The profile's setting: off unless ticked.
+        self.assertIs(ig.clean_identity({"name": "X"})["glasses"], False)
+        self.assertIs(ig.clean_identity({"name": "X", "glasses": True})["glasses"], True)
+        self.assertIs(ig.clean_identity({"name": "X", "glasses": "yes"})["glasses"], False)
+
     def test_klein_is_told_what_the_picture_keeps_before_what_is_not_copied(self):
         keeps = hs.PROMPT.index("the necklace or jewellery image 1 wears")
         self.assertLess(keeps, hs.PROMPT.index("Nothing that is worn in image 2"))
@@ -377,7 +419,7 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         with patch.object(hs, "head_graph", wraps=hs.head_graph) as asked:
             job, client, swapped = self.generate()
         self.assertEqual(job.status, "complete", job.detail)
-        find, head = client.graphs[1:3]
+        find, found, head = client.graphs[1:4]
         self.assertEqual(find["p0t"]["inputs"]["text"], hs.FIND)
         self.assertNotIn("p1t", find)
         self.assertEqual(head["h1_cut"]["inputs"]["crop_region"],
@@ -385,6 +427,15 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(head["h1_photo"]["inputs"]["image"], "studio_reference.png")
         self.assertIn(self.photo, client.uploads)
         self.assertNotIn("h2_ks", head)
+        # The photo is cut to their head first: whole, Klein copied its clothes.
+        self.assertEqual(found["p0t"]["inputs"]["text"], hs.FIND)
+        self.assertEqual(found["1"]["inputs"]["image"], "studio_reference.png")
+        self.assertEqual(head["h1_pcut"]["inputs"]["crop_region"],
+                         hs.photo_cut(1024, 1024, [(450, 250, 80, 90)]))
+        self.assertEqual(head["h1_fit"]["inputs"]["image"], ["h1_pcut", 0])
+        # They wear no glasses (the default): the prompt never names any.
+        self.assertNotIn("glasses", head["h1_text"]["inputs"]["text"])
+        self.assertEqual(head["h1_pos1"]["inputs"]["conditioning"], ["h1_text", 0])
         # The graph is told how big the picture is, for its edges.
         self.assertEqual(asked.call_args.kwargs.get("size"), (1024, 1024))
         # FaceFusion swaps the face on Klein's head, not on the generated one,
@@ -440,6 +491,33 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertNotIn("h1_lora", self.heads(client)[0])
         self.assertIn("Person's head LoRA person_head_klein.safetensors is not on this backend.",
                       job.record["notes"])
+
+    def test_a_person_who_wears_glasses_is_asked_for_them(self):
+        ident = self.studio.lib.get("identities", "person")
+        ident["glasses"] = True
+        self.studio.lib.save("identities")
+        job, client, swapped = self.generate()
+        self.assertEqual(job.status, "complete", job.detail)
+        head = self.heads(client)[0]
+        self.assertNotIn("h1_text", head)
+        self.assertIn("the same glasses", head["pos"]["inputs"]["text"])
+        self.assertEqual(head["h1_pos1"]["inputs"]["conditioning"], ["pos", 0])
+
+    def test_a_photo_sam3_finds_no_face_in_is_used_whole(self):
+        class NoFaceInPhoto(KleinClient):
+            def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                graph = self.graphs[int(pid[3:]) - 1]
+                if "p0d" in graph and graph["1"]["inputs"]["image"] == "studio_reference.png":
+                    return {"status": {"completed": True}, "outputs": {
+                        "7": {"text": ["800"]}, "8": {"text": ["800"]},
+                        "p0v": {"text": [json.dumps([[]])]}}}
+                return super().listen_for_progress(pid, on_event, stop, timeout)
+        job, client, swapped = self.generate(client=NoFaceInPhoto)
+        self.assertEqual(job.status, "complete", job.detail)
+        head = self.heads(client)[0]
+        self.assertNotIn("h1_pcut", head)
+        self.assertEqual(head["h1_fit"]["inputs"]["image"], ["h1_photo", 0])
+        self.assertEqual(swapped, [HEAD_PNG])
 
     def test_a_failed_head_swap_leaves_the_face_swap_the_generated_picture(self):
         KleinClient.fail_head = True
