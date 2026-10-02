@@ -4486,6 +4486,74 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(asked[-1], "https://example.com/me.jpg")
         rd.win.destroy()
 
+    def test_photos_dropped_on_the_identity_window_land_on_one_pad(self):
+        """The user: "make the pictures for reference images of someone drag
+        and drop into the identity window. turn the add photos, add folder,
+        and add from link into a singular landing pad that spans the width of
+        the identity description". The window takes drops (`core.filedrop`;
+        its OLE side is tests/test_filedrop.py): the pad lights while a drag
+        is over, files and a folder's pictures import, a link downloads."""
+        from unittest import mock
+        import tkinter as tk
+        import core.filedrop as filedrop
+        s, ui = self.tab()
+        patched = [mock.patch.object(ig, "fetch_picture", lambda url, opener=None: (PNG, ".png")),
+                   mock.patch("apps.image_studio.faces.crop_for_import",
+                              lambda paths, *a, **k: (list(paths), ""))]
+        for p in patched:
+            p.start()
+            self.addCleanup(p.stop)
+        ui.studio.lib.save("identities", [])
+        ed = ui.edit_identities()
+        self.addCleanup(lambda: ed.win.winfo_exists() and ed.win.destroy())
+        ed._dropped([os.path.join(self.dir, "x.png")], None)       # no one to add to
+        self.assertIn("Make or choose a person first", ed.msg.cget("text"))
+        ed._new()
+        self.app.update()
+        if filedrop.WINDOWS:
+            self.assertIsNotNone(ed.drops, "the window takes no drops")
+        pad, title = ed._pad
+        texts, stack = [], [ed.form]
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            try:
+                texts.append(w.cget("text"))
+            except tk.TclError:
+                pass
+        for gone in ("Add photos…", "Add folder…", "Add from link…"):
+            self.assertNotIn(gone, texts)                  # one pad instead
+        for link in ("Choose photos…", "Choose a folder…", "Paste a link…", "Remove"):
+            self.assertIn(link, texts)
+        description = ed.widgets["description"][1]
+        self.assertEqual((pad.winfo_x(), pad.winfo_width()),
+                         (description.winfo_x(), description.winfo_width()))
+        self.assertEqual(title.cget("text"), "Drop photos or a folder here"
+                         if ed.drops else "Click to choose photos")
+
+        ed.drops.on_enter() if ed.drops else ed._light_pad(True)     # a drag comes over
+        self.assertEqual(title.cget("text"), "Let go to add them")
+        self.assertEqual(pad.cget("highlightbackground"), self.app.C["accent"])
+        ed._light_pad(False)                                          # and goes
+        self.assertEqual(pad.cget("highlightbackground"), self.app.C["border"])
+
+        drop = tempfile.mkdtemp(dir=self.dir)
+        folder = os.path.join(drop, "more")
+        os.mkdir(folder)
+        for i, name in enumerate(("one.png", os.path.join("more", "a.png"),
+                                  os.path.join("more", "b.jpg"),
+                                  os.path.join("more", "notes.txt"))):
+            with open(os.path.join(drop, name), "wb") as f:
+                f.write(PNG[:-1] + bytes([i]) if name.endswith("g") else b"words")
+        pics = ed.widgets["references"][1]
+        ed._dropped([os.path.join(drop, "one.png"), folder], None)
+        self.pump(lambda: not pics.get("importing"))
+        self.assertEqual(len(pics["paths"]), 3, ed.msg.cget("text"))   # not the .txt
+        ed._dropped([], "https://example.com/her.png")                  # from a web page
+        self.pump(lambda: len(pics["paths"]) == 4)
+        self.assertTrue(all(p.startswith(os.path.join(ui.studio.lib.root, "references"))
+                            for p in pics["paths"]))
+
     def test_a_character_goes_from_the_creator_to_the_form_and_history(self):
         s, ui = self.tab()
         ed = ui.edit_characters()

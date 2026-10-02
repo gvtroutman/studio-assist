@@ -61,6 +61,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/procs.py` | 0.3k | Child processes that die with the parent | |
 | `core/tablog.py` | 0.1k | Each tab's log: records stamped with their tab, last lines kept per tab | `working_for`, `Stamp`, `BOOK`; the window is `Chat._log_window`, fed by `Chat._log_event` |
 | `core/files.py` | 0.1k | Attachments described for a model | |
+| `core/filedrop.py` | 0.2k | Files and links dragged onto a Tk window: an OLE `IDropTarget` in ctypes (the identity editor's landing pad) | `accept`, `Target`, `read`, `link` |
 | `core/icons.py` | 0.4k | App icons pulled from each program's .exe | |
 | `core/terminals_ui.py`, `core/consoles.py` | | The Terminal tab: consoles found, hidden and mirrored | |
 | `core/doctor.py`, `studio_update.py` | | Where things are kept / health; sync with GitHub | |
@@ -99,7 +100,8 @@ After Effects and Resolve use outside npm servers.
   `ImageStudio.build_lora`; worker `tools/train_identity_lora.py`, one-time setup
   `tools/prepare_klein_lora.py`; used by the head swap through `imagegen.head_lora`),
   the person's own face in photos `apps/image_studio/faces.py` (`Job`, `problem`,
-  `crop_for_import` - called by `RecordEditor._import_paths` and
+  `crop_for_import` - called by `RecordEditor._import_paths` (fed by the landing
+  pad `_landing_pad` and drops `_dropped`, via `core/filedrop.py`) and
   `_add_character_photo`; `Build.find_faces`; LoRA ratings `score`, `twins`,
   `rate`, `best_first`, `detail` - shown by `RecordEditor._rate_paths`,
   `_remove_duplicates`, `_draw_paths` (`IDENTITY_TILE`, `_path_cols`, `_refit_paths`)), worker `tools/identity_faces.py` (ComfyUI's venv: `person`,
