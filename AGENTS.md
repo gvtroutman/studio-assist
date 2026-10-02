@@ -1549,133 +1549,96 @@ readiness comes from the node's `/object_info` choices because `/models` lists
 files, not those directories. See `docs/withanyone.md` and
 `tests/test_withanyone.py`; `tools/try_withanyone.py` exercises the real job path.
 
-### The Visual Critic: automatic refinement after a picture is made
+### The Visual Critic: notes on finished pictures, not a pipeline step
 
-"Automatic refinement" under Generate (`auto_refine`, off by default) runs
-`Studio._refine` on the lane's thread after the picture and its face pass:
-the host's vision model (`Chat.vision`, handed to `Studio` as `vision`) looks
-at it, and what it finds wrong is redrawn, up to `refine_passes` (3) times.
-`apps/image_studio/critic.py` is the logic, no tkinter and no I/O of its own. The rules:
+**The critic is not part of Generate's pipeline** (the user, 2026-09-30: "it
+takes notes of generated images and notes them so it can learn its self
+bias"). With "Critic takes notes" under Generate (`critic_notes`, off by
+default), `Studio._take_notes` runs last on the lane's thread - after the
+face swap and every finish pass, on the picture exactly as it is kept: the
+host's vision model (`Chat.vision`, handed to `Studio` as `vision`) looks
+at it once, and what it finds wrong is filed in the ledger and on the
+record. **It redraws nothing, and nothing it learns goes into a prompt.**
+Until 2026-09-30 it ran second, after the face pass, and redrew faces and
+hands that the head swap, FaceFusion and the hands pass then replaced, so
+it never saw the picture that was kept; its redraws (`_correct`,
+`_regenerate`), the promoted details (`critic_memory.json`, which `compose`
+appended to every prompt) and the prevention words are gone. Do not put
+them back: the ledger is a record to read, and acting on it is the user's
+call. `apps/image_studio/critic.py` is the logic, no tkinter and no I/O of
+its own. The rules:
 
 - **Three states, kept apart.** The *intent* (`intent_from`: the composed
   prompt and the form's words) is a read-only mapping; nothing writes into
   it. The *canonical state* (`initial_canonical`: character_a from the look
-  slots and identities, the scene, the camera and style) holds one value per
-  key; every key the form set is `locked`. The *corrections* are rebuilt from
-  each look and never accumulate.
+  slots and identities, the scene, the camera and style) is what the form
+  states, every key `locked`. The *corrections* (Fix a spot's check only)
+  are rebuilt from each look and never accumulate.
 - **The critic returns JSON, every observation with a status** (MATCH,
   MISMATCH, UNCERTAIN, NEW_USEFUL_DETAIL), a confidence and a severity.
   `clean_result` makes anything malformed safe: an unknown status is
-  UNCERTAIN, never a fix. No JSON at all keeps the picture, with a warning.
-- **The planner prefers the smallest edit** (`plan_next_refinement`,
-  `action_for`). A *major* scene/camera/lighting/body fault is the only
-  thing that makes a new picture (`_regenerate`: `prompt_override` in
-  `compose`, a new seed), and then it is the only action. Otherwise faces
-  (FACE_CORRECTION), hands and small things (LOCAL_INPAINT,
-  OBJECT_CORRECTION) run together, and a whole-picture touch-up
-  (GLOBAL_REFINEMENT, denoise 0.2) waits until nothing local is left.
-  Mismatches under `MIN_CONFIDENCE` (0.6) are logged and ignored. The loop
-  stops when the critic says nothing meaningful is wrong.
-- **There is no inpainting node here; the face pass is the local editor.**
-  Every local fix is `face_graph` - SAM3 finds the thing (`add_face_finder`
-  on a `LoadImage`, prompt `face:8`, `hand:4`, `<object>:4`), each box is
-  cropped, redrawn with the job's model and LoRAs from a prompt compiled for
-  it, and blended back through the soft oval. A crop with `mask` False and
-  its own `edit` size is the whole-picture pass. So anything outside a
-  crop is untouched pixel for pixel, which is what "preserve" means here;
-  "keep X" in a FLUX prompt at CFG 1 does nothing. Hands stay at denoise 0.6
-  (`CRITIC_DENOISE`) for the reason in the hand-pass note: higher left
-  double hands. Only a template with a `face_detail` section (today
-  `flux_dev_baseline`) can take a local fix.
-- **Good inventions are promoted, once.** A NEW_USEFUL_DETAIL at 0.75 or
-  more, on a key the user did not set and not also called a mismatch, is set
-  at its key (`merge_canonical`; "Hair colour" and "hair_color" are one key)
-  and goes into the next prompt. **And into every later picture:** each
-  promotion is filed in `image-studio/critic_memory.json` (`remember`) -
-  a person's detail under the identity's id (only when the picture had
-  exactly one identity), a scene's under its words (`_key`'d). `compose`
-  appends what `recall` finds for this job's person and scene to every
-  prompt, auto-refine on or off, skipping any key the form sets, and
-  `_refine` seeds the canonical state with it (unlocked) so the critic
-  checks those details instead of inventing new ones.
-- **Two outputs from one compiler.** `build_refinement_instructions` writes
-  the sectioned text (ORIGINAL USER INTENT, CANONICAL ..., PRESERVE,
-  CORRECT) to the log; `generator_prompt` is the prose FLUX reads, with a
-  close-up head for a crop.
-- **Every pass is scored by the next look** (2026-09-29). What a pass redrew
-  are its *faults* (`as_faults`: numbered, `tries` counted); the next
-  question asks after each by number (`FOLLOWUP_PROMPT`) and the answer's
-  `followups` say CLEARED, PERSISTS, WORSE or UNKNOWN (`score_fixes`; a fault
-  the model skipped is read from its observations by name, else UNKNOWN -
-  never a guess). PERSISTS goes again *harder* (`critic.harder`: +0.15 a
-  try up to `CRITIC_DENOISE_TOP`; a hand's top is its 0.6, so its second try
-  is a new seed and the critic's newer words), with the followup's
-  `correction` as the fix. After `MAX_TRIES` (2) it is `left` to the user and
-  never planned again, even if the critic names it again (`closed`). A pass
-  with a WORSE and no CLEARED is taken back (`went_wrong`): the files before
-  it are the picture again. So there is one look more than passes - the
-  last pass is looked at too, with no redraw after it. This is the only
-  thing that carries from look to look; the corrections still do not.
-- **The user's notes are faults too** (Fix a spot's Wrong field and
-  "Critic checks it": `fix["check"]`, a spot's `note`, the fix's `note` for
-  spots without one). `run_fix` redraws the spots as always, then hands
-  `_refine` `marked` - `critic.user_faults` (confidence 1.0, tried once),
-  `redo` (the fix's own `redraw` closure, on some spots, each with its own
-  prompt and denoise through `face_graph`'s `faces[i]["prompt"]`) and the
-  spots' crops. Then only the marked spots are followed: what else the
-  critic sees is logged, never redrawn, since a fix changes only its
-  squares. The critic is shown up to `CLOSEUPS` (3) spots cut large
-  (`_closeups`: ImageCropV2 -> PreviewImage) *instead of* the references;
-  without them it judges by the whole picture. A note says what is wrong,
-  for the critic; Describe says what to draw, for the model. The note never
-  goes into a prompt, and the critic never rewords it.
-- **The scores add up in a ledger** (2026-09-29):
-  `image-studio/critic_ledger.json`, pure logic in `critic.py`, read and
-  written by `Studio._learn` under `CRITIC_LEDGER_LOCK`. Three things are
-  filed. *Fixes* (`note_fixes`): model -> kind of fault -> `ACTION@denoise`
-  -> tried / cleared / worse, one entry per scored redraw; UNKNOWN files
-  nothing. *Faults* (`note_picture`): per model, per person (only a
-  picture of exactly one identity) and per scene, each kind's `weight` -
-  +1 when the critic found it, +`USER_WEIGHT` (3) when the user marked it,
-  -1 for every picture the critic looked at without finding it, capped at
-  `WEIGHT_TOP` - so a fault that stopped coming back is unlearned. *Blind
-  spots* (`note_blind`): what the user marked on a picture whose record
-  says the critic passed it. A **kind** is `category/target`
-  (`fault_kind`: "realism/hand"), never the critic's wording, which
-  differs every time; that and the caps (`KINDS_MAX`, `BLIND_KEPT`,
-  `MARKED_KEPT`) are what keep the file from growing. The critic is a 7B
-  and misreads: what it says must repeat (`RECUR` 3, `LEDGER_MIN` 3 tries)
-  before it changes anything, what the user marks counts at once.
-- **The next picture starts from the ledger.** Four uses, each said in a job
-  note when it acts. (1) `start_denoise`: a redraw starts harder when its
-  default strength mended under half of 3+ tries on this model and a
-  harder one, within `CRITIC_DENOISE_TOP`, mended half or more
-  (`_critic_denoise`; a fix's strength stays the user's). (2) `recurring`
-  -> the critic's question gets WRONG BEFORE, the returning faults to look
-  at first (`FIRST_PROMPT`; not in a fix's check). (3) `prevention` ->
-  `compose` appends the critic's newest fix for a returning fault to the
-  prompt, but only for one person's faults of a `PERSON_BOUND` category
-  (identity, body, clothing): "a broad square jaw" describes her, "five
-  fingers" describes no one and the anatomy text says it already. (4)
-  `blind_checks` -> "; missed before: ..." on that category's line of
-  `CHECKS`, the three most missed.
+  UNCERTAIN, never a fault. No JSON at all files nothing, with a warning;
+  the picture is kept either way.
+- **A note is a confident mismatch** (`critic.noted`: MISMATCH at
+  `MIN_CONFIDENCE` 0.6 or more). Under it, and UNCERTAIN, is written to
+  `image-studio/visual_critic.log` (`notes_text`) as seen but not filed.
+  The notes are filed by `note_picture` (below) and kept on the record as
+  `record["refinement"]` = {intent, canonical, history [{"type": "notes"}],
+  summary, `found`}; the job's notes say "Visual Critic noted: ...".
+- **Fix a spot's check still redraws, and only the user's spots**
+  (`Studio._check_fix`; Fix a spot's Wrong field and "Critic checks it":
+  `fix["check"]`, a spot's `note`, the fix's `note` for spots without one).
+  `run_fix` redraws the spots as always, then hands `_check_fix` `marked` -
+  `critic.user_faults` (confidence 1.0, tried once), `redo` (the fix's own
+  `redraw` closure, on some spots, each with its own prompt and denoise
+  through `face_graph`'s `faces[i]["prompt"]`), `strength` and the spots'
+  crops. What else the critic sees is logged, never redrawn, since a fix
+  changes only its squares. The critic is shown up to `CLOSEUPS` (3) spots
+  cut large (`_closeups`: ImageCropV2 -> PreviewImage) *instead of* the
+  references; without them it judges by the whole picture. A note says what
+  is wrong, for the critic; Describe says what to draw, for the model. The
+  note never goes into a prompt, and the critic never rewords it.
+- **Every redraw of a check is scored by the next look.** The spots are
+  *faults* (`as_faults`: numbered, `tries` counted); the next question asks
+  after each by number (`FOLLOWUP_PROMPT`) and the answer's `followups` say
+  CLEARED, PERSISTS, WORSE or UNKNOWN (`score_fixes`; a fault the model
+  skipped is read from its observations by name, else UNKNOWN - never a
+  guess). PERSISTS goes again *harder* (`critic.harder`: +0.15 a try from
+  the fix's strength, up to "strong"), with the followup's `correction` as
+  the fix. After `MAX_TRIES` (2) it is `left` to the user. A redraw with a
+  WORSE and no CLEARED is taken back (`went_wrong`). There is one look more
+  than redraws, up to `refine_passes` (3): the last redraw is looked at too.
+  `build_refinement_instructions` writes the sectioned text (ORIGINAL USER
+  INTENT, CANONICAL ..., PRESERVE, CORRECT) to the log.
+- **The notes add up in a ledger**: `image-studio/critic_ledger.json`, pure
+  logic in `critic.py`, read and written by `Studio._learn` under
+  `CRITIC_LEDGER_LOCK`. *Faults* (`note_picture`): per model, per person
+  (only a picture of exactly one identity) and per scene, each kind's
+  `weight` - +1 when the critic noted it, +`USER_WEIGHT` (3) when the user
+  marked it, -1 for every picture the critic looked at without finding it,
+  capped at `WEIGHT_TOP` - so a fault that stopped coming back is unlearned.
+  *Blind spots* (`note_blind`): what the user marked on a picture whose
+  record says the critic passed it - the critic's own bias. *Fixes*
+  (`note_fixes`): a check's redraws by model -> kind -> `FIX@denoise` ->
+  tried / cleared / worse. A **kind** is `category/target` (`fault_kind`:
+  "realism/hand"), never the critic's wording, which differs every time;
+  that and the caps (`KINDS_MAX`, `BLIND_KEPT`, `MARKED_KEPT`) keep the
+  file from growing. The critic is a 7B and misreads: what it says must
+  repeat (`RECUR` 3) before it counts as returning; what the user marks
+  counts at once.
+- **The ledger steers only the critic.** `recurring` -> its question gets
+  WRONG BEFORE, the returning faults to look at first (`FIRST_PROMPT`; not
+  in a fix's check), and `blind_checks` -> "; missed before: ..." on that
+  category's line of `CHECKS`, the three most missed. Neither changes a
+  picture.
 - **Fix a spot feeds the ledger with the check off too.** `run_fix` files
   its spots through `note_marked` (no picture counted: the critic saw no
   whole picture) and finds the source picture's record by its file name
-  (`record_of_picture`) to tell a blind spot. After a Generate the critic
-  saw everything, so whatever it did not flag it missed; after a fix it
-  saw the spots alone, so it missed only what it had called cleared. The
-  same kind marked on the same picture again (Generate Again on a fix) is
-  not one more picture with the fault. Not built: switching a pass on from
-  the ledger - the hands pass is already on unless unticked, and the
-  user's untick is not overridden.
-- **The record says what happened.** `record["refinement"]` holds the
-  intent, final canonical state, the pass history (each pass with the
-  `scores` of its fixes, and `taken_back`), every fault's last score
-  (`scores`), what was given up (`left`) and why it stopped;
-  `image-studio/visual_critic.log` has each pass's matches, mismatches and
-  chosen action. Faces are not matched to characters: a face correction
-  redraws every face with every character's description.
+  (`record_of_picture`) to tell a blind spot. After notes the critic saw
+  the whole picture, so whatever it did not note (`found`) it missed; after
+  a fix it saw the spots alone, so it missed only what it had called
+  cleared. The same kind marked on the same picture again (Generate Again on
+  a fix) is not one more picture with the fault.
 
 ### Fix a spot: the user clicks what to redraw
 

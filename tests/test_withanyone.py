@@ -37,7 +37,7 @@ class WithAnyoneTests(unittest.TestCase):
             self.photos.append(path)
         self.settings = {"model": "withanyone", "scene": "Two people eating pretzels.",
                          "experimental_reference_groups": True,
-                         "face_detail": True, "auto_refine": True,
+                         "face_detail": True, "critic_notes": True,
                          "scene_faces": {"real": True, "people": [
                              {"name": "Left", "face": self.photos[0], "region": [.1, .2, .4, .5]},
                              {"name": "Right", "face": self.photos[1], "region": [.6, .2, .9, .5]}]}}
@@ -137,7 +137,7 @@ class WithAnyoneTests(unittest.TestCase):
         job = ig.Job(self.settings, self.backend)
         with patch.object(studio, "_faces_into_picture", side_effect=AssertionError("PuLID")), \
              patch.object(studio, "_face_pass", side_effect=AssertionError("redraw")), \
-             patch.object(studio, "_refine", side_effect=AssertionError("critic")):
+             patch.object(studio, "_check_fix", side_effect=AssertionError("critic")):
             studio.run_job(job, lambda j: None)
         self.assertEqual(job.status, "complete", job.detail)
         self.assertEqual(studio.client(self.backend).uploads, self.photos)

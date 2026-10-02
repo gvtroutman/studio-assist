@@ -225,7 +225,7 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.studio.clients = {}
         swapped = []
         s = dict(ig.default_settings(), model="z-image-turbo", backend="5090",
-                 scene="A portrait", identities=["person"], auto_refine=False,
+                 scene="A portrait", identities=["person"], critic_notes=False,
                  hand_pass=False, **settings)
         with patch.object(ff, "available", return_value=True), \
                 patch.object(ff, "swap", side_effect=lambda data, *a, **k: (
