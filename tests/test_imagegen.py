@@ -1162,6 +1162,37 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["54"]["inputs"]["positive"], ["11", 0])
         self.assertEqual(g["40"]["inputs"]["positive"], ["54", 0])
 
+    def test_klein_takes_a_pose_as_a_reference_picture_with_words_to_copy_it(self):
+        # Klein has no ControlNet: the pose map is a reference latent on both
+        # sides of its CFG, and the words before the prompt say to copy it.
+        src = os.path.join(self.dir, "pose.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        inv = dict(FLUX_FILES, diffusion_models={"flux-2-klein-base-9b.safetensors"},
+                   text_encoders={"qwen_3_8b_fp8mixed.safetensors"},
+                   vae={"flux2-vae.safetensors"})
+        p = self.plan(model="klein-9b", inventory=inv, scene="a dancer",
+                      references={"pose": src}, pose={"strength": 0.6})
+        self.assertEqual(p.errors, [])
+        self.assertEqual(p.images, {"pose_image": src})
+        self.assertFalse(any("Pose" in w for w in p.warnings), p.warnings)
+        g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"))
+        self.assertNotIn("10", g)
+        self.assertTrue(g["13"]["inputs"]["text"].startswith("Apply the pose from image 1"))
+        self.assertIn("a dancer", g["13"]["inputs"]["text"])
+        self.assertEqual(g["50"]["inputs"]["image"], "pose.png")
+        self.assertEqual(g["52"]["inputs"]["pixels"], ["51", 0])
+        self.assertEqual(g["53"]["inputs"], {"conditioning": ["13", 0], "latent": ["52", 0]})
+        self.assertEqual(g["54"]["inputs"], {"conditioning": ["12", 0], "latent": ["52", 0]})
+        self.assertEqual((g["6"]["inputs"]["positive"], g["6"]["inputs"]["negative"]),
+                         (["53", 0], ["54", 0]))
+        # Without a pose: the plain prompt, nothing of the pose in the graph.
+        p = self.plan(model="klein-9b", inventory=inv, scene="a dancer")
+        g = ig.fill(p.workflow, p.values)
+        self.assertFalse({"13", "50", "51", "52", "53", "54"} & set(g))
+        self.assertEqual((g["6"]["inputs"]["positive"], g["6"]["inputs"]["negative"]),
+                         (["10", 0], ["12", 0]))
+
     def test_flux_takes_a_source_picture_and_denoise_needs_one(self):
         src = os.path.join(self.dir, "frame.png")
         with open(src, "wb") as f:
