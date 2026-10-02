@@ -9,6 +9,16 @@ from test_imagegen import FLUX_FILES, TempStudioMixin, settle
 from test_wear import WornClient
 
 
+class TestFlagPatternOff(unittest.TestCase):
+    def test_flags_are_left_as_drawn_and_lettering_is_still_asked(self):
+        self.assertFalse(dt.FLAG_PATTERN)
+        self.assertEqual(dt.requests({"scene": "Bavarian flags at Oktoberfest"}), [])
+        req = dt.requests({"scene": "Oktoberfest flags and a welcome sign"})
+        self.assertEqual([(r['noun'], r['text']) for r in req], [('sign', 'Oktoberfest')])
+
+
+# The pattern machinery, kept with the switch off: tested switched on.
+@patch.object(dt, "FLAG_PATTERN", True)
 class TestDetails(unittest.TestCase):
     def test_only_described_designs_are_requested_and_wording_is_short(self):
         self.assertEqual(dt.requests({"scene": "A man at Oktoberfest"}), [])
@@ -142,12 +152,13 @@ class TestRun(TempStudioMixin, unittest.TestCase):
             settle(jobs)
         job = jobs[0]
         self.assertEqual(job.status, 'complete', job.detail)
-        self.assertEqual([p['label'] for p in job.passes], [dt.LABEL, dt.LABEL])
+        self.assertEqual([p['label'] for p in job.passes], [dt.LABEL])   # the sign; flags as drawn
         self.assertIn('Oktoberfest', ' '.join(job.record['notes']))
         self.assertIn((dt.STATUS, dt.LABEL), ig.pipeline_stages(self.studio.lib, job.settings))
         self.assertNotIn((dt.STATUS, dt.LABEL), ig.pipeline_stages(
             self.studio.lib, dict(job.settings, scene_details_pass=False)))
 
+    @patch.object(dt, "FLAG_PATTERN", True)
     def test_failed_second_detail_keeps_the_first_and_drops_the_failed_graph(self):
         self.studio.client_factory = DetailClient
         from test_headswap import KLEIN

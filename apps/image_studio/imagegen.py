@@ -6962,6 +6962,30 @@ class Studio:
             checkpoint["finish"].update(state="complete", results=list(job.outputs))
             self._update_checkpoint(checkpoint)
 
+    def _heads_redrawn(self, job, client, plan, width, height, boxes):
+        """Which of the face finder's `boxes` the head swap after will
+        redraw whole (`headswap.targets`, as `_head_swap` will choose them)
+        -> a set of their indexes; empty when it will not run (turned off,
+        no profile, or the backend lacks SAM3 or Klein). The face pass leaves
+        those faces alone: its redraw of them would be thrown away. If the
+        head swap then fails, FaceFusion still swaps the face."""
+        import apps.image_studio.facefusion as facefusion
+        import apps.image_studio.headswap as headswap
+        if job.settings.get("head_swap", True) is False or (
+                plan.workflow or {}).get("multi_identity"):
+            return set()
+        profiles = facefusion.selected(self.lib, job.settings)
+        if not profiles or not self.sam3_on(job.backend):
+            return set()
+        try:
+            if headswap.lacks(self.inventories.get(job.backend["id"]), client.node_types()):
+                return set()
+        except ComfyError:
+            return set()
+        boxes = [tuple(b) for b in boxes]
+        return {boxes.index(tuple(face))
+                for _, face in headswap.targets(width, height, boxes, profiles)}
+
     def _head_swap(self, job, client, values, pictures, profiles, say):
         """Before the face swap, on the lane's thread: each profile's whole
         head redrawn from their first photo by FLUX.2 Klein (`headswap`), so
@@ -8386,7 +8410,11 @@ class Studio:
         import apps.image_studio.facefusion as facefusion
         swapped = {p["person_id"] for p in facefusion.selected(self.lib, job.settings)
                   if p.get("person_id")}
-        likely = {i for i, p in known.items() if p.get("id") not in swapped}
+        # A face whose whole head the head swap redraws after is not redrawn
+        # here at all: Klein replaces every pixel of it a moment later.
+        replaced = self._heads_redrawn(job, client, plan, width, height, boxes)
+        likely = {i for i, p in known.items() if p.get("id") not in swapped
+                  and i not in replaced}
         pulid, why = self._pulid(client, plan, types=None) if any(
             p.get("face") for i, p in known.items() if i in likely) else (None, "")
         if why:
@@ -8402,6 +8430,12 @@ class Studio:
                   if layout and head_k > 0 and (values.get("controlnet") or (
                       plan.workflow.get("defaults") or {}).get("controlnet")) else set())
         pairs = indexed_crops(width, height, boxes, keep=likeness | shaped)
+        left = [i for i, _ in pairs if i in replaced]
+        if left:
+            pairs = [(i, c) for i, c in pairs if i not in replaced]
+            plan.notes.append("Face pass: %d face%s left to the head swap, which redraws %s "
+                              "after." % (len(left), "" if len(left) == 1 else "s",
+                                          "it" if len(left) == 1 else "them"))
         crops = [c for _, c in pairs]
         f = files[0]
         picture = "%s%s [%s]" % (f["subfolder"] + "/" if f.get("subfolder") else "",
@@ -8446,8 +8480,9 @@ class Studio:
                     "head_depth": {f["name"]: f["depth_strength"] for f in faces
                                    if f and f.get("depth")}}
         if not crops:
-            plan.notes.append("Face pass: %s" % ("no face found" if not boxes else
-                                                 "every face was already drawn at full size"))
+            if not boxes or not left:
+                plan.notes.append("Face pass: %s" % ("no face found" if not boxes else
+                                                     "every face was already drawn at full size"))
             return files, None
         oval = os.path.join(self.lib.root, "face_oval.png")
         try:
