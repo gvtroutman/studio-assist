@@ -375,6 +375,10 @@ def clean_identity(d):
         # A Klein LoRA of their head (Build LoRA) for the head swap alone; never
         # in a picture's own LoRA stack, which is `lora`'s (`head_lora`).
         "head_lora": _str(d.get("head_lora")),
+        # They wear glasses: the head swap asks Klein for them. Off (the
+        # default), it never names glasses - naming them drew glasses on
+        # people who wear none (`headswap.GLASSES`).
+        "glasses": d.get("glasses") is True,
         "references": _strs(d.get("references")),
         "avatar": _str(d.get("avatar")),
         "face_swap": d.get("face_swap", True) is not False,
@@ -6371,15 +6375,26 @@ class Studio:
                     for profile, face in headswap.targets(width, height, boxes, profiles):
                         photo = profile["references"][0]
                         if photo not in photos:
-                            photos[photo] = client.upload_image(photo)
+                            # The photo cut to their head (headswap.PHOTO_CROP):
+                            # whole, Klein copied the clothes it shows.
+                            name = client.upload_image(photo)
+                            job.prompt_id = client.queue_workflow(
+                                parts_graph(name, sam, [headswap.FIND]))
+                            got = parts_found(client.listen_for_progress(
+                                job.prompt_id, lambda kind, d: None,
+                                stop=job.cancel.is_set) or {}, 1)
+                            photos[photo] = (name, got and headswap.photo_cut(*got))
                         own, why = head_lora(self.lib, profile, b["id"],
                                              self.inventories.get(b["id"]))
                         if why and why not in job.notes:
                             job.notes.append(why)
+                        name, cut = photos[photo]
                         heads.append(dict(own, crop=headswap.head_crop(width, height, face),
-                                          photo=photos[photo], name=profile["name"],
+                                          photo=name, name=profile["name"],
                                           id=profile.get("id"),
-                                          middle=headswap.middle(width, height, face)))
+                                          glasses=profile.get("glasses") is True,
+                                          middle=headswap.middle(width, height, face),
+                                          **({"photo_crop": cut} if cut else {})))
                 if not heads:
                     if not job.cancel.is_set():
                         job.notes.append("SAM3 found no face of a chosen person, so no head "
