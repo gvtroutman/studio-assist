@@ -813,6 +813,48 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   out right in every detail (lacing, apron, trim, lace hem) across scenes and
   poses. But her pendant came along, and without an identity LoRA the face
   drifted toward hers. Pictures of the item alone, on white, are best.
+- **The Wearing list: any item from a picture, on any model, by the item pass**
+  (2026-10-01, the user: "upload a pic and it auto goes with the image generation"
+  - a shirt, a necklace, a hat, shoes; he chose a pass after drawing over
+  drawing it in, and a strip on the form over naming it in a slot first). The
+  form's People section has **Wearing** (`ImageStudio._show_wearing`): Add
+  picture… / Link…, then "What is it?" - the kind of thing, as the prompt would
+  say it ("red plaid flannel shirt"). `settings["wearing"]` = `[{"name",
+  "path"}]` (`clean_wearing`; the copy under `references/form items`). Every
+  entry is worn on every Generate: its name joins the person's "wearing ..."
+  words (`person_text`, so Z-Image draws a shirt there to begin with) and
+  `outfit_of` (first, so its picture wins over a tag of the same name). A
+  character keeps one too (`clean_character`, Save as…); picking it ADDS its
+  items to the form's, so an upload made before the pick is not lost. A fix
+  (`fix_base`) and a scene with people (`scene.generation`) blank it.
+  **Where Kontext does not draw the outfit** (every workflow but the FLUX
+  baseline - Z-Image, Klein), `plan_wear` hands it to the item pass
+  (`plan.wear`; the hair picture stays words); a backend without Klein's files,
+  SAM3 or the nodes gets one warning with both reasons. **The pass**
+  (`apps/image_studio/wear.py`, run by `Studio._wear` right after the fetch,
+  before the head swap's checkpoint, so a retried face swap keeps the items):
+  one SAM3 run finds each item's noun plus person/face (`find_words`;
+  `place_of`: head / face / neck / hand / feet / body by its words, noun
+  "clothing" for a name that says no kind of thing - "Nike Air Max"), `where`
+  puts it on the biggest person - a box in a smaller person's box is a
+  passer-by's (the café bench: SAM3's only "hat" was on a man behind her),
+  head/face/neck items must be near the main face, a hat is redrawn with the
+  whole head, a pair is one crop, nothing drawn = where it is worn. `crop_for`
+  is a rectangle (not the head swap's square), drawn at ~1 MP in its own shape
+  (`drawn_size`); `item_graph` is head_graph's recipe: Klein 9B with the crop
+  and the item's picture as two references (`PROMPT`: wear it exactly, keep
+  everything else, copy nothing else), blended through SAM3's mask of the noun
+  before OR after, grown (further for THIN things), soft frame with no margin
+  at the picture's edge. **No ColorTransfer**: it moves the item's colour
+  toward the garment it replaces. Items go on body first, head last (`ORDER`),
+  each on the picture the last left. An extra: any failure keeps the picture
+  as drawn and says so; the licence note says "(the item pass)" (with a head
+  swap, "(the item pass and the head swap)"). Measured on the 5090 (Z-Image
+  pictures, product shots on white): ~9 s an item, 22 s for three; shirt,
+  sneakers, denim jacket (its sleeve patches), moon necklace and bucket hat
+  all came out right, face and background untouched outside the item's mask;
+  real Generate 70-80 s with three items, and on Partner the jacket and
+  pendant survived the head and face swap after.
 - **A character is a profile: its face photos draw every picture of it**
   (2026-09-26, the user: "profiles for people to face swap"). **The photos are
   managed in the identity builder only** (Image references: "Reference
