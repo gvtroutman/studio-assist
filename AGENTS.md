@@ -2961,7 +2961,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   a band and a feather. `HELD` puts carried things in the Accessories slot on the
   mannequin: an accordion across the chest (the Carrying pose puts the hands on it)
   and a beer stein upright in front of the right palm, or both when the words say
-  more than one. Anything else typed in a slot is still sent as written; it only
+  more than one. A spatula has a dark handle gripped in the right palm and a slotted
+  metal blade extending along the fingers; every piece follows the wrist frame,
+  and `GRIPS` closes the fingers in both the mesh and pose map. `frying_pan` is a
+  prop with an open segmented bowl and a handle towards +Z, sized in metres like
+  the other props. Anything else typed in a slot is still sent as written; it only
   goes undrawn. What is not worn is the object's
   colour. The words are still sent as written; this only draws them. Every look edit
   in the inspector goes through `changed()`, so the viewport follows each keystroke
