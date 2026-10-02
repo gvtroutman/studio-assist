@@ -1081,6 +1081,31 @@ class TestAppRegistry(unittest.TestCase):
         finally:
             (eng.context_window, eng.loaded_instances, eng.unload_model, eng.load_model) = real
 
+    def test_opencodes_model_gets_the_card_to_itself(self):
+        """Loaded beside the vision model the coder decoded at 3-5 tokens/s:
+        a big enough window is not enough, the card has to be its own."""
+        oc = eng.APPS_BY_ID["opencode"]
+        calls = []
+        real = (eng.context_window, eng.loaded_instances, eng.unload_model, eng.load_model,
+                eng.resident, eng.make_room)
+        eng.context_window = lambda host, m, timeout=5: (65536, 262144)
+        eng.loaded_instances = lambda host, m, timeout=5: [(m, 65536)]
+        eng.unload_model = lambda host, i, timeout=60: calls.append(("unload", i))
+        eng.load_model = lambda host, m, timeout=600, context_length=None: calls.append(
+            ("load", m, context_length))
+        eng.make_room = lambda host, keep, timeout=10: calls.append(("room", set(keep))) or ([], None)
+        try:
+            eng.resident = lambda host, timeout=5: ["vl", "c"]
+            oc.fit_window("h", "c")
+            self.assertEqual(calls, [("room", {"c"}), ("unload", "c"), ("load", "c", 65536)])
+            calls.clear()
+            eng.resident = lambda host, timeout=5: ["c"]
+            self.assertEqual(oc.fit_window("h", "c"), 65536)
+            self.assertEqual(calls, [], "alone and big enough: left alone")
+        finally:
+            (eng.context_window, eng.loaded_instances, eng.unload_model, eng.load_model,
+             eng.resident, eng.make_room) = real
+
     def test_on_this_repo_opencode_gets_the_short_brief_not_agents_md(self):
         # AGENTS.md is far larger than the model's window; loaded whole it
         # pushed the task out of OpenCode's memory.
