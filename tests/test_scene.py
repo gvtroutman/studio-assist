@@ -2286,6 +2286,22 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual((sb.scene["camera"]["profile"], sb.scene["frame"]), ("sx-70", "square"))
         self.assertEqual(ui.collect()["camera_profile"], "sx-70")
 
+    def test_the_image_form_runs_cameras_scene_builder_then_the_prompt(self):
+        """The Scene Builder sits under the Shot on deck, twice an ordinary
+        button's size each way, and the Prompt heading labels the box itself."""
+        self.app._select("image-studio")
+        self.app.update()
+        ui = self.app.sessions["image-studio"].images
+        order = ui.sections["Image"].pack_slaves()
+        deck, button = order.index(ui.camera_deck), order.index(ui.scene_button)
+        cap, box = order.index(ui.prompt_cap), order.index(ui.scene.master)
+        self.assertEqual((deck, button, cap), (button - 1, cap - 1, box - 1))
+        plain = ui.button(ui.sections["Image"], "Scene Builder…", lambda: None)
+        self.addCleanup(plain.destroy)
+        b = ui.scene_button
+        self.assertEqual((float(b.cget("width")), float(b.cget("height"))),
+                         (2 * float(plain.cget("width")), 2 * float(plain.cget("height"))))
+
     def test_the_builder_goes_with_its_form(self):
         """It writes into the Image Studio's form, so closing the tab closes
         it - on the UI thread, since Session.close runs on a worker."""

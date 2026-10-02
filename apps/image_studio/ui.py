@@ -670,7 +670,6 @@ class ImageStudio:
             pill.pack(side="left", padx=(0, self.px(3)))
             self.section_pills[name] = pill
         f = self.sections["Image"]
-        self.cap(f, "Prompt").pack(**pad)
         setup = self.sections["Settings"]
         self.cap(setup, "Preset").pack(**pad)
         self.preset_row = self.frame(setup)
@@ -692,6 +691,18 @@ class ImageStudio:
         self.camera_deck.pack(side="top", fill="x", pady=(0, self.px(8)), **pad)
         self._build_camera_deck()
 
+        # The Scene Builder under the cameras it shares, ahead of the prompt it
+        # writes: twice the size of an ordinary button each way, so it reads
+        # as the main way to make a picture rather than an aside.
+        self.scene_button = self.button(f, "Scene Builder…", self.build_scene)
+        self.scene_button.pack(side="top", anchor="w", **pad)
+        b = self.scene_button
+        b.padx += float(b.cget("width")) / 2.0
+        b.pady += float(b.cget("height")) / 2.0
+        b.paint(self.host.C)
+
+        self.prompt_cap = self.cap(f, "Prompt")
+        self.prompt_cap.pack(**pad)
         shell = self.frame(f, "card")
         shell.pack(side="top", fill="x", **pad)
         self.scene = tk.Text(shell, height=5, wrap="word", bd=0, highlightthickness=0,
@@ -702,14 +713,9 @@ class ImageStudio:
         self.scene.pack(fill="x")
         self.scene.bind("<KeyRelease>", lambda ev: self._recheck())
         self.scene.bind("<Control-Return>", lambda ev: (self.generate(), "break")[1])
-        # As wide as the scene box above it: the way into the Scene Builder
-        # is the scene's own, not a small aside beside a hint.
         srow = self.frame(f)
         srow.pack(side="top", fill="x", pady=(self.px(4), 0), **pad)
-        self.button(srow, "Scene Builder…", self.build_scene).pack(
-            side="left", fill="x", expand=True, padx=(0, self.px(4)))
-        self.button(srow, "Image library…", self.image_library).pack(
-            side="left", fill="x", expand=True)
+        self.button(srow, "Image library…", self.image_library).pack(side="left")
         self.pc_box = pb = self.sections["People"]
         self.cap(pb, "Person").pack(**pad)
         # One dropdown for the person, characters and profiles both
