@@ -103,7 +103,8 @@ class DropTargetTests(unittest.TestCase):
             effects.append(effect.value)
         else:
             fd._method(this, 5, fd._LEAVE)(this)
-        self.root.update()                       # the drop is handed on by `after`
+        self.assertEqual(self.calls, [])         # nothing into Tk from inside OLE
+        self.target.poll()                       # as `after` does next
         return effects
 
     def test_files_light_the_window_and_arrive_after_the_drop(self):
@@ -165,9 +166,70 @@ class DropTargetTests(unittest.TestCase):
     def test_closing_the_window_revokes_it(self):
         hwnd = self.target.hwnd
         self.assertTrue(hwnd)
+        self.assertIsNotNone(self.target.job)
         self.win.destroy()
         self.assertIsNone(self.target.hwnd)
+        self.assertIsNone(self.target.job)            # the poll stops with it
         self.assertIn(self.target, fd._HELD)          # kept: OLE may still call it
+
+
+# OLE calls a target from a message Tk's own loop dispatches. A Win32 timer is
+# dispatched the same way, so its TIMERPROC drags onto the target from there.
+# A Tk call made at that point aborted the whole process (the app "crashed on
+# drop"), so this runs in a process of its own and must exit cleanly.
+_IN_MAINLOOP = r"""
+import ctypes, os, sys, tkinter as tk
+from ctypes import wintypes
+sys.path[:0] = [{root!r}, {tests!r}]
+import core.filedrop as fd
+from test_filedrop import data_object
+
+u32 = ctypes.WinDLL("user32")
+TIMERPROC = ctypes.WINFUNCTYPE(None, wintypes.HWND, wintypes.UINT, ctypes.c_size_t,
+                               wintypes.DWORD)
+u32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, TIMERPROC]
+u32.SetTimer.restype = ctypes.c_size_t
+u32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+
+root = tk.Tk()
+root.withdraw()
+win = tk.Toplevel(root)
+win.withdraw()
+label = tk.Label(win, text="")
+label.pack()
+seen = []
+def dropped(paths, url):
+    seen.append(paths)
+    label.config(text="dropped")
+    root.after(10, root.destroy)
+target = fd.accept(win, dropped, enter=lambda: label.config(text="lit"),
+                   leave=lambda: label.config(text=""))
+data = data_object(paths=[r"C:\pictures\a.png"])
+
+def fired(hwnd, msg, ident, when):
+    u32.KillTimer(None, ident)
+    this, effect = target.pointer, wintypes.DWORD(fd.DROPEFFECT_COPY)
+    fd._method(this, 3, fd._ENTER)(this, data, 0, 0, ctypes.byref(effect))
+    fd._method(this, 6, fd._ENTER)(this, data, 0, 0, ctypes.byref(effect))
+
+proc = TIMERPROC(fired)
+u32.SetTimer(None, 0, 20, proc)
+root.after(5000, root.destroy)
+root.mainloop()
+print("seen", seen)
+"""
+
+
+@unittest.skipUnless(fd.WINDOWS, "OLE drag and drop is Windows-only")
+class DropInsideTheLoopTests(unittest.TestCase):
+    def test_a_drop_from_inside_tks_message_loop_does_not_kill_the_app(self):
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        script = _IN_MAINLOOP.format(root=os.path.dirname(here), tests=here)
+        out = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(r"seen [['C:\\pictures\\a.png']]", out.stdout)
 
 
 if __name__ == "__main__":

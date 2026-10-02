@@ -15,10 +15,14 @@ gets what was let go:
 OLE finds a drop target by walking up from the window under the cursor, so
 the registration on a Toplevel covers every widget inside it.
 
-- **On the Tk thread.** `OleInitialize` and `RegisterDragDrop` are called on
-  the thread that runs the window, and OLE calls the target there, from inside
-  Tk's own message loop, while the drag's source waits. So the target only
-  reads the data and lights the window; `drop` runs afterwards, from `after`.
+- **On the Tk thread, never into Tk.** `OleInitialize` and `RegisterDragDrop`
+  are called on the thread that runs the window, and OLE calls the target
+  there, from inside Tk's own message loop, while the drag's source waits.
+  Any Tk call made there (a `config`, even an `after`) leaves `_tkinter`
+  without its saved thread state, and the next Python callback Tk runs
+  aborts the process (`Fatal Python error: PyEval_RestoreThread`). So the
+  target only reads the data and notes what happened in `events`; `poll`,
+  every `POLL_MS` from `after`, hands them to `enter` / `leave` / `drop`.
 - **The objects are never freed.** OLE may call `Release` on a target after it
   was revoked, and a ctypes callback freed while it runs takes the process
   with it. A target is a few hundred bytes, kept in `_HELD` for the process's
@@ -35,6 +39,7 @@ import re
 import sys
 
 WINDOWS = sys.platform == "win32" and sys.maxsize > 2 ** 32
+POLL_MS = 40                  # how often `Target.poll` hands OLE's events to Tk
 _HELD = []                    # every target made: OLE may call one after revoke
 _OLE = []                     # [True] once OleInitialize worked on the Tk thread
 
@@ -199,7 +204,8 @@ class Target:
 
     def __init__(self, widget, drop, enter=None, leave=None):
         self.widget, self.on_drop, self.on_enter, self.on_leave = widget, drop, enter, leave
-        self.hwnd, self.ok, self.refs = None, False, 1
+        self.hwnd, self.ok, self.refs, self.job = None, False, 1, None
+        self.events = []      # ("enter",), ("leave",), ("drop", paths, url) for `poll`
         self.table = _VTable(_QI(self._query), _REF(self._add), _REF(self._release),
                              _ENTER(self._enter), _OVER(self._over), _LEAVE(self._leave),
                              _ENTER(self._drop))
@@ -245,7 +251,7 @@ class Target:
             self.ok = bool(data) and offered(data)
             self._effect(effect)
             if self.ok:
-                self._call(self.on_enter)
+                self.events.append(("enter",))
             return S_OK
         except Exception:
             self.ok = False
@@ -261,7 +267,7 @@ class Target:
     def _leave(self, this):
         if self.ok:
             self.ok = False
-            self._call(self.on_leave)
+            self.events.append(("leave",))
         return S_OK
 
     def _drop(self, this, data, keys, point, effect):
@@ -275,16 +281,28 @@ class Target:
             effect[0] = DROPEFFECT_NONE
         self._leave(this)
         if paths or url:
-            # Not now: the drag's source is waiting for this call to return.
-            try:
-                self.widget.after(0, lambda: self._call(self.on_drop, paths, url))
-            except Exception:
-                pass
+            self.events.append(("drop", paths, url))
         return S_OK
+
+    def poll(self):
+        """On the Tk thread, from `after`: hand on what OLE noted, in order."""
+        self.job = None
+        while self.events:
+            kind, *args = self.events.pop(0)
+            self._call({"enter": self.on_enter, "leave": self.on_leave,
+                        "drop": self.on_drop}[kind], *args)
+        if self.hwnd:
+            self.job = self.widget.after(POLL_MS, self.poll)
 
     def revoke(self, ev=None):
         if ev is not None and ev.widget is not self.widget:
             return
+        if self.job is not None:
+            try:
+                self.widget.after_cancel(self.job)
+            except Exception:
+                pass
+            self.job = None
         if self.hwnd:
             _ole32.RevokeDragDrop(self.hwnd)
             self.hwnd = None
@@ -310,4 +328,5 @@ def accept(widget, drop, enter=None, leave=None):
         return None
     target.hwnd = hwnd
     widget.bind("<Destroy>", target.revoke, add="+")
+    target.poll()
     return target
