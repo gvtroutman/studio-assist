@@ -490,6 +490,23 @@ def clean_item_refs(v):
             and isinstance(x, str) and x.strip()} if isinstance(v, dict) else {}
 
 
+def clean_wearing(v):
+    """The form's Wearing list (settings["wearing"]): [{"name", "path"}] - a
+    picture of each thing the person wears, said by name and put on after
+    the picture is drawn (`wear`). Junk dropped, one entry per name."""
+    out, seen = [], set()
+    for x in v if isinstance(v, list) else []:
+        if not isinstance(x, dict):
+            continue
+        name, path = x.get("name"), x.get("path")
+        if not (isinstance(name, str) and name.strip() and isinstance(path, str)
+                and path.strip()) or name.strip().lower() in seen:
+            continue
+        seen.add(name.strip().lower())
+        out.append({"name": name.strip(), "path": path.strip()})
+    return out
+
+
 def clean_character(d):
     """A character from the creator: the look it keeps from picture to
     picture (`looks`, every CHARACTER_KEYS slot and slider it sets), the
@@ -511,6 +528,7 @@ def clean_character(d):
         "identity": _str(d.get("identity")),
         "looks": kept,
         "item_refs": clean_item_refs(d.get("item_refs")),
+        "wearing": clean_wearing(d.get("wearing")),
         "faces": _strs(d.get("faces")),
         "notes": _str(d.get("notes")),
     }
@@ -3087,6 +3105,14 @@ def outfit_of(settings):
     refs = {k.lower(): (k, x) for k, x in clean_item_refs(settings.get("item_refs")).items()}
     out = {"clothes": [], "hair": None, "accessories": []}
     used = set()
+    garments = {x.split()[-1].lower() for k in CLOTHES_SLOTS for x in SLOTS[k][3]}
+    # The Wearing list first: worn whatever the slots say, and its picture
+    # wins over a tag of the same name.
+    for w in clean_wearing(settings.get("wearing")):
+        used.add(w["name"].lower())
+        clothes = not on_head(w["name"]) and (bool(GARMENTS.search(w["name"])) or any(
+            says(w["name"], g) for g in garments))
+        out["clothes" if clothes else "accessories"].append(dict(w))
     for k in TAG_SLOTS:
         items = split_many(_field(settings, k)) if SLOTS[k][4] else [_field(settings, k)]
         for name in items:
@@ -3097,7 +3123,6 @@ def outfit_of(settings):
     # The longer tag first, and what it said is spent: "a rose tattoo" is
     # the rose tattoo's picture, not the plain tattoo's too.
     said = {k: _field(settings, k) for k in TAG_SLOTS + ("scene",)}
-    garments = {x.split()[-1].lower() for k in CLOTHES_SLOTS for x in SLOTS[k][3]}
     for low, (name, path) in sorted(refs.items(), key=lambda kv: -len(kv[0])):
         if low == HAIR_ITEM or low in used:
             continue
@@ -3614,8 +3639,8 @@ def default_settings():
             "identities": [], "style": "none", "style_strength": None,
             "scene": "", "camera": "", "camera_profile": "", "negative": "", "loras": [],
             "references": {},
-            "character": "", "item_refs": {}, "face_photos": [], "face_name": "",
-            "anatomy": True,
+            "character": "", "item_refs": {}, "wearing": [], "face_photos": [],
+            "face_name": "", "anatomy": True,
             "seed": -1, "seed_mode": "random", "steps": None, "guidance": None,
             "sampler": "", "scheduler": "", "width": None, "height": None,
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
@@ -3841,7 +3866,8 @@ def person_text(settings):
     bits.append(hair_text(s))
     bits += [_field(s, "traits"), _noun("expression", _field(s, "expression")),
              _field(s, "gaze")]
-    worn = _and([_field(s, k) for k in ("top", "bottom", "outerwear", "footwear")])
+    worn = _and([_field(s, k) for k in ("top", "bottom", "outerwear", "footwear")]
+                + [w["name"] for w in clean_wearing(s.get("wearing"))])
     bits.append("wearing " + worn if worn else "")
     carried = _and(split_many(_field(s, "accessories")))
     bits.append("with " + carried if carried else "")
@@ -3949,7 +3975,9 @@ GARMENTS = re.compile(
 def is_dressed(settings):
     """Whether the form or the scene names something the person wears."""
     return bool(any(_field(settings, k) for k in ("top", "bottom", "outerwear"))
-                or GARMENTS.search(_field(settings, "scene")))
+                or GARMENTS.search(_field(settings, "scene"))
+                or any(GARMENTS.search(w["name"]) for w in clean_wearing(
+                    settings.get("wearing"))))
 
 
 def anatomy_text():
@@ -4117,26 +4145,60 @@ class Plan:
         self.references = {}         # kind -> local path actually used
         self.items = []              # [(item name, local path)]: Kontext's reference
         self.item_text = ""          # the prompt's line about them
+        self.wear = []               # [(item name, local path)]: the item pass's, after
 
 
 ITEM_PROMPT = ("The %s %s exactly as in the reference picture, worn by the person. "
                "One person, not the reference picture itself.")
 
 
-def plan_items(p, s, wf, v, backend, short, nodes):
+def plan_wear(p, items, backend, inventory, nodes, why=""):
+    """Into `p`: the item pictures Kontext does not draw (`why` not), for the
+    item pass after the picture (`wear`, `Studio._wear`) - every one but the
+    hair, which no pass puts on. When the backend cannot run that pass
+    (Klein's files, SAM3, its nodes), the words alone describe them, said
+    once, with both reasons."""
+    import apps.image_studio.wear as wear
+    hair = [i for i in items if i["name"] == HAIR_ITEM]
+    later = [i for i in items if i["name"] != HAIR_ITEM]
+    if hair:
+        p.warnings.append("The picture of the hair: %s, and no pass after puts hair on, so "
+                          "the words alone describe it." % why)
+    if not later:
+        return
+    names = _and([i["name"] for i in later])
+    short = wear.lacks(inventory, nodes)
+    if inventory is not None and not any(SAM3 in c.lower()
+                                         for c in inventory.get("checkpoints") or ()):
+        short.append("a SAM3 checkpoint")
+    if short:
+        p.warnings.append("Pictures of the %s: %s%s lacks %s (the item pass), so the "
+                          "words alone describe %s." % (
+                              names, why + ", and " if why else "", backend["name"],
+                              ", ".join(short), "it" if len(later) == 1 else "them"))
+        return
+    p.wear = [(i["name"], i["path"]) for i in later]
+    for name, path in p.wear:
+        p.references["item: " + name] = path
+    p.notes.append("The %s: put on from %s after the picture is drawn, by FLUX.2 Klein 9B "
+                   "(the item pass)." % (names, "its picture" if len(later) == 1
+                                         else "their pictures"))
+
+
+def plan_items(p, s, wf, v, backend, short, nodes, inventory=None):
     """Into `p` and `v`: the character's pictures of what it wears today
-    (outfit_of: clothes, the hair picture, accessories) as references for the
-    picture itself. A workflow with an `items` section makes it with FLUX
-    Kontext, the pictures side by side as its reference (add_item_refs);
-    otherwise, or on a backend without Kontext (`short` names the file), the
-    words alone describe them, said once."""
+    (outfit_of: the Wearing list, clothes, the hair picture, accessories)
+    as references for the picture itself. A workflow with an `items`
+    section makes it with FLUX Kontext, the pictures side by side as its
+    reference (add_item_refs); otherwise, or on a backend without Kontext
+    (`short` names the file), they are put on after it is drawn
+    (plan_wear)."""
     outfit = outfit_of(s)
     items = outfit["clothes"] + ([{"name": "hair", "path": outfit["hair"]["path"]}]
                                  if outfit["hair"] else []) + outfit["accessories"]
     if not items:
         return
-    names = _and([i["name"] for i in items])
-    gone = [i for i in items if not os.path.isfile(i["path"])]
+    gone =[i for i in items if not os.path.isfile(i["path"])]
     for i in gone:
         p.warnings.append("The picture of the %s (%s) is not on this PC any more; not "
                           "used." % (i["name"], i["path"]))
@@ -4152,8 +4214,7 @@ def plan_items(p, s, wf, v, backend, short, nodes):
         why = "%s's ComfyUI lacks %s" % (backend["name"],
                                          ", ".join(sorted(ITEM_NODES - set(nodes))))
     if items and why:
-        p.warnings.append("Pictures of the %s: %s, so the words alone describe %s."
-                          % (names, why, "it" if len(items) == 1 else "them"))
+        plan_wear(p, items, backend, inventory, nodes, why)
         return
     if not items:
         return
@@ -4826,7 +4887,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         p.notes.append("Regional character prompting needs a workflow that supports it "
                        "(the %s workflow does not); used as ordinary words instead."
                        % wf.get("label", wid))
-    plan_items(p, s, wf, v, backend, lacking("items"), nodes)
+    plan_items(p, s, wf, v, backend, lacking("items"), nodes, inventory)
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
     # Denoise below 1 over an empty latent leaves noise in the picture: it
@@ -5025,7 +5086,7 @@ def route(role, backends, health, has_model=None, load=None):
 # ================================================================ jobs
 
 STATUSES = ("queued", "uploading", "loading", "sampling", "decoding", "running", "refining",
-            "face", "critic", "head_swap", "face_swap", "eyes", "hands", "glasses",
+            "face", "critic", "items", "head_swap", "face_swap", "eyes", "hands", "glasses",
             "complete", "failed", "cancelled")
 FINISHED = ("complete", "failed", "cancelled")
 # The stages a job is shown moving through. "running" and "refining" are what
@@ -5110,6 +5171,9 @@ def pipeline_stages(lib, settings):
     if settings.get("auto_refine"):
         stages.append(("critic", "Critic"))
     stages.append(("decoding", "Decoding"))
+    worn = outfit_of(settings)
+    if worn["clothes"] or worn["accessories"]:
+        stages.append(("items", "Item pass"))
     profiles = facefusion.selected(lib, settings)
     if profiles:
         if settings.get("head_swap", True) is not False:
@@ -6197,6 +6261,8 @@ class Studio:
         except ComfyError as e:
             return self.queue._finish(job, "failed", "The picture was made but could not be "
                                       "fetched from %s: %s" % (b["name"], e))
+        if plan.wear and not job.cancel.is_set():
+            pictures = self._wear(job, client, values, pictures, plan.wear, say)
         if profiles:
             pictures = self.finish_profiles(
                 job, graph, pictures, profiles, say,
@@ -6335,7 +6401,9 @@ class Studio:
                                      "%s's head%s" % (h["name"], " (with their head LoRA)"
                                                       if h.get("lora") else "")
                                      for h in heads))
-                job.license = headswap.LICENSE_NOTE
+                job.license = headswap.LICENSE_NOTE.replace(
+                    "(the head swap)", "(the item pass and the head swap)"
+                    if job.license else "(the head swap)")
             return out
         except Exception as e:            # an extra: whatever it is, the pictures go on
             if not isinstance(e, (ComfyError, OSError)):
@@ -6349,6 +6417,93 @@ class Studio:
                              "faces are swapped on %s as generated."
                              % (e, "the pictures after the first %d" % len(out) if out
                                 else "the picture"))
+            return out + pictures[len(out):]
+
+    def _wear(self, job, client, values, pictures, items, say):
+        """After the picture is drawn and before the head and face swap, on
+        the lane's thread: each of `items` ([(name, local path)], the plan's
+        `wear`) put on the main person by FLUX.2 Klein (`wear`) - SAM3 finds
+        where each goes, Klein redraws that part with the item's picture
+        beside it, and only the item is blended in. -> the pictures; those
+        given on any failure or a cancel - the item pass is an extra, the
+        picture is never lost to it."""
+        import apps.image_studio.wear as wear
+        b = job.backend
+        sam = self.sam3_on(b)
+        try:
+            short = wear.lacks(self.inventories.get(b["id"]),
+                               client.node_types() if sam else None)
+        except ComfyError:
+            short = []
+        if not sam or short:
+            job.notes.append("No item pass: %s; the words alone describe the %s." % (
+                "%s has no SAM3 checkpoint" % b["name"] if not sam else
+                "%s lacks %s" % (b["name"], ", ".join(short)), _and([n for n, _ in items])))
+            return pictures
+        wanted = [{"name": n, "path": p} for n, p in items]
+        words = wear.find_words(wanted)
+        folder = os.path.join(self.lib.root, "finish")
+        out = []
+        passes = len(job.passes)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            uploaded = {}
+            for n, (filename, data) in enumerate(pictures):
+                passes = len(job.passes)
+                if job.cancel.is_set():
+                    out.append((filename, data))
+                    continue
+                path = os.path.join(folder, "%s_wear_%d.png" % (job.id, n))
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                image = client.upload_image(path)
+                say(wear.STATUS, "Finding where the %s go%s" % (
+                    _and([i["name"] for i in wanted]), "es" if len(wanted) == 1 else ""), None)
+                job.prompt_id = client.queue_workflow(parts_graph(
+                    image, sam, ["%s:%d" % (w, wear.FIND) for w in words]))
+                entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
+                                                   stop=job.cancel.is_set)
+                said = parts_found(entry or {}, len(words), words, scores=True)
+                if said is None:
+                    if not job.cancel.is_set():
+                        job.notes.append("SAM3 said nothing about the picture, so no item "
+                                         "pass was made.")
+                    out.append((filename, data))
+                    continue
+                width, height, boxes = said
+                planned, missed = wear.plan(width, height, wanted, boxes)
+                if missed:
+                    job.notes.append("Item pass: no person found to wear the %s."
+                                     % _and(missed))
+                if not planned:
+                    out.append((filename, data))
+                    continue
+                for item in planned:
+                    if item["path"] not in uploaded:
+                        uploaded[item["path"]] = client.upload_image(item["path"])
+                    item["picture"] = uploaded[item["path"]]
+                graph = wear.item_graph(image, planned, int(values.get("seed") or 0),
+                                        values["filename_prefix"] + "_wear", sam,
+                                        (width, height))
+                files = self._run_pass(job, client, graph, say, wear.LABEL,
+                                       status=wear.STATUS)
+                if files is None:         # cancelled: the picture as it was
+                    out.append((filename, data))
+                    continue
+                out.append((filename, client.fetch(files[0])))
+                job.notes.append("Item pass: the %s put on from %s by FLUX.2 Klein 9B." % (
+                    _and([i["name"] for i in planned]),
+                    "its picture" if len(planned) == 1 else "their pictures"))
+                job.license = wear.LICENSE_NOTE
+            return out
+        except Exception as e:            # an extra: whatever it is, the pictures go on
+            if not isinstance(e, (ComfyError, OSError)):
+                doctor.log_error("Image Studio item pass, job %s:\n%s"
+                                 % (job.id, traceback.format_exc()))
+            del job.passes[passes:]
+            job.notes.append("The item pass could not run (%s); %s as drawn."
+                             % (e, "the pictures after the first %d go on" % len(out) if out
+                                else "the picture goes on"))
             return out + pictures[len(out):]
 
     def _apply_profiles(self, job, pictures, profiles, say):
@@ -6417,7 +6572,7 @@ class Studio:
         face pass, the critic)."""
         s = {k: v for k, v in (settings or {}).items()
              if k not in ("mode", "fix", "replay_prompt")}
-        s.update(references={}, item_refs={}, pose=None, composition=None,
+        s.update(references={}, item_refs={}, wearing=[], pose=None, composition=None,
                  face_detail=False, auto_refine=False, batch=1)
         return s
 

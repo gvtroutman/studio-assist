@@ -4686,6 +4686,40 @@ class TestImageStudioTab(unittest.TestCase):
         ui.reuse({"mode": "dress", "seed": 4})
         self.assertNotIn("dress", ui.collect())
 
+    def test_what_they_wear_is_added_on_the_form_by_picture_and_name(self):
+        s, ui = self.tab()
+        pic = os.path.join(self.dir, "IMG_1234.png")
+        with open(pic, "wb") as f:
+            f.write(PNG)
+        top = ui._name_wearing(pic)
+        self.assertEqual(top.var.get(), "")          # a camera's file name is no name
+        top.var.set("red plaid shirt")
+        top.ok()
+        self.app.update()
+        worn = ui.collect()["wearing"]
+        self.assertEqual([w["name"] for w in worn], ["red plaid shirt"])
+        self.assertNotEqual(worn[0]["path"], pic)    # copied, so history keeps it
+        self.assertTrue(os.path.isfile(worn[0]["path"]))
+        texts = [w.cget("text") for row in ui.wear_box.winfo_children()
+                 for w in row.winfo_children() if type(w).__name__ == "Label"]
+        self.assertIn("red plaid shirt", texts)
+        # The same name again replaces it; a picture's own name is offered.
+        hat = os.path.join(self.dir, "bucket_hat.png")
+        with open(hat, "wb") as f:
+            f.write(PNG)
+        top = ui._name_wearing(hat)
+        self.assertEqual(top.var.get(), "bucket hat")
+        top.ok()
+        self.assertEqual([w["name"] for w in ui.collect()["wearing"]],
+                         ["red plaid shirt", "bucket hat"])
+        # Generate Again brings it back; × takes it off.
+        settings = ui.collect()
+        ui._drop_wearing(0)
+        self.assertEqual([w["name"] for w in ui.collect()["wearing"]], ["bucket hat"])
+        ui.reuse(settings)
+        self.assertEqual([w["name"] for w in ui.collect()["wearing"]],
+                         ["red plaid shirt", "bucket hat"])
+
 
 if __name__ == "__main__":
     unittest.main()

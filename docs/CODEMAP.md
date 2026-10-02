@@ -119,6 +119,12 @@ After Effects and Resolve use outside npm servers.
   queue, kept in History): `blend.submit`, `blend.run_job`, `blend.record`,
   `blend_words`, under `ui.BlendWindow`, opened by `ImageStudio.blend`. The view cube Angles asks on:
   `apps/image_studio/viewcube.py` (`cells`, `basis`, `facing`, `ViewCube`).
+- **Wearing (item pictures on any model)** - `apps/image_studio/wear.py`
+  (`place_of`, `find_words`, `where`, `crop_for`, `plan`, `item_graph`), run by
+  `Studio._wear` after the fetch and before the head swap; planned by
+  `imagegen.plan_wear` (from `plan_items` when Kontext does not draw them);
+  settings `wearing` (`clean_wearing`); the form's strip `ImageStudio._show_wearing`.
+  Tests: `tests/test_wear.py`. AGENTS.md "The Wearing list".
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,
   `scene/pose.py`.

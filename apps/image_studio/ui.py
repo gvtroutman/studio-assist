@@ -72,10 +72,11 @@ ADVANCED = [                  # (setting, label, kind)
 STATUS_ROLE = {"queued": "muted", "uploading": "accent", "loading": "accent",
                "sampling": "accent", "decoding": "accent", "running": "accent",
                "refining": "accent", "face": "accent", "critic": "accent",
-               "head_swap": "accent", "face_swap": "accent", "eyes": "accent",
+               "items": "accent", "head_swap": "accent", "face_swap": "accent", "eyes": "accent",
                "hands": "accent",
                "glasses": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
-STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "head_swap": "Head swap",
+STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "items": "Item pass",
+               "head_swap": "Head swap",
                "face_swap": "Face swap",
                "eyes": "Eye pass", "hands": "Hand pass", "glasses": "Glasses"}
 # A status to the key on the job's own pipeline strip (ig.pipeline_stages) it
@@ -83,7 +84,7 @@ STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "head_swap": "Head swap"
 # nothing is lit yet.
 STAGE_KEY = {"queued": None, "uploading": None, "loading": None, "running": "sampling",
              "sampling": "sampling", "face": "face", "critic": "critic",
-             "decoding": "decoding", "head_swap": "head_swap", "face_swap": "face_swap",
+             "decoding": "decoding", "items": "items", "head_swap": "head_swap", "face_swap": "face_swap",
              "eyes": "eyes",
              "hands": "hands", "glasses": "glasses", "complete": "complete"}
 READY_MARK = {"ready": "✓", "missing": "✗", "offline": "○", "disabled": "–",
@@ -434,6 +435,7 @@ class ImageStudio:
         self.text = {}                # look slot and camera setting -> StringVar
         self.sliders = {}             # body slider keys -> IntVar
         self.item_refs = {}           # item -> picture, from the character
+        self.wearing = []             # [{"name", "path"}]: the Wearing strip (ig.clean_wearing)
         self.look_section = FORM_LOOKS[0][0]
         self.face_photos = []         # the picked character's face photos (ig.character_faces)
         self.face_name = ""
@@ -712,6 +714,12 @@ class ImageStudio:
         prow.pack(side="top", fill="x", pady=(self.px(6), 0), **pad)
         self.button(prow, "Editor", lambda: self.edit_characters()).pack(side="left")
         self.button(prow, "Image references", self.edit_identities).pack(side="right")
+        # Wearing: a picture of anything the person wears, and what it is.
+        # Every one goes into every picture (`wear`, the item pass).
+        self.cap(pb, "Wearing").pack(**pad)
+        self.wear_box = self.frame(pb)
+        self.wear_box.pack(side="top", fill="x", **pad)
+        self._show_wearing()
         for key in ig.SLOTS:
             self.text[key] = tk.StringVar()
         for key in ig.SLIDER_KEYS:
@@ -1296,6 +1304,12 @@ class ImageStudio:
                 else:
                     self.text[key].set(rec["looks"].get(key, ""))
             self.item_refs = dict(rec["item_refs"])
+            # What they wear joins what the form wears: a picture uploaded
+            # before the character was picked is not lost to it.
+            have = {w["name"].lower() for w in self.wearing}
+            self.wearing += [dict(w) for w in rec.get("wearing") or []
+                             if w["name"].lower() not in have]
+            self._show_wearing()
             self._select_identity(self._face_of(rec))
             # Their face photos go with the picture: the identity builder's
             # reference photos (ig.character_faces). Nothing shows on the form.
@@ -1470,6 +1484,80 @@ class ImageStudio:
                     side="right", padx=(o.px(4), 0))
             o.button(row, "Picture…", lambda i=item: choose(i)).pack(
                 side="right", padx=(o.px(4), 0))
+
+    def _show_wearing(self):
+        """The Wearing strip: a row per item - its picture, what it is and
+        × - then Add picture… and Link…."""
+        box = getattr(self, "wear_box", None)
+        if box is None:
+            return
+        for w in box.winfo_children():
+            w.destroy()
+        # Its own: switching the list view clears self.keep of all but previews.
+        self.wear_keep = []
+        for i, item in enumerate(self.wearing):
+            row = self.frame(box)
+            row.pack(side="top", fill="x", pady=(0, self.px(3)))
+            path = item["path"]
+            img = photo(path, self.px(40)) if os.path.isfile(path) else None
+            if img is not None:
+                self.wear_keep.append(img)
+                peek(tk.Label(row, image=img, bd=0), path).pack(side="left",
+                                                                padx=(0, self.px(6)))
+            self.label(row, item["name"], "text").pack(side="left", fill="x", expand=True)
+            if not os.path.isfile(path):
+                self.label(row, "picture missing", "warn", self.host.f_small).pack(
+                    side="left", padx=(self.px(4), 0))
+            self.button(row, "×", lambda i=i: self._drop_wearing(i), kind="ghost").pack(
+                side="right")
+        row = self.frame(box)
+        row.pack(side="top", fill="x", pady=(self.px(2), 0))
+        self.button(row, "Add picture…", self._add_wearing).pack(side="left")
+        self.button(row, "Link…", self._link_wearing).pack(side="left",
+                                                           padx=(self.px(4), 0))
+        if not self.wearing:
+            self.label(box, "A picture of something to wear - a shirt, a necklace, a hat, "
+                       "shoes - goes into every picture, put on after it is drawn.",
+                       "faint", self.host.f_small, wraplength=self.px(380)).pack(
+                side="top", fill="x", pady=(self.px(2), 0))
+
+    def _add_wearing(self):
+        path = filedialog.askopenfilename(parent=self.host, title="A picture of what they wear",
+                                          filetypes=[("Pictures", "*.png *.jpg *.jpeg *.webp"),
+                                                     ("All files", "*.*")])
+        if path:
+            self._name_wearing(path)
+
+    def _link_wearing(self):
+        return self.from_link(self.host, "item", "form items", self._name_wearing, self.say)
+
+    def _name_wearing(self, path):
+        """Ask what the picture is, then keep it on the strip: copied under
+        references/ (as an item row's is), so history's path stays good."""
+        guess = re.sub(r"[_\-]+", " ", os.path.splitext(os.path.basename(path))[0]).strip()
+        guess = "" if re.fullmatch(r"[0-9a-f ]{8,}|img ?\d*|image ?\d*|dsc ?\d*", guess,
+                                   re.I) else guess
+
+        def named(name):
+            try:
+                kept = self.studio.lib.keep_reference(path, "form items")
+            except OSError as e:
+                return self.say("Could not copy %s: %s" % (path, e), "err")
+            low = name.strip().lower()
+            self.wearing = [w for w in self.wearing if w["name"].lower() != low]
+            self.wearing.append({"name": name.strip(), "path": kept})
+            self._show_wearing()
+            self._recheck()
+        return self._ask_name("What is it?", "What is it? Say the kind of thing, as the "
+                              "prompt would: “red plaid flannel shirt”, “gold "
+                              "moon necklace”, “white high-top sneakers”.",
+                              guess, named, ok_text="Add")
+
+    def _drop_wearing(self, i):
+        if 0 <= i < len(self.wearing):
+            del self.wearing[i]
+        self._show_wearing()
+        self._recheck()
 
     def _link_item(self, item):
         rec = self.studio.lib.get("characters", self.settings["character"])
@@ -1787,6 +1875,7 @@ class ImageStudio:
         for key, var in self.sliders.items():
             s[key] = int(var.get())
         s["item_refs"] = dict(self.item_refs)
+        s["wearing"] = [dict(w) for w in self.wearing]
         s["face_photos"] = list(self.face_photos)
         s["face_name"] = self.face_name if s["face_photos"] else ""
         s["anatomy"] = bool(self.anatomy.get())
@@ -1846,6 +1935,8 @@ class ImageStudio:
         for key, var in self.sliders.items():
             var.set(int(s.get(key) or 0))
         self.item_refs = ig.clean_item_refs(s.get("item_refs"))
+        self.wearing = ig.clean_wearing(s.get("wearing"))
+        self._show_wearing()
         self.face_photos = ig._strs(s.get("face_photos"))
         self.face_name = s.get("face_name") or ""
         self.anatomy.set(s.get("anatomy") is not False)
@@ -3426,7 +3517,8 @@ class ImageStudio:
         return CharacterCreator(self, looks)
 
     def save_as_character(self):
-        return self.edit_characters(dict(self.collect_looks(), item_refs=self.item_refs))
+        return self.edit_characters(dict(self.collect_looks(), item_refs=self.item_refs,
+                                         wearing=[dict(w) for w in self.wearing]))
 
     def edit_styles(self):
         loras = [("", "none")] + [(r["id"], "%s (%s)" % (r["name"], r["category"]))
@@ -5327,8 +5419,9 @@ class CharacterCreator:
 
         if looks is not None:
             refs = looks.pop("item_refs", {}) if isinstance(looks, dict) else {}
+            worn = looks.pop("wearing", []) if isinstance(looks, dict) else []
             self.records.append({"name": "New character", "looks": looks,
-                                 "item_refs": dict(refs)})
+                                 "item_refs": dict(refs), "wearing": list(worn)})
         self._reload_list(len(self.records) - 1 if self.records else None)
 
     # ---------------------------------------------------------------- state
