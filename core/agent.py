@@ -987,6 +987,14 @@ from core.agent_prompts import (
     CHAT_SUFFIX, CHAT_PROMPT, CHAT_RULES,
 )
 
+# The prompt names OpenCode's folder itself: asked to find it with
+# opencode_status, the model called that before every task.
+OPENCODE_PROMPT = OPENCODE_PROMPT.replace(
+    "<WORKSPACE>", "this app's own source code"
+    if os.path.normcase(OPENCODE_WORKSPACE) == os.path.normcase(
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    else OPENCODE_WORKSPACE)
+
 from core.agent_studio_brief import (
     STUDIO_BRIEF_CHARS, STUDIO_TEMPLATE, studio_brief_path, read_studio_brief,
     studio_section, about_section, lessons_section, RESEARCH_GROUPS,

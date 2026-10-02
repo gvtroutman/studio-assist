@@ -1336,6 +1336,10 @@ def context_note(conf):
             "close and reopen Studio Assist." % (ctx, MIN_CONTEXT, MIN_CONTEXT))
 
 
+BUSY_NOTE = ("%s. Follow it with opencode_wait or stop it with opencode_abort before "
+             "sending anything new; do not start another session beside it.")
+
+
 def t_status(a):
     lines = []
     try:
@@ -1352,8 +1356,17 @@ def t_status(a):
             waiting = pending_permissions()
             if waiting:
                 lines.append("%d step(s) are waiting for the user's approval." % len(waiting))
+            sid = last_session()
+            if sid and (statuses(task_dir(sid)).get(sid) or {}).get("type", "idle") != "idle":
+                lines.append(BUSY_NOTE % ("OpenCode is busy: it is still working on session "
+                                          + sid))
         except OpenCodeError as e:
-            lines.append("Could not list sessions: %s" % e)
+            # Alive but not answering is a server at work. "Running" alone sent
+            # the model on to a new session on top of the one still going.
+            sid = last_session()
+            lines.append(BUSY_NOTE % ("OpenCode is busy and did not list its sessions (%s)%s"
+                                      % (e, "; it is most likely still working on session " + sid
+                                         if sid else "")))
     except OpenCodeError as e:
         lines.append(str(e))
     lines.append(workspace_note())
@@ -1608,6 +1621,17 @@ def t_read_file(a):
     return result(header + (data or "(empty page)"))
 
 
+SEARCH_PROSE = (".md", ".txt", ".log", ".rst")
+
+
+def _search_rank(path):
+    """Where a file stands in a search: 0 code, 1 tests, 2 prose."""
+    p = path.casefold()
+    if p.endswith(SEARCH_PROSE):
+        return 2
+    return 1 if p.startswith("tests/") or "/tests/" in p else 0
+
+
 def t_search_files(a):
     """Bounded search: literal by default, or a regex with regex=true. Offsets
     feed directly into the file reader."""
@@ -1618,6 +1642,9 @@ def t_search_files(a):
     else:
         rows, partial = list_files(a.get("path") or "", base=base)
         paths = [row.rsplit("  (", 1)[0] for row in rows]
+        # Code first, then tests, then prose. Seen live: "menu" returned its 40
+        # rows and 24 were AGENTS.md, before the search reached core/chat.py.
+        paths.sort(key=_search_rank)
     query = a["query"]
     if not query.strip():
         raise ValueError("query must contain text")
@@ -1630,7 +1657,12 @@ def t_search_files(a):
         matched = pattern.search
     else:
         needle = query.casefold()
-        matched = lambda line: needle in line.casefold()
+        # "attach|paperclip" is two literal terms in one call: the model used
+        # to spend a call on each phrasing of the same thing.
+        terms = [t.strip() for t in needle.split("|") if t.strip()]
+        if not terms:
+            raise ValueError("query must contain text")
+        matched = lambda line: any(t in line.casefold() for t in terms)
     out, size, scanned = [], 0, 0
     deadline = time.monotonic() + 3
     for path in paths:
@@ -1752,9 +1784,12 @@ TOOLS = [
            "session_id": SESSION}, ["path"])),
     ("opencode_search_files", t_search_files,
      "Find text in workspace files: literal (case insensitive) by default, or a regex with "
-     "regex=true. Returns paths, lines and start offsets for opencode_read_file. Bounded "
-     "search reports partial results; narrow path when needed.",
-     _obj({"query": _s("Literal text, or a regex when regex=true.", minLength=1, maxLength=200),
+     "regex=true. Put every phrasing in one call, separated by |: attach|paperclip|upload. "
+     "Code is listed before tests, and both before documents. Returns paths, lines and "
+     "start offsets for opencode_read_file. Bounded search reports partial results; narrow "
+     "path when needed.",
+     _obj({"query": _s("Literal text, | between alternatives; or a regex when regex=true.",
+                       minLength=1, maxLength=200),
            "regex": {"type": "boolean",
                      "description": "Treat query as a regex (case insensitive) instead of "
                                     "literal text. Default false."},
