@@ -5972,6 +5972,84 @@ def local_faces(settings):
             and not fix["spots"] and not fix["locks"])
 
 
+UPLOADS = "face-swap"         # references/<this>: pictures uploaded for a face swap
+UPLOAD_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+def keep_uploads(lib, paths=(), url=None, convert=None, opener=None):
+    """Pictures uploaded for a face swap - files, the pictures in a folder
+    (not its sub-folders), or a web picture's link - kept under
+    references/face-swap by their hash, so the same picture twice is one
+    file. -> (kept paths, errors in words). Each is a PNG: Tk shows no JPEG
+    or WebP, and FaceFusion's reader no GIF, so anything else is turned into
+    a PNG beside it by `convert` ([(src, dest)]; `catalog.to_png` in the
+    tab), and one it cannot turn is an error, not a picture without a
+    preview. Disk and network I/O: off the UI thread."""
+    files, errors, kept = [], [], []
+    for path in paths:
+        if os.path.isdir(path):
+            files += sorted(os.path.join(path, n) for n in os.listdir(path)
+                            if n.lower().endswith(UPLOAD_EXTS)
+                            and os.path.isfile(os.path.join(path, n)))
+        else:
+            files.append(path)
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            ext = picture_ext(data)
+            if not ext:
+                raise ValueError("not a picture (PNG, JPEG, WebP, GIF or BMP)")
+            kept.append((os.path.basename(path), lib.keep_bytes(data, ext, UPLOADS)))
+        except (OSError, ValueError) as e:
+            errors.append("%s: %s" % (os.path.basename(path), e))
+    if url:
+        try:
+            kept.append(("the picture from the link", lib.keep_link(url, UPLOADS, opener)))
+        except (OSError, ValueError) as e:
+            errors.append(str(e))
+    shown = lambda p: p.lower().endswith(".png")
+    turn = [(p, p + ".png") for _, p in kept if not shown(p) and not os.path.isfile(p + ".png")]
+    if turn and convert:
+        convert(turn)
+    out = []
+    for name, p in kept:
+        if shown(p):
+            out.append(p)
+        elif os.path.isfile(p + ".png"):
+            out.append(p + ".png")
+        else:
+            errors.append("%s: could not be turned into a PNG; save it as one and add it "
+                          "again" % name)
+    return list(dict.fromkeys(out)), errors
+
+
+def upload_swap(lib, path, marks=(), person=""):
+    """The job that puts library people's faces on an uploaded picture
+    (`path`, from `keep_uploads`): each of `marks` ({"identity", "point"},
+    the point the picture's 0-1 x, y inside a face) gets that person's face
+    there; with none, `person`'s face goes on the picture's only face. A
+    face-only swap (mode "faces"), like Retry face swap's, so it is
+    FaceFusion's on this PC; the picture is kept in History before the swap
+    (`finish_profiles`), listed only if the swap fails. Raises ValueError
+    saying what to choose."""
+    wanted = [m for m in marks or () if m.get("identity")] or (
+        [{"identity": person, "point": None}] if person else [])
+    if not wanted:
+        raise ValueError("Choose whose face goes on, or click a face and choose a person.")
+    profiles = []
+    for m in wanted:
+        ident = lib.get("identities", m["identity"])
+        if ident is None:
+            raise ValueError("No identity %r in the library." % m["identity"])
+        profile = copy.deepcopy(ident)
+        if m.get("point") is not None:
+            profile["target_point"] = [float(m["point"][0]), float(m["point"][1])]
+        profiles.append(profile)
+    return {"mode": "faces", "batch": 1, "seed": -1,
+            "face_finish": {"images": [path], "profiles": profiles, "upload": True}}
+
+
 def retry_faces(record):
     """Retry only the finishing pass, using the saved picture and profile snapshot.
 
@@ -6928,17 +7006,20 @@ class Studio:
         A retry passes the checkpoint it retries, already saved. `before`
         (pictures -> pictures; Generate's head swap) runs after the
         checkpoint and before the faces, so the checkpoint is the picture
-        as it was generated."""
+        as it was generated (or uploaded: `upload_swap`)."""
+        made = "Uploaded" if (job.settings.get("face_finish") or {}).get("upload") \
+            else "Generated"
         if checkpoint is None:
             record = copy.deepcopy(self.record_for(job, graph))
             record["id"] += "-generated"
             record["finish"] = {"state": "pending", "profiles": copy.deepcopy(profiles)}
-            record["notes"] = record["notes"] + ["Generated picture saved before the final face swap."]
+            record["notes"] = record["notes"] + ["%s picture saved before the final face swap."
+                                                 % made]
             job.record = self.history.add(record, pictures)
         else:
             record = job.record = checkpoint
         job.outputs = list(job.record["images"])
-        say("face_swap", "Generated picture saved; applying faces")
+        say("face_swap", "%s picture saved; applying faces" % made)
         try:
             if before is not None:
                 pictures = before(pictures)
@@ -6949,7 +7030,8 @@ class Studio:
                 raise RuntimeError("Face swap cancelled.")
             return result
         except (RuntimeError, OSError, ValueError) as error:
-            detail = str(error) + " Generated picture kept in History. Retry face swap or use Fix a spot."
+            detail = str(error) + (" %s picture kept in History. Retry face swap or use Fix "
+                                   "a spot." % made)
             record["finish"].update(state="cancelled" if job.cancel.is_set() else "failed", error=str(error))
             self._update_checkpoint(record)
             self.queue._finish(job, "cancelled" if job.cancel.is_set() else "failed", detail)

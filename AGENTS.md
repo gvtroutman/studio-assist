@@ -1991,6 +1991,36 @@ face swap on a kept picture runs - Face swap alone, or Head swap, Face swap and
 the passes for a retry on its backend - and no Sampling or Decoding, which it
 never does. Tests: `tests/test_headswap.py`.
 
+**Face swap photos** (2026-10-02, the user: "add a way for me to upload pictures
+to do a face swap"). Until this, a face could only go onto a picture the Studio
+had made (Fix a spot's row, Retry face swap). Face swap… beside Blend… (and
+"Face swap…" on the picture's menu, which adds the picture shown) opens
+`ui.FaceSwapWindow`: pictures from outside - Add pictures…, From library…, or
+files, a folder or a web picture dropped on the window (`core/filedrop.py`) - on
+a strip, the one chosen large. `ig.keep_uploads` keeps each under
+`references/face-swap` by its hash (`keep_bytes`; a link through `keep_link`),
+and turns anything but a PNG into one beside it with `catalog.to_png` at full
+size, because Tk shows no JPEG or WebP and FaceFusion's reader no GIF; one it
+cannot turn is refused in words, not shown blank. `to_png` now stands a phone's
+photo upright by its EXIF orientation (tag 274, either byte order), which
+`DrawImage` ignores - a portrait shot came out sideways, and FaceFusion finds no
+face lying down. A picture with one face needs no click: Person's face goes on
+it. With more, a click on each face to change marks it for the person chosen
+then (a click on a mark gives it the person now chosen; a right-click takes it
+off), and the mark is the profile's `target_point`, as Fix a spot's Choose face
+is. Swap faces queues one job per picture through `ig.upload_swap`: `mode:
+"faces"` with `face_finish["images"]`, `["profiles"]` (copies of the identities,
+so nothing is written to the library) and `["upload"]`, so it is `local_faces`,
+FaceFusion on this PC, no ComfyUI - exactly a kept picture's own retry. The
+picture is saved in History before the swap as every face swap's is
+(`finish_profiles`, said "Uploaded picture saved" rather than "Generated"); a
+swap that completes hides that checkpoint and lists the swapped picture, and a
+swap that fails (two faces and no mark: FaceFusion's "ambiguous or missing")
+leaves the upload listed with Retry face swap and Fix a spot > Choose face. The
+window asks `preview` of every job before sending, so a person with no
+reference photo, or no FaceFusion, is said once and nothing is queued. Tests:
+`tests/test_face_swap_upload.py`.
+
 **The glasses are redrawn only when the swap painted over them**
 (`glasses_pass`; 2026-09-29). The pass answers a fault the occlusion mask
 (above) no longer makes. Run all the same, after a swap that had kept the
