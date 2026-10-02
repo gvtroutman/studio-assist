@@ -1981,14 +1981,16 @@ GLASSES_WHAT = ("thin metal glasses frames with perfectly clear, transparent len
 # The head swap and FaceFusion then redraw that face from a photo, which can
 # shave it or bring the photo's beard instead. So a beard pass follows the
 # swap: only inside the scene's mask, in that beard's own words
-# (2026-10-02: scene render -> identity pass -> beard pass -> final). Not yet
-# run live: BEARD_DENOISE is the eye pass's, a guess.
-BEARD_DENOISE = 0.5
+# (2026-10-02: scene render -> identity pass -> beard pass -> final). Live on
+# the 5090 (2026-10-02, the sitter's head swap shaving a drawn beard, Z-Image
+# Turbo): 0.5 gave back a shadow, 0.85 a fuller beard that paled the jaw's
+# skin and left a painted edge on the neck; 0.7 a natural close-cropped beard.
+BEARD_DENOISE = 0.7
 BEARD_WHAT = "a natural beard"        # each beard is said in its own words instead
 BEARD_PAD = 1.8                       # the crop, of the beard's longer side: the jaw round it
 BEARD_ON_FACE = 0.25                  # how far round a found face a beard's middle may be
 BEARD_SHAPE = 256                     # px: the most a side of the mask picture is drawn at
-# The drawn face's own landmarks bound each beard (2026-10-02, Sitter): the
+# The drawn face's own landmarks bound each beard (2026-10-02, the user): the
 # jaw and chin its lower edge, the lips kept clear, the upper lip the
 # moustache's place, the nose its upper edge, the cheeks the beard's upper
 # line. LANDMARK_NODE (comfy_nodes/studio_facepaste) reads the face's 68
@@ -7351,8 +7353,8 @@ class Studio:
                     count, said = {
                         "_eyes": (len(faces), "Eye pass after the face swap: %d face%s, "
                                               "denoise %s."),
-                        "_beard": (len(bearded), "Beard pass: %d beard%s redrawn in the "
-                                                 "scene's mask, denoise %s."),
+                        "_beard": (len(bearded), "Beard pass: %d beard%s redrawn in its "
+                                                 "mask, denoise %s."),
                         "_hands": (len(found_hands), "Hands pass: %d hand%s redrawn, "
                                                      "denoise %s."),
                         "_glasses": (len(glasses), "Glasses redrawn last: %d pair%s, "

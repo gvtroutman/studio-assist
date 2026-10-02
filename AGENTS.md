@@ -3339,7 +3339,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   notes, never painted on a neck or a wall. `settings["beard_pass"] = False`
   turns it off (no Generate checkbox yet). Offline coverage: `test_beard.py`,
   the Scene Builder inspector test and three `test_finish_line.py` tests.
-  NOT run live: `BEARD_DENOISE` 0.5 is the eye pass's strength, a guess.
+  `BEARD_DENOISE` 0.7, from the live run below.
   **The drawn face's landmarks bound the beard** (2026-10-02, the user: not
   the jaw alone). The scene sends each beard region its pose map's 68 face
   dots (`face_dots`, iBUG order, from `pose_figures`) and its look (`beard`).
@@ -3361,8 +3361,20 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   near the scene's keeps the scene's mask. Each beard's outcome is a note. No
   node (not installed, or ComfyUI not restarted since) or no answer: the
   scene's masks as before, said in the notes. Checked offline and on real
-  InsightFace points from ComfyUI's venv (the zones drawn on three pictures);
-  none of the numbers has been tuned in a live beard pass.
+  InsightFace points from ComfyUI's venv (the zones drawn on three pictures).
+  **Live, 2026-10-02** (`tools/run_beard_pass.py`: two prepared Oktoberfest
+  scenes, the person made the sitter with a short beard, Z-Image Turbo, the
+  sitter's Klein 9B head swap and FaceFusion): the first draw had a full beard and the head
+  swap shaved it both times - the case this pass is for. The zones landed
+  right (moustache on the upper lip, lips and nose clean, the cheek line). At
+  strength 0.5 the beard came back as a shadow, at 0.7 as a natural
+  close-cropped beard, at 0.85 fuller but with the jaw's skin paled and a
+  painted edge on the neck: 0.7 kept. Both times the drawn face was 1.36x the
+  scene's dots (the head swap draws the head bigger than the first draw did),
+  past `FIT_SCALE`, so the beard came from the zones alone - which looked
+  right; the fit has not yet been seen to move a mask live. `BEARD_BELOW`,
+  `LIP_CLEAR` and `FAR_SIDE` are still untuned (no long beard, no turned head
+  past 12 degrees yet).
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
