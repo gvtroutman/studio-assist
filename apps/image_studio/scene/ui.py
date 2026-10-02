@@ -1489,17 +1489,27 @@ class SceneBuilder:
         row.pack(side="top", fill="x")
         o.choice(row, chars, obj["character"], self._set_character).pack(side="left")
         o.button(row, "Clear look", self._clear_look, kind="ghost").pack(side="right")
+        # A character's body, face and hair are the creator's (ig.WHO_SECTIONS):
+        # not shown here, so the scene cannot say them otherwise.
+        rec = o.studio.lib.get("characters", obj["character"]) if obj["character"] else None
+        sections = [(n, s) for n, s in ig.LOOKS
+                    if rec is None or n not in ig.WHO_SECTIONS]
+        shown = self.look_section if self.look_section in dict(sections) else sections[0][0]
+        if rec is not None:
+            o.label(p, "Body, face and hair are %s's: change them in the character "
+                    "creator." % rec["name"], "muted", self.host.f_small,
+                    wraplength=o.px(300)).pack(side="top", fill="x", pady=(o.px(4), 0))
         tabs = o.frame(p)
         tabs.pack(side="top", fill="x", pady=(o.px(6), o.px(2)))
-        for i, (name, _) in enumerate(ig.LOOKS):
+        for i, (name, _) in enumerate(sections):
             o.button(tabs, name, lambda n=name: self._look_tab(n),
-                     kind="accent" if name == self.look_section else "quiet",
+                     kind="accent" if name == shown else "quiet",
                      font=self.host.f_small, padx=o.px(6), pady=o.px(2)).grid(
                 row=i // 3, column=i % 3, sticky="ew", padx=(0, o.px(3)), pady=(0, o.px(3)))
         for col in range(3):
             tabs.columnconfigure(col, weight=1)
         look = obj["look"]
-        section = dict(ig.LOOKS)[self.look_section]
+        section = dict(ig.LOOKS)[shown]
         text = {k: tk.StringVar(value=look.get(k, "")) for k, *_ in section}
         steps = {k: tk.IntVar(value=int(look.get(k, 0))) for k in ig.SLIDER_KEYS}
         relight = [None]
@@ -1511,7 +1521,7 @@ class SceneBuilder:
                     look[k] = v
                 else:
                     look.pop(k, None)
-            if self.look_section == ig.SLIDER_SECTION:
+            if shown == ig.SLIDER_SECTION:
                 for k, var in steps.items():
                     if int(var.get()):
                         look[k] = int(var.get())
@@ -1521,12 +1531,12 @@ class SceneBuilder:
                 relight[0]()
             # The body and the clothes are the mannequin's shape and colours.
             self.changed()
-        if self.look_section == ig.SLIDER_SECTION:
+        if shown == ig.SLIDER_SECTION:
             o.slider_rows(p, steps, changed)
         relight[0] = o.look_rows(p, section, text, changed)
-        if self.look_section == "Face":
+        if shown == "Face":
             self._beard_controls(obj)
-        if self.look_section in ("Clothes", "Accessories"):
+        if shown in ("Clothes", "Accessories"):
             self._outfit_controls(obj)
         self.look_vars, self.look_changed = text, changed
 
@@ -1647,6 +1657,7 @@ class SceneBuilder:
         obj["character"] = cid if rec is not None else ""
         if rec is not None:
             obj["look"] = sc.character_look(rec, obj["look"])
+            sc.follow_character(obj, rec)          # and the beard their facial hair names
             # Their identity's head shape comes with them, when it has one.
             ident = self._identity_of(obj)
             head = sc.mq.clean_head((ident or {}).get("head"))
@@ -2686,6 +2697,11 @@ class SceneBuilder:
         self.scene, self.path, self.dirty = scene, path, False
         self.sel, self.inspector_section = None, "Scene"
         self.making, self.suggestion = {}, None
+        followed = self.follow_characters(redraw=False)
+        if followed:
+            problems = list(problems) + [
+                ("%s now looks as their character says." if len(followed) == 1 else
+                 "%s now look as their characters say.") % ", ".join(followed)]
         self._forget("Opened %s" % os.path.basename(path))
         self._list()
         self._inspect()
@@ -2693,6 +2709,17 @@ class SceneBuilder:
         self.status(" ".join(problems) if problems else "Opened %s." % os.path.basename(path),
                     "warn" if problems else "ok")
         return True
+
+    def follow_characters(self, redraw=True):
+        """Each person with a character takes the character's body, face and
+        hair as the library has them now (`sc.follow_characters`): the
+        creator is where those are set. -> the names of those changed."""
+        chars = {c["id"]: c for c in self.owner.studio.lib.all("characters")}
+        changed = sc.follow_characters(self.scene, chars)
+        if changed and redraw:
+            self.changed()
+            self._inspect()
+        return changed
 
     def save(self, path=None):
         path = path or self.path
@@ -2951,6 +2978,7 @@ class SceneBuilder:
             self.status(why, "err")
             return False
         o = self.owner
+        self.follow_characters()
         try:
             maps, notes = sc.scene_maps(self.scene, self.takes(o.settings["model"]))
         except OSError as e:

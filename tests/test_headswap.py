@@ -668,8 +668,8 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(job.backend["id"], ig.LOCAL_FACES["id"])
         self.assertEqual(client.graphs[before:], [])      # nothing was asked of ComfyUI
         self.assertEqual(swapped, [PNG])
-        said = ("This retry swapped the face alone - no head swap before it and no eye, "
-                "hand or glasses pass after: 5090 Workstation is not answering.")
+        said = ("This retry swapped the face alone - no head swap or beard pass before it "
+                "and no eye, hand or glasses pass after: 5090 Workstation is not answering.")
         self.assertEqual(job.detail, said)
         self.assertIn(said, job.record["notes"])
 

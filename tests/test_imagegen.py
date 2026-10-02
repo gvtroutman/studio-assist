@@ -4297,7 +4297,7 @@ class TestImageStudioTab(unittest.TestCase):
         ui._select_identity("")
         self.assertFalse(any(v[0].get() for v in ui.idents.values()))
 
-    def test_the_people_tab_has_one_person_dropdown_and_no_body_or_accessories(self):
+    def test_the_people_tab_has_one_person_dropdown_and_none_of_the_creators_look(self):
         s, ui = self.tab()
         ui.studio.lib.save("identities", [
             {"id": "gav", "name": "Gav", "references": ["a.png"]},
@@ -4318,9 +4318,20 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual((ui.settings["character"], ticked()), ("mara", ["gav"]))
         self.assertEqual(ui.person_pill.cget("text"), "Mara  ▾")
         self.assertEqual(ui.text["hair"].get(), "auburn")
+        # Saved in the creator, the form's character's hidden look follows it.
+        ui.studio.lib.save("characters", [
+            {"id": "mara", "name": "Mara", "identity": "gav",
+             "looks": {"hair": "black", "facial_hair": "heavy stubble"}},
+            {"id": "bare", "name": "Bare", "identity": "", "looks": {}}])
+        ui.text["expression"].set("laughing")
+        ui._saved("characters")
+        self.assertEqual((ui.text["hair"].get(), ui.text["facial_hair"].get()),
+                         ("black", "heavy stubble"))
+        self.assertEqual(ui.text["expression"].get(), "laughing")     # the picture's, kept
         ui._pick_from_people("i:two")                # a profile alone is not Mara
         self.assertEqual((ui.settings["character"], ticked()), ("", ["two"]))
         self.assertEqual(ui.person_pill.cget("text"), "Two  ▾")
+        self.assertEqual((ui.text["hair"].get(), ui.text["facial_hair"].get()), ("", ""))
         ui._pick_from_people("c:bare")               # no face of its own: none
         self.assertEqual((ui.settings["character"], ticked()), ("bare", []))
         self.assertEqual(ui.person_pill.cget("text"), "Bare  ▾")
@@ -4328,11 +4339,12 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual((ui.settings["character"], ticked()), ("", []))
         self.assertEqual(ui.person_pill.cget("text"), "No one  ▾")
         tabs = texts(ui.look_tabs)
-        self.assertNotIn("Body", tabs)
-        self.assertNotIn("Accessories", tabs)
-        self.assertIn("Face", tabs)
-        ui._show_looks("Body")                       # hidden: the first shown instead
-        self.assertEqual(ui.look_section, "Face")
+        # Who the person is is the creator's alone (the user, 2026-10-02).
+        for hidden in ("Body", "Face", "Hair", "Accessories"):
+            self.assertNotIn(hidden, tabs)
+        self.assertEqual(tabs, ["Expression", "Clothes"])
+        ui._show_looks("Face")                       # hidden: the first shown instead
+        self.assertEqual(ui.look_section, "Expression")
 
     def test_a_character_tag_is_a_word_and_an_uploaded_picture(self):
         s, ui = self.tab()

@@ -51,10 +51,14 @@ IDENTITY_TILE = 220           # px, not scaled: a person's photo previews are 22
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
 CAMERA_CARD = 150             # px, the Shot on card's long edge, before the display's scale
 HISTORY_PAGE = 40
-# The look sections the People tab shows. Body and Accessories are the
-# Editor's (CharacterCreator) alone: a character's still reach the prompt.
+# The look sections the People tab shows. Body, Face, Hair (ig.WHO_SECTIONS)
+# and Accessories are the Editor's (CharacterCreator) alone: a character's
+# still reach the prompt, and the form cannot say them otherwise.
 FORM_LOOKS = [(name, slots) for name, slots in ig.LOOKS
-              if name not in ("Body", "Accessories")]
+              if name not in ig.WHO_SECTIONS + ("Accessories",)]
+# The slots and sliders the form keeps but does not show: a character's own.
+CREATOR_KEYS = [k for k in ig.CHARACTER_KEYS
+                if k not in {k for _, slots in FORM_LOOKS for k, *_ in slots}]
 ELLIPSIS = "…"          # the window's marker for "still happening": it animates
 ADVANCED = [                  # (setting, label, kind)
     ("seed", "Seed", "int"),
@@ -1242,6 +1246,9 @@ class ImageStudio:
         if key.startswith("c:"):
             return self._set_character(key[2:])
         self.settings["character"] = ""
+        # The last character's body, face and hair are not on the form to
+        # be seen: they go with it, not on to someone else.
+        self._creator_looks({})
         # A profile alone: its own reference photos are the face; no one, none.
         ident = self.studio.lib.get("identities", key[2:]) if key else None
         self.face_photos = ig.character_faces({"identity": key[2:]}, self.studio.lib) if ident else []
@@ -1321,6 +1328,22 @@ class ImageStudio:
             self.face_photos, self.face_name = [], ""
         self._show_identity()
         self._recheck()
+
+    def _creator_looks(self, looks):
+        """The form's hidden slots and sliders (CREATOR_KEYS) set to `looks`,
+        blank where it has none."""
+        for key in CREATOR_KEYS:
+            if key in self.sliders:
+                self.sliders[key].set(int(looks.get(key, 0) or 0))
+            elif key in self.text:
+                self.text[key].set(looks.get(key, ""))
+
+    def _follow_character(self):
+        """The creator saved: the form's character's hidden look follows it,
+        so what was saved there is what Generate says."""
+        rec = self._character()
+        if rec is not None:
+            self._creator_looks(rec.get("looks") or {})
 
     def look_rows(self, parent, slots, vars_, changed, chips=False, bg="bg"):
         """Rows for look slots: a label, the field, and the picks - a menu on
@@ -3015,6 +3038,14 @@ class ImageStudio:
     # =============================================================== editors
     def _saved(self, kind):
         self._rebuild_choices()
+        if kind == "characters":
+            self._follow_character()
+            if self.scene_builder is not None:
+                try:
+                    if self.scene_builder.win.winfo_exists():
+                        self.scene_builder.follow_characters()
+                except tk.TclError:
+                    pass
         if kind == "identities":
             self._prepare_profiles()
         if kind == "backends":
