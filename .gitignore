@@ -14,3 +14,6 @@ studio-assistant-preview.png
 comfy_nodes/studio_withanyone/vendor/
 # files attached in the OpenCode tab from outside its folder (studio_files.ATTACH_DIR)
 .studio-attachments/
+# personal scene runs (pictures, histories) - kept out of the repo
+/Scene Math Measurements/
+/Scene Enhancements/
