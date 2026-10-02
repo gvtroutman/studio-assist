@@ -3685,7 +3685,7 @@ def pose_figures(scene, width=None, height=None):
                     hp2.append([s[0] / width, s[1] / height] if s and not hidden(world(p))
                                else None)
                 hands[name] = hp2
-            out.append({"points": pts, "face": face, "hand_points": hands,
+            out.append({"id": obj["id"], "points": pts, "face": face, "hand_points": hands,
                         "depth": cam.to_camera(world(hp))[2]})
     out.sort(key=lambda f: -f["depth"])
     return out
@@ -4970,12 +4970,20 @@ def generation(scene, maps, characters=None, identities=None):
             {"prompt": text, "mask_path": _write(masks[char], "character_mask")}
             for char, text in by_character.items() if char in masks]
     from apps.image_studio.scene import beard
-    for oid, mask in beard_masks(s).items():
+    masks = beard_masks(s)
+    # The face dots the pose map drew, so the beard pass can fit the mask to
+    # the face as drawn (imagegen.shape_beard) and bound it by its landmarks.
+    dots = {}
+    for f in pose_figures(s) if masks else []:
+        if f["face"] and f["id"] not in dots:
+            dots[f["id"]] = [[round(x, 5), round(y, 5)] for x, y in f["face"]]
+    for oid, mask in masks.items():
         person = next(o for o in folks if o["id"] == oid)
         extra.setdefault("character_regions", []).append({
             "prompt": beard.text(person["look"]["beard"]),
             "mask_path": _write(mask, "beard_mask"), "person_id": oid,
-            "kind": "facial_hair"})
+            "kind": "facial_hair", "beard": beard.clean(person["look"]["beard"]),
+            "face_dots": dots.get(oid, [])})
     return words, extra
 
 

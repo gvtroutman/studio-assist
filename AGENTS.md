@@ -3339,9 +3339,30 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   notes, never painted on a neck or a wall. `settings["beard_pass"] = False`
   turns it off (no Generate checkbox yet). Offline coverage: `test_beard.py`,
   the Scene Builder inspector test and three `test_finish_line.py` tests.
-  NOT run live: `BEARD_DENOISE` 0.5 is the eye pass's strength, a guess; the
-  mask is where the scene put the jaw, so a picture whose pose strength let
-  the head drift gets a beard slightly off.
+  NOT run live: `BEARD_DENOISE` 0.5 is the eye pass's strength, a guess.
+  **The drawn face's landmarks bound the beard** (2026-10-02, the user: not
+  the jaw alone). The scene sends each beard region its pose map's 68 face
+  dots (`face_dots`, iBUG order, from `pose_figures`) and its look (`beard`).
+  `Studio._drawn_landmarks` asks `LANDMARK_NODE` (`StudioFaceLandmarks`, in
+  `comfy_nodes/studio_facepaste` beside the face paste: InsightFace's
+  `landmark_3d_68`, whose numbering *is* in order round the jaw, unlike the
+  2d106 outline) for the drawn face at each SAM3 face. `shape_beard` fits the
+  scene's dots to the drawn ones on the lower face (jaw, nostrils, lips: a
+  rotation, scale and shift), moves the mask with them, then `beard_zones`
+  bounds it: jaw/chin the lower edge (pushed out by the beard's length,
+  `BEARD_BELOW`); the lips grown by `LIP_CLEAR` always clear; the upper lip
+  (nostrils to the lip's edge) the moustache's place, filled; the nose above
+  the nostrils clear, the moustache's upper edge; the cheeks' upper beard line
+  from the jaw (by the ear at coverage 1, halfway to the chin at 0) to the
+  nostril's wing or the mouth's corner - above it trimmed, below it filled.
+  Moustache and goatee get only their own zones. A cheek turned away
+  (`FAR_SIDE`) is trimmed, never filled. A drawn face too unlike the scene's
+  (`FIT_SCALE`, `FIT_TURN`, `FIT_SHAPE`) gets the zones alone; no drawn face
+  near the scene's keeps the scene's mask. Each beard's outcome is a note. No
+  node (not installed, or ComfyUI not restarted since) or no answer: the
+  scene's masks as before, said in the notes. Checked offline and on real
+  InsightFace points from ComfyUI's venv (the zones drawn on three pictures);
+  none of the numbers has been tuned in a live beard pass.
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle

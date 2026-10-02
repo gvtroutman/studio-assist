@@ -114,23 +114,28 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertNotIn('finish', listed[0])
 
     def finish_job(self, glasses, hands=(), profile=True, tone=False, masks=None,
-                   enhance=None, **settings):
+                   enhance=None, drawn=None, **settings):
         """Generate (with a face profile, unless `profile` is False) on a
         ComfyUI with SAM3, whose finder at the end sees one face, `glasses`
         and `hands` [(x, y, w, h)] or, with SAM3's score, [(x, y, w, h,
         score)]; `tone`, it has the tone-match node. `masks` is what the
         face swap's report says its masks were (none said, before them),
-        `enhance` the face enhancer it says ran after it."""
+        `enhance` the face enhancer it says ran after it. `drawn`: it has
+        the landmark node, which reads these faces."""
         if profile:
             self.profile()
 
         class FinishClient(FaceClient):
             def node_types(self):
                 return set(FaceClient.NODES) | ({ig.TONE_NODE} if tone else set()) | {
-                    "ConditioningCombine", "ConditioningSetMask"}   # a scene beard's regions
+                    "ConditioningCombine", "ConditioningSetMask"} | (   # a scene beard's regions
+                    {ig.LANDMARK_NODE} if drawn is not None else set())
 
             def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
                 graph = self.graphs[int(pid[3:]) - 1]
+                if "ll" in graph:             # the drawn face's landmarks
+                    return {"status": {"completed": True},
+                            "outputs": {"ll": {"text": [json.dumps(drawn)]}}}
                 if "p0d" in graph:            # the finder at the end
                     said = {"face:8": [(450, 250, 80, 90)], "glasses:4": glasses,
                             "hand:8": hands}
@@ -498,10 +503,10 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
 
     def test_a_beard_off_the_drawn_face_is_left_and_said(self):
         mask = self.beard_region(box=(10, 200, 16, 10))   # the scene put the head elsewhere
-        spots, off = ig.beard_spots(1024, 1024, [mask], [(450, 250, 80, 90)])
-        self.assertEqual((spots, off), ([], 1))
+        spots, off, said = ig.beard_spots(1024, 1024, [mask], [(450, 250, 80, 90)])
+        self.assertEqual((spots, off, said), ([], 1, []))
         on = self.beard_region(name="on.png")
-        (spot,), off = ig.beard_spots(1024, 1024, [on], [(450, 250, 80, 90)])
+        (spot,), off, _ = ig.beard_spots(1024, 1024, [on], [(450, 250, 80, 90)])
         self.assertEqual(off, 0)
         self.assertEqual(spot["box"], [460, 300, 64, 40])
         self.assertEqual(spot["size"], int(64 * ig.BEARD_PAD))
@@ -519,6 +524,118 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(job.record["passes"], [])
         self.assertIn("1 beard not redrawn: the face was not drawn where the scene put it.",
                       job.record["notes"])
+
+    @staticmethod
+    def face(unit=22.0, at=(490.0, 255.0)):
+        """68 face points (iBUG, the scene's own template) in picture px:
+        `unit` px per half eye gap, the eyes' middle `at`."""
+        from apps.image_studio.scene import pose
+        return [[at[0] + u * unit, at[1] + v * unit] for u, v in pose.FACE]
+
+    def zone_mask(self, look, unit=22.0, at=(490.0, 255.0)):
+        """A beard's landmark zones alone on a 1024 picture (no scene mask):
+        -> a function telling whether the template point (u, v) is beard."""
+        p = [tuple(q) for q in self.face(unit, at)]
+        zones = ig.beard_zones(p, dict({"style": "short", "length": 0.15, "coverage": 0.8},
+                                       **look))
+        bufs = {}
+        for k, polys in zones.items():
+            bufs[k] = bytearray(1024 * 1024)
+            for poly in polys:
+                ig.fill_polygon(bufs[k], 1024, 1024, poly)
+
+        def beard(u, v):
+            i = int(at[1] + v * unit) * 1024 + int(at[0] + u * unit)
+            return bool(bufs["fill"][i] and not bufs["clear"][i])
+        return beard
+
+    def test_the_drawn_face_s_landmarks_bound_a_beard(self):
+        beard = self.zone_mask({})
+        self.assertFalse(beard(0, 2.0))          # lips: kept clear
+        self.assertTrue(beard(0, 1.42))          # upper lip: the moustache's place
+        self.assertFalse(beard(0, 0.6))          # nose: above the moustache's upper edge
+        self.assertTrue(beard(-1.5, 2.2))        # cheek below the upper beard line
+        self.assertFalse(beard(-1.5, 0.9))       # cheek above it
+        self.assertTrue(beard(1.5, 2.2))
+        self.assertTrue(beard(0, 3.3))           # just under the chin, a short beard's length
+        self.assertFalse(beard(0, 3.8))          # past it
+        self.assertTrue(self.zone_mask({"length": 1.0})(0, 3.8))   # a long one reaches
+        low = self.zone_mask({"coverage": 0.0})
+        self.assertFalse(low(-1.5, 2.0))         # low cheek coverage: the line drops
+        self.assertTrue(low(0, 2.9))             # the chin keeps it
+        tache = self.zone_mask({"style": "moustache"})
+        self.assertTrue(tache(0, 1.42))
+        self.assertFalse(tache(-1.5, 2.2))
+        self.assertFalse(tache(0, 2.9))
+        goatee = self.zone_mask({"style": "goatee"})
+        self.assertTrue(goatee(0, 2.9))
+        self.assertTrue(goatee(0, 1.42))
+        self.assertFalse(goatee(-1.5, 2.2))
+        self.assertFalse(goatee(0, 2.0))
+        # A cheek turned away is trimmed, never filled.
+        p = [tuple(q) for q in self.face()]
+        one = ig.beard_zones(p, {"style": "full", "length": 0.3, "coverage": 0.8},
+                             (True, False))
+        self.assertEqual(len(one["fill"]), 2)    # the upper lip and the near cheek
+
+    def landmark_region(self, dots_at=(490.0, 255.0), **look):
+        region = self.beard_region()
+        region["face_dots"] = [[x / 1024.0, y / 1024.0] for x, y in self.face(at=dots_at)]
+        region["beard"] = dict({"style": "short", "length": 0.15, "coverage": 0.8,
+                                "density": 0.7, "color": ""}, **look)
+        return region
+
+    def test_the_scene_s_mask_is_fitted_to_the_drawn_face(self):
+        drawn = [{"points": self.face(at=(530.0, 275.0)), "box": [0, 0, 1, 1]}]
+        # The scene put the face 40 px left of and 20 px above where it was drawn.
+        (spot,), off, said = ig.beard_spots(1024, 1024, [self.landmark_region()],
+                                            [(450, 250, 80, 90)], drawn)
+        self.assertEqual(off, 0)
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0].startswith("Beard 1 fitted to the drawn face's landmarks: "
+                                           "the scene's mask moved 45 px"), said[0])
+        grey, mw, mh = spot["mask"]
+        at = lambda u, v: grey[int((275 + v * 22) / 4) * mw + int((530 + u * 22) / 4)]  # noqa
+        self.assertEqual(at(-0.9, 2.7), 255)     # the drawn face's cheek, not the scene's
+        self.assertEqual(at(0, 2.0), 0)          # its lips
+        # A drawn face twice the scene's: the zones alone, said so.
+        big = [{"points": self.face(unit=44.0, at=(490.0, 230.0)), "box": [0, 0, 1, 1]}]
+        _, _, said = ig.beard_spots(1024, 1024, [self.landmark_region()],
+                                    [(400, 200, 180, 200)], big)
+        self.assertIn("landmarks alone", said[0])
+        # No drawn face near it: the scene's mask as it came.
+        far = [{"points": self.face(at=(150.0, 255.0)), "box": [0, 0, 1, 1]}]
+        (spot,), _, said = ig.beard_spots(1024, 1024, [self.landmark_region()],
+                                          [(450, 250, 80, 90)], far)
+        self.assertEqual(spot["box"], [460, 300, 64, 40])
+        self.assertIn("kept as the scene made it", said[0])
+        # Without the scene's face dots, or without the reader, nothing is fitted.
+        _, _, said = ig.beard_spots(1024, 1024, [self.beard_region()], [(450, 250, 80, 90)],
+                                    drawn)
+        self.assertEqual(said, [])
+
+    def test_the_beard_pass_reads_the_drawn_face_s_landmarks(self):
+        region = self.landmark_region()
+        drawn = [{"points": self.face(), "box": [444, 245, 536, 330], "yaw": 0, "score": 0.9}]
+        job, client, _ = self.finish_job([], profile=False, scene="A bearded sailor",
+                                         hand_pass=False, character_regions=[region],
+                                         drawn=drawn)
+        self.assertEqual(job.status, 'complete', job.detail)
+        find, read, beard = client.graphs[-3:]
+        self.assertEqual(read["ll"]["class_type"], ig.LANDMARK_NODE)
+        self.assertEqual(json.loads(read["ll"]["inputs"]["boxes"]), [[450, 250, 80, 90]])
+        self.assertEqual(read["li"]["inputs"]["image"], find["1"]["inputs"]["image"])
+        self.assertTrue(any(n.startswith("Beard 1 fitted to the drawn face's landmarks: the "
+                                         "scene's mask moved 0 px") for n in job.record["notes"]),
+                        job.record["notes"])
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Beard"])
+        # A ComfyUI without the reader: the beard pass as before, and said.
+        job, client, _ = self.finish_job([], profile=False, scene="A bearded sailor",
+                                         hand_pass=False, character_regions=[region])
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertFalse(any("ll" in g for g in client.graphs))
+        self.assertTrue(any("lacks %s" % ig.LANDMARK_NODE in n for n in job.record["notes"]))
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Beard"])
 
     def test_without_sam3_the_swap_is_kept_as_it_is(self):
         self.profile()

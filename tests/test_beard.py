@@ -101,6 +101,11 @@ class TestBeard(unittest.TestCase):
             self.assertTrue(os.path.isfile(region["mask_path"]))
             self.assertIn("brown short beard", region["prompt"])
             self.assertIn("brown short beard", words.text)
+            # For the beard pass to fit to the drawn face: the pose map's dots, the look.
+            self.assertEqual(len(region["face_dots"]), 68)
+            self.assertEqual(region["face_dots"], [[round(x, 5), round(y, 5)] for x, y in
+                                                   sc.pose_figures(scene)[0]["face"]])
+            self.assertEqual(region["beard"]["style"], "short")
         obj["look"].pop("beard")
         with patch.object(sc, "id_render", side_effect=AssertionError("legacy looks need no extra render")):
             self.assertEqual(sc.beard_masks(scene), {})
