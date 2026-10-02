@@ -17,3 +17,4 @@ comfy_nodes/studio_withanyone/vendor/
 # personal scene runs (pictures, histories) - kept out of the repo
 /Scene Math Measurements/
 /Scene Enhancements/
+/output/
