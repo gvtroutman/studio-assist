@@ -121,7 +121,12 @@ After Effects and Resolve use outside npm servers.
   by `under_lenses` and `even`; `Studio._apply_profiles` points it at the head
   redrawn (`job.heads`). Retry face swap (a kept picture finished as its job
   would have): `retry_faces`, `Studio.finish_backend`, `_retry_finish`,
-  `run_profile_swap`.
+  `run_profile_swap`. Face swap photos (pictures from outside given a person's
+  face, on this PC): `imagegen.keep_uploads` (under `references/face-swap`, as
+  PNG by `catalog.to_png`, which stands EXIF-rotated photos upright),
+  `imagegen.upload_swap` (-> a `mode: "faces"` job; a mark per face is the
+  profile's `target_point`), window `ui.FaceSwapWindow` opened by
+  `ImageStudio.face_swap`. Tests: `tests/test_face_swap_upload.py`.
   Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
   (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
   preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by
