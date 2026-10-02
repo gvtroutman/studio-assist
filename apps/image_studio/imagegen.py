@@ -1788,6 +1788,11 @@ def fill(wf, values, loras=()):
         for nid, key in regional["positive_in"]:
             graph[nid]["inputs"][key] = combined
     for name, sw in (wf.get("switches") or {}).items():
+        if name in (wf.get("defaults") or {}):
+            # A switch named like one of the workflow's values (its negative
+            # words) puts its link in every "{{name}}", text fields too.
+            raise TemplateError("Workflow %s: switch %s has the name of a default."
+                                % (wf["id"], name))
         pick = sw["then"] if v.get(sw["when"]) else sw["else"]
         m = PLACEHOLDER.fullmatch(pick.strip()) if isinstance(pick, str) else None
         if m:
