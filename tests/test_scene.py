@@ -2803,6 +2803,47 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual(refs["style"], style)
         self.assertEqual(ui.jobs[0].settings["pose"], {"strength": sc.POSE_STRENGTH})
 
+    def test_a_props_details_are_asked_for_added_and_taken_off(self):
+        import tkinter as tk
+        ui, sb = self.builder()
+        pole = sb.add("lamp")
+        pole.update(name="Maypole", scale=[0.5, 9.0, 0.5])
+        sb._inspect()
+        sb.remember()                                       # the Add is its own step
+        llm = FakeLLM(MAYPOLE_REPLY)
+        sb._llm = lambda: llm
+        sb.dress_ask[pole["id"]] = "a wreath on top and flags"
+        sb.dress(pole["id"])
+        self.pump(lambda: sb.dress_offer is not None)
+        self.assertIn("a wreath on top and flags", llm.sent[0][1]["content"])
+
+        def texts(w):
+            out = []
+            for c in w.winfo_children():
+                try:
+                    out.append(c.cget("text"))
+                except tk.TclError:
+                    pass
+                out += texts(c)
+            return out
+        shown = texts(sb.panel)
+        self.assertIn("Drawn as a ring round it, at the top", shown)
+        self.assertIn("Add all", shown)
+        sb._dress_answer(1, False)                          # skip the flags
+        self.assertEqual(len(sb.dress_offer["items"]), 1)
+        sb._dress_answer(0, True)
+        self.assertIsNone(sb.dress_offer)
+        self.assertEqual([d["part"] for d in pole["dressing"]], ["ring"])
+        self.assertIn("fir wreath", sc.scene_text(sb.scene).text)
+        sb.remember()
+        self.assertEqual(sb.history.steps[sb.history.at][0], "Change Maypole's details")
+        sb._undress(0)
+        self.assertNotIn("dressing", pole)
+        # An offer for one scene is not shown in the next.
+        sb.dress_offer = {"scene": {}, "id": pole["id"], "items": sc.read_dressing(MAYPOLE_REPLY)}
+        sb._inspect()
+        self.assertNotIn("Add all", texts(sb.panel))
+
 
 class FakeLLM:
     def __init__(self, *replies):
@@ -3131,6 +3172,119 @@ class EnrichTest(unittest.TestCase):
         self.assertEqual(problems, [])
         old, _ = sc.clean_scene({"objects": [], "enrich": {"added": [3, "  ", "x" * 999]}})
         self.assertEqual(old["enrich"]["added"], ["x" * sc.ENRICH_CHARS])
+
+
+MAYPOLE_REPLY = (
+    '<think>a wreath and flags</think>{"details": ['
+    '{"detail": "a thick green fir wreath ringing the top of the maypole", "part": "ring",'
+    ' "at": "top", "count": 1, "size": [1.4, 0.3, 0.3], "colour": "#3F6B35"},'
+    '{"detail": "Six blue-and-white Bavarian flags flying from the upper pole",'
+    ' "part": "flag", "at": "upper", "count": 6.0, "size": [1.2, 0.8, 0.02],'
+    ' "colour": "#2f6fc0"}]}')
+
+
+class TestPropDetails(unittest.TestCase):
+    """A prop's details (`dressing`): offered by the model for what the user
+    says it needs, said after its description, drawn on it in metres."""
+
+    def maypole(self):
+        s = staged("lamp")
+        pole = s["objects"][0]
+        pole.update(name="Maypole", scale=[0.5, 9.0, 0.5],
+                    description="A tall blue-and-white spiral-painted Bavarian maypole.")
+        return s, pole
+
+    def points(self, obj):
+        return [p for _, faces, _ in sc.painted_pieces(obj) for f in faces for p in f]
+
+    def test_reads_the_reply_and_holds_nonsense_back(self):
+        got = sc.read_dressing(MAYPOLE_REPLY)
+        self.assertEqual([(d["part"], d["at"], d["count"], d["colour"]) for d in got],
+                         [("ring", "top", 1, "#3f6b35"), ("flag", "upper", 6, "#2f6fc0")])
+        self.assertTrue(got[0]["text"].startswith("A thick green fir wreath"))
+        bare = sc.read_dressing('[{"detail": "Rust streaks down the pole", "part": "none"}]')
+        self.assertEqual((bare[0]["part"], sc.dressing_label(bare[0])), ("none", "Words only"))
+        bad = sc.read_dressing('{"detail": "A crown of lanterns", "part": "rocket", "at": '
+                               '"inside", "count": 99, "size": [1, "x", 2], "colour": "blue"}')
+        self.assertEqual((bad[0]["part"], bad[0]["at"], bad[0]["count"], bad[0]["colour"]),
+                         ("none", "top", sc.DRESS_COUNT, ""))
+        prose = sc.read_dressing("Detail: ribbons tied round the top of the pole.")
+        self.assertEqual(prose[0]["text"], "ribbons tied round the top of the pole.")
+        self.assertEqual(sc.read_dressing(""), [])
+        self.assertEqual(sc.dressing_label(got[1]),
+                         "Drawn as 6 flags standing out from it, near the top")
+
+    def test_drawn_on_the_prop_at_its_height_and_in_metres(self):
+        s, pole = self.maypole()
+        bare = self.points(pole)
+        pole["dressing"] = sc.read_dressing(MAYPOLE_REPLY)
+        dressed = self.points(pole)
+        x, _, z = pole["position"]
+        wide = lambda pts, lo, hi: max([math.hypot(p[0] - x, p[2] - z)  # noqa: E731
+                                        for p in pts if lo <= p[1] <= hi] or [0])
+        # The wreath rings the top, 1.4 m across; the pole's head is narrower.
+        self.assertAlmostEqual(wide(dressed, 8.6, 9.0), 0.7, delta=0.05)
+        self.assertLess(wide(bare, 8.6, 9.0), 0.25)
+        # The flags stand 1.2 m out near the top (0.8 of 9 m), not low down.
+        self.assertGreater(wide(dressed, 6.8, 7.6), 1.2)
+        self.assertLess(wide(dressed, 1.0, 5.0), 0.3)
+        self.assertEqual(max(p[1] for p in dressed), max(p[1] for p in bare))
+        # A pole twice as tall keeps a 1.2 m flag, at its own upper height.
+        pole["scale"][1] = 18.0
+        self.assertAlmostEqual(wide(self.points(pole), 13.6, 15.2), wide(dressed, 6.8, 7.6),
+                               delta=0.05)
+        # The frame draws them: the PNG changes.
+        pole["scale"][1] = 9.0
+        s["camera"].update(distance=14.0, pitch=-10.0)
+        s["camera"]["target"] = [0.0, 4.5, 0.0]
+        with_them = sc.png(s)
+        del pole["dressing"]
+        self.assertNotEqual(sc.png(s), with_them)
+
+    def test_said_after_the_description_and_kept_in_the_file(self):
+        s, pole = self.maypole()
+        pole["dressing"] = sc.read_dressing(MAYPOLE_REPLY)
+        text = sc.scene_text(s).text
+        self.assertIn("A tall blue-and-white spiral-painted Bavarian maypole. A thick green "
+                      "fir wreath ringing the top of the maypole. Six blue-and-white", text)
+        pole["description"] = ""
+        self.assertIn("Maypole (", sc.scene_text(s).text)
+        self.assertNotIn("Maypole has no description", " ".join(sc.scene_text(s).notes))
+        self.assertIn("A thick green fir wreath", sc.picture_settings(pole, "flux")["scene"])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "a.scene.json")
+            sc.save(s, path)
+            back, problems = sc.load(path)
+        self.assertEqual(problems, [])
+        self.assertEqual(back["objects"][0]["dressing"], pole["dressing"])
+        # Nothing added, nothing saved; junk dropped and the count held.
+        self.assertNotIn("dressing", sc.clean_object(sc.new_object("lamp")))
+        junk = sc.clean_object(dict(pole, dressing=[{"text": "  "}, 7] + [
+            {"text": "A ribbon %d" % i} for i in range(20)]))
+        self.assertEqual(len(junk["dressing"]), sc.DRESS_KEEP)
+        before = copy.deepcopy(s)
+        pole["dressing"] = pole["dressing"][:1]
+        self.assertEqual(sc.change_label(before, s), "Change Maypole's details")
+
+    def test_suggest_asks_for_what_it_needs_and_drops_what_it_has(self):
+        s, pole = self.maypole()
+        s["details"] = "A Bavarian village square in May"
+        llm = FakeLLM(MAYPOLE_REPLY)
+        got = sc.suggest_dressing(s, pole, llm, "a wreath on top and flags")
+        self.assertEqual([d["part"] for d in got], ["ring", "flag"])
+        user = llm.sent[0][1]["content"]
+        for words in ("Maypole", "lamp post", "9 m tall", "spiral-painted",
+                      "a wreath on top and flags", "village square"):
+            self.assertIn(words, user)
+        pole["dressing"] = got[:1]
+        again = sc.suggest_dressing(s, pole, FakeLLM(MAYPOLE_REPLY))
+        self.assertEqual([d["part"] for d in again], ["flag"])
+        self.assertIn("Details it already has", sc.dress_messages(s, pole)[1]["content"])
+        pole["dressing"] = []
+        self.assertIn("has not said", sc.dress_messages(s, pole)[1]["content"])
+        pole["dressing"] = got
+        with self.assertRaises(RuntimeError):
+            sc.suggest_dressing(s, pole, FakeLLM(MAYPOLE_REPLY))
 
 
 if __name__ == "__main__":
