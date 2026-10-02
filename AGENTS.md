@@ -3022,6 +3022,30 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   description carries the words; select it and drag to adjust. Light, haze, stains
   and a hand at the frame edge are `none`, and those go into the words as written
   (`added`), before the camera line.
+- **A prop's Details are words and shapes on that prop** (2026-10-01, the user: "click on
+  an element ... add details to it with llm suggestions ... the maypole needs a wreath
+  on the top of it and flags"). Under a selected prop's Description, the Details box
+  takes what it needs (empty: what it is missing) and Suggest asks the same model as
+  Enrich (`SceneBuilder._llm`, off the UI thread) through `sc.suggest_dressing`
+  (`DRESS_SYSTEM`, `dress_messages`: the prop's name, kind, size, description, the
+  details it has, the scene's details). Each offered detail is Add or Skip, or Add
+  all; added ones are `obj["dressing"]` (`new_dressing`: `text`, `part`, `at`,
+  `count`, `size`, `colour`; `clean_dressing`, at most `DRESS_KEEP`; the key is left
+  out when empty, so an undressed prop saves as before). `described` says them after
+  the description, as written, in the scene's words and in Make picture's.
+  `dressing_pieces` draws them in `painted_pieces`, so the frame, depth map, shadows
+  and bounds all have them: a `ring` round it, `flag`s standing out radially, a
+  `banner` hanging down, a `sign` flat on its side, or a ball / box / cylinder /
+  cone - at `top` / `upper` / `middle` / `lower` / `base` of the prop, or `along` it
+  side to side, hugging the mesh's outline at that height (`girth`, where its faces
+  cross it). A piece is sized in metres, not by the prop's scale: a 20 m maypole
+  does not make 20 m flags, and a resized prop keeps its wreath at the top. `none`
+  (paint, carving, wear) is words only, and so is everything while a picture stands
+  in for the prop. These are details OF one prop, never new objects: Enrich places
+  those. Live (qwen3-coder 30B, 17 s): "a wreath on the top of it and flags" came
+  back as a ring at the top and three flags halfway up; it copies the prompt's
+  example sizes and can offer what the description already says (Skip it). Persons
+  and crowds have no Details (their look says it).
 - **Shapes are stand-ins; props are parts under one transform.** `MESHES` holds each
   shape and prop as [(faces, colour or None)] in a unit box (x and z -0.5..0.5, y
   0..1) standing on the floor: the primitives (box, cylinder, sphere, cone, frustum,

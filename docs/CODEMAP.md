@@ -127,7 +127,10 @@ After Effects and Resolve use outside npm servers.
   Tests: `tests/test_wear.py`. AGENTS.md "The Wearing list".
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,
-  `scene/pose.py`.
+  `scene/pose.py`. A prop's Details (words + shapes on it): `suggest_dressing`,
+  `read_dressing`, `dressing_pieces`, `girth`, `described` in scene.py; the box is
+  `SceneBuilder._dressing_controls` / `dress` / `_dress_answer`. AGENTS.md "A prop's
+  Details".
 - **addons/** - `addons/catalog.py` (LoRAs per model, uninstall), `addons/civitai.py`,
   `addons/hub.py` (Hugging Face, GitHub node plugins), `addons/nodes.py` (bundled
   `comfy_nodes/` installer), `addons/discovery.py`.
