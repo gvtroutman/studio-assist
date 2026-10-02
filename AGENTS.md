@@ -2324,6 +2324,8 @@ OpenCode is a coding agent - it edits and runs whatever it is pointed at. The us
 **this app's own code**, so it runs natively and what keeps it in check is that it asks,
 not a sandbox. (It used to run in a Docker container that saw one scratch folder; Docker
 was never installed here, the tab never ran, and a sandbox cannot edit this repo.)
+What follows is how it asks; *OpenCode, agentic* below is the switch that lets it
+work in a task's copy without asking at each step.
 
 - **`ServerSpec.launch()`** writes OpenCode's config to `OPENCODE_STATE`
   (`%LOCALAPPDATA%\StudioAssistant\opencode`, never the workspace), writes a fresh
@@ -2474,6 +2476,89 @@ OpenCode's to keep and invisible.
 - **Direct mode** (the tab's header "Direct" button, `Chat._direct_turn`): the user's
   message is `opencode_ask`'s prompt as typed and the report is the reply - no model
   briefs OpenCode, so one context on the GPU, not two. Approvals come up the same way.
+  A call that hands back with OpenCode still at work is followed on with
+  `opencode_wait` from here (`DIRECT_WAITS` times at most), by the state in the
+  result's `_meta["studio/opencode"]`: no model is there to do it, and the user cannot
+  call a tool. Stop reaches the call in flight (`cancel=s.cancel`) and is said as
+  "Stopped.", not as a tool error.
+
+### OpenCode, agentic
+
+The user asked (2026-09-29) to "make opencode agentic", two days after asking for his
+input at each step. By then the trainer had read 30 saved tasks and none had reached
+a finished change. So per-step approval stays the default and **Agentic is a switch
+he turns on**: the header button on OpenCode's tab (`Chat._toggle_agentic`), kept
+across restarts.
+
+- **The switch is a file, and no tool sets it.** `ServerSpec.set_agentic` writes
+  `agentic.json` (`OPENCODE_AGENTIC`) in the state folder; the bridge reads it on
+  every look (`agentic()`), like the password. Anything but `{"on": true}` is off.
+  The model that briefs OpenCode cannot turn it on, and `TestAgentic` holds that no
+  tool's name or schema mentions it. `OPENCODE_PERMISSIONS` is not loosened: OpenCode
+  still asks for every edit and command, and the bridge answers the ones below
+  `once` instead of showing a card - so the report still lists each one ("allowed by
+  Agentic: ...") and turning it off needs no restart.
+- **Only in a task's own copy** (`agentic_task`). There every change can be undone
+  and nothing reaches the user's folder before `opencode_merge`, which still shows
+  the diff and asks. A folder that is not a git repository is worked in place, and
+  asks at every step as before.
+- **What goes through** (`agentic_allows`): an edit to a file inside the copy
+  (`in_copy`; not `.git`), and a command `safe_command` passes - `python -m
+  unittest` / `pytest` / `py_compile`, `git status|diff|log|show`, and the plain
+  reads in `AGENTIC_COMMANDS`, alone or joined by `&&` (a `cd` inside the copy may
+  lead). A pipe, redirect, `;`, `&`, variable or brace, a program given by path, or
+  an argument that names a place outside the copy puts the whole line to the user.
+  Both what OpenCode lists in `patterns` (each command of the line, a leading `cd`
+  left out) and the line in `metadata.command` must pass. **Everything else still
+  asks**: any other command (`python -c`, `python x.py`), a fetch, a search, an
+  add-on's tool, `doom_loop`. `external_directory` is still denied.
+- **A backslash is read both ways** (`_readings`). The model writes `cd
+  "C:\...\copy" && python -m unittest ...` (seen live), so a backslash cannot
+  simply refuse the line. Inside quotes it is a path's. Outside quotes cmd keeps it
+  and Git Bash drops it, so `.\./x` is `../x` there: an unquoted argument must stay
+  inside the copy under both readings.
+- **It is a short list, not a sandbox.** The tests it lets run are code OpenCode
+  wrote and no one has read. That is what the switch means; say so rather than
+  pretend the list makes it safe. Do not add a program that installs, fetches,
+  deletes or changes history, and do not add `python <script>` or `python -c`.
+- **An ask with work left goes back to OpenCode** (`finish` -> `unfinished` ->
+  `send_back`), `AGENTIC_ROUNDS` times at most per ask, in this order: the tests of
+  what it changed failed (it gets the output's tail, and is told to leave a failure
+  that is not its own); to-dos are open (`open_todos` - only a list this ask
+  touched: a session keeps an earlier ask's list, and being sent back to an
+  abandoned plan is worse than stopping); or the ask read as a change
+  (`wants_change`) and nothing was changed - asked for once. Each round is
+  checkpointed, so `opencode_undo` steps back one round.
+- **One work limit for all rounds** (`Clock`), tests included, because the client
+  gives a call `PROGRESS_CAP` seconds in all. A round there is no time left for is
+  `owed` on the task; the result says "has work left" with state `unfinished`, and
+  `opencode_wait` sends it. Without `owed` the wait found the copy checkpointed,
+  ran no tests and called failing work done.
+- **The tests report while they run** (`run_tests`, every `TEST_LOOK` s) and end
+  with Stop. A run longer than the client's 180 s used to look like a hung bridge.
+- **OpenCode is told** (`AGENTIC_NOTE`, before the prompt): it works by itself, so
+  plan, change, test, fix, report - and do not stop to ask whether to go on.
+- **No `__pycache__` in a copy.** `launch()` sets `PYTHONDONTWRITEBYTECODE=1` for
+  the server, so the tests OpenCode runs write none. In a folder with no
+  `.gitignore` the checkpoint took three `.pyc` files (seen live) and a merge
+  would have brought them along.
+- **Progress is said when it changes**, and every `LOOK` seconds so the client's
+  clock keeps being restarted. `follow()` used to say it on every pass, and with
+  the event stream up a pass is every event: 765 lines in a run of 141 s.
+
+Live-checked (2026-09-29, scratch repo and state folder, port 4196, OpenCode 1.18.32,
+qwen3-coder-30b at 64k, a scripted user who refuses every card): asked to change a
+function and its test, OpenCode wrote five to-dos, edited both files and ran
+`python -m unittest` with no card, 121 s, tests passed, one checkpoint, the
+workspace untouched. `python -m pytest` and `python -c "..."` came up as cards
+(pytest has been let through since). Asked to edit only the function and run
+nothing, the bridge's tests failed, it was sent back, fixed the test and ended at
+"1 time(s) ... the tests failed" with two checkpoints, 141 s. The shapes are as the
+tests fake them: `metadata.filepath` is absolute and inside the copy,
+`metadata.command` is the whole line. The first task again after the fixes, through
+the bridge as its own process (`app.connect()`, stdio): 111 s, no card at all, 33
+progress lines, `_meta` came through. Not yet: the button pressed in the running
+app, a task on this repo, a run longer than one call's work limit.
 
 ### OpenCode's Add-ons
 

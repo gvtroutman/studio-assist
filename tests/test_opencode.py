@@ -42,10 +42,12 @@ class FakeOpenCode:
     """Just enough of OpenCode's HTTP API, recording what it was asked.
 
     `script` is what the next task does: a list of ("permission", request),
-    ("question", request), ("say", text) and ("write", (path, text)) steps,
-    played in order; a write lands in the folder the session was made for.
-    A pending request holds the session busy until it is answered, like the
-    real one."""
+    ("question", request), ("say", text), ("write", (path, text)) and
+    ("todos", list) steps, played in order; a write lands in the folder the
+    session was made for, and "<copy>" in a request is that folder. `scripts`
+    holds what the prompts after this one do, one script each, before `script`
+    is played again. A pending request holds the session busy until it is
+    answered, like the real one."""
 
     def __init__(self, ws):
         self.ws = ws
@@ -54,6 +56,8 @@ class FakeOpenCode:
         self.posts = []
         self.auth = []             # the Authorization header of each request
         self.script = [("say", "done")]
+        self.scripts = []          # the scripts of the prompts to come, in order
+        self.todos = []
         self.running = {}          # sid -> remaining steps
         self.pending = None        # (kind, request)
         self.health_route = True
@@ -85,6 +89,9 @@ class FakeOpenCode:
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(what[1])
                     continue
+                if kind == "todos":
+                    self.todos = what
+                    continue
                 if kind == "say":
                     self.messages[sid].append(
                         {"info": {"role": "assistant", "id": "msg_%d" % self.n},
@@ -94,7 +101,10 @@ class FakeOpenCode:
                                    {"type": "patch", "files": [os.path.join(self.ws, "hello.py")]},
                                    {"type": "text", "text": what}]})
                 else:
-                    req = json.loads(json.dumps(what).replace("<ws>", self.ws.replace("\\", "/")))
+                    copy = self.sessions[sid].get("directory") or self.ws
+                    req = json.loads(json.dumps(what)
+                                     .replace("<ws>", self.ws.replace("\\", "/"))
+                                     .replace("<copy>", copy.replace("\\", "/")))
                     req.update(id=("per_%d" if kind == "permission" else "que_%d") % self.n,
                                sessionID=sid)
                     self.pending = (kind, req)
@@ -152,7 +162,7 @@ class FakeOpenCode:
             if action == "message":
                 return self.messages[sid]
             if action == "todo":
-                return getattr(self, "todos", [])
+                return self.todos
             if action == "prompt_async":
                 if self.error_next:
                     code, body = self.error_next
@@ -162,7 +172,7 @@ class FakeOpenCode:
                 self.n += 1
                 self.messages[sid].append({"info": {"role": "user", "id": "msg_%d" % self.n},
                                            "parts": payload["parts"]})
-                self.running[sid] = list(self.script)
+                self.running[sid] = list(self.scripts.pop(0) if self.scripts else self.script)
                 return {}
             if action == "abort":
                 self.posts.append(("abort", sid))
@@ -694,9 +704,8 @@ def git(cwd, *args):
                           check=True).stdout
 
 
-class TestTasks(Base):
-    """A task in a git repository works in a copy of its own; the user's folder
-    changes only when the user merges, and every change can be taken back."""
+class Repo(Base):
+    """The workspace as a git repository with one commit and one test."""
 
     def setUp(self):
         Base.setUp(self)
@@ -731,6 +740,11 @@ class TestTasks(Base):
         self.fake.script = list(steps) or [("write", ("hello.py", "print('bye')\n")),
                                            ("say", "Changed it.")]
         return client.call_tool("opencode_ask", {"prompt": prompt})
+
+
+class TestTasks(Repo):
+    """A task in a git repository works in a copy of its own; the user's folder
+    changes only when the user merges, and every change can be taken back."""
 
     def test_a_task_works_in_its_copy_then_tests_and_checkpoints(self):
         res = self.ask(self.user())
@@ -869,6 +883,315 @@ class TestGrants(Base):
         self.assertIsNotNone(oc.granted(sid, dict(BASH, patterns=["python hello.py -v"])))
         self.assertIsNone(oc.granted(sid, dict(BASH, patterns=["rm -rf ."])))
         self.assertIsNone(oc.granted(sid, EDIT))
+
+
+EDIT_COPY = dict(EDIT, metadata=dict(EDIT["metadata"], filepath="<copy>/hello.py"))
+RUN_TESTS = {"permission": "bash", "patterns": ["python -m unittest tests.test_hello"],
+             "metadata": {"command": "python -m unittest tests.test_hello"},
+             "always": ["python -m unittest *"]}
+FETCH = {"permission": "webfetch", "patterns": ["https://example.com/"],
+         "metadata": {"url": "https://example.com/"}, "always": ["*"]}
+PASSING = ("import unittest\n\nclass T(unittest.TestCase):\n"
+           "    def test_it(self):\n        self.assertTrue(True)\n")
+FAILING = PASSING.replace("self.assertTrue(True)", "self.fail('boom')")
+
+
+class TestAgentic(Repo):
+    """Agentic is the user's switch. With it on, in a task's own copy, what
+    stays inside the copy goes through without a card and an ask that ends
+    with work left goes back to OpenCode; everything else is as before."""
+
+    def setUp(self):
+        Repo.setUp(self)
+        self.switch(True)
+
+    def switch(self, on):
+        os.makedirs(oc.STATE_DIR, exist_ok=True)
+        with open(os.path.join(oc.STATE_DIR, oc.AGENTIC_FILE), "w", encoding="utf-8") as f:
+            json.dump({"on": on}, f)
+
+    def out(self, res):
+        return "\n".join(c["text"] for c in res["content"])
+
+    def asks(self):
+        return [p[2]["parts"][0]["text"] for p in self.fake.posts if p[0] == "ask"]
+
+    def test_edits_and_tests_in_the_copy_go_through_without_a_card(self):
+        res = self.ask(self.user(), "change the greeting",
+                       ("permission", EDIT_COPY), ("write", ("hello.py", "print('bye')\n")),
+                       ("permission", RUN_TESTS), ("say", "Changed it."))
+        self.assertFalse(res.get("isError"), res)
+        self.assertEqual(self.asked, [], "no card was shown")
+        self.assertEqual([p[2] for p in self.fake.posts if p[0] == "reply"],
+                         [{"reply": "once"}, {"reply": "once"}])
+        out = self.out(res)
+        self.assertIn("allowed by Agentic: edit hello.py", out)
+        self.assertIn("allowed by Agentic: run python -m unittest tests.test_hello", out)
+        self.assertIn("Tests passed: tests.test_hello", out)
+        self.assertEqual(self.read("hello.py"), "print('hi')\n", "the user's folder is untouched")
+        self.assertTrue(self.asks()[0].startswith(oc.AGENTIC_NOTE))
+        self.assertTrue(self.asks()[0].endswith("change the greeting"))
+
+    def test_off_every_step_is_asked_as_before(self):
+        self.switch(False)
+        res = self.ask(self.user(self.accept(decision="once"), self.accept(decision="once")),
+                       "change the greeting",
+                       ("permission", EDIT_COPY), ("permission", RUN_TESTS), ("say", "ok"))
+        self.assertEqual(len(self.asked), 2)
+        self.assertNotIn("Agentic", self.out(res))
+        self.assertEqual(self.asks(), ["change the greeting"])
+        # A switch file that cannot be read is off, not on.
+        with open(os.path.join(oc.STATE_DIR, oc.AGENTIC_FILE), "w") as f:
+            f.write("{not json")
+        self.assertFalse(oc.agentic())
+        with open(os.path.join(oc.STATE_DIR, oc.AGENTIC_FILE), "w") as f:
+            json.dump({"on": "yes"}, f)
+        self.assertFalse(oc.agentic(), "only true is on")
+
+    def test_what_leaves_the_copy_or_is_not_on_the_list_is_still_the_users(self):
+        refuse = self.accept(decision="reject")
+        res = self.ask(self.user(refuse, refuse, refuse, refuse), "review the greeting",
+                       ("permission", EDIT),                   # the user's folder, not the copy
+                       ("permission", BASH),                   # python hello.py
+                       ("permission", FETCH),
+                       ("permission", dict(EDIT_COPY, metadata=dict(
+                           EDIT_COPY["metadata"], filepath="<copy>/.git/config"))),
+                       ("say", "ok"))
+        self.assertEqual(len(self.asked), 4)
+        self.assertNotIn("allowed by Agentic", self.out(res))
+        self.assertEqual([p[2]["reply"] for p in self.fake.posts if p[0] == "reply"],
+                         ["reject"] * 4)
+
+    def test_no_user_to_ask_still_lets_the_copys_own_steps_through(self):
+        """A client that cannot ask refuses every step that would need a card;
+        what Agentic answers never needed one."""
+        self.fake.script = [("permission", EDIT_COPY), ("say", "ok")]
+        res = oc.call_tool("opencode_ask", {"prompt": "change the greeting"})
+        self.assertFalse(res.get("isError"), res)
+        self.fake.script = [("permission", BASH), ("say", "never")]
+        res = oc.call_tool("opencode_ask", {"prompt": "run it"})
+        self.assertTrue(res["isError"])
+        self.assertIn("no one could approve", self.text(res))
+
+    def test_a_folder_worked_in_place_asks_at_every_step(self):
+        shutil.rmtree(os.path.join(oc.WORKSPACE, ".git"),
+                      onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+        self.ask(self.user(self.accept(decision="once")), "change the greeting",
+                 ("permission", EDIT), ("say", "ok"))
+        self.assertEqual(len(self.asked), 1, "no copy, no undo: the user decides")
+        self.assertEqual(self.asks(), ["change the greeting"])
+
+    def test_the_commands_it_runs_unasked_are_tests_and_reads_inside_the_copy(self):
+        copy = os.path.join(self.tmp, "copy")
+        os.makedirs(os.path.join(copy, "core"))
+        inside = copy.replace("\\", "/")
+        for cmd in ("python -m unittest tests.test_hello",
+                    "python -m unittest discover -s tests -p \"test_*.py\"",
+                    "python3 -m unittest tests.test_hello -v",
+                    "python -m pytest tests/test_hello.py -v", "pytest -q tests",
+                    "py -m py_compile core/agent.py",
+                    "Python.exe -m unittest",
+                    "git status", "git diff --stat", "git log -5 --oneline", "git show HEAD",
+                    "ls", "ls -la core", "cat core/agent.py", "grep -rn \"def fit\" core",
+                    "rg fit_window", "head -40 core/agent.py", "wc -l core/agent.py",
+                    "dir /b core", "findstr /s /i fit_window *.py", "pwd",
+                    "cd core && python -m unittest tests.test_hello",
+                    "cd %s && git status" % inside,
+                    "cat %s/core/agent.py" % inside,
+                    # As the model wrote it, live: the copy's own path, quoted.
+                    "cd \"%s\" && python -m unittest tests.test_hello" % copy,
+                    "cat \"%s\"" % os.path.join(copy, "core", "agent.py"),
+                    "cat core\\agent.py"):
+            self.assertTrue(oc.safe_command(cmd, copy), cmd)
+        for cmd in ("", "   ", None,
+                    "python hello.py", "python -c \"import os\"", "python -m pip install x",
+                    "python -c \"import hello; print(repr(hello.greet('Ada')))\"",
+                    "pytest --rootdir=/ tests", "python -m pytest ../other",
+                    "python -munittest", "pip install requests", "npm install",
+                    "rm -rf .", "del hello.py", "git commit -m x", "git push",
+                    "git checkout main", "git reset --hard", "git -C .. status",
+                    "curl https://example.com", "echo hi", "find . -delete",
+                    "python -m unittest; rm -rf .", "python -m unittest & del x",
+                    "python -m unittest || rm x", "python -m unittest | tee out.txt",
+                    "python -m unittest > out.txt", "cat < hello.py",
+                    "python -m unittest && rm -rf .", "cat `which python`",
+                    "cat $(which python)", "cat $HOME/.ssh/id_rsa", "type %USERPROFILE%\\x",
+                    "cat ../secret", "cat core/../../secret", "cat \"..\"/secret",
+                    "cat ~/.ssh/id_rsa", "cat /etc/passwd", "cat C:/Windows/win.ini",
+                    "cat /c/Windows/win.ini", "cat {..,}/secret",
+                    # A backslash is a path's in cmd and one Git Bash drops:
+                    # outside quotes both readings have to stay in the copy.
+                    "cat .\\./secret", "cat ..\\secret", "cat \"..\\secret\"",
+                    "cat \"..\\\\secret\"", "cat core\\..\\..\\secret",
+                    "cd \"%s\" && git status" % self.tmp,
+                    "cat \"C:\\Windows\\win.ini\"", "cat C:\\Windows\\win.ini",
+                    "cat \"..\"\\secret", "type \\\\server\\share\\x",
+                    "git diff --output=/tmp/x", "git diff --output=../x",
+                    "cd .. && git status", "cd /", "cd", "cd a b",
+                    "ls /s", "cat \"unclosed", "\"python\" -m unittest",
+                    "./python -m unittest"):
+            self.assertFalse(oc.safe_command(cmd, copy), cmd)
+
+    def test_a_line_is_judged_whole_and_command_by_command(self):
+        """OpenCode names each command of a line; one that is not on the list
+        puts the whole line to the user, however it is reported."""
+        sid = oc.start_task("x")
+        hidden = dict(RUN_TESTS, metadata={"command": "python -m unittest && rm -rf ."})
+        listed = dict(RUN_TESTS, patterns=["python -m unittest", "rm -rf ."], metadata={})
+        bare = dict(RUN_TESTS, metadata={})
+        self.assertIsNone(oc.agentic_allows(sid, hidden))
+        self.assertIsNone(oc.agentic_allows(sid, listed))
+        self.assertEqual(oc.agentic_allows(sid, bare), "run python -m unittest tests.test_hello")
+        self.assertIsNone(oc.agentic_allows(sid, dict(RUN_TESTS, patterns=[], metadata={})))
+        self.assertIsNone(oc.agentic_allows(sid, {"permission": "doom_loop", "patterns": ["*"]}))
+        self.assertIsNone(oc.agentic_allows(sid, {"permission": "sequential_thinking",
+                                                  "patterns": ["*"]}))
+
+    def test_failing_tests_go_back_to_opencode_until_they_pass(self):
+        self.fake.scripts = [[("write", ("tests/test_hello.py", FAILING)), ("say", "done")],
+                             [("write", ("tests/test_hello.py", PASSING)), ("say", "fixed")]]
+        res = self.user().call_tool("opencode_ask", {"prompt": "change the test"})
+        self.assertFalse(res.get("isError"), res)
+        first, second = self.asks()
+        self.assertIn("The tests of what you changed failed", second)
+        self.assertIn("boom", second)
+        out = self.out(res)
+        self.assertIn("fixed", out)
+        self.assertIn("Tests passed: tests.test_hello", out)
+        self.assertNotIn("Tests FAILED", out)
+        self.assertIn("sent OpenCode back to work 1 time(s) by itself: the tests failed", out)
+        self.assertEqual(len(oc.task(oc.last_session())["checkpoints"]), 2,
+                         "each round can be undone by itself")
+
+    def test_it_is_sent_back_only_so_often(self):
+        n = [0]
+
+        def worse():
+            n[0] += 1
+            return [("write", ("tests/test_hello.py", FAILING + "# %d\n" % n[0])),
+                    ("say", "tried")]
+        self.fake.scripts = [worse() for _ in range(oc.AGENTIC_ROUNDS + 3)]
+        res = self.user().call_tool("opencode_ask", {"prompt": "change the test"})
+        self.assertEqual(len(self.asks()), 1 + oc.AGENTIC_ROUNDS)
+        out = self.out(res)
+        self.assertIn("Tests FAILED", out)
+        self.assertIn("sent OpenCode back to work %d time(s)" % oc.AGENTIC_ROUNDS, out)
+        self.assertIn("the user's call", out)
+        # The next ask starts its own count.
+        self.fake.scripts = [[("write", ("tests/test_hello.py", PASSING)), ("say", "fixed")]]
+        res = self.user().call_tool("opencode_ask", {"prompt": "make the test pass"})
+        self.assertNotIn("sent OpenCode back", self.out(res))
+        self.assertIn("Tests passed", self.out(res))
+
+    def test_to_dos_left_open_send_it_back_and_an_earlier_list_does_not(self):
+        plan = [{"content": "edit hello.py", "status": "pending"},
+                {"content": "run the tests", "status": "pending"}]
+        done = [dict(t, status="completed") for t in plan]
+        self.fake.scripts = [[("todos", plan), ("say", "I will edit hello.py next.")],
+                             [("write", ("hello.py", "print('bye')\n")), ("todos", done),
+                              ("say", "Changed it.")]]
+        res = self.user().call_tool("opencode_ask", {"prompt": "change the greeting"})
+        first, second = self.asks()
+        self.assertIn("2 to-do(s) still open", second)
+        self.assertIn("- edit hello.py", second)
+        self.assertIn("2 to-do(s) were open", self.out(res))
+        # A list the ask never touched is an earlier ask's: not its work.
+        self.fake.todos = plan
+        self.fake.scripts = [[("write", ("hello.py", "print('ciao')\n")), ("say", "ok")]]
+        self.user().call_tool("opencode_ask", {"prompt": "change it again"})
+        self.assertEqual(len(self.asks()), 3)
+
+    def test_a_change_not_made_is_asked_for_once_and_a_question_never(self):
+        self.fake.script = [("say", "I would edit hello.py.")]
+        res = self.user().call_tool("opencode_ask", {"prompt": "change the greeting"})
+        first, second = self.asks()
+        self.assertIn("Nothing in your copy has changed yet", second)
+        self.assertIn("nothing had changed", self.out(res))
+        self.user().call_tool("opencode_ask", {"prompt": "What does hello.py print?"})
+        self.assertEqual(len(self.asks()), 3, "a question changes nothing, and need not")
+        for text, change in (("change the greeting", True),
+                             ("can you make the button blue", True),
+                             ("Add a Copy button\nto each row", True),
+                             ("what tools would be beneficial?", False),
+                             ("how does the bridge start", False),
+                             ("explain fit_window", False),
+                             ("list all tooling", False),
+                             ("What's in core?", False),
+                             ("make it faster?", False),
+                             ("", False)):
+            self.assertEqual(oc.wants_change(text), change, text)
+
+    def test_out_of_work_with_work_left_is_owed_to_the_wait(self):
+        class Later:
+            """The clock, moved on by what the tests are said to have taken."""
+            by = 0.0
+
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            def monotonic(self):
+                return real_time.monotonic() + self.by
+        real_time, real_after = oc.time, oc.after_ask
+        later = Later()
+
+        def slow(sid, label):
+            later.by += 1000
+            return real_after(sid, label)
+        oc.time, oc.after_ask = later, slow
+        try:
+            self.fake.scripts = [[("write", ("tests/test_hello.py", FAILING)), ("say", "done")]]
+            res = self.user().call_tool("opencode_ask", {"prompt": "change the test"})
+        finally:
+            oc.time, oc.after_ask = real_time, real_after
+        sid = oc.last_session()
+        self.assertTrue(res["isError"])
+        self.assertIn("has work left (the tests failed)", self.text(res))
+        self.assertIn("opencode_wait", self.text(res))
+        self.assertEqual(res["_meta"]["studio/opencode"], {"session": sid, "state": "unfinished"})
+        self.assertEqual(len(self.asks()), 1)
+        self.assertEqual(oc.task(sid)["owed"][0], "the tests failed")
+        self.fake.scripts = [[("write", ("tests/test_hello.py", PASSING)), ("say", "fixed")]]
+        res = self.user().call_tool("opencode_wait", {"session_id": sid})
+        self.assertFalse(res.get("isError"), res)
+        self.assertIn("The tests of what you changed failed", self.asks()[1])
+        self.assertIn("Tests passed", self.out(res))
+        self.assertIn("1 time(s)", self.out(res))
+        self.assertFalse(oc.task(sid).get("owed"))
+        self.assertEqual(res["_meta"]["studio/opencode"]["state"], "done")
+
+    def test_stop_ends_the_tests_and_the_run(self):
+        real = (oc.TEST_LOOK, oc.run_tests, studio_mcp.cancelled)
+        slow = ("import time, unittest\n\nclass T(unittest.TestCase):\n"
+                "    def test_it(self):\n        time.sleep(60)\n")
+        self.fake.script = [("write", ("tests/test_hello.py", slow)), ("say", "done")]
+        testing = []
+
+        def run_tests(root, mods):
+            testing.append(mods)
+            return real[1](root, mods)
+        oc.TEST_LOOK = 0.2
+        oc.run_tests = run_tests
+        studio_mcp.cancelled = lambda: bool(testing)    # Stop comes while the tests run
+        try:
+            res = self.user().call_tool("opencode_ask", {"prompt": "change the test"})
+        finally:
+            oc.TEST_LOOK, oc.run_tests, studio_mcp.cancelled = real
+        self.assertTrue(res["isError"])
+        self.assertIn("The user stopped OpenCode", self.text(res))
+        self.assertEqual(len(self.asks()), 1)
+        self.assertEqual(res["_meta"]["studio/opencode"]["state"], "stopped")
+
+    def test_status_and_grants_say_it_and_no_tool_sets_it(self):
+        self.assertIn("The user has Agentic on", self.text(oc.call_tool("opencode_status", {})))
+        self.ask(self.user())
+        self.assertIn("The user has Agentic on", self.text(oc.call_tool("opencode_grants", {})))
+        self.switch(False)
+        self.assertNotIn("Agentic", self.text(oc.call_tool("opencode_status", {})))
+        self.assertIn("every step is asked", self.text(oc.call_tool("opencode_grants", {})))
+        for t in oc.tool_list():
+            self.assertNotIn("agentic", t["name"].lower())
+            self.assertNotIn("agentic", json.dumps(t["inputSchema"]).lower(), t["name"])
+        self.assertEqual(oc.AGENTIC_FILE, eng.OPENCODE_AGENTIC)
 
 
 class TestEventsAndContext(Base):

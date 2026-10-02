@@ -180,8 +180,17 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
   `tests_for` and makes a `checkpoint`. `t_merge` / `t_undo` / `t_discard` ask through
   `confirm`. Every session call passes `task_dir(sid)` as `?directory=`. `ROUTES` is
   every server route used.
+- **Agentic** (the user's switch: no card for what stays in a task's copy, and an ask
+  with work left goes back to OpenCode) - the switch is the file `OPENCODE_AGENTIC` in
+  the state folder: `ServerSpec.agentic` / `set_agentic` write it (`Chat._toggle_agentic`,
+  the header button), `apps/opencode/mcp.py` `agentic` / `agentic_task` read it. There:
+  `agentic_allows` (`in_copy`, `safe_command` over `AGENTIC_COMMANDS`) inside `settle`;
+  `finish` loops on `unfinished` (`open_todos`, `wants_change`) through `send_back`,
+  within one `Clock`; a round out of time is `owed` to `opencode_wait`. Tests:
+  `TestAgentic` in `tests/test_opencode.py`. AGENTS.md "OpenCode, agentic".
 - **Approval UI** - `core/chat.py`: `_elicit`, `_show_elicit`, `_diff_box`, `_settle_elicit`.
-  Direct mode: `_toggle_direct`, `_direct_turn`.
+  Direct mode: `_toggle_direct`, `_direct_turn` (follows a call that hands back still
+  working with `opencode_wait`, by the result's `_meta["studio/opencode"]`).
 - **Add-ons** - `apps/opencode/codeaddons.py` (records, `config`, MCP registry / npm / skills
   search and install) and `apps/opencode/codeaddons_ui.py` (`AddonsWindow`).
 - **Trainer** - `apps/opencode/trainer_mcp.py`: an MCP server for *Claude Code*
