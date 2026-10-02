@@ -19,6 +19,12 @@ The answer travels from the user to this bridge to OpenCode. The model that
 called opencode_ask never sees the question and cannot answer it: a client
 that cannot ask its user (no MCP elicitation) gets every step refused.
 
+Agentic is the user's switch for working without those cards (the tab's
+header button; see `agentic`). With it on, and only in a task's own copy, an
+edit to a file in the copy and a command from a short list of tests and reads
+are answered here, and an ask that ends with to-dos open or tests failing is
+sent back to OpenCode. No tool sets the switch, and the merge stays the user's.
+
 The server is on loopback with a password (the key file ServerSpec writes at
 each start), because a coding agent's HTTP API is not something a web page in
 a browser on this PC should be able to reach.
@@ -39,6 +45,7 @@ import json
 import fnmatch
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -72,6 +79,8 @@ LOOK = 5.0                   # seconds between counting to-dos and changed files
 STALL = 120                  # seconds with no sign of work before progress says "stuck?"
 CONTEXT_HIGH = 80            # % of the window at which the report warns
 TEST_TIMEOUT = 300           # seconds the tests of an ask's changes may run
+TEST_LOOK = 2.0              # seconds between looks at tests that are running
+AGENTIC_ROUNDS = 3           # times one ask goes back to OpenCode by itself, Agentic on
 MAX_REPLY_CHARS = 6000       # what an ask hands back; the executor caps at 8000
 MAX_FILE_CHARS = 6000        # leave room for headers under the executor's 8000 cap
 MAX_LIST = 400               # list_files cap
@@ -616,10 +625,245 @@ def add_grant(sid, p):
     update_task(sid, grants=grants)
 
 
+# ------------------------------------------------------------- agentic
+# The user's switch for working without a card per step. The OpenCode tab's
+# Agentic button writes it to a file in the state folder and it is read here
+# on every look, like the password: no tool sets it, so the model that briefs
+# OpenCode cannot turn it on. It holds only in a task's own copy, where every
+# change can be taken back and nothing reaches the user's folder before they
+# merge; a folder worked in place asks at every step, as before.
+#
+# What goes through: an edit to a file in the copy, and a command that is one
+# of AGENTIC_COMMANDS with nothing of the shell's around it. What still asks:
+# any other command, a fetch, an add-on's tool, a call repeated in a loop.
+# It is a short list, not a sandbox: the tests it lets run are code OpenCode
+# wrote, and no one read them first.
+
+AGENTIC_FILE = "agentic.json"
+# A program, and what must follow it. Reads and tests only: nothing that
+# installs, fetches, deletes or changes history.
+AGENTIC_COMMANDS = {
+    "python": (("-m", "unittest"), ("-m", "pytest"), ("-m", "py_compile")),
+    "pytest": ((),),
+    "git": (("status",), ("diff",), ("log",), ("show",)),
+    "ls": ((),), "dir": ((),), "cat": ((),), "type": ((),), "head": ((),), "tail": ((),),
+    "grep": ((),), "rg": ((),), "findstr": ((),), "wc": ((),), "pwd": ((),),
+}
+AGENTIC_SAME = {"python3": "python", "py": "python"}
+CMD_STYLE = {"dir", "type", "findstr"}        # their switches start with a slash
+# Everything of the shell's but && between whole commands: a pipe, a redirect,
+# a variable, a second command behind ; or &, and the brace the shell would
+# turn into a path this check never saw.
+SHELL_CHARS = re.compile(r"[;&|<>`${}\n\r]|%\w+%")
+AGENTIC_STATUS = ("The user has Agentic on: in a task's copy, OpenCode's edits and its test "
+                  "runs and reads go through without a card, and an ask that ends with "
+                  "to-dos open or tests failing goes back to it, up to %d times. Any other "
+                  "command, a fetch and every merge still wait for the user, and it is "
+                  "refused anything outside its folder." % AGENTIC_ROUNDS)
+AGENTIC_NOTE = ("(Agentic is on. You are working by yourself in a private copy of the "
+                "project: your edits there and your test runs go through without the user "
+                "approving each one, so do not stop to ask whether to go on. Write a to-do "
+                "list, make the change, run the tests of what you changed, fix what fails, "
+                "and end with which files and functions you changed and what the tests "
+                "reported. The user reads the whole change before it is merged.)\n\n")
+
+
+def agentic():
+    """Whether the user has Agentic on."""
+    try:
+        with open(os.path.join(STATE_DIR, AGENTIC_FILE), encoding="utf-8") as f:
+            return json.load(f).get("on") is True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def agentic_task(sid):
+    """The task of session `sid` when Agentic holds for it - it is on, and the
+    task works in a copy of its own - or None."""
+    t = task(sid)
+    return t if t and t.get("isolated") and t.get("dir") and agentic() else None
+
+
+def within(path, copy):
+    """Whether `path` - absolute, or relative to the copy - is the task's
+    copy or something in it."""
+    root = os.path.normcase(os.path.realpath(copy))
+    full = os.path.normcase(os.path.realpath(os.path.join(root, path)))
+    return full == root or full.startswith(root + os.sep)
+
+
+def in_copy(path, copy):
+    """Whether `path` is a file of the task's copy, and not one of git's own."""
+    root = os.path.normcase(os.path.realpath(copy))
+    full = os.path.normcase(os.path.realpath(os.path.join(root, path)))
+    return (full.startswith(root + os.sep)
+            and os.path.relpath(full, root).split(os.sep)[0] != ".git")
+
+
+def _readings(arg):
+    """What the shell may make of an argument, quotes off. A backslash is a
+    path's in cmd and inside quotes - the model writes cd "C:\\...\\copy" - but
+    outside quotes Git Bash drops it and keeps what follows, so `.\\./x` is
+    `../x` there: an unquoted argument is read both ways."""
+    quote = arg[:1]
+    whole = (len(arg) >= 2 and quote in "\"'" and arg.endswith(quote)
+             and not re.search("[\"']", arg[1:-1]))
+    bare = arg.replace('"', "").replace("'", "")
+    return {bare.replace("\\", "/")} | (set() if whole else {re.sub(r"\\(.?)", r"\1", bare)})
+
+
+def _outside(arg, copy, prog):
+    """Whether a command's argument names a place outside the task's copy."""
+    for piece in (p for reading in _readings(arg) for p in reading.split("=")):
+        if prog in CMD_STYLE and re.fullmatch(r"/[A-Za-z?]([:\-].*)?", piece):
+            continue                          # a switch: dir /b, findstr /s
+        if piece.startswith("~"):
+            return True
+        drive = re.fullmatch(r"/([A-Za-z])(/.*)?", piece)     # Git Bash: /c/Users/...
+        if drive and os.name == "nt":
+            piece = "%s:%s" % (drive.group(1), drive.group(2) or "/")
+        if re.match(r"[A-Za-z]:", piece):
+            if os.name != "nt" or not within(piece, copy):
+                return True
+        elif (piece.startswith("/") or ".." in piece.split("/")) and not within(piece, copy):
+            return True
+    return False
+
+
+def safe_command(cmd, copy):
+    """Whether `cmd` may run in the task's copy without a card: each command
+    in it (&& may join several) is a cd or one of AGENTIC_COMMANDS, no
+    argument names a place outside the copy, and nothing else of the shell's
+    is in it."""
+    if (not isinstance(cmd, str) or not cmd.strip()
+            or SHELL_CHARS.search(cmd.replace("&&", " "))):
+        return False
+    for part in cmd.split("&&"):
+        try:
+            argv = shlex.split(part, posix=False)
+        except ValueError:
+            return False                      # a quote left open
+        if not argv:
+            return False
+        prog = argv[0].lower()
+        prog = prog[:-4] if prog.endswith(".exe") else prog
+        prog = AGENTIC_SAME.get(prog, prog)
+        args = argv[1:]
+        if prog == "cd":
+            known = len(args) == 1
+        else:
+            known = any(tuple(args[:len(s)]) == s for s in AGENTIC_COMMANDS.get(prog, ()))
+        if not known or any(_outside(a, copy, prog) for a in args):
+            return False
+    return True
+
+
+def agentic_allows(sid, p):
+    """What Agentic lets through without a card, in words for the report, or
+    None when request `p` is the user's to decide."""
+    t = agentic_task(sid)
+    if not t:
+        return None
+    copy = t["dir"]
+    kind = p.get("permission")
+    meta = p.get("metadata") or {}
+    patterns = [x for x in (p.get("patterns") or []) if isinstance(x, str)]
+    if kind == "edit":
+        files = [meta["filepath"]] if isinstance(meta.get("filepath"), str) else patterns
+        if files and all(in_copy(f, copy) for f in files):
+            return "edit " + ", ".join(rel(f) for f in files)
+    elif kind == "bash":
+        # OpenCode lists each command of a line in `patterns`, a leading cd
+        # left out; the line as typed (`metadata.command`) has to pass as well.
+        whole = meta.get("command")
+        cmds = patterns + ([whole] if isinstance(whole, str) else [])
+        if cmds and all(safe_command(c, copy) for c in cmds):
+            return "run " + (" && ".join(patterns) or whole)
+    return None
+
+
+def todo_list(sid, directory=None):
+    """The session's to-do list as [words, status] pairs; empty when it has
+    none or cannot be read."""
+    try:
+        items = get_json(route("todo", sessionID=sid), timeout=5, directory=directory)
+    except (OpenCodeError, ValueError):
+        return []
+    if not isinstance(items, list):
+        return []
+    return [[str(t.get("content") or "?"), str(t.get("status") or "")]
+            for t in items if isinstance(t, dict)]
+
+
+def open_todos(sid, t):
+    """The to-dos this ask left open, in OpenCode's words. A list the ask
+    never touched is an earlier ask's, given up with it, and is not counted:
+    a session keeps its list until OpenCode writes another."""
+    todos = todo_list(sid, t.get("dir"))
+    if todos == t.get("todos"):
+        return []
+    return [words for words, status in todos if status not in ("completed", "cancelled")]
+
+
+def unfinished(sid, lines, nudge=False):
+    """Why an ask that ended is not finished, and the prompt that sends
+    OpenCode back to it: (why, prompt), or None when it is finished, Agentic
+    does not hold, or it has been sent back AGENTIC_ROUNDS times already.
+    `lines` is what `after_ask` said; `nudge` is whether the ask wanted a
+    change and none has been made."""
+    t = agentic_task(sid)
+    if not t or len(t.get("rounds", [])) >= AGENTIC_ROUNDS:
+        return None
+    failed = [l for l in lines if l.startswith("Tests FAILED")]
+    if failed:
+        return ("the tests failed",
+                "The tests of what you changed failed. Fix the code - change a test only "
+                "if the test itself is wrong - then run them again. If a failing test has "
+                "nothing to do with your change, leave it alone and say so.\n\n" + failed[0])
+    todo = open_todos(sid, t)
+    if todo:
+        return ("%d to-do(s) were open" % len(todo),
+                "You stopped with %d to-do(s) still open:\n%s\nTick off any that are in "
+                "fact done, then carry on with the first that is not; do not start over. "
+                "When all are done, run the tests of what you changed and say which files "
+                "and functions you changed."
+                % (len(todo), "\n".join("- " + x[:200] for x in todo[:12])))
+    if nudge and "nothing had changed" not in t.get("rounds", []):
+        return ("nothing had changed",
+                "Nothing in your copy has changed yet. If the task asks for a change, make "
+                "it now: edit the file, then run its tests. If no change is needed, say "
+                "why in a line or two.")
+    return None
+
+
+def send_back(sid, again):
+    """Send OpenCode back to an ask that ended with work left: `again` is
+    `unfinished`'s (why, prompt). Counted on the task, so the rounds of one
+    ask stay within AGENTIC_ROUNDS over every call that follows it."""
+    why, words = again
+    update_task(sid, owed=None, rounds=(task(sid) or {}).get("rounds", []) + [why])
+    studio_mcp.progress("back to OpenCode: " + why)
+    prompt(sid, words)
+
+
+# Words a request for reading starts with; anything else is taken as a change.
+ASKS = frozenset(("what", "whats", "why", "how", "where", "which", "who", "when", "explain",
+                  "describe", "list", "show", "tell", "is", "are", "does", "do", "did",
+                  "summarize", "summarise", "review", "inspect", "diagnose", "find",
+                  "check", "look", "read", "compare"))
+
+
+def wants_change(text):
+    """Whether a task reads as a change to make rather than a question."""
+    first = (text.strip().splitlines() or [""])[0].strip().casefold()
+    return (bool(first) and not first.endswith("?")
+            and re.split(r"[^a-z]+", first.replace("'", ""), 1)[0] not in ASKS)
+
+
 def settle(family, log):
     """Put every pending request of this session's family to the user - or
-    answer it from a grant the user gave - and return how many there were.
-    Raises Stopped when the user stops."""
+    answer it from a grant the user gave, or from Agentic - and return how
+    many there were. Raises Stopped when the user stops."""
     n = 0
     where = family.directory
     for p in pending_permissions(where):
@@ -632,6 +876,11 @@ def settle(family, log):
         if g:
             reply_permission(p["id"], "once", "", where)
             log.append("allowed by the user's standing grant (%s): %s" % (g.get("label"), what))
+            continue
+        let = agentic_allows(family.root, p)
+        if let:
+            reply_permission(p["id"], "once", "", where)
+            log.append("allowed by Agentic: %s" % let)
             continue
         (decision, note), asked = ask_permission(p)
         if decision == "always":
@@ -702,17 +951,30 @@ def progress_line(state, todos, files, decided, quiet):
     return "; ".join(parts)
 
 
-def follow(sid, seen, work_limit):
+class Clock:
+    """The seconds of work one call may spend, over every round of it. Time
+    The user spends deciding is not work and is never added."""
+
+    def __init__(self, limit):
+        self.limit, self.spent = limit, 0.0
+
+    def add(self, seconds):
+        """Count `seconds` of work; True once the limit is passed."""
+        self.spent += seconds
+        return self.spent > self.limit
+
+
+def follow(sid, seen, clock, log=None):
     """Follow session `sid` until it is idle, putting each step it asks about
     to the user. Returns (state, report): state is "done", "stopped" or
     "working" (the work limit ran out). `seen` is the message ids that were
-    there before; what came after is reported. Time the user spends deciding
-    does not count."""
+    there before; what came after is reported. `clock` is the work the call
+    has left and `log` the steps decided so far, both shared by the rounds of
+    one ask. Time the user spends deciding does not count."""
     directory = task_dir(sid)
     family = Family(sid, directory)
     events = Events(directory)
-    log = []
-    worked = 0.0
+    log = [] if log is None else log
     started = time.monotonic()
     stopped = None
     idle_polls = 0
@@ -720,6 +982,7 @@ def follow(sid, seen, work_limit):
     # long since anything moved - an event, a to-do ticked, a file written -
     # so a stuck session reads as stuck rather than as endless dots.
     last_act, next_look, snap = started, 0.0, None
+    said, say_by = None, 0.0
     try:
         while True:
             if studio_mcp.cancelled():
@@ -746,11 +1009,15 @@ def follow(sid, seen, work_limit):
                     snap, last_act = look, now
             last_act = max(last_act, events.last)
             todos, files = snap
-            studio_mcp.progress(progress_line(state, todos, files, len(log), now - last_act),
-                                *(todos or (None, None)))
+            # Said when it changes, and every LOOK seconds so the client sees
+            # the bridge alive. Every pass used to say it: five lines a second
+            # while OpenCode streamed (765 in one live run of 141 s).
+            line = progress_line(state, todos, files, len(log), now - last_act)
+            if line != said or now >= say_by:
+                said, say_by = line, now + LOOK
+                studio_mcp.progress(line, *(todos or (None, None)))
             events.wait(max(POLL, EVENT_WAIT) if events.alive else POLL)
-            worked += time.monotonic() - tick
-            if worked > work_limit:
+            if clock.add(time.monotonic() - tick):
                 return "working", report(sid, seen, log)
     except Stopped as e:
         stopped = str(e)
@@ -767,24 +1034,36 @@ def follow(sid, seen, work_limit):
 
 
 def outcome(sid, state, text, work_limit):
-    """A follow's (state, report) as the tool result the model reads."""
+    """A follow's (state, report) as the tool result the model reads. The
+    state and session ride in `_meta` for a client that follows on by itself
+    (the tab's Direct mode)."""
     if state == "working":
-        return result(
+        res = result(
             "OpenCode is still working on session %s after %d seconds of work. Do "
             "not send the task again: call opencode_wait with this session_id to "
             "keep following it, or opencode_abort to stop it.\n%s"
             % (sid, work_limit, text), error=True)
-    if state == "stopped":
+    elif state == "unfinished":
         why, _, rest = text.partition("\n")
-        return result("The user stopped OpenCode %s. Session %s is halted; what it had "
-                      "already changed stays until it is undone or discarded.\n%s"
-                      % (why, sid, rest), error=True)
-    return result("Session %s is done.\n%s" % (sid, text))
+        res = result(
+            "Session %s has work left (%s) and this call's %d seconds of work are "
+            "used. Do not send the task again: call opencode_wait with this "
+            "session_id to send OpenCode back to it, or tell the user where it "
+            "stands.\n%s" % (sid, why, work_limit, rest), error=True)
+    elif state == "stopped":
+        why, _, rest = text.partition("\n")
+        res = result("The user stopped OpenCode %s. Session %s is halted; what it had "
+                     "already changed stays until it is undone or discarded.\n%s"
+                     % (why, sid, rest), error=True)
+    else:
+        res = result("Session %s is done.\n%s" % (sid, text))
+    res["_meta"] = {"studio/opencode": {"session": sid, "state": state}}
+    return res
 
 
 def run(sid, seen, work_limit):
     """follow() as a tool result."""
-    state, text = follow(sid, seen, work_limit)
+    state, text = follow(sid, seen, Clock(work_limit))
     return outcome(sid, state, text, work_limit)
 
 
@@ -1087,17 +1366,35 @@ def tests_for(root, files):
 
 
 def run_tests(root, mods):
-    """Run `mods` in `root` and say how it went, in a few lines."""
+    """Run `mods` in `root` and say how it went, in a few lines. It reports
+    that it is still at it every TEST_LOOK seconds - a run longer than the
+    client's patience is not a hung bridge - and ends with the user's Stop."""
     try:
-        p = subprocess.run([sys.executable, "-m", "unittest"] + mods, cwd=root,
-                           capture_output=True, stdin=subprocess.DEVNULL, timeout=TEST_TIMEOUT,
-                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-                           creationflags=NO_WINDOW)
-    except subprocess.TimeoutExpired:
-        return "Tests %s did not finish in %d seconds." % (", ".join(mods), TEST_TIMEOUT)
+        p = subprocess.Popen([sys.executable, "-m", "unittest"] + mods, cwd=root,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL,
+                             env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                             creationflags=NO_WINDOW)
     except OSError as e:
         return "Tests could not be run: %s" % e
-    out = (p.stderr + p.stdout).decode("utf-8", "replace").strip()
+    started = time.monotonic()
+    while True:
+        try:
+            out = p.communicate(timeout=TEST_LOOK)[0]
+            break
+        except subprocess.TimeoutExpired:
+            spent = time.monotonic() - started
+            stop = studio_mcp.cancelled()
+            if stop or spent > TEST_TIMEOUT:
+                p.kill()
+                p.communicate()
+                if stop:
+                    raise Stopped("the user pressed Stop")
+                return "Tests %s did not finish in %d seconds." % (", ".join(mods),
+                                                                   TEST_TIMEOUT)
+            studio_mcp.progress("running the tests of what OpenCode changed (%s)"
+                                % _span(spent))
+    out = out.decode("utf-8", "replace").strip()
     ran = re.search(r"Ran (\d+) tests?", out)
     count = ran.group(1) if ran else "?"
     if p.returncode == 0:
@@ -1265,12 +1562,15 @@ def t_discard(a):
 def t_grants(a):
     sid = a.get("session_id") or last_session()
     grants = (task(sid) or {}).get("grants", [])
+    # Agentic is not a grant: the user's switch, not theirs to revoke from here.
+    also = ("\n" + AGENTIC_STATUS) if agentic_task(sid) else ""
     if not grants:
-        return result("Session %s has no standing grants: every step is asked." % (sid or "-"))
+        return result("Session %s has no standing grants%s%s"
+                      % (sid or "-", "." if also else ": every step is asked.", also))
     return result("Standing grants in session %s (allowed without asking):\n%s\n"
-                  "opencode_revoke takes one back." % (sid, "\n".join(
+                  "opencode_revoke takes one back.%s" % (sid, "\n".join(
                       "%d. %s (since %s)" % (i + 1, g.get("label"), g.get("since", "?"))
-                      for i, g in enumerate(grants))))
+                      for i, g in enumerate(grants)), also))
 
 
 def t_revoke(a):
@@ -1379,7 +1679,8 @@ def t_status(a):
                 lines.append(note)
         except (OSError, ValueError):
             pass
-    lines.append("It reads freely; every edit, command and fetch waits for the user's "
+    lines.append(AGENTIC_STATUS if agentic() and is_repo() else
+                 "It reads freely; every edit, command and fetch waits for the user's "
                  "approval, and it is refused anything outside its folder.")
     return result("\n".join(lines))
 
@@ -1467,16 +1768,54 @@ def t_ask(a):
     if (task(sid) or {}).get("undone"):
         text = ("(The user undid your last change in this task: those files are back as "
                 "they were before it. Do not assume it is there.)\n\n" + text)
+    if agentic_task(sid):
+        # A new ask: its rounds start over, and the to-dos it finds are not its own.
+        update_task(sid, rounds=[], owed=None, todos=todo_list(sid, task_dir(sid)))
+        text = AGENTIC_NOTE + text
     prompt(sid, text)
-    return finish(sid, seen, _work_limit(a), a["prompt"].strip().splitlines()[0][:80])
+    return finish(sid, seen, _work_limit(a), a["prompt"].strip().splitlines()[0][:80],
+                  change=wants_change(a["prompt"]))
 
 
-def finish(sid, seen, work_limit, label):
+def finish(sid, seen, work_limit, label, change=False):
     """Follow an ask to its end; when it ends done, test and checkpoint what
-    it changed. The result the model reads."""
-    state, text = follow(sid, seen, work_limit)
+    it changed. With Agentic on, an ask that ended with work left goes back
+    to OpenCode (`unfinished`) - within this call's one work limit, and the
+    count of rounds is the task's, so opencode_wait carries on where an ask
+    ran out. `change` is whether the ask wanted one made. The result the
+    model reads."""
+    clock, log, extra = Clock(work_limit), [], []
+    before = len((task(sid) or {}).get("checkpoints", []))
+    while True:
+        state, text = follow(sid, seen, clock, log)
+        if state != "done":
+            extra = []                        # an earlier round's tests are not this one's
+            break
+        tick = time.monotonic()
+        try:
+            extra = after_ask(sid, label)
+        except Stopped as e:
+            state, text = "stopped", "(%s)\n%s" % (e, text)
+            break
+        t = task(sid) or {}
+        again = unfinished(sid, extra, change and len(t.get("checkpoints", [])) == before)
+        if not again:
+            break
+        if clock.add(time.monotonic() - tick):
+            # No work left in this call to follow another round: it is owed,
+            # and opencode_wait sends it (the tests will not fail again by
+            # themselves - what they ran is checkpointed).
+            update_task(sid, owed=list(again))
+            state, text = "unfinished", "%s\n%s" % (again[0], text)
+            break
+        send_back(sid, again)
     out = outcome(sid, state, text, work_limit)
-    extra = after_ask(sid, label) if state == "done" else []
+    rounds = (task(sid) or {}).get("rounds", [])
+    if rounds and agentic_task(sid):
+        extra.append("Agentic sent OpenCode back to work %d time(s) by itself: %s.%s"
+                     % (len(rounds), "; ".join(rounds),
+                        " That is as often as it does; what is left is the user's call."
+                        if len(rounds) >= AGENTIC_ROUNDS else ""))
     note = context_note(_loaded_conf())
     if note:
         extra.append(note)
@@ -1492,6 +1831,12 @@ def t_wait(a):
     # ask returns the whole answer rather than only what came since.
     last_user = max((i for i, m in enumerate(msgs) if _role(m) == "user"), default=-1)
     seen = {_info(m).get("id") for m in msgs[:last_user + 1]}
+    # A round the last call had no work left for is sent now, if Agentic still
+    # holds and the session is at rest.
+    t = agentic_task(sid)
+    if (t and t.get("owed") and len(t.get("rounds", [])) < AGENTIC_ROUNDS
+            and (statuses(t["dir"]).get(sid) or {}).get("type", "idle") == "idle"):
+        send_back(sid, t["owed"])
     return finish(sid, seen, _work_limit(a), "waited-for work")
 
 
@@ -1705,7 +2050,10 @@ TOOLS = [
      "who allows or refuses it - you are not asked and cannot answer for them. Returns "
      "the user's decisions and what OpenCode said and did. By "
      "default: it continues the last session, so OpenCode remembers earlier work. Set "
-     "new_session for an unrelated job.",
+     "new_session for an unrelated job. When the user has turned Agentic on, edits and "
+     "test runs inside the task's copy go through without a card, and an ask that ends "
+     "with to-dos open or tests failing is sent back to OpenCode before this returns; "
+     "only the user turns Agentic on or off.",
      _obj({"prompt": _s("The task, as you would brief a programmer: what to build or "
                         "change, in which files, and what done looks like."),
            "session_id": _s("Session to continue. Omit to continue the last one."),
@@ -1716,9 +2064,10 @@ TOOLS = [
                          minimum=10, maximum=MAX_WORK)},
           ["prompt"])),
     ("opencode_wait", t_wait,
-     "Keep following a session that is still working - after opencode_ask handed back "
-     "at its timeout - putting each step it asks about to the user as opencode_ask "
-     "does. Returns what it said and did since the last task it was given.",
+     "Keep following a session that is still working, or has work left - after "
+     "opencode_ask handed back at its timeout - putting each step it asks about to the "
+     "user as opencode_ask does. Returns what it said and did since the last task it "
+     "was given.",
      _obj({"session_id": _s("The session id."),
            "timeout": _i("Seconds of work to wait for. Default %d." % DEFAULT_WORK,
                          minimum=10, maximum=MAX_WORK)},
@@ -1809,13 +2158,15 @@ HINTS = {
 }
 
 SERVER = studio_mcp.Server(
-    "studio-opencode-mcp", "3.0",
+    "studio-opencode-mcp", "3.1",
     studio_mcp.tools_from_table(TOOLS, read_only=READ_ONLY, **HINTS),
     errors=(OpenCodeError, KeyError, TypeError, ValueError, OSError),
     instructions="OpenCode codes in one folder with the local model, each task in a copy "
                  "of its own. opencode_ask briefs it and follows it to the end; every edit, "
                  "command and fetch it wants, and every merge, undo or discard, is put to the "
-                 "user through MCP elicitation, never to the model. Call "
+                 "user through MCP elicitation, never to the model. With the user's Agentic "
+                 "switch on, edits and test runs inside a task's copy go through unasked; "
+                 "no tool sets that switch. Call "
                  "opencode_status first if a tool reports it cannot reach OpenCode.")
 
 

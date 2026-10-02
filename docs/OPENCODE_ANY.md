@@ -22,8 +22,9 @@ merges it when it is right. Do not commit, switch branches, merge or run other `
 commands that change history; a checkpoint is saved after each task for you.
 
 ## How to work
-1. Make the smallest change that does the task. The user approves every edit by
-   reading its diff, so several small edits beat one huge one.
+1. Make the smallest change that does the task. The user reads every edit's diff -
+   as you make it, or all of them before merging - so several small edits beat one
+   huge one.
 2. Match the surrounding code's style and comment density.
 3. Run the tests that cover what you changed, with the project's own test command.
 4. When finished, say in a few lines which files and functions you changed and what

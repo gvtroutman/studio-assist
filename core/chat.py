@@ -107,6 +107,15 @@ SUGGESTED_BRIDGES = {
 
 MAX_STEPS = 25
 CALL_TEXT_LIMIT = 12_000                  # chars of one argument or result shown in a folded call row
+# What the OpenCode tab says when its Agentic button is pressed.
+AGENTIC_ON = ("Agentic is on. In a task's own copy OpenCode now edits and runs its tests "
+              "without asking you at each step, and goes back to work by itself while "
+              "to-dos are open or tests fail. Any other command and every web fetch still "
+              "ask. Nothing reaches your folder until you merge, and you see the whole "
+              "change first. Stop ends a run.\n")
+AGENTIC_OFF = "Agentic is off: every edit, command and fetch asks you first.\n"
+DIRECT_FOLLOWS = ("working", "unfinished")    # states of a call Direct follows on from
+DIRECT_WAITS = 5                              # ...this many times, ten minutes of work each
 
 # ------------------------------------------------------------------- animation
 # Everything that moves is driven from one `after` tick, for the same reason
@@ -795,7 +804,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         # briefing it in between - one model's context on the GPU, not two,
         # and nothing lost in the retelling. Also OpenCode's tab only.
         self.btn_direct = self._button(head, "Direct: off", self._toggle_direct, bg="head")
-        self.btn_fix = self._button(head, "Start app", self._on_fix, bg="head",
+        # Agentic: in a task's copy OpenCode edits and runs its tests without
+        # a card for each step, and goes back to work by itself while to-dos
+        # are open or tests fail. The user's switch - no tool has it - and the
+        # merge into their folder still asks. OpenCode's tab only.
+        self.btn_agentic = self._button(head, "Agentic: off", self._toggle_agentic, bg="head")
+        self.btn_fix =self._button(head, "Start app", self._on_fix, bg="head",
                                     kind="accent")
         # Shown only when GitHub has commits this folder does not (_show_update).
         self.btn_update = self._button(head, "Update", self._on_update, bg="head",
@@ -2618,9 +2632,13 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self.btn_direct.pack(side="right", padx=(6, 0), after=self.btn_addons)
             self.btn_direct.set(text="Direct: on" if getattr(s, "direct", False) else "Direct: off",
                                 state="disabled" if s.busy else "normal")
+            self.btn_agentic.pack(side="right", padx=(6, 0), after=self.btn_direct)
+            self.btn_agentic.set(text="Agentic: on" if self._agentic(s) else "Agentic: off",
+                                 state="disabled" if s.busy else "normal")
         else:
             self.btn_addons.pack_forget()
             self.btn_direct.pack_forget()
+            self.btn_agentic.pack_forget()
         self.btn_new.set(state="disabled" if held else "normal")
         self.btn_hist.set(state="disabled" if s.busy or held else "normal")
         stopping = s.busy and s.cancel.is_set()
@@ -4610,6 +4628,25 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                     ("Direct is off: the model briefs OpenCode and reports back.\n"), "sys")
         self._apply_status()
 
+    def _agentic(self, s):
+        """Whether Agentic is on for this tab's app; off for one that has no
+        such switch."""
+        asks = getattr(s.app, "agentic", None)
+        return bool(asks()) if callable(asks) else False
+
+    def _toggle_agentic(self):
+        s = self.cur()
+        if s is None or s.busy or not getattr(s.app, "served", False):
+            return
+        on = not self._agentic(s)
+        try:
+            s.app.set_agentic(on)
+        except OSError as e:
+            self._write(s, "Agentic could not be switched: %s\n" % e, "sys")
+            return
+        self._write(s, AGENTIC_ON if on else AGENTIC_OFF, "sys")
+        self._apply_status()
+
     def _remember_turn(self, s, emit):
         """A message that only states a lesson ("remember ...", "from now on
         ...") is kept as it stands and answered here, with no model and no
@@ -4635,14 +4672,35 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
     def _direct_turn(self, s, emit):
         """One message straight to OpenCode: opencode_ask with the user's own
         words, its report as the reply. Every step it wants still comes up as
-        an approval card - the bridge asks, whoever sent the task."""
+        an approval card - the bridge asks, whoever sent the task. A call that
+        hands back with OpenCode still at work is followed on with
+        opencode_wait, since no model is here to do it; Stop ends it."""
         emit("status", ("OpenCode is working" + ELLIPSIS, "muted", True))
-        res = s.mcp.call_tool("opencode_ask", {"prompt": s.messages[-1]["content"]})
-        reply = eng.mcp_result_to_text(res).strip() or "(OpenCode said nothing)"
+        stopped = False
+        try:
+            res = s.mcp.call_tool("opencode_ask", {"prompt": s.messages[-1]["content"]},
+                                  cancel=s.cancel)
+            for _ in range(DIRECT_WAITS):
+                at = ((res.get("_meta") or {}).get("studio/opencode") or {}
+                      if isinstance(res, dict) else {})
+                if (s.cancel.is_set() or at.get("state") not in DIRECT_FOLLOWS
+                        or not at.get("session")):
+                    break
+                emit("status", ("OpenCode is still working" + ELLIPSIS, "muted", True))
+                res = s.mcp.call_tool("opencode_wait", {"session_id": at["session"]},
+                                      cancel=s.cancel)
+        except eng.Cancelled:
+            # The user's own Stop, which the bridge hears too and halts the
+            # session on: said as it is, not as a tool's error.
+            stopped = True
+        reply = ("Stopped. What OpenCode had already changed stays in its copy until it is "
+                 "undone or discarded." if stopped else
+                 eng.mcp_result_to_text(res).strip() or "(OpenCode said nothing)")
         emit("token", reply)
         emit("stream_end", None)
         s.messages.append({"role": "assistant", "content": reply})
-        s.record.status = ("response complete" if not (isinstance(res, dict) and res.get("isError"))
+        s.record.status = (reply if stopped else "response complete"
+                           if not (isinstance(res, dict) and res.get("isError"))
                            else "needs attention: " + reply.split("\n")[0][:120])
 
     def _learn(self, s, executor, emit):
