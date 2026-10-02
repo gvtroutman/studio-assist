@@ -480,7 +480,7 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
         self.assertEqual([p["label"] for p in job.record["passes"]],
                          ["Eye pass", "Beard", "Hands", "Glasses"])
-        self.assertIn("Beard pass: 1 beard redrawn in the scene's mask, denoise %s."
+        self.assertIn("Beard pass: 1 beard redrawn in its mask, denoise %s."
                       % ig.BEARD_DENOISE, job.record["notes"])
         self.assertIn(("beard", "Beard pass"), ig.pipeline_stages(self.studio.lib, job.settings))
 
