@@ -158,7 +158,7 @@ class TestItemPassInGenerate(TempStudioMixin, unittest.TestCase):
         self.studio.client_factory = client or WornClient
         self.studio.clients = {}
         s = dict(ig.default_settings(), model="z-image-turbo", backend="5090",
-                 scene="A man in a park", auto_refine=False, hand_pass=False,
+                 scene="A man in a park", critic_notes=False, hand_pass=False,
                  wearing=[{"name": "flannel shirt", "path": self.shirt}], **settings)
         jobs = self.studio.submit(s)
         settle(jobs)

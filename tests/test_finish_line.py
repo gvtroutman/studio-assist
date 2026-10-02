@@ -84,7 +84,7 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
 
     def settings(self):
         return dict(ig.default_settings(), model='z-image-turbo', backend='5090',
-                    scene='A portrait', identities=['person'], auto_refine=False)
+                    scene='A portrait', identities=['person'], critic_notes=False)
 
     def test_failed_finish_keeps_picture_and_retries_offline_with_saved_profile(self):
         self.profile()

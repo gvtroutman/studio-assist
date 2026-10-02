@@ -33,7 +33,7 @@ def main():
     settings = {"model": "withanyone", "scene": args.prompt,
                 "identities": [i["id"] for i in studio.lib.all("identities")],
                 "width": args.width, "height": args.height, "seed": args.seed,
-                "steps": args.steps, "anatomy": False, "auto_refine": False,
+                "steps": args.steps, "anatomy": False, "critic_notes": False,
                 "face_detail": False}
     job = ig.Job(settings, backend)
     previous = [None]

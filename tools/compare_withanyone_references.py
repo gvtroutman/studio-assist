@@ -44,7 +44,7 @@ def main():
             settings = dict(ig.default_settings(), model="withanyone", identities=[identity["id"]],
                             scene=args.prompt, seed=args.seed, seed_mode="fixed", steps=25,
                             width=args.size, height=args.size, anatomy=False, face_detail=False,
-                            auto_refine=False, hand_pass=False,
+                            critic_notes=False, hand_pass=False,
                             experimental_reference_groups=(label == "all-photos"))
             job = ig.Job(settings, backend)
             previous = [None]
