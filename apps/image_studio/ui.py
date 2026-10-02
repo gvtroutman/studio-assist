@@ -2364,9 +2364,12 @@ class ImageStudio:
         self.act_again = self.button(acts, "Generate again  ▾", self._again_menu, bg="card")
         self.act_fix = self.button(acts, "Fix a spot", self._fix_selected, bg="card")
         self.act_blend = self.button(acts, "Blend" + ELLIPSIS, self._blend_selected, bg="card")
+        self.act_swap = self.button(acts, "Face swap" + ELLIPSIS, lambda: self.face_swap(),
+                                    bg="card")
         self.act_again.pack(side="left")
         self.act_fix.pack(side="right")
         self.act_blend.pack(side="right", padx=(0, self.px(4)))
+        self.act_swap.pack(side="right", padx=(0, self.px(4)))
         for p in (self.act_again, self.act_fix):
             p.set(state="disabled")
         # The prompt and settings are in the Queue / History row below, so the
@@ -2420,6 +2423,7 @@ class ImageStudio:
         menu.add_command(label="Open", command=self._open_selected)
         menu.add_command(label="Fix a spot" + ELLIPSIS, command=self._fix_selected)
         menu.add_command(label="Blend with" + ELLIPSIS, command=self._blend_selected)
+        menu.add_command(label="Face swap" + ELLIPSIS, command=lambda: self.face_swap(path))
         if self._selected_steps()[0]:
             menu.add_command(label="Show nodes", command=self._show_nodes)
         menu.add_command(label="Show in folder", command=lambda: self._open_selected(True))
@@ -3019,6 +3023,17 @@ class ImageStudio:
         if window is None or not window.win.winfo_exists():
             window = self._blend_window = BlendWindow(self)
         window.take(first, settings)
+        window.win.lift()
+        return window
+
+    def face_swap(self, first=None):
+        """Face swap photos (`FaceSwapWindow`): one, raised if it is already
+        open, with `first` (the picture shown, from its menu) added to it."""
+        window = getattr(self, "_swap_window", None)
+        if window is None or not window.win.winfo_exists():
+            window = self._swap_window = FaceSwapWindow(self)
+        if first and os.path.isfile(first):
+            window._took([first], [])
         window.win.lift()
         return window
 
@@ -3920,6 +3935,289 @@ class BlendWindow:
                     "Blend again for another.", "ok")
         o._show_list("queue")
         o.host._spawn(o.s.event_id, o._submit, s)
+
+
+class FaceSwapWindow:
+    """Face swap photos (`ImageStudio.face_swap`): pictures from outside the
+    Studio - Add pictures, the library, or files, a folder or a web picture
+    dropped on the window - each given a library person's face by FaceFusion
+    on this PC (`ig.upload_swap`, a face-only job like Retry face swap's).
+    A picture with one face needs no click: Person's face goes on it. With
+    more, a click on each face to change marks it for the person chosen
+    then; a right-click takes a mark off. Swap faces queues a job per
+    picture; History gets the swapped picture, or - when the swap fails (a
+    face it could not tell from another) - the picture as uploaded, a Retry
+    face swap or a Fix a spot > Choose face away."""
+    THUMB = 72                    # px, a strip picture's long edge, before the display's scale
+    RING = 16                     # px, a mark's radius on screen
+
+    def __init__(self, owner):
+        self.owner = o = owner
+        host = o.host
+        self.pictures = []        # [{"path", "marks": [{"identity", "point": [x, y] 0-1}]}]
+        self.at = None            # the index of the picture shown large
+        self.img = None
+        self.thumbs = []
+        self.importing = False
+        idents = [(i["id"], i["name"]) for i in o.studio.lib.all("identities")]
+        self.names = dict(idents)
+        self.person = idents[0][0] if idents else ""
+        self.win = win = tk.Toplevel(host)
+        win.title("Face swap photos")
+        win.transient(host)
+        host._skin(win, bg="bg")
+        win.geometry("%dx%d" % (host._px(820), host._px(780)))
+
+        foot = o.frame(win)
+        foot.pack(side="bottom", fill="x", padx=o.px(12), pady=o.px(12))
+        o.button(foot, "Swap faces", self.start, kind="accent").pack(side="right")
+        o.button(foot, "Remove picture", self.remove, kind="ghost").pack(
+            side="right", padx=(0, o.px(4)))
+        self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(540))
+        self.msg.pack(side="left", fill="x", expand=True)
+
+        row = o.frame(win)
+        row.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(12), 0))
+        o.label(row, "Person", "muted", width=8).pack(side="left")
+        if idents:
+            o.choice(row, idents, self.person, self._pick_person).pack(side="left")
+        else:
+            o.label(row, "No identities yet (Library > Identities).", "faint",
+                    host.f_small).pack(side="left")
+        o.button(row, "From library" + ELLIPSIS, self.from_library, kind="ghost").pack(
+            side="right")
+        o.button(row, "Add pictures" + ELLIPSIS, self.from_files).pack(
+            side="right", padx=(0, o.px(4)))
+
+        self.strip = tk.Canvas(win, height=o.px(self.THUMB + 12), bd=0, highlightthickness=0)
+        o.skin(self.strip, bg="bg")
+        self.strip.pack(side="top", fill="x", padx=o.px(12), pady=(o.px(10), 0))
+        self.strip.bind("<MouseWheel>", lambda ev: self.strip.xview_scroll(
+            -1 if ev.delta > 0 else 1, "units"))
+        self.canvas = tk.Canvas(win, bd=0, highlightthickness=0, cursor="crosshair")
+        o.skin(self.canvas, bg="card")
+        self.canvas.pack(side="top", fill="both", expand=True, padx=o.px(12),
+                         pady=(o.px(8), 0))
+        self.canvas.bind("<Configure>", lambda ev: self._layout())
+        self.canvas.bind("<Button-1>", self._mark)
+        self.canvas.bind("<Button-3>", self._unmark)
+        self.drops = filedrop.accept(win, self._dropped)
+        self.draw_strip()
+        self._layout()
+        self.status()
+
+    # ------------------------------------------------------------- words
+    def status(self, text=None, role="muted"):
+        if not self.win.winfo_exists():
+            return
+        if text is None:
+            pic = self.current()
+            text = ("Add the pictures to swap faces on%s." % (
+                    ", or drop them on this window" if self.drops else "")
+                    if pic is None else
+                    "One face in it: %s's goes on, nothing to click. More than one: click "
+                    "each face to change, with its person chosen above." % self.names.get(
+                        self.person, "the person") if not pic["marks"] else
+                    "%d marked: only those faces change. Right-click one to take it off."
+                    % len(pic["marks"]))
+        self.msg.config(text=text)
+        self.owner.skin(self.msg, bg="bg", fg=role)
+
+    def _pick_person(self, ident):
+        self.person = ident
+        self.status()
+
+    def current(self):
+        return self.pictures[self.at] if self.at is not None else None
+
+    # ------------------------------------------------------------- adding
+    def take(self, paths=(), url=None):
+        """Pictures in: kept under references/face-swap (`ig.keep_uploads`,
+        off the UI thread) and added to the strip, the first new one shown."""
+        if self.importing:
+            return self.status("Still adding the last pictures; add these when it finishes.")
+        paths = [p for p in paths if p]
+        if not paths and not url:
+            return
+        self.importing = True
+        self.status("Adding%s" % ELLIPSIS)
+        lib = self.owner.studio.lib
+
+        def work():
+            try:
+                kept, errors = ig.keep_uploads(
+                    lib, paths, url, lambda pairs: catalog.to_png(pairs, side=8192))
+            except Exception as e:            # said; the window stays usable
+                kept, errors = [], ["%s: %s" % (type(e).__name__, e)]
+            self.owner._post("call", lambda: self._took(kept, errors))
+        self.owner.host._spawn(self.owner.s.event_id, work)
+
+    def _took(self, kept, errors):
+        self.importing = False
+        if not self.win.winfo_exists():
+            return
+        have = {p["path"] for p in self.pictures}
+        new = [p for p in kept if p not in have]
+        self.pictures += [{"path": p, "marks": []} for p in new]
+        if new:
+            self.at = len(self.pictures) - len(new)
+        self.draw_strip()
+        self._layout()
+        if errors:
+            return self.status("Not added - " + "; ".join(errors), "err" if not new else "warn")
+        self.status()
+        self.win.lift()
+
+    def from_files(self):
+        self.take(filedialog.askopenfilenames(parent=self.win, title="Pictures to swap faces on",
+                                              filetypes=[("Pictures", "*.png *.jpg *.jpeg "
+                                                          "*.webp *.gif *.bmp")]))
+
+    def from_library(self):
+        """A picture of History's is a PNG of the Studio's already: in as it is."""
+        ImageLibraryWindow(self.owner, pick=lambda path: self._took([path], []))
+
+    def _dropped(self, paths, url):
+        """Files, folders or a web picture let go on the window (`filedrop`)."""
+        self.take(paths, url)
+
+    def remove(self):
+        if self.at is None:
+            return
+        del self.pictures[self.at]
+        self.at = min(self.at, len(self.pictures) - 1) if self.pictures else None
+        self.draw_strip()
+        self._layout()
+        self.status()
+
+    # ------------------------------------------------------------- the strip
+    def draw_strip(self):
+        c, o, C = self.strip, self.owner, self.owner.host.C
+        c.delete("all")
+        self.thumbs = []
+        side, gap, x = o.px(self.THUMB), o.px(6), o.px(2)
+        for i, pic in enumerate(self.pictures):
+            img = photo(pic["path"], side)
+            self.thumbs.append(img)
+            tag = "pic%d" % i
+            c.create_rectangle(x, o.px(2), x + side + o.px(4), side + o.px(6), width=2,
+                               outline=C["accent"] if i == self.at else C["border"], tags=tag)
+            if img is not None:
+                c.create_image(x + o.px(2) + side // 2, o.px(4) + side // 2, image=img,
+                               tags=tag)
+            if pic["marks"]:
+                c.create_text(x + side, o.px(6), anchor="ne", text=str(len(pic["marks"])),
+                              fill=C["ok"], font=o.host.f_small, tags=tag)
+            c.tag_bind(tag, "<Button-1>", lambda ev, i=i: self.show(i))
+            x += side + o.px(4) + gap
+        c.config(scrollregion=(0, 0, x, side + o.px(8)))
+
+    def show(self, i):
+        self.at = i
+        self.draw_strip()
+        self._layout()
+        self.status()
+
+    # ------------------------------------------------------------- the picture
+    def _layout(self):
+        """Fit the picture shown to the canvas; `k` is screen px per picture px."""
+        c, pic = self.canvas, self.current()
+        cw, ch = c.winfo_width(), c.winfo_height()
+        self.img = None
+        if pic is not None and cw >= 20 and ch >= 20:
+            size = ig.file_size_of(pic["path"]) or (0, 0)
+            self.w, self.h = size
+            if self.w and self.h:
+                side = min(cw, ch * self.w / float(self.h)) if self.w >= self.h else \
+                    min(ch, cw * self.h / float(self.w))
+                self.img = photo_at(pic["path"], int(side), self.owner.host)
+        if self.img is not None:
+            self.k = self.img.width() / float(self.w)
+            self.ox = (cw - self.img.width()) // 2
+            self.oy = (ch - self.img.height()) // 2
+        self._draw()
+
+    def _draw(self):
+        c, C, pic = self.canvas, self.owner.host.C, self.current()
+        c.delete("all")
+        if self.img is None:
+            c.create_text(c.winfo_width() // 2, c.winfo_height() // 2, fill=C["faint"],
+                          font=self.owner.host.f_ui,
+                          text="No picture yet" if pic is None else
+                          "No preview for %s" % os.path.basename(pic["path"]))
+            return
+        c.create_image(self.ox, self.oy, image=self.img, anchor="nw")
+        r = self.owner.px(self.RING)
+        for m in pic["marks"]:
+            x = self.ox + m["point"][0] * self.w * self.k
+            y = self.oy + m["point"][1] * self.h * self.k
+            c.create_oval(x - r, y - r, x + r, y + r, outline=C["ok"], width=2)
+            c.create_text(x, y + r + self.owner.px(3), anchor="n", fill=C["ok"],
+                          font=self.owner.host.f_small,
+                          text=self.names.get(m["identity"], m["identity"]))
+
+    def _to_pic(self, ev):
+        if self.img is None:
+            return None
+        x, y = (ev.x - self.ox) / (self.k * self.w), (ev.y - self.oy) / (self.k * self.h)
+        return [x, y] if 0 <= x < 1 and 0 <= y < 1 else None
+
+    def _near(self, ev):
+        """The index of the mark under the pointer, or None."""
+        pic, r = self.current(), self.owner.px(self.RING)
+        for i, m in enumerate(pic["marks"] if pic else []):
+            if math.hypot(self.ox + m["point"][0] * self.w * self.k - ev.x,
+                          self.oy + m["point"][1] * self.h * self.k - ev.y) <= r:
+                return i
+        return None
+
+    def _mark(self, ev):
+        at = self._to_pic(ev)
+        if at is None:
+            return
+        if not self.person:
+            return self.status("Add a person in Library > Identities first.", "warn")
+        pic = self.current()
+        hit = self._near(ev)
+        if hit is not None:                   # a face marked already: now this person's
+            pic["marks"][hit]["identity"] = self.person
+        else:
+            pic["marks"].append({"identity": self.person, "point": at})
+        self._draw()
+        self.draw_strip()
+        self.status()
+
+    def _unmark(self, ev):
+        hit = self._near(ev)
+        if hit is not None:
+            del self.current()["marks"][hit]
+            self._draw()
+            self.draw_strip()
+            self.status()
+
+    # ------------------------------------------------------------- go
+    def start(self):
+        o = self.owner
+        if not self.pictures:
+            return self.status("Add a picture first.", "warn")
+        try:
+            jobs = [ig.upload_swap(o.studio.lib, pic["path"], pic["marks"], self.person)
+                    for pic in self.pictures]
+        except ValueError as e:
+            return self.status(str(e), "warn")
+        problems = list(dict.fromkeys(e for s in jobs for e in o.studio.preview(s).errors))
+        if problems:
+            return self.status(" ".join(problems), "warn")
+
+        def work():
+            for s in jobs:
+                o._submit(s)
+        o.host._spawn(o.s.event_id, work)
+        o._show_list("queue")
+        o.say("Swapping faces on %d picture%s%s" % (len(jobs), "" if len(jobs) == 1 else "s",
+                                                    ELLIPSIS), "muted")
+        self.status("Sent: %d in the Queue now, and in History once swapped. Add more "
+                    "or swap again with someone else." % len(jobs), "ok")
 
 
 class BuildView:
