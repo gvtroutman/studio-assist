@@ -239,20 +239,57 @@ class TestExecutor(unittest.TestCase):
             annotations={"readOnlyHint": True}),
             spec("opencode_changes", annotations={"readOnlyHint": True})]
         ex = self.setup_run([
-            *(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in ("a", "b", "c")),
+            answer(call("opencode_read_file", {"path": "a"}, ident="a")),
             answer(call("opencode_ask")), answer(call("opencode_changes")), answer(text="Verified")], specs=specs)
         self.assertEqual(ex.run(self.messages), "Verified")
         hints = [m["content"] for m in self.messages if "without handing work" in (m.get("content") or "")]
         self.assertEqual(len(hints), 1)
         self.assertIn("only requested information or review", hints[0])
-        self.assertEqual(self.bridge.call_tool.call_args_list[3].args[0], "opencode_ask")
+        # OPENCODE_PROMPT forbids sending OpenCode to AGENTS.md; the reminder must agree.
+        self.assertNotIn("AGENTS.md", hints[0])
+        self.assertIn("not to inspect first", hints[0])
+        self.assertEqual(self.bridge.call_tool.call_args_list[1].args[0], "opencode_ask")
+
+    def test_this_pcs_file_tools_and_the_session_list_use_the_same_budget(self):
+        # Seen live: with OpenCode's own three paused, the model read on
+        # through read_file, list_folder and opencode_list_sessions.
+        for name in ("read_file", "list_folder", "find_files", "opencode_list_sessions"):
+            with self.subTest(name=name):
+                specs = [spec("opencode_ask"), spec(name, annotations={"readOnlyHint": True}),
+                         spec("opencode_read_file", annotations={"readOnlyHint": True})]
+                ex = self.setup_run([
+                    answer(call(name, ident="a")), answer(call("opencode_read_file", ident="b")),
+                    answer(text="Stuck.")], specs=specs)
+                ex.run(self.messages)
+                self.assertEqual([c.args[0] for c in self.bridge.call_tool.call_args_list], [name])
+                self.assertIn("exploration budget is used", json.dumps(self.messages))
+
+    def test_continue_does_not_buy_another_look(self):
+        # Seen live: every "continue" reset the count, three more reads each.
+        specs = [spec("opencode_ask"), spec("opencode_read_file", {
+            "type": "object", "properties": {"path": {"type": "string"}}},
+            annotations={"readOnlyHint": True})]
+        ex = self.setup_run([answer(call("opencode_read_file", {"path": "a"}, ident="a")),
+                             answer(text="I will look further.")], specs=specs)
+        ex.record.briefs.append("Make the dropdown")
+        ex.run(self.messages)
+        for word, reads in (("Continue.", 1), ("try  again", 1), ("Now fix the tab label", 2)):
+            with self.subTest(word=word):
+                ex.record.briefs.append(word)
+                self.messages.append({"role": "user", "content": word})
+                self.llm.responses = iter([
+                    answer(call("opencode_read_file", {"path": word}, ident=word)),
+                    answer(text="Stopped there.")])
+                ex.run(self.messages)
+                self.assertEqual(self.bridge.call_tool.call_count, reads)
+        self.assertFalse(tasks.goes_on("continue with the blue one"))
 
     def test_opencode_read_only_review_is_not_forced_to_delegate(self):
         specs = [spec("opencode_ask"), spec("opencode_read_file", {
             "type": "object", "properties": {"path": {"type": "string"}}},
             annotations={"readOnlyHint": True})]
         ex = self.setup_run([
-            *(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in ("a", "b", "c", "d")),
+            answer(call("opencode_read_file", {"path": "a"}, ident="a")),
             answer(text="Here are the findings.")], specs=specs)
         self.messages[-1]["content"] = "Review the server lifecycle. Do not edit."
         self.assertEqual(ex.run(self.messages), "Here are the findings.")
@@ -881,7 +918,7 @@ class TestContinuation(unittest.TestCase):
         specs = [spec("opencode_read_file", {"type": "object", "properties": {"path": {"type": "string"}}},
                       annotations={"readOnlyHint": True}), spec("opencode_ask"),
                  spec("opencode_changes", annotations={"readOnlyHint": True})]
-        llm = FakeLLM([*(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in "abcd"),
+        llm = FakeLLM([*(answer(call("opencode_read_file", {"path": p}, ident=p)) for p in "ab"),
                        answer(call("opencode_ask")), answer(call("opencode_changes")), answer(text="done")])
         bridge = Mock()
         bridge.call_tool.return_value = {"content": [{"type": "text", "text": "ok"}]}
@@ -889,10 +926,11 @@ class TestContinuation(unittest.TestCase):
         messages = [{"role": "system", "content": "rules"}, {"role": "user", "content": "Make the dropdown"}]
         ex.run(messages)
         names = lambda ts: {t["function"]["name"] for t in ts}
-        self.assertNotIn("opencode_read_file", names(llm.tool_requests[3]))
-        self.assertIn("opencode_read_file", names(llm.tool_requests[5]))
-        self.assertEqual([c.args[0] for c in bridge.call_tool.call_args_list].count("opencode_read_file"), 3)
-        self.assertIn("three-read exploration budget", json.dumps(messages))
+        self.assertNotIn("opencode_read_file", names(llm.tool_requests[1]))
+        self.assertIn("opencode_read_file", names(llm.tool_requests[3]))
+        self.assertEqual([c.args[0] for c in bridge.call_tool.call_args_list].count("opencode_read_file"),
+                         tasks.OPENCODE_EXPLORATION_BUDGET)
+        self.assertIn("exploration budget is used", json.dumps(messages))
 
     def test_context_refusal_compacts_and_retries_only_once(self):
         for streaming in (True, False):

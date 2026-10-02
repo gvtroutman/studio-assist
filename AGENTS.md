@@ -2395,9 +2395,16 @@ picks the same session up. There is no tool that approves anything, and
 - **Delegate changes promptly.** The outer tab sends the user's request and
   constraints to `opencode_ask`; OpenCode reads the project rules and locates the
   implementation. It need not discover every function before handing off. After
-  three workspace reads without a handoff/session inspection in the current run,
+  one look (`OPENCODE_EXPLORATION_BUDGET`) without a handoff/session inspection,
   the shared executor removes exploration tools from the request and refuses them
-  at dispatch until a successful handoff/session inspection. It can still answer,
+  at dispatch until a successful handoff/session inspection. The look is counted
+  per request, not per run: `TaskRecord.request_from` moves only when the user's
+  message is more than a word to go on (`goes_on`), because every "continue" used
+  to buy three more reads. `OPENCODE_EXPLORATION` holds the research bridge's
+  `list_folder`/`find_files`/`read_file` and `opencode_list_sessions` beside
+  OpenCode's own three, since the model read on through those. The handoff asks
+  for the change, not for an inspection: told to "find where", OpenCode read for
+  its whole ten minutes and edited nothing (2026-09-28). It can still answer,
   ask a focused question, recall evidence, or delegate a review explicitly without
   edits. The guard also covers calls hidden inside made tools; it never approves
   an OpenCode permission request.
@@ -2405,7 +2412,11 @@ picks the same session up. There is no tool that approves anything, and
   returns at most 6000 characters plus a header with the next `start` character
   offset. `opencode_search_files` does bounded case-insensitive search - literal by
   default, or a regex with `regex=true` - returning line numbers and offsets for
-  that reader. Search and listing report
+  that reader. A literal query takes alternatives (`attach|paperclip`), and files
+  are searched code first, then tests, then prose (`_search_rank`): AGENTS.md
+  sorts first by name and used to fill the 40 rows. `opencode_status` says
+  OpenCode is busy, and with which session, when the last session is still
+  working or the session list times out. Search and listing report
   partial results when bounded; normal listings/searches skip `.runtime`, `.work` and
   `.studio-attachments` along with dependencies. Explicit paths still work.
 - **Stopping is not evidence of an edit.** A read-only journal says no
