@@ -106,7 +106,9 @@ After Effects and Resolve use outside npm servers.
   The head swap before the final face swap (FLUX.2 Klein 9B; `LICENSE_NOTE` -> `Job.license` -> `png_text`):
   `apps/image_studio/headswap.py` (`lacks`, `targets`, `head_crop`, `middle`,
   `head_graph`; what is blended: `WORDS`, `STRANDS`, `WORN`/`WORN_NEAR`, `EDGE`;
-  the soft edge: `FEATHER`, `SHRINK`),
+  the soft edge: `FEATHER`, `SHRINK`; the photo cut to the head: `photo_cut`,
+  `PHOTO_CROP`/`PHOTO_RISE`; glasses said only for a profile's `glasses`:
+  `prompt_for`, `GLASSES`),
   run by `Studio._head_swap` inside `finish_profiles`; the swap model is
   `facefusion.SWAP_MODEL` / `model`. What of a face the swap changes:
   `facefusion.SWAP_REGIONS`, `SWAP_LENS_LINE`, `SWAP_DEWEAVE`, done in the worker
