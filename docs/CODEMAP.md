@@ -114,7 +114,9 @@ After Effects and Resolve use outside npm servers.
   `facefusion.SWAP_MODEL` / `model`. What of a face the swap changes:
   `facefusion.SWAP_REGIONS`, `SWAP_LENS_LINE`, `SWAP_DEWEAVE`, done in the worker
   by `under_lenses` and `even`; `Studio._apply_profiles` points it at the head
-  redrawn (`job.heads`).
+  redrawn (`job.heads`). Retry face swap (a kept picture finished as its job
+  would have): `retry_faces`, `Studio.finish_backend`, `_retry_finish`,
+  `run_profile_swap`.
   Angles / Blend (new reference photos by FLUX Kontext): `apps/image_studio/blend.py`
   (`angle_graph`, `blend_graph`, `route`, `run`; the views `view_name`/`view_prompt`,
   preset `load_views`/`save_views`) under `ui.NewPhotos`, opened by
@@ -128,6 +130,11 @@ After Effects and Resolve use outside npm servers.
   `imagegen.plan_wear` (from `plan_items` when Kontext does not draw them);
   settings `wearing` (`clean_wearing`); the form's strip `ImageStudio._show_wearing`.
   Tests: `tests/test_wear.py`. AGENTS.md "The Wearing list".
+- **Housekeeping** - what jobs leave in a local ComfyUI's `output/ImageStudio` and
+  `input`, and in the library's `finish/`: `Studio.upkeep` (from `JobQueue._work`),
+  `Studio.tidy`, `comfy_folder`, `remove_stale`, `_upload_made`; a backend's `folder`
+  and `keep_days`. The critic's log rolls over in `_critic_log`. Tests:
+  `tests/test_upkeep.py`.
 - **Model sources** - `apps/image_studio/model_sources.py`.
 - **scene/** - Scene Builder: `scene/ui.py` over `scene/scene.py`, `scene/mannequin.py`,
   `scene/pose.py`. A prop's Details (words + shapes on it): `suggest_dressing`,

@@ -2652,8 +2652,9 @@ class ImageStudio:
                        s.get("seed")) if s.get("mode") not in ("dress", "blend") else
                    "%s · %s · seed %s" % ("Try On" if s["mode"] == "dress" else "Blend",
                                           job.backend["name"], s.get("seed"))}
-        if ig.local_faces(s):
-            widgets["base"] = "Face swap · this PC"
+        if ig.local_faces(s):         # a retry finishes on the picture's own backend
+            widgets["base"] = ("Retry face swap · %s" % job.backend["name"]
+                               if job.backend.get("url") else "Face swap · this PC")
         for w in (row, right, thumb, thumb.img, status, meta, detail):
             w.bind("<Button-1>", lambda ev: self._select(("job", job)))
         self.rows[job.id] = widgets
@@ -3042,6 +3043,9 @@ class ImageStudio:
             ("encoder_on_cpu", "Run the text encoder on the CPU", "bool"),
             ("max_megapixels", "Largest refine size (megapixels)", "number"),
             ("lora_dir", "LoRA folder, if it is on this PC (for previews)", "text"),
+            ("folder", "ComfyUI's folder, if it is on this PC (old job pictures are "
+                       "removed from its output and input)", "text"),
+            ("keep_days", "Days a job's pictures stay there (0: never removed)", "number"),
             ("notes", "Notes", "long"),
         ], template={"name": "New backend", "url": "http://127.0.0.1:8188",
                      "roles": ["secondary"]})

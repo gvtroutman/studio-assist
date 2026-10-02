@@ -2675,7 +2675,7 @@ class TestErrors(unittest.TestCase):
                 with self.assertRaises(ig.ComfyError) as caught:
                     c.upload_image(path)
         self.assertIn("not JSON", str(caught.exception))
-        self.assertEqual(c.uploaded, set())
+        self.assertEqual(c.uploaded, {})                    # nothing believed sent
 
     def test_a_template_that_will_not_read_is_logged_not_dropped_silently(self):
         from unittest import mock
