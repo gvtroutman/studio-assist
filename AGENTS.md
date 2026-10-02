@@ -3364,17 +3364,13 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   conditioning even for one unnamed person, independently of the character
   regional-prompting checkbox. Supporting workflows (currently Z-Image HQ)
   consume them; others keep the words. No added dependency.
-  **The beard pass** (2026-10-02: scene render -> head swap -> beard pass
-  -> face swap -> eyes, hands, glasses; the user moved it before the face
-  swap the same day: "the beard pass must be running prior to the face
-  swap"): the head swap redraws the head from a photo, which shaved the
-  chosen beard in every live run. So `Studio._before_faces` runs the head
-  swap and then `Studio._finish_passes(stage="beard")`, and FaceFusion
-  swaps after it; the eye, hands and glasses passes are `stage="rest"`.
-  Without a face swap the beard is the first of the finish passes. FaceFusion's
-  mask covers the mouth and chin, so a moustache or chin beard can still
-  take the photo's there; untried live in this order. It redraws each beard
-  on the picture's own model, only inside the
+  **The beard pass** (2026-10-02: scene render -> identity pass ->
+  beard pass -> final): the head swap and FaceFusion redraw a face from a
+  photo, which can shave the chosen beard or bring the photo's. So
+  `Studio._finish_passes` redraws each beard after the face swap and the eye
+  pass, and before the hands and glasses. It was moved before the face swap
+  and back the same day: the user, "the beard needs to come after otherwise
+  the face swap undo's the work". It redraws on the picture's own model, only inside the
   scene's mask (`beard_regions` reads `character_regions` of kind
   `facial_hair`; `beard_spots` scales the mask's box to the picture;
   `beard_shape_png` is the crop's `shape` for `face_graph`), in that
