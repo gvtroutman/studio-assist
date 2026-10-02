@@ -164,7 +164,10 @@ class Client:
             "User-Agent": "StudioAssist/1 (+LoRA library import)",
             "Accept": "application/json"})
         if self.token:
-            req.add_header("Authorization", "Bearer " + self.token)
+            # Unredirected: a download is answered with a redirect to a
+            # signed URL on CivitAI's storage, which must not be handed the
+            # key (and may refuse a request carrying it) - as hub._open.
+            req.add_unredirected_header("Authorization", "Bearer " + self.token)
         return req
 
     def get(self, path):
@@ -414,6 +417,44 @@ def _open_download(client, url):
                            % getattr(e, "reason", e)) from e
 
 
+SIZE_SLACK = 1024     # bytes: sizeKB is the size in KB to a fraction, so about a KB either way
+
+
+def own_name(name):
+    """`name` when it is a plain file name, to be joined onto a folder.
+    CivitAI's (or a repo's) name for a file is not ours to trust: one
+    holding a separator or '..' writes outside the LoRA folder, and ':' an
+    NTFS stream. Raises CivitAIError."""
+    name = str(name or "")
+    if (not name or name in (".", "..") or any(c in name for c in "/\\:")
+            or os.path.basename(name) != name or os.path.isabs(name)):
+        raise CivitAIError("The file is named %r, which is not a plain file name; "
+                           "nothing was downloaded." % name)
+    return name
+
+
+def promised(r):
+    """The body length a response names (Content-Length), or 0."""
+    headers = getattr(r, "headers", None)
+    try:
+        return int((headers.get("Content-Length") if headers is not None else 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def cut_short(done, total, size=0, slack=SIZE_SLACK):
+    """Why a download that ended at `done` bytes is not the whole file, or "".
+    CPython's read() ends a stream cut off mid-file with b'', as if it were
+    the end, so the length is the only sign when there is no hash: the
+    response's own Content-Length (`total`), else the size the catalog
+    lists (`size`, give or take `slack`)."""
+    if total and done < total:
+        return "%d of %d bytes came" % (done, total)
+    if not total and size and done < size - slack:
+        return "%d of about %d bytes came" % (done, size)
+    return ""
+
+
 def fetch_preview(client, url, folder, stem):
     """A version's preview picture saved under `folder` -> its path, or ""
     when there is none or it will not come. Best effort: a profile is worth
@@ -438,11 +479,13 @@ def fetch_preview(client, url, folder, stem):
     return path
 
 
-def download(client, url, folder, filename, sha256="", progress=None, stop=None):
+def download(client, url, folder, filename, sha256="", progress=None, stop=None, size=0):
     """A version's file into `folder` as `filename` -> its path. Streamed to
-    `<name>.part` and renamed only once whole (and matching CivitAI's
-    SHA-256 when there is one), so a ComfyUI listing the folder never sees
-    half a LoRA. A file already there with the right hash is kept."""
+    `<name>.part` and renamed only once whole - matching CivitAI's SHA-256
+    when there is one, else as long as the answer said (or `size`, CivitAI's
+    sizeKB) - so a ComfyUI listing the folder never sees half a LoRA. A file
+    already there with the right hash is kept."""
+    filename = own_name(filename)
     dest = os.path.join(folder, filename)
     if os.path.isfile(dest) and (not sha256 or sha256_of(dest) == sha256.lower()):
         return dest
@@ -458,8 +501,7 @@ def download(client, url, folder, filename, sha256="", progress=None, stop=None)
             if "text/html" in ctype or "application/json" in ctype:
                 raise CivitAIError("CivitAI sent a page instead of the file; it usually "
                                    "means the download needs an API key.")
-            total = int((r.headers.get("Content-Length") if hasattr(r, "headers") else 0)
-                        or 0)
+            total = promised(r)
             while True:
                 if stop is not None and stop.is_set():
                     raise CivitAIError("Download cancelled.")
@@ -471,6 +513,10 @@ def download(client, url, folder, filename, sha256="", progress=None, stop=None)
                 done += len(block)
                 if progress:
                     progress(done, total)
+        short = cut_short(done, total, size)
+        if short:
+            raise CivitAIError("The download of %s was cut off (%s); nothing was kept. "
+                               "Try again." % (filename, short))
         if sha256 and h.hexdigest() != sha256.lower():
             raise CivitAIError("%s arrived damaged (its SHA-256 is not CivitAI's); "
                                "nothing was kept." % filename)
@@ -540,7 +586,8 @@ def import_link(lib, client, link, folder="", say=lambda text: None, stop=None):
             total = total or p["_size"]
             say("Downloading %s: %d of %s MB" % (
                 p["file"], done >> 20, "%d" % (total >> 20) if total else "%.0f" % mb))
-        download(client, p["_download"], folder, p["file"], p["sha256"], progress, stop)
+        download(client, p["_download"], folder, p["file"], p["sha256"], progress, stop,
+                 size=p["_size"])
     rec, added = lib.import_lora(p)
     _with_preview(lib, client, rec, p["_preview_url"])
     lib.save("loras")

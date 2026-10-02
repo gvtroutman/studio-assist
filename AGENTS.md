@@ -690,7 +690,14 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   (a download for a link, streamed to `.part` and checked against CivitAI's hash;
   a copy for a file), or nowhere. The API key (many downloads need one) is
   `CIVITAI_API_KEY`, else `image-studio/civitai.json`. Tests: `test_civitai.py`,
-  against a table of canned answers.
+  against a table of canned answers. Since 2026-10-01 (and in `hub` for Hugging
+  Face): the key is an unredirected header, so it stays off the redirect to
+  CivitAI's signed storage URL; a file name that is not its own basename
+  (`own_name`: a separator, `..`, `:` for an NTFS stream) is refused before
+  anything is asked for; and a download shorter than its Content-Length - or,
+  with none, than sizeKB less a KB (`cut_short`) - is not kept, since CPython's
+  `read()` ends a stream cut off mid-file with `b''` like a whole one and a
+  LoRA with no SHA-256 had nothing else to catch it.
 - **Identity and style are separate records.** An identity is a LoRA, a trigger, a
   strength and reference photos (copied under `image-studio/references/`). A style
   is a LoRA and/or prompt additions plus look defaults. The precedence is model

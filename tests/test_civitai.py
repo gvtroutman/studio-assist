@@ -228,6 +228,55 @@ class TestImport(unittest.TestCase):
         self.assertIn(("https://civitai.com/api/download/models/67890", "Bearer secret"),
                       self.fake.seen)
 
+    def test_the_key_is_not_carried_onto_the_storage_redirect(self):
+        # Idea d84cdf669334: add_header put the key on CivitAI's redirect to
+        # its storage CDN too. urllib copies only `headers` onto a redirect.
+        import urllib.request
+        req = civitai.Client("secret")._request("https://civitai.com/api/download/models/1")
+        self.assertEqual(req.get_header("Authorization"), "Bearer secret")
+        moved = urllib.request.HTTPRedirectHandler().redirect_request(
+            req, None, 307, "Temporary Redirect", {},
+            "https://b2.civitai.com/file/model.safetensors?X-Amz-Signature=abc")
+        self.assertIsNone(moved.get_header("Authorization"))
+
+    def test_a_download_cut_off_is_not_kept(self):
+        # Idea e9aa56ba1d45: read() ends a cut-off stream with b'', so with no
+        # SHA-256 from CivitAI half a LoRA landed in ComfyUI's folder.
+        folder = os.path.join(self.dir, "loras")
+
+        def answer(body, headers):
+            return civitai.Client(opener=lambda req, timeout=None: Response(body, headers))
+        cut = {"Content-Type": "application/octet-stream", "Content-Length": "100"}
+        with self.assertRaisesRegex(civitai.CivitAIError, r"cut off \(10 of 100 bytes"):
+            civitai.download(answer(b"0123456789", cut), "https://x/f", folder, "a.safetensors")
+        self.assertEqual(os.listdir(folder), [])
+        # No Content-Length: CivitAI's sizeKB, give or take a KB.
+        with self.assertRaisesRegex(civitai.CivitAIError, "cut off"):
+            civitai.download(answer(b"0123456789", {}), "https://x/f", folder, "a.safetensors",
+                             size=10000)
+        self.assertEqual(os.listdir(folder), [])
+        path = civitai.download(answer(b"0123456789", {}), "https://x/f", folder,
+                                "a.safetensors", size=10 + 500)
+        self.assertEqual(os.path.getsize(path), 10)
+
+    def test_a_file_name_that_leaves_the_folder_is_refused(self):
+        # Idea 146ab9c04531: CivitAI's own name was joined onto the folder unchecked.
+        folder = os.path.join(self.dir, "loras")
+        asked = []
+
+        def opener(req, timeout=None):
+            asked.append(req.full_url)
+            return Response(LORA_BYTES, {"Content-Length": str(len(LORA_BYTES))})
+        client = civitai.Client(opener=opener)
+        for name in ("..\\evil.safetensors", "../evil.safetensors", "sub/x.safetensors",
+                     "C:\\x.safetensors", "x.safetensors:hidden", "..", ""):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(civitai.CivitAIError, "not a plain file name"):
+                    civitai.download(client, "https://x/f", folder, name)
+        self.assertEqual(asked, [])                           # nothing was even asked for
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "evil.safetensors")))
+        self.assertEqual(civitai.own_name("sx70 v2.safetensors"), "sx70 v2.safetensors")
+
     def test_a_damaged_download_leaves_nothing(self):
         folder = os.path.join(self.dir, "loras")
         self.fake.routes["https://civitai.com/api/download/models/67890"] = b"truncated"
