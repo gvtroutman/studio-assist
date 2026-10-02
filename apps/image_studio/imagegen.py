@@ -783,8 +783,10 @@ def _default_models():
          "values": {"model": "flux-2-klein-base-9b.safetensors",
                     "encoder": "qwen_3_8b_fp8mixed.safetensors", "vae": "flux2-vae.safetensors"},
          "backends": {"3090": None},
+         # A redraw's KSampler runs all its steps over the part it redraws;
+         # 50 at cfg 4 would be ~35 s a face, hand or eye.
          "defaults": {"steps": 50, "guidance": 4.0, "sampler": "euler",
-                      "width": 1024, "height": 1024},
+                      "redraw_steps": 20, "width": 1024, "height": 1024},
          "license": KLEIN_LICENSE,
          "notes": "The undistilled Klein 9B a Build LoRA head LoRA is trained on, so a "
                   "person's LoRA shows here. About 40 s a picture on the 5090. "
@@ -2751,10 +2753,14 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
     fd = wf["face_detail"]
     values = dict(wf.get("defaults") or {}, **{k: x for k, x in values.items() if x is not None})
     extra = dict(fd.get("nodes") or {})
+    # The section's `cfg` (optional, 1 when left out) is filled like the
+    # rest: Klein's "{{guidance}}" is the base model's real CFG and the
+    # distilled one's 1, one section for both.
     extra["fd_links"] = {"class_type": "_links", "inputs": {
-        k: fd[k] for k in ("model", "vae", "positive", "negative")}}
+        k: fd[k] for k in ("model", "vae", "positive", "negative", "cfg") if k in fd}}
     g = fill(dict(wf, graph=dict(wf["graph"], **extra)), values, loras)
     links = g.pop("fd_links")["inputs"]
+    cfg = float(links.pop("cfg", 1.0))
     keep, todo = set(), [x[0] for x in links.values()]
     while todo:
         nid = todo.pop()
@@ -2901,7 +2907,7 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
         # sampled as a redraw").
         g[n + "4"] = {"class_type": "KSampler", "inputs": {
             "seed": (seed + i + 1) % (MAX_SEED + 1),
-            "steps": values.get("redraw_steps") or values["steps"], "cfg": 1.0,
+            "steps": values.get("redraw_steps") or values["steps"], "cfg": cfg,
             "sampler_name": values.get("redraw_sampler") or values["sampler"],
             "scheduler": values.get("redraw_scheduler") or values["scheduler"],
             "denoise": face.get("denoise") or values["face_denoise"], "model": model,
@@ -5136,11 +5142,13 @@ def eye_pass(reports=None):
     return facefusion.enhancer() is None
 
 
-def pipeline_stages(lib, settings):
+def pipeline_stages(lib, settings, plan=None):
     """The stops a job's pipeline strip shows, in the order Generate runs
     them: the two ComfyUI stages every job goes through, then each optional
     finishing pass these settings turn on. Queued and loading are left off -
-    obvious, not worth a stop on the strip."""
+    obvious, not worth a stop on the strip. A Generate's `plan`, once
+    composed, says whether the face pass runs: a workflow without one (FLUX.2
+    Klein) leaves it out though the form names a person."""
     import apps.image_studio.facefusion as facefusion
     if settings.get("mode") == "blend":       # one Kontext run, no finishing pass
         import apps.image_studio.blend as blend
@@ -5153,7 +5161,10 @@ def pipeline_stages(lib, settings):
     stages = []
     if not swap_only:
         stages.append(("sampling", "Sampling"))
-        if faces_of(settings):
+        face = faces_of(settings)
+        if plan is not None and plan.workflow and not settings.get("mode"):
+            face = plan.values.get("face_detail")
+        if face:
             stages.append(("face", "Face pass"))
         stages.append(("decoding", "Decoding"))
         worn = outfit_of(settings)
@@ -6328,6 +6339,7 @@ class Studio:
                                                                                  - types))))
             else:
                 add_face_finder(graph, values["sam3"])
+            plan.values["face_detail"] = values["face_detail"]   # the job's strip reads it
         if lacking:
             return self.queue._finish(job, "failed", "%s's ComfyUI lacks the node(s) %s that "
                                       "the %s workflow uses." % (
