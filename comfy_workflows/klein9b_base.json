@@ -1,7 +1,7 @@
 {
   "id": "klein9b_base",
   "label": "FLUX.2 Klein 9B",
-  "about": "FLUX.2 [klein] base 9B text to image: the undistilled model a Build LoRA head LoRA is trained on, so an identity LoRA acts at full strength here (on the 4-step distilled 9B it barely shows; live on Partner, 2026-10-01). Real CFG with a written negative, 50 steps, ~40 s at 896x1152 on the 5090. Model-only LoRAs. No refine pass, face pass or source picture yet. Under the FLUX Non-Commercial License (the model's `license`).",
+  "about": "FLUX.2 [klein] base 9B text to image: the undistilled model a Build LoRA head LoRA is trained on, so an identity LoRA acts at full strength here (on the 4-step distilled 9B it barely shows; live on Partner, 2026-10-01). Real CFG with a written negative, 50 steps, ~40 s at 896x1152 on the 5090. Model-only LoRAs. No refine pass, face pass or source picture yet. The distilled 9B (model klein-9b-distilled) runs the same graph at 4 steps and cfg 1. Under the FLUX Non-Commercial License (the model's `license`).",
   "families": ["flux2-klein9b"],
   "defaults": {"steps": 50, "guidance": 4.0, "sampler": "euler", "width": 1024, "height": 1024,
                "negative": "", "encoder_device": "default", "filename_prefix": "ImageStudio/klein9b"},
