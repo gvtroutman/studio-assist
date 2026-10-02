@@ -37,6 +37,7 @@ import copy
 import hashlib
 import html
 import json
+import logging
 import math
 import os
 import queue
@@ -58,6 +59,7 @@ from apps.comfyui.mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, 
                               Unreachable, _explain, head_square, outputs_of, oval_png,
                               preview_of, status_messages)
 
+LOG = logging.getLogger("studio.images")
 HERE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 WORKFLOWS_DIR = os.path.join(HERE, "comfy_workflows")
 STYLE_EXAMPLES_DIR = os.path.join(HERE, "style_examples")
@@ -70,6 +72,14 @@ HEALTH_TTL = 30               # seconds a health reading is trusted when routing
 QUIET_AFTER = 120             # seconds without a progress event before a job says so
 POLL_EVERY = 2.0              # seconds between looks at /history while a job runs
 LOST_AFTER = 3                # answered looks finding a prompt nowhere before it is lost
+# Housekeeping (`Studio.tidy`). Every pass of every job saves a picture in
+# ComfyUI's output folder and every picture sent to it stays in its input
+# folder; History keeps its own copy of what was made, so those are left
+# behind: 2 GB and 386 MB on the 5090 in six days (2026-09-30).
+KEEP_DAYS = 7                 # days a job's pictures stay in a local ComfyUI's folders
+TIDY_EVERY = 6 * 3600         # seconds between two tidies of one backend
+UPLOAD_TTL = 6 * 3600         # seconds an upload is believed to still be on its backend
+TEMP_KEEP = 24 * 3600         # seconds a picture written only to be uploaded may lie about
 MODEL_KINDS = ("diffusion_models", "checkpoints", "text_encoders", "vae", "loras",
                "clip_vision", "style_models", "controlnet", "upscale_models", "diffusers",
                "model_patches")
@@ -307,6 +317,11 @@ def clean_backend(d):
         "lora_dir": _str(d.get("lora_dir")),
         # How to start ComfyUI there, said when it does not answer.
         "start": _str(d.get("start")),
+        # ComfyUI's own folder, when it runs on this PC: what jobs left in its
+        # output and input folders is removed after `keep_days` (`comfy_folder`,
+        # `Studio.tidy`). Empty, or 0 days, and nothing there is ever removed.
+        "folder": _str(d.get("folder")),
+        "keep_days": _num(d.get("keep_days", KEEP_DAYS), int, KEEP_DAYS, 0, 3650),
     }
 
 
@@ -1244,7 +1259,7 @@ class ComfyUIClient:
             re.sub(r"^http", "ws", self.url) + "/ws")
         self.timeout = timeout
         self.client_id = uuid.uuid4().hex
-        self.uploaded = set()
+        self.uploaded = {}            # the name ComfyUI gave an upload -> when it was sent
         self._nodes = None
 
     # --------------------------------------------------------------- HTTP
@@ -1421,12 +1436,15 @@ class ComfyUIClient:
     def upload_image(self, path):
         """Upload a local picture; -> the name ComfyUI's LoadImage takes. Named
         by content, so the same picture is sent once per backend however
-        many jobs use it."""
+        many jobs use it - for UPLOAD_TTL. After that it is sent again: old
+        uploads are tidied out of ComfyUI's input folder (`Studio.tidy`, which
+        may be another process's), and a client that lives for weeks must not
+        name a file that is gone. Sending it again makes it new there."""
         with open(path, "rb") as f:
             data = f.read()
         name = "studio_%s%s" % (hashlib.sha1(data).hexdigest()[:16],
                                 os.path.splitext(path)[1].lower() or ".png")
-        if name in self.uploaded:
+        if time.time() - self.uploaded.get(name, -UPLOAD_TTL) < UPLOAD_TTL:
             return name
         boundary = "----studio" + uuid.uuid4().hex
         body = b""
@@ -1444,7 +1462,7 @@ class ComfyUIClient:
         name = res.get("name", name)
         if res.get("subfolder"):
             name = res["subfolder"] + "/" + name
-        self.uploaded.add(name)
+        self.uploaded[name] = time.time()
         return name
 
     def queue_workflow(self, graph):
@@ -4285,6 +4303,8 @@ def change_kept(lib, name, change):
 # keep coming back, what the critic had passed, what a fix's redraws mended.
 CRITIC_LEDGER = "critic_ledger.json"
 CRITIC_LEDGER_LOCK = threading.Lock()
+CRITIC_LOG = "visual_critic.log"
+CRITIC_LOG_MAX = doctor.LOG_MAX_BYTES     # then it rolls over to a single `.1`
 
 
 def load_critic_ledger(lib):
@@ -5120,25 +5140,33 @@ def pipeline_stages(lib, settings):
     if settings.get("mode") == "blend":       # one Kontext run, no finishing pass
         import apps.image_studio.blend as blend
         return list(blend.STAGES)
-    stages = [("sampling", "Sampling")]
-    if faces_of(settings):
-        stages.append(("face", "Face pass"))
-    stages.append(("decoding", "Decoding"))
-    worn = outfit_of(settings)
-    if worn["clothes"] or worn["accessories"]:
-        stages.append(("items", "Item pass"))
-    profiles = facefusion.selected(lib, settings)
-    if profiles:
-        if settings.get("head_swap", True) is not False:
+    # A face swap on a kept picture (`retry_faces`, Fix a spot's) draws nothing
+    # new; only a Generate's retry, on its own backend, has the passes round it.
+    finish = settings.get("face_finish") or {}
+    swap_only = local_faces(settings)
+    whole = not swap_only or bool(finish.get("backend"))
+    stages = []
+    if not swap_only:
+        stages.append(("sampling", "Sampling"))
+        if faces_of(settings):
+            stages.append(("face", "Face pass"))
+        stages.append(("decoding", "Decoding"))
+        worn = outfit_of(settings)
+        if worn["clothes"] or worn["accessories"]:
+            stages.append(("items", "Item pass"))
+    profiles = (finish.get("profiles") or [] if settings.get("mode") == "faces"
+                else facefusion.selected(lib, settings))
+    if profiles or swap_only:
+        if whole and settings.get("head_swap", True) is not False:
             stages.append(("head_swap", "Head swap"))
         stages.append(("face_swap", "Face swap"))
-        if eye_pass():
+        if whole and eye_pass():
             stages.append(("eyes", "Eye pass"))
-    if hand_pass(settings):
+    if whole and hand_pass(settings):
         stages.append(("hands", "Hand pass"))
-    if profiles and glasses_pass(settings):
+    if whole and profiles and glasses_pass(settings):
         stages.append(("glasses", "Glasses"))
-    if settings.get("critic_notes"):
+    if not swap_only and settings.get("critic_notes"):
         stages.append(("critic", "Critic notes"))
     stages.append(("complete", "Complete"))
     return stages
@@ -5293,6 +5321,8 @@ class JobQueue:
                 lane.current = None
             if not lane.waiting and lane.backend.get("release_vram"):
                 self.studio.client(lane.backend).free()
+            if not lane.waiting:
+                self.studio.upkeep(lane.backend)
 
 
 # ================================================================ history
@@ -5421,14 +5451,28 @@ def local_faces(settings):
 
 
 def retry_faces(record):
-    """Retry only the finishing pass, using the saved picture and profile snapshot."""
+    """Retry only the finishing pass, using the saved picture and profile snapshot.
+
+    A Generate's kept picture never got the rest of its finish either - the
+    head swap before the faces, the eye, hand and glasses passes after - and
+    a retry that swapped the face alone put it on the generated stranger's
+    head without a word (2026-09-30). So its retry carries the picture's own
+    settings and names the backend it was made on (`face_finish["backend"]`),
+    for `Studio.run_profile_swap` to finish it there. A face-only swap's
+    kept picture (its settings have a `mode`) is retried as the swap it was."""
     finish = record.get("finish") or {}
     if not record.get("images") or not finish.get("profiles"):
         raise ComfyError("This picture has no saved face pass to retry. Use Fix a spot.")
-    return {"mode": "faces", "batch": 1, "seed": record.get("seed", -1),
-            "face_finish": {"images": list(record["images"]),
-                            "profiles": copy.deepcopy(finish["profiles"]),
-                            "record": record.get("path")}}
+    retry = {"mode": "faces", "batch": 1, "seed": record.get("seed", -1),
+             "face_finish": {"images": list(record["images"]),
+                             "profiles": copy.deepcopy(finish["profiles"]),
+                             "record": record.get("path")}}
+    made = record.get("settings")
+    backend = (record.get("backend") or {}).get("id")
+    if isinstance(made, dict) and not made.get("mode") and backend:
+        retry["face_finish"]["backend"] = backend
+        retry = dict(copy.deepcopy(made), **retry)
+    return retry
 
 
 def again(record, new_seed=False):
@@ -5585,6 +5629,61 @@ def cutout_graph(image, sam3, region, prefix="studio_person", box=None):
     return g
 
 
+# ============================================================ housekeeping
+# What the app's jobs leave on a ComfyUI that runs on this PC. A job's
+# pictures are ImageStudio/<workflow>_<job id>[_<pass>]_00001_.png (the job
+# id is 12 hex digits), an upload is studio_<16 hex digits>.<ext>
+# (`ComfyUIClient.upload_image`). Nothing else in those folders is the app's
+# to remove: a test picture under a name of its own, a subfolder, a picture
+# from ComfyUI's own page.
+MADE = re.compile(r"^[A-Za-z0-9_-]+_[0-9a-f]{12}(?:_[A-Za-z0-9_-]+)?_\d{5}_\.png$")
+SENT = re.compile(r"^studio_[0-9a-f]{16}\.[a-z0-9]+$")
+TEMP = re.compile(r"^[0-9a-f]{12}_.+\.png$")    # finish/ and fix_shapes/: <job id>_...
+TEMP_FOLDERS = ("finish", "fix_shapes")
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def comfy_folder(backend):
+    """ComfyUI's own folder for a backend that runs on this PC, or None: the
+    backend's `folder` (Backends; never guessed - naming it is the user's
+    leave to remove things there), when its URL is this PC's and the folder
+    holds ComfyUI's output folder. A backend on another machine has folders
+    this app cannot reach: ComfyUI has no call that removes a file."""
+    try:
+        host = urllib.parse.urlsplit(backend.get("url") or "").hostname
+    except ValueError:
+        return None
+    folder = backend.get("folder") or ""
+    if host not in LOCAL_HOSTS or not folder:
+        return None
+    return folder if os.path.isdir(os.path.join(folder, "output")) else None
+
+
+def remove_stale(folder, pattern, before):
+    """Remove the files directly in `folder` that are named as `pattern` and
+    were last written before `before`. -> (files, bytes) removed. A folder
+    that is not there, and a file that will not go (open in a viewer), cost
+    nothing: the next tidy tries again."""
+    count = size = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0, 0
+    for name in names:
+        path = os.path.join(folder, name)
+        try:
+            if not pattern.match(name) or not os.path.isfile(path):
+                continue
+            st = os.stat(path)
+            if st.st_mtime >= before:
+                continue
+            os.remove(path)
+        except OSError:
+            continue
+        count, size = count + 1, size + st.st_size
+    return count, size
+
+
 # ================================================================ the studio
 
 class Studio:
@@ -5594,6 +5693,7 @@ class Studio:
 
     def __init__(self, root=None, notify=lambda job: None, make_room=None,
                  client_factory=None, workflow_loader=load_workflow, vision=None):
+        self.tidied = {}              # backend id -> when it was last tidied
         self.lib = Library(root)
         self.history = History(os.path.join(self.lib.root, "history"))
         self.client_factory = client_factory or ComfyUIClient   # read late: tests swap it
@@ -5626,6 +5726,55 @@ class Studio:
             c = self.clients[backend["id"]] = self.client_factory(backend)
         c.backend = backend
         return c
+
+    # ------------------------------------------------------ housekeeping
+    def upkeep(self, backend):
+        """After a lane's last job (`JobQueue._work`): `tidy` its backend, at
+        most every TIDY_EVERY. Never raises - housekeeping costs no job.
+        -> what `tidy` said, or None."""
+        now = time.time()
+        if now - self.tidied.get(backend["id"], 0) < TIDY_EVERY:
+            return None
+        self.tidied[backend["id"]] = now
+        try:
+            return self.tidy(backend, now)
+        except Exception:
+            doctor.log_error("Image Studio could not tidy up after %s:\n%s"
+                             % (backend.get("name"), traceback.format_exc()))
+            return None
+
+    def tidy(self, backend, now=None):
+        """Remove what jobs left behind and nothing needs any more. Here: the
+        pictures written only to be uploaded (`_upload_made` removes its own;
+        these are a job's that died in between), after TEMP_KEEP. On a
+        ComfyUI that runs on this PC and whose folder the backend names
+        (`comfy_folder`), after the backend's `keep_days` (0: never): its
+        jobs' pictures in output/ImageStudio and its uploads in input.
+        History has its own copy of every finished picture, and an upload
+        still in use is sent again (UPLOAD_TTL), so what goes is a picture no
+        longer needed - but one no longer there for the Nodes view to run an
+        old record's passes on.
+        -> {"temp", "output", "input": files removed, "bytes"}."""
+        now = time.time() if now is None else now
+        done = {"temp": 0, "output": 0, "input": 0, "bytes": 0}
+
+        def sweep(key, folder, pattern, before):
+            n, size = remove_stale(folder, pattern, before)
+            done[key] += n
+            done["bytes"] += size
+        for name in TEMP_FOLDERS:
+            sweep("temp", os.path.join(self.lib.root, name), TEMP, now - TEMP_KEEP)
+        folder, days = comfy_folder(backend), backend.get("keep_days", KEEP_DAYS)
+        if folder and days:
+            before = now - days * 86400
+            sweep("output", os.path.join(folder, "output", "ImageStudio"), MADE, before)
+            sweep("input", os.path.join(folder, "input"), SENT, before)
+        if done["temp"] or done["output"] or done["input"]:
+            LOG.info("Tidied up after %s: %d of its jobs' pictures and %d uploads older than "
+                     "%s days removed from %s, %d temporary pictures from %s (%.0f MB).",
+                     backend.get("name"), done["output"], done["input"], days, folder,
+                     done["temp"], self.lib.root, done["bytes"] / 1048576.0)
+        return done
 
     # ------------------------------------------------------------ health
     def check(self, backend, full=True):
@@ -5867,6 +6016,10 @@ class Studio:
         original), then those whose roles include the preset's, when each is
         up and has everything the model's workflow needs."""
         if local_faces(settings):
+            owed = self.backend((settings.get("face_finish") or {}).get("backend") or "")
+            if owed and owed["enabled"] and (self.health.get(owed["id"]) or {}).get("ok"):
+                return owed, ("%s, where the picture was made: the head swap, the face swap "
+                              "and the finish passes." % owed["name"])
             return dict(LOCAL_FACES), "FaceFusion on this PC; no ComfyUI needed."
         model = self.lib.get("models", settings.get("model"))
         label = model["label"] if model else settings.get("model")
@@ -5917,7 +6070,8 @@ class Studio:
         all; Auto routes as plan_route says (batch when more than one),
         spreading a batch over every capable backend."""
         if local_faces(settings):
-            return [dict(LOCAL_FACES) for _ in range(count)]
+            b = self.finish_backend(settings)
+            return [b or dict(LOCAL_FACES) for _ in range(count)]
         if settings.get("backend") not in (None, "", "auto"):
             b = self.backend(settings["backend"])
             if b is None:
@@ -5948,6 +6102,18 @@ class Studio:
             picks.append(order[0])
             load[order[0]["id"]] = load.get(order[0]["id"], 0) + 1
         return picks
+
+    def finish_backend(self, settings):
+        """The ComfyUI a retried face swap finishes on: the backend its
+        picture was made on (`retry_faces`), when it is enabled and answers,
+        so the retry waits its turn on that lane. None - for every other
+        face swap, and when it does not answer: the swap runs on this PC
+        alone. Network I/O."""
+        bid = (settings.get("face_finish") or {}).get("backend")
+        b = self.backend(bid) if bid else None
+        if not b or not b["enabled"]:
+            return None
+        return b if self.check(b, full=b["id"] not in self.inventories)["ok"] else None
 
     def why_no_backend(self, settings):
         lines = []
@@ -6299,21 +6465,17 @@ class Studio:
                 "%s has no SAM3 checkpoint" % b["name"] if not sam else
                 "%s lacks %s" % (b["name"], ", ".join(short))))
             return pictures
-        folder = os.path.join(self.lib.root, "finish")
         out = []
         passes = len(job.passes)
         try:
-            os.makedirs(folder, exist_ok=True)
             photos = {}
             for n, (filename, data) in enumerate(pictures):
                 passes = len(job.passes)
                 if job.cancel.is_set():
                     out.append((filename, data))
                     continue
-                path = os.path.join(folder, "%s_head_%d.png" % (job.id, n))
-                with open(path, "wb") as fh:
-                    fh.write(data)
-                image = client.upload_image(path)
+                image = self._upload_made(client, "finish", "%s_head_%d.png" % (job.id, n),
+                                          data)
                 say(headswap.STATUS, "Finding the heads", None)
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, [headswap.FIND]))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
@@ -6407,21 +6569,16 @@ class Studio:
             return pictures
         wanted = [{"name": n, "path": p} for n, p in items]
         words = wear.find_words(wanted)
-        folder = os.path.join(self.lib.root, "finish")
         out = []
         passes = len(job.passes)
         try:
-            os.makedirs(folder, exist_ok=True)
             uploaded = {}
             for n, (filename, data) in enumerate(pictures):
                 passes = len(job.passes)
                 if job.cancel.is_set():
                     out.append((filename, data))
                     continue
-                path = os.path.join(folder, "%s_wear_%d.png" % (job.id, n))
-                with open(path, "wb") as fh:
-                    fh.write(data)
-                image = client.upload_image(path)
+                image = self._upload_made(client, "finish", "%s_wear_%d.png" % (job.id, n), data)
                 say(wear.STATUS, "Finding where the %s go%s" % (
                     _and([i["name"] for i in wanted]), "es" if len(wanted) == 1 else ""), None)
                 job.prompt_id = client.queue_workflow(parts_graph(
@@ -6497,8 +6654,67 @@ class Studio:
             result.append((os.path.splitext(filename)[0] + ".png", data))
         return result
 
+    def _retry_finish(self, job, say):
+        """What a retried face swap needs of ComfyUI to finish a Generate's
+        kept picture as the job would have (`retry_faces`): -> ((client,
+        plan, values), "") on the backend the picture was made on, where
+        `finish_backend` put the job; (None, why) when that backend does not
+        answer or the picture's settings no longer compose there - the swap
+        then runs alone and says so; (None, "") for a swap that was never
+        owed more (Fix a spot's, a face-only swap's own retry)."""
+        owed = (job.settings.get("face_finish") or {}).get("backend")
+        if not owed:
+            return None, ""
+        b = job.backend
+        why = ""
+        if not b.get("url"):          # it did not answer when the retry was queued
+            gone = self.backend(owed)
+            why = "%s is not answering" % (gone["name"] if gone else owed)
+        else:
+            try:
+                h = self.check(b, full=b["id"] not in self.inventories)
+                plan = None
+                if h["ok"]:
+                    made = {k: v for k, v in job.settings.items()
+                            if k not in ("mode", "face_finish")}
+                    plan = compose(made, self.lib, b, self.inventories.get(b["id"]),
+                                   self.workflow_loader, self.nodes.get(b["id"]))
+                if plan is None:
+                    why = "%s is not answering (%s)" % (b["name"], h["detail"])
+                elif plan.errors:
+                    why = " ".join(plan.errors).rstrip(".")
+                else:
+                    client = self.client(b)
+                    say("uploading" if plan.images else None,
+                        "uploading references" if plan.images else "")
+                    values = dict(plan.values)
+                    for var, path in plan.images.items():
+                        values[var] = client.upload_image(path)
+                    values["filename_prefix"] = "ImageStudio/%s_%s" % (
+                        plan.workflow.get("id", "job"), job.id)
+                    if b.get("shares_llm_gpu") and self.make_room is not None:
+                        say(detail="clearing LM Studio off the GPU")
+                        try:
+                            self.make_room(b)
+                        except Exception as e:
+                            job.notes.append("Could not clear the shared GPU (%s); this "
+                                             "may be slow." % e)
+                    return (client, plan, values), ""
+            except (ComfyError, TemplateError, OSError) as e:
+                why = str(e).rstrip(".")
+        why = ("This retry swapped the face alone - no head swap before it and no eye, hand "
+               "or glasses pass after: %s." % why)
+        job.notes.append(why)
+        return None, why
+
     def run_profile_swap(self, job, fix, say):
-        """An existing picture can receive a profile without a ComfyUI redraw."""
+        """An existing picture can receive a profile without a ComfyUI redraw.
+
+        The retry of a Generate's kept picture is owed what that job never
+        reached (`_retry_finish`): with its backend up, the head swap runs
+        before the faces and the eye, hand and glasses passes after, as in
+        `run_job`, and the record saved is the one that job would have
+        saved. Without it the swap runs alone, as every other swap here."""
         profiles, images = self.face_inputs(job.settings)
         job.started = time.time()
         job.plan = Plan()
@@ -6520,14 +6736,32 @@ class Studio:
                     checkpoint = dict(json.load(f), path=saved)
         except (OSError, RuntimeError, ValueError) as e:
             return self.queue._finish(job, "cancelled" if job.cancel.is_set() else "failed", str(e))
-        pictures = self.finish_profiles(job, None, pictures, profiles, say, checkpoint)
+        comfy, alone = self._retry_finish(job, say)
+        if job.cancel.is_set():
+            return self.queue._finish(job, "cancelled")
+        before = graph = None
+        if comfy:
+            client, plan, values = comfy
+            job.plan = plan               # the record is the picture's own, not a swap's
+            graph = (checkpoint or {}).get("graph")
+            before = lambda made: self._head_swap(job, client, values, made, profiles, say)
+        pictures = self.finish_profiles(job, graph, pictures, profiles, say, checkpoint,
+                                        before=before)
         if pictures is None:
             return
-        record = self.record_for(job, None)
+        if comfy and not plan.workflow.get("multi_identity"):
+            pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+        record = self.record_for(job, graph)
         record["fix"] = fix
+        if comfy:
+            # Generate Again and Reuse Settings on it are the picture's, not the retry's.
+            record["settings"] = {k: v for k, v in job.settings.items()
+                                  if k not in ("mode", "face_finish")}
+            record["notes"] = record["notes"] + [
+                "Finished by Retry face swap, from the picture kept before the face swap."]
         self.save_result(job, record, pictures)
         job.progress = 1.0
-        self.queue._finish(job, "complete")
+        self.queue._finish(job, "complete", alone)
 
     # ------------------------------------------------------------ fix a spot
     @staticmethod
@@ -6540,6 +6774,24 @@ class Studio:
         s.update(references={}, item_refs={}, wearing=[], pose=None, composition=None,
                  face_detail=False, critic_notes=False, batch=1)
         return s
+
+    def _upload_made(self, client, folder, name, data):
+        """A picture made on the way (`data`, PNG bytes) sent to `client`. ->
+        the name its LoadImage takes. An upload is of a file, so it is
+        written under the library's `folder` as `name` - and removed again:
+        ComfyUI has it, and these were never cleared (53 of them, 69 MB, in
+        four days; 2026-09-30)."""
+        path = os.path.join(self.lib.root, folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+            return client.upload_image(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def _fix_oval(self, client):
         """The fix oval, uploaded to `client`. The crop reaches FIX_CONTEXT
@@ -6607,12 +6859,10 @@ class Studio:
         # A hand keeps the picture's grade; a swapped face gets no curves,
         # which posterize its skin.
         hand_tone = FIX_TONE if TONE_NODE in types else None
-        folder = os.path.join(self.lib.root, "finish")
         out = []
         start = upto = (len(job.notes), len(job.passes))   # this picture's notes and passes
         done = None
         try:
-            os.makedirs(folder, exist_ok=True)
             oval = self._fix_oval(client)
             for n, (filename, data) in enumerate(pictures):
                 start = upto = (len(job.notes), len(job.passes))
@@ -6620,10 +6870,7 @@ class Studio:
                 if job.cancel.is_set():
                     out.append((filename, data))
                     continue
-                path = os.path.join(folder, "%s_%d.png" % (job.id, n))
-                with open(path, "wb") as fh:
-                    fh.write(data)
-                image = client.upload_image(path)
+                image = self._upload_made(client, "finish", "%s_%d.png" % (job.id, n), data)
                 say("eyes" if eyes else ("hands" if hands else "glasses"),
                     "Finding the %s" % " and ".join(looking), None)
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
@@ -6729,11 +6976,9 @@ class Studio:
         for i, crop in enumerate(crops):
             if not crop.get("outline"):
                 continue
-            path = os.path.join(self.lib.root, "fix_shapes", "%s_%s_%d.png" % (job.id, tag, i))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as fh:
-                fh.write(outline_png(crop["outline"], crop["width"], crop["height"]))
-            crop["shape"] = client.upload_image(path)
+            crop["shape"] = self._upload_made(
+                client, "fix_shapes", "%s_%s_%d.png" % (job.id, tag, i),
+                outline_png(crop["outline"], crop["width"], crop["height"]))
 
     def run_fix(self, job, client, say):
         """Fix a spot, on the lane's thread: the squares the user clicked on a
@@ -7747,11 +7992,18 @@ class Studio:
             return []
 
     def _critic_log(self, job, text):
-        """The debug log: image-studio/visual_critic.log, a block per look."""
+        """The debug log: image-studio/visual_critic.log, a block per look.
+        Past CRITIC_LOG_MAX it rolls over to a single `.1`, as the error log
+        does: it grew 300 KB in a day of refining and nothing ever cut it."""
         try:
             os.makedirs(self.lib.root, exist_ok=True)
-            with open(os.path.join(self.lib.root, "visual_critic.log"), "a",
-                      encoding="utf-8") as f:
+            path = os.path.join(self.lib.root, CRITIC_LOG)
+            try:
+                if os.path.getsize(path) > CRITIC_LOG_MAX:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass                  # no log yet, or one that will not roll; append anyway
+            with open(path, "a", encoding="utf-8") as f:
                 f.write("[%s job %s]\n%s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
                                                 job.id, text))
         except OSError:

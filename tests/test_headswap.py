@@ -606,6 +606,106 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertNotIn(("head_swap", "Head swap"),
                          ig.pipeline_stages(self.studio.lib, job.settings))
 
+    # ------------------------------------------------- Retry face swap
+    def kept(self):
+        """A Generate whose face swap failed: -> the picture kept before it."""
+        self.studio.client_factory = KleinClient
+        self.studio.clients = {}
+        s = dict(ig.default_settings(), model="z-image-turbo", backend="5090",
+                 scene="A portrait", identities=["person"], auto_refine=False,
+                 hand_pass=False)
+        with patch.object(ff, "available", return_value=True), \
+                patch.object(ff, "swap", side_effect=RuntimeError("failed")):
+            jobs = self.studio.submit(s)
+            settle(jobs)
+        self.assertEqual(jobs[0].status, "failed")
+        return self.studio.history.list()[0]
+
+    def retry(self, kept):
+        swapped = []
+        with patch.object(ff, "available", return_value=True), \
+                patch.object(ff, "swap", side_effect=lambda data, *a, **k: (
+                    swapped.append(data) or (PNG, {"outside_mask_changed_pixels": 0}))):
+            jobs = self.studio.submit(ig.retry_faces(kept))
+            settle(jobs)
+        return jobs[0], swapped
+
+    def test_a_retried_face_swap_finishes_the_picture_as_the_job_would_have(self):
+        whole, _, _ = self.generate()         # what an unbroken job runs and records
+        kept = self.kept()
+        client = FakeClient.instances[-1]
+        before = len(client.graphs)
+        job, swapped = self.retry(kept)
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(job.detail, "")
+        self.assertEqual(job.backend["id"], "5090")       # on the lane it was made on
+        # The head is redrawn again, and the face goes onto Klein's head.
+        self.assertEqual(len([g for g in client.graphs[before:] if "h1_ks" in g]), 1)
+        self.assertEqual(swapped, [HEAD_PNG])
+        # Every pass the unbroken job ran, and a record that is the picture's own.
+        labels = [p["label"] for p in whole.record["passes"]]
+        self.assertIn("Eye pass", labels)
+        self.assertEqual([p["label"] for p in job.record["passes"]], labels)
+        self.assertEqual(job.record["workflow"], whole.record["workflow"])
+        self.assertEqual(job.record["prompt"], whole.record["prompt"])
+        self.assertEqual(job.record["graph"], kept["graph"])
+        self.assertNotIn("mode", job.record["settings"])
+        self.assertNotIn("face_finish", job.record["settings"])
+        self.assertEqual(job.record["settings"]["scene"], "A portrait")
+        self.assertIn("Finished by Retry face swap, from the picture kept before the face "
+                      "swap.", job.record["notes"])
+        # The kept picture became the result: History shows the two finished ones.
+        self.assertEqual([r["id"] for r in self.studio.history.list()
+                          if r["id"].endswith("-generated")], [])
+
+    def test_a_retry_with_its_backend_down_swaps_the_face_alone_and_says_so(self):
+        kept = self.kept()
+        client = FakeClient.instances[-1]
+        before = len(client.graphs)
+        FakeClient.down = {"5090"}
+        job, swapped = self.retry(kept)
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(job.backend["id"], ig.LOCAL_FACES["id"])
+        self.assertEqual(client.graphs[before:], [])      # nothing was asked of ComfyUI
+        self.assertEqual(swapped, [PNG])
+        said = ("This retry swapped the face alone - no head swap before it and no eye, "
+                "hand or glasses pass after: 5090 Workstation is not answering.")
+        self.assertEqual(job.detail, said)
+        self.assertIn(said, job.record["notes"])
+
+    def test_a_retry_whose_settings_no_longer_compose_swaps_the_face_alone(self):
+        kept = self.kept()
+        kept["settings"]["model"] = "a model since removed"
+        job, swapped = self.retry(kept)
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(swapped, [PNG])
+        self.assertIn("No model called 'a model since removed' in the library", job.detail)
+
+    def test_only_a_generated_picture_is_owed_more_than_the_swap(self):
+        rec = {"images": ["a.png"], "seed": 3, "path": "r.json",
+               "backend": {"id": "5090"}, "finish": {"profiles": [{"id": "person"}]},
+               "settings": {"scene": "A portrait", "head_swap": False}}
+        retry = ig.retry_faces(rec)
+        self.assertEqual((retry["mode"], retry["seed"], retry["batch"]), ("faces", 3, 1))
+        self.assertEqual(retry["face_finish"]["backend"], "5090")
+        self.assertEqual((retry["scene"], retry["head_swap"]), ("A portrait", False))
+        # A face-only swap's kept picture (Fix a spot, an earlier swap) is retried as it was.
+        for settings in ({"mode": "fix", "scene": "x"}, {"mode": "faces"}, None):
+            alone = ig.retry_faces(dict(rec, settings=settings))
+            self.assertEqual(sorted(alone), ["batch", "face_finish", "mode", "seed"])
+            self.assertNotIn("backend", alone["face_finish"])
+        self.assertIsNone(self.studio.finish_backend(alone))
+        self.assertEqual(self.studio.plan_route(alone)[0]["id"], ig.LOCAL_FACES["id"])
+        # The job's strip shows what the retry runs: nothing is sampled again.
+        lib = self.studio.lib
+        self.assertEqual([k for k, _ in ig.pipeline_stages(lib, alone)],
+                         ["face_swap", "complete"])
+        self.assertEqual([k for k, _ in ig.pipeline_stages(lib, retry)],
+                         ["face_swap", "eyes", "hands", "complete"])
+        on = ig.retry_faces(dict(rec, settings={"scene": "A still life", "hand_pass": False}))
+        self.assertEqual([k for k, _ in ig.pipeline_stages(lib, on)],
+                         ["head_swap", "face_swap", "eyes", "complete"])
+
     def test_a_picture_saved_before_the_head_swap_has_it_on(self):
         self.assertTrue(ig.default_settings()["head_swap"])
         old = {k: v for k, v in ig.default_settings().items() if k != "head_swap"}
