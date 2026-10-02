@@ -542,6 +542,21 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
                       "A bowl of ramen on a wooden table", "Snow on a mountain pass"):
             self.assertFalse(ig.hand_pass({"scene": scene}), scene)
         self.assertTrue(ig.hand_pass({"scene": "A lighthouse", "identities": ["person"]}))
+
+    def test_the_strip_shows_the_face_pass_only_when_the_plan_runs_it(self):
+        # A Klein job with a person chosen said Face pass on its strip while
+        # its workflow had none (2026-10-02): once composed, the plan says.
+        s = dict(ig.default_settings(), scene="A chef in a kitchen")
+        plan = ig.Plan()
+        plan.workflow = {"id": "klein9b_base"}
+        for on in (True, False):
+            plan.values = {"face_detail": on}
+            self.assertEqual(("face", "Face pass") in ig.pipeline_stages(
+                self.studio.lib, s, plan), on)
+        # Only a Generate's plan: a Fix's is not the picture's.
+        plan.values = {"face_detail": True}
+        self.assertNotIn(("face", "Face pass"), ig.pipeline_stages(
+            self.studio.lib, dict(s, mode="fix"), plan))
         self.assertTrue(ig.hand_pass({"scene": "A lighthouse", "subject": "a sailor"}))
         self.assertFalse(ig.hand_pass({"scene": "A chef", "hand_pass": False}))
 

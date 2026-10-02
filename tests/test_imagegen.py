@@ -1651,6 +1651,31 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             self.assertEqual(p.errors, [])
             self.assertTrue(p.values["face_detail"])
             self.assertEqual(p.values["face_denoise"], strength, model)
+        # Klein, base and distilled, has a face pass: one section, each
+        # model's guidance its CFG (the base's real one, the distilled's 1),
+        # the written negative, the simple scheduler; the base redraws in
+        # 20 steps, not its 50.
+        klein = ig.load_workflow("klein9b_base")
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"},
+                   diffusion_models={"flux-2-klein-base-9b.safetensors",
+                                     "flux-2-klein-9b-fp8.safetensors"},
+                   text_encoders={"qwen_3_8b_fp8mixed.safetensors"},
+                   vae={"flux2-vae.safetensors"})
+        nodes = set(FaceClient.NODES) | {n["class_type"] for n in klein["graph"].values()}
+        for model, want in (("klein-9b", (20, 4.0)), ("klein-9b-distilled", (4, 1.0))):
+            s = dict(ig.default_settings(), model=model, scene="a woman", preset="hq_final")
+            p = ig.compose(s, self.studio.lib, self.backend("5090"), inv, nodes=nodes)
+            self.assertEqual(p.errors, [])
+            self.assertTrue(p.values["face_detail"], p.warnings)
+            self.assertFalse(any("face pass" in w for w in p.warnings), p.warnings)
+            values = dict(p.values, face_prompt="a face", face_denoise=0.4)
+            g = ig.face_graph(klein, values, [], "made.png", ig.fix_crops(512, 512, [
+                {"x": 200, "y": 200, "size": 64}]), "oval.png", "out")
+            k = g["fc1_4"]["inputs"]
+            self.assertEqual((k["steps"], k["cfg"]), want, model)
+            self.assertEqual((k["sampler_name"], k["scheduler"]), ("euler", "simple"))
+            self.assertEqual(k["negative"], ["12", 0])
+            self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])
         # FLUX names none, and redraws with the picture's as before.
         self.assertNotIn("redraw_sampler", ig.load_workflow("flux_dev_baseline")["defaults"])
         job, client, _ = self.fix_job(model="flux-dev")
