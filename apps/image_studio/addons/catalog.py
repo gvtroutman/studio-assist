@@ -207,7 +207,17 @@ $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
 foreach ($p in $job.pairs) {
   try {
     $img = [System.Drawing.Image]::FromFile($p.src)
-    $k = [Math]::Min(1.0, $job.side / [Math]::Max($img.Width, $img.Height))
+    if ($img.PropertyIdList -contains 274) {
+      # A phone's photo stands upright by its EXIF orientation (1-8), which
+      # DrawImage ignores. One of the tag's two bytes is 0, whichever order.
+      $v = $img.GetPropertyItem(274).Value
+      $o = [Math]::Max([int]$v[0], [int]$v[1])
+      $turn = @{2 = 'RotateNoneFlipX'; 3 = 'Rotate180FlipNone'; 4 = 'Rotate180FlipX';
+                5 = 'Rotate90FlipX'; 6 = 'Rotate90FlipNone'; 7 = 'Rotate270FlipX';
+                8 = 'Rotate270FlipNone'}
+      if ($turn.ContainsKey($o)) { $img.RotateFlip([System.Drawing.RotateFlipType]$turn[$o]) }
+    }
+    $k =[Math]::Min(1.0, $job.side / [Math]::Max($img.Width, $img.Height))
     $w = [Math]::Max(1, [int]($img.Width * $k))
     $h = [Math]::Max(1, [int]($img.Height * $k))
     $bmp = New-Object System.Drawing.Bitmap $w, $h
