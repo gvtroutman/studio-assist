@@ -1242,6 +1242,33 @@ class TestSceneFile(unittest.TestCase):
 
 
 class TestWords(unittest.TestCase):
+    def test_accordion_words_require_contact_with_the_rendered_instrument(self):
+        obj = sc.new_object("person")
+        obj["look"] = {"build": "stocky", "top": "white linen shirt", "accessories": "accordion"}
+        ctl = obj["pose"]["controls"]
+        ctl.update(arm_l_raise=40, arm_l_out=35, arm_l_bend=80,
+                   arm_r_raise=40, arm_r_out=20, arm_r_bend=85)
+        original = dict(ctl)
+        gaps = sc.accordion_contacts(ctl, obj["look"])
+        self.assertGreater(gaps["r"], 0.1)
+        self.assertGreater(gaps["l"], 0.1)
+        words = ", ".join(sc.posture_words(obj))
+        self.assertNotIn("on the accordion", words)
+        self.assertEqual(ctl, original)
+        scene = sc.new_scene("")
+        scene["objects"] = [obj]
+        self.assertTrue(any("do not reach" in n for n in sc.scene_text(scene).notes))
+        # Fitted to the keyboard and bass surfaces of the same clothed,
+        # stocky mesh: independent of camera perspective and world yaw.
+        ctl.update(arm_r_raise=8.6, arm_r_out=21, arm_r_bend=107.2, wrist_r_bend=5.8,
+                   arm_l_raise=19.4, arm_l_out=12, arm_l_bend=105.5, wrist_l_bend=10)
+        words = ", ".join(sc.posture_words(obj))
+        self.assertIn("right fingers on the accordion keys", words)
+        self.assertIn("left hand on the accordion's bass end", words)
+        self.assertFalse(any("not reach" in n for n in sc.scene_text(scene).notes))
+        obj["rotation"] = [65, 0, 0]
+        self.assertEqual(", ".join(sc.posture_words(obj)), words)
+
     def test_descriptions_are_sent_as_written(self):
         s = staged("person", "cylinder")
         p, c = s["objects"]
@@ -2544,6 +2571,32 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual((second["look"], second["character"]), ({}, ""))
         ui.studio.lib.save("characters", [])
 
+    def test_structured_beard_controls_edit_and_restore_a_person(self):
+        from apps.image_studio.scene import beard
+        ui, sb = self.builder()
+        person = sb.add("person")
+        person["look"]["beard"] = dict(beard.DEFAULT, color="auburn")
+        sb._look_tab("Face")
+        self.assertIn("beard_length", sb.vars)
+        self.assertEqual(sb.vars["beard_density"][0].get(), 0.65)
+        slider_var, _ = sb.vars["beard_length"]
+        slider_var.set(0.25)
+        # Exercise the real slider command through its Tk widget.
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+        slider = next(w for w in descendants(sb.panel)
+                      if w.winfo_class() == "Scale" and str(w.cget("variable")) == str(slider_var))
+        sb.win.tk.call(slider.cget("command"), "0.25")
+        self.assertEqual(person["look"]["beard"]["length"], 0.25)
+        self.assertIn("auburn short beard", sb.words_label.cget("text"))
+        sb._look_tab("Hair")
+        sb._look_tab("Face")
+        self.assertEqual(sb.vars["beard_length"][0].get(), 0.25)
+        sb._clear_look()
+        self.assertNotIn("beard", person["look"])
+
     def test_head_shape_sliders_save_to_the_identity_and_come_back(self):
         ui, sb = self.builder()
         lib = ui.studio.lib
@@ -2952,8 +3005,8 @@ class TestHeadShape(unittest.TestCase):
             shots.append((sc.framing(s)[0], extra["pose"]["strength"],
                           extra["composition"]["strength"]))
         self.assertEqual(shots, [("wide shot", 0.85, 0.55),
-                                 ("medium shot", round(0.85 * 0.75, 3), round(0.55 * 0.75, 3)),
-                                 ("close-up", round(0.85 * 0.45, 3), round(0.55 * 0.45, 3))])
+                                 ("medium shot", 0.85, round(0.55 * 0.75, 3)),
+                                 ("close-up", 0.85, round(0.55 * 0.45, 3))])
         self.assertTrue(any("close-up" in n for n in words.notes), words.notes)
         faces = extra["scene_faces"]
         self.assertEqual(faces["head_depth"], sc.HEAD_DEPTH)

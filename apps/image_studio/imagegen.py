@@ -1259,7 +1259,9 @@ class ComfyUIClient:
             re.sub(r"^http", "ws", self.url) + "/ws")
         self.timeout = timeout
         self.client_id = uuid.uuid4().hex
-        self.uploaded = {}            # the name ComfyUI gave an upload -> when it was sent
+        self.uploaded = {}            # an upload's content name -> when it was sent
+        self.upload_names = {}        # ... -> the name ComfyUI gave it (LoadImage's)
+        self._upload_lock = threading.Lock()
         self._nodes = None
 
     # --------------------------------------------------------------- HTTP
@@ -1444,8 +1446,18 @@ class ComfyUIClient:
             data = f.read()
         name = "studio_%s%s" % (hashlib.sha1(data).hexdigest()[:16],
                                 os.path.splitext(path)[1].lower() or ".png")
-        if time.time() - self.uploaded.get(name, -UPLOAD_TTL) < UPLOAD_TTL:
-            return name
+        # Finders and generation may share this client. Hold the cache lookup
+        # and upload together so two callers do not send the same bytes twice.
+        with self._upload_lock:
+            if time.time() - self.uploaded.get(name, -UPLOAD_TTL) < UPLOAD_TTL:
+                return self.upload_names.get(name, name)
+            sent = self._upload_image(name, data)
+            self.upload_names[name] = sent
+            self.uploaded[name] = time.time()
+            return sent
+
+    def _upload_image(self, name, data):
+        """Send uncached bytes; only a successful response enters the cache."""
         boundary = "----studio" + uuid.uuid4().hex
         body = b""
         for k, v in (("overwrite", "true"), ("type", "input")):
@@ -1462,7 +1474,6 @@ class ComfyUIClient:
         name = res.get("name", name)
         if res.get("subfolder"):
             name = res["subfolder"] + "/" + name
-        self.uploaded[name] = time.time()
         return name
 
     def queue_workflow(self, graph):
@@ -1535,6 +1546,14 @@ class ComfyUIClient:
         try:
             while True:
                 if stop is not None and stop():
+                    # Stop may have been clicked while /prompt was in flight,
+                    # before JobQueue.cancel knew the new prompt id. This is
+                    # the worker thread, so it can stop that accepted prompt
+                    # without holding Tk or interrupting another client's job.
+                    try:
+                        self.cancel_job(prompt_id)
+                    except ComfyError:
+                        pass
                     return None
                 now = time.monotonic()
                 if now >= next_poll:
@@ -1957,6 +1976,18 @@ GLASSES_WHAT = ("thin metal glasses frames with perfectly clear, transparent len
 # off a finger, aged a florist's hand into scales and bent a guitarist's
 # fingers off the frets, where 0.4 left each hand as it was and sharpened the
 # small ones. A hand that is wrong is the Critic's or Fix a spot's, at 0.6.
+# A Scene Builder person given a beard (`look.beard`) has it drawn where the
+# scene's jaw puts it (scene.beard_masks -> character_regions "facial_hair").
+# The head swap and FaceFusion then redraw that face from a photo, which can
+# shave it or bring the photo's beard instead. So a beard pass follows the
+# swap: only inside the scene's mask, in that beard's own words
+# (2026-10-02: scene render -> identity pass -> beard pass -> final). Not yet
+# run live: BEARD_DENOISE is the eye pass's, a guess.
+BEARD_DENOISE = 0.5
+BEARD_WHAT = "a natural beard"        # each beard is said in its own words instead
+BEARD_PAD = 1.8                       # the crop, of the beard's longer side: the jaw round it
+BEARD_ON_FACE = 0.25                  # how far round a found face a beard's middle may be
+BEARD_SHAPE = 256                     # px: the most a side of the mask picture is drawn at
 HAND_FIND = "hand:8"
 HAND_DENOISE = 0.4
 HAND_WHAT = ("a natural, relaxed human hand with four fingers and a thumb, each finger "
@@ -2280,6 +2311,77 @@ def glasses_spots(width, height, glasses, faces):
         return f[0] <= cx <= f[0] + f[2] and f[1] <= cy <= f[1] + f[3]
     return found_spots(width, height, [tuple(g[:4]) + ("glasses",) for g in glasses
                                        if any(on(g, f) for f in faces)], "other")
+
+
+def beard_regions(settings):
+    """The beards a Scene Builder person was given (`look.beard`), as the
+    scene sent them: settings["character_regions"] of kind "facial_hair",
+    each its words and its mask over the scene's frame - those whose mask
+    is still on this PC. None when settings["beard_pass"] is off."""
+    if settings.get("beard_pass", True) is False:
+        return []
+    return [r for r in settings.get("character_regions") or []
+            if isinstance(r, dict) and r.get("kind") == "facial_hair" and r.get("prompt")
+            and r.get("mask_path") and os.path.isfile(r["mask_path"])]
+
+
+def beard_spots(width, height, regions, faces):
+    """Each beard region -> a spot on the width x height picture: its mask's
+    box scaled from the scene's frame, the square round it BEARD_PAD times
+    its longer side, its words (`prompt`) and its mask (`mask`: grey bytes,
+    width, height). Only a beard whose middle is on one of `faces` (x, y,
+    w, h; SAM3's, grown by BEARD_ON_FACE): a drawn head the pose did not put
+    where the scene did gets no beard on its neck or the wall beside it.
+    -> (spots, how many were off every face)."""
+    import struct
+    import zlib
+    import core.icons as studio_icons
+    spots, off = [], 0
+    for r in regions:
+        try:
+            with open(r["mask_path"], "rb") as fh:
+                rgba, mw, mh = studio_icons.png_to_rgba(fh.read())
+        except (OSError, ValueError, KeyError, IndexError, zlib.error, struct.error):
+            continue
+        grey = bytes(rgba[0::4])
+        rows = [y for y in range(mh) if max(grey[y * mw:(y + 1) * mw]) >= 128]
+        if not rows:
+            continue
+        cols = [x for x in range(mw) if max(grey[x::mw]) >= 128]
+        kx, ky = width / float(mw), height / float(mh)
+        x0, y0 = cols[0] * kx, rows[0] * ky
+        bw, bh = (cols[-1] + 1) * kx - x0, (rows[-1] + 1) * ky - y0
+        cx, cy = x0 + bw / 2.0, y0 + bh / 2.0
+
+        def on(f):
+            gx, gy = f[2] * BEARD_ON_FACE, f[3] * BEARD_ON_FACE
+            return f[0] - gx <= cx <= f[0] + f[2] + gx and f[1] - gy <= cy <= f[1] + f[3] + gy
+        if not any(on(f) for f in faces):
+            off += 1
+            continue
+        spots.append({"x": int(cx), "y": int(cy),
+                      "size": int(min(max(FIX_MIN, max(bw, bh) * BEARD_PAD), width, height)),
+                      "box": [int(x0), int(y0), int(bw), int(bh)],
+                      "prompt": r["prompt"], "mask": (grey, mw, mh)})
+    return spots, off
+
+
+def beard_shape_png(spot, crop, width, height):
+    """The beard's mask over `crop` (a square of the width x height
+    picture) as a PNG at most BEARD_SHAPE px a side, for face_graph's
+    `shape`: white where the beard is drawn, black elsewhere."""
+    import core.icons as studio_icons
+    grey, mw, mh = spot["mask"]
+    side = crop["width"]
+    n = max(8, min(side, BEARD_SHAPE))
+    px = bytearray(n * n * 4)
+    for v in range(n):
+        my = min(mh - 1, int((crop["y"] + (v + 0.5) * side / n) * mh / height))
+        for u in range(n):
+            mx = min(mw - 1, int((crop["x"] + (u + 0.5) * side / n) * mw / width))
+            g = grey[my * mw + mx]
+            px[(v * n + u) * 4:(v * n + u) * 4 + 4] = bytes((g, g, g, 255))
+    return studio_icons.png(bytes(px), n, n)
 
 
 def parts_graph(image, sam3, prompts):
@@ -3882,8 +3984,9 @@ def person_text(settings):
     bits = [_field(s, k) for k in ("subject", "age")]
     bits += [_noun(k, _field(s, k)) for k in ("skin", "build")]
     bits += [slider_word(k, s.get(k)) for k, _, _ in SLIDERS]
-    bits += [_noun(k, _field(s, k)) for k in ("face", "eyes", "brows", "nose", "lips",
-                                              "facial_hair")]
+    bits += [_noun(k, _field(s, k)) for k in ("face", "eyes", "brows", "nose", "lips")]
+    from apps.image_studio.scene import beard
+    bits.append(beard.text(s.get("beard")) or _field(s, "facial_hair"))
     bits.append(hair_text(s))
     bits += [_field(s, "traits"), _noun("expression", _field(s, "expression")),
              _field(s, "gaze")]
@@ -4853,7 +4956,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         for i, region in enumerate(regions_in, 1):
             path = region.get("mask_path")
             if not path or not os.path.isfile(path):
-                p.warnings.append("A character's mask picture is not on this PC any "
+                p.warnings.append("A person's mask picture is not on this PC any "
                                   "more; regional prompting skipped for it.")
                 continue
             var = "char_mask_%d" % i
@@ -4861,7 +4964,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             regions.append({"prompt": region["prompt"], "mask_var": var})
         if regions:
             v["character_regions"] = regions
-            p.notes.append("%d character%s given their own words and region of the "
+            p.notes.append("%d person region%s given their own words and mask in the "
                            "picture." % (len(regions), "" if len(regions) == 1 else "s"))
     elif regions_in:
         p.notes.append("Regional character prompting needs a workflow that supports it "
@@ -5066,7 +5169,8 @@ def route(role, backends, health, has_model=None, load=None):
 # ================================================================ jobs
 
 STATUSES = ("queued", "uploading", "loading", "sampling", "decoding", "running", "refining",
-            "face", "critic", "items", "head_swap", "face_swap", "eyes", "hands", "glasses",
+            "face", "critic", "items", "head_swap", "face_swap", "eyes", "beard", "hands",
+            "glasses",
             "complete", "failed", "cancelled")
 FINISHED = ("complete", "failed", "cancelled")
 # The stages a job is shown moving through. "running" and "refining" are what
@@ -5167,6 +5271,8 @@ def pipeline_stages(lib, settings):
         stages.append(("face_swap", "Face swap"))
         if whole and eye_pass():
             stages.append(("eyes", "Eye pass"))
+    if whole and beard_regions(settings):
+        stages.append(("beard", "Beard pass"))
     if whole and hand_pass(settings):
         stages.append(("hands", "Hand pass"))
     if whole and profiles and glasses_pass(settings):
@@ -5353,7 +5459,7 @@ def run_errors(entry, graph=None):
                 text += " - the GPU ran out of memory; free VRAM or lower the size."
             out.append(text)
     if not out:
-        out = [x for x in status_messages(entry)]
+        out = status_messages(dict(entry, status=entry.get("status") or {}))
     return out
 
 
@@ -6812,7 +6918,10 @@ class Studio:
         """The end of Generate, on the lane's thread, by the fix machinery on
         the picture's own model: after FaceFusion (`profiles`) each swapped
         face's eyes (EYE_WHAT) - unless a face enhancer sharpened them
-        (`eye_pass`); then the hands of a picture of people
+        (`eye_pass`); then each beard a Scene Builder person was given,
+        inside the scene's own beard mask (`beard_regions`, `beard_spots`;
+        with or without a swap, unless settings["beard_pass"] is off); then
+        the hands of a picture of people
         (HAND_WHAT, `real_hands`; the hands pass, unless
         settings["hand_pass"] is off); then the swapped faces' glasses last
         (GLASSES_WHAT), so nothing is drawn over them - when the swap
@@ -6830,10 +6939,11 @@ class Studio:
         if profiles and not specs and job.settings.get("glasses_pass") is not False:
             job.notes.append("No glasses pass: the face swap went behind what was in front "
                              "of the face, so glasses are as they were drawn.")
-        if not eyes and not specs and not hands:
+        beards = beard_regions(job.settings)
+        if not eyes and not specs and not hands and not beards:
             return pictures
-        kinds = (["eye"] if eyes else []) + (["hands"] if hands else []) + (
-            ["glasses"] if specs else [])
+        kinds = (["eye"] if eyes else []) + (["beard"] if beards else []) + (
+            ["hands"] if hands else []) + (["glasses"] if specs else [])
         named = "%s pass%s" % (", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1
                                else kinds[0], " after the face swap" if profiles else "")
         b = job.backend
@@ -6855,11 +6965,11 @@ class Studio:
             job.notes.append("No %s: %s." % (named, why))
             return pictures
         asked = list(zip(FINISH_FIND, FINISH_WORDS))
-        asked = [a for a in asked if (a[1] == "face" and (eyes or specs))
+        asked = [a for a in asked if (a[1] == "face" and (eyes or specs or beards))
                  or (a[1] == "glasses" and specs)] + ([(HAND_FIND, "hand")] if hands else [])
         find, words = [a[0] for a in asked], [a[1] for a in asked]
-        looking = (["eyes"] if eyes else []) + (["hands"] if hands else []) + (
-            ["glasses"] if specs else [])
+        looking = (["eyes"] if eyes else []) + (["face"] if beards and not eyes else []) + (
+            ["hands"] if hands else []) + (["glasses"] if specs else [])
         v = dict(values, sam3=sam, match_tone=None)
         # A hand keeps the picture's grade; a swapped face gets no curves,
         # which posterize its skin.
@@ -6876,7 +6986,7 @@ class Studio:
                     out.append((filename, data))
                     continue
                 image = self._upload_made(client, "finish", "%s_%d.png" % (job.id, n), data)
-                say("eyes" if eyes else ("hands" if hands else "glasses"),
+                say("eyes" if eyes else ("beard" if beards else ("hands" if hands else "glasses")),
                     "Finding the %s" % " and ".join(looking), None)
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
@@ -6889,7 +6999,7 @@ class Studio:
                     out.append((filename, data))
                     continue
                 width, height, boxes = said
-                passes, faces, found_hands, glasses = [], [], [], []
+                passes, faces, found_hands, glasses, bearded = [], [], [], [], []
                 if eyes or specs:
                     faces = swapped_faces(width, height,
                                           [x[:4] for x in boxes if x[4] == "face"], profiles)
@@ -6897,11 +7007,27 @@ class Studio:
                         spots = eye_spots(faces)
                         passes.append(("Eye pass", fix_areas(fix_crops(width, height, spots),
                                                              spots),
-                                       EYE_DENOISE, EYE_WHAT, "_eyes", None))
+                                       EYE_DENOISE, EYE_WHAT, "_eyes", None, None))
                     elif not faces:
                         job.notes.append("SAM3 found no swapped face, so no %s pass was made."
                                          % ("eye or glasses" if eyes and specs else
                                             "eye" if eyes else "glasses"))
+                if beards:
+                    bearded, off = beard_spots(
+                        width, height, beards, [x[:4] for x in boxes if x[4] == "face"])
+                    if off:
+                        job.notes.append("%d beard%s not redrawn: the face was not drawn where "
+                                         "the scene put it." % (off, "" if off == 1 else "s"))
+                    if bearded:
+                        crops = fix_crops(width, height, bearded)
+                        for i, (crop, sp) in enumerate(zip(crops, bearded)):
+                            crop.update(area=(0, 0, crop["width"], crop["height"]),
+                                        shape=self._upload_made(
+                                            client, "finish", "%s_%d_beard%d.png" % (job.id, n, i),
+                                            beard_shape_png(sp, crop, width, height)))
+                        passes.append(("Beard", crops, BEARD_DENOISE, BEARD_WHAT, "_beard",
+                                       None, [{"prompt": FIX_PROMPT % sp["prompt"]}
+                                              for sp in bearded]))
                 if hands:
                     found_hands = found_spots(width, height, real_hands(
                         width, height, [x for x in boxes if x[4] == "hand"]), "hand")
@@ -6909,7 +7035,7 @@ class Studio:
                         crops = fix_crops(width, height, [
                             dict(sp, size=int(sp["size"] * FIX_CONTEXT)) for sp in found_hands])
                         passes.append(("Hands", fix_areas(crops, found_hands), HAND_DENOISE,
-                                       HAND_WHAT, "_hands", hand_tone))
+                                       HAND_WHAT, "_hands", hand_tone, None))
                     else:
                         job.notes.append("SAM3 found no hands, so no hands pass was made.")
                 if faces and specs:
@@ -6919,16 +7045,16 @@ class Studio:
                         crops = fix_crops(width, height, [
                             dict(sp, size=int(sp["size"] * FIX_CONTEXT)) for sp in glasses])
                         passes.append(("Glasses", fix_areas(crops, glasses), GLASSES_DENOISE,
-                                       GLASSES_WHAT, "_glasses", None))
+                                       GLASSES_WHAT, "_glasses", None, None))
                     else:
                         job.notes.append("SAM3 found no glasses on the swapped face.")
                 done = None
-                for label, crops, denoise, what, tag, tone in passes:
+                for label, crops, denoise, what, tag, tone, who in passes:
                     graph = face_graph(plan.workflow, dict(v, face_prompt=FIX_PROMPT % what,
                                                            face_denoise=denoise,
                                                            match_tone=tone),
                                        plan.loras, image, crops, oval,
-                                       values["filename_prefix"] + tag)
+                                       values["filename_prefix"] + tag, faces=who)
                     files = self._run_pass(job, client, graph, say, label,
                                            status=tag.lstrip("_"))
                     if files is None:     # cancelled: keep what is finished
@@ -6939,6 +7065,8 @@ class Studio:
                     count, said = {
                         "_eyes": (len(faces), "Eye pass after the face swap: %d face%s, "
                                               "denoise %s."),
+                        "_beard": (len(bearded), "Beard pass: %d beard%s redrawn in the "
+                                                 "scene's mask, denoise %s."),
                         "_hands": (len(found_hands), "Hands pass: %d hand%s redrawn, "
                                                      "denoise %s."),
                         "_glasses": (len(glasses), "Glasses redrawn last: %d pair%s, "
@@ -8021,9 +8149,10 @@ class Studio:
 
     def _run_pass(self, job, client, graph, say, label, status="refining"):
         """Run one refinement graph to its end. -> files, or None if cancelled.
-        Raises ComfyError when it ends without a picture."""
+        Raises ComfyError when it fails, even if it saved a partial picture."""
+        if job.cancel.is_set():
+            return None
         job.passes.append({"label": label, "graph": graph})
-        job.prompt_id = client.queue_workflow(graph)
 
         def on_event(kind, data):
             if kind == "progress" and data[1]:
@@ -8031,6 +8160,9 @@ class Studio:
                     data[0] / float(data[1]))
         watch = client.watch() if hasattr(client, "watch") else None
         try:
+            if job.cancel.is_set():
+                return None
+            job.prompt_id = client.queue_workflow(graph)
             entry = client.listen_for_progress(
                 job.prompt_id, on_event, stop=job.cancel.is_set,
                 **({"watch": watch} if watch is not None else {}))
@@ -8039,9 +8171,12 @@ class Studio:
                 watch.close()
         if entry is None:
             return None
+        errors = run_errors(entry, graph)
+        if errors or (entry.get("status") or {}).get("status_str") == "error":
+            raise ComfyError("; ".join(errors) or "the run failed")
         out = outputs_of(entry)
         if not out:
-            raise ComfyError("; ".join(run_errors(entry, graph)) or "no picture")
+            raise ComfyError("no picture")
         return out
 
     def _real_faces(self, job, client, plan, values, files, say):
@@ -8116,27 +8251,38 @@ class Studio:
             return True                   # the face pass says why, once
         if not w or not h:
             return True
-        faces, chained = [], []
+        faces, chained, conditioned = [], [], []
         try:
+            masks = {}
+            if job.settings.get("scene_layout"):
+                from apps.image_studio.scene import scene as sc
+                layout, _ = sc.clean_scene(job.settings["scene_layout"])
+                masks = sc.identity_masks(layout, people)
             folder = os.path.join(self.lib.root, "face_regions")
             os.makedirs(folder, exist_ok=True)
             for person in people:
                 if job.cancel.is_set():
                     return False
+                if person.get("id") in masks and masks[person["id"]] is None:
+                    plan.notes.append("%s: no visible face surface for identity conditioning."
+                                      % person["name"])
+                    continue
+                conditioned.append(person["name"])
                 photos = [p for p in (person.get("photos") or [person["face"]])
                          if os.path.isfile(p)] or [person["face"]]
                 photos = photos[:REFERENCE_PHOTOS_MAX]
                 if len(photos) > 1:
                     chained.append(person["name"])
                 uploaded = [client.upload_image(p) for p in photos]
-                if list(person["region"]) == WHOLE_FRAME:
+                if list(person["region"]) == WHOLE_FRAME and person.get("id") not in masks:
                     # No mask: one the size of the picture's tokens does not
                     # fit when Kontext adds the item picture's (2026-09-26:
                     # "tensor a (8022) must match ... (3952)"), and a mask of
                     # everything masks nothing.
                     faces.append((uploaded, None))
                     continue
-                data = region_png(person["region"], w, h)
+                data = (masks[person["id"]] if person.get("id") in masks else
+                        region_png(person["region"], w, h))
                 path = os.path.join(folder, hashlib.sha1(data).hexdigest()[:16] + ".png")
                 if not os.path.isfile(path):
                     with open(path, "wb") as f:
@@ -8147,8 +8293,13 @@ class Studio:
                                  "drawn without them." % e)
             return True
         add_pulid(graph, pulid, faces)
+        if not faces:
+            return True
         plan.notes.append("%s drawn from their face picture%s in the picture itself." % (
-            ", ".join(p["name"] for p in people), "" if len(people) == 1 else "s"))
+            ", ".join(conditioned), "" if len(faces) == 1 else "s"))
+        if masks:
+            plan.notes.append("Scene identity masks follow visible head surfaces, with "
+                              "incidence confidence and inward edge feathering.")
         if chained:
             plan.notes.append("%s drawn from more than one of their photos for a stronger "
                               "match." % _and(sorted(chained)))

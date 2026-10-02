@@ -73,19 +73,20 @@ STATUS_ROLE = {"queued": "muted", "uploading": "accent", "loading": "accent",
                "sampling": "accent", "decoding": "accent", "running": "accent",
                "refining": "accent", "face": "accent", "critic": "accent",
                "items": "accent", "head_swap": "accent", "face_swap": "accent", "eyes": "accent",
-               "hands": "accent",
+               "beard": "accent", "hands": "accent",
                "glasses": "accent", "complete": "ok", "failed": "err", "cancelled": "faint"}
 STATUS_TEXT = {"face": "Face pass", "critic": "Critic", "items": "Item pass",
                "head_swap": "Head swap",
                "face_swap": "Face swap",
-               "eyes": "Eye pass", "hands": "Hand pass", "glasses": "Glasses"}
+               "eyes": "Eye pass", "beard": "Beard pass", "hands": "Hand pass",
+               "glasses": "Glasses"}
 # A status to the key on the job's own pipeline strip (ig.pipeline_stages) it
 # lights up. Queued/uploading/loading run before the strip's first stop, so
 # nothing is lit yet.
 STAGE_KEY = {"queued": None, "uploading": None, "loading": None, "running": "sampling",
              "sampling": "sampling", "face": "face", "critic": "critic",
              "decoding": "decoding", "items": "items", "head_swap": "head_swap", "face_swap": "face_swap",
-             "eyes": "eyes",
+             "eyes": "eyes", "beard": "beard",
              "hands": "hands", "glasses": "glasses", "complete": "complete"}
 READY_MARK = {"ready": "✓", "missing": "✗", "offline": "○", "disabled": "–",
               "unchecked": "?"}

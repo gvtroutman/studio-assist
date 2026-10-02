@@ -126,7 +126,8 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
 
         class FinishClient(FaceClient):
             def node_types(self):
-                return set(FaceClient.NODES) | ({ig.TONE_NODE} if tone else set())
+                return set(FaceClient.NODES) | ({ig.TONE_NODE} if tone else set()) | {
+                    "ConditioningCombine", "ConditioningSetMask"}   # a scene beard's regions
 
             def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
                 graph = self.graphs[int(pid[3:]) - 1]
@@ -433,6 +434,91 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         find, eyes, glasses = client.graphs[-3:]
         self.assertNotIn("p2t", find)
         self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
+
+    def beard_region(self, box=(115, 75, 16, 10), side=256, name="beard_mask.png"):
+        """A scene's beard as Scene Builder sends it: words and a side x side
+        mask, white over `box` (x, y, w, h in the mask's pixels). The finder's
+        face (450, 250, 80, 90) on 1024 is (112, 62, 20, 22) at 256."""
+        import core.icons as studio_icons
+        x, y, w, h = box
+        px = bytearray(side * side * 4)
+        for yy in range(side):
+            for xx in range(side):
+                v = 255 if x <= xx < x + w and y <= yy < y + h else 0
+                px[(yy * side + xx) * 4:(yy * side + xx) * 4 + 4] = bytes((v, v, v, 255))
+        path = os.path.join(self.dir, name)
+        Path(path).write_bytes(studio_icons.png(bytes(px), side, side))
+        return {"prompt": "closely cropped dense auburn short beard, high cheek coverage",
+                "mask_path": path, "person_id": "p1", "kind": "facial_hair"}
+
+    def test_a_scene_beard_is_redrawn_after_the_eyes_inside_its_mask(self):
+        region = self.beard_region()
+        job, client, order = self.finish_job([(460, 272, 60, 22)], hands=[(200, 600, 70, 80)],
+                                             character_regions=[region])
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(order, ['swap'])
+        find, eyes, beard, hands, glasses = client.graphs[-5:]
+        self.assertEqual(find["p0t"]["inputs"]["text"], "face:8")
+        self.assertEqual(eyes["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
+        # The beard on the eye pass's picture, redrawn only inside the scene's mask.
+        self.assertEqual(beard["fi"]["inputs"]["image"], "ImageStudio/faces_00001_.png [output]")
+        self.assertTrue(beard["fc1_a0"]["inputs"]["image"].startswith("studio_%s_0_beard0"
+                                                                      % job.id))
+        self.assertNotIn("fc1_s0", beard)           # the mask is the scene's, not SAM3's
+        self.assertEqual(beard["fc1_4"]["inputs"]["denoise"], ig.BEARD_DENOISE)
+        said = beard[beard["fc1_4"]["inputs"]["positive"][0]]["inputs"]["text"]
+        self.assertIn("auburn short beard", said)
+        region_px = beard["fc1_1"]["inputs"]["crop_region"]
+        self.assertLessEqual(region_px["x"], 460)               # the mask's box, 460..524 x 300..340
+        self.assertGreaterEqual(region_px["x"] + region_px["width"], 524)
+        self.assertEqual(hands["fc1_s0"]["inputs"]["text"], "hand")
+        self.assertEqual(glasses["fc1_s0"]["inputs"]["text"], "glasses")
+        self.assertEqual([p["label"] for p in job.record["passes"]],
+                         ["Eye pass", "Beard", "Hands", "Glasses"])
+        self.assertIn("Beard pass: 1 beard redrawn in the scene's mask, denoise %s."
+                      % ig.BEARD_DENOISE, job.record["notes"])
+        self.assertIn(("beard", "Beard pass"), ig.pipeline_stages(self.studio.lib, job.settings))
+
+    def test_a_scene_beard_without_a_face_swap_and_its_switch(self):
+        region = self.beard_region()
+        job, client, order = self.finish_job([], profile=False, scene="A bearded sailor",
+                                             hand_pass=False, character_regions=[region])
+        self.assertEqual(job.status, 'complete', job.detail)
+        find, beard = client.graphs[-2:]
+        self.assertEqual(find["p0t"]["inputs"]["text"], "face:8")
+        self.assertNotIn("p1t", find)
+        self.assertEqual([p["label"] for p in job.record["passes"]], ["Beard"])
+        # Off, nothing is looked for; no beard chosen, no pass.
+        job, client, _ = self.finish_job([], profile=False, scene="A bearded sailor",
+                                         hand_pass=False, beard_pass=False,
+                                         character_regions=[region])
+        self.assertFalse(any("p0d" in g for g in client.graphs))
+        self.assertEqual(ig.beard_regions({"character_regions": [
+            dict(region, kind=None), dict(region, mask_path="gone.png")]}), [])
+
+    def test_a_beard_off_the_drawn_face_is_left_and_said(self):
+        mask = self.beard_region(box=(10, 200, 16, 10))   # the scene put the head elsewhere
+        spots, off = ig.beard_spots(1024, 1024, [mask], [(450, 250, 80, 90)])
+        self.assertEqual((spots, off), ([], 1))
+        on = self.beard_region(name="on.png")
+        (spot,), off = ig.beard_spots(1024, 1024, [on], [(450, 250, 80, 90)])
+        self.assertEqual(off, 0)
+        self.assertEqual(spot["box"], [460, 300, 64, 40])
+        self.assertEqual(spot["size"], int(64 * ig.BEARD_PAD))
+        # The mask picture over the crop: white at the beard, black round it.
+        crop = ig.fix_crops(1024, 1024, [spot])[0]
+        rgba, w, h = __import__("core.icons", fromlist=["x"]).png_to_rgba(
+            ig.beard_shape_png(spot, crop, 1024, 1024))
+        self.assertEqual((w, h), (crop["width"], crop["height"]))
+        mid = ((h // 2) * w + w // 2) * 4
+        self.assertEqual(rgba[mid], 255)
+        self.assertEqual(rgba[0], 0)
+        job, client, _ = self.finish_job([], profile=False, scene="A bearded sailor",
+                                         hand_pass=False, character_regions=[mask])
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(job.record["passes"], [])
+        self.assertIn("1 beard not redrawn: the face was not drawn where the scene put it.",
+                      job.record["notes"])
 
     def test_without_sam3_the_swap_is_kept_as_it_is(self):
         self.profile()
