@@ -147,7 +147,7 @@ DEPTH_EDGE = 512               # px on the depth map's long edge; the ControlNet
 # mannequin's egg head and ringed neck (2026-09-26).
 HEAD_DEPTH = 0.35
 HEAD_DEPTH_RANGE = (0.0, 0.8)
-# How much of the pose and depth strengths a shot gets, by how tall the
+# How much of the depth strength a shot gets, by how tall the
 # biggest face is in the frame (head, neck to crown, over the frame's
 # height): a close-up gets little, the face pass carries its head.
 FRAMING = [(0.22, "close-up", 0.45), (0.1, "medium shot", 0.75), (0.0, "wide shot", 1.0)]
@@ -988,6 +988,16 @@ def _reshape(warp, p):
     return (x, y + 0.11, z + 0.01)
 
 
+def head_point(p, head=None):
+    """Deform a head-frame landmark with the skull's identity warp.
+
+    Landmarks already describe the neutral face (including its jaw), so
+    only the identity deformation applies here, not the base `_jaw` shape.
+    """
+    warp = mq.head_warp(head)
+    return _reshape(warp, p) if warp else p
+
+
 def _jaw(p):
     """The skull's ellipsoid made a head: narrower at the jaw and the chin,
     the back of the neck in under the skull, the face a little flatter."""
@@ -1306,7 +1316,7 @@ def person_pieces(controls, root=IDENTITY, shape=None, dressed=None, head=None):
         # Across the chest, bellows between two ends; the Carrying pose puts
         # the hands on it.
         _, rgb = held["accordion"]
-        z = 0.11 * chest_deep * (1 + 0.3 * bust) + 0.06 * max(0.0, bust) + 0.13
+        z = accordion_front(chest_deep, bust)
         chest_box = lambda lo, hi: outward([[at("chest", p) for p in f]   # noqa: E731
                                             for f in box(lo, hi)])
         out += [("body", rgb, chest_box((-0.23, -0.2, z - 0.1), (-0.15, 0.12, z + 0.1))),
@@ -2311,6 +2321,10 @@ def clean_look(d):
         step = int(round(_num(d.get(k), 0, -ig.SLIDER_SPAN, ig.SLIDER_SPAN)))
         if step:
             out[k] = step
+    from apps.image_studio.scene import beard
+    facial_hair = beard.clean(d.get("beard"))
+    if facial_hair is not None:
+        out["beard"] = facial_hair
     return out
 
 
@@ -2321,6 +2335,7 @@ def character_look(rec, look=None):
     and stay."""
     import apps.image_studio.imagegen as ig
     look = dict(look or {})
+    look.pop("beard", None)
     for k in ig.CHARACTER_KEYS:
         look.pop(k, None)
     look.update((rec or {}).get("looks") or {})
@@ -2985,7 +3000,8 @@ class Poly:
     shadows; `nrm` is the face's unit world-space normal, one for the whole
     face (flat-shaded, so it never varies across it). `id_render` reads
     both - `cam` to interpolate world position, `nrm` to fill it straight
-    in - without walking the scene's geometry a second time."""
+    in. A true depth pass determines visible ownership before filling the
+    buffers, including room occlusion and cutout holes."""
     __slots__ = ("pts", "rgb", "depth", "owner", "part", "tex", "dim", "cam", "nrm")
 
     def __init__(self, pts, rgb, depth, owner, part, tex=None, dim=None, cam=None, nrm=None):
@@ -3631,7 +3647,9 @@ def pose_figures(scene, width=None, height=None):
                 return add(mul(p, k), shift)
             hp, hm = sk["head"]
             coco = {i: world(sk[j][0]) for i, j in KP_JOINTS.items()}
-            coco.update({i: world(add(hp, apply(hm, v))) for i, v in KP_HEAD.items()})
+            head = obj.get("head") if obj["asset"] == "person" else None
+            coco.update({i: world(add(hp, apply(hm, head_point(v, head))))
+                         for i, v in KP_HEAD.items()})
             to_cam = norm(sub(cam.eye, world(hp)))
             fwd, side = column(hm, 2), column(hm, 0)     # the face looks +Z; +X is their left
             faces_way = {0: fwd, 1: norm(add(fwd, mul(side, 0.35))),
@@ -3652,7 +3670,7 @@ def pose_figures(scene, width=None, height=None):
                 for u, v in studio_pose.FACE:
                     local = (u * FACE_UNIT, KP_HEAD[1][1] - v * FACE_UNIT,
                              0.10 - 0.012 * u * u)
-                    s = cam.project(world(add(hp, apply(hm, local))))
+                    s = cam.project(world(add(hp, apply(hm, head_point(local, head)))))
                     if s:
                         face.append((s[0] / width, s[1] / height))
             # The hands, as DWPose finds them: only where the wrist is seen,
@@ -3667,7 +3685,7 @@ def pose_figures(scene, width=None, height=None):
                     hp2.append([s[0] / width, s[1] / height] if s and not hidden(world(p))
                                else None)
                 hands[name] = hp2
-            out.append({"points": pts, "face": face, "hand_points": hands,
+            out.append({"id": obj["id"], "points": pts, "face": face, "hand_points": hands,
                         "depth": cam.to_camera(world(hp))[2]})
     out.sort(key=lambda f: -f["depth"])
     return out
@@ -3860,8 +3878,8 @@ def depth_crop_png(scene, region, size, oid=None):
 # compositing a corrected arm back in, or - from `world` - answering "what
 # 3D point is this bad pixel" at all.
 #
-# Four buffers, `id_render`'s one pass over `render`'s polygons (no second
-# walk of the scene's geometry):
+# Four buffers, `id_render`'s pass over `render`'s polygons, gated by
+# true camera depth from `depth_values`:
 # `instance` - which body a pixel belongs to (an object is one instance, a
 # crowd one per member), one byte, 0 for the room and its shadows.
 # `part` - which of that body's pieces (a crowd member is one piece,
@@ -3939,7 +3957,7 @@ def _instance_meta(obj, member):
 
 def id_render(scene, width=None, height=None):
     """-> (instance bytes, part bytes, normal floats, world floats,
-    sidecar): every per-pixel truth buffer, one pass over `render`'s own
+    sidecar): every per-pixel truth buffer, a pass over `render`'s own
     polygons (`_spans`) - instance and part a byte a pixel, normal and
     world three `array('f')` floats a pixel (x, y, z in a pixel's 3 slots),
     all 0 for the room and its shadows. `sidecar` names the instance and
@@ -3948,7 +3966,8 @@ def id_render(scene, width=None, height=None):
     "parts": {"<id>": {"<part id>": "<label>"}}}` - JSON-safe (string keys).
 
     `normal` is one vector for a whole face (flat-shaded, so it does not
-    vary across it); `world` is the exact point under each pixel,
+    vary across it); true camera depth selects the nearest surface,
+    independently of painter order. `world` is the exact point under each pixel,
     perspective-correct across the face, not just its centre - so a bad
     pixel's instance, part, facing and 3D position can all be read back."""
     if width is None:
@@ -3963,6 +3982,10 @@ def id_render(scene, width=None, height=None):
     n = width * height
     inst, part = bytearray(n), bytearray(n)
     normal, world = array.array("f", [0.0]) * (n * 3), array.array("f", [0.0]) * (n * 3)
+    # True camera depth, including room surfaces and transparent cards.
+    # Average polygon depth cannot order intersecting limbs or two people
+    # whose surfaces exchange which one is in front across the frame.
+    nearest = depth_values(scene, width, height)
     parts, meta = {}, {}                   # instance id -> {label: part id}; -> sidecar entry
     for poly in render(scene, width, height):
         if poly.owner is None:
@@ -3995,18 +4018,19 @@ def id_render(scene, width=None, height=None):
             ay, by, cy = py
         for y, xa, xb in spans:
             row = y * width
-            inst[row + xa:row + xb + 1] = bytes([iid]) * (xb - xa + 1)
-            part[row + xa:row + xb + 1] = bytes([pid]) * (xb - xa + 1)
             yc = y + 0.5
             for x in range(xa, xb + 1):
-                o = (row + x) * 3
-                normal[o], normal[o + 1], normal[o + 2] = nx, ny, nz
+                xc = x + 0.5
                 if pz is None:
                     continue
-                xc = x + 0.5
                 q = az + bz * xc + cz * yc
-                if not q:
+                if q <= 0 or q < nearest[row + x] - max(1e-8, abs(q) * 1e-7):
                     continue
+                if isinstance(poly.tex, CutMap) and poly.tex.sample(xc, yc) is None:
+                    continue
+                inst[row + x], part[row + x] = iid, pid
+                o = (row + x) * 3
+                normal[o], normal[o + 1], normal[o + 2] = nx, ny, nz
                 z = 1.0 / q
                 cx_, cy_ = (ax + bx * xc + cx * yc) * z, (ay + by * xc + cy * yc) * z
                 world[o] = ex + cx_ * rx + cy_ * ux + z * fx
@@ -4016,6 +4040,63 @@ def id_render(scene, width=None, height=None):
                "parts": {str(iid): {str(pid): label for label, pid in labels.items()}
                          for iid, labels in parts.items()}}
     return bytes(inst), bytes(part), normal, world, sidecar
+
+
+def surface_render(scene, width=None, height=None):
+    """Shared truth buffers plus numerical incidence, edges and illumination.
+
+    Float maps are ephemeral analysis, never quantised PNGs or saved settings.
+    Lighting is Lambertian incidence only, without shadows or material colour.
+    """
+    from apps.image_studio.scene.surface import analyse
+    if width is None:
+        width, height = frame_size(scene)
+    inst, part, normals, world, sidecar = id_render(scene, width, height)
+    cam = Camera(scene["camera"], width, height)
+    maps = analyse(inst, part, normals, world, width, height, cam.eye, cam.f, LIGHT_DIR)
+    maps.update(instance=inst, part=part, normal=normals, world=world,
+                sidecar=sidecar, width=width, height=height)
+    return maps
+
+
+def identity_masks(scene, targets, long_edge=256):
+    """{person id: PNG or None}: surface-aware masks for initial identity attention.
+
+    Render once at bounded resolution for all people, at the scene's aspect.
+    None means no eligible visible head: never substitute a rectangle that
+    could condition an occluder. Form-only identity regions keep their own path.
+    """
+    from apps.image_studio.scene.surface import identity_mask
+    targets = [p for p in targets if p.get("id")]
+    if not targets:
+        return {}
+    fw, fh = frame_size(scene)
+    k = min(1.0, long_edge / float(max(fw, fh)))
+    w, h = max(1, round(fw * k)), max(1, round(fh * k))
+    maps = surface_render(scene, w, h)
+    by_owner = {m["owner"]: int(sid) for sid, m in maps["sidecar"]["instances"].items()
+                if m["type"] == "person"}
+    out = {}
+    for person in targets:
+        oid = person["id"]
+        iid = by_owner.get(oid)
+        # Identity belongs to the face, not the rear of a head. Profile views
+        # remain eligible; the per-pixel incidence handles their grazing edge.
+        if iid is None or (person.get("head_pose") or {}).get("facing_cosine", 1) < -0.1:
+            out[oid] = None
+            continue
+        head_parts = {int(pid) for pid, label in maps["sidecar"]["parts"][str(iid)].items()
+                      if label == "head"}
+        alpha = identity_mask(maps["instance"], maps["part"], maps, w, h,
+                              iid, head_parts, person["region"])
+        if not any(alpha):
+            out[oid] = None
+            continue
+        rgb = bytearray(w * h * 3)
+        for channel in range(3):
+            rgb[channel::3] = alpha
+        out[oid] = rgb_png(bytes(rgb), w, h)
+    return out
 
 
 def instance_id_png(scene):
@@ -4104,8 +4185,24 @@ def _character_mask_buffers(scene, feather=6):
     buffers = {}
     for char, iids in by_character.items():
         table = bytes(255 if i in iids else 0 for i in range(256))
-        buffers[char] = _feather(bytearray(inst.translate(table)), w, h, feather)
+        hard = bytearray(inst.translate(table))
+        if feather > 0:
+            from apps.image_studio.scene.distance import signed_distance, feather_distance
+            buffers[char] = feather_distance(signed_distance(hard, w, h), feather)
+        else:
+            buffers[char] = hard
     return w, h, buffers
+
+
+def character_distance_fields(scene):
+    """(width, height, {character: signed float pixels}) from visible ownership.
+
+    Positive inside each character, negative outside, in frame pixels.
+    Occluded geometry does not contribute to this visible boundary.
+    """
+    from apps.image_studio.scene.distance import signed_distance
+    w, h, masks = _character_mask_buffers(scene, feather=0)
+    return w, h, {char: signed_distance(mask, w, h) for char, mask in masks.items()}
 
 
 def character_masks(scene, feather=6):
@@ -4113,8 +4210,9 @@ def character_masks(scene, feather=6):
     character in this scene, from the instance buffer `id_render` already
     computes: 255 where that character's own instance painted a pixel, 0
     elsewhere. Occlusion and overlap fall out for free (a covered character's
-    hidden pixels were never painted with their id, so two masks never
-    claim the same pixel). A crowd member or a person with no character
+    hidden pixels were never painted with their id; hard masks never
+    claim the same pixel, while their feathers may overlap). A crowd member
+    or a person with no character
     assigned has no `"character"` in the sidecar, so it gets no mask -
     regional prompting is for named characters only."""
     w, h, buffers = _character_mask_buffers(scene, feather)
@@ -4127,9 +4225,67 @@ def character_masks(scene, feather=6):
     return masks
 
 
+def beard_mask_buffers(scene, width=None, height=None, feather=2):
+    """Visible beard coverage by person id, including unnamed people.
+
+    Sample the existing world/ownership buffers in the posed head frame.
+    Covered faces and rear heads therefore contribute no beard pixels.
+    Feathering is clipped to the same person's visible head.
+    """
+    from apps.image_studio.scene import beard
+    if width is None:
+        width, height = frame_size(scene)
+    candidates = {}
+    for obj in scene["objects"]:
+        b = beard.clean((obj.get("look") or {}).get("beard"))
+        if obj["asset"] == "person" and b and b["style"] != "none" and b["density"] and b["coverage"]:
+            sk, k, shift = rigs(obj)[0]
+            origin, rotation = sk["head"]
+            candidates[obj["id"]] = (b, k, shift, origin, transpose(rotation))
+    if not candidates:
+        return width, height, {}
+    inst, parts, _, world, sidecar = id_render(scene, width, height)
+    buffers = {}
+    for sid, meta in sidecar["instances"].items():
+        oid = meta["owner"]
+        if oid not in candidates:
+            continue
+        b, k, shift, origin, inverse = candidates[oid]
+        head_ids = {int(pid) for pid, label in sidecar["parts"][sid].items() if label == "head"}
+        buf, visible = bytearray(width * height), bytearray(width * height)
+        for i, iid in enumerate(inst):
+            if iid != int(sid) or parts[i] not in head_ids:
+                continue
+            visible[i] = 255
+            point = tuple(world[3 * i + j] for j in range(3))
+            local = apply(inverse, sub(mul(sub(point, shift), 1 / k), origin))
+            if beard.contains(local, b):
+                buf[i] = 255
+        if any(buf):
+            if feather:
+                buf = _feather(buf, width, height, feather)
+                for i in range(len(buf)):
+                    if not visible[i]:
+                        buf[i] = 0
+            buffers[oid] = buf
+    return width, height, buffers
+
+
+def beard_masks(scene, feather=2):
+    """{person id: RGB mask PNG}, ready for regional conditioning."""
+    w, h, buffers = beard_mask_buffers(scene, feather=feather)
+    masks = {}
+    for oid, buf in buffers.items():
+        rgb = bytearray(w * h * 3)
+        for channel in range(3):
+            rgb[channel::3] = buf
+        masks[oid] = rgb_png(bytes(rgb), w, h)
+    return masks
+
+
 def framing(scene):
     """-> (name, factor): the shot by its biggest face (FRAMING), and how
-    much of the pose and depth strengths it gets."""
+    much of the depth strength it gets."""
     tall = max((t["tall"] for t in face_targets(scene)), default=0.0)
     for least, name, factor in FRAMING:
         if tall >= least:
@@ -4294,13 +4450,52 @@ HELD_WORDS = {"stein": "fingers wrapped round the beer stein",
               "pretzel": "pinching the pretzel between thumb and fingers"}
 
 
-def hand_words(controls, held):
+def accordion_front(chest_deep, bust):
+    """Instrument centre in the chest frame, shared by mesh and contact checks."""
+    return 0.11 * chest_deep * (1 + 0.3 * bust) + 0.06 * max(0.0, bust) + 0.13
+
+
+def accordion_contacts(controls, look=None):
+    """Nearest hand-landmark gaps to the playing surfaces, in rig metres.
+
+    Uses the mesh's clothed chest depth, rig and finger points. Right
+    fingertips meet the keyboard; left palm landmarks meet the bass end.
+    This checks contact without changing the user's pose.
+    """
+    shape, dressed = body_shape(look), outfit(look or {})
+    c = gripped(controls, {"accordion": (("r",), None)})
+    sk = skeleton(c, IDENTITY, shape)
+    cp, cm = sk["chest"]
+    depth = 1 + 0.7 * (shape["fat"] - 1) + shape["muscle"] - 1
+    if "chest" in (dressed.get("regions") or {}):
+        depth *= 1.04
+    z = accordion_front(depth, shape["chest"] - 1)
+    surfaces = {"r": ((-0.225, -0.18, z + 0.1), (-0.155, 0.1, z + 0.115)),
+                "l": ((0.23, -0.2, z - 0.1), (0.23, 0.12, z + 0.1))}
+    out = {}
+    for side, sign in (("r", -1), ("l", 1)):
+        wp, wm = sk["wrist_" + side]
+        grip = tuple(float(c.get(g % side, 0) or 0) for g in GRIP_KEYS[1:])
+        pts = [apply(transpose(cm), sub(add(wp, apply(wm, p)), cp))
+               for p in hand_joints(sign, grip)]
+        lo, hi = surfaces[side]
+        def gap(p):
+            return math.sqrt(sum(max(lo[i] - p[i], 0, p[i] - hi[i]) ** 2 for i in range(3)))
+        indices = (8, 12, 16, 20) if side == "r" else (5, 9, 13, 17)
+        out[side] = min(gap(pts[i]) for i in indices)
+    return out
+
+
+def hand_words(controls, held, look=None):
     """What each hand is doing, as phrases, for the fingers the pose map's
     hands are too small to carry alone. A hand at rest says nothing."""
     c = gripped(controls, held)
     g = lambda k: float(c.get(k, 0) or 0)                 # noqa: E731
     if "accordion" in held:
-        return ["right fingers on the accordion keys", "left hand on the accordion's bass end"]
+        gaps = accordion_contacts(controls, look)
+        return [phrase for side, phrase in (
+            ("r", "right fingers on the accordion keys"),
+            ("l", "left hand on the accordion's bass end")) if gaps[side] <= 0.035]
     out = []
     for side, name in (("r", "right"), ("l", "left")):
         kind = next((k for k in HELD_WORDS if side in held.get(k, ((),))[0]), None)
@@ -4346,7 +4541,7 @@ def posture_words(obj):
         out.append(BOTH_ARMS[arms["r"]])
     else:
         out += ["right arm " + arms["r"], "left arm " + arms["l"]]
-    out += hand_words(c, outfit(look).get("held") or {})
+    out += hand_words(c, outfit(look).get("held") or {}, look)
     if obj["pose"].get("preset") not in LEG_POSES:
         sl, sr = g("leg_l_step"), g("leg_r_step")
         bl, br = g("leg_l_bend"), g("leg_r_bend")
@@ -4510,6 +4705,16 @@ def _scene_parts(scene):
                 about.append(POSE_NAMES[preset].lower())
             posture = ", ".join(posture_words(obj))
             posture = posture[:1].upper() + posture[1:]
+            if "accordion" in (outfit(obj.get("look") or {}).get("held") or {}):
+                gaps = accordion_contacts(obj["pose"]["controls"], obj.get("look"))
+                missing = [name for side, name in (("r", "right"), ("l", "left"))
+                           if gaps[side] > 0.035]
+                if missing:
+                    out.notes.append("%s: the %s hand%s %s not reach the accordion's "
+                                     "playing surface; adjust the pose before generating." % (
+                                         obj["name"], " and ".join(missing),
+                                         "s" if len(missing) > 1 else "",
+                                         "do" if len(missing) > 1 else "does"))
         line = "%s (%s)" % (obj["name"].strip() or ASSET[obj["asset"]]["label"],
                             ", ".join(about))
         desc = described(obj)
@@ -4609,6 +4814,28 @@ FACE_SIDE = (0.08, 0.06, 0.0)  # the head's side at the ears, in its frame
 NOSE_TIP = (0.0, 0.05, 0.1)
 
 
+def head_angles(cam, centre, frame):
+    """Camera-relative yaw, pitch, roll in degrees from the head frame.
+
+    The viewing frame is centred on the head, including off-axis heads.
+    Yaw is positive toward screen right, pitch positive looking up, roll
+    positive counterclockwise on screen. At a vertical gaze Euler yaw/roll
+    are coupled; choose roll zero. `facing_cosine` is 1 front-on, -1 away.
+    """
+    toward = norm(sub(cam.eye, centre))
+    right = norm(sub(cam.r, mul(toward, dot(cam.r, toward))))
+    up = cross(toward, right)
+    forward = column(frame, 2)
+    fx, fy, fz = dot(forward, right), dot(forward, up), dot(forward, toward)
+    pitch = math.asin(max(-1.0, min(1.0, fy)))
+    yaw = math.atan2(fx, fz)
+    roll = (math.atan2(dot(column(frame, 0), up), dot(column(frame, 1), up))
+            if math.hypot(fx, fz) > 1e-8 else 0.0)
+    return {"yaw": round(math.degrees(yaw), 4),
+            "pitch": round(math.degrees(pitch), 4),
+            "roll": round(math.degrees(roll), 4), "facing_cosine": round(fz, 6)}
+
+
 def _facing(a, b, nose):
     """Where the nose is between the face's two sides as the picture shows
     them, 0 at the left one, 1 at the right, 0.5 facing the camera; None
@@ -4654,10 +4881,11 @@ def face_targets(scene, characters=None, identities=None):
         said = [x.strip().rstrip(".") for x in (look_text(obj), obj["description"], details)
                 if x and x.strip()]
         face, source = face_picture(obj, characters, identities)
-        seen = lambda v: cam.project(add(mul(add(hp, apply(hm, v)), k), shift))  # noqa: E731
+        seen = lambda v: cam.project(add(mul(add(hp, apply(hm, head_point(v, obj.get("head")))), k), shift))  # noqa: E731
         facing = _facing(seen(FACE_SIDE), seen((-FACE_SIDE[0],) + FACE_SIDE[1:]),
                          seen(NOSE_TIP))
         out.append({"id": obj["id"], "name": obj["name"], "facing": facing,
+                    "head_pose": head_angles(cam, add(mul(hp, k), shift), hm),
                     "identity": ((characters or {}).get(obj.get("character")) or {}).get("identity", ""),
                     "head": mq.clean_head(obj.get("head")), "tall": round(head / h, 4),
                     "at": [round(p[0] / w, 4), round(p[1] / h, 4)],
@@ -4706,10 +4934,10 @@ def generation(scene, maps, characters=None, identities=None):
              "references": dict(maps), "pose": None, "composition": None}
     shot, factor = framing(s)
     if factor < 1 and ("pose" in maps or "composition" in maps):
-        words.notes.append("A %s: pose and layout at %d%% of their strength, so the "
+        words.notes.append("A %s: layout at %d%% of its strength, so the "
                            "mannequin is not drawn." % (shot, round(factor * 100)))
     if "pose" in maps:
-        extra["pose"] = {"strength": round(s["pose_strength"] * factor, 3)}
+        extra["pose"] = {"strength": round(s["pose_strength"], 3)}
     if "composition" in maps:
         extra["composition"] = {"strength": round(s["depth_strength"] * factor, 3)}
     if "source" in maps:
@@ -4741,6 +4969,21 @@ def generation(scene, maps, characters=None, identities=None):
         extra["character_regions"] = [
             {"prompt": text, "mask_path": _write(masks[char], "character_mask")}
             for char, text in by_character.items() if char in masks]
+    from apps.image_studio.scene import beard
+    masks = beard_masks(s)
+    # The face dots the pose map drew, so the beard pass can fit the mask to
+    # the face as drawn (imagegen.shape_beard) and bound it by its landmarks.
+    dots = {}
+    for f in pose_figures(s) if masks else []:
+        if f["face"] and f["id"] not in dots:
+            dots[f["id"]] = [[round(x, 5), round(y, 5)] for x, y in f["face"]]
+    for oid, mask in masks.items():
+        person = next(o for o in folks if o["id"] == oid)
+        extra.setdefault("character_regions", []).append({
+            "prompt": beard.text(person["look"]["beard"]),
+            "mask_path": _write(mask, "beard_mask"), "person_id": oid,
+            "kind": "facial_hair", "beard": beard.clean(person["look"]["beard"]),
+            "face_dots": dots.get(oid, [])})
     return words, extra
 
 
