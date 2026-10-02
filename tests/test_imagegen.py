@@ -1210,12 +1210,16 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         self.assertEqual(g["54"]["inputs"], {"conditioning": ["12", 0], "latent": ["52", 0]})
         self.assertEqual((g["6"]["inputs"]["positive"], g["6"]["inputs"]["negative"]),
                          (["53", 0], ["54", 0]))
+        # The negative words stay words: a switch named "negative" once put
+        # its link in node 12's text, and ComfyUI refused the graph.
+        self.assertIsInstance(g["12"]["inputs"]["text"], str)
         # Without a pose: the plain prompt, nothing of the pose in the graph.
         p = self.plan(model="klein-9b", inventory=inv, scene="a dancer")
         g = ig.fill(p.workflow, p.values)
         self.assertFalse({"13", "50", "51", "52", "53", "54"} & set(g))
         self.assertEqual((g["6"]["inputs"]["positive"], g["6"]["inputs"]["negative"]),
                          (["10", 0], ["12", 0]))
+        self.assertIsInstance(g["12"]["inputs"]["text"], str)
 
     def test_flux_takes_a_source_picture_and_denoise_needs_one(self):
         src = os.path.join(self.dir, "frame.png")
