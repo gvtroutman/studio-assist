@@ -783,7 +783,7 @@ def _default_models():
          "values": {"model": "flux-2-klein-base-9b.safetensors",
                     "encoder": "qwen_3_8b_fp8mixed.safetensors", "vae": "flux2-vae.safetensors"},
          "backends": {"3090": None},
-         # A redraw's KSampler runs all its steps over the part it redraws;
+         # A redraw runs all its steps over the part it redraws;
          # 50 at cfg 4 would be ~35 s a face, hand or eye.
          "defaults": {"steps": 50, "guidance": 4.0, "sampler": "euler",
                       "redraw_steps": 20, "width": 1024, "height": 1024},
@@ -1881,6 +1881,15 @@ FACE_NODES = {"CheckpointLoaderSimple", "SAM3_Detect", "PreviewAny", "GetImageSi
               "ImageCropV2", "ImageScale", "ImageToMask", "ImageCompositeMasked", "LoadImage",
               "SetLatentNoiseMask", "ThresholdMask", "CLIPTextEncode", "MaskComposite",
               "GrowMask", "MaskToImage", "ImageBlur", "SolidMask"}
+
+
+def face_nodes(workflow):
+    """The nodes this workflow's crop redraws need, beyond its first draw."""
+    if (workflow.get("face_detail") or {}).get("scheduler") == "flux2":
+        return FACE_NODES | {"Flux2Scheduler", "SplitSigmas", "RandomNoise",
+                             "KSamplerSelect", "CFGGuider", "SamplerCustomAdvanced"}
+    return FACE_NODES
+
 FACE_BOX_GROW = 0.15           # of its size the found face's box grows, as the part always blended
 FACE_HEAD_GROW = 12            # px at FACE_EDIT the head's mask grows before it is softened
 FACE_HEAD_SOFT = (21, 7.0)     # ImageBlur radius and sigma of its edge, at FACE_EDIT
@@ -3350,9 +3359,34 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
             "steps": values.get("redraw_steps") or values["steps"], "cfg": cfg,
             "sampler_name": values.get("redraw_sampler") or values["sampler"],
             "scheduler": values.get("redraw_scheduler") or values["scheduler"],
-            "denoise": face.get("denoise") or values["face_denoise"], "model": model,
+            "denoise": (face["denoise"] if face.get("denoise") is not None
+                        else values["face_denoise"]), "model": model,
             "positive": positive, "negative": negative,
             "latent_image": latent}}
+        if fd.get("scheduler") == "flux2":
+            # KSampler's generic schedule uses the model's fixed shift.
+            # Flux2's schedule depends on both the crop size and step count.
+            # Extend then trim it, retaining exactly the requested redraw
+            # steps, as KSampler does for a partial-denoise redraw.
+            k = g[n + "4"]["inputs"]
+            denoise = k["denoise"]
+            steps = int(k["steps"])
+            total = max(steps, int(steps / denoise)) if denoise > 0 else steps
+            g[n + "noise"] = {"class_type": "RandomNoise", "inputs": {
+                "noise_seed": k["seed"]}}
+            g[n + "sampler"] = {"class_type": "KSamplerSelect", "inputs": {
+                "sampler_name": k["sampler_name"]}}
+            g[n + "sigmas"] = {"class_type": "Flux2Scheduler", "inputs": {
+                "steps": total, "width": ew, "height": eh}}
+            g[n + "trim"] = {"class_type": "SplitSigmas", "inputs": {
+                "sigmas": [n + "sigmas", 0],
+                "step": total - steps if denoise > 0 else total}}
+            g[n + "guider"] = {"class_type": "CFGGuider", "inputs": {
+                "model": model, "positive": positive, "negative": negative, "cfg": cfg}}
+            g[n + "4"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": [n + "noise", 0], "guider": [n + "guider", 0],
+                "sampler": [n + "sampler", 0], "sigmas": [n + "trim", 1],
+                "latent_image": latent}}
         g[n + "5"] = {"class_type": "VAEDecode", "inputs": {"samples": [n + "4", 0],
                                                             "vae": links["vae"]}}
         drawn = [n + "5", 0]
@@ -4113,7 +4147,8 @@ def default_settings():
             "denoise": None, "refine": None, "upscale": None, "refine_denoise": None,
             "face_detail": None, "batch": 1, "pose": None, "composition": None,
             "critic_notes": False, "refine_passes": 3, "hand_pass": True, "head_swap": True,
-            "glasses_pass": None, "lora_budget": None,
+            "glasses_pass": None, "lora_budget": None, "scene_details_pass": True,
+            "smile_pass": True,
             **{k: "" for k in SLOTS}, **{k: 0 for k, _, _ in SLIDERS}}
 
 
@@ -5406,11 +5441,18 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     # pass is left out, said once.
     form_face = not s.get("scene_faces") and not wf.get("multi_identity") and faces_of(s)
     if form_face:
+        import apps.image_studio.facefusion as facefusion
         who = form_face["people"][0]
         v["face_detail"] = True
         if set(wf.get("families") or ()) & PULID_FAMILIES:
             p.notes.append("Face: %s, from %d photo%s." % (
                 who["name"], len(who["photos"]), "" if len(who["photos"]) == 1 else "s"))
+        elif facefusion.selected(lib, s):
+            # Not drawn from the photos, but put on after: the head swap and
+            # face swap take them on any model (job_stages), so no warning.
+            p.notes.append("Face: %s, from their photos by the %s after drawing." % (
+                who["name"], "face swap" if s.get("head_swap", True) is False
+                else "head swap and face swap"))
         else:
             p.warnings.append("Face: only a FLUX.1 model can draw %s's face from their "
                               "photos; with %s the face comes from the words." % (
@@ -5438,9 +5480,9 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         elif ckpts is not None and not sam:
             why = ("%s has no SAM3 checkpoint (a file with sam3 in its name, in "
                    "ComfyUI/models/checkpoints), which finds the faces" % backend["name"])
-        elif nodes is not None and FACE_NODES - set(nodes):
+        elif nodes is not None and face_nodes(wf) - set(nodes):
             why = "%s's ComfyUI lacks the node(s) %s" % (
-                backend["name"], ", ".join(sorted(FACE_NODES - set(nodes))))
+                backend["name"], ", ".join(sorted(face_nodes(wf) - set(nodes))))
         if why:
             if asked:
                 p.warnings.append(why + "; the picture is made without the face pass.")
@@ -5597,8 +5639,8 @@ def pipeline_stages(lib, settings, plan=None):
     them: the two ComfyUI stages every job goes through, then each optional
     finishing pass these settings turn on. Queued and loading are left off -
     obvious, not worth a stop on the strip. A Generate's `plan`, once
-    composed, says whether the face pass runs: a workflow without one (FLUX.2
-    Klein) leaves it out though the form names a person."""
+    composed, says whether the face pass runs: a workflow without one
+    leaves it out though the form names a person."""
     import apps.image_studio.facefusion as facefusion
     if settings.get("mode") == "blend":       # one Kontext run, no finishing pass
         import apps.image_studio.blend as blend
@@ -5630,10 +5672,17 @@ def pipeline_stages(lib, settings, plan=None):
             stages.append(("eyes", "Eye pass"))
     if whole and beard_regions(settings):
         stages.append(("beard", "Beard pass"))
+    from apps.image_studio.scene import smile
+    if whole and (not settings.get("mode") or finish.get("backend")) and smile.requests(settings):
+        stages.append((smile.STATUS, smile.LABEL))
     if whole and hand_pass(settings):
         stages.append(("hands", "Hand pass"))
     if whole and profiles and glasses_pass(settings):
         stages.append(("glasses", "Glasses"))
+    from apps.image_studio.scene import details
+    if whole and (not settings.get("mode") or finish.get("backend")) and details.requests(
+            dict(settings, mode=None)):
+        stages.append((details.STATUS, details.LABEL))
     if not swap_only and settings.get("critic_notes"):
         stages.append(("critic", "Critic notes"))
     stages.append(("complete", "Complete"))
@@ -6785,10 +6834,10 @@ class Studio:
                 values["face_detail"] = False
                 plan.warnings.append("%s's SAM3 checkpoint is not known; the picture is made "
                                      "without the face pass." % b["name"])
-            elif types is not None and FACE_NODES - types:
+            elif types is not None and face_nodes(plan.workflow) - types:
                 values["face_detail"] = False
                 plan.warnings.append("%s's ComfyUI lacks %s; the picture is made without the "
-                                     "face pass." % (b["name"], ", ".join(sorted(FACE_NODES
+                                     "face pass." % (b["name"], ", ".join(sorted(face_nodes(plan.workflow)
                                                                                  - types))))
             else:
                 add_face_finder(graph, values["sam3"])
@@ -6858,6 +6907,7 @@ class Studio:
                 return
         if not plan.workflow.get("multi_identity"):
             pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+        pictures = self._scene_details(job, client, values, pictures, say)
         # Last, on the picture as it is kept: notes, never a redraw.
         if job.settings.get("critic_notes") and pictures and not job.cancel.is_set():
             self._take_notes(job, plan, pictures, say)
@@ -7221,6 +7271,8 @@ class Studio:
             return
         if comfy and not plan.workflow.get("multi_identity"):
             pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+        if comfy:
+            pictures = self._scene_details(job, client, values, pictures, say)
         record = self.record_for(job, graph)
         record["fix"] = fix
         if comfy:
@@ -7299,6 +7351,96 @@ class Studio:
                              "nothing about the face." % LANDMARK_NODE)
         return drawn
 
+    def _scene_details(self, job, client, values, pictures, say):
+        """A bounded local finish for described flag patterns and lettering.
+
+        Each successful object is fetched before the next is attempted; a
+        failed edit keeps that last picture and records only completed passes.
+        """
+        from apps.image_studio.scene import details
+        from apps.image_studio import wear
+        wanted = details.requests(dict(job.settings, mode=None))
+        if not wanted or job.cancel.is_set():
+            return pictures
+        b = job.backend
+        try:
+            sam = self.sam3_on(b)
+            short = wear.lacks(self.inventories.get(b["id"]), client.node_types())
+            if not sam or short:
+                job.notes.append("No flags and lettering pass: %s lacks %s." % (
+                    b["name"], ", ".join(short) if short else "SAM3"))
+                return pictures
+        except Exception as e:
+            job.notes.append("No flags and lettering pass: %s." % e)
+            return pictures
+        out = []
+        for n, (filename, original) in enumerate(pictures):
+            current = original
+            at = len(job.passes)
+            try:
+                if job.cancel.is_set():
+                    out.append((filename, current))
+                    continue
+                image = self._upload_made(client, "finish", "%s_details_%d.png" % (job.id, n),
+                                          current)
+                words = list(dict.fromkeys(r["noun"] for r in wanted))
+                say(details.STATUS, "Finding flags and signs", None)
+                job.prompt_id = client.queue_workflow(parts_graph(
+                    image, sam, ["%s:%d" % (w, details.MAX_TARGETS) for w in words]))
+                entry = client.listen_for_progress(job.prompt_id, lambda kind, data: None,
+                                                   stop=job.cancel.is_set)
+                errors = run_errors(entry or {})
+                if errors:
+                    raise ComfyError("; ".join(errors))
+                found = parts_found(entry or {}, len(words), words, scores=True)
+                if found is None:
+                    job.notes.append("Flags and lettering: no detection result; the picture "
+                                     "was kept as it was.")
+                else:
+                    width, height, boxes = found
+                    items, notes = details.plan(width, height, wanted, boxes)
+                    job.notes.extend(notes)
+                    if not items:
+                        job.notes.append("Flags and lettering: no sufficiently large visible "
+                                         "flag or sign was found; no edit was made.")
+                    for k, item in enumerate(items):
+                        if job.cancel.is_set():
+                            break
+                        at = len(job.passes)
+                        pattern = None
+                        if item.get("pattern"):
+                            rw, rh = details.reference_size(item["box"])
+                            pattern = self._upload_made(client, "detail_refs",
+                                "bavarian_lozenges_%dx%d.png" % (rw, rh),
+                                details.pattern_png(rw, rh))
+                        graph = details.detail_graph(image, [item], int(values.get("seed") or 0) + k,
+                            values["filename_prefix"] + "_details_%d_%d" % (n, k), sam,
+                            (width, height), pattern)
+                        files = self._run_pass(job, client, graph, say, details.LABEL,
+                                               status=details.STATUS)
+                        if files is None:
+                            del job.passes[at:]
+                            break
+                        data = client.fetch(files[0])
+                        current = data
+                        f = files[0]
+                        image = "%s%s [%s]" % (f.get("subfolder", "") + "/"
+                            if f.get("subfolder") else "", f["filename"], f.get("type") or "output")
+                        job.notes.append("Flags and lettering: %s." % (
+                            "blue-and-white lozenges redrawn from a pattern reference"
+                            if item.get("pattern") else 'lettering requested as "%s"' % item["text"]))
+                        job.license = details.LICENSE_NOTE
+                        at = len(job.passes)
+            except Exception as e:
+                del job.passes[at:]
+                if not isinstance(e, (ComfyError, OSError)):
+                    doctor.log_error("Image Studio scene details, job %s:\n%s" % (
+                        job.id, traceback.format_exc()))
+                job.notes.append("Flags and lettering stopped; the last finished picture "
+                                 "was kept (%s)." % e)
+            out.append((filename, current))
+        return out
+
     def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
         """The end of Generate, on the lane's thread, by the fix machinery on
         the picture's own model: after FaceFusion (`profiles`) each swapped
@@ -7310,6 +7452,8 @@ class Studio:
         fitted to the drawn face and bounded by its landmarks when
         LANDMARK_NODE reads them, `_drawn_landmarks`, `shape_beard`;
         with or without a swap, unless settings["beard_pass"] is off); then
+        requested smiles, confined to each identified face's mouth and lip band;
+        then
         the hands of a picture of people
         (HAND_WHAT, `real_hands`; the hands pass, unless
         settings["hand_pass"] is off); then the swapped faces' glasses last
@@ -7317,6 +7461,8 @@ class Studio:
         painted over them (`glasses_pass`).
         -> the pictures; those given when a pass cannot run, fails or is
         cancelled - the picture is never lost to its finish."""
+        from apps.image_studio.scene import smile
+        smiles = smile.requests(job.settings)
         hands = hand_pass(job.settings)
         if job.settings.get("hand_pass", True) is not False and not hands:
             job.notes.append("No hands pass: the picture's words name no person.")
@@ -7329,9 +7475,10 @@ class Studio:
             job.notes.append("No glasses pass: the face swap went behind what was in front "
                              "of the face, so glasses are as they were drawn.")
         beards = beard_regions(job.settings)
-        if not eyes and not specs and not hands and not beards:
+        if not eyes and not specs and not hands and not beards and not smiles:
             return pictures
         kinds = (["eye"] if eyes else []) + (["beard"] if beards else []) + (
+            ["smile"] if smiles else []) + (
             ["hands"] if hands else []) + (["glasses"] if specs else [])
         named = "%s pass%s" % (", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1
                                else kinds[0], " after the face swap" if profiles else "")
@@ -7345,7 +7492,7 @@ class Studio:
         else:
             try:
                 types = set(client.node_types())
-                lacks = FACE_NODES - types
+                lacks = face_nodes(plan.workflow) - types
             except ComfyError:
                 lacks = set()
             if lacks:
@@ -7354,10 +7501,10 @@ class Studio:
             job.notes.append("No %s: %s." % (named, why))
             return pictures
         asked = list(zip(FINISH_FIND, FINISH_WORDS))
-        asked = [a for a in asked if (a[1] == "face" and (eyes or specs or beards))
+        asked = [a for a in asked if (a[1] == "face" and (eyes or specs or beards or smiles))
                  or (a[1] == "glasses" and specs)] + ([(HAND_FIND, "hand")] if hands else [])
         find, words = [a[0] for a in asked], [a[1] for a in asked]
-        looking = (["eyes"] if eyes else []) + (["face"] if beards and not eyes else []) + (
+        looking = (["eyes"] if eyes else []) + (["face"] if (beards or smiles) and not eyes else []) + (
             ["hands"] if hands else []) + (["glasses"] if specs else [])
         v = dict(values, sam3=sam, match_tone=None)
         colours = profile_eyes(self.lib, job.settings, profiles) if eyes else []
@@ -7376,7 +7523,8 @@ class Studio:
                     out.append((filename, data))
                     continue
                 image = self._upload_made(client, "finish", "%s_%d.png" % (job.id, n), data)
-                say("eyes" if eyes else ("beard" if beards else ("hands" if hands else "glasses")),
+                say("eyes" if eyes else ("beard" if beards else ("smile" if smiles else (
+                    "hands" if hands else "glasses"))),
                     "Finding the %s" % " and ".join(looking), None)
                 job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
@@ -7389,7 +7537,7 @@ class Studio:
                     out.append((filename, data))
                     continue
                 width, height, boxes = said
-                passes, faces, found_hands, glasses, bearded = [], [], [], [], []
+                passes, faces, found_hands, glasses, bearded, smiling = [], [], [], [], [], []
                 checked = []                          # the eye bands looked at for a green blob
                 if eyes or specs:
                     pairs = swapped_pairs(width, height,
@@ -7432,6 +7580,18 @@ class Studio:
                         passes.append(("Beard", crops, BEARD_DENOISE, BEARD_WHAT, "_beard",
                                        None, [{"prompt": FIX_PROMPT % sp["prompt"]}
                                               for sp in bearded]))
+                if smiles:
+                    smiling, skipped = smile.spots(width, height, smiles,
+                        [x[:4] for x in boxes if x[4] == "face"], profiles)
+                    if skipped:
+                        job.notes.append("Smile pass: %d requested face%s could not be "
+                                         "identified unambiguously; left unchanged." % (
+                                             skipped, "" if skipped == 1 else "s"))
+                    if smiling:
+                        crops = smile.crops(width, height, smiling)
+                        passes.append((smile.LABEL, crops, smile.DENOISE,
+                            "a natural smile", "_smile", None,
+                            [{"prompt": FIX_PROMPT % s["prompt"]} for s in smiling]))
                 if hands:
                     found_hands = found_spots(width, height, real_hands(
                         width, height, [x for x in boxes if x[4] == "hand"]), "hand")
@@ -7475,6 +7635,7 @@ class Studio:
                                               "denoise %s."),
                         "_beard": (len(bearded), "Beard pass: %d beard%s redrawn in its "
                                                  "mask, denoise %s."),
+                        "_smile": (len(smiling), "Smile pass: %d mouth%s redrawn, denoise %s."),
                         "_hands": (len(found_hands), "Hands pass: %d hand%s redrawn, "
                                                      "denoise %s."),
                         "_glasses": (len(glasses), "Glasses redrawn last: %d pair%s, "

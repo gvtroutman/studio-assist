@@ -1152,6 +1152,17 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   recipe, unchanged). FLUX names none and redraws with its own `euler` at
   0.4, as before (not measured there). A sampler typed in Advanced is the
   picture's, not its redraws'.
+- **Klein redraws use its own schedule** (2026-10-02). A `face_detail`
+  section with `scheduler: "flux2"` uses `SamplerCustomAdvanced`,
+  `Flux2Scheduler` at each crop's edit width and height, and `SplitSigmas`
+  to keep the requested redraw steps at partial denoise. The base keeps
+  20 sampling steps and its real CFG; distilled keeps 4 and CFG 1. Both
+  retain the job's LoRAs, negative conditioning, crop noise mask and seed.
+  `face_nodes(workflow)` includes these nodes in the face and finishing
+  capability checks; a missing node keeps the picture and says why the
+  redraw was skipped. The generic schedule remains for other workflows.
+  Offline tests cover wiring and fallback; visual improvement still needs
+  a live comparison.
 - **The face pass, like the hands pass, is for pictures whose words name a
   person** (2026-09-30). Its prompt draws "a real human face ... natural lips
   and teeth" on whatever SAM3 calls a face, and a fox's is one to it: High
@@ -3242,6 +3253,48 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   description carries the words; select it and drag to adjust. Light, haze, stains
   and a hand at the frame edge are `none`, and those go into the words as written
   (`added`), before the camera line.
+- **Requested smiles get a mouth finishing pass** (2026-10-02).
+  `scene.smile` reads each person's saved expression, or the form's expression
+  and scene words. Gentle/closed smiles keep the lips together; broad smiles
+  and laughter ask for natural teeth. Neutral or non-smiling expressions skip
+  the pass. `scene.face_targets` carries expression separately from identity.
+  `Studio._finish_passes` runs it after the face swap, eyes and beard, before
+  hands and glasses, using the generation model and its existing crop recipe
+  at denoise 0.35. Context includes the face, but the noise and blend masks stay
+  in the mouth/lip band without generic fix-area growth into the nose. Scene
+  regions and profile targets select the face; an ambiguous or missing face is
+  skipped. Failed passes retain the preceding successful picture. The form's
+  "Natural smile pass (when requested)" checkbox (`smile_pass`, default on)
+  disables it. Offline tests cover wiring and recovery; live appearance and
+  the default strength still need checking when the render backend is idle.
+- **Flags and lettering get a local finishing pass** (2026-10-02).
+  `scene.details.requests` reads the scene's own prop descriptions and dressing,
+  or a form's scene words. Bavarian/Oktoberfest flags get a clean repeating
+  blue-and-white diamond swatch as Klein 9B's second reference. Signs and banners
+  use one crop reference and explicit quoted text; without a quotation an
+  Oktoberfest sign uses "Oktoberfest". Conflicting wording for several signs of
+  the same kind is skipped, not assigned by detection order. SAM3 finds visible
+  flags/signs; tiny, duplicate and oversized boxes are skipped, and at most eight
+  targets are edited. `detail_graph` reuses `wear.item_graph`, changes its prompts,
+  removes the unused second reference for lettering and intersects each final
+  mask with its detected box, so another object in the contextual crop is held.
+  `Studio._scene_details` runs after the other finishes and on a Generate retry;
+  each edit is fetched before the next, failures retain the last good picture,
+  and a backend without Klein/SAM3 keeps the original with a note. The form's
+  "Flag patterns and sign lettering" checkbox (`scene_details_pass`, default on)
+  disables it. Lettering is generated, not a guarantee of exact typography.
+  Offline wiring/recovery tests and the 5090's node/file checks pass; visual
+  quality still needs a live comparison when that backend is idle.
+  The reference now matches each detected flag's aspect (long edge 512,
+  aspect bounded to 1:8 through 8:1). `lattice` uses one affine phase for
+  the two edge families, fixed 5:8 diagonals and a 0.25 shear in pixel
+  coordinates, so wide and tall references keep the same rhombus shape;
+  four subpixel samples smooth their edges. `detail_graph` uses only the
+  original SAM silhouette, eroded one pixel, blurred then intersected with
+  the original mask and box. It discards the clothing editor's outward-grown
+  before/after union: a print repair cannot extend the cloth into its pole
+  or background. Folds and perspective still depend on Klein's edit, not
+  a measured cloth UV map.
 - **A prop's Details are words and shapes on that prop** (2026-10-01, the user: "click on
   an element ... add details to it with llm suggestions ... the maypole needs a wreath
   on the top of it and flags"). Under a selected prop's Description, the Details box

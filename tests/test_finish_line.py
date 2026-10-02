@@ -290,6 +290,55 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertTrue(any(n.startswith("Eye pass after the face swap") for n in notes), notes)
         self.assertTrue(any(n.startswith("Glasses redrawn last: 1 pair") for n in notes), notes)
 
+    def test_a_requested_smile_is_redrawn_after_the_swap_before_glasses(self):
+        from apps.image_studio.scene import smile
+        job, client, order = self.finish_job([(460, 272, 60, 22)], expression='soft smile',
+                                             hand_pass=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual(order, ['swap'])
+        labels = [p['label'] for p in job.record['passes']]
+        self.assertEqual(labels, ['Eye pass', smile.LABEL, 'Glasses'])
+        graph = job.record['passes'][1]['graph']
+        k = graph['fc1_4']['inputs']
+        text = graph[k['positive'][0]]['inputs']['text']
+        self.assertIn('closed-mouth', text)
+        self.assertIn('No visible teeth', text)
+        self.assertEqual(k['denoise'], smile.DENOISE)
+        self.assertIn('fc1_a2', graph)   # only the mouth band is redrawn
+        self.assertNotIn('fc1_s0', graph)  # no unreliable SAM3 mouth mask
+        self.assertEqual(graph['fc1_a1']['inputs']['height'],
+                         int(29 * ig.FACE_EDIT / graph['fc1_1']['inputs']['crop_region']['height']))
+        self.assertIn((smile.STATUS, smile.LABEL), ig.pipeline_stages(self.studio.lib, job.settings))
+
+    def test_smile_pass_without_a_swap_and_the_switch(self):
+        from apps.image_studio.scene import smile
+        job, client, _ = self.finish_job([], profile=False, expression='broad smile',
+                                         scene='A smiling man', hand_pass=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual([p['label'] for p in job.record['passes']], [smile.LABEL])
+        graph = job.record['passes'][0]['graph']
+        text = graph[graph['fc1_4']['inputs']['positive'][0]]['inputs']['text']
+        self.assertIn('upper row of individual teeth', text)
+        job, _, _ = self.finish_job([], expression='broad smile', smile_pass=False, hand_pass=False)
+        self.assertNotIn(smile.LABEL, [p['label'] for p in job.record['passes']])
+        self.assertNotIn((smile.STATUS, smile.LABEL), ig.pipeline_stages(self.studio.lib, job.settings))
+
+    def test_a_failed_smile_pass_keeps_the_eye_pass_and_records_no_smile(self):
+        from apps.image_studio.scene import smile
+        original = ig.Studio._run_pass
+
+        def fail(studio, job, client, graph, say, label, status='refining'):
+            if label == smile.LABEL:
+                job.passes.append({'label': label, 'graph': graph})
+                raise ig.ComfyError('smile failed')
+            return original(studio, job, client, graph, say, label, status=status)
+
+        with patch.object(ig.Studio, '_run_pass', fail):
+            job, _, _ = self.finish_job([], expression='broad smile', hand_pass=False)
+        self.assertEqual(job.status, 'complete', job.detail)
+        self.assertEqual([p['label'] for p in job.record['passes']], ['Eye pass'])
+        self.assertFalse(any(n.startswith('Smile pass: 1 mouth') for n in job.record['notes']))
+
     def test_without_glasses_only_the_eyes_are_redrawn(self):
         job, client, _ = self.finish_job([])
         self.assertEqual(job.status, 'complete', job.detail)

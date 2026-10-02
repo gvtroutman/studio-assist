@@ -4979,6 +4979,7 @@ def face_targets(scene, characters=None, identities=None):
                     "head": mq.clean_head(obj.get("head")), "tall": round(head / h, 4),
                     "at": [round(p[0] / w, 4), round(p[1] / h, 4)],
                     "region": [round(x, 4) for x in region],
+                    "expression": str((obj.get("look") or {}).get("expression") or ""),
                     "words": ". ".join(said) + ("." if said else ""),
                     "face": face, "from": source,
                     "photos": face_photos(obj, characters, identities)})
