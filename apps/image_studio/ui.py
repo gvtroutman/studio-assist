@@ -3147,6 +3147,7 @@ class ImageStudio:
                               "nothing, less keeps some of the drawn face)", "number"),
             ("head_lora", "Head swap LoRA (FLUX.2 Klein 9B; Build LoRA makes it)",
              ("choice", self.head_lora_choices())),
+            ("glasses", "Wears glasses (the head swap keeps them; off, it draws none)", "bool"),
             ("notes", "Notes", "long"),
             ("lora", "Identity LoRA", ("choice", loras)),
             ("trigger", "Trigger token", "text"),

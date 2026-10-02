@@ -1696,6 +1696,35 @@ is the whole picture and the wider edge lets more of Klein's clothes through
 from this change: the identity-finish merge adds a thin necklace Klein drew
 on the dinner picture, which today's main does not.
 
+**Klein sees the person's photo cut to their head, and hears of glasses only
+when they wear them** (2026-10-01, Sitter's first head LoRA: "yes try the
+tighter crop", then "go with no mention"). `head_graph` could already cut the
+photo (`photo_crop`), but nothing asked it to, so Klein got the whole Primary
+and copied what it wore: on 12 stranger men, Sitter's wedding suit, blue tie and
+boutonniere - see-through over a bare chest at the beach, on a denim jacket,
+on a man walking away whom it turned round to face the camera; on Partner's 12,
+her wedding dress, flowers and the bridesmaids behind her. `Studio._head_swap`
+now asks SAM3 (`FIND`) for the faces in each person's photo once a job, and
+`photo_cut` cuts round the one nearest the middle, `PHOTO_CROP` 1.6 faces wide
+and `PHOTO_RISE` a quarter of a face up: the hair whole, the collar barely. A
+photo SAM3 finds no face in is used whole, as before. With it the pictures kept
+their own clothes and a stranger's cap, and a man walking away stayed turned
+away (his ArcFace falls, as there is less face to read - the picture is the
+truer). Separately, `PROMPT`'s "the same glasses" drew glasses on the user, who
+wears none, in 12 of 12 with his LoRA or without. Told "with glasses only if
+the person in image 2 wears glasses", Klein still drew them on every one;
+told "and no glasses", none, but it took the stranger's cap off too; not told
+anything, none and the cap kept. So `prompt_for(trigger, glasses)` leaves
+`GLASSES` out unless the profile's `glasses` ("Wears glasses" in the identity
+editor, off by default) is ticked; a head that does not say (`wear`) keeps the
+prompt as it was. Median ArcFace of the head swap on his 12, his 750-step LoRA:
+whole photo 0.629, cut 0.666, cut and no glasses 0.736; after the face swap
+0.866 / 0.858 / 0.889 (his own photos against each other 0.888). Partner, cut,
+kept her glasses: 0.675 / 0.865 against 0.706 / 0.868 whole, the face swap
+refusing 1 picture instead of 3. Still open: a thin necklace Klein invents
+(the user at the beach, pearls on Partner), and a laughing man at a dinner party
+whose head barely changes in any version (0.06).
+
 **The swap is a finish on the head: no weave, no teeth, no cheek behind a lens**
 (2026-09-29, seen live: a pink patch on a cheek and a strained, yellowed smile
 where Klein's head had looked natural). Looked at three times enlarged, the

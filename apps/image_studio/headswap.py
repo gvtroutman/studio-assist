@@ -48,6 +48,15 @@ SIDE = 1024                               # what Klein draws the crop at
 CROP = 4.0                                # the crop's side / the face's: room for the hair
 RISE = 0.0                                # how much of a face the crop sits above centre
 FIND = "face:8"
+# The person's photo is cut to their head before Klein sees it (`photo_cut`).
+# Given the whole photo, Klein copied what it wears: Sitter's wedding suit, tie
+# and boutonniere over a bare chest, a denim jacket and a stranger's black
+# jacket; Partner's wedding dress, flowers and bridesmaids (12 bench pictures
+# each, 2026-10-01). Cut 1.6 faces wide and a quarter of a face up - the hair
+# whole, the collar barely - the picture's own clothes and cap stayed, and
+# the head swap's median ArcFace rose 0.63 -> 0.67 (0.74 with GLASSES).
+PHOTO_CROP = 1.6
+PHOTO_RISE = 0.25
 # SAM3's words for what is blended back. "head" alone stops at the jaw: hair
 # that Klein took off the shoulders came back from the picture underneath.
 # The words are bare. ComfyUI's SAM3 encoder takes the count off "face:8" but
@@ -123,13 +132,24 @@ PROMPT = ("The person in image 1 now has the head of the person in image 2: the 
           "copied.")
 
 
-def prompt_for(trigger=None):
+# "the same glasses" drew glasses on the user, who wears none, in 12 pictures of
+# 12, LoRA or not; "with glasses only if the person in image 2 wears glasses"
+# did too, and "and no glasses" took a stranger's cap off with them. Not said
+# at all, no glasses and the cap kept (2026-10-01). So it is said only for a
+# profile that wears glasses (`glasses`).
+GLASSES = ("the same face, the same glasses, and the same hair",
+           "the same face and the same hair")
+
+
+def prompt_for(trigger=None, glasses=True):
     """PROMPT, naming the person of image 2 by their LoRA's trigger word when
-    they have one (`head_graph`'s "lora")."""
+    they have one (`head_graph`'s "lora"), and without their glasses when
+    they wear none (GLASSES)."""
+    text = PROMPT if glasses else PROMPT.replace(GLASSES[0], GLASSES[1], 1)
     if not trigger:
-        return PROMPT
-    return PROMPT.replace("the head of the person in image 2",
-                          "the head of %s, the person in image 2" % trigger, 1)
+        return text
+    return text.replace("the head of the person in image 2",
+                        "the head of %s, the person in image 2" % trigger, 1)
 
 
 def lacks(inventory, nodes=None):
@@ -193,6 +213,20 @@ def head_crop(width, height, face, crop=None, rise=None):
     return {"x": left, "y": top, "width": side, "height": side}
 
 
+def photo_cut(width, height, boxes):
+    """Where a person's photo (`width` x `height`, SAM3's FIND `boxes`) is
+    cut to their head (PHOTO_CROP): `head_crop` round the face nearest the
+    photo's middle, as an import cuts it round them -> head_graph's
+    "photo_crop", or None when SAM3 found no face (the photo is used whole)."""
+    if not boxes:
+        return None
+
+    def off(b):
+        return (((b[0] + b[2] / 2.0) / float(width) - 0.5) ** 2
+                + ((b[1] + b[3] / 2.0) / float(height) - 0.45) ** 2)
+    return head_crop(width, height, min(boxes, key=off)[:4], crop=PHOTO_CROP, rise=PHOTO_RISE)
+
+
 def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=None,
                strands=None, feather=None):
     """In `image` (a LoadImage name) each of `heads` ([{"crop": head_crop,
@@ -200,7 +234,8 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=Non
     Klein with the photo beside it (cut to "photo_crop" when a head gives
     one) - through the person's own Klein LoRA when the head names one
     ("lora": file, "strength", "trigger": said in the prompt, `prompt_for`;
-    Build LoRA's) - shrunk back, its colour moved `tone` of the way to the crop's
+    Build LoRA's), glasses left out of its prompt when it says "glasses":
+    False (GLASSES) - shrunk back, its colour moved `tone` of the way to the crop's
     (ColorTransfer, reinhard_lab; TONE), and blended in - through the head,
     hair and necklace alone: SAM3's `words` (WORDS) in the crop before and
     after (the new hair may be bigger or smaller than the old), grown and
@@ -265,9 +300,10 @@ def head_graph(image, heads, seed, prefix, sam3, words=None, tone=None, size=Non
                 "model": model, "lora_name": head["lora"],
                 "strength_model": float(head.get("strength", 1.0))}}
             model = [n + "lora", 0]
-        if head.get("trigger"):
+        glasses = head.get("glasses", True) is not False
+        if head.get("trigger") or not glasses:
             g[n + "text"] = {"class_type": "CLIPTextEncode", "inputs": {
-                "clip": ["clip", 0], "text": prompt_for(head["trigger"])}}
+                "clip": ["clip", 0], "text": prompt_for(head.get("trigger"), glasses)}}
             g[n + "zero"] = {"class_type": "ConditioningZeroOut", "inputs": {
                 "conditioning": [n + "text", 0]}}
             cond = {"pos": [n + "text", 0], "neg": [n + "zero", 0]}
