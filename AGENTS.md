@@ -760,8 +760,24 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   profiles (identities) alone, `"c:<id>"` / `"i:<id>"` (`_pick_from_people`); a
   character brings its profile or none, and picking another profile clears the
   character. Under it, **Editor** (the creator) and **Image references** (the
-  profiles). The form's look tabs are `FORM_LOOKS`: Body and Accessories are the
-  creator's alone, though a character's body and accessories still reach the prompt.
+  profiles). The form's look tabs are `FORM_LOOKS`: Expression and Clothes. Body,
+  Face, Hair (`imagegen.WHO_SECTIONS`) and Accessories are the creator's alone
+  (2026-10-02, the user: the person page's look "should be hidden so it doesn't
+  mess up the variables"), though a character's still reach the prompt. The
+  form keeps them hidden (`CREATOR_KEYS`): saved in the creator they follow the
+  character (`_follow_character`), and a profile alone or no one blanks them.
+  The history record still holds the whole look, so Generate Again is unchanged.
+  **A Scene Builder person with a character follows it** (same day; this
+  reverses "a copy, not a link" for who they are). The scene had copied
+  "in their 20s, light stubble" when the character was chosen, and later
+  said that although the character now read "in their 30s, heavy stubble".
+  Now `scene.follow_character` takes the character's `WHO_KEYS` (body, face,
+  hair) as the library has them now, and a beard from its facial hair pick
+  (`beard.from_words`, so a character's "heavy stubble" gets a beard region and
+  the beard pass). Clothes, accessories and expression stay the scene's. It runs
+  on choosing the character, on opening a scene, on Generate, inside
+  `scene.generation` (on a copy) and when the creator saves. A person with a
+  character shows no Body, Face or Hair tab in the inspector.
 - **A character's tags are words for its pictures** (2026-09-27, the user: "tags need
   images to upload. so when i say glasses i reference the image"). The creator's
   Tags tab is for things on the person (the user: "glasses, earrings, dress, tattoos,
@@ -3351,8 +3367,10 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   **The beard pass** (2026-10-02: scene render -> identity pass ->
   beard pass -> final): the head swap and FaceFusion redraw a face from a
   photo, which can shave the chosen beard or bring the photo's. So
-  `Studio._finish_passes` redraws each beard after the eye pass and before
-  the hands and glasses, on the picture's own model, only inside the
+  `Studio._finish_passes` redraws each beard after the face swap and the eye
+  pass, and before the hands and glasses. It was moved before the face swap
+  and back the same day: the user, "the beard needs to come after otherwise
+  the face swap undo's the work". It redraws on the picture's own model, only inside the
   scene's mask (`beard_regions` reads `character_regions` of kind
   `facial_hair`; `beard_spots` scales the mask's box to the picture;
   `beard_shape_png` is the crop's `shape` for `face_graph`), in that

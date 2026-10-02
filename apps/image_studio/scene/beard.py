@@ -25,6 +25,26 @@ def clean(value):
     return out
 
 
+# The character creator's facial hair picks (imagegen LOOKS "facial_hair") as
+# beards, so a character's "heavy stubble" gets a beard region and a beard
+# pass in a scene. Words not among them stay words, with no region.
+FROM_WORDS = {
+    "clean-shaven": {"style": "none"},
+    "light stubble": {"style": "stubble", "length": 0.05, "coverage": 0.8, "density": 0.4},
+    "heavy stubble": {"style": "stubble", "length": 0.1, "coverage": 0.85, "density": 0.85},
+    "short beard": dict(DEFAULT),
+    "full beard": {"style": "full", "length": 0.45, "coverage": 0.9, "density": 0.85},
+    "moustache": {"style": "moustache", "length": 0.15, "coverage": 0.8, "density": 0.7},
+    "goatee": {"style": "goatee", "length": 0.2, "coverage": 0.8, "density": 0.7},
+}
+
+
+def from_words(words):
+    """A facial hair pick (FROM_WORDS) -> its beard; None for anything else."""
+    pick = FROM_WORDS.get((words or "").strip().lower()) if isinstance(words, str) else None
+    return clean(pick) if pick else None
+
+
 def text(value):
     b = clean(value)
     if b is None:

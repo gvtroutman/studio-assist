@@ -51,10 +51,14 @@ IDENTITY_TILE = 220           # px, not scaled: a person's photo previews are 22
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
 CAMERA_CARD = 150             # px, the Shot on card's long edge, before the display's scale
 HISTORY_PAGE = 40
-# The look sections the People tab shows. Body and Accessories are the
-# Editor's (CharacterCreator) alone: a character's still reach the prompt.
+# The look sections the People tab shows. Body, Face, Hair (ig.WHO_SECTIONS)
+# and Accessories are the Editor's (CharacterCreator) alone: a character's
+# still reach the prompt, and the form cannot say them otherwise.
 FORM_LOOKS = [(name, slots) for name, slots in ig.LOOKS
-              if name not in ("Body", "Accessories")]
+              if name not in ig.WHO_SECTIONS + ("Accessories",)]
+# The slots and sliders the form keeps but does not show: a character's own.
+CREATOR_KEYS = [k for k in ig.CHARACTER_KEYS
+                if k not in {k for _, slots in FORM_LOOKS for k, *_ in slots}]
 ELLIPSIS = "…"          # the window's marker for "still happening": it animates
 ADVANCED = [                  # (setting, label, kind)
     ("seed", "Seed", "int"),
@@ -1242,6 +1246,9 @@ class ImageStudio:
         if key.startswith("c:"):
             return self._set_character(key[2:])
         self.settings["character"] = ""
+        # The last character's body, face and hair are not on the form to
+        # be seen: they go with it, not on to someone else.
+        self._creator_looks({})
         # A profile alone: its own reference photos are the face; no one, none.
         ident = self.studio.lib.get("identities", key[2:]) if key else None
         self.face_photos = ig.character_faces({"identity": key[2:]}, self.studio.lib) if ident else []
@@ -1321,6 +1328,22 @@ class ImageStudio:
             self.face_photos, self.face_name = [], ""
         self._show_identity()
         self._recheck()
+
+    def _creator_looks(self, looks):
+        """The form's hidden slots and sliders (CREATOR_KEYS) set to `looks`,
+        blank where it has none."""
+        for key in CREATOR_KEYS:
+            if key in self.sliders:
+                self.sliders[key].set(int(looks.get(key, 0) or 0))
+            elif key in self.text:
+                self.text[key].set(looks.get(key, ""))
+
+    def _follow_character(self):
+        """The creator saved: the form's character's hidden look follows it,
+        so what was saved there is what Generate says."""
+        rec = self._character()
+        if rec is not None:
+            self._creator_looks(rec.get("looks") or {})
 
     def look_rows(self, parent, slots, vars_, changed, chips=False, bg="bg"):
         """Rows for look slots: a label, the field, and the picks - a menu on
@@ -2630,15 +2653,6 @@ class ImageStudio:
         self.wrap(meta, right, self.px(12))
         strip = self.frame(right, "card")
         strip.pack(side="top", fill="x", pady=(self.px(3), 0))
-        stages, stage_keys = [], []
-        for i, (key, label) in enumerate(ig.pipeline_stages(self.studio.lib, s)):
-            if i:
-                self.label(strip, "→", "faint", self.host.f_small, bg="card").pack(
-                    side="left", padx=self.px(3))
-            lbl = self.label(strip, label, "faint", self.host.f_small, bg="card")
-            lbl.pack(side="left")
-            stages.append(lbl)
-            stage_keys.append(key)
         bar = tk.Canvas(right, height=self.px(4), highlightthickness=0, bd=0)
         self.skin(bar, bg="card")
         bar.pack(side="top", fill="x", pady=(self.px(4), 0), padx=(0, self.px(8)))
@@ -2647,7 +2661,7 @@ class ImageStudio:
         self.wrap(detail, right, self.px(12))
         widgets = {"row": row, "thumb": thumb, "status": status, "elapsed": elapsed,
                    "bar": bar, "detail": detail, "cancel": cancel, "meta": meta,
-                   "stages": stages, "stage_keys": stage_keys, "strip": strip,
+                   "strip": strip,
                    "base": "%s · %s · %s · seed %s" % (
                        preset, model.get("label", s.get("model")), job.backend["name"],
                        s.get("seed")) if s.get("mode") not in ("dress", "blend") else
@@ -2659,12 +2673,36 @@ class ImageStudio:
         for w in (row, right, thumb, thumb.img, status, meta, detail):
             w.bind("<Button-1>", lambda ev: self._select(("job", job)))
         self.rows[job.id] = widgets
+        self._fill_strip(widgets, job)
         self._paint_job(job)
+
+    def _fill_strip(self, w, job):
+        """The job's pipeline strip, from its settings until its plan is
+        composed and then from the plan (a workflow without a face pass has
+        no Face pass stop), drawn again only when the stops change."""
+        w["planned"] = job.plan
+        stops = ig.pipeline_stages(self.studio.lib, job.settings, job.plan)
+        if [k for k, _ in stops] == w.get("stage_keys"):
+            return
+        strip = w["strip"]
+        for child in strip.winfo_children():
+            child.destroy()
+        w["stages"], w["stage_keys"] = [], []
+        for i, (key, label) in enumerate(stops):
+            if i:
+                self.label(strip, "→", "faint", self.host.f_small, bg="card").pack(
+                    side="left", padx=self.px(3))
+            lbl = self.label(strip, label, "faint", self.host.f_small, bg="card")
+            lbl.pack(side="left")
+            w["stages"].append(lbl)
+            w["stage_keys"].append(key)
 
     def _paint_job(self, job):
         w = self.rows.get(job.id)
         if w is None:
             return
+        if job.plan is not w.get("planned"):
+            self._fill_strip(w, job)
         cancelling = job.cancel.is_set() and job.status not in ig.FINISHED
         w["status"].config(text="Cancelling…" if cancelling else
                            STATUS_TEXT.get(job.status, job.status.capitalize()))
@@ -3015,6 +3053,14 @@ class ImageStudio:
     # =============================================================== editors
     def _saved(self, kind):
         self._rebuild_choices()
+        if kind == "characters":
+            self._follow_character()
+            if self.scene_builder is not None:
+                try:
+                    if self.scene_builder.win.winfo_exists():
+                        self.scene_builder.follow_characters()
+                except tk.TclError:
+                    pass
         if kind == "identities":
             self._prepare_profiles()
         if kind == "backends":
