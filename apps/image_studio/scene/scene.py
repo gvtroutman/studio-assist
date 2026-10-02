@@ -4497,6 +4497,7 @@ LEG_POSES = ("walking", "crouching", "kneeling", "sitting")   # named: the legs 
 HEAD_TOP = 0.2                 # m from the head joint (the top of the neck) to the crown
 BOTH_ARMS = {"hanging relaxed at the side": "arms relaxed at the sides",
              "raised above the head": "both arms raised above the head",
+             "raised, the hand at head height": "both arms raised, the hands at head height",
              "reaching forward at shoulder height": "both arms reaching forward",
              "stretched out to the side": "arms stretched out to the sides",
              "bent, the hand in front of the chest": "both arms bent, hands in front of the chest",
@@ -4513,6 +4514,11 @@ def _arm(sk, side, bent, hip_y):
     ahead, out = w[2] - s[2], abs(w[0]) - abs(s[0])
     if w[1] > sk["head"][0][1] + HEAD_TOP:
         return "raised above the head"
+    # A hand between the chin and the crown, in front, is raised (a toast),
+    # not at shoulder height: said as forward, the picture drew a second
+    # forearm out in front as well as the raised arm the pose map shows.
+    if w[1] > sk["head"][0][1] and ahead >= out:
+        return "raised, the hand at head height"
     if w[1] > s[1] - 0.12:
         return ("reaching forward at shoulder height" if ahead >= out
                 else "stretched out to the side")
