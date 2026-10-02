@@ -818,6 +818,20 @@ def make_room(base_url, keep, timeout=10):
     return gone, "; ".join(errors) or None
 
 
+def resident(base_url, timeout=5):
+    """The language and vision models loaded on the host, by key, or None
+    from a host that does not say. Embedding models are not counted, as in
+    `make_room`."""
+    try:
+        with urllib.request.urlopen(api_root(base_url) + "/api/v1/models",
+                                    timeout=timeout) as r:
+            models = json.load(r).get("models", [])
+    except Exception:
+        return None
+    return [m.get("key") for m in models
+            if isinstance(m, dict) and m.get("loaded_instances") and m.get("type") != "embedding"]
+
+
 def give_back(base_url, model, context_length):
     """Reload `model` at `context_length` if a render unloaded it. -> error or None."""
     if loaded_instances(base_url, model):
@@ -1217,13 +1231,22 @@ class ServerSpec(AppSpec):
         """Make sure `model` is loaded with at least OPENCODE_CONTEXT tokens
         (or its maximum) and return the window it has. Loaded smaller - or
         not at all, when the coder is not the model in use - OpenCode
-        compacts its task away. Only this model is reloaded; the rest stay."""
+        compacts its task away.
+
+        It goes onto an empty card: anything else loaded is unloaded first,
+        and the coder itself reloaded if it shares the card. Loaded beside the
+        vision model it decoded at 3-5 tokens a second (2026-09-27) - every
+        OpenCode step a minute - where alone it does 77-79."""
         loaded, maximum = context_window(host, model)
         if loaded is None and maximum is None:
             return None                       # a host that does not say
         want = min(OPENCODE_CONTEXT, maximum) if isinstance(maximum, int) else OPENCODE_CONTEXT
-        if isinstance(loaded, int) and loaded >= want:
+        others = [k for k in resident(host) or [] if k != model]
+        if isinstance(loaded, int) and loaded >= want and not others:
             return loaded
+        if others:
+            make_room(host, {model})
+            want = max(want, loaded) if isinstance(loaded, int) else want
         for instance, _ in loaded_instances(host, model):
             if unload_model(host, instance):
                 return loaded

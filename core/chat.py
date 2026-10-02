@@ -161,7 +161,15 @@ CONSOLE_SWEEP_S = 1.0                     # how soon a console opened outside is
 HOST_RETRY_MS = 30000                     # between probes while the host is down
 UPDATE_FIRST_MS = 8000                    # the first look at GitHub, after start-up settles
 UPDATE_EVERY_MS = 15 * 60 * 1000          # ...and again while the window is open
-LLM_PC = "LLM PC"                         # the sidebar's second group: remote apps
+# A model no tab has used for this long is unloaded from the LLM PC, so the
+# GPU is free for renders and the next tab's model gets the card to itself;
+# the tab reloads it before its next turn. STUDIO_MODEL_IDLE_MIN=0 keeps them.
+try:
+    MODEL_IDLE_S = max(0, float(os.environ.get("STUDIO_MODEL_IDLE_MIN", "15"))) * 60
+except ValueError:
+    MODEL_IDLE_S = 15 * 60
+IDLE_CHECK_MS = 60 * 1000
+LLM_PC ="LLM PC"                         # the sidebar's second group: remote apps
 
 
 def app_subtitle(a):
@@ -210,7 +218,7 @@ class Prefs:
 
     DEFAULTS = {"theme": "dark", "accent": None, "tabs": None, "pinned": [], "hidden": [], "bridges": [],
                 "hold_consoles": True, "rounding": 1.0, "text_size": 1.0, "icons": {},
-                "button_show": {}, "names": {}}
+                "button_show": {}, "names": {}, "model_pins": {}}
 
     def __init__(self, path=None):
         self.path = path or settings_path()
@@ -234,6 +242,11 @@ class Prefs:
             # "nope" would otherwise hide four apps called n, o, p and e.
             self.data[key] = ([x for x in got if isinstance(x, str)]
                               if isinstance(got, list) else [])
+        # A tab's model chosen by hand from its model chip: app id -> model id.
+        pins = self.data.get("model_pins")
+        self.data["model_pins"] = ({k: v for k, v in pins.items()
+                                    if isinstance(k, str) and isinstance(v, str)}
+                                   if isinstance(pins, dict) else {})
         if not isinstance(self.data.get("hold_consoles"), bool):
             self.data["hold_consoles"] = True
         # Corners and text size are sliders; outside their range is nothing.
@@ -332,6 +345,7 @@ class Session:
         # app measured it, acted on it and forgot it. Diagnostics shows it.
         self.prefix_tokens = None
         self.window = None
+        self.used_at = time.time()        # last turn, for unloading an idle model
         self.frame = None
         self.view = None
         self.hero = None                  # the app's mark and name while nothing is said
@@ -521,6 +535,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self.restart = False              # set by an update; main() relaunches
         self.updating = False
         self.update_timer = self.after(UPDATE_FIRST_MS, self._update_tick)
+        # Pins from the model chip ride on STUDIO_MODEL_<APP>, which every
+        # `model_for` - the tabs' and OpenCode's server - already reads.
+        for app_id, model in self.prefs.get("model_pins").items():
+            os.environ["STUDIO_MODEL_" + app_id.upper()] = model
+        self.idle_timer = self.after(IDLE_CHECK_MS, self._idle_tick) if MODEL_IDLE_S else None
         self._spawn(None, self._read_icons)
         self._spawn(None, self._boot_host)
         if _MAIN:
@@ -795,7 +814,10 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         # briefing it in between - one model's context on the GPU, not two,
         # and nothing lost in the retelling. Also OpenCode's tab only.
         self.btn_direct = self._button(head, "Direct: off", self._toggle_direct, bg="head")
-        self.btn_fix = self._button(head, "Start app", self._on_fix, bg="head",
+        # The tab's model: "Auto" is the best the host has for this app, loaded
+        # when the tab opens; a click pins another or goes back to Auto.
+        self.btn_model = self._button(head, "Model", self._model_menu, bg="head")
+        self.btn_fix =self._button(head, "Start app", self._on_fix, bg="head",
                                     kind="accent")
         # Shown only when GitHub has commits this folder does not (_show_update).
         self.btn_update = self._button(head, "Update", self._on_update, bg="head",
@@ -2632,6 +2654,15 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         else:
             self.btn_addons.pack_forget()
             self.btn_direct.pack_forget()
+        llm = s.llm
+        if llm is not None and not s.app.images and not s.app.terminals:
+            pinned = s.app.id in self.prefs.get("model_pins")
+            self.btn_model.pack(side="right", padx=(6, 0), after=self.btn_hist)
+            self.btn_model.set(text="%s · %s" % ("Pinned" if pinned else "Auto",
+                                                      clip(llm.model, 22)),
+                               state="disabled" if s.busy or s.booting else "normal")
+        else:
+            self.btn_model.pack_forget()
         self.btn_new.set(state="disabled" if held else "normal")
         self.btn_hist.set(state="disabled" if s.busy or held else "normal")
         stopping = s.busy and s.cancel.is_set()
@@ -3534,6 +3565,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                                            % (llm.model, ELLIPSIS), "muted", True)))
         prefix = s.prefix_tokens or eng.estimate_tokens(s.messages[0]["content"], s.tools)
         self._fit(s, prefix, exact=bool(s.prefix_tokens))
+        # Unloaded while idle, the vision model comes back after it, as at boot.
+        if self.vision is not None and self.vision.needs_load and not s.app.gpu_tools:
+            self._load_vision()
 
     def _headroom(self, s, reply):
         """After a warm-up: the prefix's exact token cost, which the host
@@ -3646,44 +3680,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                 if s.closed:
                     return
 
-            # The model has to be in VRAM with a window that holds this tab's
-            # prefix before the warm-up pays for that prefix: loaded here, with
-            # the window from an estimate, rather than just in time by the
-            # warm-up at LM Studio's default and reloaded straight after.
-            offered = tasks.inference_tools(s.tools, s.library)
-            if not eng.loaded_instances(self.host, s.llm.model):
-                self.q.put(("status", sid, ("loading %s on the host%s"
-                                            % (s.llm.model, ELLIPSIS),
-                                            "warn", False)))
-            _, note = self._fit(s, eng.estimate_tokens(s.messages[0]["content"], offered),
-                                exact=False)
-            if note:
-                self.q.put(("sys", sid, note))
-            # Prefill dominates the first call - a full tool schema set is 9,000 to
-            # 20,000 tokens, seconds on a model with the card to itself and over a
-            # minute on one loaded beside another (see `_fit`). Pay it here against
-            # the exact prompt prefix a real message will use, so the first question
-            # comes back in seconds. Each tab has its own prefix, so each warms up
-            # the first time it is opened. The reply carries the prefix's exact
-            # cost; a window the estimate got wrong is fitted on it and the warm-up
-            # paid once more.
-            for attempt in (1, 2):
-                self.q.put(("status", sid, ("warming up the model" + ELLIPSIS,
-                                            "warn", False)))
-                try:
-                    reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
-                                       offered, max_tokens=1)
-                except eng.HostUnreachable as e:
-                    self._host_lost()
-                    self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
-                    break
-                except Exception as e:
-                    self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
-                    break
-                self._host_back()
-                if attempt == 2 or not self._headroom(s, reply):
-                    break
-            self._draft_check(s, s.llm)
+            self._warm(s)
             s.ready = True
             if s.app.bridged:
                 self._refresh_bridge(s)
@@ -3699,6 +3696,162 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         finally:
             s.booting = False
             self.q.put(("idle", sid, None))
+
+    def _warm(self, s):
+        """This tab's model loaded with a window that fits its prefix, and
+        the prefix paid for once on the host - at boot, and again after the
+        model chip swaps the model."""
+        sid = s.event_id
+        # The model has to be in VRAM with a window that holds this tab's
+        # prefix before the warm-up pays for that prefix: loaded here, with
+        # the window from an estimate, rather than just in time by the
+        # warm-up at LM Studio's default and reloaded straight after.
+        offered = tasks.inference_tools(s.tools, s.library)
+        if not eng.loaded_instances(self.host, s.llm.model):
+            self.q.put(("status", sid, ("loading %s on the host%s"
+                                        % (s.llm.model, ELLIPSIS),
+                                        "warn", False)))
+        _, note = self._fit(s, eng.estimate_tokens(s.messages[0]["content"], offered),
+                            exact=False)
+        if note:
+            self.q.put(("sys", sid, note))
+        # Prefill dominates the first call - a full tool schema set is 9,000 to
+        # 20,000 tokens, seconds on a model with the card to itself and over a
+        # minute on one loaded beside another (see `_fit`). Pay it here against
+        # the exact prompt prefix a real message will use, so the first question
+        # comes back in seconds. Each tab has its own prefix, so each warms up
+        # the first time it is opened. The reply carries the prefix's exact
+        # cost; a window the estimate got wrong is fitted on it and the warm-up
+        # paid once more.
+        for attempt in (1, 2):
+            self.q.put(("status", sid, ("warming up the model" + ELLIPSIS,
+                                        "warn", False)))
+            try:
+                reply = s.llm.chat([s.messages[0], {"role": "user", "content": "Say ready."}],
+                                   offered, max_tokens=1)
+            except eng.HostUnreachable as e:
+                self._host_lost()
+                self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
+                break
+            except Exception as e:
+                self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
+                break
+            self._host_back()
+            if attempt == 2 or not self._headroom(s, reply):
+                break
+        self._draft_check(s, s.llm)
+        s.used_at = time.time()
+
+    # ------------------------------------------------------------ the model chip
+
+    def _model_menu(self):
+        """The chip's menu: Auto, then every model the host serves that can
+        drive a tab - not the vision model, a draft or an embedding."""
+        s = self.cur()
+        if s is None or s.llm is None or s.busy or s.booting:
+            return
+        pins = self.prefs.get("model_pins")
+        pinned = pins.get(s.app.id)
+        helpers = eng.helper_models()
+        choices = [m for m in self.model_ids if m and m not in helpers
+                   and not eng.looks_vision(m) and "embed" not in m.lower()]
+        m = self._menu()
+        m.add_command(label=("✓ " if not pinned else "   ") +
+                      "Auto - the best this host has for %s" % s.app.name,
+                      command=lambda: self._pin_model(s, None))
+        m.add_separator()
+        for mid in choices:
+            m.add_command(label=("✓ " if mid == pinned else "   ") + mid,
+                          command=lambda x=mid: self._pin_model(s, x))
+        self._popup(m, self.btn_model)
+
+    def _pin_model(self, s, model):
+        """Pin `model` for this app (None: back to Auto), kept across restarts,
+        and swap the tab onto it now."""
+        pins = dict(self.prefs.get("model_pins"))
+        key = "STUDIO_MODEL_" + s.app.id.upper()
+        if model:
+            pins[s.app.id] = model
+            os.environ[key] = model
+        else:
+            pins.pop(s.app.id, None)
+            os.environ.pop(key, None)
+        self.prefs.set(model_pins=pins)
+        if s.busy or s.booting or s.closed:
+            return
+        s.busy = True
+        self._apply_status()
+        self._spawn(s.event_id, self._swap_model, s)
+
+    def _swap_model(self, s):
+        """The tab onto the model `_llm_for` now picks: loaded, fitted and
+        warmed up like at boot. The conversation carries on; only the model
+        reading it changes."""
+        sid = s.event_id
+        try:
+            old = getattr(s.llm, "model", None)
+            s.llm = self._llm_for(s)
+            if s.llm.model == old:
+                return
+            s.prefix_tokens, s.window = None, None
+            self._warm(s)
+            note = "This tab now runs on %s." % s.llm.model
+            if getattr(s.app, "served", False):
+                note += " OpenCode itself picks it up when it is next started (Start OpenCode)."
+            self.q.put(("sys", sid, note))
+            self.q.put(("status", sid, ("ready", "ok", False)))
+        finally:
+            s.busy = False
+            self.q.put(("idle", sid, None))
+
+    # ------------------------------------------------------------ idle models
+
+    def _idle_tick(self):
+        """Once a minute: hand the idle check to a worker, since it asks the host."""
+        self.idle_timer = None
+        if self.closing:
+            return
+        if self.llm is not None and not self.host_booting:
+            self._spawn(None, self._unload_idle)
+        self.idle_timer = self.after(IDLE_CHECK_MS, self._idle_tick)
+
+    def _unload_idle(self):
+        """Unload each tab model that no tab has used for MODEL_IDLE_S, and
+        the vision model once every tab is idle. A tab gets its model back,
+        at its own window, before its next turn (`_reload_if_unloaded`); the
+        vision model after it (`needs_load`)."""
+        now = time.time()
+        tabs = [t for t in self.sessions.values() if t.llm is not None and t.window is not None]
+        if not tabs:
+            return
+        last = {}
+        for t in tabs:
+            m = t.llm.model
+            used = now if (t.busy or t.booting) else t.used_at
+            last[m] = max(last.get(m, 0), used)
+        idle = {m for m, used in last.items() if now - used >= MODEL_IDLE_S}
+        vision = self.vision
+        if vision is not None and all(m in idle for m in last) and vision.model not in last:
+            idle.add(vision.model)
+        if not idle:
+            return
+        gone = set()
+        with self.fit_lock:
+            for m in sorted(idle):
+                for inst, _ in eng.loaded_instances(self.host, m):
+                    if not eng.unload_model(self.host, inst):
+                        gone.add(m)
+            if vision is not None and vision.model in idle and gone:
+                vision.needs_load = True
+        if not gone:
+            return
+        mins = int(MODEL_IDLE_S // 60)
+        for t in tabs:
+            if t.llm.model in gone:
+                self.q.put(("sys", t.event_id,
+                            "Unloaded %s from the LLM PC after %d minutes unused; it is loaded "
+                            "again when you next send here." % (t.llm.model, mins)))
+        self._host_healthy("muted", "idle: unloaded %d" % len(gone))
 
     def _boot_bridge(self, s):
         """
@@ -4552,6 +4705,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             # A run that ended in an error can leave a render's model away;
             # it comes back at the window it had.
             eng.settle(s.mcp)
+            s.used_at = time.time()
             self._reload_if_unloaded(s)
             if pictures and self.vision:
                 # The executing model reads text. Put what the pictures show
@@ -4592,6 +4746,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             lost = isinstance(e, eng.HostUnreachable)
             raise
         finally:
+            s.used_at = time.time()
             self.q.put(("stream_end", sid, None))
             self._publish_lessons(s)      # studio_remember, or a stopped run's lessons
             self._draft_check(s, s.llm or self.llm)
@@ -4699,7 +4854,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                 s.images.release(confirmed=True)
         self.holder.stop()                # every held console back on the desktop
         self.anim.clear()
-        for timer in ("drain_timer", "host_timer", "anim_timer", "update_timer"):
+        for timer in ("drain_timer", "host_timer", "anim_timer", "update_timer", "idle_timer"):
             self._stand_down(timer)
         # Off the screen at once; the bridges get their grace behind it, all
         # together. One at a time, each allowed seconds to exit, was a window
