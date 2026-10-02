@@ -1524,9 +1524,42 @@ class SceneBuilder:
         if self.look_section == ig.SLIDER_SECTION:
             o.slider_rows(p, steps, changed)
         relight[0] = o.look_rows(p, section, text, changed)
+        if self.look_section == "Face":
+            self._beard_controls(obj)
         if self.look_section in ("Clothes", "Accessories"):
             self._outfit_controls(obj)
         self.look_vars, self.look_changed = text, changed
+
+    def _beard_controls(self, obj):
+        from apps.image_studio.scene import beard
+        o, p, look = self.owner, self.panel, obj["look"]
+        b = beard.clean(look.get("beard"))
+        o.cap(p, "Beard region")
+
+        def style(value):
+            if value == "":
+                look.pop("beard", None)
+            else:
+                look["beard"] = dict(b or beard.DEFAULT, style=value)
+            self.changed()
+            self._inspect()
+
+        o.choice(p, [("", "Use facial hair words")] + [(s, s.title()) for s in beard.STYLES],
+                 b["style"] if b else "", style).pack(side="top", fill="x")
+        if b is None or b["style"] == "none":
+            return
+        # Keep the same mutable record for callbacks until the inspector rebuilds.
+        look["beard"] = b
+        for key in ("length", "coverage", "density"):
+            self._slider(p, "beard_" + key, key.title(),
+                         lambda k=key: b[k], lambda x, k=key: b.__setitem__(k, x),
+                         0.0, 1.0, 0.01)
+        o.label(p, "Beard colour", "muted", self.host.f_small).pack(side="top", anchor="w")
+        self._text(p, b["color"], lambda value: self._beard_colour(b, value), height=1)
+
+    def _beard_colour(self, beard, value):
+        beard["color"] = value.strip()[:80]
+        self.changed()
 
     def _crowd_controls(self, obj):
         """How many, over how much floor, facing which way, doing what, and

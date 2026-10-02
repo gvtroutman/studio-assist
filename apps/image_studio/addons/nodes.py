@@ -28,7 +28,7 @@ CATALOG = {
     "studio_facepaste": {
         "title": "Blend a real reference face",
         "purpose": "Aligns a face from a reference photo with the generated face and blends its color and edges.",
-        "improves": "Helps preserve the person's actual facial details in the existing face-paste workflow.",
+        "improves": "Helps preserve the person's actual facial details in the existing face-paste workflow, and fits a Scene Builder beard to the drawn face's jaw, lips, nose and cheeks.",
         "integration": "Requires InsightFace, antelopev2 models, ONNX Runtime, OpenCV, NumPy and PyTorch in ComfyUI. Installs the node code; these dependencies and models must already be available.",
         "node": "StudioFacePaste",
     },
