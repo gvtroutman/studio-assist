@@ -1485,7 +1485,27 @@ people's primary photo only, and pools each enabled person's own set.
 Scene-linked profiles carry the same setting. Never use the older repeated-token
 experiment as a substitute for this switch.
 
-The identity editor's **Add folder…** imports supported image files directly in
+**A person's photos are dropped on the identity window** (2026-10-02, the user:
+"make the pictures for reference images of someone drag and drop into the
+identity window. turn the add photos, add folder, and add from link into a
+singular landing pad that spans the width of the identity description"). Under
+the photo tiles is one pad (`RecordEditor._landing_pad`) as wide as the form: a
+click chooses photos, its links choose a folder or paste a link, and anything
+dropped anywhere on the window lands there (`_dropped`): files and folders go
+through `_import_paths` (a folder as Choose a folder takes it), a picture dragged
+out of a web page arrives as its link and is downloaded (`ImageStudio.fetch_link`,
+the half of `from_link` after the asking). While a drag is over the window the
+pad lights (`_light_pad`). Remove moved to the row of actions. Tk has no drag and
+drop and the stdlib-only rule bars tkinterdnd2, so `core/filedrop.py` is an OLE
+`IDropTarget` built in ctypes, registered on the Toplevel (OLE walks up from the
+window under the cursor, so every widget in it is covered). Its traps are in its
+docstring: OLE calls it inside Tk's message loop while the source waits, so the
+import runs from `after`; a target is never freed, as OLE may call `Release` after
+revoke; nothing may raise into OLE. Without it (not 64-bit Windows, or the Tk
+thread already in another COM apartment) the pad says "Click to choose photos".
+`tests/test_filedrop.py` calls the target as OLE does, with a shell data object.
+
+The identity editor's **Choose a folder…** imports supported image files directly in
 that folder (not subfolders), in filename order, on a worker. It keeps local
 copies, deduplicates by image bytes against the existing set, and reports failed
 files without dropping successful ones. **Use as primary** moves one selected

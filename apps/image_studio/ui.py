@@ -29,6 +29,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import core.doctor as doctor
+import core.filedrop as filedrop
 
 import apps.image_studio.addons.catalog as catalog
 import apps.image_studio.addons.hub as hub
@@ -1116,36 +1117,39 @@ class ImageStudio:
 
     def from_link(self, parent, what, owner, then, status):
         """A picture of `what` from a link instead of a file: ask for the link
-        (the clipboard's, when it holds one), download it off the UI thread
-        into references/<owner> (`Library.keep_link`), then `then(path)` on
-        the UI thread while `parent` is still open. `status(text, role)` says
-        it is downloading, and why when nothing came."""
-        def got(url):
-            status("Downloading the picture of the %s%s" % (what, ELLIPSIS))
-
-            def work():
-                try:
-                    path = self.studio.lib.keep_link(url, owner)
-                except (ig.LinkError, OSError) as e:
-                    msg = "No picture from that link: %s" % e
-                    self._post("call", lambda: parent.winfo_exists() and status(msg, "err"))
-                    return
-
-                def done():
-                    if parent.winfo_exists():
-                        status("Downloaded the picture of the %s." % what, "ok")
-                        then(path)
-                self._post("call", done)
-            self.host._spawn(self.s.event_id, work)
+        (the clipboard's, when it holds one), then `fetch_link` it."""
         try:
             clip = parent.clipboard_get().strip()
         except tk.TclError:
             clip = ""
-        looks = ("\n" not in clip and len(clip) < 8192 and
-                 re.match(r"(?i)(https?://|data:image/)\S+$", clip))
         return self._ask_name("A picture from a link", "Link to a picture of the %s "
                               "(or to a page that shows it)" % what,
-                              clip if looks else "", got, parent=parent, ok_text="Download")
+                              filedrop.link(clip) or "",
+                              lambda url: self.fetch_link(parent, what, owner, url, then,
+                                                          status),
+                              parent=parent, ok_text="Download")
+
+    def fetch_link(self, parent, what, owner, url, then, status):
+        """Download the picture of `what` at `url` off the UI thread into
+        references/<owner> (`Library.keep_link`), then `then(path)` on the UI
+        thread while `parent` is still open. `status(text, role)` says it is
+        downloading, and why when nothing came."""
+        status("Downloading the picture of the %s%s" % (what, ELLIPSIS))
+
+        def work():
+            try:
+                path = self.studio.lib.keep_link(url, owner)
+            except (ig.LinkError, OSError) as e:
+                msg = "No picture from that link: %s" % e
+                self._post("call", lambda: parent.winfo_exists() and status(msg, "err"))
+                return
+
+            def done():
+                if parent.winfo_exists():
+                    status("Downloaded the picture of the %s." % what, "ok")
+                    then(path)
+            self._post("call", done)
+        self.host._spawn(self.s.event_id, work)
 
     def _build_style_tiles(self, styles):
         """The styles as a grid of pictures: each one the same photo in that
@@ -4251,6 +4255,11 @@ class RecordEditor:
         outer, self.form = owner.scrolled(right)
         outer.pack(side="top", fill="both", expand=True)
         self.widgets = {}
+        # A person's photos can be dropped anywhere on the window; the
+        # landing pad (`_landing_pad`) lights while a drag is over it.
+        self.drops = filedrop.accept(win, self._dropped, enter=lambda: self._light_pad(True),
+                                     leave=lambda: self._light_pad(False)) \
+            if kind == "identities" else None
         self._reload_list(0 if self.records else None)
 
     def status(self, text, role="muted"):
@@ -4381,31 +4390,29 @@ class RecordEditor:
                         self.form.bind("<Configure>",
                                        lambda ev: self._refit_paths(self._tile_pics), add="+")
                 row = o.frame(parent)
-                row.pack(side="top", fill="x", pady=(o.px(4), 0))
-                o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
-                    side="left")
-                if self.kind == "identities":
-                    o.button(row, "Add folder…", lambda p=pics: self._add_folder(p)).pack(
-                        side="left", padx=(o.px(4), 0))
-                    o.button(row, "Add from link…", lambda p=pics: self._add_link(p)).pack(
-                        side="left", padx=(o.px(4), 0))
-                    actions = o.frame(parent)
-                    actions.pack(side="top", fill="x")
-                    o.button(actions, "Use as primary", lambda p=pics: self._primary_path(p)).pack(
+                if self.kind != "identities":
+                    row.pack(side="top", fill="x", pady=(o.px(4), 0))
+                    o.button(row, "Add photos…", lambda p=pics: self._add_paths(p)).pack(
                         side="left")
-                    o.button(actions, "Build LoRA" + ELLIPSIS,
+                else:
+                    # Add photos, Add folder and Add from link are one pad.
+                    self._landing_pad(parent, pics)
+                    row.pack(side="top", fill="x")
+                    o.button(row, "Use as primary", lambda p=pics: self._primary_path(p)).pack(
+                        side="left")
+                    o.button(row, "Build LoRA" + ELLIPSIS,
                              lambda: self.owner.build_lora(self)).pack(
                         side="left", padx=(o.px(4), 0))
-                    o.button(actions, "Rate photos",
+                    o.button(row, "Rate photos",
                              lambda p=pics: self._rate_paths(p)).pack(
                         side="left", padx=(o.px(4), 0))
-                    o.button(actions, "Remove duplicates" + ELLIPSIS,
+                    o.button(row, "Remove duplicates" + ELLIPSIS,
                              lambda p=pics: self._remove_duplicates(p)).pack(
                         side="left", padx=(o.px(4), 0))
-                    o.button(actions, "Angles" + ELLIPSIS,
+                    o.button(row, "Angles" + ELLIPSIS,
                              lambda p=pics: self._new_photos(p, "angles")).pack(
                         side="left", padx=(o.px(4), 0))
-                    o.button(actions, "Blend" + ELLIPSIS,
+                    o.button(row, "Blend" + ELLIPSIS,
                              lambda p=pics: self._new_photos(p, "blend")).pack(
                         side="left", padx=(o.px(4), 0))
                     o.label(parent, "Use clear photos of the same person, one face per photo.\n"
@@ -4618,6 +4625,60 @@ class RecordEditor:
             ("Pictures", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")])
         self._import_paths(pics, paths)
 
+    def _landing_pad(self, parent, pics):
+        """Add photos, Add folder and Add from link as one pad as wide as the
+        form: a click on it chooses photos, its links the other two. Pictures,
+        folders or a picture's link dropped anywhere on the window land here
+        (`_dropped`), and the pad lights while a drag is over the window."""
+        o, host = self.owner, self.owner.host
+        pad = tk.Frame(parent, bd=0, highlightthickness=o.px(2), cursor="hand2")
+        pad.pack(side="top", fill="x", pady=(o.px(6), o.px(6)))
+        title = o.label(pad, "", "text", host.f_bold, bg="card")
+        title.config(anchor="center", justify="center")
+        title.pack(side="top", fill="x", pady=(o.px(16), o.px(4)))
+        links = o.frame(pad, "card")
+        links.pack(side="top", pady=(0, o.px(16)))
+        hits = [pad, title, links]
+        for i, (text, fn) in enumerate((("Choose photos" + ELLIPSIS, self._add_paths),
+                                        ("Choose a folder" + ELLIPSIS, self._add_folder),
+                                        ("Paste a link" + ELLIPSIS, self._add_link))):
+            if i:
+                dot = o.label(links, "·", "faint", host.f_small, bg="card")
+                dot.pack(side="left", padx=o.px(8))
+                hits.append(dot)
+            link = o.label(links, text, "accent", host.f_small, bg="card", cursor="hand2")
+            link.pack(side="left")
+            link.bind("<Button-1>", lambda ev, fn=fn: fn(pics))
+        for w in hits:
+            w.bind("<Button-1>", lambda ev: self._add_paths(pics))
+        self._pad = (pad, title)
+        self._light_pad(False)
+
+    def _light_pad(self, on):
+        """The pad as a drag comes over the window (`on`) and goes."""
+        pad, title = getattr(self, "_pad", (None, None))
+        if pad is None or not pad.winfo_exists():
+            return
+        ring = "accent" if on else "border"
+        self.owner.skin(pad, bg="card", highlightbackground=ring, highlightcolor=ring)
+        title.config(text="Let go to add them" if on else
+                     "Drop photos or a folder here" if getattr(self, "drops", None) else
+                     "Click to choose photos")
+
+    def _dropped(self, paths, url):
+        """Files or a link let go on the window (`filedrop`): pictures and
+        folders go in as Choose photos and Choose a folder take them, a
+        picture from a web page as Paste a link does."""
+        pics = next((w[1] for w in self.widgets.values() if w[0] == "paths"), None)
+        if pics is None or not pics["grid"].winfo_exists():
+            return self.status("Make or choose a person first, then drop their photos.")
+        if url:
+            return self._add_link(pics, url)
+        if pics.get("importing"):
+            return self.status("Still importing the last photos; drop these when it finishes.")
+        self._import_paths(pics, [p for p in paths if not os.path.isdir(p)],
+                           folders=[p for p in paths if os.path.isdir(p)])
+
     def _new_photos(self, pics, mode):
         """Angles of the selected photos, or a blend of the two selected."""
         chosen = [pics["paths"][i] for i in sorted(pics["sel"])
@@ -4644,12 +4705,14 @@ class RecordEditor:
         if folder:
             self._import_paths(pics, folder=folder)
 
-    def _import_paths(self, pics, paths=(), folder=None, crop=True):
-        """Copy photos into the person's references on a worker. With `crop`
+    def _import_paths(self, pics, paths=(), folder=None, crop=True, folders=()):
+        """Copy photos into the person's references on a worker: `paths`, then
+        the pictures directly in `folder` and each of `folders`. With `crop`
         (photos from disk, not ones made here), each is first cut to the
         person's head and shoulders (`faces.crop_for_import`): a whole group
         or wedding photo teaches a LoRA the crowd."""
-        if pics.get("importing") or (not paths and not folder):
+        folders = list(folders) + ([folder] if folder else [])
+        if pics.get("importing") or (not paths and not folders):
             return
         rec = self.records[self.current]
         owner = rec.get("name") or "person"
@@ -4697,10 +4760,10 @@ class RecordEditor:
         def work():
             scratch = None
             try:
-                candidates = paths
-                if folder:
-                    with os.scandir(folder) as entries:
-                        candidates = sorted((e.path for e in entries if e.is_file()
+                candidates = list(paths)
+                for each in folders:
+                    with os.scandir(each) as entries:
+                        candidates += sorted((e.path for e in entries if e.is_file()
                             and os.path.splitext(e.name)[1].lower() in
                             (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")),
                             key=lambda p: (p.casefold(), p))
@@ -4719,9 +4782,9 @@ class RecordEditor:
             self.owner._post("call", lambda: done(result))
         self.owner.host._spawn(self.owner.s.event_id, work)
 
-    def _add_link(self, pics):
-        """A photo of the person from a link, added to the list when it has
-        come, as `_add_paths` adds a file."""
+    def _add_link(self, pics, url=None):
+        """A photo of the person from a link - asked for, or `url` (dropped)
+        - added to the list when it has come, as `_add_paths` adds a file."""
         rec = self.records[self.current]
 
         def then(path):
@@ -4730,8 +4793,10 @@ class RecordEditor:
             if path not in pics["paths"]:
                 pics["paths"].append(path)
             self._draw_paths(pics)
-        return self.owner.from_link(self.win, "person", rec.get("name") or "person", then,
-                                    self.status)
+        name = rec.get("name") or "person"
+        if url:
+            return self.owner.fetch_link(self.win, "person", name, url, then, self.status)
+        return self.owner.from_link(self.win, "person", name, then, self.status)
 
     def _link_path(self, var):
         rec = self.records[self.current]
