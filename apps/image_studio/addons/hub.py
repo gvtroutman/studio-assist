@@ -136,7 +136,11 @@ def hf_pick_file(info):
     files = []
     for s in info.get("siblings") or []:
         name = s.get("rfilename") or ""
-        if "/" in name or not name.lower().endswith(".safetensors"):
+        if not name.lower().endswith(".safetensors"):
+            continue
+        try:
+            civitai.own_name(name)     # top level only, and nothing that leaves the folder
+        except civitai.CivitAIError:
             continue
         lfs = s.get("lfs") or {}
         files.append((name, int(s.get("size") or lfs.get("size") or 0),
@@ -188,6 +192,7 @@ def _download(url, dest, sha256, size, token, say, stop, opener):
     part, h, done = dest + ".part", hashlib.sha256(), 0
     try:
         with _open(url, token, "*/*", opener) as r, open(part, "wb") as out:
+            total = civitai.promised(r)
             while True:
                 if stop is not None and stop.is_set():
                     raise HubError("Download cancelled.")
@@ -199,6 +204,11 @@ def _download(url, dest, sha256, size, token, say, stop, opener):
                 done += len(block)
                 say("Downloading %s: %d of %d MB" % (os.path.basename(dest), done >> 20,
                                                       max(size, done) >> 20))
+        # The Hub's size is exact; a stream cut off ends like a whole one.
+        short = civitai.cut_short(done, total, size, slack=0)
+        if short:
+            raise HubError("The download of %s was cut off (%s); nothing was kept. "
+                           "Try again." % (os.path.basename(dest), short))
         if sha256 and h.hexdigest() != sha256:
             raise HubError("%s arrived damaged (its SHA-256 is not the Hub's); nothing "
                            "was kept." % os.path.basename(dest))
