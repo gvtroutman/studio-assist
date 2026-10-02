@@ -29,6 +29,21 @@ class TestHeadSwapParts(unittest.TestCase):
         self.assertIs(ig.compatibility("flux2", hs.FAMILY), False)
         self.assertIs(ig.compatibility(hs.FAMILY, hs.FAMILY), True)
 
+    def test_the_distilled_9b_is_a_model_on_the_base_graph_at_its_own_count(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        backend = next(b for b in lib.all("backends") if b["id"] == "5090")
+        drawn = {}
+        for mid in ("klein-9b", "klein-9b-distilled"):
+            model = lib.get("models", mid)
+            self.assertEqual((model["family"], model["license"]), (hs.FAMILY, ig.KLEIN_LICENSE))
+            plan = ig.compose(dict(ig.default_settings(), model=mid, scene="a cat"), lib, backend)
+            self.assertEqual(plan.errors, [])
+            g = ig.fill(plan.workflow, plan.values)
+            drawn[mid] = (g["1"]["inputs"]["unet_name"], g["8"]["inputs"]["steps"],
+                          g["6"]["inputs"]["cfg"])
+        self.assertEqual(drawn, {"klein-9b": ("flux-2-klein-base-9b.safetensors", 50, 4.0),
+                                 "klein-9b-distilled": (hs.KLEIN, 4, 1.0)})
+
     def test_a_licence_is_written_into_a_png_and_nothing_else(self):
         out = ig.png_text(PNG, "Comment", "Not for commercial use.")
         self.assertEqual(out[:8], PNG[:8])

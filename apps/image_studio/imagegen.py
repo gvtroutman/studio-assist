@@ -763,7 +763,7 @@ def _default_models():
                       "scheduler": "simple", "width": 1024, "height": 1024},
          "notes": "Fast photographic model and the default: the 5090 when it has the "
                   "files, else the 3090."},
-        {"id": "klein-9b", "label": "FLUX.2 Klein 9B", "family": "flux2-klein9b",
+        {"id": "klein-9b", "label": "FLUX.2 Klein 9B base", "family": "flux2-klein9b",
          "workflow": "klein9b_base",
          "values": {"model": "flux-2-klein-base-9b.safetensors",
                     "encoder": "qwen_3_8b_fp8mixed.safetensors", "vae": "flux2-vae.safetensors"},
@@ -774,6 +774,19 @@ def _default_models():
          "notes": "The undistilled Klein 9B a Build LoRA head LoRA is trained on, so a "
                   "person's LoRA shows here. About 40 s a picture on the 5090. "
                   "Non-commercial."},
+        # The head swap's own file (`headswap.KLEIN`) on the same graph: the
+        # distilled model's 4 steps at cfg 1, where the negative does nothing.
+        {"id": "klein-9b-distilled", "label": "FLUX.2 Klein 9B distilled",
+         "family": "flux2-klein9b", "workflow": "klein9b_base",
+         "values": {"model": "flux-2-klein-9b-fp8.safetensors",
+                    "encoder": "qwen_3_8b_fp8mixed.safetensors", "vae": "flux2-vae.safetensors"},
+         "backends": {"3090": None},
+         "defaults": {"steps": 4, "guidance": 1.0, "sampler": "euler",
+                      "width": 1024, "height": 1024},
+         "license": KLEIN_LICENSE,
+         "notes": "The 4-step Klein 9B the head swap uses: a few seconds a picture, no "
+                  "negative. A head LoRA trained on the base barely shows here; use "
+                  "the base for a person's likeness. Non-commercial."},
     ]
 
 
