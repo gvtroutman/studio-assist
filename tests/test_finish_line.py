@@ -66,6 +66,106 @@ class TestFaceTargets(unittest.TestCase):
                                           [big])[0]["word"], "glasses")
         self.assertEqual(len(ig.glasses_spots(1000, 1000, [(40, 900, 30, 10)], [big])), 0)
 
+    def test_the_eye_pass_knows_whose_face_is_whose(self):
+        left, right = (100, 100, 60, 60), (700, 100, 60, 60)
+        self.assertEqual(ig.swapped_pairs(1000, 1000, [right, left], [{}, {}]),
+                         [(0, left), (1, right)])
+        # A profile whose region holds no face is skipped; the next keeps its own index.
+        self.assertEqual(ig.swapped_pairs(1000, 1000, [left, right],
+                                          [{"target_region": [0, .8, 1, 1]},
+                                           {"target_region": [.6, 0, 1, .5]}]), [(1, right)])
+
+    def test_the_eye_colour_is_read_from_a_look(self):
+        for look, colour in (("blue", "blue"), ("dark brown", "dark brown"),
+                             ("blue-grey", "blue-grey"), ("green, hooded", "green"),
+                             ("Hazel", "hazel"), ("almond-shaped", ""), ("", ""), (None, "")):
+            with self.subTest(look=look):
+                self.assertEqual(ig.eye_colour(look), colour)
+
+    def test_each_profile_takes_its_characters_eye_colour(self):
+        chars = [{"id": "c1", "identity": "a", "looks": {"eyes": "blue"}},
+                 {"id": "c2", "identity": "a", "looks": {"eyes": "green"}},
+                 {"id": "c3", "identity": "b", "looks": {"eyes": "hazel"}},
+                 {"id": "c4", "identity": "b", "looks": {"eyes": "hooded"}},
+                 {"id": "c5", "looks": {"eyes": "grey"}}]
+        lib = SimpleNamespace(all=lambda kind: chars)
+        a, b, c = {"id": "a"}, {"id": "b"}, {"id": "c"}
+        # The job's own character first; else the identity's characters when they agree.
+        self.assertEqual(ig.profile_eyes(lib, {"character": "c2"}, [a, b]), ["green", "hazel"])
+        self.assertEqual(ig.profile_eyes(lib, {}, [a, b]), ["", "hazel"])
+        # No character of it: the form's own eyes for a lone profile, nothing for two.
+        self.assertEqual(ig.profile_eyes(lib, {"eyes": "light blue"}, [c]), ["light blue"])
+        self.assertEqual(ig.profile_eyes(lib, {"eyes": "blue"}, [c, b]), ["", "hazel"])
+
+    def test_new_green_counts_only_green_the_pass_drew(self):
+        w, h = 20, 10
+        grey = bytes([90, 90, 90]) * (w * h)
+        teal = bytearray(grey)
+        green = bytearray(grey)
+        for y in range(2, 5):
+            for x in range(2, 6):            # 12 px of green in the left band
+                green[(y * w + x) * 3:(y * w + x) * 3 + 3] = bytes([60, 110, 60])
+        for x in range(12, 15):              # green already there before: not counted
+            teal[(2 * w + x) * 3:(2 * w + x) * 3 + 3] = bytes([60, 110, 60])
+            green[(2 * w + x) * 3:(2 * w + x) * 3 + 3] = bytes([60, 110, 60])
+        before, after = sc.rgb_png(bytes(teal), w, h), sc.rgb_png(bytes(green), w, h)
+        self.assertEqual(ig.new_green(before, after, w, h, [(0, 0, 10, 10), (10, 0, 10, 10)]),
+                         [12, 0])
+        self.assertIsNone(ig.new_green(before, after, w + 1, h, [(0, 0, 10, 10)]))
+        self.assertIsNone(ig.new_green(b"not a png", after, w, h, [(0, 0, 10, 10)]))
+
+    def test_an_eye_pass_with_a_green_blob_is_drawn_again(self):
+        w, h = 8, 8
+        before = sc.rgb_png(bytes([90, 90, 90]) * (w * h), w, h)
+
+        def blob(n):                         # a picture with n px of new green
+            rgb = bytearray([90, 90, 90]) * (w * h)
+            for i in range(n):
+                rgb[i * 3:i * 3 + 3] = bytes([60, 110, 60])
+            return sc.rgb_png(bytes(rgb), w, h)
+
+        def tries(greens, fail_at=None, bands=((0, 0, w, h),)):
+            job = SimpleNamespace(passes=[], notes=[])
+            seeds = []
+
+            def run(reseed):
+                if len(seeds) == fail_at:
+                    job.passes.append({"label": "Eye pass", "seed": reseed})
+                    raise ig.ComfyError("the run failed")
+                seeds.append(reseed)
+                job.passes.append({"label": "Eye pass", "seed": reseed})
+                return [{"filename": "eyes_%d.png" % len(seeds)}]
+            client = SimpleNamespace(fetch=lambda f: blob(greens[int(f["filename"][5]) - 1]))
+            kept = ig.Studio._eye_tries(None, job, client, run, before, w, h, list(bands))
+            return kept, seeds, job
+
+        old = ig.EYE_GREEN_MAX
+        ig.EYE_GREEN_MAX = 20
+        try:
+            # Clean at once: one try, nothing said.
+            kept, seeds, job = tries([3])
+            self.assertEqual((kept[0]["filename"], seeds, job.notes), ("eyes_1.png", [0], []))
+            # A blob, then clean: the second kept, and only its graph in the record.
+            kept, seeds, job = tries([40, 2])
+            self.assertEqual(kept[0]["filename"], "eyes_2.png")
+            self.assertEqual(seeds, [0, ig.EYE_RESEED])
+            self.assertEqual([p["seed"] for p in job.passes], [ig.EYE_RESEED])
+            self.assertIn("2 tries, the one with none kept", job.notes[0])
+            # Blobs every time: EYE_TRIES, the least kept.
+            kept, seeds, job = tries([40, 25, 33])
+            self.assertEqual((kept[0]["filename"], len(seeds)), ("eyes_2.png", ig.EYE_TRIES))
+            self.assertEqual(len(job.passes), 1)
+            self.assertIn("the least (25 px)", job.notes[0])
+            # A second try that fails keeps the first, and no graph of the failed one.
+            kept, seeds, job = tries([40], fail_at=1)
+            self.assertEqual((kept[0]["filename"], [p["seed"] for p in job.passes]),
+                             ("eyes_1.png", [0]))
+            # Eyes meant green (no bands to look at): one try, never fetched.
+            kept, seeds, job = tries([40], bands=())
+            self.assertEqual(seeds, [0])
+        finally:
+            ig.EYE_GREEN_MAX = old
+
     def test_same_identity_can_appear_at_two_scene_positions(self):
         lib = SimpleNamespace(get=lambda *_: {"id": "a", "name": "A", "references": ["a.png"]})
         selected = ff.selected(lib, {"scene_faces": {"people": [
@@ -197,6 +297,23 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertEqual(client.graphs[-1]["fc1_s0"]["inputs"]["text"], ig.EYE_WORD)
         self.assertIn("SAM3 found no glasses on the swapped face.", job.record["notes"])
         self.assertIn("SAM3 found no hands, so no hands pass was made.", job.record["notes"])
+
+    def test_the_eye_pass_is_told_the_persons_eye_colour(self):
+        self.studio.lib.save('characters', [{'id': 'c1', 'name': 'C', 'identity': 'person',
+                                             'looks': {'eyes': 'blue'}}])
+        job, client, _ = self.finish_job([])
+        self.assertEqual(job.status, 'complete', job.detail)
+        eyes = client.graphs[-1]
+        said = eyes[eyes["fc1_4"]["inputs"]["positive"][0]]["inputs"]["text"]
+        self.assertIn("round blue irises", said)
+        self.assertIn("Eye pass told the eye colour: Person blue.", job.record["notes"])
+        # No colour known: the eye pass as it was, and nothing said of it.
+        self.studio.lib.save('characters', [])
+        job, client, _ = self.finish_job([])
+        eyes = client.graphs[-1]
+        said = eyes[eyes["fc1_4"]["inputs"]["positive"][0]]["inputs"]["text"]
+        self.assertIn(ig.EYE_WHAT, said)
+        self.assertFalse(any(n.startswith("Eye pass told") for n in job.record["notes"]))
 
     def test_the_hands_are_redrawn_after_the_eyes_and_before_the_glasses(self):
         job, client, _ = self.finish_job([(460, 272, 60, 22)],

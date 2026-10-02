@@ -1962,6 +1962,24 @@ EYE_BAND = (0.15, 0.6)                # the eyes' rows, of the face box's height
 EYE_DENOISE = 0.5
 EYE_WHAT = ("clear, detailed eyes with round irises, dark pupils and lashes, both looking "
             "the same way")
+# Told no colour, the eye pass drew blue eyes brown (2 of 5 in the GFPGAN
+# trial; 4 of 4 seeds in a replay, 2026-10-02). Told the colour of the
+# person's character's "eyes" look (`profile_eyes`), blue on 4 of 4.
+EYE_COLOURED = ("clear, detailed eyes with round %s irises, dark pupils and lashes, both "
+                "looking the same way")
+EYE_COLOURS = ("brown", "hazel", "amber", "green", "blue", "grey", "gray", "black", "violet")
+EYE_SHADES = ("dark", "light", "pale", "deep", "bright", "ice", "steel", "warm")
+# Green eye makeup in a person's photos, carried by the head swap and
+# smeared into the eye by FaceFusion, came back from the eye pass as a
+# blocky green blob over the iris (one picture, 6 runs of 2026-09-29/30), on
+# 3 of 6 seeds. So the pass is looked at (`new_green`) and drawn again on
+# another seed while a face's eye band has a blob, the try with the least
+# kept. Not for eyes said green or hazel, whose iris is meant to be green.
+EYE_GREEN_LIFT = 15                   # green over red and blue by this, where it was 5 or less
+EYE_GREEN_MAX = 12                    # px of new green in a band: a blob (blobs 20-106, clean 0-8)
+EYE_TRIES = 3                         # eye passes at most, each try's seeds EYE_RESEED apart
+EYE_RESEED = 7919
+EYE_GREEN_OK = ("green", "hazel")
 # Live on Partner (2026-09-26): at 0.6, "glasses with ... clear lenses" came
 # back with crisp frames but milky lenses over the eyes just drawn; 0.45
 # and the lenses said to be glare-free kept the eyes seen through them.
@@ -2290,11 +2308,12 @@ def real_hands(width, height, boxes):
     return kept
 
 
-def swapped_faces(width, height, boxes, profiles):
-    """The faces (x, y, w, h) FaceFusion swapped for `profiles`, chosen as
-    it chooses them (studio_facefusion.target_face over the faces left to
-    right). One profile falls back to the biggest face when SAM3 sees more
-    faces than FaceFusion did."""
+def swapped_pairs(width, height, boxes, profiles):
+    """[(index into `profiles`, (x, y, w, h))]: the faces FaceFusion swapped
+    for `profiles`, chosen as it chooses them (studio_facefusion.target_face
+    over the faces left to right), each once, with whose it is. One profile
+    falls back to the biggest face when SAM3 sees more faces than FaceFusion
+    did."""
     import apps.image_studio.facefusion as facefusion
     order = sorted(boxes, key=lambda b: b[0])
     norm = [[x / float(width), y / float(height), (x + w) / float(width), (y + h) / float(height)]
@@ -2310,8 +2329,68 @@ def swapped_faces(width, height, boxes, profiles):
             if len(profiles) != 1 or not order:
                 continue
             k = order.index(max(order, key=lambda b: b[2] * b[3]))
-        if order[k] not in out:
-            out.append(order[k])
+        if order[k] not in [b for _, b in out]:
+            out.append((i, order[k]))
+    return out
+
+
+def swapped_faces(width, height, boxes, profiles):
+    """The faces (x, y, w, h) FaceFusion swapped for `profiles`
+    (`swapped_pairs` without whose)."""
+    return [b for _, b in swapped_pairs(width, height, boxes, profiles)]
+
+
+def eye_colour(text):
+    """The colour a character's "eyes" look names - "blue", "dark brown",
+    "blue-grey" - or "" for one that names none ("almond-shaped")."""
+    words = re.findall(r"[a-z]+(?:-[a-z]+)*", str(text or "").lower())
+    for i, w in enumerate(words):
+        if any(part in EYE_COLOURS for part in w.split("-")):
+            return (words[i - 1] + " " + w) if i and words[i - 1] in EYE_SHADES else w
+    return ""
+
+
+def profile_eyes(lib, settings, profiles):
+    """Each of `profiles`' eye colour ("" when unknown), from the characters
+    that are that identity: the job's own character when it is one of them,
+    else all of them when they agree. A lone profile no character is of
+    takes the form's own "eyes"."""
+    chars = [c for c in lib.all("characters") if c.get("identity")]
+    out = []
+    for p in profiles:
+        mine = [c for c in chars if c["identity"] == p.get("id")]
+        own = [c for c in mine if c.get("id") == settings.get("character")]
+        said = {eye_colour((c.get("looks") or {}).get("eyes")) for c in (own or mine)} - {""}
+        if not mine and len(profiles) == 1:
+            said = {eye_colour(settings.get("eyes"))} - {""}
+        out.append(said.pop() if len(said) == 1 else "")
+    return out
+
+
+def new_green(before, after, width, height, bands):
+    """Per eye band (x, y, w, h): the pixels of `after` green over red and
+    blue by EYE_GREEN_LIFT that were not green (5 or less) in `before` - both
+    PNG bytes of the whole picture. None when either will not read at
+    `width` x `height`: nothing is checked."""
+    import struct
+    import zlib
+    import core.icons as studio_icons
+    try:
+        a, aw, ah = studio_icons.png_to_rgba(after)
+        b, bw, bh = studio_icons.png_to_rgba(before)
+    except (ValueError, KeyError, IndexError, zlib.error, struct.error):
+        return None
+    if (aw, ah) != (width, height) or (bw, bh) != (width, height):
+        return None
+    out = []
+    for x, y, w, h in bands:
+        n = 0
+        for row in range(max(0, y), min(height, y + h)):
+            for i in range(4 * (row * width + max(0, x)), 4 * (row * width + min(width, x + w)), 4):
+                if (a[i + 1] - max(a[i], a[i + 2]) > EYE_GREEN_LIFT
+                        and b[i + 1] - max(b[i], b[i + 2]) <= 5):
+                    n += 1
+        out.append(n)
     return out
 
 
@@ -7200,8 +7279,10 @@ class Studio:
     def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
         """The end of Generate, on the lane's thread, by the fix machinery on
         the picture's own model: after FaceFusion (`profiles`) each swapped
-        face's eyes (EYE_WHAT) - unless a face enhancer sharpened them
-        (`eye_pass`); then each beard a Scene Builder person was given,
+        face's eyes (EYE_WHAT, or EYE_COLOURED with the colour of their
+        character's eyes, `profile_eyes`; drawn again on another seed while
+        an iris has a green blob, `_eye_tries`) - unless a face enhancer
+        sharpened them (`eye_pass`); then each beard a Scene Builder person was given,
         inside the scene's own beard mask (`beard_regions`, `beard_spots`;
         fitted to the drawn face and bounded by its landmarks when
         LANDMARK_NODE reads them, `_drawn_landmarks`, `shape_beard`;
@@ -7256,6 +7337,7 @@ class Studio:
         looking = (["eyes"] if eyes else []) + (["face"] if beards and not eyes else []) + (
             ["hands"] if hands else []) + (["glasses"] if specs else [])
         v = dict(values, sam3=sam, match_tone=None)
+        colours = profile_eyes(self.lib, job.settings, profiles) if eyes else []
         # A hand keeps the picture's grade; a swapped face gets no curves,
         # which posterize its skin.
         hand_tone = FIX_TONE if TONE_NODE in types else None
@@ -7285,14 +7367,25 @@ class Studio:
                     continue
                 width, height, boxes = said
                 passes, faces, found_hands, glasses, bearded = [], [], [], [], []
+                checked = []                          # the eye bands looked at for a green blob
                 if eyes or specs:
-                    faces = swapped_faces(width, height,
+                    pairs = swapped_pairs(width, height,
                                           [x[:4] for x in boxes if x[4] == "face"], profiles)
+                    faces = [box for _, box in pairs]
                     if faces and eyes:
                         spots = eye_spots(faces)
+                        said = [colours[i] for i, _ in pairs]
+                        checked = [sp["box"] for sp, c in zip(spots, said)
+                                   if not any(w in c for w in EYE_GREEN_OK)]
+                        if any(said):
+                            job.notes.append("Eye pass told the eye colour: %s." % ", ".join(
+                                "%s %s" % (profiles[i].get("name") or "the person", colours[i])
+                                for i, _ in pairs if colours[i]))
                         passes.append(("Eye pass", fix_areas(fix_crops(width, height, spots),
                                                              spots),
-                                       EYE_DENOISE, EYE_WHAT, "_eyes", None, None))
+                                       EYE_DENOISE, EYE_WHAT, "_eyes", None,
+                                       [{"prompt": FIX_PROMPT % (EYE_COLOURED % c)} if c else {}
+                                        for c in said]))
                     elif not faces:
                         job.notes.append("SAM3 found no swapped face, so no %s pass was made."
                                          % ("eye or glasses" if eyes and specs else
@@ -7338,13 +7431,17 @@ class Studio:
                         job.notes.append("SAM3 found no glasses on the swapped face.")
                 done = None
                 for label, crops, denoise, what, tag, tone, who in passes:
-                    graph = face_graph(plan.workflow, dict(v, face_prompt=FIX_PROMPT % what,
-                                                           face_denoise=denoise,
-                                                           match_tone=tone),
-                                       plan.loras, image, crops, oval,
-                                       values["filename_prefix"] + tag, faces=who)
-                    files = self._run_pass(job, client, graph, say, label,
-                                           status=tag.lstrip("_"))
+                    def run(reseed, image=image, crops=crops, denoise=denoise, what=what,
+                            tag=tag, tone=tone, who=who, label=label):
+                        graph = face_graph(plan.workflow, dict(
+                            v, seed=int(v["seed"]) + reseed, face_prompt=FIX_PROMPT % what,
+                            face_denoise=denoise, match_tone=tone), plan.loras, image, crops,
+                            oval, values["filename_prefix"] + tag, faces=who)
+                        return self._run_pass(job, client, graph, say, label,
+                                              status=tag.lstrip("_"))
+                    # The eye pass is the first, so what it redrew is `data`.
+                    files = (self._eye_tries(job, client, run, data, width, height, checked)
+                             if tag == "_eyes" else run(0))
                     if files is None:     # cancelled: keep what is finished
                         break
                     done = files[0]
@@ -7390,6 +7487,48 @@ class Studio:
                 else "the picture is kept as it was before it"))
             return out + pictures[len(out):]
         return out
+
+    def _eye_tries(self, job, client, run, before, width, height, bands):
+        """The eye pass (`run(seed offset)` -> files, or None if cancelled),
+        drawn again on another seed while one of `bands` came back with a
+        green blob over the iris (`new_green` over EYE_GREEN_MAX), at most
+        EYE_TRIES in all; the try with the least green is kept, and only its
+        graph stays in `job.passes`. A try after the first that fails or is
+        cancelled leaves the best before it. Not looked at when there are no
+        `bands` or the pictures will not read. -> the files kept."""
+        files = run(0)
+        if files is None or not bands:
+            return files
+        tries = []                            # (worst band's green, files, its job.passes index)
+        while True:
+            try:
+                green = new_green(before, client.fetch(files[0]), width, height, bands)
+            except ComfyError:
+                green = None
+            if green is None:
+                return files
+            tries.append((max(green), files, len(job.passes) - 1))
+            if tries[-1][0] <= EYE_GREEN_MAX or len(tries) == EYE_TRIES:
+                break
+            at = len(job.passes)
+            try:
+                files = run(len(tries) * EYE_RESEED)
+            except ComfyError:
+                files = None
+            if files is None:                 # cancelled or failed: keep the best so far
+                del job.passes[at:]
+                break
+        best = min(tries, key=lambda t: t[0])
+        for _, _, at in sorted(tries, key=lambda t: -t[2]):
+            if at != best[2]:
+                del job.passes[at]
+        if len(tries) > 1:
+            job.notes.append("Eye pass: a green blob over an iris (%d px), so it was drawn "
+                             "again on another seed - %d tries, the one with %s kept."
+                             % (tries[0][0], len(tries),
+                                "none" if best[0] <= EYE_GREEN_MAX else
+                                "the least (%d px)" % best[0]))
+        return best[1]
 
     def _outline_masks(self, job, client, crops, tag):
         """Each crop with a freehand outline gets `shape`: the outline drawn
