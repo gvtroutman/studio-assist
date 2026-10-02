@@ -88,7 +88,8 @@ After Effects and Resolve use outside npm servers.
 - **The refine pass** - `zimage_hq.json` (`refine_model`, nodes 42-49) and the
   block after "A refine pass is sized" in `imagegen.compose`. AGENTS.md "The Z-Image
   refine pass enlarges with an upscale model".
-- **The finish** - `Studio._finish_passes`: `eye_pass`, the beard pass
+- **The finish** - `Studio._before_faces` (head swap, then the beard pass, before
+  FaceFusion) and `Studio._finish_passes` (`stage`): `eye_pass`, the beard pass
   (`beard_regions`, `beard_spots`, `beard_shape_png`; bounded by the drawn face's
   landmarks: `Studio._drawn_landmarks`, `landmarks_graph`, `shape_beard`,
   `beard_zones`, node `StudioFaceLandmarks` in `comfy_nodes/studio_facepaste`), `hand_pass`, `real_hands`,

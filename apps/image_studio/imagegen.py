@@ -1998,8 +1998,10 @@ GLASSES_WHAT = ("thin metal glasses frames with perfectly clear, transparent len
 # scene's jaw puts it (scene.beard_masks -> character_regions "facial_hair").
 # The head swap and FaceFusion then redraw that face from a photo, which can
 # shave it or bring the photo's beard instead. So a beard pass follows the
-# swap: only inside the scene's mask, in that beard's own words
-# (2026-10-02: scene render -> identity pass -> beard pass -> final). Live on
+# head swap: only inside the scene's mask, in that beard's own words. It
+# runs before the face swap (2026-10-02, the user: "the beard pass must be
+# running prior to the face swap"): scene render -> head swap -> beard pass ->
+# face swap -> eyes, hands, glasses (`Studio._before_faces`). Live on
 # the 5090 (2026-10-02, the sitter's head swap shaving a drawn beard, Z-Image
 # Turbo): 0.5 gave back a shadow, 0.85 a fuller beard that paled the jaw's
 # skin and left a painted edge on the neck; 0.7 a natural close-cropped beard.
@@ -4232,6 +4234,14 @@ SLIDER_SECTION = "Body"
 # does not keep these, and choosing one leaves them as they are.
 PER_PICTURE = ("expression", "gaze")
 CHARACTER_KEYS = [k for k in SLOTS if k not in PER_PICTURE] + [k for k, _, _ in SLIDERS]
+# Who the person is: set in the character creator alone (2026-10-02, the
+# user: the person page's look "should be hidden so it doesn't mess up the
+# variables"). The People tab does not show these sections, and a Scene
+# Builder person with a character takes them from the character as it is
+# now (scene.follow_character), not as it was when it was chosen.
+WHO_SECTIONS = ("Body", "Face", "Hair")
+WHO_KEYS = [k for name, slots in LOOKS if name in WHO_SECTIONS
+            for k, *_ in slots] + SLIDER_KEYS
 # What a clothes preset (the `outfits` library) holds: the Clothes and
 # Accessories sections' slots.
 OUTFIT_KEYS = [k for name, slots in LOOKS if name in ("Clothes", "Accessories")
@@ -5601,13 +5611,16 @@ def pipeline_stages(lib, settings):
             stages.append(("items", "Item pass"))
     profiles = (finish.get("profiles") or [] if settings.get("mode") == "faces"
                 else facefusion.selected(lib, settings))
+    beard = whole and beard_regions(settings)
     if profiles or swap_only:
         if whole and settings.get("head_swap", True) is not False:
             stages.append(("head_swap", "Head swap"))
+        if beard:                             # before the face swap (Studio._before_faces)
+            stages.append(("beard", "Beard pass"))
         stages.append(("face_swap", "Face swap"))
         if whole and eye_pass():
             stages.append(("eyes", "Eye pass"))
-    if whole and beard_regions(settings):
+    elif beard:
         stages.append(("beard", "Beard pass"))
     if whole and hand_pass(settings):
         stages.append(("hands", "Hand pass"))
@@ -6830,11 +6843,13 @@ class Studio:
         if profiles:
             pictures = self.finish_profiles(
                 job, graph, pictures, profiles, say,
-                before=lambda made: self._head_swap(job, client, values, made, profiles, say))
+                before=lambda made: self._before_faces(job, client, plan, values, made,
+                                                       profiles, say))
             if pictures is None:
                 return
         if not plan.workflow.get("multi_identity"):
-            pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+            pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say,
+                                           stage="rest" if profiles else "all")
         # Last, on the picture as it is kept: notes, never a redraw.
         if job.settings.get("critic_notes") and pictures and not job.cancel.is_set():
             self._take_notes(job, plan, pictures, say)
@@ -6888,6 +6903,17 @@ class Studio:
         if checkpoint and checkpoint.get("finish"):
             checkpoint["finish"].update(state="complete", results=list(job.outputs))
             self._update_checkpoint(checkpoint)
+
+    def _before_faces(self, job, client, plan, values, pictures, profiles, say):
+        """What runs between the kept picture and FaceFusion, on the lane's
+        thread: the head swap, then the beard pass on the swapped head
+        (`_finish_passes`, stage "beard"), so the face swap comes after the
+        beard is back. -> the pictures."""
+        pictures = self._head_swap(job, client, values, pictures, profiles, say)
+        if job.cancel.is_set() or plan.workflow.get("multi_identity"):
+            return pictures
+        return self._finish_passes(job, client, plan, values, pictures, profiles, say,
+                                   stage="beard")
 
     def _head_swap(self, job, client, values, pictures, profiles, say):
         """Before the face swap, on the lane's thread: each profile's whole
@@ -7149,8 +7175,8 @@ class Studio:
                     return (client, plan, values), ""
             except (ComfyError, TemplateError, OSError) as e:
                 why = str(e).rstrip(".")
-        why = ("This retry swapped the face alone - no head swap before it and no eye, hand "
-               "or glasses pass after: %s." % why)
+        why = ("This retry swapped the face alone - no head swap or beard pass before it and "
+               "no eye, hand or glasses pass after: %s." % why)
         job.notes.append(why)
         return None, why
 
@@ -7191,13 +7217,15 @@ class Studio:
             client, plan, values = comfy
             job.plan = plan               # the record is the picture's own, not a swap's
             graph = (checkpoint or {}).get("graph")
-            before = lambda made: self._head_swap(job, client, values, made, profiles, say)
+            before = lambda made: self._before_faces(job, client, plan, values, made,
+                                                     profiles, say)
         pictures = self.finish_profiles(job, graph, pictures, profiles, say, checkpoint,
                                         before=before)
         if pictures is None:
             return
         if comfy and not plan.workflow.get("multi_identity"):
-            pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say)
+            pictures = self._finish_passes(job, client, plan, values, pictures, profiles, say,
+                                           stage="rest")
         record = self.record_for(job, graph)
         record["fix"] = fix
         if comfy:
@@ -7276,9 +7304,12 @@ class Studio:
                              "nothing about the face." % LANDMARK_NODE)
         return drawn
 
-    def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
+    def _finish_passes(self, job, client, plan, values, pictures, profiles, say, stage="all"):
         """The end of Generate, on the lane's thread, by the fix machinery on
-        the picture's own model: after FaceFusion (`profiles`) each swapped
+        the picture's own model. `stage` "beard" is the beard pass alone,
+        which `_before_faces` runs before FaceFusion; "rest" is every pass
+        but the beard, after it; "all" (no face swap) is every pass.
+        After FaceFusion (`profiles`) each swapped
         face's eyes (EYE_WHAT, or EYE_COLOURED with the colour of their
         character's eyes, `profile_eyes`; drawn again on another seed while
         an iris has a green blob, `_eye_tries`) - unless a face enhancer
@@ -7294,24 +7325,27 @@ class Studio:
         painted over them (`glasses_pass`).
         -> the pictures; those given when a pass cannot run, fails or is
         cancelled - the picture is never lost to its finish."""
-        hands = hand_pass(job.settings)
-        if job.settings.get("hand_pass", True) is not False and not hands:
+        rest = stage != "beard"
+        hands = rest and hand_pass(job.settings)
+        if rest and job.settings.get("hand_pass", True) is not False and not hands:
             job.notes.append("No hands pass: the picture's words name no person.")
-        eyes = bool(profiles) and eye_pass(job.facefusion)
-        if profiles and not eyes:
+        eyes = rest and bool(profiles) and eye_pass(job.facefusion)
+        if rest and profiles and not eyes:
             job.notes.append("No eye pass: the face enhancer sharpened the eyes after the "
                              "face swap.")
-        specs = bool(profiles) and glasses_pass(job.settings, job.facefusion)
-        if profiles and not specs and job.settings.get("glasses_pass") is not False:
+        specs = rest and bool(profiles) and glasses_pass(job.settings, job.facefusion)
+        if rest and profiles and not specs and job.settings.get("glasses_pass") is not False:
             job.notes.append("No glasses pass: the face swap went behind what was in front "
                              "of the face, so glasses are as they were drawn.")
-        beards = beard_regions(job.settings)
+        beards = beard_regions(job.settings) if stage != "rest" else []
         if not eyes and not specs and not hands and not beards:
             return pictures
         kinds = (["eye"] if eyes else []) + (["beard"] if beards else []) + (
             ["hands"] if hands else []) + (["glasses"] if specs else [])
         named = "%s pass%s" % (", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1
-                               else kinds[0], " after the face swap" if profiles else "")
+                               else kinds[0], "" if not profiles else
+                               " before the face swap" if stage == "beard" else
+                               " after the face swap")
         b = job.backend
         sam = self.sam3_on(b)
         why, types = "", set()
@@ -7450,8 +7484,10 @@ class Studio:
                     count, said = {
                         "_eyes": (len(faces), "Eye pass after the face swap: %d face%s, "
                                               "denoise %s."),
-                        "_beard": (len(bearded), "Beard pass: %d beard%s redrawn in its "
-                                                 "mask, denoise %s."),
+                        "_beard": (len(bearded), "Beard pass%s: %%d beard%%s redrawn in its "
+                                                 "mask, denoise %%s." % (
+                                                     " before the face swap" if profiles
+                                                     else "")),
                         "_hands": (len(found_hands), "Hands pass: %d hand%s redrawn, "
                                                      "denoise %s."),
                         "_glasses": (len(glasses), "Glasses redrawn last: %d pair%s, "

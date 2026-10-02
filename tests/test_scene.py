@@ -1575,6 +1575,36 @@ class TestWords(unittest.TestCase):
         self.assertNotIn("subject", props)                   # no people: the form's stays
         self.assertNotIn("scene_identities", props)
 
+    def test_a_character_is_said_as_it_is_now_not_as_the_scene_copied_it(self):
+        # 2026-10-02: the scene's copy said "in their 20s, light stubble" while
+        # the character had been changed to "in their 30s, heavy stubble".
+        from apps.image_studio.scene import beard
+        s = staged("person")
+        s["objects"][0].update(character="sitter", name="Chef", look={
+            "subject": "a man", "age": "in their 20s", "facial_hair": "light stubble",
+            "hair": "dark brown", "expression": "thoughtful", "top": "white chef jacket"})
+        chars = {"sitter": {"id": "sitter", "identity": "", "item_refs": {}, "looks": {
+            "subject": "a man", "age": "in their 30s", "facial_hair": "heavy stubble",
+            "hair": "dark brown", "hair_style": "short"}}}
+        words, _ = sc.generation(s, {}, chars)
+        self.assertIn("in their 30s", words.text)
+        self.assertIn("dense stubble", words.text)
+        self.assertNotIn("in their 20s", words.text)
+        self.assertIn("thoughtful", words.text)               # the scene's own stays
+        self.assertIn("white chef jacket", words.text)
+        self.assertEqual(s["objects"][0]["look"]["age"], "in their 20s")  # a copy was said
+        # In the scene itself: who they are follows, the rest stays.
+        self.assertEqual(sc.follow_characters(s, chars), ["Chef"])
+        look = s["objects"][0]["look"]
+        self.assertEqual((look["age"], look["hair_style"], look["top"], look["expression"]),
+                         ("in their 30s", "short", "white chef jacket", "thoughtful"))
+        self.assertEqual(look["beard"], beard.from_words("heavy stubble"))
+        self.assertEqual(sc.follow_characters(s, chars), [])          # nothing left to change
+        self.assertEqual(sc.follow_characters(s, {}), [])             # gone: left as it is
+        # Words that are not a pick stay words, with no beard region.
+        self.assertIsNone(beard.from_words("a ginger handlebar"))
+        self.assertEqual(beard.from_words("Clean-shaven")["style"], "none")
+
     def test_generation_carries_size_strengths_and_the_scene(self):
         s = staged("person")
         s["frame"], s["pose_strength"], s["depth_strength"] = "landscape", 0.7, 0.4
@@ -2605,6 +2635,51 @@ class TestSceneBuilderWindow(unittest.TestCase):
                                           "weight": -1, "expression": "shy"})
         sb._clear_look()
         self.assertEqual((second["look"], second["character"]), ({}, ""))
+        ui.studio.lib.save("characters", [])
+
+    def test_a_characters_body_face_and_hair_are_the_creators_alone(self):
+        from apps.image_studio.scene import beard
+        ui, sb = self.builder()
+        ui.studio.lib.save("characters", [{"id": "sitter", "name": "Sitter", "identity": "",
+                                           "looks": {"subject": "a man", "age": "in their 20s",
+                                                     "facial_hair": "light stubble"}}])
+        person = sb.add("person")
+        sb._set_character("sitter")
+        self.assertEqual(person["look"]["beard"], beard.from_words("light stubble"))
+
+        def shown():
+            out = []
+            def walk(w):
+                for c in w.winfo_children():
+                    if hasattr(c, "paint"):
+                        out.append(c.cget("text"))
+                    walk(c)
+            walk(sb.panel)
+            return out
+        sb._look_tab("Face")                          # hidden: Expression instead
+        for hidden in ig.WHO_SECTIONS:
+            self.assertNotIn(hidden, shown())
+        self.assertIn("Clothes", shown())
+        self.assertIn("gaze", sb.look_vars)
+        self.assertNotIn("facial_hair", sb.look_vars)
+        sb.look_vars["gaze"].set("looking down")
+        sb.look_changed()
+        person["look"]["top"] = "chef jacket"
+
+        # Changed in the creator: the scene's person follows, the scene's own stays.
+        ui.studio.lib.save("characters", [{"id": "sitter", "name": "Sitter", "identity": "",
+                                           "looks": {"subject": "a man", "age": "in their 30s",
+                                                     "facial_hair": "heavy stubble"}}])
+        ui._saved("characters")
+        self.assertEqual(person["look"]["age"], "in their 30s")
+        self.assertEqual(person["look"]["beard"], beard.from_words("heavy stubble"))
+        self.assertEqual((person["look"]["gaze"], person["look"]["top"]),
+                         ("looking down", "chef jacket"))
+        self.assertIn("in their 30s", sb.words_label.cget("text"))
+        self.assertNotIn("in their 20s", sb.words_label.cget("text"))
+        # No character: every section is the scene's again.
+        sb._set_character("")
+        self.assertIn("Face", shown())
         ui.studio.lib.save("characters", [])
 
     def test_structured_beard_controls_edit_and_restore_a_person(self):
