@@ -1988,6 +1988,26 @@ BEARD_WHAT = "a natural beard"        # each beard is said in its own words inst
 BEARD_PAD = 1.8                       # the crop, of the beard's longer side: the jaw round it
 BEARD_ON_FACE = 0.25                  # how far round a found face a beard's middle may be
 BEARD_SHAPE = 256                     # px: the most a side of the mask picture is drawn at
+# The drawn face's own landmarks bound each beard (2026-10-02, Sitter): the
+# jaw and chin its lower edge, the lips kept clear, the upper lip the
+# moustache's place, the nose its upper edge, the cheeks the beard's upper
+# line. LANDMARK_NODE (comfy_nodes/studio_facepaste) reads the face's 68
+# points, numbered as the scene's face dots are (iBUG): `shape_beard`. None of
+# the numbers below has been measured live yet.
+LANDMARK_NODE = "StudioFaceLandmarks"
+JAW_POINTS = 17                       # iBUG 0-16: the jaw, the person's right ear to left
+NOSE_BASE = (31, 32, 33, 34, 35)      # the nostrils, right wing to left
+LIP_TOP = (48, 49, 50, 51, 52, 53, 54)       # the upper lip's edge, right corner to left
+LIPS = tuple(range(48, 60))           # the outer lips
+LOWER_FACE = tuple(range(JAW_POINTS)) + NOSE_BASE + LIPS   # what the scene's dots are fitted on
+BEARD_BELOW = (0.02, 0.30)            # how far below the jaw a beard may reach, of the face's
+                                      # height (bridge to chin): at length 0 and at length 1
+LIP_CLEAR = 0.035                     # the lips' clear zone grows by this, of the face's height
+FIT_SCALE = (0.75, 1.33)              # the drawn face to the scene's, beyond which the scene's
+FIT_TURN = 20                         # mask is no guide (degrees)
+FIT_SHAPE = 0.15                      # mean miss left after fitting, of the face's height
+FAR_SIDE = 0.5                        # a cheek this much narrower than the other is turned away:
+                                      # it is only trimmed, never filled
 HAND_FIND = "hand:8"
 HAND_DENOISE = 0.4
 HAND_WHAT = ("a natural, relaxed human hand with four fingers and a thumb, each finger "
@@ -2325,32 +2345,50 @@ def beard_regions(settings):
             and r.get("mask_path") and os.path.isfile(r["mask_path"])]
 
 
-def beard_spots(width, height, regions, faces):
+def _mask_box(grey, mw, mh):
+    """(x0, y0, x1, y1), inclusive, of a grey mask's pixels at 128 or more;
+    None when it has none."""
+    rows = [y for y in range(mh) if max(grey[y * mw:(y + 1) * mw]) >= 128]
+    if not rows:
+        return None
+    cols = [x for x in range(mw) if max(grey[x::mw]) >= 128]
+    return cols[0], rows[0], cols[-1], rows[-1]
+
+
+def beard_spots(width, height, regions, faces, drawn=None):
     """Each beard region -> a spot on the width x height picture: its mask's
     box scaled from the scene's frame, the square round it BEARD_PAD times
     its longer side, its words (`prompt`) and its mask (`mask`: grey bytes,
     width, height). Only a beard whose middle is on one of `faces` (x, y,
     w, h; SAM3's, grown by BEARD_ON_FACE): a drawn head the pose did not put
     where the scene did gets no beard on its neck or the wall beside it.
-    -> (spots, how many were off every face)."""
+    With `drawn` (the faces LANDMARK_NODE read), a region that carries the
+    scene's face dots has its mask fitted to the drawn face and bounded by
+    its landmarks first (`shape_beard`).
+    -> (spots, how many were off every face, what the fitting did: words)."""
     import struct
     import zlib
     import core.icons as studio_icons
-    spots, off = [], 0
-    for r in regions:
+    from apps.image_studio.scene import beard as scene_beard
+    spots, off, said = [], 0, []
+    for n, r in enumerate(regions, 1):
         try:
             with open(r["mask_path"], "rb") as fh:
                 rgba, mw, mh = studio_icons.png_to_rgba(fh.read())
         except (OSError, ValueError, KeyError, IndexError, zlib.error, struct.error):
             continue
         grey = bytes(rgba[0::4])
-        rows = [y for y in range(mh) if max(grey[y * mw:(y + 1) * mw]) >= 128]
-        if not rows:
+        look = scene_beard.clean(r.get("beard"))
+        if (drawn is not None and len(r.get("face_dots") or []) == 68
+                and look and look["style"] != "none"):
+            grey, words = shape_beard(grey, mw, mh, dict(r, beard=look), drawn, width, height)
+            said.append("Beard %d %s." % (n, words))
+        box = _mask_box(grey, mw, mh)
+        if box is None:
             continue
-        cols = [x for x in range(mw) if max(grey[x::mw]) >= 128]
         kx, ky = width / float(mw), height / float(mh)
-        x0, y0 = cols[0] * kx, rows[0] * ky
-        bw, bh = (cols[-1] + 1) * kx - x0, (rows[-1] + 1) * ky - y0
+        x0, y0 = box[0] * kx, box[1] * ky
+        bw, bh = (box[2] + 1) * kx - x0, (box[3] + 1) * ky - y0
         cx, cy = x0 + bw / 2.0, y0 + bh / 2.0
 
         def on(f):
@@ -2363,7 +2401,7 @@ def beard_spots(width, height, regions, faces):
                       "size": int(min(max(FIX_MIN, max(bw, bh) * BEARD_PAD), width, height)),
                       "box": [int(x0), int(y0), int(bw), int(bh)],
                       "prompt": r["prompt"], "mask": (grey, mw, mh)})
-    return spots, off
+    return spots, off, said
 
 
 def beard_shape_png(spot, crop, width, height):
@@ -2382,6 +2420,223 @@ def beard_shape_png(spot, crop, width, height):
             g = grey[my * mw + mx]
             px[(v * n + u) * 4:(v * n + u) * 4 + 4] = bytes((g, g, g, 255))
     return studio_icons.png(bytes(px), n, n)
+
+
+def landmarks_graph(image, boxes):
+    """LANDMARK_NODE asked for the drawn face at each of `boxes` (x, y, w, h)
+    in `image` (a LoadImage name); its answer is read by `landmarks_found`."""
+    return {"li": {"class_type": "LoadImage", "inputs": {"image": image}},
+            "ll": {"class_type": LANDMARK_NODE, "inputs": {
+                "image": ["li", 0], "boxes": json.dumps([list(b[:4]) for b in boxes])}}}
+
+
+def landmarks_found(entry):
+    """The faces LANDMARK_NODE found: [{"points": 68 [x, y], "box": [x0, y0,
+    x1, y1], ...}], those it did not find left out; None when it said nothing."""
+    text = ((entry.get("outputs") or {}).get("ll") or {}).get("text") or []
+    try:
+        said = json.loads(text[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+    if not isinstance(said, list):
+        return None
+    return [f for f in said if isinstance(f, dict) and len(f.get("points") or []) == 68]
+
+
+def _lerp(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+
+def _along(pts, t):
+    """The point at fractional index `t` along the polyline `pts`."""
+    i = max(0, min(int(t), len(pts) - 2))
+    return _lerp(pts[i], pts[i + 1], t - i)
+
+
+def _middle(pts):
+    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+
+def fill_polygon(buf, width, height, poly, value=1):
+    """`poly` [(x, y)] filled into `buf` (width x height bytes): each pixel
+    whose centre is inside it, by the even-odd rule, set to `value`."""
+    ys = [p[1] for p in poly]
+    n = len(poly)
+    for y in range(max(0, int(min(ys))), min(height - 1, int(max(ys)) + 1) + 1):
+        yc = y + 0.5
+        xs = []
+        for i in range(n):
+            (ax, ay), (bx, by) = poly[i], poly[(i + 1) % n]
+            if (ay <= yc) != (by <= yc):
+                xs.append(ax + (yc - ay) * (bx - ax) / (by - ay))
+        xs.sort()
+        for a, b in zip(xs[0::2], xs[1::2]):
+            x0, x1 = max(0, int(math.ceil(a - 0.5))), min(width - 1, int(math.floor(b - 0.5)))
+            if x1 >= x0:
+                buf[y * width + x0:y * width + x1 + 1] = bytes((value,)) * (x1 - x0 + 1)
+
+
+def similarity_fit(src, dst):
+    """The rotation, uniform scale and shift taking points `src` onto `dst`
+    in least squares, as complex (a, b): a point z goes to a * z + b."""
+    s = [complex(*p) for p in src]
+    d = [complex(*p) for p in dst]
+    sm, dm = sum(s) / len(s), sum(d) / len(d)
+    den = sum(abs(z - sm) ** 2 for z in s)
+    a = sum((w - dm) * (z - sm).conjugate() for z, w in zip(s, d)) / den if den else 1 + 0j
+    return a, dm - a * sm
+
+
+def beard_zones(p, look, sides=(True, True)):
+    """A beard's bounds on a face, from its 68 points `p` (iBUG order) and
+    its look (scene/beard.py: style, length, coverage) -> {"within":
+    polygons it stays inside, "outside": polygons it stays out of, "fill":
+    polygons it covers whatever the scene's mask said, "clear": polygons
+    kept clear of it, last}. `sides` (the person's right cheek, left): which
+    face the camera enough to be filled; a turned-away cheek is only trimmed.
+
+    - jaw and chin: the lower edge, the jaw pushed out from the nose tip by
+      the beard's length (BEARD_BELOW), most at the chin, least at the ears;
+    - lips: the outer lips grown by LIP_CLEAR, always clear;
+    - upper lip: the moustache's place, nostrils to the lip's edge, filled;
+    - nose: above the nostrils, between the eyes, clear - the moustache's
+      upper edge;
+    - cheeks: the upper beard line, from the jaw (by the ear at coverage 1,
+      halfway to the chin at 0) to the nostril's wing (coverage 1) or the
+      mouth's corner (0); above it is trimmed, below it filled."""
+    tall = math.hypot(p[8][0] - p[27][0], p[8][1] - p[27][1]) or 1.0
+    tip = p[30]
+    lo, hi = BEARD_BELOW
+    reach = tall * (lo if look["style"] == "stubble" else lo + (hi - lo) * look["length"])
+    low = []
+    for i in range(JAW_POINTS):
+        dx, dy = p[i][0] - tip[0], p[i][1] - tip[1]
+        d = math.hypot(dx, dy) or 1.0
+        r = reach * (0.3 + 0.7 * math.sin(math.pi * i / (JAW_POINTS - 1)))
+        low.append((p[i][0] + dx / d * r, p[i][1] + dy / d * r))
+    face = low + [p[i] for i in range(26, 16, -1)]         # the pushed-out jaw, closed by the brows
+    c = _middle([p[i] for i in LIPS])
+    grow = tall * LIP_CLEAR
+    lips = []
+    for i in LIPS:
+        dx, dy = p[i][0] - c[0], p[i][1] - c[1]
+        d = math.hypot(dx, dy) or 1.0
+        lips.append((p[i][0] + dx / d * grow, p[i][1] + dy / d * grow))
+    nose = [p[i] for i in NOSE_BASE] + [p[42], p[27], p[39]]
+    upper_lip = [p[i] for i in NOSE_BASE] + [p[i] for i in reversed(LIP_TOP)]
+    clear = [lips, nose]
+    if look["style"] == "moustache":
+        return {"within": [upper_lip], "outside": [], "fill": [upper_lip], "clear": clear}
+    if look["style"] == "goatee":
+        chin = [p[48], p[54]] + [low[i] for i in range(10, 5, -1)]
+        return {"within": [upper_lip, chin], "outside": [], "fill": [upper_lip, chin],
+                "clear": clear}
+    cov = look["coverage"]
+    t_r, t_l = 5 - 4 * cov, 11 + 4 * cov               # where the upper line meets the jaw
+    e_r, e_l = _along(low, t_r), _along(low, t_l)
+    i_r, i_l = _lerp(p[48], p[31], cov), _lerp(p[54], p[35], cov)
+    above_r = [p[i] for i in range(int(t_r) + 1)] + [e_r, i_r, p[31], p[39], p[36], p[17]]
+    above_l = [p[i] for i in range(16, int(math.ceil(t_l)) - 1, -1)] + [
+        e_l, i_l, p[35], p[42], p[45], p[26]]
+    right = [p[33], p[32], p[31], i_r, e_r] + [low[i] for i in range(int(t_r) + 1, 9)] + [
+        p[57], p[51]]
+    left = [p[33], p[51], p[57]] + [low[i] for i in range(8, int(math.ceil(t_l)))] + [
+        e_l, i_l, p[35], p[34]]
+    fill = [upper_lip] + ([right] if sides[0] else []) + ([left] if sides[1] else [])
+    return {"within": [face], "outside": [above_r, above_l], "fill": fill, "clear": clear}
+
+
+def shape_beard(grey, mw, mh, region, drawn, width, height):
+    """The scene's beard mask (`grey`, mw x mh over the width x height
+    picture) fitted to the face drawn there and bounded by its landmarks.
+    `region` carries the scene's 68 face dots (fractions of the frame) and
+    the beard's look; `drawn` the faces LANDMARK_NODE read (picture px).
+
+    The scene's dots are fitted to the drawn face's on the lower face (jaw,
+    nostrils, lips) by a rotation, scale and shift, and the mask moved with
+    them. Then `beard_zones`: what lies past the jaw, on the lips, over the
+    nose or above the cheek line is trimmed; the upper lip and the cheeks
+    below the line are filled. A drawn face too unlike the scene's for the
+    fit (FIT_SCALE, FIT_TURN, FIT_SHAPE) gets its beard from the zones alone.
+    -> (the mask, what was done in words, to follow "Beard N")."""
+    kx, ky = width / float(mw), height / float(mh)
+    dots = [(x * mw, y * mh) for x, y in region["face_dots"]]
+    lower = lambda pts: [pts[i] for i in LOWER_FACE]          # noqa: E731
+    here = _middle(lower(dots))
+    best = None
+    for f in drawn:
+        pts = [(x / kx, y / ky) for x, y in f["points"]]
+        tall = math.hypot(pts[8][0] - pts[27][0], pts[8][1] - pts[27][1])
+        mid = _middle(lower(pts))
+        d = math.hypot(mid[0] - here[0], mid[1] - here[1])
+        if tall and d <= tall and (best is None or d < best[0]):
+            best = (d, pts, tall)
+    if best is None:
+        return grey, "kept as the scene made it: no drawn face was read near it"
+    _, p, tall = best
+    a, b = similarity_fit(lower(dots), lower(p))
+    scale, turn = abs(a), math.degrees(math.atan2(a.imag, a.real))
+    miss = sum(abs(a * complex(*s) + b - complex(*q))
+               for s, q in zip(lower(dots), lower(p))) / len(LOWER_FACE) / tall
+    follow = (FIT_SCALE[0] <= scale <= FIT_SCALE[1] and abs(turn) <= FIT_TURN
+              and miss <= FIT_SHAPE)
+    right = math.hypot(p[2][0] - p[30][0], p[2][1] - p[30][1])
+    left = math.hypot(p[14][0] - p[30][0], p[14][1] - p[30][1])
+    zones = beard_zones(p, region["beard"], (right >= FAR_SIDE * left, left >= FAR_SIDE * right))
+    rasters = {}
+    for k, polys in zones.items():
+        rasters[k] = bytearray(mw * mh)
+        for poly in polys:
+            fill_polygon(rasters[k], mw, mh, poly)
+    within, outside, fill, clear = (rasters[k] for k in ("within", "outside", "fill", "clear"))
+    xs = [q[0] for poly in zones["within"] for q in poly]
+    ys = [q[1] for poly in zones["within"] for q in poly]
+    box = _mask_box(grey, mw, mh)
+    shift = 0.0
+    if follow and box:
+        corners = [a * complex(x, y) + b for x in (box[0], box[2] + 1) for y in (box[1], box[3] + 1)]
+        xs += [z.real for z in corners]
+        ys += [z.imag for z in corners]
+        mid = complex((box[0] + box[2] + 1) / 2.0, (box[1] + box[3] + 1) / 2.0)
+        moved = a * mid + b - mid
+        shift = math.hypot(moved.real * kx, moved.imag * ky)
+    x0, x1 = max(0, int(min(xs)) - 1), min(mw - 1, int(max(xs)) + 1)
+    y0, y1 = max(0, int(min(ys)) - 1), min(mh - 1, int(max(ys)) + 1)
+    inv = 1 / a if follow else 0
+    out = bytearray(mw * mh)
+    seen = kept = added = 0
+    for y in range(y0, y1 + 1):
+        for x in range(x0, x1 + 1):
+            i = y * mw + x
+            v = 0
+            if follow:
+                z = (complex(x + 0.5, y + 0.5) - b) * inv
+                sx, sy = int(z.real), int(z.imag)
+                if 0 <= sx < mw and 0 <= sy < mh:
+                    v = grey[sy * mw + sx]
+            was = v >= 128
+            if v and (not within[i] or outside[i]):
+                v = 0
+            if fill[i]:
+                v = 255
+            if clear[i]:
+                v = 0
+            out[i] = v
+            seen += was
+            kept += was and v >= 128
+            added += v >= 128 and not was
+    if not any(out):
+        return out, "not redrawn: nothing of it is left inside the drawn face's landmarks"
+    if not follow:
+        return out, ("drawn from the drawn face's landmarks alone: that face is not the "
+                     "scene's (scale %.2f, turned %d degrees, %d%% of its height off after "
+                     "fitting), so the scene's mask was no guide"
+                     % (scale, round(turn), round(miss * 100)))
+    return out, ("fitted to the drawn face's landmarks: the scene's mask moved %d px; %d%% of "
+                 "it trimmed (past the jaw, on the lips, over the nose or above the cheek "
+                 "line), %d%% more added (the upper lip and the cheeks below the line)"
+                 % (round(shift), round(100.0 * (seen - kept) / seen) if seen else 0,
+                    round(100.0 * added / seen) if seen else 0))
 
 
 def parts_graph(image, sam3, prompts):
@@ -6914,12 +7169,40 @@ class Studio:
             fh.write(oval_png(scale=1.0 / FIX_CONTEXT, centre=0.5))
         return client.upload_image(oval)
 
+    def _drawn_landmarks(self, job, client, backend, types, image, faces, beards, say):
+        """The drawn faces' 68 points (LANDMARK_NODE, at SAM3's `faces`) for
+        the beard pass to fit the scene's beards to; None, said in the
+        notes, when they cannot be read - the beards then keep the scene's
+        masks as they came."""
+        if not faces or not any(len(r.get("face_dots") or []) == 68 for r in beards):
+            return None
+        if LANDMARK_NODE not in types:
+            job.notes.append("Beards not fitted to the drawn face's landmarks: %s's ComfyUI "
+                             "lacks %s (the add-on \"Blend a real reference face\"; restart "
+                             "ComfyUI after installing it)." % (backend["name"], LANDMARK_NODE))
+            return None
+        say("beard", "Reading the drawn face's landmarks", None)
+        try:
+            job.prompt_id = client.queue_workflow(landmarks_graph(image, faces))
+            entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
+                                               stop=job.cancel.is_set)
+        except ComfyError as e:
+            job.notes.append("Beards not fitted to the drawn face's landmarks: %s." % e)
+            return None
+        drawn = landmarks_found(entry or {})
+        if drawn is None and not job.cancel.is_set():
+            job.notes.append("Beards not fitted to the drawn face's landmarks: %s said "
+                             "nothing about the face." % LANDMARK_NODE)
+        return drawn
+
     def _finish_passes(self, job, client, plan, values, pictures, profiles, say):
         """The end of Generate, on the lane's thread, by the fix machinery on
         the picture's own model: after FaceFusion (`profiles`) each swapped
         face's eyes (EYE_WHAT) - unless a face enhancer sharpened them
         (`eye_pass`); then each beard a Scene Builder person was given,
         inside the scene's own beard mask (`beard_regions`, `beard_spots`;
+        fitted to the drawn face and bounded by its landmarks when
+        LANDMARK_NODE reads them, `_drawn_landmarks`, `shape_beard`;
         with or without a swap, unless settings["beard_pass"] is off); then
         the hands of a picture of people
         (HAND_WHAT, `real_hands`; the hands pass, unless
@@ -7013,8 +7296,11 @@ class Studio:
                                          % ("eye or glasses" if eyes and specs else
                                             "eye" if eyes else "glasses"))
                 if beards:
-                    bearded, off = beard_spots(
-                        width, height, beards, [x[:4] for x in boxes if x[4] == "face"])
+                    found = [x[:4] for x in boxes if x[4] == "face"]
+                    drawn = self._drawn_landmarks(job, client, b, types, image, found, beards,
+                                                  say)
+                    bearded, off, fitted = beard_spots(width, height, beards, found, drawn)
+                    job.notes.extend(fitted)
                     if off:
                         job.notes.append("%d beard%s not redrawn: the face was not drawn where "
                                          "the scene put it." % (off, "" if off == 1 else "s"))
