@@ -2775,6 +2775,18 @@ class TestSceneBuilderWindow(unittest.TestCase):
         self.assertEqual((st["width"], st["height"]), (896, 1152))
         self.assertEqual((st["pose"], st["composition"]),
                          ({"strength": sc.POSE_STRENGTH}, {"strength": sc.DEPTH_STRENGTH}))
+
+        sb.scene["frame_keep"] = 0.2                        # the frame on top of the maps
+        n = len(ui.jobs)
+        self.assertTrue(sb.generate())
+        self.pump(lambda: len(ui.jobs) > n and ui.jobs[0].status in ig.FINISHED)
+        job = ui.jobs[0]
+        self.assertEqual(job.status, "complete", job.detail)
+        st = job.settings
+        self.assertEqual(sorted(st["references"]), ["composition", "pose", "source"])
+        with open(st["references"]["source"], "rb") as f:
+            self.assertEqual(png_size(f.read()), (896, 1152))
+        self.assertEqual((st["width"], st["height"], st["denoise"]), (896, 1152, 0.8))
         self.assertIn("welding a beam; helmet down, leather gloves", st["scene"])
         self.assertIn("Workbench (", st["scene"])
         self.assertEqual(st["scene_file"], path)
@@ -2794,6 +2806,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         two_tone(style, (200, 40, 40), (40, 40, 200))
         ui._set_ref("style", style)
         ui._set_ref("source", style)
+        sb.scene["frame_keep"] = 0.0
         sb._set_model("flux-dev")
         n = len(ui.jobs)
         self.assertTrue(sb.generate())
