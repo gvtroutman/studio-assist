@@ -1651,6 +1651,31 @@ class TestJobs(TempStudioMixin, unittest.TestCase):
             self.assertEqual(p.errors, [])
             self.assertTrue(p.values["face_detail"])
             self.assertEqual(p.values["face_denoise"], strength, model)
+        # Klein, base and distilled, has a face pass: one section, each
+        # model's guidance its CFG (the base's real one, the distilled's 1),
+        # the written negative, the simple scheduler; the base redraws in
+        # 20 steps, not its 50.
+        klein = ig.load_workflow("klein9b_base")
+        inv = dict(FLUX_FILES, checkpoints={"sam3.pt"},
+                   diffusion_models={"flux-2-klein-base-9b.safetensors",
+                                     "flux-2-klein-9b-fp8.safetensors"},
+                   text_encoders={"qwen_3_8b_fp8mixed.safetensors"},
+                   vae={"flux2-vae.safetensors"})
+        nodes = set(FaceClient.NODES) | {n["class_type"] for n in klein["graph"].values()}
+        for model, want in (("klein-9b", (20, 4.0)), ("klein-9b-distilled", (4, 1.0))):
+            s = dict(ig.default_settings(), model=model, scene="a woman", preset="hq_final")
+            p = ig.compose(s, self.studio.lib, self.backend("5090"), inv, nodes=nodes)
+            self.assertEqual(p.errors, [])
+            self.assertTrue(p.values["face_detail"], p.warnings)
+            self.assertFalse(any("face pass" in w for w in p.warnings), p.warnings)
+            values = dict(p.values, face_prompt="a face", face_denoise=0.4)
+            g = ig.face_graph(klein, values, [], "made.png", ig.fix_crops(512, 512, [
+                {"x": 200, "y": 200, "size": 64}]), "oval.png", "out")
+            k = g["fc1_4"]["inputs"]
+            self.assertEqual((k["steps"], k["cfg"]), want, model)
+            self.assertEqual((k["sampler_name"], k["scheduler"]), ("euler", "simple"))
+            self.assertEqual(k["negative"], ["12", 0])
+            self.assertEqual(g["f10"]["inputs"]["clip"], ["2", 0])
         # FLUX names none, and redraws with the picture's as before.
         self.assertNotIn("redraw_sampler", ig.load_workflow("flux_dev_baseline")["defaults"])
         job, client, _ = self.fix_job(model="flux-dev")
@@ -4297,7 +4322,7 @@ class TestImageStudioTab(unittest.TestCase):
         ui._select_identity("")
         self.assertFalse(any(v[0].get() for v in ui.idents.values()))
 
-    def test_the_people_tab_has_one_person_dropdown_and_no_body_or_accessories(self):
+    def test_the_people_tab_has_one_person_dropdown_and_none_of_the_creators_look(self):
         s, ui = self.tab()
         ui.studio.lib.save("identities", [
             {"id": "gav", "name": "Gav", "references": ["a.png"]},
@@ -4318,9 +4343,20 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual((ui.settings["character"], ticked()), ("mara", ["gav"]))
         self.assertEqual(ui.person_pill.cget("text"), "Mara  ▾")
         self.assertEqual(ui.text["hair"].get(), "auburn")
+        # Saved in the creator, the form's character's hidden look follows it.
+        ui.studio.lib.save("characters", [
+            {"id": "mara", "name": "Mara", "identity": "gav",
+             "looks": {"hair": "black", "facial_hair": "heavy stubble"}},
+            {"id": "bare", "name": "Bare", "identity": "", "looks": {}}])
+        ui.text["expression"].set("laughing")
+        ui._saved("characters")
+        self.assertEqual((ui.text["hair"].get(), ui.text["facial_hair"].get()),
+                         ("black", "heavy stubble"))
+        self.assertEqual(ui.text["expression"].get(), "laughing")     # the picture's, kept
         ui._pick_from_people("i:two")                # a profile alone is not Mara
         self.assertEqual((ui.settings["character"], ticked()), ("", ["two"]))
         self.assertEqual(ui.person_pill.cget("text"), "Two  ▾")
+        self.assertEqual((ui.text["hair"].get(), ui.text["facial_hair"].get()), ("", ""))
         ui._pick_from_people("c:bare")               # no face of its own: none
         self.assertEqual((ui.settings["character"], ticked()), ("bare", []))
         self.assertEqual(ui.person_pill.cget("text"), "Bare  ▾")
@@ -4328,11 +4364,12 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual((ui.settings["character"], ticked()), ("", []))
         self.assertEqual(ui.person_pill.cget("text"), "No one  ▾")
         tabs = texts(ui.look_tabs)
-        self.assertNotIn("Body", tabs)
-        self.assertNotIn("Accessories", tabs)
-        self.assertIn("Face", tabs)
-        ui._show_looks("Body")                       # hidden: the first shown instead
-        self.assertEqual(ui.look_section, "Face")
+        # Who the person is is the creator's alone (the user, 2026-10-02).
+        for hidden in ("Body", "Face", "Hair", "Accessories"):
+            self.assertNotIn(hidden, tabs)
+        self.assertEqual(tabs, ["Expression", "Clothes"])
+        ui._show_looks("Face")                       # hidden: the first shown instead
+        self.assertEqual(ui.look_section, "Expression")
 
     def test_a_character_tag_is_a_word_and_an_uploaded_picture(self):
         s, ui = self.tab()

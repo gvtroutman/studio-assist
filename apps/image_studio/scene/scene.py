@@ -2390,6 +2390,40 @@ def character_look(rec, look=None):
     return clean_look(look)
 
 
+def follow_character(obj, rec):
+    """A person's look made their character's as it is now, for who they
+    are (imagegen.WHO_KEYS: body, face, hair; blank where the character has
+    none), with the beard the character keeps or its facial hair pick names
+    (beard.from_words). What they wear and their expression stay the
+    scene's. `rec` None leaves the look. -> True when it changed."""
+    import apps.image_studio.imagegen as ig
+    from apps.image_studio.scene import beard
+    if rec is None or obj.get("asset") != "person":
+        return False
+    looks = rec.get("looks") or {}
+    look = dict(obj.get("look") or {})
+    for k in ig.WHO_KEYS:
+        look.pop(k, None)
+    look.update((k, looks[k]) for k in ig.WHO_KEYS if k in looks)
+    b = beard.clean(looks.get("beard")) or beard.from_words(look.get("facial_hair"))
+    look.pop("beard", None)
+    if b is not None:
+        look["beard"] = b
+    look = clean_look(look)
+    if look == obj.get("look"):
+        return False
+    obj["look"] = look
+    return True
+
+
+def follow_characters(scene, characters):
+    """Every person with a character (`characters` {id: record}) follows
+    it (`follow_character`). -> the names of those whose look changed."""
+    return [o["name"] for o in scene.get("objects") or []
+            if o.get("asset") == "person" and o.get("character")
+            and follow_character(o, (characters or {}).get(o["character"]))]
+
+
 def wear_outfit(rec, look=None):
     """A clothes preset put on a person: every clothes and accessories slot
     is the preset's, blank where it has none; the body, face and hair stay."""
@@ -4966,8 +5000,14 @@ def generation(scene, maps, characters=None, identities=None):
 
     A scene with people always gets the face pass, told who each face is
     (`scene_faces`, from `face_targets`): each redrawn in their own words,
-    and to their face picture's likeness where they have one."""
+    and to their face picture's likeness where they have one.
+
+    A person with a character is said as the character is now
+    (`follow_characters`), not as the scene copied it."""
     import apps.image_studio.imagegen as ig
+    if characters:
+        scene = copy.deepcopy(scene)
+        follow_characters(scene, characters)
     w, h = frame_size(scene)
     s, _ = clean_scene(scene)
     by_character = {}
