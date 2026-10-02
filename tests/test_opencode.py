@@ -497,6 +497,28 @@ class TestOtherTools(Base):
         self.fake.documented = [r.replace("{sessionID}", "{id}") for r in self.fake.documented]
         self.assertNotIn("does not list", self.text(oc.call_tool("opencode_status", {})))
 
+    def test_status_says_busy_not_just_running(self):
+        # Seen live: "is running" over a server ten minutes into a session
+        # sent the model on to a new session beside it.
+        self.assertNotIn("busy", self.text(oc.call_tool("opencode_status", {})))
+        self.fake.forever = True
+        self.fake.script = []
+        sid = oc.new_session("x")["id"]
+        oc.remember_session(sid)
+        oc.prompt(sid, "go")
+        out = self.text(oc.call_tool("opencode_status", {}))
+        self.assertIn("still working on session " + sid, out)
+        self.assertIn("opencode_abort", out)
+        real = oc.sessions
+        oc.sessions = lambda: (_ for _ in ()).throw(oc.OpenCodeError("timed out"))
+        try:
+            out = self.text(oc.call_tool("opencode_status", {}))
+        finally:
+            oc.sessions = real
+        self.assertIn("OpenCode 1.2.3 is running", out)
+        self.assertIn("busy and did not list its sessions (timed out)", out)
+        self.assertIn("most likely still working on session " + sid, out)
+
     def test_file_tools_read_the_folder_only(self):
         os.makedirs(os.path.join(oc.WORKSPACE, "src"))
         with open(os.path.join(oc.WORKSPACE, "src", "a.py"), "w") as f:
@@ -574,6 +596,31 @@ class TestOtherTools(Base):
         bad = oc.call_tool("opencode_search_files", {"query": "restart_(", "regex": True})
         self.assertTrue(bad["isError"])
         self.assertIn("Invalid regex", self.text(bad))
+
+    def test_search_takes_alternatives_in_one_call(self):
+        with open(os.path.join(oc.WORKSPACE, "ui.py"), "w") as f:
+            f.write("attach = Button('Attach')\nclip = 'paperclip'\nother = 1\n")
+        out = self.text(oc.call_tool("opencode_search_files", {"query": " Attach | PAPERCLIP |"}))
+        self.assertIn("ui.py:1", out)
+        self.assertIn("ui.py:2", out)
+        self.assertNotIn("ui.py:3", out)
+        self.assertTrue(oc.call_tool("opencode_search_files", {"query": " | "})["isError"])
+
+    def test_search_lists_code_before_tests_before_documents(self):
+        # Seen live: AGENTS.md sorts first and took 24 of the 40 rows, so the
+        # search for "menu" stopped before it reached core/chat.py.
+        os.makedirs(os.path.join(oc.WORKSPACE, "core"))
+        os.makedirs(os.path.join(oc.WORKSPACE, "tests"))
+        for name, lines in (("AGENTS.md", 60), ("tests/test_chat.py", 1), ("core/chat.py", 1)):
+            with open(os.path.join(oc.WORKSPACE, name), "w") as f:
+                f.write("the menu\n" * lines)
+        rows = self.text(oc.call_tool("opencode_search_files", {"query": "menu"})).splitlines()
+        self.assertTrue(rows[0].startswith("Partial search"))
+        self.assertEqual([r.split(":")[0] for r in rows[1:4]],
+                         ["core/chat.py", "tests/test_chat.py", "AGENTS.md"])
+        # Asked for by name, a document is still searched.
+        out = self.text(oc.call_tool("opencode_search_files", {"query": "menu", "path": "AGENTS.md"}))
+        self.assertIn("AGENTS.md:1 ", out)
 
     def test_search_and_listing_fit_executor_budget_and_report_partial(self):
         for i in range(150):

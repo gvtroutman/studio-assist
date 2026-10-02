@@ -1101,6 +1101,15 @@ class TestAppRegistry(unittest.TestCase):
         self.assertIn("notes", cfg["mcp"])
         self.assertEqual(cfg["mcp"]["repo"]["command"][-1], eng.OPENCODE_REPO_MAP)
 
+    def test_opencode_prompt_names_its_folder_so_status_is_not_a_first_step(self):
+        # Asked to find the folder with opencode_status, the model called it
+        # before every task; a round trip that told it nothing new.
+        self.assertNotIn("<WORKSPACE>", eng.OPENCODE_PROMPT)
+        self.assertIn("OpenCode works in this app's own source code", eng.OPENCODE_PROMPT)
+        self.assertNotIn("opencode_status says which folder", eng.OPENCODE_PROMPT)
+        self.assertIn("attach|paperclip", eng.OPENCODE_PROMPT)
+        self.assertNotIn("three exploratory", eng.OPENCODE_PROMPT)
+
     def test_on_this_repo_opencode_gets_the_short_brief_not_agents_md(self):
         # AGENTS.md is far larger than the model's window; loaded whole it
         # pushed the task out of OpenCode's memory.

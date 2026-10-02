@@ -77,7 +77,22 @@ RECALL_TOOL = {"type": "function", "function": {
 
 INTERNAL_TOOLS = (TASK_TOOL, toolsmith.CREATE_TOOL, ASK_TOOL, lessons.REMEMBER_TOOL, RECALL_TOOL,
                   ideas.IDEA_TOOL)
-OPENCODE_EXPLORATION = {"opencode_list_files", "opencode_read_file", "opencode_search_files"}
+# Looking instead of handing off. The research bridge's file tools and the
+# session list are here too: seen live, the model went on reading through them
+# once OpenCode's own three were paused.
+OPENCODE_EXPLORATION = {"opencode_list_files", "opencode_read_file", "opencode_search_files",
+                        "opencode_list_sessions", "list_folder", "find_files", "read_file"}
+# Looks the OpenCode tab may take before it hands off. OpenCode finds the code
+# itself; at three the model spent all three on phrasings of one button.
+OPENCODE_EXPLORATION_BUDGET = 1
+# A message that only says to go on is the same request: the budget it used is
+# still used. Seen live, every "continue" bought three more reads.
+GO_ON = frozenset(("continue", "go on", "go ahead", "keep going", "proceed", "resume",
+                   "retry", "try again", "try now", "again"))
+
+
+def goes_on(brief):
+    return " ".join(brief.casefold().split()).strip(" .!") in GO_ON
 
 QUALITY_RULES = """
 
@@ -228,6 +243,7 @@ class TaskRecord:
         self.checks = []
         self.issues = []
         self.journal = []
+        self.request_from = 0          # first journal entry of the request being worked on
         self.notes = []
         self.compacted_until = 1       # first history message not yet archived
         self.status = "ready"
@@ -622,7 +638,6 @@ class Executor:
         self.max_chars = max_chars
         self._context_checked = False
         self._output_tokens = None
-        self._journal_start = len(self.record.journal)
         # The app's own answers to "how do I check that landed": see
         # AppSpec.readback and AppSpec.review. Only tools this tab offers count.
         self.readback = [(t, n) for t, n in readback if t in self.allowed]
@@ -747,12 +762,13 @@ class Executor:
     def _handoff_due(self):
         if "opencode_ask" not in self.allowed:
             return False
-        recent = self.record.journal[self._journal_start:]
+        recent = self.record.journal[self.record.request_from:]
         if any(e.get("status") == "ok" and e.get("name") in
                ("opencode_ask", "opencode_wait", "opencode_get_session")
                for e in recent):
             return False
-        return sum(e.get("name") in OPENCODE_EXPLORATION for e in recent) >= 3
+        return (sum(e.get("name") in OPENCODE_EXPLORATION for e in recent)
+                >= OPENCODE_EXPLORATION_BUDGET)
 
     def _fresh_lessons(self):
         if self.notebook is None:
@@ -885,7 +901,7 @@ class Executor:
         if name not in self.allowed:
             raise ValueError("tool is not enabled: " + name)
         if name in OPENCODE_EXPLORATION and self._handoff_due():
-            raise ValueError("The three-read exploration budget is used. Call opencode_ask with "
+            raise ValueError("The exploration budget is used. Call opencode_ask with "
                              "the user's request and constraints, or answer/ask a focused question. "
                              "For a review, explicitly ask OpenCode to inspect without edits.")
         spec = self.specs.get(name, {})
@@ -1121,7 +1137,8 @@ class Executor:
         roadmap_nudges = 0
         handoff_reminded = False
         context_retried = False
-        self._journal_start = len(self.record.journal)
+        if not (self.record.briefs and goes_on(self.record.briefs[-1])):
+            self.record.request_from = len(self.record.journal)
         self._context_checked = False
         for entry in self.record.journal:
             if entry.get("verifies") and entry.get("status") == "ok":
@@ -1151,15 +1168,19 @@ class Executor:
             if self.cancel.is_set():
                 return stop(stopped("Stopped."))
             # This tab delegates coding. A small model can instead spend the
-            # whole run reading file beginnings. Pause exploration after three
-            # reads; answering or delegating a read-only review remain available.
+            # whole run reading file beginnings. Pause exploration after the
+            # budget; answering or delegating a read-only review remain available.
+            # Never tell it to send OpenCode to AGENTS.md: OPENCODE_PROMPT forbids
+            # that, since the file pushes the task out of the model's memory. And
+            # the handoff is the change itself: told to "inspect" or "find where",
+            # OpenCode read for its whole ten minutes and edited nothing.
             if self._handoff_due() and not handoff_reminded:
                 handoff_reminded = True
                 messages.append({"role": "user", "content":
-                    "You have inspected several files without handing work to OpenCode. "
+                    "You have looked at the workspace without handing work to OpenCode. "
                     "If the user requested a code change, call opencode_ask now with their "
-                    "exact request and constraints; ask OpenCode to read AGENTS.md, locate "
-                    "the implementation and test it. You do not need to identify every "
+                    "exact request and constraints, plus any file you found; ask OpenCode to "
+                    "make the change and test it, not to inspect first. You do not need to identify every "
                     "function first. Workspace exploration tools are now paused until the "
                     "handoff. If the user only requested information or review, answer from "
                     "the evidence, ask a focused question, or delegate inspection explicitly "
