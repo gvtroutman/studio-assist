@@ -1358,6 +1358,15 @@ class TestWords(unittest.TestCase):
             _, p = self.posed(preset)
             self.assertEqual(sc.posture_words(p), words, preset)
 
+    def test_a_toast_is_a_raised_arm_not_one_at_shoulder_height(self):
+        # The Oktoberfest toast: a wrist level with the crown was said as
+        # "reaching forward at shoulder height", and the picture drew a
+        # third arm out in front as well as the raised one.
+        _, p = self.posed(arm_r_raise=115, arm_r_bend=30)
+        self.assertIn("right arm raised, the hand at head height", sc.posture_words(p))
+        _, p = self.posed(arm_r_raise=115, arm_r_bend=30, arm_l_raise=115, arm_l_bend=30)
+        self.assertIn("both arms raised, the hands at head height", sc.posture_words(p))
+
     def test_the_legs_are_said_unless_a_named_pose_says_them(self):
         _, p = self.posed(leg_l_bend=25)
         self.assertIn("weight on the right leg, the other knee relaxed", sc.posture_words(p))
