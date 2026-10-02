@@ -119,8 +119,11 @@ def parse_link(text):
                 "version": int(m.group(2)) if m.group(2) else None}
     if "://" not in t:
         t = "https://" + t
-    u = urllib.parse.urlparse(t)
-    host = (u.hostname or "").lower()
+    try:
+        u = urllib.parse.urlparse(t)
+        host = (u.hostname or "").lower()
+    except ValueError:  # clipboard prose (including a Codex handoff) is not a URL
+        return None
     if not (host == "civitai.com" or host.endswith(".civitai.com")
             or re.match(r"^(www\.)?civitai\.[a-z]+$", host)):
         return None

@@ -3418,6 +3418,49 @@ def _headless():
 
 @unittest.skipIf(_headless(), "no display")
 class TestImageStudioTab(unittest.TestCase):
+    def test_codex_finish_round_trip_keeps_protected_pixels_and_completes_pipeline(self):
+        import apps.image_studio.ui as ui_mod
+        from core.icons import png, png_to_rgba
+        from unittest.mock import patch
+        _, ui = self.tab()
+        original = png(bytes([30, 40, 50, 255]) * 16, 4, 4)
+        self.addCleanup(ui.codex_finish.set, ui.codex_finish.get())
+        settings = dict(ig.default_settings(), scene="festival", codex_finish=True,
+                        scene_faces={"people": [{"region": [0, 0, .5, .5]}]})
+        job = ig.Job(settings, {"id": "5090", "name": "Test"})
+        rec = {"id": "codex-ui-base", "created_ts": time.time(), "created": "2026-10-02T12:00:00",
+               "settings": settings, "prompt": "festival"}
+        ui.studio.save_result(job, rec, [("base.png", original)])
+        ui.studio.queue._finish(job, "complete")
+        ui.jobs.append(job)
+        ui._select(("record", job.record))
+        window = ui_mod.CodexFinishWindow(ui, job.record, job.outputs[0])
+        self.addCleanup(window.win.destroy)
+        clipboard = []
+        with patch.object(ui.host, "_spawn", side_effect=lambda sid, fn: fn()), \
+                patch.object(ui.host, "clipboard_clear", side_effect=clipboard.clear), \
+                patch.object(ui.host, "clipboard_append", side_effect=clipboard.append), \
+                patch.object(ui.host, "clipboard_get", side_effect=lambda: "".join(clipboard)):
+            window.export()
+            self.pump(lambda: not window.busy)
+            self.assertIn("protected", ui.host.clipboard_get())
+            self.assertIn(window.handoff["redacted_image"], ui.host.clipboard_get())
+            self.assertNotIn(window.path, ui.host.clipboard_get())
+            self.assertEqual(window.picture.get(0, 0), (96, 96, 96))
+            with open(window.handoff["output"], "wb") as stream:
+                stream.write(png(bytes([80, 60, 40, 255]) * 16, 4, 4))
+            with patch.object(ui_mod.filedialog, "askopenfilename", return_value=window.handoff["output"]):
+                window.take()
+                self.pump(lambda: not window.busy)
+        self.assertEqual(job.status, "complete")
+        self.assertEqual(ui._selected_record()["workflow"], "codex-imagegen")
+        with open(job.outputs[0], "rb") as stream:
+            pixels, _, _ = png_to_rgba(stream.read())
+        self.assertEqual(pixels[:8], bytes([30, 40, 50, 255]) * 2)
+        self.assertEqual(pixels[8:16], bytes([80, 60, 40, 255]) * 2)
+        ui.codex_finish.set(True)
+        self.assertTrue(ui.collect()["codex_finish"])
+
     def test_head_photo_opens_position_lock_window_with_kept_source(self):
         from unittest.mock import patch
         import apps.image_studio.ui as ui_mod

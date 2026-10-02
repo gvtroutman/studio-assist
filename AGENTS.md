@@ -4873,6 +4873,18 @@ folder are exactly that, and their `serve()` loops are gone.
 
 ### Finishing and recovery
 
+- **Codex finishing is a handoff, not an API call.** `apps/image_studio/codex_finish.py`
+  exports an opaque face-redacted PNG and request after the local passes. Original
+  pixels and the manifest stay separately in `codex-private`; the copied request
+  must reference only the redacted image, never originals or identity references. With
+  `codex_finish` enabled the strip adds Codex finish before Complete and the job
+  settles as `awaiting_codex` (in `FINISHED`, so no lane/GPU is held). Import writes
+  a separate History result and completes the job when the whole batch is returned.
+  Protected head rectangles keep exact source RGBA pixels; only the edited canvas
+  may be fitted to the source resolution. Changed proportions are refused. Never
+  promise that an imagegen prompt alone preserves a face. The user reviews/adds
+  boxes in Finish with Codex. See `docs/codex-image-finish.md` and
+  `tests/test_codex_finish.py`; the tab test covers export/import and completion.
 - Scene Builder's close result can veto tab/app closure. `ImageStudio.can_close()`
   checks before any tab state is removed or `Chat.closing` is set; `release(confirmed=True)`
   only destroys windows after those checks. Failed saves and cancelled Save As dialogs
