@@ -31,6 +31,10 @@ It answers with the picture and a JSON report (`ui.text` and a STRING):
 per face, the photo chosen, both angles, the tolerance, the confidence,
 and whether it was pasted and why not.
 
+StudioFaceLandmarks, beside it, only reads: for each face box it is given,
+the drawn face's 68 points (iBUG order, from landmark_3d_68), so the beard
+pass can bound a beard by that face's jaw, lips, nose and cheeks.
+
 Needs nothing ComfyUI's venv lacks once PuLID is installed: insightface,
 onnxruntime, OpenCV, numpy, and models/insightface/models/antelopev2. The
 source of truth is comfy_nodes/studio_facepaste in the Studio Assist repo;
@@ -92,7 +96,9 @@ def _face(f, shift=(0.0, 0.0), k=1.0):
     pts = f.landmark_2d_106.astype(np.float64) / k + np.array(shift)
     box = f.bbox.astype(np.float64) / k + np.array(shift * 2)
     kps = f.kps.astype(np.float64) / k + np.array(shift)
-    return {"points": pts, "kps": kps, "box": box, "width": float(box[2] - box[0]),
+    ibug = f.landmark_3d_68[:, :2].astype(np.float64) / k + np.array(shift)
+    return {"points": pts, "kps": kps, "ibug": ibug, "box": box,
+            "width": float(box[2] - box[0]),
             "yaw": yaw, "pitch": pitch, "roll": roll, "score": float(f.det_score)}
 
 
@@ -343,5 +349,42 @@ class StudioFacePaste:
                 "result": (torch.from_numpy(out.astype(np.float32))[None], text)}
 
 
-NODE_CLASS_MAPPINGS = {"StudioFacePaste": StudioFacePaste}
-NODE_DISPLAY_NAME_MAPPINGS = {"StudioFacePaste": "Real face paste (Studio Assist)"}
+def landmarks(img, boxes):
+    """img: (H, W, 3) float RGB 0..1. boxes: [[x, y, w, h]]. -> per box, the
+    drawn face nearest it {"points": 68 [x, y] in iBUG order, "box": [x0,
+    y0, x1, y1], "yaw", "score"}, or None where none was found clearly."""
+    bgr = np.ascontiguousarray((img[:, :, ::-1] * 255).clip(0, 255).astype(np.uint8))
+    out = []
+    for box in boxes:
+        f = face_near(bgr, box)
+        if f is None or f["score"] < MIN_SCORE:
+            out.append(None)
+            continue
+        out.append({"points": [[round(float(x), 2), round(float(y), 2)] for x, y in f["ibug"]],
+                    "box": [round(float(v), 2) for v in f["box"]],
+                    "yaw": round(f["yaw"], 1), "score": round(f["score"], 3)})
+    return out
+
+
+class StudioFaceLandmarks:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image": ("IMAGE",),
+                             "boxes": ("STRING", {"multiline": True, "default": "[]"})}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("landmarks",)
+    FUNCTION = "run"
+    OUTPUT_NODE = True
+    CATEGORY = "Studio Assist"
+
+    def run(self, image, boxes):
+        img = image[0].cpu().numpy().astype(np.float32)
+        text = json.dumps(landmarks(img, json.loads(boxes or "[]")))
+        return {"ui": {"text": [text]}, "result": (text,)}
+
+
+NODE_CLASS_MAPPINGS = {"StudioFacePaste": StudioFacePaste,
+                       "StudioFaceLandmarks": StudioFaceLandmarks}
+NODE_DISPLAY_NAME_MAPPINGS = {"StudioFacePaste": "Real face paste (Studio Assist)",
+                              "StudioFaceLandmarks": "Face landmarks (Studio Assist)"}

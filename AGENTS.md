@@ -85,6 +85,15 @@ this PC's files and the web instead. Two moving parts:
 - **`apps/image_studio/scene/mannequin.py`** — the sections the Scene Builder's person is sculpted from
   (chest with pecs, waist, seat, mitten hands): functions of the angle round a bone,
   handed to `apps.image_studio.scene.scene.loft`. No tkinter.
+- **`apps/image_studio/scene/surface.py`** — float surface analysis from the renderer's
+  normals and world positions: perspective incidence, grazing, normal/depth/world
+  edges, ownership/part boundaries and Lambertian illumination. `scene.surface_render`
+  shares one set of truth buffers; `scene.identity_masks` renders once at a 256-pixel
+  long edge for all initial PuLID head regions. Masks feather inward, stay on the
+  visible head, and reduce confidence at grazing angles. Hidden or rear-facing heads
+  receive no initial identity conditioning. Form-only regions retain rectangular
+  masks. Normal edges are creases, not curvature; illumination is not a comparison
+  against the generated picture. `tests/test_surface.py` covers the math and consumer.
 - **`apps/image_studio/addons/civitai.py`** — LoRA profiles from CivitAI links or `.safetensors` files,
   for the Image Studio's LoRA library. No tkinter. See *The Image Studio*.
 - **`apps/image_studio/addons/catalog.py`** — the Image Studio's Add-ons: LoRAs sorted by the model they
@@ -2801,8 +2810,11 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   shapes too. For a model whose workflow has the ControlNet inputs (the FLUX
   baseline) the builder sends two maps instead, each with its own slider (0 is
   off), and the words say how things look:
-  - **Pose** (`pose_png`, reference kind `pose`, default 0.85): every person
-    and crowd member's skeleton (`rigs`: the same placement `painted_pieces`
+  - **Pose** (`pose_png`, reference kind `pose`, default 0.85): keeps the
+    selected pose strength at every shot size; only depth is reduced
+    by `FRAMING`. The matched-seed medium-shot trial found better body placement
+    with full pose strength, but wrist errors remained.
+    Every person and crowd member's skeleton (`rigs`: the same placement `painted_pieces`
     gives their faces) projected through the camera as OpenPose, drawn by
     `apps.image_studio.scene.pose.render_figures`, far to near. Head points are dropped as
     DWPose would miss them - nose and eyes on the side facing the camera, the
@@ -2874,8 +2886,12 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   and so is an object with no description. A test holds punctuation and case verbatim.
   "Outside" is none of its box on screen: its middle alone dropped a person framed head
   and shoulders, whose middle is below the frame; left / centre / right is the seen part's.
-- **A person is said from their controls, as the pose map draws them.** Each person's
-  line is `Name (a person, where, facing, [gaze], framing, [named pose]): look.
+- **A person is said from their controls, as the pose map draws them.**
+  Accordion contact phrases are geometry-gated (`accordion_contacts`): the right
+  fingertips must reach the keyboard and left palm landmarks the bass surface.
+  A missed contact produces a scene note rather than claiming the hands touch.
+  Mesh and checks share `accordion_front`; checks never move the user's controls.
+  Each person's line is `Name (a person, where, facing, [gaze], framing, [named pose]): look.
   Posture. Description`. `posture_words` reads the posed skeleton, not the sliders, so
   a combination says what it looks like: the torso's bend, lean and turn; each arm
   from where its wrist ends up against the crown (`HEAD_TOP` above the head joint),
@@ -3296,6 +3312,69 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   prompting never blocks a job. `tools/ab_regional_prompt.py` runs the same
   scene, seed, model, LoRAs, pose and depth twice (regional off, then on)
   for a by-hand comparison - not yet run live.
+- **Facial hair can be a structured per-person look** (`look.beard`,
+  `scene/beard.py`): style (`none`, `stubble`, `short`, `full`, `moustache`,
+  `goatee`), relative length, coverage and density (0..1), and colour text.
+  Scene Builder's Look → Face → Beard region edits it; scene save, undo and
+  recovery retain it. Its words override the legacy `facial_hair` phrase and
+  reach the face pass. `beard_mask_buffers` samples visible head pixels from
+  `id_render` in the posed head's local frame: coarse jaw/chin/cheek/upper-lip
+  bands, clipped to that person's ownership after feathering. These are
+  approximate anatomical regions, not individual hairs or a detailed face mesh.
+  `generation` supplies these masks through the existing `character_regions`
+  conditioning even for one unnamed person, independently of the character
+  regional-prompting checkbox. Supporting workflows (currently Z-Image HQ)
+  consume them; others keep the words. No added dependency.
+  **The beard pass** (2026-10-02: scene render -> identity pass ->
+  beard pass -> final): the head swap and FaceFusion redraw a face from a
+  photo, which can shave the chosen beard or bring the photo's. So
+  `Studio._finish_passes` redraws each beard after the eye pass and before
+  the hands and glasses, on the picture's own model, only inside the
+  scene's mask (`beard_regions` reads `character_regions` of kind
+  `facial_hair`; `beard_spots` scales the mask's box to the picture;
+  `beard_shape_png` is the crop's `shape` for `face_graph`), in that
+  beard's own words at `BEARD_DENOISE`. It runs with or without a swap,
+  and needs SAM3 only to find the faces: a beard whose middle is not on a
+  found face (the pose put the head elsewhere) is left and said in the
+  notes, never painted on a neck or a wall. `settings["beard_pass"] = False`
+  turns it off (no Generate checkbox yet). Offline coverage: `test_beard.py`,
+  the Scene Builder inspector test and three `test_finish_line.py` tests.
+  `BEARD_DENOISE` 0.7, from the live run below.
+  **The drawn face's landmarks bound the beard** (2026-10-02, the user: not
+  the jaw alone). The scene sends each beard region its pose map's 68 face
+  dots (`face_dots`, iBUG order, from `pose_figures`) and its look (`beard`).
+  `Studio._drawn_landmarks` asks `LANDMARK_NODE` (`StudioFaceLandmarks`, in
+  `comfy_nodes/studio_facepaste` beside the face paste: InsightFace's
+  `landmark_3d_68`, whose numbering *is* in order round the jaw, unlike the
+  2d106 outline) for the drawn face at each SAM3 face. `shape_beard` fits the
+  scene's dots to the drawn ones on the lower face (jaw, nostrils, lips: a
+  rotation, scale and shift), moves the mask with them, then `beard_zones`
+  bounds it: jaw/chin the lower edge (pushed out by the beard's length,
+  `BEARD_BELOW`); the lips grown by `LIP_CLEAR` always clear; the upper lip
+  (nostrils to the lip's edge) the moustache's place, filled; the nose above
+  the nostrils clear, the moustache's upper edge; the cheeks' upper beard line
+  from the jaw (by the ear at coverage 1, halfway to the chin at 0) to the
+  nostril's wing or the mouth's corner - above it trimmed, below it filled.
+  Moustache and goatee get only their own zones. A cheek turned away
+  (`FAR_SIDE`) is trimmed, never filled. A drawn face too unlike the scene's
+  (`FIT_SCALE`, `FIT_TURN`, `FIT_SHAPE`) gets the zones alone; no drawn face
+  near the scene's keeps the scene's mask. Each beard's outcome is a note. No
+  node (not installed, or ComfyUI not restarted since) or no answer: the
+  scene's masks as before, said in the notes. Checked offline and on real
+  InsightFace points from ComfyUI's venv (the zones drawn on three pictures).
+  **Live, 2026-10-02** (`tools/run_beard_pass.py`: two prepared Oktoberfest
+  scenes, the person made the sitter with a short beard, Z-Image Turbo, the
+  sitter's Klein 9B head swap and FaceFusion): the first draw had a full beard and the head
+  swap shaved it both times - the case this pass is for. The zones landed
+  right (moustache on the upper lip, lips and nose clean, the cheek line). At
+  strength 0.5 the beard came back as a shadow, at 0.7 as a natural
+  close-cropped beard, at 0.85 fuller but with the jaw's skin paled and a
+  painted edge on the neck: 0.7 kept. Both times the drawn face was 1.36x the
+  scene's dots (the head swap draws the head bigger than the first draw did),
+  past `FIT_SCALE`, so the beard came from the zones alone - which looked
+  right; the fit has not yet been seen to move a mask live. `BEARD_BELOW`,
+  `LIP_CLEAR` and `FAR_SIDE` are still untuned (no long beard, no turned head
+  past 12 degrees yet).
 - **Stdlib, like everything else.** The meshes are built in code, the renderer is a
   painter's algorithm with back-face culling and near-plane clipping (a prop's faces are
   cut into ~0.3 m `tiles`, or a wall running away from the camera sorts by its middle
@@ -4679,6 +4758,12 @@ folder are exactly that, and their `serve()` loops are gone.
   the final face swap; failure leaves that checkpoint available in History.
 - `JobQueue.cancel()` may be called by Tk: set its event immediately, send network
   interruption on a worker, and let the UI show Cancelling until the job settles.
+  `ComfyUIClient.listen_for_progress` also stops its own prompt when it sees that
+  event: cancellation may have happened while `/prompt` was in flight, before the
+  queue knew its id. `_run_pass` opens its progress socket before submission and
+  closes it even when submission fails. An error or interruption in history makes
+  that pass fail even if an earlier node wrote a picture; the finishing fallback
+  then keeps the last good picture.
 - Repeat seed uses current library records and model files, and the record's own
   prompt. Do not describe it as exact recipe replay. `tests/test_finish_line.py`
   covers the recovery boundaries offline.
