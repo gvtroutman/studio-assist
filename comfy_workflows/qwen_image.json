@@ -1,7 +1,7 @@
 {
   "id": "qwen_image",
   "label": "Qwen-Image",
-  "about": "Qwen-Image text to image, ComfyUI's own recipe: the 20B MMDiT (UNETLoader), Qwen2.5-VL 7B as its text encoder (CLIPLoader type qwen_image), its own VAE, ModelSamplingAuraFlow at shift 3.1, KSampler euler on simple at 20 steps and cfg 2.5 with a written negative, on an SD3 latent. Model-only LoRAs. A pose (OpenPose stick figure) goes through InstantX's Qwen-Image ControlNet Union (ComfyUI's own Qwen-Image InstantX ControlNet recipe: ControlNetLoader and ControlNetApplyAdvanced with the VAE) on the positive and negative, so the model is not patched and the face pass samples node 4 as the picture did. The face pass redraws each face crop on that model at the picture's own CFG with the written negative (`face_denoise`). Apache 2.0, so its pictures may be sold; a community checkpoint from the Checkpoints tab runs on this graph with its own file as `model`. A composition (depth map) goes through the same ControlNet, chained after the pose (node 54), as FLUX's does. The refine pass (`refine`) enlarges the picture by lanczos (`upscale`) and redraws it lightly (`refine_denoise`) on node 4 with the unposed conditioning at the picture's CFG, tiled VAE either side: a pose or depth map made for the first size would pull the enlarged one out of place. No source picture yet.",
+  "about": "Qwen-Image text to image, ComfyUI's own recipe: the 20B MMDiT (UNETLoader), Qwen2.5-VL 7B as its text encoder (CLIPLoader type qwen_image), its own VAE, ModelSamplingAuraFlow at shift 3.1, KSampler euler on simple at 20 steps and cfg 2.5 with a written negative, on an SD3 latent. Model-only LoRAs. A pose (OpenPose stick figure) goes through InstantX's Qwen-Image ControlNet Union (ComfyUI's own Qwen-Image InstantX ControlNet recipe: ControlNetLoader and ControlNetApplyAdvanced with the VAE) on the positive and negative, so the model is not patched and the face pass samples node 4 as the picture did. The face pass redraws each face crop on that model at the picture's own CFG with the written negative (`face_denoise`). Apache 2.0, so its pictures may be sold; a community checkpoint from the Checkpoints tab runs on this graph with its own file as `model`. A composition (depth map) goes through the same ControlNet, chained after the pose (node 54), as FLUX's does. The refine pass (`refine`) enlarges the picture by lanczos (`upscale`) and redraws it lightly (`refine_denoise`) on node 4 with the unposed conditioning at the picture's CFG, tiled VAE either side: a pose or depth map made for the first size would pull the enlarged one out of place. A source picture is encoded as the starting latent (nodes 21-22, as FLUX's) and redrawn at `denoise`, 0.65 unless the form says (`source_denoise`).",
   "families": [
     "qwen-image"
   ],
@@ -28,7 +28,8 @@
     "refine_steps": 10,
     "refine_denoise": 0.3,
     "refine_sampler": "euler",
-    "refine_scheduler": "simple"
+    "refine_scheduler": "simple",
+    "denoise": 1.0
   },
   "files": {
     "model": "diffusion_models",
@@ -51,7 +52,9 @@
       "51",
       "52",
       "53",
-      "54"
+      "54",
+      "21",
+      "22"
     ],
     "sampling": [
       "40"
@@ -122,7 +125,8 @@
         "width": "{{width}}",
         "height": "{{height}}",
         "batch_size": 1
-      }
+      },
+      "_unless": "source_image"
     },
     "40": {
       "class_type": "KSampler",
@@ -133,16 +137,13 @@
         ],
         "positive": "{{controlled_positive}}",
         "negative": "{{controlled_negative}}",
-        "latent_image": [
-          "20",
-          0
-        ],
+        "latent_image": "{{latent}}",
         "seed": "{{seed}}",
         "steps": "{{steps}}",
         "cfg": "{{guidance}}",
         "sampler_name": "{{sampler}}",
         "scheduler": "{{scheduler}}",
-        "denoise": 1.0
+        "denoise": "{{denoise}}"
       }
     },
     "41": {
@@ -316,6 +317,27 @@
         "temporal_size": 64,
         "temporal_overlap": 8
       }
+    },
+    "21": {
+      "_when": "source_image",
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "{{source_image}}"
+      }
+    },
+    "22": {
+      "_when": "source_image",
+      "class_type": "VAEEncode",
+      "inputs": {
+        "pixels": [
+          "21",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
     }
   },
   "needs": {
@@ -328,7 +350,8 @@
   },
   "references": {
     "pose": "pose_image",
-    "composition": "composition_image"
+    "composition": "composition_image",
+    "source": "source_image"
   },
   "switches": {
     "posed_positive": {
@@ -379,6 +402,17 @@
         "41",
         0
       ]
+    },
+    "latent": {
+      "when": "source_image",
+      "then": [
+        "22",
+        0
+      ],
+      "else": [
+        "20",
+        0
+      ]
     }
   },
   "face_detail": {
@@ -411,5 +445,6 @@
         }
       }
     }
-  }
+  },
+  "source_denoise": 0.65
 }
