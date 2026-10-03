@@ -838,6 +838,17 @@ def _default_models():
                       "scheduler": "simple", "width": 1024, "height": 1024},
          "notes": "Fast photographic model and the default: the 5090 when it has the "
                   "files, else the 3090."},
+        # ComfyUI's own Qwen-Image template's files. Apache 2.0: the base the
+        # Checkpoints tab's Qwen-Image checkpoints are copied from.
+        {"id": "qwen-image", "label": "Qwen-Image", "family": "qwen-image",
+         "workflow": "qwen_image",
+         "values": {"model": "qwen_image_fp8_e4m3fn.safetensors",
+                    "encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                    "vae": "qwen_image_vae.safetensors"},
+         "defaults": {"steps": 20, "guidance": 2.5, "sampler": "euler",
+                      "scheduler": "simple", "width": 1328, "height": 1328},
+         "notes": "Qwen-Image 20B, fp8: strong at text in pictures and at following long "
+                  "prompts. Apache 2.0, so its pictures may be sold."},
         {"id": "klein-9b", "label": "FLUX.2 Klein 9B base", "family": "flux2-klein9b",
          "workflow": "klein9b_base",
          "values": {"model": "flux-2-klein-base-9b.safetensors",
@@ -944,6 +955,29 @@ class Library:
         self.problems = []
         self.data = {kind: self._load(kind) for kind in CLEAN}
 
+    # Default models added after a library was made: each joins it once (a
+    # model removed afterwards stays removed), remembered in models-added.json.
+    ADDED_MODELS = ("qwen-image",)
+
+    def _added_defaults(self, raw):
+        mark = os.path.join(self.root, "models-added.json")
+        try:
+            with open(mark, encoding="utf-8") as f:
+                done = set(json.load(f))
+        except (OSError, ValueError, TypeError):
+            done = set()
+        have = {d.get("id") for d in raw if isinstance(d, dict)}
+        new = [d for d in _default_models() if d["id"] in self.ADDED_MODELS
+               and d["id"] not in done and d["id"] not in have]
+        if new:
+            try:
+                with open(mark + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(sorted(done | set(self.ADDED_MODELS)), f)
+                os.replace(mark + ".tmp", mark)
+            except OSError:
+                return []         # not remembered, so not added: it would come back
+        return new
+
     def _path(self, kind):
         return os.path.join(self.root, kind + ".json")
 
@@ -958,6 +992,8 @@ class Library:
                                      % (path, e))
         if not isinstance(raw, list):
             raw = DEFAULTS[kind]()
+        elif kind == "models":
+            raw = raw + self._added_defaults(raw)
         out, seen = [], set()
         for d in raw:
             rec = CLEAN[kind](d)

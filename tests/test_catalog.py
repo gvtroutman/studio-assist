@@ -106,7 +106,7 @@ class TestFits(unittest.TestCase):
             {"id": "off", "file": "o.safetensors", "name": "Alpha", "family": "z-image",
              "enabled": False},
             {"id": "f", "file": "f.safetensors", "family": "flux1"},
-            {"id": "q", "file": "q.safetensors", "family": "qwen-image"},
+            {"id": "q", "file": "q.safetensors", "family": "sd15"},
             {"id": "u", "file": "u.safetensors"}])
         fits, unknown = catalog.sorted_for(lib, lib.get("models", "z-image-turbo"))
         self.assertEqual([r["id"] for r in fits], ["z", "off"])      # on first
@@ -239,9 +239,9 @@ class TestLicenses(unittest.TestCase):
     def test_models_are_listed_by_license_keeping_their_order(self):
         lib = ig.Library(tempfile.mkdtemp())
         ordered = [m["id"] for m in ig.by_license(lib.all("models"), ig.model_license)]
-        self.assertEqual(ordered[0], "z-image-turbo")
-        self.assertEqual(ordered[1:3], ["flux-dev", "withanyone"])
-        self.assertEqual(ordered[3:], ["klein-9b", "klein-9b-distilled"])
+        self.assertEqual(ordered[:2], ["z-image-turbo", "qwen-image"])
+        self.assertEqual(ordered[2:4], ["flux-dev", "withanyone"])
+        self.assertEqual(ordered[4:], ["klein-9b", "klein-9b-distilled"])
 
     def test_records_keep_a_license_and_drop_a_made_up_group(self):
         rec = ig.clean_lora({"file": "a.safetensors", "license_group": "commercial",
@@ -300,6 +300,30 @@ class TestCheckpoints(unittest.TestCase):
         self.assertEqual(ig.model_license(rec)[0], "commercial")
         with self.assertRaises(civitai.CivitAIError):
             catalog.checkpoint_install(lib, None, dict(c, family="sd15"), "x")
+
+    def test_a_qwen_checkpoint_needs_no_qwen_model_in_the_library(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        lib.save("models", [m for m in lib.all("models") if m["family"] != "qwen-image"])
+        c = catalog.card(dict(HIT, allowCommercialUse=["Image"]), {"z-image"})
+        c.update(family="qwen-image", name="Real Qwen")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(civitai, "download"):
+            rec = catalog.checkpoint_install(lib, None, c, d)
+        self.assertEqual((rec["workflow"], rec["values"]["encoder"]),
+                         ("qwen_image", "qwen_2.5_vl_7b_fp8_scaled.safetensors"))
+
+    def test_qwen_joins_an_existing_library_once(self):
+        root = tempfile.mkdtemp()
+        lib = ig.Library(root)
+        lib.save("models", [m for m in lib.all("models") if m["id"] != "qwen-image"])
+        lib = ig.Library(root)
+        self.assertIsNotNone(lib.get("models", "qwen-image"))
+        lib.save("models", [m for m in lib.all("models") if m["id"] != "qwen-image"])
+        self.assertIsNone(ig.Library(root).get("models", "qwen-image"))      # stays removed
+
+    def test_the_qwen_workflow_builds(self):
+        wf = ig.load_workflow("qwen_image")
+        self.assertEqual(wf["families"], ["qwen-image"])
+        self.assertEqual(wf["graph"]["2"]["inputs"]["type"], "qwen_image")
 
 
 class TestPictures(unittest.TestCase):

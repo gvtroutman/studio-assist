@@ -124,7 +124,11 @@ this PC's files and the web instead. Two moving parts:
   (`checkpoint_search`). Install downloads into a folder the user picks
   (models/checkpoints, or diffusion_models for Z-Image and Qwen-Image) and adds a model
   record copied from one of the same family with `values.model` swapped
-  (`checkpoint_install`); with no model of that family it refuses.
+  (`checkpoint_install`), or from the built-in default of that family when the library
+  has none; with neither it refuses. **Qwen-Image** is a default model (`qwen_image.json`,
+  ComfyUI's own recipe; Apache 2.0), added once to libraries made before it
+  (`Library.ADDED_MODELS`, remembered in `models-added.json`, so a removed one stays
+  removed).
 - **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
