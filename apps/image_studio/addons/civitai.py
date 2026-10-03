@@ -305,6 +305,24 @@ def preview_image(version):
     return best[1] if best else ""
 
 
+def license_of(model):
+    """(group, words) for a CivitAI model from its permission fields.
+    `allowCommercialUse` is a list ("Image" = sell generated pictures, "Rent",
+    "RentCivit", "Sell" = the model itself) or, from older answers, one of
+    those as a string; "None" or empty is no commercial use."""
+    if not isinstance(model, dict) or "allowCommercialUse" not in model:
+        return "unstated", ""
+    uses = model.get("allowCommercialUse")
+    uses = {uses} if isinstance(uses, str) else set(uses or ())
+    uses = {u for u in uses if isinstance(u, str) and u and u != "None"}
+    credit = "" if model.get("allowNoCredit", True) else ", credit the creator"
+    if "Image" in uses:
+        return "commercial", "Sell pictures OK" + credit
+    if uses:
+        return "custom", "Commercial use limited to " + ", ".join(sorted(uses)) + credit
+    return "noncommercial", "No commercial use" + credit
+
+
 def profile(version, model=None):
     """A LoRA record (what `studio_imagegen.clean_lora` takes) from a
     version and, when there is one, its model. Pure."""
@@ -343,7 +361,17 @@ def profile(version, model=None):
             "%s/api/download/models/%s" % (SITE, vid) if vid else ""),
         "_preview_url": preview_image(version),
         "_size": int(float(f.get("sizeKB") or 0) * 1024),
+        **license_fields(model),
     }
+
+
+def license_fields(model):
+    """The record's license fields, when `model` is a whole model answer
+    (a version's own `model` has no permission fields: left to be looked up)."""
+    if not isinstance(model, dict) or "allowCommercialUse" not in model:
+        return {}
+    group, words = license_of(model)
+    return {"license_group": group, "license": words}
 
 
 # ============================================================== the file
@@ -636,7 +664,8 @@ def import_file(lib, client, path, folder="", lora_dirs=(), lookup=True,
                         model = None
                 online = profile(version, model)
                 preview = online["_preview_url"]
-                for k in ("name", "category", "trigger", "family", "notes", "source"):
+                for k in ("name", "category", "trigger", "family", "notes", "source",
+                          "license", "license_group"):
                     if online.get(k):
                         p[k] = online[k]
         except CivitAIError as e:

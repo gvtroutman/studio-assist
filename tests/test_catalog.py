@@ -135,7 +135,7 @@ class TestCatalog(unittest.TestCase):
         self.assertIsNone(catalog.card(HIT, {"qwen-image"}))
 
     def test_a_card_carries_civitais_license(self):
-        lic = catalog.civitai_license
+        lic = civitai.license_of
         self.assertEqual(lic({"allowCommercialUse": ["Image", "Rent"], "allowNoCredit": True}),
                          ("commercial", "Sell pictures OK"))
         self.assertEqual(lic({"allowCommercialUse": "Image", "allowNoCredit": False}),
@@ -224,6 +224,50 @@ class TestCatalog(unittest.TestCase):
     def test_human_counts(self):
         self.assertEqual([catalog.human_count(n) for n in (7, 1500, 187485, 2300000)],
                          ["7", "1.5k", "187k", "2.3M"])
+
+
+class TestLicenses(unittest.TestCase):
+    def test_a_base_model_takes_its_familys_license_unless_set(self):
+        self.assertEqual(ig.model_license({"family": "z-image"}), ("commercial", "Apache 2.0"))
+        self.assertEqual(ig.model_license({"family": "flux1"})[0], "custom")
+        self.assertEqual(ig.model_license({"family": "krea2"}), ("unstated", ""))
+        klein = {"family": "flux2-klein9b", "license": ig.KLEIN_LICENSE}
+        self.assertEqual(ig.model_license(klein), ("noncommercial", ig.KLEIN_LICENSE))
+        self.assertEqual(ig.model_license({"family": "flux1", "license_group": "commercial"}),
+                         ("commercial", ""))
+
+    def test_models_are_listed_by_license_keeping_their_order(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        ordered = [m["id"] for m in ig.by_license(lib.all("models"), ig.model_license)]
+        self.assertEqual(ordered[0], "z-image-turbo")
+        self.assertEqual(ordered[1:3], ["flux-dev", "withanyone"])
+        self.assertEqual(ordered[3:], ["klein-9b", "klein-9b-distilled"])
+
+    def test_records_keep_a_license_and_drop_a_made_up_group(self):
+        rec = ig.clean_lora({"file": "a.safetensors", "license_group": "commercial",
+                             "license": "Sell pictures OK"})
+        self.assertEqual((rec["license_group"], rec["license"]),
+                         ("commercial", "Sell pictures OK"))
+        self.assertEqual(ig.clean_lora({"file": "a.safetensors",
+                                        "license_group": "free"})["license_group"], "")
+        self.assertEqual(ig.lora_license({"license_group": ""}), ("unstated", ""))
+        self.assertEqual(ig.clean_model({"id": "m", "license_group": "noncommercial"})[
+            "license_group"], "noncommercial")
+
+    def test_installed_loras_are_listed_by_license(self):
+        lib = lib_with([{"file": "a.safetensors", "name": "A"},
+                        {"file": "b.safetensors", "name": "B", "license_group": "noncommercial"},
+                        {"file": "c.safetensors", "name": "C", "license_group": "commercial"}])
+        self.assertEqual([r["name"] for r in catalog.by_license(lib.all("loras"))],
+                         ["C", "B", "A"])
+
+    def test_an_import_takes_the_license_only_from_a_whole_model(self):
+        whole = dict(HIT, allowCommercialUse=["Image"], allowNoCredit=False)
+        p = civitai.profile(version(1, "ZImageBase"), whole)
+        self.assertEqual((p["license_group"], p["license"]),
+                         ("commercial", "Sell pictures OK, credit the creator"))
+        partial = civitai.profile(dict(version(1, "ZImageBase"), model={"name": "Hands"}))
+        self.assertNotIn("license_group", partial)
 
 
 class TestPictures(unittest.TestCase):
