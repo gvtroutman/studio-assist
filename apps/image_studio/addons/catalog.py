@@ -203,7 +203,9 @@ def checkpoint_install(lib, client, c, folder, say=lambda t: None, stop=None):
     """A checkpoint downloaded into `folder` and added as a model -> the
     model record. It copies a model of the same family (workflow, encoders,
     defaults) with its main file swapped, so it needs one to copy."""
-    like = next((m for m in lib.all("models") if m.get("family") == c["family"]), None)
+    like = next((m for m in lib.all("models") if m.get("family") == c["family"]), None) or \
+        next((ig.clean_model(m) for m in ig._default_models()
+              if m["family"] == c["family"]), None)
     if like is None:
         raise civitai.CivitAIError("No %s model in your library to base it on; add one in "
                                    "Models… first." % ig.FAMILIES.get(c["family"], c["family"]))

@@ -1,0 +1,25 @@
+{
+  "id": "qwen_image",
+  "label": "Qwen-Image",
+  "about": "Qwen-Image text to image, ComfyUI's own recipe: the 20B MMDiT (UNETLoader), Qwen2.5-VL 7B as its text encoder (CLIPLoader type qwen_image), its own VAE, ModelSamplingAuraFlow at shift 3.1, KSampler euler on simple at 20 steps and cfg 2.5 with a written negative, on an SD3 latent. Model-only LoRAs. Apache 2.0, so its pictures may be sold; a community checkpoint from the Checkpoints tab runs on this graph with its own file as `model`. No pose, references, face pass or refine pass yet.",
+  "families": ["qwen-image"],
+  "defaults": {"steps": 20, "guidance": 2.5, "sampler": "euler", "scheduler": "simple",
+               "width": 1328, "height": 1328, "shift": 3.1, "negative": "",
+               "weight_dtype": "default", "encoder_device": "default",
+               "filename_prefix": "ImageStudio/qwen"},
+  "files": {"model": "diffusion_models", "encoder": "text_encoders", "vae": "vae"},
+  "lora_chain": {"model": ["1", 0]},
+  "stages": {"loading": ["1", "2", "3"], "sampling": ["40"], "decoding": ["41", "9"]},
+  "graph": {
+    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "{{model}}", "weight_dtype": "{{weight_dtype}}"}},
+    "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "{{encoder}}", "type": "qwen_image", "device": "{{encoder_device}}"}},
+    "3": {"class_type": "VAELoader", "inputs": {"vae_name": "{{vae}}"}},
+    "4": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": "{{model_out}}", "shift": "{{shift}}"}},
+    "10": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{prompt}}", "clip": ["2", 0]}},
+    "12": {"class_type": "CLIPTextEncode", "inputs": {"text": "{{negative}}", "clip": ["2", 0]}},
+    "20": {"class_type": "EmptySD3LatentImage", "inputs": {"width": "{{width}}", "height": "{{height}}", "batch_size": 1}},
+    "40": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["10", 0], "negative": ["12", 0], "latent_image": ["20", 0], "seed": "{{seed}}", "steps": "{{steps}}", "cfg": "{{guidance}}", "sampler_name": "{{sampler}}", "scheduler": "{{scheduler}}", "denoise": 1.0}},
+    "41": {"class_type": "VAEDecode", "inputs": {"samples": ["40", 0], "vae": ["3", 0]}},
+    "9": {"class_type": "SaveImage", "inputs": {"images": ["41", 0], "filename_prefix": "{{filename_prefix}}"}}
+  }
+}
