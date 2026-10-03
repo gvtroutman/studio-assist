@@ -325,6 +325,47 @@ class TestCheckpoints(unittest.TestCase):
         self.assertEqual(wf["families"], ["qwen-image"])
         self.assertEqual(wf["graph"]["2"]["inputs"]["type"], "qwen_image")
 
+    QWEN_FILES = {"diffusion_models": {"qwen_image_fp8_e4m3fn.safetensors"},
+                  "text_encoders": {"qwen_2.5_vl_7b_fp8_scaled.safetensors"},
+                  "vae": {"qwen_image_vae.safetensors"},
+                  "controlnet": {"Qwen-Image-InstantX-ControlNet-Union.safetensors"},
+                  "checkpoints": {"sam3.pt"}}
+
+    def qwen_plan(self, inventory):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        pose = os.path.join(studio.lib.root, "pose.png")
+        with open(pose, "wb") as f:
+            f.write(PNG)
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="a woman waving on a beach",
+                 references={"pose": pose}, face_detail=True)
+        return ig.compose(s, studio.lib, studio.backend("5090"), inventory)
+
+    def test_qwen_takes_a_pose_through_its_controlnet_and_has_a_face_pass(self):
+        p = self.qwen_plan(self.QWEN_FILES)
+        self.assertEqual((p.errors, p.warnings), ([], []))
+        self.assertIn("pose_image", p.images)
+        self.assertTrue(p.values["face_detail"])
+        g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"), p.loras)
+        self.assertEqual(g["40"]["inputs"]["positive"], ["52", 0])
+        self.assertEqual(g["52"]["class_type"], "ControlNetApplyAdvanced")
+
+    def test_qwen_without_its_controlnet_says_so_and_drops_the_pose(self):
+        p = self.qwen_plan(dict(self.QWEN_FILES, controlnet=set()))
+        self.assertNotIn("pose_image", p.images)
+        self.assertTrue(any("ControlNet-Union" in w for w in p.warnings))
+
+    def test_the_qwen_face_pass_redraws_on_the_unposed_model(self):
+        wf = ig.load_workflow("qwen_image")
+        v = dict(wf["defaults"], model="m", encoder="e", vae="v", prompt="p", seed=1,
+                 face_prompt="a face", sam3="sam3.pt")
+        g = ig.face_graph(wf, v, [], "pic.png", [{"x": 0, "y": 0, "width": 256,
+                                                  "height": 256}], "oval.png", "F")
+        samplers = [n for n in g.values() if n["class_type"] == "KSampler"]
+        self.assertEqual([(n["inputs"]["model"], n["inputs"]["cfg"]) for n in samplers],
+                         [(["4", 0], 2.5)])
+        self.assertFalse(any("ControlNet" in n["class_type"] for n in g.values()))
+
 
 class TestPictures(unittest.TestCase):
     def test_png_is_kept_and_anything_else_is_converted_once(self):
