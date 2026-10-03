@@ -4,6 +4,7 @@ Recycle Bin. CivitAI is a table of canned answers; the one live piece is the
 PowerShell picture conversion, run on a BMP this test writes."""
 
 import base64
+import json
 import os
 import struct
 import sys
@@ -349,6 +350,28 @@ class TestCheckpoints(unittest.TestCase):
         g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"), p.loras)
         self.assertEqual(g["40"]["inputs"]["positive"], ["52", 0])
         self.assertEqual(g["52"]["class_type"], "ControlNetApplyAdvanced")
+
+    def test_qwen_chains_composition_after_pose_and_refines(self):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        refs = {}
+        for kind in ("pose", "composition"):
+            refs[kind] = os.path.join(studio.lib.root, kind + ".png")
+            with open(refs[kind], "wb") as f:
+                f.write(PNG)
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="a woman on a beach", references=refs, refine=True)
+        p = ig.compose(s, studio.lib, studio.backend("5090"), self.QWEN_FILES)
+        self.assertEqual((p.errors, p.warnings), ([], []))
+        self.assertEqual(sorted(p.images), ["composition_image", "pose_image"])
+        g = ig.fill(p.workflow, dict(p.values, pose_image="a", composition_image="b"),
+                    p.loras)
+        self.assertEqual(g["54"]["inputs"]["positive"], ["52", 0])     # depth after pose
+        self.assertEqual(g["40"]["inputs"]["positive"], ["54", 0])
+        self.assertEqual(g["9"]["inputs"]["images"], ["45", 0])        # the refined one
+        # The refine redraws the enlarged picture unposed, on the plain model.
+        self.assertEqual((g["44"]["inputs"]["model"], g["44"]["inputs"]["positive"]),
+                         (["4", 0], ["10", 0]))
+        self.assertNotIn("{{", json.dumps(g))
 
     def test_qwen_without_its_controlnet_says_so_and_drops_the_pose(self):
         p = self.qwen_plan(dict(self.QWEN_FILES, controlnet=set()))
