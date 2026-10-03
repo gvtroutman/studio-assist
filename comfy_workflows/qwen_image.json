@@ -1,7 +1,7 @@
 {
   "id": "qwen_image",
   "label": "Qwen-Image",
-  "about": "Qwen-Image text to image, ComfyUI's own recipe: the 20B MMDiT (UNETLoader), Qwen2.5-VL 7B as its text encoder (CLIPLoader type qwen_image), its own VAE, ModelSamplingAuraFlow at shift 3.1, KSampler euler on simple at 20 steps and cfg 2.5 with a written negative, on an SD3 latent. Model-only LoRAs. A pose (OpenPose stick figure) goes through InstantX's Qwen-Image ControlNet Union (ComfyUI's own Qwen-Image InstantX ControlNet recipe: ControlNetLoader and ControlNetApplyAdvanced with the VAE) on the positive and negative, so the model is not patched and the face pass samples node 4 as the picture did. The face pass redraws each face crop on that model at the picture's own CFG with the written negative (`face_denoise`). Apache 2.0, so its pictures may be sold; a community checkpoint from the Checkpoints tab runs on this graph with its own file as `model`. No source picture, composition or refine pass yet.",
+  "about": "Qwen-Image text to image, ComfyUI's own recipe: the 20B MMDiT (UNETLoader), Qwen2.5-VL 7B as its text encoder (CLIPLoader type qwen_image), its own VAE, ModelSamplingAuraFlow at shift 3.1, KSampler euler on simple at 20 steps and cfg 2.5 with a written negative, on an SD3 latent. Model-only LoRAs. A pose (OpenPose stick figure) goes through InstantX's Qwen-Image ControlNet Union (ComfyUI's own Qwen-Image InstantX ControlNet recipe: ControlNetLoader and ControlNetApplyAdvanced with the VAE) on the positive and negative, so the model is not patched and the face pass samples node 4 as the picture did. The face pass redraws each face crop on that model at the picture's own CFG with the written negative (`face_denoise`). Apache 2.0, so its pictures may be sold; a community checkpoint from the Checkpoints tab runs on this graph with its own file as `model`. A composition (depth map) goes through the same ControlNet, chained after the pose (node 54), as FLUX's does. The refine pass (`refine`) enlarges the picture by lanczos (`upscale`) and redraws it lightly (`refine_denoise`) on node 4 with the unposed conditioning at the picture's CFG, tiled VAE either side: a pose or depth map made for the first size would pull the enlarged one out of place. No source picture yet.",
   "families": [
     "qwen-image"
   ],
@@ -20,7 +20,15 @@
     "controlnet": "Qwen-Image-InstantX-ControlNet-Union.safetensors",
     "pose_strength": 0.9,
     "pose_end": 0.6,
-    "face_denoise": 0.4
+    "face_denoise": 0.4,
+    "composition_strength": 0.55,
+    "composition_end": 0.5,
+    "refine": false,
+    "upscale": 1.5,
+    "refine_steps": 10,
+    "refine_denoise": 0.3,
+    "refine_sampler": "euler",
+    "refine_scheduler": "simple"
   },
   "files": {
     "model": "diffusion_models",
@@ -41,7 +49,9 @@
       "3",
       "50",
       "51",
-      "52"
+      "52",
+      "53",
+      "54"
     ],
     "sampling": [
       "40"
@@ -49,6 +59,12 @@
     "decoding": [
       "41",
       "9"
+    ],
+    "refining": [
+      "42",
+      "43",
+      "44",
+      "45"
     ]
   },
   "graph": {
@@ -115,8 +131,8 @@
           "4",
           0
         ],
-        "positive": "{{posed_positive}}",
-        "negative": "{{posed_negative}}",
+        "positive": "{{controlled_positive}}",
+        "negative": "{{controlled_negative}}",
         "latent_image": [
           "20",
           0
@@ -145,15 +161,15 @@
     "9": {
       "class_type": "SaveImage",
       "inputs": {
-        "images": [
-          "41",
-          0
-        ],
+        "images": "{{final}}",
         "filename_prefix": "{{filename_prefix}}"
       }
     },
     "50": {
-      "_when": "pose_image",
+      "_when": [
+        "pose_image",
+        "composition_image"
+      ],
       "class_type": "ControlNetLoader",
       "inputs": {
         "control_net_name": "{{controlnet}}"
@@ -194,15 +210,125 @@
           0
         ]
       }
+    },
+    "53": {
+      "_when": "composition_image",
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "{{composition_image}}"
+      }
+    },
+    "54": {
+      "_when": "composition_image",
+      "class_type": "ControlNetApplyAdvanced",
+      "inputs": {
+        "positive": "{{posed_positive}}",
+        "negative": "{{posed_negative}}",
+        "control_net": [
+          "50",
+          0
+        ],
+        "image": [
+          "53",
+          0
+        ],
+        "strength": "{{composition_strength}}",
+        "start_percent": 0.0,
+        "end_percent": "{{composition_end}}",
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "42": {
+      "_when": "refine",
+      "class_type": "ImageScaleBy",
+      "inputs": {
+        "image": [
+          "41",
+          0
+        ],
+        "upscale_method": "lanczos",
+        "scale_by": "{{upscale}}"
+      }
+    },
+    "43": {
+      "_when": "refine",
+      "class_type": "VAEEncodeTiled",
+      "inputs": {
+        "pixels": [
+          "42",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ],
+        "tile_size": 1024,
+        "overlap": 128,
+        "temporal_size": 64,
+        "temporal_overlap": 8
+      }
+    },
+    "44": {
+      "_when": "refine",
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "4",
+          0
+        ],
+        "seed": "{{seed}}",
+        "steps": "{{refine_steps}}",
+        "cfg": "{{guidance}}",
+        "sampler_name": "{{refine_sampler}}",
+        "scheduler": "{{refine_scheduler}}",
+        "positive": [
+          "10",
+          0
+        ],
+        "negative": [
+          "12",
+          0
+        ],
+        "latent_image": [
+          "43",
+          0
+        ],
+        "denoise": "{{refine_denoise}}"
+      }
+    },
+    "45": {
+      "_when": "refine",
+      "class_type": "VAEDecodeTiled",
+      "inputs": {
+        "samples": [
+          "44",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ],
+        "tile_size": 1024,
+        "overlap": 128,
+        "temporal_size": 64,
+        "temporal_overlap": 8
+      }
     }
   },
   "needs": {
     "pose_image": [
       "controlnet"
+    ],
+    "composition_image": [
+      "controlnet"
     ]
   },
   "references": {
-    "pose": "pose_image"
+    "pose": "pose_image",
+    "composition": "composition_image"
   },
   "switches": {
     "posed_positive": {
@@ -224,6 +350,33 @@
       ],
       "else": [
         "12",
+        0
+      ]
+    },
+    "controlled_positive": {
+      "when": "composition_image",
+      "then": [
+        "54",
+        0
+      ],
+      "else": "{{posed_positive}}"
+    },
+    "controlled_negative": {
+      "when": "composition_image",
+      "then": [
+        "54",
+        1
+      ],
+      "else": "{{posed_negative}}"
+    },
+    "final": {
+      "when": "refine",
+      "then": [
+        "45",
+        0
+      ],
+      "else": [
+        "41",
         0
       ]
     }
