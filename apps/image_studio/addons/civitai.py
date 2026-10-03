@@ -207,12 +207,12 @@ class Client:
                 return None
             raise
 
-    def search(self, bases, query="", sort=SORTS[0], cursor="", limit=24):
+    def search(self, bases, query="", sort=SORTS[0], cursor="", limit=24, types="LORA"):
         """One page of LoRAs filed under any of `bases` (CivitAI's own
         `baseModel` names, FAMILY_BASES) -> (models, next cursor or "").
         Always cursor paging: CivitAI refuses page numbers with a query.
         `nsfw=false` leaves out models their creators marked as adult."""
-        params = [("types", "LORA"), ("sort", sort if sort in SORTS else SORTS[0]),
+        params = [("types", types), ("sort", sort if sort in SORTS else SORTS[0]),
                   ("limit", str(int(limit))), ("nsfw", "false")]
         params += [("baseModels", b) for b in bases]
         if query.strip():

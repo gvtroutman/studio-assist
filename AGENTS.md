@@ -118,6 +118,13 @@ this PC's files and the web instead. Two moving parts:
   `license` note (written into each picture) is left as it is.
   `flux-1-dev-non-commercial-license` is own terms, not non-commercial: it lets the
   pictures be used commercially.
+  **Checkpoints tab.** CivitAI `types=Checkpoint` for the families whose base license is
+  commercial (`catalog.checkpoint_families`), Pony and Illustrious bases left out (own
+  licenses), and only checkpoints whose own `allowCommercialUse` has "Image" shown
+  (`checkpoint_search`). Install downloads into a folder the user picks
+  (models/checkpoints, or diffusion_models for Z-Image and Qwen-Image) and adds a model
+  record copied from one of the same family with `values.model` swapped
+  (`checkpoint_install`); with no model of that family it refuses.
 - **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.

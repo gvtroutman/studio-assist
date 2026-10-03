@@ -156,6 +156,7 @@ def card(model, families):
             "sha256": ((f.get("hashes") or {}).get("SHA256") or "").lower(),
             "preview_url": safe_preview(version),
             "link": civitai.page_url(mid, vid),
+            "download": version.get("downloadUrl") or f.get("downloadUrl") or "",
             "license_group": group,
             "license": terms,
         }
@@ -171,6 +172,52 @@ def search(client, model, query="", sort=civitai.SORTS[0], cursor=""):
     hits, nxt = client.search(bases, query, sort, cursor)
     cards = [c for c in (card(m, families) for m in hits) if c]
     return cards, nxt
+
+
+# ============================================================ checkpoints
+# Community checkpoints of the architectures whose pictures may be sold
+# (imagegen.FAMILY_LICENSES "commercial"), keeping only the checkpoints whose
+# own CivitAI license allows it too. Pony and Illustrious are SDXL underneath
+# but carry their own licenses, so they are not searched.
+OWN_LICENSE_BASES = ("Pony", "Illustrious")
+
+
+def checkpoint_families():
+    return [f for f, (g, _w) in ig.FAMILY_LICENSES.items()
+            if g == "commercial" and civitai.FAMILY_BASES.get(f)]
+
+
+def checkpoint_search(client, family, query="", sort=civitai.SORTS[0], cursor=""):
+    """One page of commercially usable checkpoints of `family` -> (cards,
+    next cursor, how many were left out for their license)."""
+    bases = [b for b in civitai.FAMILY_BASES.get(family, ()) if b not in OWN_LICENSE_BASES]
+    if not bases:
+        return [], "", 0
+    hits, nxt = client.search(bases, query, sort, cursor, types="Checkpoint")
+    cards = [c for c in (card(m, {family}) for m in hits) if c]
+    keep = [c for c in cards if c["license_group"] == "commercial"]
+    return keep, nxt, len(cards) - len(keep)
+
+
+def checkpoint_install(lib, client, c, folder, say=lambda t: None, stop=None):
+    """A checkpoint downloaded into `folder` and added as a model -> the
+    model record. It copies a model of the same family (workflow, encoders,
+    defaults) with its main file swapped, so it needs one to copy."""
+    like = next((m for m in lib.all("models") if m.get("family") == c["family"]), None)
+    if like is None:
+        raise civitai.CivitAIError("No %s model in your library to base it on; add one in "
+                                   "Models… first." % ig.FAMILIES.get(c["family"], c["family"]))
+
+    def progress(done, total):
+        say("Downloading %s: %d of %d MB" % (c["file"], done >> 20, max(total, done) >> 20))
+    civitai.download(client, c["download"], folder, c["file"], c["sha256"], progress, stop)
+    rec = dict(like, id=ig.unique_id(ig.slug(c["name"]), {m["id"] for m in lib.all("models")}),
+               label=c["name"], values=dict(like.get("values") or {}, model=c["file"]),
+               license_group="commercial", license="",
+               notes="From CivitAI: %s\nLicense: %s" % (c["link"], c["license"]))
+    rec.pop("backends", None)
+    lib.save("models", lib.all("models") + [rec])
+    return lib.get("models", rec["id"])
 
 
 def installed_as(lib, c):
