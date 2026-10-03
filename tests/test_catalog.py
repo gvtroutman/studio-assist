@@ -373,6 +373,23 @@ class TestCheckpoints(unittest.TestCase):
                          (["4", 0], ["10", 0]))
         self.assertNotIn("{{", json.dumps(g))
 
+    def test_qwen_starts_from_a_source_picture(self):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        src = os.path.join(studio.lib.root, "source.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="a woman on a beach", references={"source": src})
+        p = ig.compose(s, studio.lib, studio.backend("5090"), self.QWEN_FILES)
+        self.assertEqual((p.errors, p.warnings), ([], []))
+        self.assertEqual(p.values["denoise"], 0.65)
+        g = ig.fill(p.workflow, dict(p.values, source_image="s.png"), p.loras)
+        self.assertEqual(g["40"]["inputs"]["latent_image"], ["22", 0])
+        self.assertEqual(g["40"]["inputs"]["denoise"], 0.65)
+        self.assertNotIn("20", g)
+        plain = ig.fill(p.workflow, dict(p.values, source_image=None, denoise=1.0), p.loras)
+        self.assertEqual(plain["40"]["inputs"]["latent_image"], ["20", 0])
+
     def test_qwen_without_its_controlnet_says_so_and_drops_the_pose(self):
         p = self.qwen_plan(dict(self.QWEN_FILES, controlnet=set()))
         self.assertNotIn("pose_image", p.images)
