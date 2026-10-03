@@ -105,6 +105,31 @@ this PC's files and the web instead. Two moving parts:
   `<ComfyUI>/custom_nodes/<repo>`, never overwriting and never running anything. No
   tkinter; the tabs are `AddonsWindow`'s "Hugging Face" and "GitHub plugins", and the
   Image Studio header's "App store" opens that window.
+  **Licenses.** Models and LoRAs are listed by license, most freely usable first
+  (`imagegen.LICENSE_GROUPS`: commercial use, own terms, non-commercial, none stated),
+  keeping their own order inside a group (`imagegen.by_license`): the CivitAI and
+  Hugging Face tabs, the Installed tab, the "For" row and the form's model menu (a
+  line between groups). CivitAI's group comes from `allowCommercialUse` ("Image" =
+  selling pictures is allowed), the Hub's from the card's license id (`hf_license`).
+  A LoRA record keeps `license_group` / `license`: set at install, or looked up once a
+  window from its `source` page (`hub.look_up_licenses`, applied on the UI thread);
+  empty is "not known yet", shown as none stated. A base model's is its family's
+  (`FAMILY_LICENSES`) unless the Models editor sets `license_group`; the record's
+  `license` note (written into each picture) is left as it is.
+  `flux-1-dev-non-commercial-license` is own terms, not non-commercial: it lets the
+  pictures be used commercially.
+  **Checkpoints tab.** CivitAI `types=Checkpoint` for the families whose base license is
+  commercial (`catalog.checkpoint_families`), Pony and Illustrious bases left out (own
+  licenses), and only checkpoints whose own `allowCommercialUse` has "Image" shown
+  (`checkpoint_search`). Install downloads into a folder the user picks
+  (models/checkpoints, or diffusion_models for Z-Image and Qwen-Image) and adds a model
+  record copied from one of the same family with `values.model` swapped
+  (`checkpoint_install`), or from the built-in default of that family when the library
+  has none; with neither it refuses. **Qwen-Image** is a default model (`qwen_image.json`,
+  ComfyUI's own recipe; Apache 2.0; a pose through InstantX's Qwen-Image ControlNet
+  Union on the conditioning, and a face pass on the unposed model at its own CFG), added once to libraries made before it
+  (`Library.ADDED_MODELS`, remembered in `models-added.json`, so a removed one stays
+  removed).
 - **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.

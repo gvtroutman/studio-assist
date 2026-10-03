@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 import apps.image_studio.addons.hub as hub  # noqa: E402
+import apps.image_studio.imagegen as ig  # noqa: E402
 
 
 class Answer(io.BytesIO):
@@ -46,6 +47,25 @@ class HuggingFace(unittest.TestCase):
         self.assertEqual([c["id"] for c in cards], ["a/b"])
         self.assertEqual(cards[0]["license"], "mit")
         self.assertIn("base_model%3Aadapter%3Ablack-forest-labs%2FFLUX.1-dev", seen[0])
+
+    def test_license_groups(self):
+        lic = hub.hf_license
+        self.assertEqual(lic("apache-2.0"), ("commercial", "apache-2.0"))
+        self.assertEqual(lic("creativeml-openrail-m")[0], "commercial")
+        self.assertEqual(lic("cc-by-4.0")[0], "commercial")
+        self.assertEqual(lic("cc-by-nc-sa-4.0")[0], "noncommercial")
+        self.assertEqual(lic("other", "my-research-only-license")[0], "noncommercial")
+        self.assertEqual(lic("other", "flux-1-dev-non-commercial-license"),
+                         ("custom", "flux-1-dev-non-commercial-license"))
+        self.assertEqual(lic("other")[0], "custom")
+        self.assertEqual(lic(""), ("unstated", ""))
+
+    def test_search_reads_the_cards_license_name(self):
+        rows = [{"id": "a/b", "downloads": 5, "tags": ["license:other"],
+                 "cardData": {"license": "other", "license_name": "cc-by-nc-4.0"}}]
+        cards = hub.hf_search({"family": "flux1"}, opener=opener({"api/models": rows}))
+        self.assertEqual((cards[0]["license_group"], cards[0]["license"]),
+                         ("noncommercial", "cc-by-nc-4.0"))
 
     def test_pick_largest_top_level_safetensors(self):
         info = {"siblings": [{"rfilename": "x/deep.safetensors", "size": 99},
@@ -85,6 +105,41 @@ class HuggingFace(unittest.TestCase):
                           lambda t: None, None, opener({"/f": body}))
             with open(dest, "rb") as f:
                 self.assertEqual(f.read(), body)
+
+
+class Licenses(unittest.TestCase):
+    class Client:
+        def version(self, vid):
+            return {"id": vid, "modelId": 7}
+
+        def model(self, mid):
+            if mid != 7:
+                raise hub.civitai.CivitAIError("no")
+            return {"id": 7, "allowCommercialUse": ["None"]}
+
+    def test_installed_loras_are_looked_up_where_they_came_from(self):
+        recs = [{"id": "civ", "source": "https://civitai.com/models/7?modelVersionId=3"},
+                {"id": "ver", "source": "https://civitai.com/model-versions/3"},
+                {"id": "hf", "source": "https://huggingface.co/a/b"},
+                {"id": "gone", "source": "https://civitai.com/models/8"},
+                {"id": "file", "source": ""},
+                {"id": "done", "source": "https://huggingface.co/a/b",
+                 "license_group": "commercial"}]
+        hf = {"id": "a/b", "cardData": {"license": "apache-2.0"}}
+        found = hub.look_up_licenses(recs, self.Client(), opener=opener({"api/models/a/b": hf}))
+        self.assertEqual(found, {"civ": ("noncommercial", "No commercial use"),
+                                 "ver": ("noncommercial", "No commercial use"),
+                                 "hf": ("commercial", "apache-2.0")})
+
+    def test_apply_keeps_a_license_set_meanwhile(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        lib.save("loras", [{"file": "a.safetensors", "id": "a"},
+                           {"file": "b.safetensors", "id": "b", "license_group": "custom"}])
+        n = hub.apply_licenses(lib, {"a": ("commercial", "mit"), "b": ("commercial", "mit"),
+                                     "missing": ("commercial", "mit")})
+        self.assertEqual(n, 1)
+        self.assertEqual(ig.lora_license(lib.get("loras", "a")), ("commercial", "mit"))
+        self.assertEqual(lib.get("loras", "b")["license_group"], "custom")
 
 
 def zipball(files):
