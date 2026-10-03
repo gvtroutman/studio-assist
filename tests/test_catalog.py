@@ -4,6 +4,7 @@ Recycle Bin. CivitAI is a table of canned answers; the one live piece is the
 PowerShell picture conversion, run on a BMP this test writes."""
 
 import base64
+import json
 import os
 import struct
 import sys
@@ -349,6 +350,58 @@ class TestCheckpoints(unittest.TestCase):
         g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"), p.loras)
         self.assertEqual(g["40"]["inputs"]["positive"], ["52", 0])
         self.assertEqual(g["52"]["class_type"], "ControlNetApplyAdvanced")
+
+    def test_qwen_chains_composition_after_pose_and_refines(self):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        refs = {}
+        for kind in ("pose", "composition"):
+            refs[kind] = os.path.join(studio.lib.root, kind + ".png")
+            with open(refs[kind], "wb") as f:
+                f.write(PNG)
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="a woman on a beach", references=refs, refine=True)
+        p = ig.compose(s, studio.lib, studio.backend("5090"), self.QWEN_FILES)
+        self.assertEqual((p.errors, p.warnings), ([], []))
+        self.assertEqual(sorted(p.images), ["composition_image", "pose_image"])
+        g = ig.fill(p.workflow, dict(p.values, pose_image="a", composition_image="b"),
+                    p.loras)
+        self.assertEqual(g["54"]["inputs"]["positive"], ["52", 0])     # depth after pose
+        self.assertEqual(g["40"]["inputs"]["positive"], ["54", 0])
+        self.assertEqual(g["9"]["inputs"]["images"], ["45", 0])        # the refined one
+        # The refine redraws the enlarged picture unposed, on the plain model.
+        self.assertEqual((g["44"]["inputs"]["model"], g["44"]["inputs"]["positive"]),
+                         (["4", 0], ["10", 0]))
+        self.assertNotIn("{{", json.dumps(g))
+
+    def test_qwen_starts_from_a_source_picture(self):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        src = os.path.join(studio.lib.root, "source.png")
+        with open(src, "wb") as f:
+            f.write(PNG)
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="a woman on a beach", references={"source": src})
+        p = ig.compose(s, studio.lib, studio.backend("5090"), self.QWEN_FILES)
+        self.assertEqual((p.errors, p.warnings), ([], []))
+        self.assertEqual(p.values["denoise"], 0.65)
+        g = ig.fill(p.workflow, dict(p.values, source_image="s.png"), p.loras)
+        self.assertEqual(g["40"]["inputs"]["latent_image"], ["22", 0])
+        self.assertEqual(g["40"]["inputs"]["denoise"], 0.65)
+        self.assertNotIn("20", g)
+        plain = ig.fill(p.workflow, dict(p.values, source_image=None, denoise=1.0), p.loras)
+        self.assertEqual(plain["40"]["inputs"]["latent_image"], ["20", 0])
+
+    def test_qwen_says_truly_where_a_persons_face_comes_from(self):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        photo = os.path.join(studio.lib.root, "face.png")
+        with open(photo, "wb") as f:
+            f.write(PNG)
+        studio.lib.save("identities", [{"id": "sam", "name": "Sam", "references": [photo]}])
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="Sam on a beach", identities=["sam"])
+        p = ig.compose(s, studio.lib, studio.backend("5090"), self.QWEN_FILES)
+        said = " ".join(p.notes + p.warnings)
+        self.assertNotIn("LoRA carries", said)
+        self.assertIn("head swap and face swap", said)
 
     def test_qwen_without_its_controlnet_says_so_and_drops_the_pose(self):
         p = self.qwen_plan(dict(self.QWEN_FILES, controlnet=set()))
