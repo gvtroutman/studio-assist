@@ -47,6 +47,25 @@ class HuggingFace(unittest.TestCase):
         self.assertEqual(cards[0]["license"], "mit")
         self.assertIn("base_model%3Aadapter%3Ablack-forest-labs%2FFLUX.1-dev", seen[0])
 
+    def test_license_groups(self):
+        lic = hub.hf_license
+        self.assertEqual(lic("apache-2.0"), ("commercial", "apache-2.0"))
+        self.assertEqual(lic("creativeml-openrail-m")[0], "commercial")
+        self.assertEqual(lic("cc-by-4.0")[0], "commercial")
+        self.assertEqual(lic("cc-by-nc-sa-4.0")[0], "noncommercial")
+        self.assertEqual(lic("other", "my-research-only-license")[0], "noncommercial")
+        self.assertEqual(lic("other", "flux-1-dev-non-commercial-license"),
+                         ("custom", "flux-1-dev-non-commercial-license"))
+        self.assertEqual(lic("other")[0], "custom")
+        self.assertEqual(lic(""), ("unstated", ""))
+
+    def test_search_reads_the_cards_license_name(self):
+        rows = [{"id": "a/b", "downloads": 5, "tags": ["license:other"],
+                 "cardData": {"license": "other", "license_name": "cc-by-nc-4.0"}}]
+        cards = hub.hf_search({"family": "flux1"}, opener=opener({"api/models": rows}))
+        self.assertEqual((cards[0]["license_group"], cards[0]["license"]),
+                         ("noncommercial", "cc-by-nc-4.0"))
+
     def test_pick_largest_top_level_safetensors(self):
         info = {"siblings": [{"rfilename": "x/deep.safetensors", "size": 99},
                              {"rfilename": "small.safetensors", "size": 1},

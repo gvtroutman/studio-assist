@@ -6,8 +6,10 @@ window is `studio_images_ui.AddonsWindow`, tabs "Hugging Face" and
 "GitHub"); stdlib only.
 
 - **Hugging Face** is `/api/models` filtered to adapters of the model's own
-  base repos (`FAMILY_REPOS`), by downloads. Install picks the repo's
-  top-level `.safetensors` (the largest when there are several), downloads it
+  base repos (`FAMILY_REPOS`), by downloads, each card with its license
+  group (`hf_license`) so the window can list them by license. Install
+  picks the repo's top-level `.safetensors` (the largest when there are
+  several), downloads it
   into a backend's LoRA folder checked against the Hub's LFS SHA-256, and
   files it through the importer's `import_file`, so the record is the same
   kind CivitAI's install makes.
@@ -33,6 +35,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+import apps.image_studio.addons.catalog as catalog
 import apps.image_studio.addons.civitai as civitai
 import apps.image_studio.imagegen as ig
 
@@ -99,17 +102,45 @@ def _text(value, limit=ABOUT_MAX):
 
 # ========================================================== Hugging Face
 
+# Hub license ids by what they let the studio do with a LoRA's pictures
+# (catalog.LICENSE_GROUPS). Prefixes; a "-nc" anywhere wins over them.
+FREE_LICENSES = ("apache", "mit", "bsd", "cc0", "cc-by", "openrail", "creativeml-openrail",
+                 "bigscience-openrail", "unlicense", "gpl", "lgpl", "agpl", "mpl", "isc",
+                 "artistic", "wtfpl", "afl", "ecl", "epl", "zlib", "ofl", "postgresql")
+# Named non-commercial for the weights, but its terms let the pictures be used
+# commercially: own terms, not "non-commercial only".
+OWN_TERMS = ("flux-1-dev-non-commercial-license",)
+
+
+def hf_license(license_id, license_name=""):
+    """(group, words) for a Hub license id ("other" + the card's
+    `license_name` for a custom one)."""
+    lid = str(license_id or "").strip().lower()
+    name = str(license_name or "").strip().lower()
+    shown = name if lid == "other" and name else lid
+    if not shown:
+        return "unstated", ""
+    if shown in OWN_TERMS:
+        return "custom", shown
+    if re.search(r"(^|-)nc(-|$)|non-?commercial|research-only", shown):
+        return "noncommercial", shown
+    if lid != "other" and lid.startswith(FREE_LICENSES):
+        return "commercial", shown
+    return "custom", shown
+
+
 def repos_for(model):
     return [r for fam in sorted(ig.model_families(model)) for r in FAMILY_REPOS.get(fam, ())]
 
 
 def hf_search(model, query="", token="", opener=None):
-    """Hugging Face LoRAs for `model` -> cards, most downloaded first."""
+    """Hugging Face LoRAs for `model` -> cards, most downloaded first (the
+    window groups them by license, `catalog.by_license`)."""
     seen, cards = set(), []
     for base in repos_for(model):
         url = HF + "/api/models?" + urllib.parse.urlencode({
             "filter": "base_model:adapter:" + base, "search": query.strip(),
-            "sort": "downloads", "direction": -1, "limit": PAGE})
+            "sort": "downloads", "direction": -1, "limit": PAGE, "cardData": "true"})
         rows = get_json(url, token, opener)
         if not isinstance(rows, list):
             raise HubError("Hugging Face returned an unexpected model list.")
@@ -119,12 +150,16 @@ def hf_search(model, query="", token="", opener=None):
                 continue
             seen.add(rid)
             tags = [t for t in row.get("tags") or [] if isinstance(t, str)]
+            meta = row.get("cardData") if isinstance(row.get("cardData"), dict) else {}
+            lid = meta.get("license") if isinstance(meta.get("license"), str) else next(
+                (t[8:] for t in tags if t.startswith("license:")), "")
+            group, terms = hf_license(lid, meta.get("license_name") or "")
             cards.append({
                 "kind": "hf", "id": rid, "name": rid.split("/", 1)[1],
                 "creator": rid.split("/", 1)[0], "base": base,
                 "downloads": int(row.get("downloads") or 0),
                 "likes": int(row.get("likes") or 0),
-                "license": next((t[8:] for t in tags if t.startswith("license:")), ""),
+                "license": terms, "license_group": group,
                 "link": HF + "/" + rid})
     cards.sort(key=lambda c: -c["downloads"])
     return cards

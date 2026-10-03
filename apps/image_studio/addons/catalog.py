@@ -16,6 +16,9 @@ AddonsWindow`; this module is its engine and has no tkinter.
   names (`civitai.FAMILY_BASES`), one card per model for the version that
   suits it (`card`). Install is the LoRA importer's `import_link`: the file
   into a backend's LoRA folder on this PC, checked against CivitAI's hash.
+- **Licenses**: every catalog card (CivitAI's and Hugging Face's) carries a
+  `license_group` and the window lists cards grouped by it (`by_license`),
+  most freely usable first, keeping the service's own order inside a group.
 - **Thumbnails** are PNG, because Tk reads no JPEG and CivitAI serves JPEG.
   `to_png` converts through Windows' own System.Drawing in one PowerShell
   run per batch (stdlib only; a contained child, `studio_procs.spawn`).
@@ -42,6 +45,16 @@ THUMB = 160                   # px on the long edge of a stored thumbnail
 SAFE_LEVELS = (1, 2)          # CivitAI's nsfwLevel bits: PG, PG-13
 ABOUT_MAX = 280               # chars of a card's description
 CONVERT_TIMEOUT = 60
+
+# A catalog card's license, in the order the window lists them: what the
+# studio may do with the pictures a LoRA makes, most freely usable first.
+LICENSE_GROUPS = ("commercial", "custom", "noncommercial", "unstated")
+LICENSE_NAMES = {
+    "commercial": "Commercial use allowed",
+    "custom": "Own terms - read the license first",
+    "noncommercial": "Non-commercial only",
+    "unstated": "No license stated",
+}
 
 
 # ============================================================ installed
@@ -108,6 +121,30 @@ def safe_preview(version, width=THUMB * 2):
     return ""
 
 
+def civitai_license(model):
+    """(group, words) for a CivitAI model from its permission fields.
+    `allowCommercialUse` is a list ("Image" = sell generated pictures, "Rent",
+    "RentCivit", "Sell" = the model itself) or, from older answers, one of
+    those as a string; "None" or empty is no commercial use."""
+    if not isinstance(model, dict) or "allowCommercialUse" not in model:
+        return "unstated", ""
+    uses = model.get("allowCommercialUse")
+    uses = {uses} if isinstance(uses, str) else set(uses or ())
+    uses = {u for u in uses if isinstance(u, str) and u and u != "None"}
+    credit = "" if model.get("allowNoCredit", True) else ", credit the creator"
+    if "Image" in uses:
+        return "commercial", "Sell pictures OK" + credit
+    if uses:
+        return "custom", "Commercial use limited to " + ", ".join(sorted(uses)) + credit
+    return "noncommercial", "No commercial use" + credit
+
+
+def by_license(cards):
+    """Cards in LICENSE_GROUPS order; a group keeps the order it came in."""
+    rank = {g: i for i, g in enumerate(LICENSE_GROUPS)}
+    return sorted(cards, key=lambda c: rank.get(c.get("license_group"), len(rank)))
+
+
 def card(model, families):
     """One CivitAI search hit -> a catalog card for its newest version that
     suits one of `families`, or None when none does (CivitAI lists a model
@@ -129,6 +166,7 @@ def card(model, families):
             about = about[:ABOUT_MAX].rsplit(" ", 1)[0] + " …"
         words = [w.strip().strip(",") for w in version.get("trainedWords") or []
                  if isinstance(w, str) and w.strip()]
+        group, terms = civitai_license(model)
         return {
             "model_id": mid, "version_id": vid,
             "name": (model.get("name") or f["name"]).strip(),
@@ -145,6 +183,8 @@ def card(model, families):
             "sha256": ((f.get("hashes") or {}).get("SHA256") or "").lower(),
             "preview_url": safe_preview(version),
             "link": civitai.page_url(mid, vid),
+            "license_group": group,
+            "license": terms,
         }
     return None
 

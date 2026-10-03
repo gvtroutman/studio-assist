@@ -105,6 +105,12 @@ this PC's files and the web instead. Two moving parts:
   `<ComfyUI>/custom_nodes/<repo>`, never overwriting and never running anything. No
   tkinter; the tabs are `AddonsWindow`'s "Hugging Face" and "GitHub plugins", and the
   Image Studio header's "App store" opens that window.
+  The CivitAI and Hugging Face tabs list LoRAs grouped by license, most freely usable
+  first (`catalog.LICENSE_GROUPS`: commercial use, own terms, non-commercial, none
+  stated), in the service's order inside a group. CivitAI's group comes from
+  `allowCommercialUse` ("Image" = selling pictures is allowed), the Hub's from the card's
+  license id (`hf_license`). `flux-1-dev-non-commercial-license` is own terms, not
+  non-commercial: it lets the pictures be used commercially.
 - **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
