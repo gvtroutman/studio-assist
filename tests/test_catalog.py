@@ -390,6 +390,19 @@ class TestCheckpoints(unittest.TestCase):
         plain = ig.fill(p.workflow, dict(p.values, source_image=None, denoise=1.0), p.loras)
         self.assertEqual(plain["40"]["inputs"]["latent_image"], ["20", 0])
 
+    def test_qwen_says_truly_where_a_persons_face_comes_from(self):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        photo = os.path.join(studio.lib.root, "face.png")
+        with open(photo, "wb") as f:
+            f.write(PNG)
+        studio.lib.save("identities", [{"id": "sam", "name": "Sam", "references": [photo]}])
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="Sam on a beach", identities=["sam"])
+        p = ig.compose(s, studio.lib, studio.backend("5090"), self.QWEN_FILES)
+        said = " ".join(p.notes + p.warnings)
+        self.assertNotIn("LoRA carries", said)
+        self.assertIn("head swap and face swap", said)
+
     def test_qwen_without_its_controlnet_says_so_and_drops_the_pose(self):
         p = self.qwen_plan(dict(self.QWEN_FILES, controlnet=set()))
         self.assertNotIn("pose_image", p.images)
