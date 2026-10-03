@@ -7300,7 +7300,8 @@ class AddonsWindow:
     a newer search replaced them (`gen`)."""
 
     TABS = (("installed", "Installed"), ("catalog", "CivitAI"),
-            ("huggingface", "Hugging Face"), ("github", "GitHub plugins"))
+            ("huggingface", "Hugging Face"), ("checkpoints", "Checkpoints"),
+            ("github", "GitHub plugins"))
     OTHER = "_other"              # the pill for LoRAs that fit none of the models
     CONFIRM_MS = 4000             # how long "Click again to uninstall" waits
 
@@ -7418,6 +7419,8 @@ class AddonsWindow:
             self.show_hf()
         elif self.tab == "github":
             self.show_github()
+        elif self.tab == "checkpoints":
+            self.show_checkpoints()
         else:
             self.show_catalog()
 
@@ -7980,6 +7983,145 @@ class AddonsWindow:
                 self.call(lambda: self.installed(c, button, bid, None, why))
                 return
             self.call(lambda: self.installed(c, button, bid, rec, ""))
+        self.spawn(work)
+
+    # --------------------------------------------------------- checkpoints
+    def show_checkpoints(self):
+        o = self.owner
+        fams = catalog.checkpoint_families()
+        if getattr(self, "ck_family", None) not in fams:
+            self.ck_family = fams[0]
+        self.search_row(self.search_checkpoints)
+        o.choice(self.tools, [(f, ig.FAMILIES.get(f, f)) for f in fams], self.ck_family,
+                 self.set_ck_family).pack(side="left", padx=(o.px(6), 0))
+        o.choice(self.tools, [(x, x) for x in civitai.SORTS], self.sort,
+                 self.set_ck_sort).pack(side="left", padx=(o.px(6), 0))
+        self.heading("Community checkpoints you may sell pictures from",
+                     "CivitAI checkpoints of architectures whose license allows commercial "
+                     "use, kept only when the checkpoint's own license lets you sell the "
+                     "pictures too. Pony and Illustrious carry their own licenses and are "
+                     "left out. Install downloads the file and adds it as a model, copying "
+                     "the settings of a model of the same family you already have.")
+        self.box = o.frame(self.list)
+        self.box.pack(side="top", fill="x")
+        self.search_checkpoints()
+
+    def set_ck_family(self, value):
+        self.ck_family = value
+        self.search_checkpoints()
+
+    def set_ck_sort(self, value):
+        self.sort = value
+        self.search_checkpoints()
+
+    def search_checkpoints(self, more=False):
+        self.gen += 1
+        gen, cursor = self.gen, self.cursor if more else ""
+        if not more:
+            self.cursor, self.cards = "", []
+            for w in self.box.winfo_children():
+                w.destroy()
+        self.status("Asking CivitAI" + ELLIPSIS, "accent")
+        client, fam, query, sort = self.client(), self.ck_family, self.query.get(), self.sort
+        folder, stop = self.thumbs_dir(), self.stop
+
+        def work():
+            try:
+                cards, nxt, dropped = catalog.checkpoint_search(client, fam, query, sort, cursor)
+            except civitai.CivitAIError as e:
+                self.call(lambda: self.status(str(e), "err") if gen == self.gen else None)
+                return
+            self.call(lambda: self.checkpoints_found(gen, cards, nxt, dropped))
+            pics = catalog.thumbnails(client, {c["version_id"]: c["preview_url"]
+                                               for c in cards}, folder, stop)
+            self.call(lambda: gen == self.gen and self.set_pictures(pics))
+        self.spawn(work)
+
+    def checkpoints_found(self, gen, cards, nxt, dropped):
+        if gen != self.gen:
+            return
+        o = self.owner
+        for w in self.box.winfo_children():
+            if getattr(w, "more", False):
+                w.destroy()
+        self.cursor = nxt
+        self.cards += cards
+        for c in cards:
+            self.checkpoint_card(c)
+        if not self.cards:
+            o.label(self.box, "Nothing on this page is licensed for selling pictures.",
+                    "muted").pack(side="top", anchor="w", pady=o.px(8))
+        if nxt:
+            b = o.button(self.box, "More", lambda: self.search_checkpoints(more=True),
+                         kind="ghost")
+            b.more = True
+            b.pack(side="top", pady=o.px(10))
+        self.status("%d checkpoints you may sell pictures from%s." % (
+            len(self.cards), "; %d on this page left out for their license" % dropped
+            if dropped else ""))
+
+    def checkpoint_card(self, c):
+        o, host = self.owner, self.owner.host
+        card, pic, mid, right = self.card_frame()
+        pic.config(text="no safe\npreview" if not c["preview_url"] else "")
+        self.pics[c["version_id"]] = pic
+        o.label(mid, c["name"] + (" · " + c["version"] if c["version"] else ""), "text",
+                host.f_bold, bg="card", wraplength=o.px(440)).pack(side="top", fill="x")
+        bits = [x for x in ("by " + c["creator"] if c["creator"] else "",
+                            "↓ " + catalog.human_count(c["downloads"]), c["base_model"],
+                            "%.1f GB" % (c["size"] / 1073741824.0) if c["size"] else "") if x]
+        o.label(mid, " · ".join(bits), "muted", host.f_small, bg="card").pack(
+            side="top", fill="x")
+        o.label(mid, "License: " + c["license"], "muted", host.f_small, bg="card").pack(
+            side="top", fill="x")
+        if c["about"]:
+            o.label(mid, c["about"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x", pady=(o.px(2), 0))
+        have = any((m.get("values") or {}).get("model") == c["file"]
+                   for m in self.owner.studio.lib.all("models"))
+        b = o.button(right, "Installed" if have else "Install", lambda: None,
+                     kind="option" if have else "accent", bg="card")
+        b.command = lambda c=c, b=b: self.install_checkpoint(c, b)
+        if have:
+            b.set(state="disabled")
+        b.pack(side="top", fill="x")
+        o.button(right, "Page", lambda u=c["link"]: webbrowser.open(u), kind="option",
+                 bg="card").pack(side="top", fill="x", pady=(o.px(4), 0))
+
+    def install_checkpoint(self, c, button):
+        kind = "diffusion_models" if c["family"] in ("z-image", "qwen-image") else "checkpoints"
+        folder = filedialog.askdirectory(
+            parent=self.win, mustexist=True,
+            title="Choose the ComfyUI models/%s folder on this PC" % kind)
+        if not folder:
+            return
+        button.set(state="disabled", text="Installing" + ELLIPSIS)
+        lib, client, stop = self.owner.studio.lib, self.client(), self.stop
+
+        def say(text):
+            self.call(lambda: self.status(text, "accent"))
+
+        def work():
+            try:
+                rec, error = catalog.checkpoint_install(lib, client, c, folder, say, stop), ""
+            except Exception as e:           # said; the window stays usable
+                rec = None
+                error = str(e) if isinstance(e, civitai.CivitAIError) else "%s: %s" % (
+                    type(e).__name__, e)
+            self.call(lambda: done(rec, error))
+
+        def done(rec, error):
+            if button.winfo_exists():
+                button.set(state="normal" if error else "disabled",
+                           text="Install" if error else "Installed")
+            if error:
+                self.status("Could not install %s: %s" % (c["name"], error), "err")
+                return
+            self.library_changed()
+            self.owner.refresh_backends()
+            self.status("Installed %s as the model “%s”. Check it in Models… (its settings "
+                        "are copied from a model of the same family)." % (
+                            c["file"], rec["label"]), "ok")
         self.spawn(work)
 
     # -------------------------------------------------------------- GitHub

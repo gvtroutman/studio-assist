@@ -270,6 +270,38 @@ class TestLicenses(unittest.TestCase):
         self.assertNotIn("license_group", partial)
 
 
+class TestCheckpoints(unittest.TestCase):
+    def test_only_commercial_architectures_are_searched(self):
+        self.assertEqual(sorted(catalog.checkpoint_families()),
+                         ["qwen-image", "sd15", "sdxl", "z-image"])
+
+    def test_search_keeps_checkpoints_you_may_sell_pictures_from(self):
+        sell = dict(HIT, id=1, allowCommercialUse=["Image"])
+        nc = dict(HIT, id=2, allowCommercialUse=["None"])
+        client = FakeClient(hits=[sell, nc])
+        calls = []
+        client.search = lambda bases, q, s, c, types="LORA": (
+            calls.append((tuple(bases), types)) or ([sell, nc], ""))
+        cards, nxt, dropped = catalog.checkpoint_search(client, "sdxl")
+        self.assertEqual(([c["model_id"] for c in cards], dropped), ([1], 1))
+        self.assertEqual(calls, [(("SDXL 1.0",), "Checkpoint")])
+
+    def test_install_adds_a_model_copied_from_the_same_family(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        c = catalog.card(dict(HIT, allowCommercialUse=["Image"]), {"z-image"})
+        c["name"] = "Better Z"
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(civitai, "download") as dl:
+            rec = catalog.checkpoint_install(lib, None, c, d)
+        self.assertEqual(dl.call_args[0][3], c["file"])
+        self.assertEqual((rec["label"], rec["family"], rec["values"]["model"]),
+                         ("Better Z", "z-image", c["file"]))
+        self.assertEqual(rec["workflow"], lib.get("models", "z-image-turbo")["workflow"])
+        self.assertEqual(ig.model_license(rec)[0], "commercial")
+        with self.assertRaises(civitai.CivitAIError):
+            catalog.checkpoint_install(lib, None, dict(c, family="sd15"), "x")
+
+
 class TestPictures(unittest.TestCase):
     def test_png_is_kept_and_anything_else_is_converted_once(self):
         folder = tempfile.mkdtemp()
