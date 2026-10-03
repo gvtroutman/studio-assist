@@ -6,8 +6,10 @@ window is `studio_images_ui.AddonsWindow`, tabs "Hugging Face" and
 "GitHub"); stdlib only.
 
 - **Hugging Face** is `/api/models` filtered to adapters of the model's own
-  base repos (`FAMILY_REPOS`), by downloads. Install picks the repo's
-  top-level `.safetensors` (the largest when there are several), downloads it
+  base repos (`FAMILY_REPOS`), by downloads, each card with its license
+  group (`hf_license`) so the window can list them by license. Install
+  picks the repo's top-level `.safetensors` (the largest when there are
+  several), downloads it
   into a backend's LoRA folder checked against the Hub's LFS SHA-256, and
   files it through the importer's `import_file`, so the record is the same
   kind CivitAI's install makes.
@@ -99,17 +101,55 @@ def _text(value, limit=ABOUT_MAX):
 
 # ========================================================== Hugging Face
 
+# Hub license ids by what they let the studio do with a LoRA's pictures
+# (imagegen.LICENSE_GROUPS). Prefixes; a "-nc" anywhere wins over them.
+FREE_LICENSES = ("apache", "mit", "bsd", "cc0", "cc-by", "openrail", "creativeml-openrail",
+                 "bigscience-openrail", "unlicense", "gpl", "lgpl", "agpl", "mpl", "isc",
+                 "artistic", "wtfpl", "afl", "ecl", "epl", "zlib", "ofl", "postgresql")
+# Named non-commercial for the weights, but its terms let the pictures be used
+# commercially: own terms, not "non-commercial only".
+OWN_TERMS = ("flux-1-dev-non-commercial-license",)
+
+
+def hf_license(license_id, license_name=""):
+    """(group, words) for a Hub license id ("other" + the card's
+    `license_name` for a custom one)."""
+    lid = str(license_id or "").strip().lower()
+    name = str(license_name or "").strip().lower()
+    shown = name if lid == "other" and name else lid
+    if not shown:
+        return "unstated", ""
+    if shown in OWN_TERMS:
+        return "custom", shown
+    if re.search(r"(^|-)nc(-|$)|non-?commercial|research-only", shown):
+        return "noncommercial", shown
+    if lid != "other" and lid.startswith(FREE_LICENSES):
+        return "commercial", shown
+    return "custom", shown
+
+
+def row_license(row):
+    """(group, words) for a Hub model answer: the card's license (and
+    `license_name` for a custom one), else the `license:` tag."""
+    tags = [t for t in row.get("tags") or [] if isinstance(t, str)]
+    meta = row.get("cardData") if isinstance(row.get("cardData"), dict) else {}
+    lid = meta.get("license") if isinstance(meta.get("license"), str) else next(
+        (t[8:] for t in tags if t.startswith("license:")), "")
+    return hf_license(lid, meta.get("license_name") or "")
+
+
 def repos_for(model):
     return [r for fam in sorted(ig.model_families(model)) for r in FAMILY_REPOS.get(fam, ())]
 
 
 def hf_search(model, query="", token="", opener=None):
-    """Hugging Face LoRAs for `model` -> cards, most downloaded first."""
+    """Hugging Face LoRAs for `model` -> cards, most downloaded first (the
+    window groups them by license, `catalog.by_license`)."""
     seen, cards = set(), []
     for base in repos_for(model):
         url = HF + "/api/models?" + urllib.parse.urlencode({
             "filter": "base_model:adapter:" + base, "search": query.strip(),
-            "sort": "downloads", "direction": -1, "limit": PAGE})
+            "sort": "downloads", "direction": -1, "limit": PAGE, "cardData": "true"})
         rows = get_json(url, token, opener)
         if not isinstance(rows, list):
             raise HubError("Hugging Face returned an unexpected model list.")
@@ -118,13 +158,13 @@ def hf_search(model, query="", token="", opener=None):
             if not REPO_ID.fullmatch(rid) or rid in seen:
                 continue
             seen.add(rid)
-            tags = [t for t in row.get("tags") or [] if isinstance(t, str)]
+            group, terms = row_license(row)
             cards.append({
                 "kind": "hf", "id": rid, "name": rid.split("/", 1)[1],
                 "creator": rid.split("/", 1)[0], "base": base,
                 "downloads": int(row.get("downloads") or 0),
                 "likes": int(row.get("likes") or 0),
-                "license": next((t[8:] for t in tags if t.startswith("license:")), ""),
+                "license": terms, "license_group": group,
                 "link": HF + "/" + rid})
     cards.sort(key=lambda c: -c["downloads"])
     return cards
@@ -178,6 +218,8 @@ def hf_install(lib, card, folder, family="", token="", say=lambda text: None,
         rec["family"] = family
     if rec.get("name") in ("", filename, stem):
         rec["name"] = card["name"]
+    if not rec.get("license_group") and card.get("license_group"):
+        rec["license_group"], rec["license"] = card["license_group"], card.get("license", "")
     lib.save("loras")
     return rec, added
 
@@ -220,6 +262,69 @@ def _download(url, dest, sha256, size, token, say, stop, opener):
             pass
         raise
     return dest
+
+
+# ============================================== licenses of installed LoRAs
+
+HF_PAGE = re.compile(r"https://huggingface\.co/([\w.-]+/[\w.-]+)/?$")
+
+
+def license_source(rec):
+    """Whether a LoRA record's license can be looked up where it came from."""
+    src = rec.get("source") or ""
+    return bool(HF_PAGE.match(src) or (src.startswith("https://civitai.com/")
+                                        and civitai.parse_link(src)))
+
+
+def license_from_source(source, client, token="", opener=None):
+    """(group, words) for the page a LoRA came from, or None for a page
+    there is nothing to ask. Raises HubError / CivitAIError when the service
+    does not answer."""
+    m = HF_PAGE.match(source or "")
+    if m:
+        info = get_json(HF + "/api/models/" + m.group(1), token, opener)
+        return row_license(info if isinstance(info, dict) else {})
+    ref = civitai.parse_link(source) if (source or "").startswith("https://civitai.com/") \
+        else None
+    if not ref:
+        return None
+    mid = ref["model"]
+    if mid is None:
+        mid = client.version(ref["version"]).get("modelId")
+        if not mid:
+            return None
+    return civitai.license_of(client.model(mid))
+
+
+def look_up_licenses(recs, client, token="", stop=None, opener=None):
+    """{record id: (group, words)} for the LoRA records not looked up yet
+    whose source can be asked; one that fails is left for next time. On a
+    worker: it only reads, `apply_licenses` writes."""
+    found = {}
+    for rec in recs:
+        if stop is not None and stop.is_set():
+            break
+        if rec.get("license_group") or not license_source(rec):
+            continue
+        try:
+            got = license_from_source(rec["source"], client, token, opener)
+        except (HubError, civitai.CivitAIError):
+            continue
+        if got:
+            found[rec["id"]] = got
+    return found
+
+
+def apply_licenses(lib, found):
+    """`look_up_licenses`' answers into the library (unsaved) -> how many
+    records took one. A record given a license meanwhile keeps it."""
+    n = 0
+    for rid, (group, words) in found.items():
+        rec = lib.get("loras", rid)
+        if rec is not None and not rec.get("license_group"):
+            rec["license_group"], rec["license"] = group, rec.get("license") or words
+            n += 1
+    return n
 
 
 # ================================================================ GitHub

@@ -106,7 +106,7 @@ class TestFits(unittest.TestCase):
             {"id": "off", "file": "o.safetensors", "name": "Alpha", "family": "z-image",
              "enabled": False},
             {"id": "f", "file": "f.safetensors", "family": "flux1"},
-            {"id": "q", "file": "q.safetensors", "family": "qwen-image"},
+            {"id": "q", "file": "q.safetensors", "family": "sd15"},
             {"id": "u", "file": "u.safetensors"}])
         fits, unknown = catalog.sorted_for(lib, lib.get("models", "z-image-turbo"))
         self.assertEqual([r["id"] for r in fits], ["z", "off"])      # on first
@@ -133,6 +133,27 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual(c["trigger"], "trig")
         self.assertEqual(catalog.card(HIT, {"flux1"})["version_id"], 2)
         self.assertIsNone(catalog.card(HIT, {"qwen-image"}))
+
+    def test_a_card_carries_civitais_license(self):
+        lic = civitai.license_of
+        self.assertEqual(lic({"allowCommercialUse": ["Image", "Rent"], "allowNoCredit": True}),
+                         ("commercial", "Sell pictures OK"))
+        self.assertEqual(lic({"allowCommercialUse": "Image", "allowNoCredit": False}),
+                         ("commercial", "Sell pictures OK, credit the creator"))
+        self.assertEqual(lic({"allowCommercialUse": ["RentCivit"]})[0], "custom")
+        self.assertEqual(lic({"allowCommercialUse": ["None"]}),
+                         ("noncommercial", "No commercial use"))
+        self.assertEqual(lic({"allowCommercialUse": []})[0], "noncommercial")
+        self.assertEqual(lic({}), ("unstated", ""))
+        c = catalog.card(dict(HIT, allowCommercialUse=["Image"]), {"z-image"})
+        self.assertEqual(c["license_group"], "commercial")
+        self.assertEqual(catalog.card(HIT, {"z-image"})["license_group"], "unstated")
+
+    def test_cards_are_listed_by_license_keeping_order_inside_a_group(self):
+        cards = [{"n": 1, "license_group": "noncommercial"}, {"n": 2},
+                 {"n": 3, "license_group": "commercial"}, {"n": 4, "license_group": "custom"},
+                 {"n": 5, "license_group": "commercial"}]
+        self.assertEqual([c["n"] for c in catalog.by_license(cards)], [3, 5, 4, 1, 2])
 
     def test_only_a_pg_picture_is_shown_and_asked_for_small(self):
         c = catalog.card(HIT, {"z-image"})
@@ -203,6 +224,147 @@ class TestCatalog(unittest.TestCase):
     def test_human_counts(self):
         self.assertEqual([catalog.human_count(n) for n in (7, 1500, 187485, 2300000)],
                          ["7", "1.5k", "187k", "2.3M"])
+
+
+class TestLicenses(unittest.TestCase):
+    def test_a_base_model_takes_its_familys_license_unless_set(self):
+        self.assertEqual(ig.model_license({"family": "z-image"}), ("commercial", "Apache 2.0"))
+        self.assertEqual(ig.model_license({"family": "flux1"})[0], "custom")
+        self.assertEqual(ig.model_license({"family": "krea2"}), ("unstated", ""))
+        klein = {"family": "flux2-klein9b", "license": ig.KLEIN_LICENSE}
+        self.assertEqual(ig.model_license(klein), ("noncommercial", ig.KLEIN_LICENSE))
+        self.assertEqual(ig.model_license({"family": "flux1", "license_group": "commercial"}),
+                         ("commercial", ""))
+
+    def test_models_are_listed_by_license_keeping_their_order(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        ordered = [m["id"] for m in ig.by_license(lib.all("models"), ig.model_license)]
+        self.assertEqual(ordered[:2], ["z-image-turbo", "qwen-image"])
+        self.assertEqual(ordered[2:4], ["flux-dev", "withanyone"])
+        self.assertEqual(ordered[4:], ["klein-9b", "klein-9b-distilled"])
+
+    def test_records_keep_a_license_and_drop_a_made_up_group(self):
+        rec = ig.clean_lora({"file": "a.safetensors", "license_group": "commercial",
+                             "license": "Sell pictures OK"})
+        self.assertEqual((rec["license_group"], rec["license"]),
+                         ("commercial", "Sell pictures OK"))
+        self.assertEqual(ig.clean_lora({"file": "a.safetensors",
+                                        "license_group": "free"})["license_group"], "")
+        self.assertEqual(ig.lora_license({"license_group": ""}), ("unstated", ""))
+        self.assertEqual(ig.clean_model({"id": "m", "license_group": "noncommercial"})[
+            "license_group"], "noncommercial")
+
+    def test_installed_loras_are_listed_by_license(self):
+        lib = lib_with([{"file": "a.safetensors", "name": "A"},
+                        {"file": "b.safetensors", "name": "B", "license_group": "noncommercial"},
+                        {"file": "c.safetensors", "name": "C", "license_group": "commercial"}])
+        self.assertEqual([r["name"] for r in catalog.by_license(lib.all("loras"))],
+                         ["C", "B", "A"])
+
+    def test_an_import_takes_the_license_only_from_a_whole_model(self):
+        whole = dict(HIT, allowCommercialUse=["Image"], allowNoCredit=False)
+        p = civitai.profile(version(1, "ZImageBase"), whole)
+        self.assertEqual((p["license_group"], p["license"]),
+                         ("commercial", "Sell pictures OK, credit the creator"))
+        partial = civitai.profile(dict(version(1, "ZImageBase"), model={"name": "Hands"}))
+        self.assertNotIn("license_group", partial)
+
+
+class TestCheckpoints(unittest.TestCase):
+    def test_only_commercial_architectures_are_searched(self):
+        self.assertEqual(sorted(catalog.checkpoint_families()),
+                         ["qwen-image", "sd15", "sdxl", "z-image"])
+
+    def test_search_keeps_checkpoints_you_may_sell_pictures_from(self):
+        sell = dict(HIT, id=1, allowCommercialUse=["Image"])
+        nc = dict(HIT, id=2, allowCommercialUse=["None"])
+        client = FakeClient(hits=[sell, nc])
+        calls = []
+        client.search = lambda bases, q, s, c, types="LORA": (
+            calls.append((tuple(bases), types)) or ([sell, nc], ""))
+        cards, nxt, dropped = catalog.checkpoint_search(client, "sdxl")
+        self.assertEqual(([c["model_id"] for c in cards], dropped), ([1], 1))
+        self.assertEqual(calls, [(("SDXL 1.0",), "Checkpoint")])
+
+    def test_install_adds_a_model_copied_from_the_same_family(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        c = catalog.card(dict(HIT, allowCommercialUse=["Image"]), {"z-image"})
+        c["name"] = "Better Z"
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(civitai, "download") as dl:
+            rec = catalog.checkpoint_install(lib, None, c, d)
+        self.assertEqual(dl.call_args[0][3], c["file"])
+        self.assertEqual((rec["label"], rec["family"], rec["values"]["model"]),
+                         ("Better Z", "z-image", c["file"]))
+        self.assertEqual(rec["workflow"], lib.get("models", "z-image-turbo")["workflow"])
+        self.assertEqual(ig.model_license(rec)[0], "commercial")
+        with self.assertRaises(civitai.CivitAIError):
+            catalog.checkpoint_install(lib, None, dict(c, family="sd15"), "x")
+
+    def test_a_qwen_checkpoint_needs_no_qwen_model_in_the_library(self):
+        lib = ig.Library(tempfile.mkdtemp())
+        lib.save("models", [m for m in lib.all("models") if m["family"] != "qwen-image"])
+        c = catalog.card(dict(HIT, allowCommercialUse=["Image"]), {"z-image"})
+        c.update(family="qwen-image", name="Real Qwen")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(civitai, "download"):
+            rec = catalog.checkpoint_install(lib, None, c, d)
+        self.assertEqual((rec["workflow"], rec["values"]["encoder"]),
+                         ("qwen_image", "qwen_2.5_vl_7b_fp8_scaled.safetensors"))
+
+    def test_qwen_joins_an_existing_library_once(self):
+        root = tempfile.mkdtemp()
+        lib = ig.Library(root)
+        lib.save("models", [m for m in lib.all("models") if m["id"] != "qwen-image"])
+        lib = ig.Library(root)
+        self.assertIsNotNone(lib.get("models", "qwen-image"))
+        lib.save("models", [m for m in lib.all("models") if m["id"] != "qwen-image"])
+        self.assertIsNone(ig.Library(root).get("models", "qwen-image"))      # stays removed
+
+    def test_the_qwen_workflow_builds(self):
+        wf = ig.load_workflow("qwen_image")
+        self.assertEqual(wf["families"], ["qwen-image"])
+        self.assertEqual(wf["graph"]["2"]["inputs"]["type"], "qwen_image")
+
+    QWEN_FILES = {"diffusion_models": {"qwen_image_fp8_e4m3fn.safetensors"},
+                  "text_encoders": {"qwen_2.5_vl_7b_fp8_scaled.safetensors"},
+                  "vae": {"qwen_image_vae.safetensors"},
+                  "controlnet": {"Qwen-Image-InstantX-ControlNet-Union.safetensors"},
+                  "checkpoints": {"sam3.pt"}}
+
+    def qwen_plan(self, inventory):
+        studio = ig.Studio(root=tempfile.mkdtemp())
+        pose = os.path.join(studio.lib.root, "pose.png")
+        with open(pose, "wb") as f:
+            f.write(PNG)
+        s = ig.default_settings()
+        s.update(model="qwen-image", scene="a woman waving on a beach",
+                 references={"pose": pose}, face_detail=True)
+        return ig.compose(s, studio.lib, studio.backend("5090"), inventory)
+
+    def test_qwen_takes_a_pose_through_its_controlnet_and_has_a_face_pass(self):
+        p = self.qwen_plan(self.QWEN_FILES)
+        self.assertEqual((p.errors, p.warnings), ([], []))
+        self.assertIn("pose_image", p.images)
+        self.assertTrue(p.values["face_detail"])
+        g = ig.fill(p.workflow, dict(p.values, pose_image="pose.png"), p.loras)
+        self.assertEqual(g["40"]["inputs"]["positive"], ["52", 0])
+        self.assertEqual(g["52"]["class_type"], "ControlNetApplyAdvanced")
+
+    def test_qwen_without_its_controlnet_says_so_and_drops_the_pose(self):
+        p = self.qwen_plan(dict(self.QWEN_FILES, controlnet=set()))
+        self.assertNotIn("pose_image", p.images)
+        self.assertTrue(any("ControlNet-Union" in w for w in p.warnings))
+
+    def test_the_qwen_face_pass_redraws_on_the_unposed_model(self):
+        wf = ig.load_workflow("qwen_image")
+        v = dict(wf["defaults"], model="m", encoder="e", vae="v", prompt="p", seed=1,
+                 face_prompt="a face", sam3="sam3.pt")
+        g = ig.face_graph(wf, v, [], "pic.png", [{"x": 0, "y": 0, "width": 256,
+                                                  "height": 256}], "oval.png", "F")
+        samplers = [n for n in g.values() if n["class_type"] == "KSampler"]
+        self.assertEqual([(n["inputs"]["model"], n["inputs"]["cfg"]) for n in samplers],
+                         [(["4", 0], 2.5)])
+        self.assertFalse(any("ControlNet" in n["class_type"] for n in g.values()))
 
 
 class TestPictures(unittest.TestCase):

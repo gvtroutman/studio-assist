@@ -146,6 +146,59 @@ COMPATIBLE = {
     "flux1-kontext": {"flux1-kontext", "flux1"},
 }
 
+# What the pictures a model or LoRA makes may be used for, most freely usable
+# first: the order the Image Studio lists models and LoRAs in (`by_license`).
+LICENSE_GROUPS = ("commercial", "custom", "noncommercial", "unstated")
+LICENSE_NAMES = {
+    "commercial": "Commercial use allowed",
+    "custom": "Own terms - read the license first",
+    "noncommercial": "Non-commercial only",
+    "unstated": "No license stated",
+}
+# A base model's license by its family, as its weights are published, until
+# the Models editor sets one (`license_group` on the record).
+FAMILY_LICENSES = {
+    "z-image": ("commercial", "Apache 2.0"),
+    "qwen-image": ("commercial", "Apache 2.0"),
+    "sdxl": ("commercial", "CreativeML Open RAIL++-M"),
+    "sd15": ("commercial", "CreativeML Open RAIL-M"),
+    # Non-commercial for the weights, but its terms let the pictures be used
+    # commercially: own terms, not non-commercial.
+    "flux1": ("custom", "FLUX.1 [dev] Non-Commercial License: the pictures may be "
+                        "used commercially, the model may not"),
+    "flux1-kontext": ("custom", "FLUX.1 [dev] Non-Commercial License: the pictures may "
+                                "be used commercially, the model may not"),
+    "flux2": ("custom", "FLUX.2 [dev] Non-Commercial License: read its terms"),
+    "flux2-klein9b": ("noncommercial", "FLUX Non-Commercial License: not for commercial use"),
+}
+
+
+def license_rank(group):
+    return LICENSE_GROUPS.index(group) if group in LICENSE_GROUPS else len(LICENSE_GROUPS)
+
+
+def by_license(items, license_of):
+    """`items` in LICENSE_GROUPS order; inside a group, the order they came
+    in. `license_of(item)` -> (group, words)."""
+    return sorted(items, key=lambda x: license_rank(license_of(x)[0]))
+
+
+def model_license(model):
+    """(group, words) for a base model: the record's own group, else its
+    family's (FAMILY_LICENSES). Words are the record's `license` note when it
+    has one."""
+    own = model.get("license_group")
+    fam_group, fam_words = FAMILY_LICENSES.get(model.get("family") or "", ("unstated", ""))
+    group = own if own in LICENSE_GROUPS else fam_group
+    words = model.get("license") or (fam_words if group == fam_group else "")
+    return group, words
+
+
+def lora_license(rec):
+    """(group, words) for a LoRA record; one never looked up is unstated."""
+    group = rec.get("license_group")
+    return (group if group in LICENSE_GROUPS else "unstated"), rec.get("license") or ""
+
 REFERENCE_KINDS = [
     ("face", "Face", "Who the person is: a face to condition identity on"),
     ("pose", "Pose", "How the body is posed"),
@@ -347,6 +400,9 @@ def clean_model(d):
         "backends": backends,
         "defaults": {k: v for k, v in defaults.items() if isinstance(v, (str, int, float, bool))},
         "license": _str(d.get("license")),     # the model's terms, carried by each picture
+        # Set in the Models editor; empty is the family's (`model_license`).
+        "license_group": d.get("license_group") if d.get("license_group") in LICENSE_GROUPS
+        else "",
         "notes": _str(d.get("notes")),
     }
 
@@ -373,6 +429,10 @@ def clean_lora(d):
         "notes": _str(d.get("notes")),
         "source": _str(d.get("source")),          # where it came from (a CivitAI page)
         "sha256": _str(d.get("sha256")).lower(),  # the file's, which is how CivitAI names it
+        # Its license where it came from (`lora_license`); empty: not looked up.
+        "license": _str(d.get("license")),
+        "license_group": d.get("license_group") if d.get("license_group") in LICENSE_GROUPS
+        else "",
     }
 
 
@@ -778,6 +838,17 @@ def _default_models():
                       "scheduler": "simple", "width": 1024, "height": 1024},
          "notes": "Fast photographic model and the default: the 5090 when it has the "
                   "files, else the 3090."},
+        # ComfyUI's own Qwen-Image template's files. Apache 2.0: the base the
+        # Checkpoints tab's Qwen-Image checkpoints are copied from.
+        {"id": "qwen-image", "label": "Qwen-Image", "family": "qwen-image",
+         "workflow": "qwen_image",
+         "values": {"model": "qwen_image_fp8_e4m3fn.safetensors",
+                    "encoder": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                    "vae": "qwen_image_vae.safetensors"},
+         "defaults": {"steps": 20, "guidance": 2.5, "sampler": "euler",
+                      "scheduler": "simple", "width": 1328, "height": 1328},
+         "notes": "Qwen-Image 20B, fp8: strong at text in pictures and at following long "
+                  "prompts. Apache 2.0, so its pictures may be sold."},
         {"id": "klein-9b", "label": "FLUX.2 Klein 9B base", "family": "flux2-klein9b",
          "workflow": "klein9b_base",
          "values": {"model": "flux-2-klein-base-9b.safetensors",
@@ -884,6 +955,29 @@ class Library:
         self.problems = []
         self.data = {kind: self._load(kind) for kind in CLEAN}
 
+    # Default models added after a library was made: each joins it once (a
+    # model removed afterwards stays removed), remembered in models-added.json.
+    ADDED_MODELS = ("qwen-image",)
+
+    def _added_defaults(self, raw):
+        mark = os.path.join(self.root, "models-added.json")
+        try:
+            with open(mark, encoding="utf-8") as f:
+                done = set(json.load(f))
+        except (OSError, ValueError, TypeError):
+            done = set()
+        have = {d.get("id") for d in raw if isinstance(d, dict)}
+        new = [d for d in _default_models() if d["id"] in self.ADDED_MODELS
+               and d["id"] not in done and d["id"] not in have]
+        if new:
+            try:
+                with open(mark + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(sorted(done | set(self.ADDED_MODELS)), f)
+                os.replace(mark + ".tmp", mark)
+            except OSError:
+                return []         # not remembered, so not added: it would come back
+        return new
+
     def _path(self, kind):
         return os.path.join(self.root, kind + ".json")
 
@@ -898,6 +992,8 @@ class Library:
                                      % (path, e))
         if not isinstance(raw, list):
             raw = DEFAULTS[kind]()
+        elif kind == "models":
+            raw = raw + self._added_defaults(raw)
         out, seen = [], set()
         for d in raw:
             rec = CLEAN[kind](d)
