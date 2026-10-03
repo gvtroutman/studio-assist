@@ -146,6 +146,59 @@ COMPATIBLE = {
     "flux1-kontext": {"flux1-kontext", "flux1"},
 }
 
+# What the pictures a model or LoRA makes may be used for, most freely usable
+# first: the order the Image Studio lists models and LoRAs in (`by_license`).
+LICENSE_GROUPS = ("commercial", "custom", "noncommercial", "unstated")
+LICENSE_NAMES = {
+    "commercial": "Commercial use allowed",
+    "custom": "Own terms - read the license first",
+    "noncommercial": "Non-commercial only",
+    "unstated": "No license stated",
+}
+# A base model's license by its family, as its weights are published, until
+# the Models editor sets one (`license_group` on the record).
+FAMILY_LICENSES = {
+    "z-image": ("commercial", "Apache 2.0"),
+    "qwen-image": ("commercial", "Apache 2.0"),
+    "sdxl": ("commercial", "CreativeML Open RAIL++-M"),
+    "sd15": ("commercial", "CreativeML Open RAIL-M"),
+    # Non-commercial for the weights, but its terms let the pictures be used
+    # commercially: own terms, not non-commercial.
+    "flux1": ("custom", "FLUX.1 [dev] Non-Commercial License: the pictures may be "
+                        "used commercially, the model may not"),
+    "flux1-kontext": ("custom", "FLUX.1 [dev] Non-Commercial License: the pictures may "
+                                "be used commercially, the model may not"),
+    "flux2": ("custom", "FLUX.2 [dev] Non-Commercial License: read its terms"),
+    "flux2-klein9b": ("noncommercial", "FLUX Non-Commercial License: not for commercial use"),
+}
+
+
+def license_rank(group):
+    return LICENSE_GROUPS.index(group) if group in LICENSE_GROUPS else len(LICENSE_GROUPS)
+
+
+def by_license(items, license_of):
+    """`items` in LICENSE_GROUPS order; inside a group, the order they came
+    in. `license_of(item)` -> (group, words)."""
+    return sorted(items, key=lambda x: license_rank(license_of(x)[0]))
+
+
+def model_license(model):
+    """(group, words) for a base model: the record's own group, else its
+    family's (FAMILY_LICENSES). Words are the record's `license` note when it
+    has one."""
+    own = model.get("license_group")
+    fam_group, fam_words = FAMILY_LICENSES.get(model.get("family") or "", ("unstated", ""))
+    group = own if own in LICENSE_GROUPS else fam_group
+    words = model.get("license") or (fam_words if group == fam_group else "")
+    return group, words
+
+
+def lora_license(rec):
+    """(group, words) for a LoRA record; one never looked up is unstated."""
+    group = rec.get("license_group")
+    return (group if group in LICENSE_GROUPS else "unstated"), rec.get("license") or ""
+
 REFERENCE_KINDS = [
     ("face", "Face", "Who the person is: a face to condition identity on"),
     ("pose", "Pose", "How the body is posed"),
@@ -347,6 +400,9 @@ def clean_model(d):
         "backends": backends,
         "defaults": {k: v for k, v in defaults.items() if isinstance(v, (str, int, float, bool))},
         "license": _str(d.get("license")),     # the model's terms, carried by each picture
+        # Set in the Models editor; empty is the family's (`model_license`).
+        "license_group": d.get("license_group") if d.get("license_group") in LICENSE_GROUPS
+        else "",
         "notes": _str(d.get("notes")),
     }
 
@@ -373,6 +429,10 @@ def clean_lora(d):
         "notes": _str(d.get("notes")),
         "source": _str(d.get("source")),          # where it came from (a CivitAI page)
         "sha256": _str(d.get("sha256")).lower(),  # the file's, which is how CivitAI names it
+        # Its license where it came from (`lora_license`); empty: not looked up.
+        "license": _str(d.get("license")),
+        "license_group": d.get("license_group") if d.get("license_group") in LICENSE_GROUPS
+        else "",
     }
 
 

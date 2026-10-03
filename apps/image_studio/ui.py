@@ -97,6 +97,9 @@ STAGE_KEY = {"queued": None, "uploading": None, "loading": None, "running": "sam
              "decoding": "decoding", "items": "items", "head_swap": "head_swap", "face_swap": "face_swap",
              "eyes": "eyes", "beard": "beard",
              "hands": "hands", "glasses": "glasses", "complete": "complete"}
+# A model's license group in the form's model menu (ig.LICENSE_GROUPS).
+LICENSE_SHORT = {"commercial": "commercial use OK", "custom": "own license terms",
+                 "noncommercial": "non-commercial", "unstated": "license not set"}
 READY_MARK = {"ready": "✓", "missing": "✗", "offline": "○", "disabled": "–",
               "unchecked": "?"}
 
@@ -1177,9 +1180,14 @@ class ImageStudio:
         lib = self.studio.lib
         for w in self.model_row.winfo_children():
             w.destroy()
-        models = []
-        for m in lib.all("models"):
-            text = "%s  (%s)" % (m["label"], ig.FAMILIES.get(m["family"], m["family"] or "?"))
+        models, group = [], None
+        for m in ig.by_license(lib.all("models"), ig.model_license):
+            g = ig.model_license(m)[0]
+            if group is not None and g != group:
+                models.append((None, ""))          # a line between license groups
+            group = g
+            text = "%s  (%s · %s)" % (m["label"], ig.FAMILIES.get(m["family"], m["family"] or "?"),
+                                      LICENSE_SHORT[g])
             ready = self.studio.readiness(m)
             if all(state == "unchecked" for state, _ in ready.values()):
                 text += "  — not checked yet"
@@ -3383,6 +3391,8 @@ class ImageStudio:
             ("values", "Files and settings, every machine (name = value)", "kv"),
             ("backends", "Per machine: what differs there", "per_backend"),
             ("defaults", "Defaults (steps, guidance, sampler, width...)", "kv"),
+            ("license_group", "License (what its pictures may be used for)",
+             ("choice", [("", "From the model family")] + list(ig.LICENSE_NAMES.items()))),
             ("notes", "Notes", "long"),
         ], template={"id": "new-model", "label": "New model", "family": "flux1",
                      "workflow": "flux_dev_baseline", "values": {"model": "model.safetensors"}},
@@ -3428,6 +3438,9 @@ class ImageStudio:
             ("family", "Trained for", ("choice", [("", "unknown")] + list(ig.FAMILIES.items()))),
             ("preview", "Preview image", "path"),
             ("source", "Where it came from", "text"),
+            ("license_group", "License (looked up from where it came from)",
+             ("choice", [("", "Not known yet")] + list(ig.LICENSE_NAMES.items()))),
+            ("license", "License terms", "text"),
             ("notes", "Notes", "long"),
         ], template={"file": "new_lora.safetensors", "category": "Other"},
             extra=[("Import from CivitAI…", lambda ed: LoraImport(self, ed)),
@@ -7296,6 +7309,7 @@ class AddonsWindow:
         host = owner.host
         self.tab = tab if tab in self.TABS else "installed"
         self.page = 1                 # GitHub's next page
+        self.licenses_asked = False   # installed LoRAs' licenses looked up once a window
         self.model = model or owner.settings["model"]
         self.sort = civitai.SORTS[0]
         self.query = tk.StringVar()
@@ -7388,7 +7402,8 @@ class AddonsWindow:
         self.thumb_paths = {}         # key -> PNG fetched, put back when cards are redrawn
         self.box = self.list          # where cards go
         o.label(self.model_row, "For", "muted", o.host.f_small).pack(side="left")
-        for m in models + [{"id": self.OTHER, "label": "Other models"}]:
+        for m in ig.by_license(models, ig.model_license) + [
+                {"id": self.OTHER, "label": "Other models"}]:
             o.button(self.model_row, m["label"], lambda mid=m["id"]: self.pick_model(mid),
                      kind="accent" if m["id"] == self.model else "quiet").pack(
                 side="left", padx=(o.px(6), 0))
@@ -7466,19 +7481,20 @@ class AddonsWindow:
             self.heading("Fits none of your models (%d)" % len(recs),
                          "Made for a model you do not generate with, so the form never offers "
                          "them. Uninstall to free the space, or set the model if it is wrong.")
-            for rec in recs:
-                self.installed_card(rec)
+            self.show_by_license(recs, self.installed_card, sub=True)
             if not recs:
                 o.label(self.list, "None.", "muted").pack(side="top", anchor="w")
         else:
             model = self.model_rec()
             fits, unknown = catalog.sorted_for(lib, model)
             fam = ig.FAMILIES.get(model["family"], model["family"])
+            group, words = ig.model_license(model)
             self.heading("Works with %s (%d)" % (model["label"], len(fits)),
-                         "Made for %s. Turned off, a LoRA stays installed but is not offered "
-                         "on the form." % fam)
-            for rec in fits:
-                self.installed_card(rec)
+                         "Made for %s, listed by license. Turned off, a LoRA stays installed "
+                         "but is not offered on the form. %s itself: %s." % (
+                             fam, model["label"],
+                             (words or ig.LICENSE_NAMES[group].lower()).rstrip(".")))
+            self.show_by_license(fits, self.installed_card, sub=True)
             if not fits:
                 row = o.frame(self.list)
                 row.pack(side="top", fill="x", pady=o.px(6))
@@ -7490,8 +7506,7 @@ class AddonsWindow:
                 self.heading("Model not set (%d)" % len(unknown),
                              "Offered with every model, marked “may not work”, until "
                              "you say which model each was made for.")
-                for rec in unknown:
-                    self.installed_card(rec)
+                self.show_by_license(unknown, self.installed_card, sub=True)
         shown = [r for r in lib.all("loras") if r["id"] in self.pics]
         folder = self.thumbs_dir()
 
@@ -7499,6 +7514,39 @@ class AddonsWindow:
             pics = catalog.previews(shown, folder)
             self.call(lambda: self.set_pictures(pics))
         self.spawn(work)
+        if not self.licenses_asked:
+            self.look_up_licenses()
+
+    def look_up_licenses(self):
+        """Installed LoRAs never looked up get their license from the page
+        they came from (`hub.look_up_licenses`), once a window; the tab
+        redraws with them."""
+        lib = self.owner.studio.lib
+        pending = [dict(r) for r in lib.all("loras")
+                   if not r.get("license_group") and hub.license_source(r)]
+        self.licenses_asked = True
+        if not pending:
+            return
+        self.status("Looking up the licenses of %d installed LoRAs%s" % (
+            len(pending), ELLIPSIS), "accent")
+        client, token, stop = self.client(), self.hf_token(), self.stop
+
+        def work():
+            found = hub.look_up_licenses(pending, client, token, stop)
+            self.call(lambda: self.licenses_found(found, len(pending)))
+        self.spawn(work)
+
+    def licenses_found(self, found, asked):
+        n = hub.apply_licenses(self.owner.studio.lib, found)
+        missed = asked - len(found)
+        note = " %d could not be looked up; they are tried again next time." % missed \
+            if missed else ""
+        if not n:
+            self.status(("No licenses found." + note).strip(), "warn" if missed else "muted")
+            return
+        if self.save_library("Licenses found for %d LoRAs.%s" % (n, note)) and \
+                self.tab == "installed":
+            self.show()
 
     def installed_card(self, rec):
         o, host, studio = self.owner, self.owner.host, self.owner.studio
@@ -7516,6 +7564,9 @@ class AddonsWindow:
             side="top", fill="x")
         if rec.get("trigger"):
             o.label(mid, "Trigger: " + rec["trigger"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x")
+        if rec.get("license"):
+            o.label(mid, "License: " + rec["license"], "muted", host.f_small, bg="card",
                     wraplength=o.px(440)).pack(side="top", fill="x")
         where_on, where_off = catalog.where_installed(rec, studio.backends(),
                                                       studio.inventories)
@@ -7787,17 +7838,23 @@ class AddonsWindow:
     def civitai_key(self):
         return ModelSourceSettings(self.owner, "civitai")
 
-    def show_by_license(self, cards, make):
-        """`cards` into the box under a heading per license group
-        (catalog.LICENSE_GROUPS), most freely usable first; a group keeps
-        the order the service gave."""
-        group = None
+    def show_by_license(self, cards, make, sub=False):
+        """`cards` (catalog cards or LoRA records) into the box under a
+        heading per license group (ig.LICENSE_GROUPS), most freely usable
+        first; a group keeps the order it came in. `sub`: a smaller heading,
+        under a section's own."""
+        o, group = self.owner, None
         for c in catalog.by_license(cards):
-            g = c.get("license_group", "unstated")
+            g = ig.lora_license(c)[0]
             if g != group:
                 group = g
-                n = sum(1 for x in cards if x.get("license_group", "unstated") == g)
-                self.owner.cap(self.box, "%s (%d)" % (catalog.LICENSE_NAMES.get(g, g), n))
+                text = "%s (%d)" % (ig.LICENSE_NAMES[g], sum(
+                    1 for x in cards if ig.lora_license(x)[0] == g))
+                if sub:
+                    o.label(self.box, text, "muted", o.host.f_bold).pack(
+                        side="top", anchor="w", pady=(o.px(8), 0))
+                else:
+                    o.cap(self.box, text)
             make(c)
 
     # -------------------------------------------------------- Hugging Face

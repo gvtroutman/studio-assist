@@ -105,12 +105,19 @@ this PC's files and the web instead. Two moving parts:
   `<ComfyUI>/custom_nodes/<repo>`, never overwriting and never running anything. No
   tkinter; the tabs are `AddonsWindow`'s "Hugging Face" and "GitHub plugins", and the
   Image Studio header's "App store" opens that window.
-  The CivitAI and Hugging Face tabs list LoRAs grouped by license, most freely usable
-  first (`catalog.LICENSE_GROUPS`: commercial use, own terms, non-commercial, none
-  stated), in the service's order inside a group. CivitAI's group comes from
-  `allowCommercialUse` ("Image" = selling pictures is allowed), the Hub's from the card's
-  license id (`hf_license`). `flux-1-dev-non-commercial-license` is own terms, not
-  non-commercial: it lets the pictures be used commercially.
+  **Licenses.** Models and LoRAs are listed by license, most freely usable first
+  (`imagegen.LICENSE_GROUPS`: commercial use, own terms, non-commercial, none stated),
+  keeping their own order inside a group (`imagegen.by_license`): the CivitAI and
+  Hugging Face tabs, the Installed tab, the "For" row and the form's model menu (a
+  line between groups). CivitAI's group comes from `allowCommercialUse` ("Image" =
+  selling pictures is allowed), the Hub's from the card's license id (`hf_license`).
+  A LoRA record keeps `license_group` / `license`: set at install, or looked up once a
+  window from its `source` page (`hub.look_up_licenses`, applied on the UI thread);
+  empty is "not known yet", shown as none stated. A base model's is its family's
+  (`FAMILY_LICENSES`) unless the Models editor sets `license_group`; the record's
+  `license` note (written into each picture) is left as it is.
+  `flux-1-dev-non-commercial-license` is own terms, not non-commercial: it lets the
+  pictures be used commercially.
 - **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
   directory → `RT_GROUP_ICON` → `RT_ICON` → DIB or PNG → resample → PNG), and
   writes the PNGs `make_icon.py` packs into the `.ico`. `struct` and `zlib` only.
