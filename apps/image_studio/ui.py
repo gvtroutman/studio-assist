@@ -7385,6 +7385,7 @@ class AddonsWindow:
                 self.tools.winfo_children() + self.list.winfo_children():
             w.destroy()
         self.images, self.pics, self.cards, self.armed = {}, {}, [], None
+        self.thumb_paths = {}         # key -> PNG fetched, put back when cards are redrawn
         self.box = self.list          # where cards go
         o.label(self.model_row, "For", "muted", o.host.f_small).pack(side="left")
         for m in models + [{"id": self.OTHER, "label": "Other models"}]:
@@ -7443,6 +7444,7 @@ class AddonsWindow:
 
     def set_pictures(self, paths):
         """{key: PNG path} into the cards' picture labels."""
+        self.thumb_paths.update(paths)
         side = self.owner.px(84)
         for key, path in paths.items():
             lbl = self.pics.get(key)
@@ -7630,8 +7632,10 @@ class AddonsWindow:
         o.button(self.tools, "Search", self.search, kind="accent").pack(
             side="left", padx=(o.px(6), 0))
         self.heading("CivitAI LoRAs for %s" % model["label"],
-                     "Listed under %s. Only pictures CivitAI rates PG or PG-13 are shown; "
-                     "check a LoRA's page before installing." % ", ".join(bases))
+                     "Listed under %s, grouped by license (most freely usable first), in "
+                     "the chosen order inside each group. Only pictures CivitAI rates PG or "
+                     "PG-13 are shown; check a LoRA's page before installing."
+                     % ", ".join(bases))
         self.box = o.frame(self.list)
         self.box.pack(side="top", fill="x")
         self.search()
@@ -7682,8 +7686,11 @@ class AddonsWindow:
             return
         self.cursor = nxt
         self.cards += cards
-        for c in cards:
-            self.catalog_card(c)
+        for w in self.box.winfo_children():   # every page re-sorted into the license groups
+            w.destroy()
+        self.pics = {}
+        self.show_by_license(self.cards, self.catalog_card)
+        self.set_pictures(dict(self.thumb_paths))
         if not self.cards:
             o.label(self.box, "Nothing found.", "muted").pack(side="top", anchor="w",
                                                                 pady=o.px(8))
@@ -7712,6 +7719,9 @@ class AddonsWindow:
                     wraplength=o.px(440)).pack(side="top", fill="x", pady=(o.px(2), 0))
         if c["trigger"]:
             o.label(mid, "Trigger: " + c["trigger"], "faint", host.f_small, bg="card",
+                    wraplength=o.px(440)).pack(side="top", fill="x")
+        if c.get("license"):
+            o.label(mid, "License: " + c["license"], "muted", host.f_small, bg="card",
                     wraplength=o.px(440)).pack(side="top", fill="x")
         have = catalog.installed_as(self.owner.studio.lib, c)
         b = o.button(right, "Installed" if have else "Install", lambda: None,
@@ -7777,6 +7787,19 @@ class AddonsWindow:
     def civitai_key(self):
         return ModelSourceSettings(self.owner, "civitai")
 
+    def show_by_license(self, cards, make):
+        """`cards` into the box under a heading per license group
+        (catalog.LICENSE_GROUPS), most freely usable first; a group keeps
+        the order the service gave."""
+        group = None
+        for c in catalog.by_license(cards):
+            g = c.get("license_group", "unstated")
+            if g != group:
+                group = g
+                n = sum(1 for x in cards if x.get("license_group", "unstated") == g)
+                self.owner.cap(self.box, "%s (%d)" % (catalog.LICENSE_NAMES.get(g, g), n))
+            make(c)
+
     # -------------------------------------------------------- Hugging Face
     def search_row(self, run):
         o = self.owner
@@ -7800,7 +7823,8 @@ class AddonsWindow:
             return
         self.search_row(self.search_hf)
         self.heading("Hugging Face LoRAs for %s" % model["label"],
-                     "Adapters of %s, most downloaded first. Check a LoRA's page and "
+                     "Adapters of %s, grouped by license (most freely usable first), "
+                     "most downloaded first inside each group. Check a LoRA's page and "
                      "license before installing." % ", ".join(repos))
         self.box = o.frame(self.list)
         self.box.pack(side="top", fill="x")
@@ -7825,10 +7849,10 @@ class AddonsWindow:
                 cards, error = hub.hf_search(model, query, token), ""
             except hub.HubError as e:
                 cards, error = [], str(e)
-            self.call(lambda: self.hub_found(gen, cards, error, self.hf_card, 0))
+            self.call(lambda: self.hub_found(gen, cards, error, self.hf_card, 0, True))
         self.spawn(work)
 
-    def hub_found(self, gen, cards, error, make, more):
+    def hub_found(self, gen, cards, error, make, more, grouped=False):
         if gen != self.gen:
             return
         o = self.owner
@@ -7838,9 +7862,14 @@ class AddonsWindow:
         if error:
             self.status(error, "err")
             return
-        for c in cards:
-            make(c)
-        shown = len([w for w in self.box.winfo_children() if not getattr(w, "more", False)])
+        if grouped:
+            self.show_by_license(cards, make)
+            shown = len(cards)
+        else:
+            for c in cards:
+                make(c)
+            shown = len([w for w in self.box.winfo_children()
+                         if not getattr(w, "more", False)])
         if not shown:
             o.label(self.box, "Nothing found.", "muted").pack(side="top", anchor="w",
                                                                 pady=o.px(8))

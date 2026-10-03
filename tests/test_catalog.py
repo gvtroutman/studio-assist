@@ -134,6 +134,27 @@ class TestCatalog(unittest.TestCase):
         self.assertEqual(catalog.card(HIT, {"flux1"})["version_id"], 2)
         self.assertIsNone(catalog.card(HIT, {"qwen-image"}))
 
+    def test_a_card_carries_civitais_license(self):
+        lic = catalog.civitai_license
+        self.assertEqual(lic({"allowCommercialUse": ["Image", "Rent"], "allowNoCredit": True}),
+                         ("commercial", "Sell pictures OK"))
+        self.assertEqual(lic({"allowCommercialUse": "Image", "allowNoCredit": False}),
+                         ("commercial", "Sell pictures OK, credit the creator"))
+        self.assertEqual(lic({"allowCommercialUse": ["RentCivit"]})[0], "custom")
+        self.assertEqual(lic({"allowCommercialUse": ["None"]}),
+                         ("noncommercial", "No commercial use"))
+        self.assertEqual(lic({"allowCommercialUse": []})[0], "noncommercial")
+        self.assertEqual(lic({}), ("unstated", ""))
+        c = catalog.card(dict(HIT, allowCommercialUse=["Image"]), {"z-image"})
+        self.assertEqual(c["license_group"], "commercial")
+        self.assertEqual(catalog.card(HIT, {"z-image"})["license_group"], "unstated")
+
+    def test_cards_are_listed_by_license_keeping_order_inside_a_group(self):
+        cards = [{"n": 1, "license_group": "noncommercial"}, {"n": 2},
+                 {"n": 3, "license_group": "commercial"}, {"n": 4, "license_group": "custom"},
+                 {"n": 5, "license_group": "commercial"}]
+        self.assertEqual([c["n"] for c in catalog.by_license(cards)], [3, 5, 4, 1, 2])
+
     def test_only_a_pg_picture_is_shown_and_asked_for_small(self):
         c = catalog.card(HIT, {"z-image"})
         self.assertEqual(c["preview_url"],
