@@ -233,9 +233,15 @@ PRODUCTS = [
      r"Acrobat\Acrobat.exe"),
 ]
 
+# Globs, first hit wins (`newest_match`): Blender installs into a folder named
+# for its release, and its launcher is what the Start Menu runs - blender.exe
+# itself opens a console window beside the app.
 OTHER_APPS = [
-    (r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe",
+    ([r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"],
      "Dv", "DaVinci Resolve", "#F5A623", "#2B2B2B"),
+    ([r"C:\Program Files\Blender Foundation\Blender*\blender-launcher.exe",
+      r"C:\Program Files\Blender Foundation\Blender*\blender.exe"],
+     "Bl", "Blender", "#F5792A", "#232323"),
 ]
 
 # Derived, never hand-maintained: an app is drivable exactly when the registry
@@ -273,8 +279,9 @@ def detect_apps():
         found.append({"code": code, "name": name, "version": label, "fg": fg,
                       "bg": bg, "id": DRIVABLE.get(name), "exe": exe,
                       "drivable": name in DRIVABLE, "remote": False})
-    for path, code, name, fg, bg in OTHER_APPS:
-        if os.path.exists(path):
+    for globs, code, name, fg, bg in OTHER_APPS:
+        path = newest_match(globs)
+        if path:
             found.append({"code": code, "name": name, "version": "", "fg": fg,
                           "bg": bg, "id": DRIVABLE.get(name), "exe": path,
                           "drivable": name in DRIVABLE, "remote": False})
