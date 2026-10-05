@@ -477,6 +477,17 @@ to leave room for conversation. `--call` also runs the bridge's harmless reads.
 `snapshot` records the contract into `tests/contracts/`, and the tests then hold the
 registry to it offline.
 
+## Audio Review
+
+**File → Audio Review…** compares two to six narration takes directly on an
+audio-capable inference host. Set its host URL and model ID, add WAV/MP3 files
+or source ranges, and optionally provide the intended words and delivery.
+The result ranks the readings with strengths, concerns and evidence timestamps;
+it leaves the source media and timelines unchanged. This requires audio input
+support, not a text-only model or a transcription endpoint.
+
+See [Audio Review setup and usage](docs/audio-review.md).
+
 ## Contributing
 
 Run `python -m unittest discover -s tests` before and after a change. `AGENTS.md`

@@ -709,6 +709,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                            command=self._log_window)
         m_file.add_command(label="Lessons for this tab...", command=self._lessons_window)
         m_file.add_command(label="About this studio...", command=self._studio_window)
+        m_file.add_command(label="Audio Review...", command=self._audio_review_window)
         m_file.add_command(label="New tab...", accelerator="Ctrl+T",
                            command=lambda: self._tab_menu(self.btn_add))
         m_file.add_command(label="Close tab", accelerator="Ctrl+W",
@@ -785,6 +786,19 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self.input.bind(seq, lambda ev, f=fn: (f(), "break")[1])
         self.bind_all("<Control-Tab>", self._on_next_tab)
         self.input.bind("<Control-Tab>", self._on_next_tab)
+
+    def _audio_review_window(self):
+        """Explicit audio comparison on a separately configured inference host."""
+        win = self.windows.get("audio-review")
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        from core.audio_review_ui import AudioReviewWindow
+        self.windows["audio-review"] = AudioReviewWindow(
+            self, palette=self.C, settings=self.prefs.get("audio_review"),
+            save_settings=lambda settings: self.prefs.set(audio_review=settings),
+            report_error=self._report)
 
     # ----------------------------------------------------------------- updates
     def _build(self):
@@ -4906,6 +4920,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         # flag and does not re-arm. Leaving them armed is what printed
         # "invalid command name ..._drain" over a window that was already gone.
         self.closing = True
+        audio_window = self.windows.get("audio-review")
+        if audio_window is not None and audio_window.winfo_exists():
+            audio_window.close()
         tablog.BOOK.unlisten(self._on_log_line)   # nobody will read the queue now
         for s in self.sessions.values():
             if s.images is not None:
