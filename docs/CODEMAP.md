@@ -39,7 +39,8 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/chat_theme.py` | 0.1k | Applying the palette; repainting drawn (not `config()`-able) widgets on a theme switch | `ChatThemeMixin`, `_theme`, `_skin`, `_redraw_marks` |
 | `core/chat_widgets.py` | 0.6k | The drawing primitives every window is built from - buttons, fields, marks, dots, arcs, menus | `ChatWidgetsMixin`, `_button`, `_entry`, `_dots`, `_arc`, `_mark`, `_selectable` (copyable text) |
 | `core/chat_updates.py` | 0.1k | Checking GitHub for updates and pulling them | `ChatUpdatesMixin`, `_check_updates`, `_on_update` |
-| `core/chat_icons.py` | 0.4k | Preferences > Icons: reading an app's icon from its .exe, upload/reset, the icons window | `ChatIconsMixin`, `_read_icons`, `_icons_window`, `_upload_icon` |
+| `core/chat_icons.py` | 0.6k | Preferences > Icons: reading an app's icon from its .exe, upload/reset, the icons window, the web search window (also on a rail row's menu, `Chat._app_menu`) | `ChatIconsMixin`, `_read_icons`, `_icons_window`, `_pick_icon`, `_search_icons`, `_upload_icon` |
+| `core/icon_search.py` | 0.1k | Icons on the web: Wikimedia Commons search, PNG/GIF thumbnails from its hosts only | `search`, `fetch`, `ours`, `words_for` |
 | `core/chat_bridge_dialog.py` | 0.2k | Connect an MCP bridge by hand: the dialog and its registry writes | `ChatBridgeDialogMixin`, `_bridge_dialog`, `_save_bridge` |
 | `core/chat_ask.py` | 0.1k | `studio_ask` as a form in the transcript; the card chrome `chat_elicit.py` shares | `ChatAskMixin`, `_show_ask`, `_form_card`, `_place_form` |
 | `core/chat_elicit.py` | 0.2k | A bridge's MCP elicitation, answered by the user, never the model | `ChatElicitMixin`, `_elicit`, `_show_elicit`, `_diff_box` |

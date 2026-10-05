@@ -1,12 +1,16 @@
 """Preferences > Icons: reading an app's icon out of its .exe, the
 upload/reset flow, and the window that lists every mark and button.
 Split out of core/chat.py (docs/CODEMAP.md) as a mixin."""
+import base64
 import hashlib
 import os
 import re
+import tempfile
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import core.agent as eng
+import core.icon_search as icon_search
 import core.icons as icons
 
 from core.chat import clip, BUTTON_SHOWS
@@ -147,7 +151,6 @@ class ChatIconsMixin:
         """Every app and tab with its mark as drawn now, then every button,
         each with Upload... to give it a picture and Reset to take it back.
         Scrolls: with the Image Studio built there are dozens of buttons."""
-        from tkinter import filedialog, messagebox
         win = self.windows.get("icons")
         if win is not None and win.winfo_exists():
             win.deiconify()
@@ -212,6 +215,7 @@ class ChatIconsMixin:
         rows += [("button:" + label, label, None) for label in labels]
         grid = i = cols = None
         states = {}                       # key -> its row's refresh, for renames
+        self.windows["icon_rows"] = states    # and for a change from the sidebar
         for entry in rows:
             if isinstance(entry, str):
                 grid, i, cols = section(entry), 0, 2 if entry == "APPS AND TABS" else 1
@@ -279,20 +283,11 @@ class ChatIconsMixin:
                 counted()
 
             def upload(key=key, name=name, state=state):
-                path = filedialog.askopenfilename(
-                    parent=win, title="Icon for %s" % name,
-                    filetypes=[("Pictures", "*.png *.ico *.jpg *.jpeg *.gif "
-                                            "*.bmp *.tif *.tiff"),
-                               ("All files", "*.*")])
-                if not path:
-                    return
+                self._pick_icon(key, name, parent=win, after=state)
 
-                def done(error):
-                    if error:
-                        messagebox.showerror("Icon not changed", error,
-                                             parent=win if win.winfo_exists() else self)
-                    state()
-                self._spawn(None, self._upload_icon, key, path, done)
+            def find(key=key, name=name, state=state, logo=spec is not None):
+                self._search_icons(key, name, parent=win, after=state,
+                                   words=icon_search.words_for(name, logo))
 
             choice = {}
 
@@ -311,6 +306,7 @@ class ChatIconsMixin:
                 state()
 
             self._button(cell, "Upload...", upload).pack(side="left")
+            self._button(cell, "Search...", find).pack(side="left", padx=(6, 0))
             reset.command = forget
             reset.pack(side="left", padx=(6, 0))
             if show_key is not None:
@@ -359,6 +355,225 @@ class ChatIconsMixin:
             self.photos[key] = tk.PhotoImage(width=size, height=size, master=self)
         return self.photos[key]
 
+    ICON_TYPES = [("Pictures", "*.png *.ico *.jpg *.jpeg *.gif *.bmp *.tif *.tiff"),
+                  ("All files", "*.*")]
+
+    def _pick_icon(self, key, name, parent=None, after=None):
+        """Ask for a picture and make it `key`'s icon: the Icons window's
+        Upload... and a sidebar row's Change icon... both. A picture that
+        will not read says why; `after` runs once it is settled, either way."""
+        from tkinter import filedialog, messagebox
+        parent = parent or self
+        path = filedialog.askopenfilename(parent=parent, title="Icon for %s" % name,
+                                          filetypes=self.ICON_TYPES)
+        if not path:
+            return
+
+        def done(error):
+            if error:
+                messagebox.showerror("Icon not changed", error,
+                                     parent=parent if parent.winfo_exists() else self)
+            if after is not None:
+                after()
+        self._spawn(None, self._upload_icon, key, path, done)
+
+    SEARCH_COLS = 6
+    SEARCH_TILE = 72                      # a found picture's preview, before _px
+    SEARCH_FETCHERS = 4                   # previews downloaded at once
+
+    def _search_icons(self, key, name, parent=None, after=None, words=None):
+        """Find an icon on the web (Wikimedia Commons, `core.icon_search`)
+        and make the one clicked `key`'s icon, kept like an upload. Searching
+        and downloading are off the UI thread; each preview is made on it,
+        and dropped on it when the window closes - a PhotoImage freed on a
+        worker is a Tk call there."""
+        parent = parent or self
+        wkey = ("icon_search", key)
+        win = self.windows.get(wkey)
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            return
+        win = tk.Toplevel(parent)
+        self.windows[wkey] = win
+        win.title("Find an icon for %s" % name)
+        win.transient(parent)
+        self._skin(win, bg="bg")
+        outer = self._skin(tk.Frame(win), bg="bg")
+        outer.pack(fill="both", expand=True, padx=22, pady=18)
+        line = self._skin(tk.Frame(outer), bg="bg")
+        line.pack(fill="x")
+        field = tk.Entry(line, font=self.f_ui, width=36, relief="flat", bd=0,
+                         highlightthickness=1)
+        self._skin(field, bg="card", fg="text", insertbackground="accent",
+                   highlightbackground="border", highlightcolor="accent")
+        field.insert(0, words or icon_search.words_for(name))
+        field.pack(side="left", fill="x", expand=True, ipady=self._px(3))
+        status = tk.Label(outer, font=self.f_small, anchor="w", justify="left",
+                          wraplength=self._px(560))
+        self._skin(status, bg="bg", fg="faint")
+        grid = self._skin(tk.Frame(outer), bg="bg")
+        foot = self._skin(tk.Frame(outer), bg="bg")
+        note = tk.Label(foot, font=self.f_small, anchor="w", justify="left",
+                        wraplength=self._px(420),
+                        text="From Wikimedia Commons, with each picture's licence "
+                             "under it. A logo stays its maker's trademark.")
+        self._skin(note, bg="bg", fg="faint")
+        note.pack(side="left")
+        self._button(foot, "Close", win.destroy, kind="accent").pack(side="right")
+        status.pack(fill="x", pady=(8, 8))
+        grid.pack(fill="both", expand=True)
+        foot.pack(fill="x", pady=(14, 0))
+
+        run = {"n": 0}                    # the search on show; older ones stop
+        found = {}                        # tile -> the thumbnail's bytes
+        tile_px = self._px(self.SEARCH_TILE)
+
+        def say(text):
+            try:
+                status.config(text=text)
+            except tk.TclError:
+                pass
+
+        def gone(_ev=None):
+            run["n"] += 1
+            for k in [k for k in self.photos
+                      if isinstance(k, tuple) and k[:2] == ("found", key)]:
+                del self.photos[k]
+
+        win.bind("<Destroy>", lambda ev: gone() if ev.widget is win else None)
+
+        def search(_ev=None):
+            gone()
+            n = run["n"]
+            found.clear()
+            for w in grid.winfo_children():
+                w.destroy()
+            text = field.get()
+            if not text.strip():
+                say("Type what to search for.")
+                return
+            say("Searching Wikimedia Commons...")
+            self._spawn(None, look, text, n)
+
+        def look(text, n):
+            """Worker: the search, then every preview, a few at a time."""
+            try:
+                hits, why = icon_search.search(text), None
+            except icon_search.SearchError as e:
+                hits, why = [], str(e)
+            self.q.put(("call", None, lambda: listed(n, hits, why)))
+            if not hits:
+                return
+
+            def get(hit):
+                if run["n"] != n:
+                    return None
+                try:
+                    return icon_search.fetch(hit["thumb"])
+                except icon_search.SearchError:
+                    return None
+            with ThreadPoolExecutor(self.SEARCH_FETCHERS) as pool:
+                jobs = {pool.submit(get, hit): i for i, hit in enumerate(hits)}
+                for job in as_completed(jobs):
+                    data = job.result()
+                    if data and run["n"] == n:
+                        self.q.put(("call", None,
+                                    lambda i=jobs[job], d=data: shown(n, i, d)))
+
+        def listed(n, hits, why):
+            if run["n"] != n or not win.winfo_exists():
+                return
+            if why:
+                say(why)
+            elif not hits:
+                say("Nothing found. Try other words - the program's name, "
+                    "or its maker's.")
+            else:
+                say("Click a picture to use it. Drawings first.")
+            for i, hit in enumerate(hits):
+                tile(i, hit)
+
+        def tile(i, hit):
+            cell = self._skin(tk.Frame(grid, highlightthickness=1, cursor="hand2"),
+                              bg="bg", highlightbackground="bg")
+            cell.grid(row=i // self.SEARCH_COLS, column=i % self.SEARCH_COLS,
+                      padx=3, pady=3, sticky="n")
+            pic = tk.Label(cell, image=self._blank(tile_px), bd=0)
+            self._skin(pic, bg="bg")
+            pic.pack(padx=4, pady=(4, 2))
+            title = tk.Label(cell, text=clip(hit["title"], 14), font=self.f_small)
+            self._skin(title, bg="bg", fg="text")
+            title.pack()
+            lic = tk.Label(cell, text=clip(hit["license"], 14), font=self.f_small)
+            self._skin(lic, bg="bg", fg="faint")
+            lic.pack(pady=(0, 4))
+            cell.pic = pic
+            for w in (cell, pic, title, lic):
+                w.bind("<Enter>", lambda ev: cell.config(
+                    highlightbackground=self.C["accent"]))
+                w.bind("<Leave>", lambda ev: cell.config(
+                    highlightbackground=self.C["bg"]))
+                w.bind("<Button-1>", lambda ev: keep(i, hit))
+
+        def shown(n, i, data):
+            """A preview: Tk reads any PNG or GIF, and shrinks it whole times."""
+            if run["n"] != n or not win.winfo_exists():
+                return
+            cells = grid.winfo_children()
+            if i >= len(cells):
+                return
+            try:
+                full = tk.PhotoImage(data=base64.b64encode(data).decode("ascii"),
+                                     master=self)
+                step = max(1, -(-max(full.width(), full.height()) // tile_px))
+                photo = full.subsample(step) if step > 1 else full
+                self.photos[("found", key, n, i)] = photo
+                cells[i].pic.config(image=photo)
+            except tk.TclError:
+                return                    # not a picture Tk reads: left blank
+            found[i] = data
+
+        def keep(i, hit):
+            say("Using %s..." % hit["title"])
+            self._spawn(None, take, hit, found.get(i))
+
+        def take(hit, data):
+            """Worker: the picture to a temp file, kept as an upload is."""
+            try:
+                data = data or icon_search.fetch(hit["thumb"])
+                fd, path = tempfile.mkstemp(
+                    suffix=".gif" if data[:3] == b"GIF" else ".png")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+            except (icon_search.SearchError, OSError) as e:
+                why = str(e)
+                self.q.put(("call", None, lambda: say(why)))
+                return
+            try:
+                self._upload_icon(key, path, taken)
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        def taken(error):
+            if error:
+                say("Icon not changed: %s" % error)
+                return
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            if after is not None:
+                after()
+
+        self._button(line, "Search", search).pack(side="left", padx=(8, 0))
+        field.bind("<Return>", search)
+        field.focus_set()
+        search()
+
     def _upload_icon(self, key, path, done):
         """Worker: make `path` the icon for `key`. The picture is kept as a
         square PNG under the icons folder, named by its bytes so a new upload
@@ -393,6 +608,12 @@ class ChatIconsMixin:
                 os.remove(os.path.join(self._icons_dir(), old))
             except OSError:
                 pass
+        # Changed from a sidebar row, an open Icons window or Preferences
+        # would otherwise show the old state until reopened.
+        for refresh in (self.windows.get("icon_rows", {}).get(key),
+                        self.windows.get("icons_count")):
+            if callable(refresh):
+                refresh()
         if key.startswith(("button:", "glyph:", "conn:")):
             # Drawn by the UI thread from the kept file, not read from an .exe.
             for k in [k for k in self.button_photos if k[0] == key]:

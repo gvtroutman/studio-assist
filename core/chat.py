@@ -1560,7 +1560,17 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             w.bind("<Button-3>", lambda ev, r=a: self._app_context(ev, r), add="+")
 
     def _app_context(self, ev, a):
+        m = self._app_menu(a)
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+
+    def _app_menu(self, a):
+        """A rail row's right-click menu: its tab or bridge, its icon, and
+        its place in the list."""
         name = a["name"]
+        key = a["id"] or name
         m = self._menu()
         spec = eng.APPS_BY_ID.get(a["id"]) if a["drivable"] else None
         if a["drivable"]:
@@ -1578,14 +1588,22 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             m.add_command(label="Connect an MCP bridge for %s..." % name,
                           command=lambda r=a: self._bridge_dialog(row=r))
             m.add_separator()
+        # The same upload and reset as Preferences > Icons, keyed the same,
+        # so the row, its tab and the window all wear the one picture.
+        m.add_command(label="Change icon...",
+                      command=lambda: self._pick_icon(key, self._name(key, name)))
+        m.add_command(label="Find an icon online...",
+                      command=lambda: self._search_icons(key, name))
+        m.add_command(label="Reset icon",
+                      state="normal" if key in self.prefs.get("icons") else "disabled",
+                      command=lambda: self._set_icon(key, None))
+        m.add_command(label="All icons...", command=self._icons_window)
+        m.add_separator()
         m.add_command(label="Unpin" if name in self.pinned else "Pin to the top",
                       command=lambda n=name: self._pin_app(n))
         m.add_command(label="Remove from the list",
                       command=lambda n=name: self._hide_app(n))
-        try:
-            m.tk_popup(ev.x_root, ev.y_root)
-        finally:
-            m.grab_release()
+        return m
 
     def _pin_app(self, name):
         if name in self.pinned:
