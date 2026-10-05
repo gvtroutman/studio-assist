@@ -102,6 +102,15 @@ def clip(s, n):
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
+def fit_chars(s, font, room):
+    """The most characters of `s` whose `clip` fits `room` pixels in `font`
+    (anything with Tk's `measure`); never fewer than four, a name's stub."""
+    n = len(s)
+    while n > 4 and font.measure(clip(s, n)) > room:
+        n -= 1
+    return max(n, 4)
+
+
 # Preferences > Corners and Text size. Every corner `rounded` draws is scaled
 # by ROUNDING, so one number reshapes the window; the text sizes scale the
 # window's fonts (`Chat._text_size`). Both are sliders over these ranges, and

@@ -1890,6 +1890,16 @@ class TestPrefs(unittest.TestCase):
         self.assertEqual((again.get("rounding"), again.get("text_size")), (1.0, 1.0))
         self.assertEqual(again.get("icons"), {"ok": "a.png"})
 
+    def test_a_dragged_rail_width_is_kept_only_inside_its_range(self):
+        p = self._prefs()
+        self.assertIsNone(p.get("side_w"))   # None: fit the rows
+        p.set(side_w=320)
+        self.assertEqual(self._prefs().get("side_w"), 320)
+        for junk in (20, 5000, True, "wide"):
+            with self.subTest(junk=junk):
+                p.set(side_w=junk)
+                self.assertIsNone(self._prefs().get("side_w"))
+
     def test_rounded_scales_its_corner_and_squares_at_zero(self):
         import tkinter
         import core.ui as ui
@@ -3148,6 +3158,53 @@ class TestGui(unittest.TestCase):
         self.app.update()
         self.assertEqual(self.app.f_ui.cget("size"), before)
         self.assertTrue(ui.in_range(1.0, ui.TEXT_RANGE))
+
+    def test_the_rail_is_dragged_wider_kept_and_double_clicked_back(self):
+        app = self.app
+        self.addCleanup(lambda: (app.prefs.set(side_w=None), app._metrics(),
+                                 app._side_width(app.side_w), app._build_apps()))
+        app.geometry("1400x900")
+        for _ in range(10):
+            app.update()
+        grip, side = app.side_grip, app.side_frame
+        # Between the rail and the page, the full height of both.
+        self.assertEqual(grip.winfo_rootx(), side.winfo_rootx() + side.winfo_width())
+        self.assertEqual(grip.winfo_height(), side.winfo_height())
+        fitted = app.side_w
+        left = side.winfo_rootx()
+
+        def drag_to(px):
+            grip.event_generate("<ButtonPress-1>", rootx=left + fitted, x=1, y=5)
+            grip.event_generate("<B1-Motion>", rootx=left + px, x=1, y=5)
+            grip.event_generate("<ButtonRelease-1>", rootx=left + px, x=1, y=5)
+            app.update()
+
+        drag_to(fitted + app._px(100))
+        self.assertEqual(app.side_w, fitted + app._px(100))
+        self.assertEqual(side.winfo_width(), app.side_w)
+        self.assertEqual(app.prefs.get("side_w"), round(app.side_w / app.scale))
+        # A text size change keeps the width the user chose.
+        app._text_size(1.2)
+        app.update()
+        self.assertEqual(side.winfo_width(), fitted + app._px(100))
+        app._text_size(1.0)
+        # Too far either way stops at the range.
+        drag_to(-500)
+        self.assertEqual(app.side_w, app._px(self.mod.SIDEBAR_RANGE[0]))
+        drag_to(5000)                     # and never leaves the page too little
+        low, high = self.mod.SIDEBAR_RANGE
+        self.assertEqual(app.side_w, min(app._px(high),
+                                         app.winfo_width() - app._px(low + 240)))
+        self.assertTrue(all(lbl.winfo_exists() for lbl in app.app_subtitles.values()))
+        # Double-click: back to fitting the rows, and nothing saved by its
+        # releases. Tk cannot be sent a double; two quick presses are one.
+        for seq in ("<ButtonPress-1>", "<ButtonRelease-1>", "<ButtonPress-1>",
+                    "<ButtonRelease-1>"):
+            grip.event_generate(seq, rootx=left + 10, x=1, y=5)
+        app.update()
+        self.assertIsNone(app.prefs.get("side_w"))
+        self.assertEqual(app.side_w, fitted)
+        self.assertEqual(side.winfo_width(), fitted)
 
     def test_corners_repaint_the_live_window_and_keep_transcripts(self):
         import core.ui as ui
