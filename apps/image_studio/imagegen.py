@@ -1096,6 +1096,22 @@ def _default_camera_profiles():
          "lenses": [{"name": "AF 28-80mm kit at 28mm", "mm": 28, "f": 3.3},
                     {"name": "AF 28-80mm kit at 80mm", "mm": 80, "f": 5.6},
                     {"name": "AF 50mm f/1.8D", "mm": 50, "f": 1.8}]},
+        # Sony's figures: 5.8-17.4mm on a 1/2.5" CCD is 35-105mm, f/2.8-4.8.
+        {"id": "sony-dsc-s650", "name": "Sony Cyber-shot DSC-S650",
+         "chemistry": "Shot on a Sony Cyber-shot DSC-S650, a 7.2-megapixel point-and-shoot "
+                      "from 2007 with a small CCD sensor: CCD colour, punchy saturated "
+                      "primaries, slightly cool whites, clean crisp blues and reds, skin "
+                      "a little pink in daylight; contrasty with a narrow dynamic range, "
+                      "bright skies and highlights blowing out to white, shadows "
+                      "dropping to black; in dim light the hard on-camera flash, bright "
+                      "flat faces against a dark background; JPEG detail with visible "
+                      "sharpening, colour noise and smeared texture indoors, faint purple "
+                      "fringing on bright edges; deep focus, everything sharp; a "
+                      "nostalgic mid-2000s digital snapshot look.",
+         "lens": 35.0, "format": "4:3",
+         "lenses": [{"name": "35mm (wide)", "mm": 35, "f": 2.8},
+                    {"name": "70mm", "mm": 70, "f": None},
+                    {"name": "105mm (3x zoom)", "mm": 105, "f": 4.8}]},
     ]
 
 

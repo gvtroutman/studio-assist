@@ -3085,7 +3085,7 @@ class TestLibrary(unittest.TestCase):
     def test_the_starter_cameras_include_the_phone_and_the_cinema_camera(self):
         cams = {c["id"]: c for c in ig.Library(tempfile.mkdtemp()).all("camera_profiles")}
         for cid in ("galaxy-s25-ultra", "canon-rebel-sl1", "sony-zv1", "bmpcc-6k-g2",
-                    "nikon-n80"):
+                    "nikon-n80", "sony-dsc-s650"):
             cam = cams[cid]
             self.assertTrue(cam["lenses"], cid)
             self.assertIsNotNone(ig.lens_at(cam["lenses"], cam["lens"]), cid)  # native is one
