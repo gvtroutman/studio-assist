@@ -1481,11 +1481,12 @@ class TestHandEnteredBridges(unittest.TestCase):
         self.assertEqual(eng.split_command("npx -y some-mcp"), ("npx", ["-y", "some-mcp"]))
 
     def test_the_sidebar_learns_of_it(self):
-        eng.add_bridge(eng.BridgeSpec("Blender", "uvx", ["blender-mcp"]))
+        # nothing installed by this name, so the bridge is the row's only evidence
+        eng.add_bridge(eng.BridgeSpec("Some DAW", "uvx", ["daw-mcp"]))
         rows = {r["name"]: r for r in eng.detect_apps()}
-        self.assertTrue(rows["Blender"]["drivable"])
-        self.assertEqual(rows["Blender"]["version"], "bridge")
-        self.assertFalse(rows["Blender"]["remote"])
+        self.assertTrue(rows["Some DAW"]["drivable"])
+        self.assertEqual(rows["Some DAW"]["version"], "bridge")
+        self.assertFalse(rows["Some DAW"]["remote"])
         # a bridge named for an app that already has one written here gets a
         # tab, but the sidebar row stays with the bridge written here
         eng.add_bridge(eng.BridgeSpec("After Effects", "npx", ["other-ae-mcp"], id="ae2"))
@@ -1687,6 +1688,33 @@ class TestDetection(unittest.TestCase):
                 self.assertIn(a["id"], eng.APPS_BY_ID)
             else:
                 self.assertIsNone(a["id"])
+
+    def test_other_apps_are_found_by_glob_and_wait_for_a_bridge(self):
+        """Blender installs into a folder named for its release; detected, it is
+        a row that is not drivable until a bridge is connected for it - and then
+        that same row is, rather than a second 'bridge' row beside it."""
+        import core.agent_bridges as bridges
+        here = os.path.dirname(sys.executable)
+        row = ([os.path.join(os.path.dirname(here), "*", "nothing.exe"),
+                os.path.join(os.path.dirname(here), os.path.basename(here) + "*",
+                             os.path.basename(sys.executable))],
+               "Bl", "Blender", "#F5792A", "#232323")
+        from unittest import mock
+        with mock.patch.object(bridges, "OTHER_APPS", [row]):
+            rows = [a for a in eng.detect_apps() if a["name"] == "Blender"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(os.path.normcase(rows[0]["exe"]), os.path.normcase(sys.executable))
+            self.assertFalse(rows[0]["drivable"])
+            self.assertIsNone(rows[0]["id"])
+            spec = eng.add_bridge(eng.BridgeSpec("Blender", "uvx", ["blender-mcp"]))
+            try:
+                rows = [a for a in eng.detect_apps() if a["name"] == "Blender"]
+                self.assertEqual(len(rows), 1)
+                self.assertTrue(rows[0]["drivable"])
+                self.assertEqual(rows[0]["id"], spec.id)
+                self.assertEqual(rows[0]["version"], "")
+            finally:
+                eng.remove_bridge(spec.id)
 
     def test_newest_match_returns_none_when_nothing_exists(self):
         self.assertIsNone(eng.newest_match([r"Z:\nothing\here\*.exe"]))
@@ -4717,7 +4745,12 @@ class TestGui(unittest.TestCase):
                 self.app._forget_bridge(eng.APPS_BY_ID["blender"])
         self.assertNotIn("blender", eng.APPS_BY_ID)
         self.assertNotIn("blender", self.app.sessions)
-        self.assertNotIn("Blender", self._sidebar_names())
+        # Blender installed here keeps its detected row, no longer drivable
+        rows = [r for r in self.app.detected if r["name"] == "Blender"]
+        if rows:
+            self.assertEqual([r["drivable"] for r in rows], [False])
+        else:
+            self.assertNotIn("Blender", self._sidebar_names())
         self.assertEqual(self.mod.Prefs(self.app.prefs.path).get("bridges"), [])
 
     def test_a_learned_bridge_rewrites_the_prompt_before_the_warm_up(self):
