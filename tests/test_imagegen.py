@@ -4880,9 +4880,15 @@ class TestImageStudioTab(unittest.TestCase):
         import apps.image_studio.ui as studio_images_ui
         from unittest.mock import patch
         _, ui = self.tab()
+        store = ui.open_addons()
+        try:
+            self.app.update()
+            for source in studio_images_ui.model_sources.SOURCES:
+                self.assertTrue(store.source_buttons[source].winfo_ismapped())
+        finally:
+            store.close()
         with patch.dict(os.environ, {}, clear=True):
             for source, (_, domain, _) in studio_images_ui.model_sources.SOURCES.items():
-                self.assertTrue(ui.source_buttons[source].winfo_ismapped())
                 dlg = studio_images_ui.ModelSourceSettings(ui, source)
                 try:
                     link = "https://%s/models/example" % domain

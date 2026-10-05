@@ -1,6 +1,7 @@
 # Model and code discovery
 
-In Image Studio, open **Hugging Face** or **Civitai** beside Manage.
+In Image Studio, open **App store**, then **Hugging Face** or **Civitai** at its
+top, beside Manage.
 Opening either window fetches candidate metadata on a background worker. A
 successful result is reused for 24 hours; **Refresh now** bypasses that cache.
 This checks when the window opens, not on a timer while Studio Assist is closed.

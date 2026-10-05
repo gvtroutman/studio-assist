@@ -7364,7 +7364,17 @@ class AddonsWindow:
         win.protocol("WM_DELETE_WINDOW", self.close)
         head = o.frame(win)
         head.pack(side="top", fill="x", padx=o.px(16), pady=(o.px(14), 0))
-        o.label(head, "Add-ons", font=host.f_title).pack(side="top", anchor="w")
+        title = o.frame(head)
+        title.pack(side="top", fill="x")
+        o.label(title, "Add-ons", font=host.f_title).pack(side="left")
+        manage = o.button(title, "Manage ▾", lambda: None)
+        manage.command = lambda: owner._manage_menu(manage)
+        manage.pack(side="right")
+        self.source_buttons = {}
+        for source, (name, _domain, _env) in model_sources.SOURCES.items():
+            button = o.button(title, name, lambda key=source: owner.open_model_source(key))
+            button.pack(side="right", padx=(0, o.px(6)))
+            self.source_buttons[source] = button
         o.label(head, "LoRAs for the models you have. The form only offers a LoRA with a "
                 "model it works with.", "muted", host.f_small,
                 wraplength=o.px(760)).pack(side="top", fill="x")
@@ -7377,8 +7387,6 @@ class AddonsWindow:
         foot = o.frame(win)
         foot.pack(side="bottom", fill="x", padx=o.px(16), pady=o.px(12))
         o.button(foot, "Close", self.close, kind="ghost").pack(side="right")
-        o.button(foot, "CivitAI key…", self.civitai_key, kind="ghost").pack(
-            side="right", padx=(0, o.px(6)))
         o.button(foot, "Library…", owner.edit_loras, kind="ghost").pack(
             side="right", padx=(0, o.px(6)))
         self.msg = o.label(foot, "", "muted", host.f_small, wraplength=o.px(470))
@@ -7863,16 +7871,13 @@ class AddonsWindow:
         if error:
             key = "API key" in error or "401" in error or "403" in error
             self.status("Could not install %s: %s%s" % (
-                c["name"], error, " Paste one under CivitAI key…" if key else ""), "err")
+                c["name"], error, " Paste one under Civitai, at the top." if key else ""), "err")
             return
         self.library_changed()
         self.owner.refresh_backends()     # so the form knows the file is there
         self.status("Installed %s into %s. It is on the form's Add LoRA menu for %s." % (
             rec["name"], self.owner.studio.backend(bid)["name"],
             self.model_rec()["label"]), "ok")
-
-    def civitai_key(self):
-        return ModelSourceSettings(self.owner, "civitai")
 
     def show_by_license(self, cards, make, sub=False):
         """`cards` (catalog cards or LoRA records) into the box under a
