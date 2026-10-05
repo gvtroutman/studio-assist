@@ -969,79 +969,129 @@ def _default_styles():
 
 def _default_camera_profiles():
     # Chemistry, not example photos: a camera is named and shot on real film
-    # or a real sensor, so its own words say what that does to a picture.
+    # or a real sensor, so its own words say what that does to a picture -
+    # in things a picture can show, in this order: colour (cast, which hues
+    # it pushes or mutes, skin), tone (contrast, highlights, shadows),
+    # texture (grain or noise, sharpening) and the lens's drawing.
     return [
         {"id": "none", "name": "No camera set", "chemistry": ""},
         {"id": "digital-5d", "name": "Canon 5D Mark IV",
-         "chemistry": "Shot on a Canon 5D Mark IV: clean full-frame digital colour "
-                      "science, natural skin tones, moderate dynamic range, minimal "
-                      "noise, crisp fine detail.",
+         "chemistry": "Shot on a Canon 5D Mark IV, a full-frame DSLR: Canon colour "
+                      "science, warm and slightly rosy skin tones, rich saturated "
+                      "reds, greens that lean a little yellow; a smooth, natural tonal "
+                      "curve with clean, open shadows and a soft highlight roll-off; "
+                      "crisp, finely resolved detail with almost no noise; full-frame "
+                      "depth of field, the background melting into smooth, creamy "
+                      "blur.",
          "lens": 50.0},
         {"id": "leica-m6", "name": "Leica M6",
          "chemistry": "Shot on a Leica M6, a 35mm rangefinder loaded with Kodak Portra "
-                      "400 colour negative film: warm, creamy skin tones, fine grain, "
-                      "gentle highlight roll-off.",
+                      "400 colour negative film: warm, peachy, creamy skin tones; soft "
+                      "pastel saturation with olive-leaning greens and gentle teal in "
+                      "the shadows; low contrast and wide latitude, highlights that "
+                      "roll off gently instead of clipping, shadows that stay open; "
+                      "fine, even film grain; a Leica lens's crisp micro-contrast and "
+                      "a faint natural vignette.",
          "lens": 35.0},
         {"id": "hasselblad-500cm", "name": "Hasselblad 500C/M",
          "chemistry": "Shot on a Hasselblad 500C/M medium format camera loaded with "
-                      "Kodak Portra 160: ultra-smooth tonal gradation, shallow depth of "
-                      "field, fine grain.",
+                      "Kodak Portra 160, a 6x6 square negative: ultra-smooth tonal "
+                      "gradation with no harsh transitions; natural, neutral-to-warm "
+                      "skin tones and soft, restrained colour; low contrast, luminous "
+                      "highlights, detailed shadows; very fine, almost invisible "
+                      "grain; a Zeiss Planar lens's gentle sharpness, a thin plane of "
+                      "focus and a smooth, three-dimensional fall-off into blur.",
          "lens": 50.0},
         {"id": "canon-ae1", "name": "Canon AE-1",
-         "chemistry": "Shot on a Canon AE-1, 35mm black and white on Kodak Tri-X: deep "
-                      "blacks, visible grain, high contrast, strong directional light.",
+         "chemistry": "Shot on a Canon AE-1, 35mm black and white on Kodak Tri-X 400: "
+                      "rich, deep blacks and bright, silvery highlights; high contrast "
+                      "with a classic S-shaped curve; pronounced, gritty, organic "
+                      "grain through the midtones and shadows; skin rendered in "
+                      "luminous greys with every texture showing; strong directional "
+                      "light; a documentary, photojournalism look.",
          "lens": 50.0},
         {"id": "sx-70", "name": "Polaroid SX-70",
-         "chemistry": "Shot on a Polaroid SX-70 instant camera: soft focus, warm faded "
-                      "colour, lifted blacks, gentle vignetting, square format.",
+         "chemistry": "Shot on a Polaroid SX-70 instant camera on integral instant "
+                      "film: soft, dreamy focus with a gentle glow around highlights; "
+                      "warm, faded colour, an amber-yellow cast in the highlights and "
+                      "cool cyan-green in the shadows; low saturation, milky lifted "
+                      "blacks and compressed contrast, bright areas blooming softly; "
+                      "smooth, grainless chemical texture; gentle dark vignetting "
+                      "toward the corners; square format.",
          "lens": 35.0},
         {"id": "sony-a7siii", "name": "Sony a7S III",
-         "chemistry": "Shot on a Sony a7S III: low-light video-grade digital sensor, "
-                      "clean high ISO, slightly cool colour science, smooth shadow "
-                      "detail.",
+         "chemistry": "Shot on a Sony a7S III, a full-frame low-light camera: Sony "
+                      "colour science, neutral-to-cool whites, skin with a faint "
+                      "yellow-green lean, clean saturated blues; wide dynamic range "
+                      "with smooth, detailed shadows and a gentle highlight roll-off; "
+                      "very clean at high ISO, only a fine, even luminance noise; a "
+                      "12-megapixel rendering, crisp but without hair-fine detail.",
          "lens": 35.0},
         # Lenses in full-frame equivalents: the phone's are Samsung's own
         # figures, the SL1's (APS-C, x1.6) and the Pocket 6K's (Super 35, x1.6)
         # are the lens's focal length times the crop.
         {"id": "galaxy-s25-ultra", "name": "Samsung Galaxy S25 Ultra",
-         "chemistry": "Shot on a Samsung Galaxy S25 Ultra smartphone: computational HDR, "
-                      "bright lifted shadows, vivid saturated Samsung colour, crisp "
-                      "sharpened detail, deep focus from a small sensor.",
+         "chemistry": "Shot on a Samsung Galaxy S25 Ultra smartphone: Samsung's "
+                      "computational processing, multi-frame HDR that flattens "
+                      "contrast, lifts the shadows and brightens faces; vivid, "
+                      "saturated colour with punchy blues and greens and bright, "
+                      "slightly warm skin; crisp, strongly sharpened edges, noise "
+                      "reduction smoothing fine skin texture; deep focus from a small "
+                      "sensor, near and far both sharp; a clean, bright, high-key "
+                      "phone look.",
          "lens": 23.0, "format": "4:3",
          "lenses": [{"name": "0.6x ultra-wide", "mm": 13, "f": 2.2},
                     {"name": "1x wide", "mm": 23, "f": 1.7},
                     {"name": "3x telephoto", "mm": 67, "f": 2.4},
                     {"name": "5x telephoto", "mm": 111, "f": 3.4}]},
         {"id": "canon-rebel-sl1", "name": "Canon EOS Rebel SL1",
-         "chemistry": "Shot on a Canon EOS Rebel SL1, an entry-level APS-C DSLR: warm "
-                      "Canon colour, pleasing skin tones, modest dynamic range, a "
-                      "little noise in the shadows.",
+         "chemistry": "Shot on a Canon EOS Rebel SL1, an entry-level APS-C DSLR: Canon "
+                      "colour science in its Standard picture style, warm skin with a "
+                      "slightly rosy-magenta lean, rich reds, moderately saturated "
+                      "colour; moderate contrast and limited dynamic range, highlights "
+                      "that clip a little abruptly and shadows that go dark quickly; "
+                      "some luminance and colour noise in the shadows; 18-megapixel "
+                      "detail, slightly soft at the finest level.",
          "lens": 29.0, "format": "3:2",
          "lenses": [{"name": "18-55mm kit at 18mm", "mm": 29, "f": 3.5},
                     {"name": "18-55mm kit at 55mm", "mm": 88, "f": 5.6},
                     {"name": "40mm f/2.8 pancake", "mm": 64, "f": 2.8},
                     {"name": "50mm f/1.8", "mm": 80, "f": 1.8}]},
         {"id": "sony-zv1", "name": "Sony ZV-1",
-         "chemistry": "Shot on a Sony ZV-1 compact camera: 1-inch sensor, bright Zeiss "
-                      "zoom, Sony colour with warm flattering skin tones, soft "
-                      "background blur, clean detail.",
+         "chemistry": "Shot on a Sony ZV-1 compact camera, a 1-inch sensor behind a "
+                      "bright Zeiss zoom: Sony colour tuned for faces, bright, evenly "
+                      "exposed, warm and flattering skin, moderately saturated colour; "
+                      "good dynamic range with slightly crushed deep shadows; crisp "
+                      "centre sharpness; modest background blur, deeper focus than a "
+                      "full-frame camera; a little fine noise in the shadows indoors; "
+                      "a clean creator-vlog look.",
          "lens": 24.0, "format": "3:2",
          "lenses": [{"name": "24mm (wide end)", "mm": 24, "f": 1.8},
                     {"name": "50mm", "mm": 50, "f": None},
                     {"name": "70mm (long end)", "mm": 70, "f": 2.8}]},
         {"id": "bmpcc-6k-g2", "name": "Blackmagic Pocket Cinema Camera 6K G2",
          "chemistry": "Shot on a Blackmagic Pocket Cinema Camera 6K G2 in Blackmagic "
-                      "RAW, graded: Super 35 cinema sensor, wide dynamic range, filmic "
-                      "Blackmagic colour science, natural skin, soft highlight "
-                      "roll-off, cinematic look.",
+                      "RAW with Blackmagic Gen 5 colour science, graded: a Super 35 "
+                      "cinema sensor with wide dynamic range; natural, true-to-life "
+                      "skin with gentle warmth and accurate hues; a filmic, soft "
+                      "highlight roll-off and rich, detailed shadows; restrained "
+                      "saturation and cinematic contrast from the grade; an "
+                      "unsharpened, organic image with fine, film-like noise in the "
+                      "shadows; shallow cinematic depth of field; the look of a film "
+                      "still.",
          "lens": 29.0, "format": "16:9",
          "lenses": [{"name": "Sigma 18-35 f/1.8 at 18mm", "mm": 29, "f": 1.8},
                     {"name": "Sigma 18-35 f/1.8 at 35mm", "mm": 56, "f": 1.8},
                     {"name": "EF 50mm f/1.8", "mm": 80, "f": 1.8}]},
         {"id": "nikon-n80", "name": "Nikon N80",
-         "chemistry": "Shot on a Nikon N80, a 35mm autofocus film SLR, loaded with Kodak "
-                      "Gold 200 colour negative film: warm golden tones, saturated "
-                      "colour, soft visible grain, gentle highlight roll-off.",
+         "chemistry": "Shot on a Nikon N80, a 35mm autofocus film SLR, loaded with "
+                      "Kodak Gold 200 colour negative film: a warm, golden-yellow cast "
+                      "and sunny, nostalgic colour; saturated reds, oranges and "
+                      "yellows, slightly muted blues, yellow-leaning greens; warm, "
+                      "golden skin tones; moderate contrast with a soft highlight "
+                      "shoulder; visible but fine consumer-film grain; a sharp Nikkor "
+                      "lens with a gentle glow wide open; an everyday 1990s snapshot "
+                      "look.",
          "lens": 50.0, "format": "3:2",
          "lenses": [{"name": "AF 28-80mm kit at 28mm", "mm": 28, "f": 3.3},
                     {"name": "AF 28-80mm kit at 80mm", "mm": 80, "f": 5.6},
