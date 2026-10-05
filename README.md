@@ -74,8 +74,8 @@ LLM PC, so its button is **Check ComfyUI** and it tells you where to start it.
 own, and it stops when Studio Assist closes.
 
 The left rail shows what's installed on **this machine** — named, so you know which
-one — with each app's own icon and a live status dot for the ones the agent can
-drive. It's your list, not the machine's: **pin** the apps you work in to the top,
+one — with each app's own icon; drag its right edge to make it wider or narrower
+(double-click the edge to fit it again). It's your list, not the machine's: **pin** the apps you work in to the top,
 **×** the ones you haven't set up out of the way, and **+** in the heading brings any
 of them back. Click a drivable app to open its tab.
 

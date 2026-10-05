@@ -287,16 +287,6 @@ class ChatWidgetsMixin:
         except tk.TclError:
             self.dot_role.pop(canvas, None)
 
-    def _paint_app_dot(self, s):
-        """The rail's dot for one app: its bridge's state, breathing while
-        that tab is still starting up. `booting` and not the bridge role,
-        because a tab can sit at "not started" indefinitely - the host coming
-        back resets every stuck tab, and the ones you are not looking at wait
-        to be selected. Those are settled, not busy, and must not animate."""
-        dot = self.app_dots.get(s.id)
-        if dot is not None:
-            self._pulse_dot(dot, s.bridge[0], "side", s.booting)
-
     def _pulse_dot(self, canvas, role, bg, busy):
         """A status dot that breathes while its tab is working, and sits still
         the rest of the time. The dot already carries what the bridge is doing;
