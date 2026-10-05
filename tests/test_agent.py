@@ -3257,7 +3257,7 @@ class TestGui(unittest.TestCase):
 
         def walk(w):
             for child in w.winfo_children():
-                if isinstance(child, self.mod.tk.Scale):
+                if isinstance(child, self.mod.ui.Slider):
                     found.append(child)
                 walk(child)
         walk(win)
@@ -4435,6 +4435,47 @@ class TestGui(unittest.TestCase):
                     body = f.read()
                 self.assertNotIn("tk.Button(", body,
                                  "use _button(); see PILL_ROLES for the kinds")
+
+    def test_every_slider_has_a_pill_handle(self):
+        """Tk's Scale is a square block on a square trough; every slider goes
+        through `_scale`, a `Slider` whose handle is a pill. Read from the
+        source for the sites in dialogs that are not open, then driven."""
+        import core.chat_icons as icons_mod
+        import apps.image_studio.ui as studio_tab
+        for module in (self.mod, icons_mod, studio_tab):
+            with self.subTest(module=module.__name__):
+                with open(module.__file__, encoding="utf-8") as f:
+                    self.assertNotIn("tk.Scale(", f.read(), "use _scale()")
+        var = self.mod.tk.DoubleVar(value=0.5)
+        said = []
+        s = self.app._scale(self.app, var, 0.0, 2.0, resolution=0.05,
+                             command=said.append, length=200)
+        self.addCleanup(s.destroy)
+        s.place(x=0, y=0, width=200)
+        self.app.update()
+        def ends():
+            return [s.coords(i) for i in s.find_all() if s.type(i) == "oval"]
+        ovals = ends()
+        self.assertEqual(len(ovals), 2)                       # the pill's two ends
+        self.assertEqual(ovals[0][3] - ovals[0][1], ovals[0][2] - ovals[0][0])
+        self.assertEqual((float(s.cget("from")), float(s.cget("to"))), (0.0, 2.0))
+        self.assertEqual(s.cget("variable"), str(var))
+        s.set(1.234)                                          # rounded to the resolution
+        self.assertEqual(said, ["1.25"])
+        self.assertAlmostEqual(var.get(), 1.25)
+        s.set(1.25)                                           # unchanged: no command
+        self.assertEqual(said, ["1.25"])
+        at = ends()[0][0]
+        var.set(0.0)                                          # the variable moves the hand
+        self.app.update()
+        self.assertEqual(ends()[0][0], 0)
+        self.assertGreater(at, 50)
+        self.assertEqual(said, ["1.25"])                      # and says nothing
+        self.app.tk.call(s.cget("command"), "0.7")            # a Tcl name, as the Scale's was
+        self.assertEqual(said[-1], "0.7")
+        s.config(resolution=1)
+        s.set(1.6)
+        self.assertEqual(said[-1], "2")
 
     def test_the_window_says_its_name_once(self):
         """The title bar has it, and Windows repeats it on the taskbar and in

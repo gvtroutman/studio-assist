@@ -4247,6 +4247,17 @@ and `invoke()` the way the Button it replaced did, and `anchor="w"` makes it a
 full-width row that reads from the left and wraps — that is what the question form's
 options are. A test reads both source files and fails on a literal `tk.Button(`.
 
+**Every slider is a `Slider`, through `Chat._scale`** (2026-10-05). Tk's Scale is a
+square block on a square trough, so `core.ui.Slider` draws a round-capped track and a
+pill handle on a canvas (two ovals and a band, as `Pill(round=True)` does — not
+`rounded()`, so Corners never squares it). It answers what callers asked of the Scale:
+`variable`/`from`/`to`/`resolution`/`command` through `config` and `cget`, `get()`,
+`set()`, and `cget("command")` is a Tcl name. As with the Scale, `set()` and a drag call
+`command` with the value as text and writing the variable only moves the handle; a press
+off the handle jumps it there. `Chat._slider` is the Preferences row (label, slider,
+percent, 100%) that holds one; tests find sliders with `isinstance(w, ui.Slider)`, and
+one fails on a literal `tk.Scale(` in the window, Preferences or Image Studio source.
+
 **The bridges' mark is drawn, not a glyph.** MDL2's chain link says "two things
 fastened together", which is not what a bridge is or what that row reports, and a font
 glyph cannot show a span going up. `_arc` plots it: shallow on purpose, because at 18×13
