@@ -4560,11 +4560,11 @@ class TestImageStudioTab(unittest.TestCase):
             {"id": "mara", "name": "Mara", "identity": "gav",
              "looks": {"hair": "black", "facial_hair": "heavy stubble"}},
             {"id": "bare", "name": "Bare", "identity": "", "looks": {}}])
-        ui.text["expression"].set("laughing")
+        ui.text["top"].set("linen shirt")
         ui._saved("characters")
         self.assertEqual((ui.text["hair"].get(), ui.text["facial_hair"].get()),
                          ("black", "heavy stubble"))
-        self.assertEqual(ui.text["expression"].get(), "laughing")     # the picture's, kept
+        self.assertEqual(ui.text["top"].get(), "linen shirt")         # the form's, kept
         ui._pick_from_people("i:two")                # a profile alone is not Mara
         self.assertEqual((ui.settings["character"], ticked()), ("", ["two"]))
         self.assertEqual(ui.person_pill.cget("text"), "Two  ▾")
@@ -4576,18 +4576,23 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual((ui.settings["character"], ticked()), ("", []))
         self.assertEqual(ui.person_pill.cget("text"), "No one  ▾")
         # Who the person is is the creator's alone (the user, 2026-10-02);
-        # Expression and Clothes show one after the other, no tabs (2026-10-05).
+        # the Clothes rows show with no tabs, and no Expression (2026-10-05).
         self.assertFalse(hasattr(ui, "look_tabs"))
+        self.assertNotIn("expression", ui.text)
+        ui.settings["expression"] = "laughing"       # saved before: not said
+        self.assertNotIn("expression", ui.collect())
+        self.assertNotIn("laughing", ig.person_text(ui.collect()))
         shown, todo = [], list(ui.look_box.winfo_children())
         while todo:
             w = todo.pop()
             todo += w.winfo_children()
             if w.winfo_class() == "Label":
                 shown.append(w.cget("text"))
-        for label in ("Expression", "Top / dress", "Shoes"):
+        for label in ("Top / dress", "Shoes"):
             self.assertIn(label, shown)
-        for hidden in ("Colour", "Eyes", "Accessories", "Looking"):
+        for hidden in ("Expression", "Colour", "Eyes", "Accessories", "Looking"):
             self.assertNotIn(hidden, shown)
+        self.assertFalse([w for w in shown if w in ig.EMOJI.values()])
 
     def test_a_character_tag_is_a_word_and_an_uploaded_picture(self):
         s, ui = self.tab()
@@ -4804,19 +4809,8 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("glasses", rec["item_refs"])
         self.assertEqual(ui.settings["character"], "mara")
         self.assertEqual(ui.text["hair"].get(), "auburn")
-        ui.text["expression"].set("")
         ui._show_looks()
-        rows = ui.look_box.winfo_children()
-        self.assertTrue(rows)
-        # The Expression row, first, is the faces alone: no field or menu.
-        shown, todo = [], [rows[0]]
-        while todo:
-            w = todo.pop()
-            todo += w.winfo_children()
-            shown.append(w)
-        self.assertIn("Expression", [w.cget("text") for w in shown
-                                     if w.winfo_class() == "Label"])
-        self.assertFalse([w for w in shown if w.winfo_class() == "Entry"])
+        self.assertTrue(ui.look_box.winfo_children())
         s_ = ui.collect()
         self.assertEqual((s_["character"], s_["weight"], s_["accessories"]),
                          ("mara", -1, "glasses"))

@@ -774,8 +774,10 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   nouns, picks, many)`; every slot also takes free text, and a `many` slot
   (accessories, marks) toggles picks in a comma list (`toggle`). Weight, muscle and
   height are `SLIDERS`, -3..3, nothing said at 0. Height's setting is `stature`:
-  `height` is the picture's. Expressions show as emoji (`EMOJI`), on the form as
-  faces alone (no field or menu); the emoji never reach the prompt. There is no gaze
+  `height` is the picture's. Expressions show as emoji (`EMOJI`), in Scene Builder
+  as faces alone (no field or menu); the emoji never reach the prompt. The People
+  tab has no expression at all (2026-10-05): not shown, not kept (`FORM_SLOTS`), and
+  `collect` drops a saved one. There is no gaze
   slot (Looking, dropped 2026-10-05): a saved `gaze` is not said, and a scene's head
   says where it looks. A **character** (`characters.json`,
   made in `CharacterCreator`) keeps every slot and slider but `PER_PICTURE`
@@ -787,8 +789,8 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   profiles (identities) alone, `"c:<id>"` / `"i:<id>"` (`_pick_from_people`); a
   character brings its profile or none, and picking another profile clears the
   character. Under it, **Editor** (the creator) and **Image references** (the
-  profiles). The form's look sections are `FORM_LOOKS`: Expression and Clothes,
-  shown one after the other with no tabs (`_show_looks`, 2026-10-05). Body,
+  profiles). The form's look section is `FORM_LOOKS`: Clothes alone, with no tabs
+  (`_show_looks`, 2026-10-05). Body,
   Face, Hair (`imagegen.WHO_SECTIONS`) and Accessories are the creator's alone
   (2026-10-02, the user: the person page's look "should be hidden so it doesn't
   mess up the variables"), though a character's still reach the prompt. The
