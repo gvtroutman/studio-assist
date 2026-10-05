@@ -2382,8 +2382,8 @@ def clean_look(d):
 def character_look(rec, look=None):
     """A character's look put on a person, as the form does it: every slot
     and slider the character keeps (blank where it has none, so the last
-    one's beard does not stay); the expression and gaze are the picture's,
-    and stay."""
+    one's beard does not stay); the expression is the picture's, and
+    stays."""
     import apps.image_studio.imagegen as ig
     look = dict(look or {})
     look.pop("beard", None)
@@ -4646,11 +4646,10 @@ def posture_words(obj):
         elif abs(bl - br) >= 12:
             out.append("weight on the %s leg, the other knee relaxed"
                        % ("right" if bl > br else "left"))
-    if not str(look.get("gaze") or "").strip():
-        if g("head_nod") >= 20:
-            out.append("looking down")
-        elif g("head_nod") <= -15:
-            out.append("looking up")
+    if g("head_nod") >= 20:
+        out.append("looking down")
+    elif g("head_nod") <= -15:
+        out.append("looking up")
     if abs(g("head_tilt")) >= 15:
         out.append("head tilted")
     return out
@@ -4659,9 +4658,7 @@ def posture_words(obj):
 def gaze_words(scene, obj):
     """Where a person's head looks, as the picture shows it, when that is
     not the way their body faces (a head turned back over the shoulder,
-    towards the camera): '' otherwise, or when the look's Gaze says it."""
-    if str((obj.get("look") or {}).get("gaze") or "").strip():
-        return ""
+    towards the camera): '' otherwise."""
     w, h = frame_size(scene)
     cam = Camera(scene["camera"], w, h)
     rig = rigs(obj)[0]

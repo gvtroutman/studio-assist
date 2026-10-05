@@ -775,9 +775,11 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   (accessories, marks) toggles picks in a comma list (`toggle`). Weight, muscle and
   height are `SLIDERS`, -3..3, nothing said at 0. Height's setting is `stature`:
   `height` is the picture's. Expressions show as emoji (`EMOJI`), on the form as
-  faces alone; the emoji never reach the prompt. A **character** (`characters.json`,
+  faces alone (no field or menu); the emoji never reach the prompt. There is no gaze
+  slot (Looking, dropped 2026-10-05): a saved `gaze` is not said, and a scene's head
+  says where it looks. A **character** (`characters.json`,
   made in `CharacterCreator`) keeps every slot and slider but `PER_PICTURE`
-  (expression, gaze), an identity for the face, and a picture per item worn
+  (expression), an identity for the face, and a picture per item worn
   (`item_refs`, copied under `references/`). Choosing one copies its look onto the
   form (blanking what it does not set) rather than linking to it, so history holds
   the whole look and Generate Again does not change when the character is edited.
@@ -3054,8 +3056,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   sliders; moving a head slider by hand drops the point. A crowd has none.
   Left and right are theirs, as captions say them. `gaze_words` says where the head
   looks when that is not the body's way ("head turned towards the camera"), and
-  `framing_words` how much of them the frame shows ("seen from the knees up"). A
-  look with a Gaze keeps it: the head words are left out rather than contradict it.
+  `framing_words` how much of them the frame shows ("seen from the knees up").
   Heights, degrees and body words are not added: the look's sliders already say
   build and height, the anatomy constants say natural proportions, and numbers do
   little in a prompt. Live (2026-09-25, same seed): an arm raised in both the map and
@@ -3065,7 +3066,7 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   Studio's `LOOKS` slots and `SLIDERS`, sparse, cleaned by `clean_look`) and
   `character`. The inspector's Look section is the form's own `look_rows` /
   `slider_rows`, one section at a time. Choosing a character copies its look
-  (`character_look`: blank where it has none, the expression and gaze kept) and, if the
+  (`character_look`: blank where it has none, the expression kept) and, if the
   person still has the default name, its name; it is a copy, like the form's. The look is
   said in that person's line, `Name (a person, where, facing): look. Description`.
 - **Chest size can drive a LoRA.** Library records assign `body_control` to

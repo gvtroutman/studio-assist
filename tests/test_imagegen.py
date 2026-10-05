@@ -898,10 +898,11 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
             "subject": "a woman", "age": "in their 30s", "skin": "olive", "weight": -1,
             "stature": 2, "eyes": "green", "facial_hair": "", "hair": "auburn",
             "hair_style": "long wavy", "traits": "freckles", "expression": "neutral",
-            "gaze": "looking at the camera", "top": "knit sweater", "bottom": "blue jeans",
+            "gaze": "looking at the camera",          # dropped 2026-10-05: not said
+            "top": "knit sweater", "bottom": "blue jeans",
             "footwear": "ankle boots", "accessories": "glasses, necklace"}),
             "a woman, in their 30s, olive skin, slim, tall, green eyes, long wavy auburn hair, "
-            "freckles, neutral expression, looking at the camera, wearing knit sweater, "
+            "freckles, neutral expression, wearing knit sweater, "
             "blue jeans and ankle boots, with glasses and necklace")
 
     def test_hair_reads_as_one_phrase(self):

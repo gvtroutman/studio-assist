@@ -824,15 +824,9 @@ class ImageStudio:
     def _build(self, root):
         head = self.frame(root)
         head.pack(side="top", fill="x", padx=self.px(18), pady=(0, self.px(6)))
-        self.manage_pill = self.button(head, "Manage ▾", self._manage_menu)
-        self.manage_pill.pack(side="right")
+        # Civitai, Hugging Face and Manage live in the App store's own head.
         self.button(head, "App store", lambda: self.open_addons("catalog"),
-                    kind="accent").pack(side="right", padx=(0, self.px(6)))
-        self.source_buttons = {}
-        for source, (name, _domain, _env) in model_sources.SOURCES.items():
-            button = self.button(head, name, lambda key=source: self.open_model_source(key))
-            button.pack(side="right", padx=(0, self.px(6)))
-            self.source_buttons[source] = button
+                    kind="accent").pack(side="right")
         self.health_row = self.frame(head)
         self.health_row.pack(side="left", fill="x", expand=True)
         self.starting = set()             # backends whose ComfyUI Start launched, not yet up
@@ -1095,13 +1089,13 @@ class ImageStudio:
         pill = self.readiness_pill
         menu.tk_popup(pill.winfo_rootx(), pill.winfo_rooty() + pill.winfo_height())
 
-    def _manage_menu(self):
+    def _manage_menu(self, p):
+        """Posted under `p`, the App store window's Manage pill."""
         menu = self.host._menu()
         menu.add_command(label="Models…", command=self.edit_models)
         menu.add_command(label="Backends…", command=self.edit_backends)
         menu.add_separator()
         menu.add_command(label="Check connections", command=self.refresh_backends)
-        p = self.manage_pill
         menu.tk_popup(p.winfo_rootx(), p.winfo_rooty() + p.winfo_height())
 
     def _rebuild_choices(self):
@@ -1590,10 +1584,6 @@ class ImageStudio:
         chosen ones lit. -> a function that relights the chips."""
         lights = []
         for key, label, _, picks, many in slots:
-            # The form's expression is its faces alone, with no field, menu
-            # or gaze row; the creator keeps all three.
-            if not chips and key == "gaze":
-                continue
             row = self.frame(parent, bg)
             row.pack(side="top", fill="x", pady=(self.px(2), 0))
             self.label(row, label, "muted", bg=bg, width=12).pack(side="left", anchor="n")
@@ -1604,6 +1594,7 @@ class ImageStudio:
             def pick(p, k=key, m=many):
                 vars_[k].set(ig.toggle(vars_[k].get(), p, m))
                 changed()
+            # The form's expression is its faces alone: no field or menu.
             if chips or key != "expression":
                 line = self.frame(box, bg)
                 line.pack(side="top", fill="x")
