@@ -53,7 +53,8 @@ IDENTITY_TILE = 220           # px, not scaled: a person's photo previews are 22
 STYLE_TILE = 104              # px, before the display's scale; the examples are 208
 CAMERA_CARD = 150             # px, the Shot on card's long edge, before the display's scale
 HISTORY_PAGE = 40
-# The look sections the People tab shows. Body, Face, Hair (ig.WHO_SECTIONS)
+# The look sections the People tab shows, one after the other (no tabs).
+# Body, Face, Hair (ig.WHO_SECTIONS)
 # and Accessories are the Editor's (CharacterCreator) alone: a character's
 # still reach the prompt, and the form cannot say them otherwise.
 FORM_LOOKS = [(name, slots) for name, slots in ig.LOOKS
@@ -641,7 +642,6 @@ class ImageStudio:
         self.sliders = {}             # body slider keys -> IntVar
         self.item_refs = {}           # item -> picture, from the character
         self.wearing = []             # [{"name", "path"}]: the Wearing strip (ig.clean_wearing)
-        self.look_section = FORM_LOOKS[0][0]
         self.face_photos = []         # the picked character's face photos (ig.character_faces)
         self.face_name = ""
         self.anatomy = tk.BooleanVar(value=True)
@@ -928,11 +928,9 @@ class ImageStudio:
             self.text[key] = tk.StringVar()
         for key in ig.SLIDER_KEYS:
             self.sliders[key] = tk.IntVar(value=0)
-        self.look_tabs = self.frame(pb)
-        self.look_tabs.pack(side="top", fill="x", pady=(self.px(10), 0), **pad)
         self.look_box = self.frame(pb)
-        self.look_box.pack(side="top", fill="x", **pad)
-        self._show_looks(self.look_section)
+        self.look_box.pack(side="top", fill="x", pady=(self.px(10), 0), **pad)
+        self._show_looks()
         b = tk.Checkbutton(pb, text="Anatomy constants", variable=self.anatomy, anchor="w",
                            font=self.host.f_ui, bd=0, highlightthickness=0,
                            command=self._recheck)
@@ -1552,7 +1550,7 @@ class ImageStudio:
             # reference photos (ig.character_faces). Nothing shows on the form.
             self.face_photos = ig.character_faces(rec, self.studio.lib)
             self.face_name = rec["name"]
-            self._show_looks(self.look_section)
+            self._show_looks()
         else:
             self.face_photos, self.face_name = [], ""
         self._show_identity()
@@ -1670,39 +1668,27 @@ class ImageStudio:
             sc.pack(side="left", fill="x", expand=True, padx=(self.px(6), self.px(6)))
             word.config(text=ig.slider_word(key, vars_[key].get()) or "average")
 
-    def _show_looks(self, section):
-        """One section of the look on the form at a time, as the creator's
-        tabs are - the ones in FORM_LOOKS."""
-        if section not in dict(FORM_LOOKS):
-            section = FORM_LOOKS[0][0]
-        self.look_section = section
-        for box in (self.look_tabs, self.look_box):
-            for w in box.winfo_children():
-                w.destroy()
-        for i, (name, _) in enumerate(FORM_LOOKS):
-            self.button(self.look_tabs, name, lambda n=name: self._show_looks(n),
-                        kind="accent" if name == section else "quiet",
-                        font=self.host.f_small, padx=self.px(6), pady=self.px(2)).grid(
-                row=0, column=i, sticky="ew", padx=(0, self.px(3)),
-                pady=(self.px(3), self.px(2)))
-        for col in range(len(FORM_LOOKS)):
-            self.look_tabs.columnconfigure(col, weight=1)
-        relight = [None]
+    def _show_looks(self):
+        """The look sections in FORM_LOOKS, one after the other: no tabs
+        (2026-10-05, the user: the Expression / Clothes tabs go)."""
+        for w in self.look_box.winfo_children():
+            w.destroy()
+        relights = []
 
         def changed():
-            if relight[0]:
-                relight[0]()
+            for relight in relights:
+                relight()
             self._recheck()
-        if section == ig.SLIDER_SECTION:
-            self.slider_rows(self.look_box, self.sliders, changed)
-        relight[0] = self.look_rows(self.look_box, dict(ig.LOOKS)[section], self.text,
-                                    changed)
-        if section in ("Clothes", "Accessories", "Hair"):
-            keys = [sl[0] for sl in dict(ig.LOOKS)[section]]
-            items = ([ig.HAIR_ITEM] if section == "Hair" else
-                     ig.items_worn({k: self.text[k].get() for k in keys}))
-            self.item_rows(self.look_box, items, self.item_refs, self._choose_item,
-                           self._set_item, link=self._link_item)
+        for section, slots in FORM_LOOKS:
+            if section == ig.SLIDER_SECTION:
+                self.slider_rows(self.look_box, self.sliders, changed)
+            relights.append(self.look_rows(self.look_box, slots, self.text, changed))
+            if section in ("Clothes", "Accessories", "Hair"):
+                keys = [sl[0] for sl in slots]
+                items = ([ig.HAIR_ITEM] if section == "Hair" else
+                         ig.items_worn({k: self.text[k].get() for k in keys}))
+                self.item_rows(self.look_box, items, self.item_refs, self._choose_item,
+                               self._set_item, link=self._link_item)
 
     def item_rows(self, p, items, refs, choose, drop, title="ITEM PICTURES",
                   empty="Choose an item above to give it a picture.", link=None):
@@ -1837,7 +1823,7 @@ class ImageStudio:
             self.item_refs[item] = path
         else:
             self.item_refs.pop(item, None)
-        self._show_looks(self.look_section)
+        self._show_looks()
         self._recheck()
 
     def collect_looks(self):
@@ -2233,7 +2219,7 @@ class ImageStudio:
                 sv.set(chosen[iid])
             if bv.get():
                 sc.pack(side="right", fill="x", expand=True, padx=(self.px(8), 0))
-        self._show_looks(self.look_section)
+        self._show_looks()
         if s.get("style_strength") is not None:
             self.style_strength.set(s["style_strength"])
         for d in s.get("loras") or []:
