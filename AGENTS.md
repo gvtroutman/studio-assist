@@ -5061,6 +5061,22 @@ AE runs, and Resolve's server can only attach to a running Resolve. AE's `check_
 (via the MCP server) diagnoses the whole chain and its `nextSteps` are reliable; relay
 them rather than guessing.
 
+## Audio Review
+
+`core/audio_review.py` is the stdlib-only direct-audio comparison client, and
+`core/audio_review_ui.py` is the File > Audio Review window. Its inference host
+and model are separately user-configured (or STUDIO_AUDIO_BASE_URL / MODEL),
+never a resident workstation model and never automatically the text/vision host.
+The transport sends WAV input_audio parts to an OpenAI-compatible Chat Completions
+endpoint for text output. It refuses unsupported audio, malformed comparisons,
+missing/unknown takes, conflicting winners and evidence outside an excerpt.
+There is no transcription fallback, automatic retry or project/media mutation.
+The remembered preferences contain only host/model; API keys are not persisted.
+WAV excerpts preserve samples. MP3 uses FFmpeg on PATH through core.procs,
+with hidden, contained children and bounded decoding. Worker threads only enqueue
+events; closing cancels the window timer and discards late replies. Tests:
+`tests/test_audio_review.py`; usage: `docs/audio-review.md`.
+
 ## Conventions
 
 - Tool groups keep the exposed tool count down; a 3B-active MoE gets sloppy shown
