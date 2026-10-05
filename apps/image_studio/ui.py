@@ -813,12 +813,8 @@ class ImageStudio:
         return pill
 
     def slider(self, parent, var, lo=0.0, hi=1.5, bg="bg", command=None):
-        sc = tk.Scale(parent, variable=var, from_=lo, to=hi, resolution=0.05,
-                      orient="horizontal", showvalue=True, bd=0, highlightthickness=0,
-                      sliderrelief="flat", sliderlength=self.px(14), width=self.px(8),
-                      font=self.host.f_small, command=command)
-        return self.skin(sc, bg=bg, fg="muted", troughcolor="border",
-                         activebackground="accent")
+        return self.host._scale(parent, var, lo, hi, resolution=0.05, command=command,
+                                 bg=bg, showvalue=True)
 
     # ================================================================ layout
     def _build(self, root):
@@ -1669,11 +1665,8 @@ class ImageStudio:
             def moved(_v=None, k=key, w=word):
                 w.config(text=ig.slider_word(k, vars_[k].get()) or "average")
                 changed()
-            sc = tk.Scale(row, variable=vars_[key], from_=-ig.SLIDER_SPAN,
-                          to=ig.SLIDER_SPAN, resolution=1, orient="horizontal",
-                          showvalue=False, bd=0, highlightthickness=0, sliderrelief="flat",
-                          sliderlength=self.px(14), width=self.px(8), command=moved)
-            self.skin(sc, bg=bg, fg="muted", troughcolor="border", activebackground="accent")
+            sc = self.host._scale(row, vars_[key], -ig.SLIDER_SPAN, ig.SLIDER_SPAN,
+                                   command=moved, bg=bg)
             sc.pack(side="left", fill="x", expand=True, padx=(self.px(6), self.px(6)))
             word.config(text=ig.slider_word(key, vars_[key].get()) or "average")
 

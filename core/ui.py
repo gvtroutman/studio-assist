@@ -399,3 +399,215 @@ class Pill(tk.Canvas):
                 draw_jumps(self, left + tw + gap + d, baseline, self.lift,
                            self.disc(ink, size), self.font)
         self.config(cursor="hand2" if self.state == "normal" else "arrow")
+
+
+class Slider(tk.Canvas):
+    """
+    A horizontal slider whose handle is a pill. Tk's Scale draws a square
+    block on a square trough and neither bends, so this draws its own: a
+    thin round-capped track and a lozenge riding it. It answers what callers
+    asked of the Scale it replaced - `variable`, `from`, `to`, `resolution`
+    and `command` through `config`/`cget`, `get()` and `set()` - and `cget
+    ("command")` is a Tcl command name, as the Scale's was. `roles` are the
+    palette names of (track, handle, handle under the pointer, value text,
+    disabled); `paint(C)` is called with the palette on every theme switch.
+
+    As with the Scale, `set()` and a drag call `command` with the value as
+    text, and writing the variable only moves the handle. A press off the
+    handle jumps it there rather than stepping one resolution towards it.
+    """
+
+    OWN = ("variable", "from", "to", "resolution", "command", "showvalue")
+
+    def __init__(self, parent, variable, from_, to, command=None, resolution=1.0,
+                 length=100, thick=14, handle=26, track=4, showvalue=False,
+                 font=None, roles=("border", "accent", "accent_dk", "muted", "faint"),
+                 **kw):
+        tk.Canvas.__init__(self, parent, highlightthickness=0, bd=0, width=length,
+                           height=thick, cursor="hand2", **kw)
+        self.var, self.lo, self.hi = variable, float(from_), float(to)
+        self.res, self.showvalue, self.font = float(resolution), showvalue, font
+        self.thick, self.handle, self.track, self.roles = thick, max(handle, thick), track, roles
+        self.command, self.cmd_name = None, ""
+        self._command(command)
+        self.lit = self.dragging = False
+        self.grab, self.C = 0.0, None
+        self.trace = variable.trace_add("write", self._moved)
+        self.bind("<Destroy>", self._gone, add="+")
+        self.bind("<Configure>", lambda ev: self.C and self.paint(self.C))
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Enter>", lambda ev: self._light(True))
+        self.bind("<Leave>", lambda ev: self._light(False))
+        self.bind("<Left>", lambda ev: self._step(-1))
+        self.bind("<Right>", lambda ev: self._step(1))
+
+    # ------------------------------------------------------------ as a Scale
+    def _command(self, command):
+        self.command = command
+        self.cmd_name = self.register(command) if command else ""
+
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        own = {k.rstrip("_"): kw.pop(k) for k in list(kw) if k.rstrip("_") in self.OWN}
+        if not own:
+            return tk.Canvas.configure(self, **kw)
+        if kw:
+            tk.Canvas.configure(self, **kw)
+        if "variable" in own:
+            self.var.trace_remove("write", self.trace)
+            self.var = own["variable"]
+            self.trace = self.var.trace_add("write", self._moved)
+        self.lo = float(own.get("from", self.lo))
+        self.hi = float(own.get("to", self.hi))
+        self.res = float(own.get("resolution", self.res))
+        self.showvalue = own.get("showvalue", self.showvalue)
+        if "command" in own:
+            self._command(own["command"])
+        if self.C:
+            self.paint(self.C)
+
+    config = configure
+
+    def cget(self, key):
+        key = key.rstrip("_")
+        if key == "variable":
+            return str(self.var)
+        if key == "command":
+            return self.cmd_name
+        if key in ("from", "to", "resolution", "showvalue"):
+            return {"from": self.lo, "to": self.hi, "resolution": self.res,
+                    "showvalue": self.showvalue}[key]
+        return tk.Canvas.cget(self, key)
+
+    __getitem__ = cget
+
+    def get(self):
+        try:
+            return float(self.getvar(str(self.var)))
+        except (tk.TclError, ValueError):
+            return self.lo
+
+    def set(self, value):
+        """Round to the resolution, clamp to the range and, if that changed
+        the value, write the variable and call `command` - as a drag does."""
+        value = self._fit(value)
+        if self._text(value) == self._text(self.get()):
+            return
+        text = self._text(value)
+        self.setvar(str(self.var), text)
+        if self.command is not None:
+            self.command(text)
+
+    def _fit(self, value):
+        value = float(value)
+        if self.res > 0:
+            value = round(value / self.res) * self.res
+        return min(max(value, min(self.lo, self.hi)), max(self.lo, self.hi))
+
+    def _text(self, value):
+        """The value as the Scale wrote it: as many decimals as the
+        resolution has, so a whole-number slider fills an IntVar cleanly."""
+        shown = "%g" % self.res if self.res > 0 else "0.01"
+        places = len(shown.split(".")[1]) if "." in shown else 0
+        return "%.*f" % (places, value)
+
+    # ------------------------------------------------------------- the hand
+    def _span(self):
+        """(left end, usable width) of the handle's centre."""
+        w = self.winfo_width() if self.winfo_width() > 1 else int(tk.Canvas.cget(self, "width"))
+        return self.handle / 2.0, max(1.0, w - self.handle)
+
+    def _x(self, value):
+        left, room = self._span()
+        t = 0.0 if self.hi == self.lo else (value - self.lo) / (self.hi - self.lo)
+        return left + min(1.0, max(0.0, t)) * room
+
+    def _value(self, x):
+        left, room = self._span()
+        return self.lo + (x - left) / room * (self.hi - self.lo)
+
+    def _live(self):
+        return str(tk.Canvas.cget(self, "state")) != "disabled"
+
+    def _press(self, ev):
+        if not self._live():
+            return "break"
+        self.focus_set()
+        hx = self._x(self.get())
+        # On the handle it keeps where it was taken; off it, it jumps there.
+        self.grab = ev.x - hx if abs(ev.x - hx) <= self.handle / 2.0 else 0.0
+        self.dragging = True
+        self.set(self._value(ev.x - self.grab))
+        self._repaint()
+        return "break"
+
+    def _drag(self, ev):
+        if self.dragging:
+            self.set(self._value(ev.x - self.grab))
+        return "break"
+
+    def _release(self, _ev):
+        self.dragging = False
+        self._repaint()
+        return "break"
+
+    def _light(self, on):
+        self.lit = on
+        self._repaint()
+
+    def _step(self, sign):
+        if self._live():
+            step = self.res if self.res > 0 else abs(self.hi - self.lo) / 100.0
+            self.set(self.get() + sign * step * (1 if self.hi >= self.lo else -1))
+        return "break"
+
+    def _moved(self, *_args):
+        self._repaint()
+
+    def _repaint(self):
+        try:
+            if self.C and self.winfo_exists():
+                self.paint(self.C)
+        except tk.TclError:
+            pass
+
+    def _gone(self, ev):
+        """A variable outlives its slider (the Scene Builder rebuilds its
+        panel on every pick), so the trace that names it must go with it."""
+        if ev.widget is self:
+            try:
+                self.var.trace_remove("write", self.trace)
+            except (tk.TclError, ValueError):
+                pass
+
+    def paint(self, C):
+        self.C = C
+        track, hand, hover, ink, off = (C[r] for r in self.roles)
+        live = self._live()
+        self.delete("all")
+        top = self.font.metrics("linespace") + 2 if self.showvalue and self.font else 0
+        self.config(height=top + self.thick)
+        w = self.winfo_width() if self.winfo_width() > 1 else int(tk.Canvas.cget(self, "width"))
+        mid = top + self.thick / 2.0
+        left, room = self._span()
+        self.create_line(left, mid, left + room, mid, width=self.track,
+                         capstyle="round", fill=track)
+        value = self.get()
+        hx = self._x(value)
+        fill = off if not live else hover if (self.lit or self.dragging) else hand
+        # Two circles and the band between them, as `Pill(round=True)` draws:
+        # a smoothed polygon asked for half-height corners undershoots them.
+        k, x1 = self.thick, hx - self.handle / 2.0
+        for x in (x1, x1 + self.handle - k):
+            self.create_oval(x, top, x + k, top + k, fill=fill, outline=fill)
+        self.create_rectangle(x1 + k / 2.0, top, x1 + self.handle - k / 2.0, top + k,
+                              fill=fill, outline=fill)
+        if top:
+            text = self._text(self._fit(value))
+            half = self.font.measure(text) / 2.0
+            self.create_text(min(max(hx, half), w - half), top / 2.0, text=text,
+                             font=self.font, fill=ink if live else off)
+        self.config(cursor="hand2" if live else "arrow")

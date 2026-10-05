@@ -98,13 +98,8 @@ class ChatIconsMixin:
                 line.after_cancel(pending["id"])
             pending["id"] = line.after(self.SLIDER_SETTLE_MS, settle)
 
-        scale = tk.Scale(line, variable=var, from_=bounds[0], to=bounds[1],
-                         resolution=0.05, orient="horizontal", showvalue=False,
-                         length=self._px(240), command=moved, bd=0,
-                         highlightthickness=0, sliderrelief="flat",
-                         width=self._px(12), sliderlength=self._px(22))
-        self._skin(scale, bg="accent", troughcolor="border",
-                   activebackground="accent_dk")
+        scale = self._scale(line, var, bounds[0], bounds[1], resolution=0.05,
+                             command=moved, length=self._px(240))
         scale.pack(side="left")
         shown.pack(side="left", padx=(10, 0))
 

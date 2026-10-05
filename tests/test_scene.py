@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import core.icons as studio_icons  # noqa: E402
+import core.ui as studio_ui  # noqa: E402
 import apps.image_studio.imagegen as ig  # noqa: E402
 import apps.image_studio.scene.scene as sc  # noqa: E402
 from test_imagegen import FLUX_FILES, FakeClient, TempStudioMixin, _headless  # noqa: E402
@@ -2510,7 +2511,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         steps = len(sb.history.steps)
         want = str(sb.vars["x"][0])
         scale = next(w for row in sb.panel.winfo_children() for w in row.winfo_children()
-                     if isinstance(w, tk.Scale) and str(w.cget("variable")) == want)
+                     if isinstance(w, studio_ui.Slider) and str(w.cget("variable")) == want)
         start = sb.obj()["position"][0]
         for v in (0.5, 1.0, 1.5, 2.0):
             scale.set(start + v)
@@ -2580,7 +2581,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb._set_pose("pointing")
         want = str(sb.vars["arm_r_raise"][0])
         scale = next(w for row in sb.panel.winfo_children() for w in row.winfo_children()
-                     if isinstance(w, tk.Scale) and str(w.cget("variable")) == want)
+                     if isinstance(w, studio_ui.Slider) and str(w.cget("variable")) == want)
         self.app.update()                                     # map the rebuilt inspector before dragging
         scale.set(40)                                          # as a drag of the slider
         self.app.update()
@@ -2776,7 +2777,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
                 yield child
                 yield from descendants(child)
         slider = next(w for w in descendants(sb.panel)
-                      if w.winfo_class() == "Scale" and str(w.cget("variable")) == str(slider_var))
+                      if isinstance(w, studio_ui.Slider) and str(w.cget("variable")) == str(slider_var))
         sb.win.tk.call(slider.cget("command"), "0.25")
         self.assertEqual(person["look"]["beard"]["length"], 0.25)
         self.assertIn("auburn short beard", sb.words_label.cget("text"))
@@ -2803,7 +2804,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
         import tkinter as tk
         want = str(sb.vars["jaw_width"][0])
         scale = next(w for row in sb.panel.winfo_children() for w in row.winfo_children()
-                     if isinstance(w, tk.Scale) and str(w.cget("variable")) == want)
+                     if isinstance(w, studio_ui.Slider) and str(w.cget("variable")) == want)
         scale.set(0.8)                                     # as a drag of the slider
         self.app.update()
         self.assertEqual(a["head"], {"jaw_width": 0.8})

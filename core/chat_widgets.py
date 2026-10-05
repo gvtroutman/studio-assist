@@ -30,6 +30,21 @@ class ChatWidgetsMixin:
         pill.paint(self.C)
         return pill
 
+    def _scale(self, parent, var, lo, hi, resolution=1.0, command=None, bg="bg",
+                showvalue=False, length=None):
+        """Every slider in this window is a `Slider`: a pill riding a
+        round-capped track, for the reason every button is a `Pill` - Tk's
+        Scale is a square block on a square trough. Registered for a repaint,
+        since its colours are plotted, not configured."""
+        s = ui.Slider(parent, var, lo, hi, command=command, resolution=resolution,
+                      length=length or self._px(100), thick=self._px(14),
+                      handle=self._px(26), track=self._px(4), showvalue=showvalue,
+                      font=self.f_small)
+        self._skin(s, bg=bg)
+        self._repaint_on_theme(s, lambda: s.paint(self.C))
+        s.paint(self.C)
+        return s
+
     def _repaint_on_theme(self, widget, draw):
         """Register a shape that must be drawn again when the palette changes.
 
