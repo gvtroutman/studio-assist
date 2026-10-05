@@ -787,7 +787,8 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   profiles (identities) alone, `"c:<id>"` / `"i:<id>"` (`_pick_from_people`); a
   character brings its profile or none, and picking another profile clears the
   character. Under it, **Editor** (the creator) and **Image references** (the
-  profiles). The form's look tabs are `FORM_LOOKS`: Expression and Clothes. Body,
+  profiles). The form's look sections are `FORM_LOOKS`: Expression and Clothes,
+  shown one after the other with no tabs (`_show_looks`, 2026-10-05). Body,
   Face, Hair (`imagegen.WHO_SECTIONS`) and Accessories are the creator's alone
   (2026-10-02, the user: the person page's look "should be hidden so it doesn't
   mess up the variables"), though a character's still reach the prompt. The

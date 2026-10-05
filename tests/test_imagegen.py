@@ -4575,13 +4575,19 @@ class TestImageStudioTab(unittest.TestCase):
         ui._pick_from_people("")
         self.assertEqual((ui.settings["character"], ticked()), ("", []))
         self.assertEqual(ui.person_pill.cget("text"), "No one  ▾")
-        tabs = texts(ui.look_tabs)
-        # Who the person is is the creator's alone (the user, 2026-10-02).
-        for hidden in ("Body", "Face", "Hair", "Accessories"):
-            self.assertNotIn(hidden, tabs)
-        self.assertEqual(tabs, ["Expression", "Clothes"])
-        ui._show_looks("Face")                       # hidden: the first shown instead
-        self.assertEqual(ui.look_section, "Expression")
+        # Who the person is is the creator's alone (the user, 2026-10-02);
+        # Expression and Clothes show one after the other, no tabs (2026-10-05).
+        self.assertFalse(hasattr(ui, "look_tabs"))
+        shown, todo = [], list(ui.look_box.winfo_children())
+        while todo:
+            w = todo.pop()
+            todo += w.winfo_children()
+            if w.winfo_class() == "Label":
+                shown.append(w.cget("text"))
+        for label in ("Expression", "Top / dress", "Shoes"):
+            self.assertIn(label, shown)
+        for hidden in ("Colour", "Eyes", "Accessories", "Looking"):
+            self.assertNotIn(hidden, shown)
 
     def test_a_character_tag_is_a_word_and_an_uploaded_picture(self):
         s, ui = self.tab()
@@ -4675,9 +4681,9 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("Tagged earrings", ed.msg.cget("text"))
         ed.win.destroy()
 
-        ui._show_looks("Clothes")                       # an item on the form
+        ui._show_looks()                       # an item on the form
         ui.text["top"].set("denim jacket")
-        ui._show_looks("Clothes")
+        ui._show_looks()
         self.app.update()
         top = ui._link_item("denim jacket")
         top.var.set("https://shop.example/jacket")
@@ -4799,18 +4805,18 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertEqual(ui.settings["character"], "mara")
         self.assertEqual(ui.text["hair"].get(), "auburn")
         ui.text["expression"].set("")
-        ui._show_looks("Expression")
-        faces = [w for w in ui.look_box.winfo_children()]
-        self.assertTrue(faces)
-        # The faces alone: no expression field or menu, no Looking row.
-        shown, todo = [], list(faces)
+        ui._show_looks()
+        rows = ui.look_box.winfo_children()
+        self.assertTrue(rows)
+        # The Expression row, first, is the faces alone: no field or menu.
+        shown, todo = [], [rows[0]]
         while todo:
             w = todo.pop()
             todo += w.winfo_children()
             shown.append(w)
-        self.assertFalse([w for w in shown if w.winfo_class() == "Entry"])
-        self.assertNotIn("Looking", [w.cget("text") for w in shown
+        self.assertIn("Expression", [w.cget("text") for w in shown
                                      if w.winfo_class() == "Label"])
+        self.assertFalse([w for w in shown if w.winfo_class() == "Entry"])
         s_ = ui.collect()
         self.assertEqual((s_["character"], s_["weight"], s_["accessories"]),
                          ("mara", -1, "glasses"))
@@ -4819,9 +4825,8 @@ class TestImageStudioTab(unittest.TestCase):
         ui.sliders["weight"].set(0)
         ui.apply(s_)                                  # Reuse Settings brings it back
         self.assertEqual((ui.text["hair"].get(), ui.sliders["weight"].get()), ("auburn", -1))
-        for name, _ in ig.LOOKS:
-            ui._show_looks(name)
-            self.app.update()
+        ui._show_looks()
+        self.app.update()
         ui.save_as_character().win.destroy()
 
     def test_model_source_open_fetches_reviewable_results_off_thread(self):
@@ -5036,7 +5041,7 @@ class TestImageStudioTab(unittest.TestCase):
         with open(pic, "wb") as f:
             f.write(PNG)
         ui.text["outerwear"].set("leather jacket")
-        ui._show_looks("Clothes")
+        ui._show_looks()
         ui._set_item("leather jacket", pic)
         self.app.update()
         kept = ui.collect()["item_refs"]["leather jacket"]
@@ -5047,7 +5052,7 @@ class TestImageStudioTab(unittest.TestCase):
         self.assertIn("leather jacket", texts)
         ui._set_item("leather jacket", None)
         self.assertNotIn("leather jacket", ui.collect()["item_refs"])
-        ui._show_looks("Hair")
+        ui._show_looks()
         self.app.update()
         # A Try On record from before stays out of the form, and says why.
         ui.reuse({"mode": "dress", "seed": 4})
