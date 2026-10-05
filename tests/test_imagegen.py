@@ -4236,7 +4236,7 @@ class TestImageStudioTab(unittest.TestCase):
         lib.save("loras", [
             {"id": "skin", "file": "skin.safetensors", "name": "Skin", "family": "z-image"},
             {"id": "grain", "file": "grain.safetensors", "name": "Grain", "family": "flux1"},
-            {"id": "edit", "file": "edit.safetensors", "name": "Edit", "family": "qwen-image"},
+            {"id": "edit", "file": "edit.safetensors", "name": "Edit", "family": "sd15"},
             {"id": "mystery", "file": "mystery.safetensors", "name": "Mystery"}])
         ui.settings["model"] = "z-image-turbo"
         win = ui.open_addons()
@@ -4288,7 +4288,7 @@ class TestImageStudioTab(unittest.TestCase):
                 self.pump(lambda: win.cards)
                 self.assertEqual(calls, [("flux-dev", "", "Most Downloaded", "")])
                 self.assertEqual([c["version_id"] for c in win.cards], [7])
-                (row,) = [w for w in win.box.winfo_children()]
+                _heading, row = win.box.winfo_children()   # its license group, then the card
                 button = row.winfo_children()[1].winfo_children()[0]
                 self.assertEqual(button.cget("text"), "Install")
                 with patch.object(ui.studio, "backend",
