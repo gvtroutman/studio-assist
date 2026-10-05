@@ -183,8 +183,7 @@ LLM_PC ="LLM PC"                         # the sidebar's second group: remote ap
 
 def app_subtitle(a):
     """The second line of a sidebar row. Also what the rail is measured on."""
-    sub = a["version"] or ("remote" if a.get("remote") else "installed")
-    return sub + "  ·  drivable" if a["drivable"] else sub
+    return a["version"] or ("remote" if a.get("remote") else "installed")
 
 
 # Attachments - reading a picture's header, describing a folder, copying into
