@@ -4495,9 +4495,6 @@ LOOKS = [
           "dreamy", "playful", "confident smirk", "serious", "thoughtful", "pensive",
           "surprised", "worried", "scared", "sad", "tearful", "angry", "determined",
           "disgusted", "tired"], False),
-        ("gaze", "Looking", (),
-         ["looking at the camera", "looking away", "looking over the shoulder",
-          "looking up", "looking down", "eyes closed"], False),
     ]),
     ("Clothes", [
         ("top", "Top / dress", (),
@@ -4531,9 +4528,7 @@ EMOJI = {"neutral": "\U0001F610", "soft smile": "\U0001F642", "broad smile": "\U
          "thoughtful": "\U0001F914", "pensive": "\U0001F614", "surprised": "\U0001F62E",
          "worried": "\U0001F61F", "scared": "\U0001F628", "sad": "\U0001F641",
          "tearful": "\U0001F622", "angry": "\U0001F620", "determined": "\U0001F624",
-         "disgusted": "\U0001F922", "tired": "\U0001F629",
-         "looking at the camera": "\U0001F440", "looking up": "\U0001F644",
-         "eyes closed": "\U0001F60C"}
+         "disgusted": "\U0001F922", "tired": "\U0001F629"}
 
 
 def pick_label(pick):
@@ -4559,7 +4554,8 @@ SLIDER_SECTION = "Body"
 
 # What changes picture to picture rather than person to person: a character
 # does not keep these, and choosing one leaves them as they are.
-PER_PICTURE = ("expression", "gaze")
+# (A "gaze" slot, Looking, was dropped 2026-10-05: a saved one is not said.)
+PER_PICTURE = ("expression",)
 CHARACTER_KEYS = [k for k in SLOTS if k not in PER_PICTURE] + [k for k, _, _ in SLIDERS]
 # Who the person is: set in the character creator alone (2026-10-02, the
 # user: the person page's look "should be hidden so it doesn't mess up the
@@ -4661,8 +4657,7 @@ def person_text(settings):
     from apps.image_studio.scene import beard
     bits.append(beard.text(s.get("beard")) or _field(s, "facial_hair"))
     bits.append(hair_text(s))
-    bits += [_field(s, "traits"), _noun("expression", _field(s, "expression")),
-             _field(s, "gaze")]
+    bits += [_field(s, "traits"), _noun("expression", _field(s, "expression"))]
     worn = _and([_field(s, k) for k in ("top", "bottom", "outerwear", "footwear")]
                 + [w["name"] for w in clean_wearing(s.get("wearing"))])
     bits.append("wearing " + worn if worn else "")

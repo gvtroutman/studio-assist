@@ -1380,16 +1380,17 @@ class TestWords(unittest.TestCase):
         self.assertIn("leaning to their right", words)
         self.assertIn("left arm stretched out to the side", words)
 
-    def test_the_looks_gaze_outranks_the_heads_words(self):
+    def test_the_head_says_where_it_looks(self):
         s, p = self.posed(head_nod=30)
         self.assertIn("looking down", sc.posture_words(p))
         p["rotation"][0] = 90
         p["pose"]["controls"]["head_turn"] = -80        # over the shoulder, to the camera
         self.assertEqual(sc.gaze_words(s, p), "head turned towards the camera")
-        p["look"] = {"gaze": "looking at the camera"}
-        self.assertNotIn("looking down", sc.posture_words(p))
-        self.assertEqual(sc.gaze_words(s, p), "")
-        p["look"] = {}
+        # An old saved Looking (gaze) is dropped: the head still says it.
+        p["look"] = sc.clean_look({"gaze": "looking at the camera"})
+        self.assertEqual(p["look"], {})
+        self.assertIn("looking down", sc.posture_words(p))
+        self.assertEqual(sc.gaze_words(s, p), "head turned towards the camera")
         p["pose"]["controls"]["head_turn"] = 0
         self.assertEqual(sc.gaze_words(s, p), "")        # the head goes the body's way
 
@@ -2737,9 +2738,9 @@ class TestSceneBuilderWindow(unittest.TestCase):
         for hidden in ig.WHO_SECTIONS:
             self.assertNotIn(hidden, shown())
         self.assertIn("Clothes", shown())
-        self.assertIn("gaze", sb.look_vars)
+        self.assertIn("expression", sb.look_vars)
         self.assertNotIn("facial_hair", sb.look_vars)
-        sb.look_vars["gaze"].set("looking down")
+        sb.look_vars["expression"].set("calm")
         sb.look_changed()
         person["look"]["top"] = "chef jacket"
 
@@ -2750,8 +2751,8 @@ class TestSceneBuilderWindow(unittest.TestCase):
         ui._saved("characters")
         self.assertEqual(person["look"]["age"], "in their 30s")
         self.assertEqual(person["look"]["beard"], beard.from_words("heavy stubble"))
-        self.assertEqual((person["look"]["gaze"], person["look"]["top"]),
-                         ("looking down", "chef jacket"))
+        self.assertEqual((person["look"]["expression"], person["look"]["top"]),
+                         ("calm", "chef jacket"))
         self.assertIn("in their 30s", sb.words_label.cget("text"))
         self.assertNotIn("in their 20s", sb.words_label.cget("text"))
         # No character: every section is the scene's again.
