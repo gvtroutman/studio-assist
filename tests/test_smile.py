@@ -69,6 +69,18 @@ class TestSmile(unittest.TestCase):
         self.assertEqual(g['fc1_guider']['inputs']['model'], ['lora1', 0])
         self.assertNotIn('fc1_s0', g)
 
+    def test_smile_crop_uses_integer_pixel_coordinates(self):
+        # Odd mouth bands have half-pixel centers; ComfyUI slices cannot use floats.
+        wf = ig.load_workflow('klein9b_base')
+        for face in [(200, 100, 80, 100), (201, 101, 81, 101)]:
+            spots, _ = smile.spots(512, 512, [{'shape': 'smile'}], [face])
+            crops = smile.crops(512, 512, spots)
+            g = ig.face_graph(wf, dict(wf['defaults'], model='m', encoder='e', vae='v',
+                prompt='A smiling man', face_prompt=spots[0]['prompt'], seed=1,
+                face_denoise=smile.DENOISE), [], 'made.png', crops, 'oval.png', 'out')
+            region = g['fc1_1']['inputs']['crop_region']
+            self.assertTrue(all(type(value) is int for value in region.values()), region)
+
 
 if __name__ == '__main__':
     unittest.main()

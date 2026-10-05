@@ -102,7 +102,7 @@ def spots(width, height, wanted, faces, profiles=()):
             if x1 <= x0 or y1 <= y0:
                 skipped += 1
                 continue
-            selected.append({"x": (x0 + x1) / 2, "y": (y0 + y1) / 2,
+            selected.append({"x": (x0 + x1) // 2, "y": (y0 + y1) // 2,
                 "size": int(max(64, max(w, h) * 1.6)), "box": [x0, y0, x1 - x0, y1 - y0],
                 "face": ordered[k], "prompt": PROMPTS[req["shape"]] + BASE})
     return selected, skipped
