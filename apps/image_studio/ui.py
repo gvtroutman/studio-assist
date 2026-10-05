@@ -2187,6 +2187,8 @@ class ImageStudio:
         self.settings["character"] = s.get("character") or ""
         if (s.get("camera_profile") or "none") != self.settings.get("camera_profile"):
             self.set_camera(s.get("camera_profile") or "none")
+        if s.get("camera_lens") and s["camera_lens"] != self.settings.get("camera_lens"):
+            self.set_camera_lens(s["camera_lens"])
         chosen = {d["id"]: d.get("strength") for d in s.get("identities") or []
                   if isinstance(d, dict)}
         for iid, (bv, sv, _) in self.idents.items():
@@ -2398,7 +2400,10 @@ class ImageStudio:
         pic.pack(side="top")
         self.camera_next = self.button(row, "›", lambda: self._flip_camera(1), kind="ghost")
         self.camera_next.pack(side="left", fill="y")
-        about = [x for x in (("%dmm" % cp["lens"]) if cp.get("lens") else "",
+        lens = ig.chosen_lens(cp, self.settings)
+        mm = lens["mm"] if lens else cp.get("lens")
+        about = [x for x in (("%dmm" % mm) if mm else "",
+                             ("f/%g" % lens["f"]) if lens and lens["f"] else "",
                              cp.get("format") or "") if x]
         self.camera_name = self.label(self.camera_deck, cp["name"], "text", self.host.f_ui)
         self.camera_name.pack(side="top", anchor="w", pady=(self.px(4), 0))
@@ -2408,6 +2413,10 @@ class ImageStudio:
         self.camera_about.pack(side="top", anchor="w")
         foot = self.frame(self.camera_deck)
         foot.pack(side="top", anchor="w")
+        if lens:          # the camera's own lenses, the one it shoots with showing
+            self.choice(foot, [("%g" % ln["mm"], ln["name"]) for ln in cp["lenses"]],
+                        "%g" % lens["mm"], lambda v: self.set_camera_lens(float(v))).pack(
+                side="left", padx=(0, self.px(6)))
         self.button(foot, "Cameras…", self.edit_camera_profiles, kind="ghost").pack(side="left")
         for w in (card, pic, *pic.winfo_children()):
             w.bind("<MouseWheel>", lambda ev: self._flip_camera(-1 if ev.delta > 0 else 1))
@@ -2422,7 +2431,10 @@ class ImageStudio:
         self.set_camera(ids[(i + step) % len(ids)])
 
     def set_camera(self, cid):
-        """The deck's choice: the form's camera, and the open scene's."""
+        """The deck's choice: the form's camera, and the open scene's. A
+        camera starts on its native lens."""
+        if cid != self.settings.get("camera_profile"):
+            self.settings["camera_lens"] = None
         self.settings["camera_profile"] = cid
         self._build_camera_deck()
         sb = self.scene_builder
@@ -2430,15 +2442,27 @@ class ImageStudio:
             sb._set_camera_profile(cid)
         self._recheck()
 
+    def set_camera_lens(self, mm):
+        """The deck's lens (its focal length): the form's, and the open scene's."""
+        self.settings["camera_lens"] = mm
+        self._build_camera_deck()
+        sb = self.scene_builder
+        if sb is not None and round(sb.scene["camera"]["lens"]) != round(mm):
+            sb._set_lens(mm)
+        self._recheck()
+
     def show_shot_on(self):
-        """The Scene Builder's camera changed (or it opened or closed): turn
-        the deck to it."""
+        """The Scene Builder's camera or lens changed (or it opened or
+        closed): turn the deck to it."""
         sb = self.scene_builder
         if sb is None or getattr(self, "camera_deck", None) is None:
             return
-        cid = sb.scene["camera"].get("profile") or "none"
-        if cid != self.settings.get("camera_profile"):
-            self.settings["camera_profile"] = cid
+        cam = sb.scene["camera"]
+        cid = cam.get("profile") or "none"
+        at = ig.lens_at(cam.get("lenses"), cam["lens"])
+        mm = at["mm"] if at else self.settings.get("camera_lens")
+        if (cid, mm) != (self.settings.get("camera_profile"), self.settings.get("camera_lens")):
+            self.settings["camera_profile"], self.settings["camera_lens"] = cid, mm
             try:
                 self._build_camera_deck()
             except tk.TclError:
@@ -3890,7 +3914,10 @@ class ImageStudio:
             ("name", "Name", "text"),
             ("chemistry", "Chemistry (film stock or colour science, in words)", "long"),
             ("lens", "Native lens (mm; sets the scene's lens when chosen)", "number"),
-            ("format", "Frame shape: 1:1 or 3:2 (sets the scene's frame when chosen)", "text"),
+            ("lenses", "Its lenses, one a line: mm (full-frame equivalent), f-number, "
+                       "name - e.g. 67 f/2.4 3x telephoto", "lenses"),
+            ("format", "Frame shape: 1:1, 3:2, 4:3 or 16:9 (sets the scene's frame "
+                       "when chosen)", "text"),
             ("image", "Picture of the camera (PNG; the button in Scene Builder)", "path"),
             ("notes", "Notes", "long"),
         ], template={"name": "New camera"})
@@ -4970,6 +4997,14 @@ class RecordEditor:
                 t.insert("1.0", val or "")
                 t.pack(side="top", fill="x")
                 self.widgets[key] = (kind, t)
+            elif kind == "lenses":            # one lens a line (`imagegen.clean_lenses`)
+                t = tk.Text(parent, height=4, wrap="none", bd=0, highlightthickness=0,
+                            font=host.f_mono, padx=o.px(6), pady=o.px(4))
+                o.skin(t, bg="card", fg="text", insertbackground="accent")
+                host._selectable(t, editable=True)
+                t.insert("1.0", ig.lens_lines(val))
+                t.pack(side="top", fill="x")
+                self.widgets[key] = (kind, t)
             elif kind == "bool":
                 var = tk.BooleanVar(value=bool(val))
                 o.switch(parent, var).pack(side="top", anchor="w")
@@ -5452,6 +5487,8 @@ class RecordEditor:
                     pass
             elif kind == "long":
                 rec[key] = w.get("1.0", "end").strip()
+            elif kind == "lenses":
+                rec[key] = ig.clean_lenses(w.get("1.0", "end"))
             elif kind == "bool":
                 rec[key] = bool(w.get())
             elif kind == "multi":

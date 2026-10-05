@@ -513,23 +513,87 @@ def clean_camera_profile(d):
     if fmt is None:
         fmt = DEFAULT_CAMERA_FORMATS.get(cid, "")
     fmt = _str(fmt).replace(" ", "").replace("x", ":")
+    lenses = clean_lenses(d.get("lenses"))
+    lens = None if lens in (None, "") else _num(lens, float, None, 10, 300)
     return {
         "id": cid,
         "name": _str(d["name"]),
         "chemistry": _str(d.get("chemistry")),
-        "lens": None if lens in (None, "") else _num(lens, float, None, 10, 300),
+        # The native lens; a camera with lenses and none named starts on its first.
+        "lens": lens if lens is not None or not lenses else lenses[0]["mm"],
+        "lenses": lenses,
         "format": fmt if fmt in CAMERA_FORMATS else "",
         "image": _str(d.get("image")),
         "notes": _str(d.get("notes")),
     }
 
 
-# A camera's frame shape: square (medium format 6x6, an SX-70) or 3:2 (35mm
-# film and full-frame digital), held either way up. "" leaves the frame be.
-CAMERA_FORMATS = ("", "1:1", "3:2")
+# A camera's frame shape: square (medium format 6x6, an SX-70), 3:2 (35mm
+# film and full-frame digital), 4:3 (a phone) or 16:9 (a cinema camera),
+# held either way up. "" leaves the frame be.
+CAMERA_FORMATS = ("", "1:1", "3:2", "4:3", "16:9")
 DEFAULT_CAMERA_FORMATS = {"digital-5d": "3:2", "leica-m6": "3:2", "hasselblad-500cm": "1:1",
                           "canon-ae1": "3:2", "sx-70": "1:1", "sony-a7siii": "3:2"}
-FORMAT_RATIO = {"1:1": 1.0, "3:2": 1.5}
+FORMAT_RATIO = {"1:1": 1.0, "3:2": 1.5, "4:3": 4 / 3, "16:9": 16 / 9}
+
+# One lens as the Cameras editor takes it, a line each: its focal length
+# (full-frame equivalent, which is what the Scene Builder's viewfinder and
+# the words use), an optional f-number, and a name - "67 f/2.4 3x telephoto".
+LENS_LINE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:mm)?\s*(?:f\s*/?\s*(\d+(?:\.\d+)?))?"
+                       r"\s*[-,:]?\s*(.*?)\s*$", re.I)
+
+
+def clean_lenses(v):
+    """A camera's lenses: [{"name", "mm", "f"}] from a saved list or the
+    editor's lines (`LENS_LINE`). `mm` is the full-frame equivalent, `f` the
+    widest aperture or None; a lens with no name is called by its focal
+    length. Junk and repeats of a focal length dropped."""
+    if isinstance(v, str):
+        v = [m.groups() for m in map(LENS_LINE.match, v.splitlines()) if m]
+        v = [{"mm": mm, "f": f, "name": name} for mm, f, name in v]
+    out, seen = [], set()
+    for x in v if isinstance(v, list) else []:
+        if not isinstance(x, dict) or x.get("mm") in (None, ""):
+            continue
+        mm = _num(x.get("mm"), float, None, 10, 300)
+        if mm is None or mm in seen:
+            continue
+        seen.add(mm)
+        f = x.get("f")
+        f = None if f in (None, "") else _num(f, float, None, 0.7, 64)
+        out.append({"name": _str(x.get("name")) or "%gmm" % mm, "mm": mm, "f": f})
+    return out
+
+
+def lens_lines(lenses):
+    """A camera's lenses as the editor's lines, the way `clean_lenses` reads
+    them back."""
+    return "\n".join(" ".join(x for x in ("%g" % ln["mm"],
+                                          "f/%g" % ln["f"] if ln["f"] else "",
+                                          ln["name"]) if x) for ln in lenses or ())
+
+
+def lens_words(mm, f=None):
+    """A lens in the prompt's words: "a 23mm wide-angle lens at f/1.7"."""
+    mm = int(round(mm))
+    kind = "wide-angle " if mm <= 28 else "telephoto " if mm >= 70 else ""
+    return "a %dmm %slens%s" % (mm, kind, " at f/%g" % f if f else "")
+
+
+def lens_at(lenses, mm):
+    """The lens among `lenses` at focal length `mm` (to the millimetre), or None."""
+    if mm is None:
+        return None
+    return next((ln for ln in lenses or () if round(ln["mm"]) == round(mm)), None)
+
+
+def chosen_lens(cp, s):
+    """The lens the form shoots a camera with: `settings["camera_lens"]` (its
+    focal length) when that is one of the camera's, else its native lens,
+    else its first. None for a camera with no lenses listed."""
+    lenses = cp.get("lenses") or []
+    return (lens_at(lenses, s.get("camera_lens")) or lens_at(lenses, cp.get("lens"))
+            or (lenses[0] if lenses else None))
 
 
 def chosen_camera(lib, s):
@@ -936,6 +1000,52 @@ def _default_camera_profiles():
                       "clean high ISO, slightly cool colour science, smooth shadow "
                       "detail.",
          "lens": 35.0},
+        # Lenses in full-frame equivalents: the phone's are Samsung's own
+        # figures, the SL1's (APS-C, x1.6) and the Pocket 6K's (Super 35, x1.6)
+        # are the lens's focal length times the crop.
+        {"id": "galaxy-s25-ultra", "name": "Samsung Galaxy S25 Ultra",
+         "chemistry": "Shot on a Samsung Galaxy S25 Ultra smartphone: computational HDR, "
+                      "bright lifted shadows, vivid saturated Samsung colour, crisp "
+                      "sharpened detail, deep focus from a small sensor.",
+         "lens": 23.0, "format": "4:3",
+         "lenses": [{"name": "0.6x ultra-wide", "mm": 13, "f": 2.2},
+                    {"name": "1x wide", "mm": 23, "f": 1.7},
+                    {"name": "3x telephoto", "mm": 67, "f": 2.4},
+                    {"name": "5x telephoto", "mm": 111, "f": 3.4}]},
+        {"id": "canon-rebel-sl1", "name": "Canon EOS Rebel SL1",
+         "chemistry": "Shot on a Canon EOS Rebel SL1, an entry-level APS-C DSLR: warm "
+                      "Canon colour, pleasing skin tones, modest dynamic range, a "
+                      "little noise in the shadows.",
+         "lens": 29.0, "format": "3:2",
+         "lenses": [{"name": "18-55mm kit at 18mm", "mm": 29, "f": 3.5},
+                    {"name": "18-55mm kit at 55mm", "mm": 88, "f": 5.6},
+                    {"name": "40mm f/2.8 pancake", "mm": 64, "f": 2.8},
+                    {"name": "50mm f/1.8", "mm": 80, "f": 1.8}]},
+        {"id": "sony-zv1", "name": "Sony ZV-1",
+         "chemistry": "Shot on a Sony ZV-1 compact camera: 1-inch sensor, bright Zeiss "
+                      "zoom, Sony colour with warm flattering skin tones, soft "
+                      "background blur, clean detail.",
+         "lens": 24.0, "format": "3:2",
+         "lenses": [{"name": "24mm (wide end)", "mm": 24, "f": 1.8},
+                    {"name": "50mm", "mm": 50, "f": None},
+                    {"name": "70mm (long end)", "mm": 70, "f": 2.8}]},
+        {"id": "bmpcc-6k-g2", "name": "Blackmagic Pocket Cinema Camera 6K G2",
+         "chemistry": "Shot on a Blackmagic Pocket Cinema Camera 6K G2 in Blackmagic "
+                      "RAW, graded: Super 35 cinema sensor, wide dynamic range, filmic "
+                      "Blackmagic colour science, natural skin, soft highlight "
+                      "roll-off, cinematic look.",
+         "lens": 29.0, "format": "16:9",
+         "lenses": [{"name": "Sigma 18-35 f/1.8 at 18mm", "mm": 29, "f": 1.8},
+                    {"name": "Sigma 18-35 f/1.8 at 35mm", "mm": 56, "f": 1.8},
+                    {"name": "EF 50mm f/1.8", "mm": 80, "f": 1.8}]},
+        {"id": "nikon-n80", "name": "Nikon N80",
+         "chemistry": "Shot on a Nikon N80, a 35mm autofocus film SLR, loaded with Kodak "
+                      "Gold 200 colour negative film: warm golden tones, saturated "
+                      "colour, soft visible grain, gentle highlight roll-off.",
+         "lens": 50.0, "format": "3:2",
+         "lenses": [{"name": "AF 28-80mm kit at 28mm", "mm": 28, "f": 3.3},
+                    {"name": "AF 28-80mm kit at 80mm", "mm": 80, "f": 5.6},
+                    {"name": "AF 50mm f/1.8D", "mm": 50, "f": 1.8}]},
     ]
 
 
@@ -4234,7 +4344,8 @@ def missing_for(model, backend, inventory, nodes=None, workflow_loader=None):
 def default_settings():
     return {"preset": "standard", "model": "z-image-turbo", "backend": "auto",
             "identities": [], "style": "none", "style_strength": None,
-            "scene": "", "camera": "", "camera_profile": "", "negative": "", "loras": [],
+            "scene": "", "camera": "", "camera_profile": "", "camera_lens": None,
+            "negative": "", "loras": [],
             "references": {},
             "character": "", "item_refs": {}, "wearing": [], "face_photos": [],
             "face_name": "", "anatomy": True,
@@ -5289,6 +5400,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                   else "")
     if body_words and body_words in scene:
         body_words = ""
+    # The lens it is shot with, for a camera that lists its lenses.
+    lens = chosen_lens(cam_body, s) if body_words else None
+    if lens:
+        body_words = "%s. Shot on %s" % (body_words.rstrip(" ."),
+                                         lens_words(lens["mm"], lens["f"]))
     # The clothing floor is said of the person described, in their own
     # sentence; a scene that describes its people itself gets it after.
     described = bool(named or person)

@@ -607,8 +607,9 @@ class SceneBuilder:
 
         o.cap(p, "Camera body")
         o.label(p, "The camera this scene is shot on. Its chemistry - film stock or "
-                "digital colour science - is added to the words, and its native lens "
-                "replaces the one below.", "faint", self.host.f_small,
+                "digital colour science - is added to the words, its native lens "
+                "replaces the one below, and its own lenses are offered there.",
+                "faint", self.host.f_small,
                 wraplength=o.px(310)).pack(side="top", fill="x")
         self._camera_profile_tiles()
         o.button(p, "Cameras…", self.owner.edit_camera_profiles, kind="ghost").pack(
@@ -617,7 +618,13 @@ class SceneBuilder:
         o.cap(p, "Camera")
         lens = o.frame(p)
         lens.pack(side="top", fill="x", pady=(0, o.px(4)))
-        for mm in sc.LENSES:
+        # The camera body's own lenses by name, two a row; else the usual primes.
+        own = cam.get("lenses") or []
+        for n, ln in enumerate(own):
+            o.button(lens, ln["name"], lambda mm=ln["mm"]: self._set_lens(mm),
+                     kind="option").grid(row=n // 2, column=n % 2, sticky="w",
+                                         padx=(0, o.px(4)), pady=(0, o.px(4)))
+        for mm in () if own else sc.LENSES:
             o.button(lens, "%dmm" % mm, lambda mm=mm: self._set_lens(mm),
                      kind="option").pack(side="left", padx=(0, o.px(4)))
 
@@ -625,7 +632,7 @@ class SceneBuilder:
             def write(x):
                 cam[key] = conv(x)
             return write
-        self._slider(p, "lens", "Lens (mm)", lambda: cam["lens"], put("lens"), 14, 135)
+        self._slider(p, "lens", "Lens (mm)", lambda: cam["lens"], put("lens"), 12, 135)
         self._slider(p, "yaw", "Orbit", lambda: cam["yaw"], put("yaw"), 0, 359)
         self._slider(p, "pitch", "Look down", lambda: cam["pitch"], put("pitch"), -30, 80)
         self._slider(p, "distance", "Distance (m)", lambda: cam["distance"],
@@ -699,6 +706,7 @@ class SceneBuilder:
         cam["body"] = cp["name"] if cp and cp["id"] != "none" else ""
         cam["format"] = (cp.get("format") or "") if cp else ""
         cam["chemistry"] = cp["chemistry"] if cp else ""
+        cam["lenses"] = [dict(ln) for ln in cp.get("lenses") or ()] if cp else []
         if cp and cp["lens"]:
             cam["lens"] = float(cp["lens"])
         # The viewfinder is the camera's: a square camera shoots square, a

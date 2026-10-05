@@ -2993,13 +2993,26 @@ of `ImageStudio` exactly as `CharacterCreator` is. The rules:
   outside it is left out of the words (below), and so are walls or a floor it does not
   show (`room_seen`), with a note saying so.
 - **The camera body sets the frame and is named in the form.** A camera profile has a
-  `format` ("1:1" or "3:2", `imagegen.CAMERA_FORMATS`; starter cameras saved before it
-  take `DEFAULT_CAMERA_FORMATS` by id). Choosing it bakes `profile`, `body` (its name),
-  `format` and `chemistry` into `scene["camera"]` and moves the frame to one that
-  camera shoots (`camera_frame`: kept upright if it was; `FORMAT_FRAMES`, the 3:2 frames
-  are 1216 x 832 / 832 x 1216); the Frame choice then offers only those, and
-  `clean_scene` holds a saved scene to it. `camera_words` says "Shot on a <body>" when
-  the chemistry does not already name it.
+  `format` ("1:1", "3:2", "4:3" or "16:9", `imagegen.CAMERA_FORMATS`; starter cameras
+  saved before it take `DEFAULT_CAMERA_FORMATS` by id). Choosing it bakes `profile`,
+  `body` (its name), `format`, `chemistry` and `lenses` into `scene["camera"]` and moves
+  the frame to one that camera shoots (`camera_frame`: kept upright if it was;
+  `FORMAT_FRAMES`, the 3:2 frames are 1216 x 832 / 832 x 1216, 4:3 is Portrait 896 x
+  1152 / 1152 x 896, 16:9 is Landscape 1344 x 768 only); the Frame choice then offers
+  only those, and `clean_scene` holds a saved scene to it. `camera_words` says "Shot on
+  a <body>" when the chemistry does not already name it.
+- **A camera lists its own lenses.** `lenses` is [{"name", "mm", "f"}]
+  (`imagegen.clean_lenses`; the Cameras editor takes one a line, "67 f/2.4 3x
+  telephoto", `lens_lines` writes them back). `mm` is the **full-frame equivalent** -
+  the viewfinder's maths and the words both assume it - so a crop body's lens is its
+  focal length times the crop (APS-C and Super 35 x1.6) and a phone's is the maker's
+  equivalent figure. The Scene Builder's lens buttons are the body's lenses by name
+  (else 24/35/50/85); `camera_words` adds "at f/N" only while the lens sits on one of
+  them (`lens_at`), so the slider moved off one drops the aperture. The form's deck
+  has a Lens dropdown (`set_camera_lens`, `settings["camera_lens"]`, reset to the
+  native lens on a flip; `show_shot_on` follows the builder's) and a plain Generate
+  says "Shot on a <mm> lens at f/N" after the camera's words (`chosen_lens`). A camera
+  with no lenses listed says no lens on the form, as before.
 - **Shot on is a deck of cards above the Scene field.** The Image Studio form shows
   one camera card at a time (its picture, else its name), flipped with ‹ › or the wheel
   over it; the card showing is the choice, `settings["camera_profile"]`
