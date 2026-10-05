@@ -4052,6 +4052,21 @@ connection rows, it also shows the uploaded picture before the words, and Text /
 is state and not decoration. `_repaint_buttons` redresses them all. A rename also
 rebuilds the rail and refits the tabs (`_renamed_everywhere`).
 
+**An icon can be found on the web, and a rail row changes its own** (2026-10-05). A
+rail row's right-click menu (`_app_menu`) has Change icon..., Find an icon online...,
+Reset icon and All icons.... These are the same upload (`_pick_icon`) and key as the
+Icons window. That window's rows have Search... beside Upload.... `_set_icon`
+refreshes an open Icons window's row (`windows["icon_rows"]`) and the Preferences
+count, whichever opened it. The search (`core/icon_search.py`, `_search_icons`) is
+Wikimedia Commons'. It needs no key, and it serves its SVG logos as PNG thumbnails,
+which matters because Tk 8.6 reads no SVG or JPEG and stdlib-only bars a rasteriser.
+So JPEG results (photos) are dropped, drawings are listed first (an app's name also
+finds screenshots of it), and each tile shows its licence. Thumbnails are fetched only
+over https from Wikimedia's hosts (`ours`): the addresses come from the answer.
+The previews are PhotoImages made on the UI thread and kept in `photos` under
+`("found", key, ...)`. The window's `<Destroy>` drops them on the UI thread, never
+in a worker's closure (the Tcl_AsyncDelete trap above).
+
 **Do not remove the startup warm-up.** It looks like a redundant throwaway request.
 It is not: a full tool-schema set took about a minute to prefill cold - seconds, since
 the model loads onto an empty card (see *A model loads onto an empty card*). The warm-up

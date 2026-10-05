@@ -3284,6 +3284,98 @@ class TestGui(unittest.TestCase):
         self.assertEqual(field.get(), "Bridges")
         self.assertEqual(reset.state, "disabled")
 
+    def _entry(self, menu, label):
+        return next(i for i in range(menu.index("end") + 1)
+                    if menu.type(i) != "separator"
+                    and menu.entrycget(i, "label") == label)
+
+    def test_a_sidebar_row_changes_and_resets_its_own_icon(self):
+        from unittest import mock
+        import core.icons as icons
+        a = self.app.detected[0]
+        key = a["id"] or a["name"]
+        self.addCleanup(self.app._set_icon, key, None)
+        menu = self.app._app_menu(a)
+        for want in ("Change icon...", "Reset icon", "All icons..."):
+            self.assertIn(want, self._labels(menu))
+        self.assertEqual(menu.entrycget(self._entry(menu, "Reset icon"), "state"),
+                         "disabled")
+        # An open Icons window follows a change made from the rail.
+        self.app._icons_window()
+        self.app.update()
+        win = self.app.windows["icons"]
+        self.addCleanup(win.destroy)
+        field = next(w for w in self._all(win)
+                     if isinstance(w, self.mod.tk.Entry)
+                     and w.get() == self.app._name(key, a["name"]))
+        reset = next(w for w in self._all(field.master)
+                     if isinstance(w, self.mod.Pill) and w.text == "Reset")
+        self.assertEqual(reset.state, "disabled")
+        src = os.path.join(self.dir, "row.png")
+        with open(src, "wb") as f:
+            f.write(icons.png(bytes([0, 0, 200, 255]) * 64, 8, 8))
+        with mock.patch("tkinter.filedialog.askopenfilename", return_value=src):
+            menu.invoke(self._entry(menu, "Change icon..."))
+        deadline = time.time() + 5
+        while key not in self.app.prefs.get("icons") and time.time() < deadline:
+            time.sleep(0.05)
+            self.app._drain()
+        self.assertIn(key, self.app.prefs.get("icons"))
+        self.assertEqual(reset.state, "normal")
+        menu = self.app._app_menu(a)
+        item = self._entry(menu, "Reset icon")
+        self.assertEqual(menu.entrycget(item, "state"), "normal")
+        menu.invoke(item)
+        self.assertNotIn(key, self.app.prefs.get("icons"))
+        self.assertEqual(reset.state, "disabled")
+
+    def test_an_icon_found_online_is_kept_like_an_upload(self):
+        from unittest import mock
+        import core.icon_search as icon_search
+        import core.icons as icons
+        a = self.app.detected[0]
+        key = a["id"] or a["name"]
+        self.addCleanup(self.app._set_icon, key, None)
+        hits = [{"title": "Logo %d.svg" % i, "license": "Public domain",
+                 "thumb": "https://upload.wikimedia.org/%d.png" % i, "page": ""}
+                for i in range(3)]
+        asked = []
+        # A big PNG: the preview is shrunk to its tile.
+        big = icons.png(bytes([200, 0, 0, 255]) * 250 * 250, 250, 250)
+        with mock.patch.object(icon_search, "search",
+                               lambda words: asked.append(words) or hits), \
+                mock.patch.object(icon_search, "fetch", lambda url: big):
+            self.assertIn("Find an icon online...",
+                          self._labels(self.app._app_menu(a)))
+            self.app._search_icons(key, a["name"])
+            win = self.app.windows[("icon_search", key)]
+            self.addCleanup(lambda: win.winfo_exists() and win.destroy())
+            deadline = time.time() + 5
+            while (len([k for k in self.app.photos if k[:2] == ("found", key)]) < 3
+                   and time.time() < deadline):
+                time.sleep(0.05)
+                self.app._drain()
+            self.assertEqual(asked, ["%s logo" % a["name"]])
+            found = [v for k, v in self.app.photos.items() if k[:2] == ("found", key)]
+            self.assertEqual(len(found), 3)
+            tile = self.app._px(self.app.SEARCH_TILE)
+            self.assertTrue(all(p.width() <= tile for p in found))
+            grid_cells = [w for w in self._all(win)
+                          if isinstance(w, self.mod.tk.Frame) and hasattr(w, "pic")]
+            self.assertEqual(len(grid_cells), 3)
+            self.app.update()
+            grid_cells[1].pic.event_generate("<Button-1>")
+            deadline = time.time() + 5
+            while key not in self.app.prefs.get("icons") and time.time() < deadline:
+                time.sleep(0.05)
+                self.app._drain()
+        self.assertIn(key, self.app.prefs.get("icons"))
+        self.assertFalse(win.winfo_exists())       # closed once kept
+        # Its previews went with it, on this thread.
+        self.assertFalse([k for k in self.app.photos if k[:2] == ("found", key)])
+        kept = os.path.join(self.app._icons_dir(), self.app.prefs.get("icons")[key])
+        self.assertIsNotNone(icons.sized_png(kept, 16))
+
     def _all(self, w):
         out = []
         for child in w.winfo_children():
