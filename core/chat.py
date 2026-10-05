@@ -52,6 +52,7 @@ except ImportError:
 HERE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, HERE)
 import core.agent as eng
+import core.app_update as app_update
 import core.appinfo as appinfo
 import core.consoles as consoles
 import core.doctor as doctor
@@ -182,8 +183,10 @@ LLM_PC ="LLM PC"                         # the sidebar's second group: remote ap
 
 
 def app_subtitle(a):
-    """The second line of a sidebar row. Also what the rail is measured on."""
-    return a["version"] or ("remote" if a.get("remote") else "installed")
+    """The second line of a sidebar row. Also what the rail is measured on.
+    The release in the program (core/app_update.py) when there is one to
+    read; which installs were found, until then or instead."""
+    return a.get("release") or a["version"] or ("remote" if a.get("remote") else "installed")
 
 
 # Attachments - reading a picture's header, describing a folder, copying into
@@ -528,6 +531,10 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self.detected = eng.detect_apps()
         self.hidden = list(self.prefs.get("hidden"))
         self.pinned = list(self.prefs.get("pinned"))
+        # Releases read off the UI thread, by app name (`_read_releases`);
+        # read again on coming to the front once an update has been started.
+        self.releases, self.release_watch, self.release_read = {}, False, 0.0
+        self.app_subtitles = {}
 
         apps = self._opening_tabs()
         self.sessions = {a.id: self._session(a) for a in apps}
@@ -550,10 +557,13 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self.idle_timer = self.after(IDLE_CHECK_MS, self._idle_tick) if MODEL_IDLE_S else None
         self._spawn(None, self._read_icons)
         self._spawn(None, self._boot_host)
+        self.bind("<FocusIn>", self._on_focus_releases, add="+")
         if _MAIN:
             # Only the app started by main(), which holds the single-instance
             # lock: a test's window must not take the real desktop's consoles.
             self._spawn(None, self._watch_consoles)
+            # ...nor ask OpenCode and the LLM PC for their releases.
+            self._spawn(None, self._read_releases)
         self._select(self.active)
         self.protocol("WM_DELETE_WINDOW", self._quit)
 
@@ -631,10 +641,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         # editor as blanks, and MDL2 is documented by its hex codes anyway.
         mdl2 = {"pin": 0xE718, "unpin": 0xE77A, "close": 0xE8BB,
                 "add": 0xE710, "more": 0xE70D, "picture": 0xEB9F,
-                "file": 0xE8A5, "folder": 0xE8B7, "closed": 0xE76C, "open": 0xE70D}
+                "file": 0xE8A5, "folder": 0xE8B7, "closed": 0xE76C, "open": 0xE70D,
+                "update": 0xE896}
         plain = {"pin": 0x2191, "unpin": 0x2193, "close": 0x00D7,
                  "add": 0x002B, "more": 0x02C5, "picture": 0x25A3,
-                 "file": 0x2750, "folder": 0x25AD, "closed": 0x203A, "open": 0x02C5}
+                 "file": 0x2750, "folder": 0x25AD, "closed": 0x203A, "open": 0x02C5,
+                 "update": 0x21BB}
         self.g = {k: chr(v) for k, v in (mdl2 if have else plain).items()}
 
     def _scale_fonts(self, k):
@@ -1430,7 +1442,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             w.destroy()
         self._forget()
         self.app_dots = {}
+        self.app_subtitles = {}
 
+        for a in self.detected:           # a re-detection never asked OpenCode or ComfyUI
+            if not a.get("release") and self.releases.get(a["name"]):
+                a["release"] = self.releases[a["name"]]
         rows = [a for a in self.detected if a["name"] not in self.hidden]
         # Pinning orders a row within its own group: a remote app pinned to the
         # top still lives on the LLM PC, and the heading has to stay true.
@@ -1522,6 +1538,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             f.config(width=g.winfo_reqwidth(), height=g.winfo_reqheight())
             f.pack_propagate(False)
             g.pack()
+        update = None                     # placed on the release line, below
 
         def reveal(lit):
             for g in (hide,) if pinned else (hide, pin):
@@ -1529,7 +1546,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                     g.pack()
                 else:
                     g.pack_forget()
-        reveal(False)
+            if update is not None:
+                if lit:
+                    update.place(relx=0.5, rely=0.5, anchor="center")
+                else:
+                    update.place_forget()
         dot = None
         if a["drivable"]:
             dot = self._dot(row, "faint")
@@ -1542,16 +1563,34 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                            bg="side", fg="text")
         self._dress(title, spec["key"], name, clip_n=APP_NAME_CHARS)
         title.pack(fill="x")
-        subtitle = self._skin(tk.Label(box, text=app_subtitle(a), font=self.f_small,
+        # The release, and on hover the update glyph just after it: the line
+        # has room the rail does not (the rail at its narrowest has none for a
+        # third glyph beside pin and hide). The glyph sits in a slot of the
+        # line's own height, so showing it never makes the row taller.
+        line = self._skin(tk.Frame(box), bg="side")
+        line.pack(fill="x")
+        subtitle = self._skin(tk.Label(line, text=app_subtitle(a), font=self.f_small,
                                        anchor="w"), bg="side", fg="faint")
-        subtitle.pack(fill="x")
+        subtitle.pack(side="left")
+        self.app_subtitles[name] = subtitle
+        step = app_update.plan(a)
+        update_slot = self._skin(tk.Frame(line), bg="side")
+        update_slot.pack(side="left", padx=(2, 0))
+        if step is not None:
+            update = self._glyph(update_slot, "update",
+                                 lambda w, s=step: self._update_app(s), tip=step["tip"])
+            update_slot.config(width=update.winfo_reqwidth(),
+                               height=subtitle.winfo_reqheight())
+            update_slot.pack_propagate(False)
+        reveal(False)
 
-        widgets = [row, box, title, subtitle, mark, hide, pin, hide_slot, pin_slot]
+        widgets = [row, box, line, title, subtitle, mark, hide, pin, hide_slot,
+                   pin_slot, update_slot] + ([update] if update is not None else [])
         if dot is not None:
             widgets.append(dot)
             shell.config(cursor="hand2")
             row.config(cursor="hand2")
-            for w in (shell, row, box, title, subtitle, mark):
+            for w in (shell, row, box, line, title, subtitle, mark):
                 w.bind("<Button-1>", lambda ev, i=a["id"]: self._add_tab(i))
         # `shell` is the row for hover purposes but keeps the rail's own
         # background: the highlight it shows is drawn, not configured.
@@ -1588,6 +1627,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             m.add_command(label="Connect an MCP bridge for %s..." % name,
                           command=lambda r=a: self._bridge_dialog(row=r))
             m.add_separator()
+        # The release the row shows, and where it is updated (core/app_update.py).
+        step = app_update.plan(a)
+        m.add_command(label="%s %s" % (name, app_subtitle(a)), state="disabled")
+        if step is not None:
+            m.add_command(label=step["label"], command=lambda s=step: self._update_app(s))
+        m.add_separator()
         # The same upload and reset as Preferences > Icons, keyed the same,
         # so the row, its tab and the window all wear the one picture.
         m.add_command(label="Change icon...",
@@ -1643,6 +1688,42 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self.hidden = []
         self.prefs.set(hidden=[])
         self._build_apps()
+
+    # ---------------------------------------------------------------- releases
+    def _update_app(self, step):
+        """Hand the user to the app's own updater (core/app_update.py). From
+        then on the rail's releases are read again each time the window comes
+        back to the front, so a row changes once its update has landed."""
+        try:
+            app_update.run(step)
+        except OSError as e:
+            messagebox.showwarning(APP_NAME, "Could not start the update: %s" % e,
+                                   parent=self)
+            return
+        self.release_watch = True
+
+    def _on_focus_releases(self, _ev=None):
+        if not self.release_watch or time.time() - self.release_read < 10:
+            return
+        self.release_read = time.time()
+        self._spawn(None, self._read_releases)
+
+    def _read_releases(self):
+        """Off the UI thread: every row's release read again. OpenCode and
+        ComfyUI have to be asked, and the LLM PC may take seconds to answer."""
+        found = {a["name"]: app_update.read(a) for a in list(self.detected)}
+        self.q.put(("releases", None, found))
+
+    def _show_releases(self, found):
+        """Keep what was read - a re-detection (a bridge added) starts from
+        rows that never asked OpenCode or ComfyUI - and repaint the rows."""
+        self.releases.update({k: v for k, v in found.items() if v})
+        for a in self.detected:
+            if self.releases.get(a["name"]):
+                a["release"] = self.releases[a["name"]]
+            lbl = self.app_subtitles.get(a["name"])
+            if lbl is not None and lbl.winfo_exists():
+                lbl.config(text=app_subtitle(a))
 
     # ------------------------------------------------------------- connections
     # The connection rows, as Preferences > Icons lists them: each can be
@@ -3013,6 +3094,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
 
         if kind == "update":              # the window's, like "icon" below
             self._show_update(*payload)
+            return
+        if kind == "releases":            # the rail's, like "update"
+            self._show_releases(payload)
             return
         if kind == "updated":
             self._updated(*payload)

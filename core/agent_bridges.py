@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 
+import core.app_update as app_update
 from core.agent import (
     AppSpec, APPS, APPS_BY_ID, TABS, TABS_BY_ID, BRIDGE_PROMPT, newest_match,
 )
@@ -272,18 +273,20 @@ def detect_apps():
             m = re.search(r"(20\d\d)", e)
             if m:
                 years.add(m.group(1))
-        label = ", ".join(sorted(years, reverse=True))
-        if beta:
-            label = (label + ", Beta") if label else "Beta"
+        labels = sorted(years, reverse=True) + (["Beta"] if beta else [])
+        label = ", ".join(labels)
         exe = newest_match([os.path.join(ADOBE_DIR, e, exe_glob) for e in hits])
-        found.append({"code": code, "name": name, "version": label, "fg": fg,
-                      "bg": bg, "id": DRIVABLE.get(name), "exe": exe,
+        # `release` is what the row shows: the number in the exe it runs.
+        found.append({"code": code, "name": name, "version": label,
+                      "release": app_update.release_line(exe, labels) if exe else "",
+                      "fg": fg, "bg": bg, "id": DRIVABLE.get(name), "exe": exe,
                       "drivable": name in DRIVABLE, "remote": False})
     for globs, code, name, fg, bg in OTHER_APPS:
         path = newest_match(globs)
         if path:
-            found.append({"code": code, "name": name, "version": "", "fg": fg,
-                          "bg": bg, "id": DRIVABLE.get(name), "exe": path,
+            found.append({"code": code, "name": name, "version": "",
+                          "release": app_update.release_line(path),
+                          "fg": fg, "bg": bg, "id": DRIVABLE.get(name), "exe": path,
                           "drivable": name in DRIVABLE, "remote": False})
     # A served app is on this machine but has no window .exe: the registry is
     # the only evidence, and the row says "server" where a year would go. No
@@ -291,7 +294,7 @@ def detect_apps():
     for a in APPS:
         if a.served:
             found.append({"code": a.code, "name": a.name, "version": "server",
-                          "fg": a.fg, "bg": a.bg, "id": a.id, "exe": None,
+                          "release": "", "fg": a.fg, "bg": a.bg, "id": a.id, "exe": None,
                           "drivable": True, "remote": False})
     # A bridge the user entered by hand for something not detected above -
     # Blender, a DAW, a bridge with no app behind it. One whose name matches a
@@ -300,14 +303,14 @@ def detect_apps():
     for a in APPS:
         if a.custom and a.name not in named:
             found.append({"code": a.code, "name": a.name, "version": "bridge",
-                          "fg": a.fg, "bg": a.bg, "id": a.id, "exe": a.exe(),
+                          "release": "", "fg": a.fg, "bg": a.bg, "id": a.id, "exe": a.exe(),
                           "drivable": True, "remote": False})
     # Remote apps last: nothing on this disk to find, so the registry is the
     # only evidence they exist.
     for a in APPS:
         if a.remote:
-            found.append({"code": a.code, "name": a.name, "version": "", "fg": a.fg,
-                          "bg": a.bg, "id": a.id, "exe": None, "drivable": True,
-                          "remote": True})
+            found.append({"code": a.code, "name": a.name, "version": "", "release": "",
+                          "fg": a.fg, "bg": a.bg, "id": a.id, "exe": None,
+                          "drivable": True, "remote": True})
     return found
 

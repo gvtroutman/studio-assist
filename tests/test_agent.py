@@ -1642,8 +1642,8 @@ class TestComBridges(unittest.TestCase):
 class TestDetection(unittest.TestCase):
     def test_detect_apps_shape(self):
         for a in eng.detect_apps():
-            self.assertEqual({"code", "name", "version", "fg", "bg", "id", "exe",
-                              "drivable", "remote"}, set(a))
+            self.assertEqual({"code", "name", "version", "release", "fg", "bg", "id",
+                              "exe", "drivable", "remote"}, set(a))
             self.assertTrue(a["fg"].startswith("#"))
 
     def test_remote_apps_are_listed_without_an_exe(self):
@@ -3023,16 +3023,20 @@ class TestGui(unittest.TestCase):
         Searched rather than walked by a fixed depth: a row is a canvas with
         its content on a frame placed inside it, so the name box is a
         grandchild now and would be a great-grandchild the next time the row
-        gains a wrapper. The name box is the first frame holding two labels -
-        the pin and hide glyphs each sit in a one-label slot of their own."""
+        gains a wrapper. The name box is the first frame holding a label (the
+        name) and a frame holding a label (the release line) - the pin and
+        hide glyphs each sit in a one-label slot of their own."""
         import tkinter
 
         def box_of(widget):
             for child in widget.winfo_children():
                 if isinstance(child, tkinter.Frame):
-                    labels = [w for w in child.winfo_children()
-                              if isinstance(w, tkinter.Label)]
-                    if len(labels) >= 2:
+                    kids = child.winfo_children()
+                    labels = [w for w in kids if isinstance(w, tkinter.Label)]
+                    lines = [w for w in kids if isinstance(w, tkinter.Frame)
+                             and any(isinstance(x, tkinter.Label)
+                                     for x in w.winfo_children())]
+                    if labels and lines:
                         return labels[0]
                 found = box_of(child)
                 if found is not None:
@@ -3288,6 +3292,34 @@ class TestGui(unittest.TestCase):
         return next(i for i in range(menu.index("end") + 1)
                     if menu.type(i) != "separator"
                     and menu.entrycget(i, "label") == label)
+
+    def test_a_sidebar_row_shows_its_release_and_offers_its_update(self):
+        from unittest import mock
+        import core.app_update as app_update
+        a = next(r for r in self.app.detected if r["name"] in self.app.app_subtitles)
+        name = a["name"]
+        label = self.app.app_subtitles[name]
+        self.assertEqual(label.cget("text"), self.mod.app_subtitle(a))
+        step = {"label": "Update it...", "tip": "t", "open": "https://example.com/"}
+        with mock.patch.object(app_update, "plan", return_value=step):
+            menu = self.app._app_menu(a)
+        self.assertIn("%s %s" % (name, self.mod.app_subtitle(a)), self._labels(menu))
+        self.addCleanup(setattr, self.app, "release_watch", False)
+        with mock.patch.object(app_update, "run") as ran:
+            menu.invoke(self._entry(menu, "Update it..."))
+        ran.assert_called_once_with(step)
+        self.assertTrue(self.app.release_watch)
+        # A release read off the UI thread repaints the row where it stands.
+        before = dict(a)
+        self.addCleanup(lambda: (a.update(before), self.app.releases.pop(name, None),
+                                 label.config(text=self.mod.app_subtitle(a))))
+        self.app._show_releases({name: "99.1.0"})
+        self.assertEqual(label.cget("text"), "99.1.0")
+        # An app with no known updater says its release and offers nothing.
+        with mock.patch.object(app_update, "plan", return_value=None):
+            labels = self._labels(self.app._app_menu(a))
+        self.assertIn("%s 99.1.0" % name, labels)
+        self.assertNotIn("Update it...", labels)
 
     def test_a_sidebar_row_changes_and_resets_its_own_icon(self):
         from unittest import mock

@@ -56,6 +56,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/mcp.py` | 1.2k | MCP harness every bridge is built on | `Server`, `tools_from_table`, `elicit`, `Declined`, `progress`, `cancelled`, `Loopback` |
 | `core/tasks.py` | 0.9k | Task execution and recoverable task records | |
 | `core/lessons.py` | 0.5k | What the model learns after each task, per app; `trouble_in`/`self_review` for the trainer's cross-task check | |
+| `core/app_update.py` | 0.1k | A sidebar row's release line (the number in its .exe; OpenCode and ComfyUI asked off the UI thread) and where each app is updated: Creative Cloud, winget, `opencode upgrade`, a download page. The row's glyph and menu entry are `Chat._app_row` / `_app_menu` -> `_update_app` | `release_line`, `read`, `plan`, `run` |
 | `core/appinfo.py` | 0.2k | Each app tab's profile for its prompt: name, installed release, Wikipedia overview (cached in `appinfo/`) | `refresh`, `render`, `WIKI` |
 | `core/toolsmith.py` | 0.4k | Tools the model writes for itself from its own bridge tools | |
 | `core/ui.py` | 0.3k | Palette roles and drawing primitives | |
