@@ -92,7 +92,7 @@ SIDEBAR_W = 236
 # The narrowest still shows every row's mark, pin, hide and dot - the name is
 # what gives - and the widest leaves the transcript most of the window.
 SIDEBAR_RANGE = (160, 560)
-SIDEBAR_CHROME = 126      # a row less its name: mark, both glyphs, the dot, the gaps
+SIDEBAR_CHROME = 112      # a row less its name: mark, both glyphs, the gaps
 
 # Apps this machine may have that no bridge here drives, and where a bridge
 # for each has been seen. Hints for the connect dialog, not commands: each of
@@ -703,7 +703,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         for a in self.detected:
             widest = max(widest, self.f_ui.measure(clip(a["name"], APP_NAME_CHARS)),
                          self.f_small.measure(app_subtitle(a)))
-        # mark, both glyph buttons, the status dot and every gap between them
+        # mark, both glyph buttons and every gap between them
         self.side_fit = max(self._px(SIDEBAR_W), widest + self._px(SIDEBAR_CHROME))
         # A width the user dragged it to outranks the fit, at any text size:
         # the names clip to it instead (`_app_row`).
@@ -1500,7 +1500,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         for w in self.applist.winfo_children():
             w.destroy()
         self._forget()
-        self.app_dots = {}
         self.app_subtitles = {}
 
         for a in self.detected:           # a re-detection never asked OpenCode or ComfyUI
@@ -1575,11 +1574,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
 
         # Every fixed-size widget before the expanding one. The name box claims
         # whatever is left over, so packing it first shoves the pin, the hide
-        # and the status dot off the right-hand edge - the same pack-order trap
-        # that hid the Send button. Right to left: hide, pin, dot.
+        # off the right-hand edge - the same pack-order trap that hid the Send
+        # button. Right to left: hide, pin. (No status dot: the user wanted it
+        # off the rail; a tab's state is on its tab.)
         # The glyphs only appear while the pointer is over the row. Each sits
         # in a slot frozen at the glyph's own size, so unmapping the glyph
-        # leaves the slot - and the dot beside it - exactly where they were.
+        # leaves the slot - and the name beside it - exactly where they were.
         # (Painting the glyph in the row colour instead leaves a ClearType
         # ghost.) A pinned app's pin is state, and stays put.
         def slot():
@@ -1610,11 +1610,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                     update.place(relx=0.5, rely=0.5, anchor="center")
                 else:
                     update.place_forget()
-        dot = None
-        if a["drivable"]:
-            dot = self._dot(row, "faint")
-            dot.pack(side="right", padx=(4, 2))
-            self.app_dots[a["id"]] = dot
 
         box = self._skin(tk.Frame(row), bg="side")
         box.pack(side="left", fill="x", expand=True, padx=(9, 0))
@@ -1651,8 +1646,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
 
         widgets = [row, box, line, title, subtitle, mark, hide, pin, hide_slot,
                    pin_slot, update_slot] + ([update] if update is not None else [])
-        if dot is not None:
-            widgets.append(dot)
+        if a["drivable"]:
             shell.config(cursor="hand2")
             row.config(cursor="hand2")
             for w in (shell, row, box, line, title, subtitle, mark):
@@ -3223,7 +3217,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         elif kind == "bridge":
             s.bridge = payload
             role, detail = payload
-            self._paint_app_dot(s)
             self._paint_tab(s.id)
             self._sync_bridges()
         elif kind == "sys":
@@ -3276,7 +3269,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             s.busy = False
             self._end_thinking(s)
             self._clear_stages(s)
-            self._paint_app_dot(s)        # `booting` is cleared just before this
 
             if s.id == self.active:
                 self._apply_status()
@@ -4219,7 +4211,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s.status = ("%d console%s held" % (n, "" if n == 1 else "s") if n
                     else "no consoles held", "muted", False)
         s.bridge = ("ok" if n else "faint", "%s\n%d held" % (s.app.bridge_label, n))
-        self._paint_app_dot(s)
         if s.id in self.tab_ui:
             self._paint_tab(s.id)
         if s.id == self.active:
@@ -4300,7 +4291,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                 self._panel_say(s, arg[:1].upper() + arg[1:], "err")
             elif what == "note":
                 self._panel_say(s, *arg)
-            self._paint_app_dot(s)
             if s.id in self.tab_ui:
                 self._paint_tab(s.id)
             if s.id == self.active:
