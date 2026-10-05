@@ -56,12 +56,17 @@ HISTORY_PAGE = 40
 # The look sections the People tab shows, one after the other (no tabs).
 # Body, Face, Hair (ig.WHO_SECTIONS)
 # and Accessories are the Editor's (CharacterCreator) alone: a character's
-# still reach the prompt, and the form cannot say them otherwise.
+# still reach the prompt, and the form cannot say them otherwise. Expression
+# is not on the form at all (2026-10-05, the user: "hide the emojis", and
+# nothing in their place): the form neither keeps nor says one.
 FORM_LOOKS = [(name, slots) for name, slots in ig.LOOKS
-              if name not in ig.WHO_SECTIONS + ("Accessories",)]
+              if name not in ig.WHO_SECTIONS + ("Accessories", "Expression")]
 # The slots and sliders the form keeps but does not show: a character's own.
 CREATOR_KEYS = [k for k in ig.CHARACTER_KEYS
                 if k not in {k for _, slots in FORM_LOOKS for k, *_ in slots}]
+# Every slot the form keeps, shown or a character's: not the expression.
+FORM_SLOTS = [k for k in ig.SLOTS if k in ig.CHARACTER_KEYS
+              or k in {k for _, slots in FORM_LOOKS for k, *_ in slots}]
 ELLIPSIS = "…"          # the window's marker for "still happening": it animates
 ADVANCED = [                  # (setting, label, kind)
     ("seed", "Seed", "int"),
@@ -924,7 +929,7 @@ class ImageStudio:
         self.wear_box = self.frame(pb)
         self.wear_box.pack(side="top", fill="x", **pad)
         self._show_wearing()
-        for key in ig.SLOTS:
+        for key in FORM_SLOTS:
             self.text[key] = tk.StringVar()
         for key in ig.SLIDER_KEYS:
             self.sliders[key] = tk.IntVar(value=0)
@@ -2108,6 +2113,9 @@ class ImageStudio:
         """The form as settings, exactly what history stores."""
         s = dict(self.settings)
         s["scene"] = self.scene.get("1.0", "end").strip()
+        for key in ig.SLOTS:
+            if key not in FORM_SLOTS:          # an old saved expression: not said
+                s.pop(key, None)
         for key, var in self.text.items():
             s[key] = var.get().strip()
         for key, var in self.sliders.items():
