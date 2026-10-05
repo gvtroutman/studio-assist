@@ -1112,6 +1112,19 @@ def _default_camera_profiles():
          "lenses": [{"name": "35mm (wide)", "mm": 35, "f": 2.8},
                     {"name": "70mm", "mm": 70, "f": None},
                     {"name": "105mm (3x zoom)", "mm": 105, "f": 4.8}]},
+        # Lomography's figures: a fixed 50mm f/10 lens and one 1/80 s speed.
+        {"id": "lomo-konstruktor-f", "name": "Lomography Konstruktor Flash",
+         "chemistry": "Shot on a Lomography Konstruktor Flash, a build-it-yourself 35mm "
+                      "SLR, loaded with Lomography Color Negative 400 film: vivid, "
+                      "saturated lo-fi colour, punchy warm reds and yellows, slightly "
+                      "cyan-green shadows, warm skin; contrasty, highlights blooming "
+                      "and shadows blocking up; visible film grain; a simple plastic "
+                      "50mm lens at a fixed f/10, sharp in the centre and softening "
+                      "toward the edges, darkened corners, fairly deep focus; a fixed "
+                      "1/80 s shutter, a touch of motion blur on anything moving; an "
+                      "imperfect, handmade analogue look.",
+         "lens": 50.0, "format": "3:2",
+         "lenses": [{"name": "50mm f/10 (fixed)", "mm": 50, "f": 10}]},
     ]
 
 
