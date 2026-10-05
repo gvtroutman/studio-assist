@@ -547,6 +547,22 @@ class TestCompose(TempStudioMixin, unittest.TestCase):
         s.update(kw)
         return ig.compose(s, self.studio.lib, self.backend(backend), inventory, nodes=nodes)
 
+    def test_the_chosen_lens_is_said_after_the_camera(self):
+        phone = dict(scene="a street market", camera_profile="galaxy-s25-ultra")
+        self.assertIn("Shot on a 23mm wide-angle lens at f/1.7", self.plan(**phone).prompt)
+        self.assertIn("Shot on a 67mm lens at f/2.4",
+                      self.plan(camera_lens=67.0, **phone).prompt)
+        # A lens the camera does not have falls back to its native one.
+        self.assertIn("23mm", self.plan(camera_lens=40.0, **phone).prompt)
+        # The phone shoots 4:3.
+        p = self.plan(**phone)
+        w, h = p.values["width"], p.values["height"]
+        self.assertAlmostEqual(max(w, h) / min(w, h), 4 / 3, delta=0.06)
+        # A camera with no lenses listed says none, as before; a scene's own
+        # words carry its lens instead.
+        self.assertNotIn(" lens at f/", self.plan(scene="x", camera_profile="leica-m6").prompt)
+        self.assertNotIn("Shot on a 23mm", self.plan(scene_layout={"objects": []}, **phone).prompt)
+
     def test_the_shot_on_camera_says_its_words_and_shapes_the_picture(self):
         plain = self.plan(scene="a harbour at dusk")
         w, h = plain.values["width"], plain.values["height"]
@@ -3039,16 +3055,52 @@ class TestLibrary(unittest.TestCase):
         cam = ig.clean_camera_profile({"name": "Leica M6", "chemistry": "Warm tones.",
                                        "lens": "35", "image": "", "notes": 7})
         self.assertEqual(cam, {"id": "leica-m6", "name": "Leica M6",
-                               "chemistry": "Warm tones.", "lens": 35.0, "format": "3:2",
-                               "image": "", "notes": ""})
-        # A camera's format is 1:1 or 3:2 or nothing; a starter camera saved
-        # before formats existed takes its own.
+                               "chemistry": "Warm tones.", "lens": 35.0, "lenses": [],
+                               "format": "3:2", "image": "", "notes": ""})
+        # A camera's format is one of CAMERA_FORMATS or nothing; a starter
+        # camera saved before formats existed takes its own.
         self.assertEqual(ig.clean_camera_profile({"name": "Mine", "format": "3x2"})["format"], "3:2")
-        self.assertEqual(ig.clean_camera_profile({"name": "Mine", "format": "16:9"})["format"], "")
+        self.assertEqual(ig.clean_camera_profile({"name": "Mine", "format": "16x9"})["format"], "16:9")
+        self.assertEqual(ig.clean_camera_profile({"name": "Mine", "format": "5:4"})["format"], "")
         self.assertEqual(ig.clean_camera_profile({"name": "Mine"})["format"], "")
         self.assertIsNone(ig.clean_camera_profile({"name": "No lens"})["lens"])
         # A lens out of the camera's own sane range is clamped, like a style's.
         self.assertEqual(ig.clean_camera_profile({"name": "Wild", "lens": 5000})["lens"], 300)
+
+    def test_a_cameras_lenses_are_read_from_a_list_or_the_editors_lines(self):
+        lines = "13 f/2.2 0.6x ultra-wide\n67mm f2.4 - 3x telephoto\n\n50\njunk\n13 again"
+        self.assertEqual(ig.clean_lenses(lines), [
+            {"name": "0.6x ultra-wide", "mm": 13.0, "f": 2.2},
+            {"name": "3x telephoto", "mm": 67.0, "f": 2.4},
+            {"name": "50mm", "mm": 50.0, "f": None}])
+        # The editor shows them the way it reads them back.
+        self.assertEqual(ig.clean_lenses(ig.lens_lines(ig.clean_lenses(lines))),
+                         ig.clean_lenses(lines))
+        self.assertEqual(ig.clean_lenses([{"mm": 5000, "f": 0.1}, "x", {"name": "no mm"}]),
+                         [{"name": "300mm", "mm": 300.0, "f": 0.7}])
+        # A camera with lenses and no native lens starts on its first.
+        cam = ig.clean_camera_profile({"name": "Phone", "lenses": "23 f/1.7 Wide\n67 Tele"})
+        self.assertEqual(cam["lens"], 23.0)
+
+    def test_the_starter_cameras_include_the_phone_and_the_cinema_camera(self):
+        cams = {c["id"]: c for c in ig.Library(tempfile.mkdtemp()).all("camera_profiles")}
+        for cid in ("galaxy-s25-ultra", "canon-rebel-sl1", "sony-zv1", "bmpcc-6k-g2",
+                    "nikon-n80"):
+            cam = cams[cid]
+            self.assertTrue(cam["lenses"], cid)
+            self.assertIsNotNone(ig.lens_at(cam["lenses"], cam["lens"]), cid)  # native is one
+            self.assertIn(cam["format"], ig.CAMERA_FORMATS[1:], cid)
+            self.assertIn(cam["name"].lower(), cam["chemistry"].lower(), cid)
+        self.assertEqual(cams["galaxy-s25-ultra"]["format"], "4:3")
+        self.assertEqual(cams["bmpcc-6k-g2"]["format"], "16:9")
+
+    def test_new_formats_reshape_to_the_scene_builders_frames(self):
+        import apps.image_studio.scene.scene as sc
+        self.assertEqual(ig.camera_size("4:3", 896, 1152), (896, 1152))
+        self.assertEqual(ig.camera_size("4:3", 1024, 1024), (1152, 896))
+        self.assertEqual(ig.camera_size("16:9", 1024, 1024), (1344, 768))
+        for fmt in ig.CAMERA_FORMATS[1:]:
+            self.assertIn(fmt, sc.FORMAT_FRAMES)
 
 DRESS_FILES = {"diffusion_models": {"qwen_image_edit_2509_fp8_e4m3fn.safetensors"},
                "text_encoders": {"qwen_2.5_vl_7b_fp8_scaled.safetensors"},

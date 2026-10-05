@@ -102,11 +102,14 @@ FRAMES = [
     ("landscape", "Landscape 1344 x 768", 1344, 768),
     ("landscape_3x2", "3:2 landscape 1216 x 832", 1216, 832),
     ("portrait_2x3", "3:2 portrait 832 x 1216", 832, 1216),
+    ("landscape_4x3", "4:3 landscape 1152 x 896", 1152, 896),
 ]
 FRAME_SIZES = {k: (w, h) for k, _, w, h in FRAMES}
 # A camera's format (`imagegen.CAMERA_FORMATS`) -> the frames it shoots,
-# the way it is usually held first.
-FORMAT_FRAMES = {"1:1": ("square",), "3:2": ("landscape_3x2", "portrait_2x3")}
+# the way it is usually held first: a phone upright (Portrait is 4:3's
+# 896 x 1152), a cinema camera wide (Landscape is 16:9's 1344 x 768).
+FORMAT_FRAMES = {"1:1": ("square",), "3:2": ("landscape_3x2", "portrait_2x3"),
+                 "4:3": ("portrait", "landscape_4x3"), "16:9": ("landscape",)}
 
 
 def camera_frame(fmt, current):
@@ -2309,7 +2312,7 @@ def new_scene(details=""):
             "regional_prompting": REGIONAL_PROMPTING,
             "camera": {"target": [0.0, 1.0, 0.0], "yaw": 0.0, "pitch": 6.0,
                        "distance": 4.2, "lens": 35.0, "profile": "", "body": "",
-                       "format": "", "chemistry": ""},
+                       "format": "", "chemistry": "", "lenses": []},
             "room": new_room(), "objects": [], "enrich": new_enrich()}
 
 
@@ -2544,6 +2547,8 @@ def clean_scene(d):
     c["body"] = str(cam.get("body") or "")          # its name, for "Shot on" in the form
     c["format"] = cam.get("format") if cam.get("format") in FORMAT_FRAMES else ""
     c["chemistry"] = str(cam.get("chemistry") or "")
+    import apps.image_studio.imagegen as ig
+    c["lenses"] = ig.clean_lenses(cam.get("lenses"))      # the camera's, for its buttons
     s["frame"] = camera_frame(c["format"], s["frame"])    # the frame is the camera's
     room = d.get("room") if isinstance(d.get("room"), dict) else {}
     r = s["room"]
@@ -4699,9 +4704,10 @@ def framing_words(scene, obj):
 
 
 def camera_words(scene):
+    import apps.image_studio.imagegen as ig
     c = scene["camera"]
-    lens = int(round(c["lens"]))
-    kind = "wide-angle " if lens <= 28 else "telephoto " if lens >= 70 else ""
+    # At one of the camera's own lenses, its aperture is said too.
+    lens = ig.lens_at(c.get("lenses"), c["lens"])
     if c["pitch"] > 35:
         angle = "a high angle looking down"
     elif c["pitch"] > 12:
@@ -4710,7 +4716,7 @@ def camera_words(scene):
         angle = "a low angle looking up"
     else:
         angle = "eye level"
-    words = "Shot from %s on a %dmm %slens" % (angle, lens, kind)
+    words = "Shot from %s on %s" % (angle, ig.lens_words(c["lens"], lens and lens["f"]))
     chemistry = (c.get("chemistry") or "").strip()
     body = (c.get("body") or "").strip()
     if body and body.lower() not in chemistry.lower():   # a camera whose words skip its name

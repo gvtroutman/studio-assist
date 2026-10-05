@@ -1412,6 +1412,23 @@ class TestWords(unittest.TestCase):
         self.assertEqual(sc.camera_words(s),
                          "Shot from a high angle looking down on a 24mm wide-angle lens")
 
+    def test_at_one_of_the_cameras_own_lenses_its_aperture_is_said(self):
+        s = staged()
+        s["camera"].update(pitch=0, lens=67.0, lenses=[
+            {"name": "1x wide", "mm": 23.0, "f": 1.7},
+            {"name": "3x telephoto", "mm": 67.0, "f": 2.4}])
+        self.assertEqual(sc.camera_words(s), "Shot from eye level on a 67mm lens at f/2.4")
+        s["camera"]["lens"] = 80.0            # the slider moved off its lenses
+        self.assertEqual(sc.camera_words(s), "Shot from eye level on a 80mm telephoto lens")
+        # The lenses are kept with the scene; a 16:9 camera shoots Landscape.
+        s["camera"].update(lens=23.0, format="16:9")
+        back, problems = sc.clean_scene(s)
+        self.assertEqual(problems, [])
+        self.assertEqual(back["camera"]["lenses"], s["camera"]["lenses"])
+        self.assertEqual(back["frame"], "landscape")
+        s["camera"]["format"] = "4:3"
+        self.assertEqual(sc.clean_scene(s)[0]["frame"], "portrait")
+
     def test_a_chosen_camera_adds_its_chemistry(self):
         s = staged()
         s["camera"].update(pitch=45, lens=24,
@@ -2021,7 +2038,8 @@ class TestSceneFromPicture(unittest.TestCase):
 
     def test_the_frame_is_the_photos_shape(self):
         self.assertEqual(sc.picture_frame(1100, 1000), "square")
-        self.assertEqual(sc.picture_frame(4000, 3000), "landscape_3x2")  # 4:3 is nearest 3:2
+        self.assertEqual(sc.picture_frame(4000, 3000), "landscape_4x3")
+        self.assertEqual(sc.picture_frame(6000, 4000), "landscape_3x2")
         self.assertEqual(sc.picture_frame(3000, 4000), "portrait")
         self.assertEqual(sc.picture_frame(1920, 1080), "landscape")
 
@@ -2285,6 +2303,40 @@ class TestSceneBuilderWindow(unittest.TestCase):
         sb = ui.build_scene()
         self.assertEqual((sb.scene["camera"]["profile"], sb.scene["frame"]), ("sx-70", "square"))
         self.assertEqual(ui.collect()["camera_profile"], "sx-70")
+
+    def test_a_cameras_own_lenses_in_the_builder_and_on_the_deck(self):
+        ui, sb = self.builder()
+        self.addCleanup(lambda: ui.settings.update(camera_profile="none", camera_lens=None))
+        sb._inspector_tab("Camera")
+        sb._set_camera_profile("galaxy-s25-ultra")
+        cam = sb.scene["camera"]
+        self.assertEqual((cam["lens"], sb.scene["frame"]), (23.0, "portrait"))  # 1x, 4:3 upright
+        self.assertEqual([ln["name"] for ln in cam["lenses"]][:2], ["0.6x ultra-wide", "1x wide"])
+        self.assertIn("23mm · f/1.7 · 4:3", ui.camera_about.cget("text"))
+        sb._set_lens(67.0)                              # the 3x in the builder: the deck follows
+        self.assertEqual(ui.settings["camera_lens"], 67.0)
+        self.assertIn("67mm · f/2.4", ui.camera_about.cget("text"))
+        self.assertIn("on a 67mm lens at f/2.4", sc.scene_text(sb.scene).text)
+        ui.set_camera_lens(111.0)                       # the 5x on the deck: the scene follows
+        self.assertEqual(cam["lens"], 111.0)
+        ui.set_camera("leica-m6")                       # another camera starts on its own lens
+        self.assertIsNone(ui.settings["camera_lens"])
+        self.assertEqual((cam["lens"], cam["lenses"]), (35.0, []))
+        self.assertIn("35mm · 3:2", ui.camera_about.cget("text"))
+
+    def test_the_cameras_editor_takes_lenses_one_a_line(self):
+        ui, sb = self.builder()
+        ed = ui.edit_camera_profiles()
+        self.addCleanup(ed.win.destroy)
+        ed.reload("sony-zv1")
+        kind, box = ed.widgets["lenses"]
+        self.assertEqual(box.get("1.0", "end").strip().splitlines()[0], "24 f/1.8 24mm (wide end)")
+        box.delete("1.0", "end")
+        box.insert("1.0", "24 f/1.8 Wide\n100 f/4 Long")
+        ed._store()
+        self.assertEqual(ed.records[ed.current]["lenses"],
+                         [{"name": "Wide", "mm": 24.0, "f": 1.8},
+                          {"name": "Long", "mm": 100.0, "f": 4.0}])
 
     def test_the_image_form_runs_cameras_scene_builder_then_the_prompt(self):
         """The Scene Builder sits under the Shot on deck, twice an ordinary
