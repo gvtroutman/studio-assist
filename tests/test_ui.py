@@ -34,6 +34,24 @@ class Scaled:
         ui.ROUNDING = value
 
 
+class TestFitChars(unittest.TestCase):
+    """A name clipped to the pixels a dragged rail has for it."""
+
+    class Mono:                       # ten pixels a character
+        def measure(self, s):
+            return 10 * len(s)
+
+    def test_a_name_that_fits_is_whole_and_one_that_does_not_is_clipped(self):
+        font = self.Mono()
+        self.assertEqual(ui.fit_chars("Photoshop", font, 200), 9)
+        n = ui.fit_chars("Adobe Premiere Pro 2026", font, 120)
+        self.assertEqual(n, 12)
+        self.assertLessEqual(font.measure(ui.clip("Adobe Premiere Pro 2026", n)), 120)
+
+    def test_no_room_still_leaves_a_stub(self):
+        self.assertEqual(ui.fit_chars("Illustrator", self.Mono(), 0), 4)
+
+
 class TestBlend(unittest.TestCase):
     def test_the_ends_are_the_two_colours_not_both_the_second(self):
         # The bug the comment in `blend` describes: lazily built channels made

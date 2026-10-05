@@ -88,6 +88,11 @@ blend, rounded, clip, pretty_host = ui.blend, ui.rounded, ui.clip, ui.pretty_hos
 Pill = ui.Pill
 
 SIDEBAR_W = 236
+# Dragging the rail's right edge: how narrow and how wide it may go, at 96dpi.
+# The narrowest still shows every row's mark, pin, hide and dot - the name is
+# what gives - and the widest leaves the transcript most of the window.
+SIDEBAR_RANGE = (160, 560)
+SIDEBAR_CHROME = 126      # a row less its name: mark, both glyphs, the dot, the gaps
 
 # Apps this machine may have that no bridge here drives, and where a bridge
 # for each has been seen. Hints for the connect dialog, not commands: each of
@@ -229,7 +234,7 @@ class Prefs:
 
     DEFAULTS = {"theme": "dark", "accent": None, "tabs": None, "pinned": [], "hidden": [], "bridges": [],
                 "hold_consoles": True, "rounding": 1.0, "text_size": 1.0, "icons": {},
-                "button_show": {}, "names": {}, "model_pins": {}}
+                "button_show": {}, "names": {}, "model_pins": {}, "side_w": None}
 
     def __init__(self, path=None):
         self.path = path or settings_path()
@@ -264,6 +269,9 @@ class Prefs:
         for key, bounds in (("rounding", ui.ROUNDING_RANGE), ("text_size", ui.TEXT_RANGE)):
             if not ui.in_range(self.data.get(key), bounds):
                 self.data[key] = 1.0
+        # The rail's width dragged by hand, at 96dpi; None is "fit the rows".
+        if not ui.in_range(self.data.get("side_w"), SIDEBAR_RANGE):
+            self.data["side_w"] = None
         # What the user renamed things to in the Icons window: icon key ->
         # words. Short and one line, whatever the file says.
         got = self.data.get("names")
@@ -696,7 +704,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             widest = max(widest, self.f_ui.measure(clip(a["name"], APP_NAME_CHARS)),
                          self.f_small.measure(app_subtitle(a)))
         # mark, both glyph buttons, the status dot and every gap between them
-        self.side_w = max(self._px(SIDEBAR_W), widest + self._px(126))
+        self.side_fit = max(self._px(SIDEBAR_W), widest + self._px(SIDEBAR_CHROME))
+        # A width the user dragged it to outranks the fit, at any text size:
+        # the names clip to it instead (`_app_row`).
+        dragged = self.prefs.get("side_w")
+        self.side_w = self._px(dragged) if dragged else self.side_fit
 
     # ------------------------------------------------------------------ theming
     def _menus(self):
@@ -870,6 +882,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         self._build_sidebar(side)
+        self._build_grip(main)
 
         right = self._skin(tk.Frame(main), bg="bg")
         right.pack(side="left", fill="both", expand=True)
@@ -1366,6 +1379,51 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         return "break"
 
     # ----------------------------------------------------------------- sidebar
+    def _build_grip(self, main):
+        """The rail's right edge, dragged to make it wider or narrower. A
+        strip of its own between the rail and the page, lit while the pointer
+        is on it so it can be found. The rail follows the drag live; its rows
+        are laid out again (names clipped to the new room) and the width saved
+        on release. A double-click goes back to fitting the rows."""
+        grip = self.side_grip = tk.Frame(main, width=self._px(5),
+                                         cursor="sb_h_double_arrow")
+        self._skin(grip, bg="side")
+        grip.pack(side="left", fill="y")
+        self._hover(grip, [grip], "side", "border")
+        # Only a drag is saved: a double-click releases the button twice, and
+        # the second release would otherwise pin the fitted width as dragged.
+        moved = [False]
+
+        def drag(ev):
+            moved[0] = True
+            self._side_width(ev.x_root - self.side_frame.winfo_rootx())
+
+        def drop(_ev):
+            if moved[0]:
+                moved[0] = False
+                self.prefs.set(side_w=round(self.side_w / self.scale))
+                self._build_apps()
+
+        def fit(_ev):
+            self.prefs.set(side_w=None)
+            self._metrics()
+            self._side_width(self.side_w)
+            self._build_apps()
+
+        grip.bind("<B1-Motion>", drag)
+        grip.bind("<ButtonRelease-1>", drop)
+        grip.bind("<Double-Button-1>", fit)
+
+    def _side_width(self, px):
+        """Set the rail to `px` wide, kept inside SIDEBAR_RANGE and never so
+        wide the page beside it has less than a narrow rail's room."""
+        low, high = (self._px(n) for n in SIDEBAR_RANGE)
+        room = self.winfo_width() - self._px(SIDEBAR_RANGE[0] + 240)
+        if room > low:
+            high = min(high, room)
+        self.side_w = max(low, min(high, int(px)))
+        self.side_frame.config(width=self.side_w)
+
     def _build_sidebar(self, side):
         # Connections are built first and anchored to the bottom. The app list
         # runs to eight rows on a full Adobe install and would otherwise push
@@ -1380,9 +1438,10 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
 
         header = self._skin(tk.Frame(listing), bg="side")
         header.pack(fill="x", padx=(18, 12), pady=(18, 8))
-        self._cap(header, "ON %s" % clip(this_pc(), 22)).pack(side="left")
+        # The glyph first: on a rail dragged narrow the caption is what gives.
         self._glyph(header, "add", self._unhide_menu,
                     tip="Add an app back to this list").pack(side="right")
+        self._cap(header, "ON %s" % clip(this_pc(), 22)).pack(side="left")
 
         # A full Adobe install plus Resolve is eight rows, and a short window
         # cut the last one in half. The list scrolls inside a canvas; the bar
@@ -1561,7 +1620,13 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         box.pack(side="left", fill="x", expand=True, padx=(9, 0))
         title = self._skin(tk.Label(box, font=self.f_ui, anchor="w"),
                            bg="side", fg="text")
-        self._dress(title, spec["key"], name, clip_n=APP_NAME_CHARS)
+        # The fitted rail is sized to hold APP_NAME_CHARS of the widest name;
+        # one dragged wider or narrower shows as much as its width has room for.
+        clip_n = APP_NAME_CHARS
+        if self.prefs.get("side_w"):
+            clip_n = ui.fit_chars(self._name(spec["key"], name), self.f_ui,
+                                  self.side_w - self._px(SIDEBAR_CHROME))
+        self._dress(title, spec["key"], name, clip_n=clip_n)
         title.pack(fill="x")
         # The release, and on hover the update glyph just after it: the line
         # has room the rail does not (the rail at its narrowest has none for a

@@ -35,7 +35,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 ## core/ (every tab)
 | File | Lines | What it is | Start at |
 | --- | --- | --- | --- |
-| `core/chat.py` | 4.8k | The Tkinter window shell: `__init__`, layout, tabs, the transcript, host/model fit, the send/turn pipeline, the event pump. Inherits the mixins below, so `Chat`'s full method list is split across all of them | `Chat`, `_drain`/`_handle`/`_report`, `_turn`, `_boot_host`/`_fit`/`_make_room` |
+| `core/chat.py` | 4.8k | The Tkinter window shell: `__init__`, layout, tabs, the transcript, host/model fit, the send/turn pipeline, the event pump. Inherits the mixins below, so `Chat`'s full method list is split across all of them | `Chat`, `_drain`/`_handle`/`_report`, `_turn`, `_boot_host`/`_fit`/`_make_room`; the rail's dragged width `_build_grip`/`_side_width` |
 | `core/chat_theme.py` | 0.1k | Applying the palette; repainting drawn (not `config()`-able) widgets on a theme switch | `ChatThemeMixin`, `_theme`, `_skin`, `_redraw_marks` |
 | `core/chat_widgets.py` | 0.6k | The drawing primitives every window is built from - buttons, fields, marks, dots, arcs, menus | `ChatWidgetsMixin`, `_button`, `_entry`, `_dots`, `_arc`, `_mark`, `_selectable` (copyable text) |
 | `core/chat_updates.py` | 0.1k | Checking GitHub for updates and pulling them | `ChatUpdatesMixin`, `_check_updates`, `_on_update` |
