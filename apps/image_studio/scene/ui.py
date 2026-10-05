@@ -783,7 +783,6 @@ class SceneBuilder:
                 "photo of them turned most like it - only when it is close enough for "
                 "the face's size; the PuLID picture is kept beside it in History.",
                 "faint", self.host.f_small, wraplength=o.px(310)).pack(side="top", fill="x")
-        self._words_box()
 
     def _enrich_box(self, p):
         """The detail Enrich offered, with its three answers, and the details
