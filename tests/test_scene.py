@@ -2730,7 +2730,7 @@ class TestSceneBuilderWindow(unittest.TestCase):
             out = []
             def walk(w):
                 for c in w.winfo_children():
-                    if hasattr(c, "paint"):
+                    if isinstance(c, studio_ui.Pill):
                         out.append(c.cget("text"))
                     walk(c)
             walk(sb.panel)
