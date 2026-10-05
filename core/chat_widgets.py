@@ -335,7 +335,7 @@ class ChatWidgetsMixin:
     # under. Each can wear an uploaded picture in place of its glyph.
     GLYPH_NAMES = [("add", "Add (+)"), ("close", "Close (x)"), ("pin", "Pin"),
                    ("unpin", "Unpin"), ("folder", "Attach folder"),
-                   ("more", "More (v)")]
+                   ("more", "More (v)"), ("update", "Update an app")]
 
     def _glyph_icon(self, lbl, name):
         """Show `name`'s uploaded picture on a glyph label instead of its
