@@ -4801,6 +4801,15 @@ class TestImageStudioTab(unittest.TestCase):
         ui._show_looks("Expression")
         faces = [w for w in ui.look_box.winfo_children()]
         self.assertTrue(faces)
+        # The faces alone: no expression field or menu, no Looking row.
+        shown, todo = [], list(faces)
+        while todo:
+            w = todo.pop()
+            todo += w.winfo_children()
+            shown.append(w)
+        self.assertFalse([w for w in shown if w.winfo_class() == "Entry"])
+        self.assertNotIn("Looking", [w.cget("text") for w in shown
+                                     if w.winfo_class() == "Label"])
         s_ = ui.collect()
         self.assertEqual((s_["character"], s_["weight"], s_["accessories"]),
                          ("mara", -1, "glasses"))

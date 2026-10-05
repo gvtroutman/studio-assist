@@ -1590,26 +1590,31 @@ class ImageStudio:
         chosen ones lit. -> a function that relights the chips."""
         lights = []
         for key, label, _, picks, many in slots:
+            # The form's expression is its faces alone, with no field, menu
+            # or gaze row; the creator keeps all three.
+            if not chips and key == "gaze":
+                continue
             row = self.frame(parent, bg)
             row.pack(side="top", fill="x", pady=(self.px(2), 0))
             self.label(row, label, "muted", bg=bg, width=12).pack(side="left", anchor="n")
             var = vars_[key]
             box = self.frame(row, bg)
             box.pack(side="left", fill="x", expand=True)
-            line = self.frame(box, bg)
-            line.pack(side="top", fill="x")
 
             def pick(p, k=key, m=many):
                 vars_[k].set(ig.toggle(vars_[k].get(), p, m))
                 changed()
-            if not chips:
-                menu_pill = self.button(line, "▾", lambda: None, kind="ghost", bg=bg)
-                menu_pill.pack(side="right", padx=(self.px(4), 0))
-                menu_pill.command = (lambda pl=menu_pill, ps=picks, k=key, m=many, f=pick:
-                                     self._post_picks(pl, ps, vars_[k], m, f))
-            entry = self.host._entry(line, var, bg=bg)
-            entry.master.pack(side="left", fill="x", expand=True)
-            entry.bind("<KeyRelease>", lambda ev: changed())
+            if chips or key != "expression":
+                line = self.frame(box, bg)
+                line.pack(side="top", fill="x")
+                if not chips:
+                    menu_pill = self.button(line, "▾", lambda: None, kind="ghost", bg=bg)
+                    menu_pill.pack(side="right", padx=(self.px(4), 0))
+                    menu_pill.command = (lambda pl=menu_pill, ps=picks, k=key, m=many,
+                                         f=pick: self._post_picks(pl, ps, vars_[k], m, f))
+                entry = self.host._entry(line, var, bg=bg)
+                entry.master.pack(side="left", fill="x", expand=True)
+                entry.bind("<KeyRelease>", lambda ev: changed())
             if not chips and key != "expression":
                 continue
             # The form shows expressions as faces alone, big enough to read;
