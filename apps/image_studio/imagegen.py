@@ -3332,6 +3332,21 @@ PULID_NODES = {"PulidFluxModelLoader", "PulidFluxEvaClipLoader",
                "PulidFluxInsightFaceLoader", "ApplyPulidFlux"}
 PULID_WEIGHT = 1.0
 PULID_FAMILIES = {"flux1"}
+
+
+def face_carrier(lib, s):
+    """What gives a person their face when the workflow cannot draw it from
+    their photos: the head swap and face swap after drawing, their LoRA, or
+    nothing but the words."""
+    import apps.image_studio.facefusion as facefusion
+    if facefusion.selected(lib, s):
+        return (" Their face is put on after drawing by the %s, from their photos." % (
+            "face swap" if s.get("head_swap", True) is False else "head swap and face swap"))
+    chosen = [lib.get("identities", i.get("id") if isinstance(i, dict) else i)
+              for i in s.get("identities") or []]
+    if any(r and r.get("lora") for r in chosen):
+        return " Their identity LoRA carries the likeness."
+    return " The face comes from the words alone."
 # The same faces go into the picture itself, each confined to its person's
 # head (`region`, a mask PuLID scales to the latent): the picture is then
 # drawn with their heads, hair and skin, and the face pass only refines. A
@@ -5605,8 +5620,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
             text = ("%s reference: the %s workflow has no %s conditioning, so it was not "
                     "used." % (label, wf.get("label", wid), kind))
             (p.notes if kind == "face" and "face" not in s["references"] else
-             p.warnings).append(text + (" The identity LoRA carries the likeness."
-                                        if kind == "face" else ""))
+             p.warnings).append(text + (face_carrier(lib, s) if kind == "face" else ""))
             continue
         if var in p.images:
             p.warnings.append("%s reference: the workflow's %s input is already taken by "
