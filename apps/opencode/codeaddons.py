@@ -37,6 +37,7 @@ FILE = "addons.json"
 KINDS = ("mcp", "plugin", "skill")
 KIND_NAMES = {"mcp": "MCP servers", "plugin": "Plugins", "skill": "Skills"}
 NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+TOOL_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
 
 MCP_REGISTRY = "https://registry.modelcontextprotocol.io/v0/servers"
 NPM_SEARCH = "https://registry.npmjs.org/-/v1/search"
@@ -46,6 +47,44 @@ GITHUB_API = "https://api.github.com/repos/"
 GITHUB_RAW = "https://raw.githubusercontent.com/"
 TIMEOUT = 20
 PAGE = 30
+
+# Existing, signed-in Chrome tabs, selected by the user in Microsoft's extension.
+PLAYWRIGHT_VERSION = "0.0.83"
+CHROME_SOURCE = "https://github.com/microsoft/playwright-mcp"
+CHROME_EXTENSION = "https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm"
+PROJECT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+CHROME_BRIEF = os.path.join(PROJECT, "docs", "OPENCODE_BROWSER.md")
+CHROME_RUNTIME = os.path.join(PROJECT, ".runtime", "browser", "node_modules", "@playwright", "mcp")
+CHROME_EXCLUDED = (
+    "browser_close", "browser_resize", "browser_emulate_media", "browser_evaluate",
+    "browser_file_upload", "browser_drop", "browser_network_requests", "browser_network_request",
+    "browser_run_code_unsafe", "browser_take_screenshot", "browser_console_messages",
+)
+
+
+def chrome_record():
+    """A pinned browser add-on; connecting to a tab remains the user's action.
+    Prefer the separately installed runtime; otherwise use the normal npm runner."""
+    command = ["npx", "-y", "@playwright/mcp@" + PLAYWRIGHT_VERSION]
+    node = shutil.which("node")
+    script = os.path.join(CHROME_RUNTIME, "cli.js")
+    try:
+        with open(os.path.join(CHROME_RUNTIME, "package.json"), encoding="utf-8") as f:
+            package = json.load(f)
+        if node and os.path.isfile(script) and package.get("name") == "@playwright/mcp" \
+                and package.get("version") == PLAYWRIGHT_VERSION:
+            command = [node, script]
+    except (OSError, ValueError, AttributeError):
+        pass
+    command += ["--extension", "--no-webmcp", "--image-responses", "omit", "--codegen", "none",
+                "--timeout-action", "10000", "--timeout-navigation", "30000"]
+    return {"kind": "mcp", "name": "chrome", "title": "Chrome - existing tabs",
+            "description": "Read pages, click, type and fill forms in tabs you connect through "
+                           "the Playwright extension. Uses your existing Chrome login. "
+                           "Every tool asks before it runs; browser changes affect the live site.",
+            "version": PLAYWRIGHT_VERSION, "source": CHROME_SOURCE,
+            "config": {"type": "local", "command": command},
+            "excluded_tools": list(CHROME_EXCLUDED), "instructions": [CHROME_BRIEF]}
 
 
 class AddonError(Exception):
@@ -123,13 +162,23 @@ def _inside(p, root):
 def config(addons):
     """The opencode.json sections for the enabled add-ons."""
     out = {}
-    mcp, plugins, skills = {}, [], []
+    mcp, plugins, skills, excluded, instructions = {}, [], [], {}, []
     for a in addons:
         if not a.get("enabled", True):
             continue
         kind = a.get("kind")
         if kind == "mcp" and isinstance(a.get("config"), dict) and NAME.match(a["name"]):
             mcp[a["name"]] = dict(a["config"], enabled=True)
+            # Large servers can keep a focused tool set in the model's context.
+            # Exclusions only deny tools; the remaining tools still ask.
+            names = a.get("excluded_tools")
+            excluded[a["name"]] = [n for n in names if isinstance(n, str) and TOOL_NAME.fullmatch(n)] \
+                if isinstance(names, list) else []
+            briefs = a.get("instructions")
+            if isinstance(briefs, list):
+                for brief in briefs:
+                    if isinstance(brief, str) and brief.strip() and brief not in instructions:
+                        instructions.append(brief)
         elif kind == "plugin" and a.get("package"):
             plugins.append(a["package"])
         elif kind == "skill" and a.get("path"):
@@ -139,10 +188,14 @@ def config(addons):
         # OpenCode runs an MCP server's tools without asking unless told to;
         # a server can do anything, so each of its tools asks like an edit.
         out["permission"] = {"%s_*" % name: "ask" for name in mcp}
+        out["permission"].update({"%s_%s" % (name, tool): "deny"
+                                  for name, names in excluded.items() for tool in names})
     if plugins:
         out["plugin"] = plugins
     if skills:
         out["skills"] = {"paths": skills}
+    if instructions:
+        out["instructions"] = instructions
     return out
 
 

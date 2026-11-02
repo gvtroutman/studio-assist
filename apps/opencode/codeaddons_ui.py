@@ -194,6 +194,9 @@ class AddonsWindow:
             hand = {"mcp": "Add a server by hand…", "plugin": "Add a package by name…",
                     "skill": "Add a skill folder…"}[self.kind]
             self.button(self.tools, hand, self.add_by_hand, kind="ghost").pack(side="left")
+            if self.kind == "mcp":
+                self.button(self.tools, "Connect Chrome…", self.chrome_form, kind="ghost").pack(
+                    side="left", padx=(h._px(6), 0))
             self.show_installed()
         self.paint_restart()
 
@@ -253,6 +256,9 @@ class AddonsWindow:
                 side="left", padx=(self.host._px(6), 0))
             if str(r.get("source", "")).startswith("http"):
                 self.button(row, "Page", lambda u=r["source"]: webbrowser.open(u),
+                            kind="ghost", bg="card").pack(side="right")
+            if r.get("source") == ca.CHROME_SOURCE:
+                self.button(row, "Browser extension", lambda: webbrowser.open(ca.CHROME_EXTENSION),
                             kind="ghost", bg="card").pack(side="right")
 
     def installed_meta(self, r):
@@ -338,6 +344,40 @@ class AddonsWindow:
             self.show_installed()
             return
         self.hand_form()
+
+    def chrome_form(self):
+        self.gen += 1
+        self.clear()
+        self.open_form = None
+        _, _, row = self.card("Connect Chrome", "Your existing tabs and logins",
+                              "1. Install Microsoft's Playwright extension in Chrome. "
+                              "2. Add Chrome tools here, then restart OpenCode. "
+                              "3. On its first browser call, choose the tab to connect. "
+                              "It can read, click and type on that live site. Each tool asks "
+                              "before it runs, even with Agentic on.")
+        self.button(row, "Open extension page", lambda: webbrowser.open(ca.CHROME_EXTENSION),
+                    bg="card").pack(side="left")
+
+        def add():
+            existing = next((r for r in ca.load(self.state())
+                             if ca.key(r) == "mcp:chrome"), None)
+            if existing and existing.get("source") != ca.CHROME_SOURCE:
+                self.say("A different server is already named chrome. Rename or remove it "
+                         "before adding these tools.", "warn")
+                return
+            try:
+                ca.add(self.state(), ca.chrome_record())
+            except OSError as e:
+                self.failed(e)
+                return
+            self.mark_changed("Chrome tools added. Choose a tab on the first browser call. ")
+            self.show_installed()
+            self.refresh_live()
+
+        self.button(row, "Add Chrome tools", add, kind="accent", bg="card").pack(
+            side="left", padx=(self.host._px(6), 0))
+        self.button(row, "Cancel", self.show_installed, kind="ghost", bg="card").pack(
+            side="right")
 
     def hand_form(self):
         """A small form at the top of the list: a name and a command line or
