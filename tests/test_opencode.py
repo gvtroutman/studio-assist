@@ -21,6 +21,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from unittest import mock
 
 import core.agent as eng
 import core.mcp as studio_mcp
@@ -91,6 +92,10 @@ class FakeOpenCode:
                     continue
                 if kind == "todos":
                     self.todos = what
+                    continue
+                if kind == "tool":
+                    self.messages[sid].append(
+                        {"info": {"role": "assistant", "id": "msg_%d" % self.n}, "parts": [what]})
                     continue
                 if kind == "say":
                     self.messages[sid].append(
@@ -180,6 +185,24 @@ class FakeOpenCode:
                 self.pending = None
                 return True
         self.fail(404, {"message": "no route " + route})
+
+
+class TestBrowserActivity(unittest.TestCase):
+    def test_old_read_only_foreign_and_unstarted_calls_do_not_hide_a_missing_change(self):
+        def message(name, status="completed", msgid="new", session="ses", inputs=None):
+            return {"info": {"role": "assistant", "id": msgid, "sessionID": session},
+                    "parts": [{"type": "tool", "tool": name,
+                               "state": {"status": status, "input": inputs or {}}}]}
+        records = [message("chrome_browser_click", msgid="old"),
+                   message("chrome_browser_click", session="other"),
+                   message("chrome_browser_click", status="pending"),
+                   message("chrome_browser_snapshot"), message("chrome_browser_find"),
+                   message("chrome_browser_tabs", inputs={"action": "list"})]
+        with mock.patch.object(oc, "messages", return_value=records):
+            self.assertFalse(oc.browser_action_attempted("ses", {"old"}))
+        for status in ("completed", "error", "running"):
+            with mock.patch.object(oc, "messages", return_value=[message("chrome_browser_click", status)]):
+                self.assertTrue(oc.browser_action_attempted("ses", set()), status)
 
 
 class Base(unittest.TestCase):
@@ -1077,6 +1100,19 @@ class TestAgentic(Repo):
         self.assertIn("Tests FAILED", out)
         self.assertIn("sent OpenCode back to work %d time(s)" % oc.AGENTIC_ROUNDS, out)
         self.assertIn("the user's call", out)
+        self.assertTrue(res.get("isError"), "failing work is not done at the repair limit")
+        self.assertEqual(res["_meta"]["studio/opencode"]["state"], "needs_input")
+        self.assertNotIn("is done.", self.text(res))
+        sid = oc.last_session()
+        self.assertEqual(oc.task(sid)["owed"][0], "the tests failed")
+        waited = self.user().call_tool("opencode_wait", {"session_id": sid})
+        self.assertEqual(waited["_meta"]["studio/opencode"]["state"], "needs_input")
+        self.assertIn("the tests failed", self.text(waited))
+        self.assertEqual(len(self.asks()), 1 + oc.AGENTIC_ROUNDS, "wait grants no more retries")
+        self.switch(False)
+        waited = self.user().call_tool("opencode_wait", {"session_id": sid})
+        self.assertEqual(waited["_meta"]["studio/opencode"]["state"], "needs_input")
+        self.switch(True)
         # The next ask starts its own count.
         self.fake.scripts = [[("write", ("tests/test_hello.py", PASSING)), ("say", "fixed")]]
         res = self.user().call_tool("opencode_ask", {"prompt": "make the test pass"})
@@ -1120,6 +1156,29 @@ class TestAgentic(Repo):
                              ("make it faster?", False),
                              ("", False)):
             self.assertEqual(oc.wants_change(text), change, text)
+
+    def test_live_browser_work_does_not_trigger_an_unrelated_repository_edit(self):
+        step = {"type": "tool", "tool": "chrome_browser_click",
+                "state": {"status": "completed", "input": {"target": "e12"},
+                          "output": "The service is running."}}
+        self.fake.script = [("tool", step), ("say", "The service is running.")]
+        res = self.user().call_tool("opencode_ask", {"prompt": "Start the service in Chrome"})
+        self.assertEqual(len(self.asks()), 1, "live UI work does not require a code edit")
+        self.assertIn("Browser actions affect the live site", self.out(res))
+        self.assertEqual(self.read("hello.py"), "print('hi')\n")
+        self.fake.script = [("say", "I would edit hello.py.")]
+        self.user().call_tool("opencode_ask", {"prompt": "change the greeting"})
+        self.assertEqual(len(self.asks()), 3, "a browser call from an earlier ask cannot hide missing code work")
+        self.assertIn("Nothing in your copy has changed yet", self.asks()[-1])
+
+    def test_browser_permissions_are_not_approved_by_agentic(self):
+        request = {"permission": "chrome_browser_click", "patterns": ["*"],
+                   "metadata": {"target": "e12"}, "always": ["*"]}
+        res = self.ask(self.user(self.accept(decision="reject")), "inspect the service in Chrome",
+                       ("permission", request), ("say", "The user refused."))
+        self.assertEqual(len(self.asked), 1)
+        self.assertNotIn("allowed by Agentic", self.out(res))
+        self.assertEqual([p[2]["reply"] for p in self.fake.posts if p[0] == "reply"], ["reject"])
 
     def test_out_of_work_with_work_left_is_owed_to_the_wait(self):
         class Later:

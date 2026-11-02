@@ -169,13 +169,18 @@ class Child:
                 pass
         self.kill()
 
-    def kill(self):
-        """The whole tree, now: the job if there is one, else what we can."""
+    def terminate(self):
+        """End the tree, keeping pipes open so its final output can be drained."""
         p = self.proc
         if self.job:
             self.job.terminate()
         elif p.poll() is None:
             _kill_tree(p)
+
+    def kill(self):
+        """The whole tree, now: the job if there is one, else what we can."""
+        p = self.proc
+        self.terminate()
         try:
             p.wait(timeout=5)
         except Exception:

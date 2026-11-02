@@ -55,6 +55,8 @@ import urllib.parse
 import urllib.request
 
 import core.mcp as studio_mcp
+import core.procs as procs
+from core.activity import bridge_event
 
 HERE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_URL = "http://127.0.0.1:4096"
@@ -315,6 +317,30 @@ def _parts(m):
     return m.get("parts") or []
 
 
+def _excerpt(text, limit):
+    """Keep both ends of evidence, with an explicit omission inside the bound."""
+    if len(text) <= limit:
+        return text
+    marker = "\n... [%d characters omitted] ...\n" % len(text)
+    if limit < len(marker):
+        return text[:max(0, limit)]
+    room = max(0, limit - len(marker))
+    head, tail = (room + 1) // 2, room // 2
+    marker = "\n... [%d characters omitted] ...\n" % (len(text) - room)
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def _saved_result(state):
+    """Saved output/error text, or why its absence leaves the result unknown."""
+    if (state.get("time") or {}).get("compacted"):
+        return None, "Earlier output was cleared by compaction; result unknown."
+    output, error = state.get("output"), state.get("error")
+    values = [v for v in (output, error) if isinstance(v, str)]
+    if not values:
+        return None, "No saved output or error; result unknown."
+    return "\n\nTool error:\n".join(values), ""
+
+
 def summarize(m, limit=4000):
     """One message as prose: its text, and one line per tool it ran or file it
     touched. Reasoning and step markers are noise to the model on this side."""
@@ -322,26 +348,43 @@ def summarize(m, limit=4000):
     for p in _parts(m):
         kind = p.get("type")
         if kind == "text" and p.get("text"):
-            lines.append(p["text"].strip())
+            lines.append(_excerpt(p["text"].strip(), limit))
         elif kind == "tool":
             state = p.get("state") or {}
             title = state.get("title") or ""
             status = state.get("status") or ""
             lines.append("[%s %s%s]" % (p.get("tool", "tool"), status,
-                                        (": " + title) if title else ""))
-            err = state.get("error")
-            if err:
-                lines.append("  error: %s" % str(err)[:300])
+                                        (": " + _excerpt(title, 200)) if title else ""))
+            call_id = p.get("callID")
+            if call_id:
+                lines.append("  call_id=" + str(call_id))
+            if p.get("tool") == "bash":
+                command = (state.get("input") or {}).get("command")
+                lines.append("  command=" + json.dumps(_excerpt(command, 300)
+                             if isinstance(command, str) else "[unknown]", ensure_ascii=False))
+                exit_code = (state.get("metadata") or {}).get("exit")
+                lines.append("  exit=%s (tool completion is not a passing check)" %
+                             (exit_code if type(exit_code) is int else "unknown"))
+            saved, unknown = _saved_result(state)
+            if saved is None:
+                if p.get("tool") == "bash" or status == "error":
+                    lines.append("  " + unknown)
+            elif saved:
+                lines.append("  saved result=" + json.dumps(_excerpt(saved, 600), ensure_ascii=False))
+            elif p.get("tool") == "bash":
+                lines.append("  saved result is empty; use the exit code, not silence, to assess it.")
+            if saved is not None and len(saved) > 600 and call_id:
+                sid = _info(m).get("sessionID") or p.get("sessionID")
+                lines.append("  Read full saved result: opencode_tool_result with "
+                             "session_id=%s, call_id=%s, start=0." % (sid or "this session", call_id))
         elif kind == "patch":
             files += [f for f in (p.get("files") or []) if isinstance(f, str)]
         elif kind == "file" and p.get("filename"):
             files.append(p["filename"])
     text = "\n".join(l for l in lines if l)
-    if len(text) > limit:
-        text = text[:limit] + "\n... [%d more characters]" % (len(text) - limit)
     if files:
         text += "\nFiles touched: " + ", ".join(sorted(set(rel(f) for f in files)))
-    return text
+    return _excerpt(text, limit)
 
 
 def rel(path):
@@ -539,6 +582,8 @@ class Events:
         self.alive = False
         self.last = time.monotonic()      # when the last real event came in
         self.resp = None
+        self.parts = {}
+        self.parts_lock = threading.Lock()
         try:
             self.resp = _open(_request(ROUTES["events"], directory=directory), EVENT_TIMEOUT)
             if "event-stream" not in (self.resp.headers.get("Content-Type") or ""):
@@ -556,7 +601,16 @@ class Events:
                 if not line.startswith("data:"):
                     continue
                 try:
-                    kind = json.loads(line[5:]).get("type", "")
+                    event = json.loads(line[5:])
+                    kind = event.get("type", "")
+                    part = (event.get("properties") or {}).get("part")
+                    if kind == "message.part.updated" and isinstance(part, dict) and part.get("type") == "tool":
+                        key = (part.get("sessionID"), part.get("id"))
+                        if all(isinstance(x, str) and x for x in key):
+                            with self.parts_lock:
+                                if key not in self.parts and len(self.parts) >= 200:
+                                    self.parts.pop(next(iter(self.parts)))
+                                self.parts[key] = part
                 except (ValueError, AttributeError):
                     kind = ""
                 if kind not in self.QUIET:
@@ -572,6 +626,11 @@ class Events:
             self.flag.wait(seconds)
         self.flag.clear()
 
+    def drain_tools(self):
+        with self.parts_lock:
+            parts, self.parts = list(self.parts.values()), {}
+        return parts
+
     def close(self):
         resp, self.resp = self.resp, None
         if resp is not None:
@@ -579,6 +638,47 @@ class Events:
                 resp.close()
             except Exception:
                 pass
+
+
+class ToolFeed:
+    """Publish observed OpenCode tool parts, scoped and deduplicated by call id.
+    This view of events never answers permissions or decides session completion."""
+    def __init__(self, family, seen):
+        self.family, self.seen = family, seen
+        self.sent = {}
+
+    def part(self, part):
+        if not isinstance(part, dict) or part.get("type") != "tool":
+            return
+        sid, ident = part.get("sessionID"), part.get("callID") or part.get("id")
+        if not isinstance(sid, str) or not isinstance(ident, str) or sid not in self.family:
+            return
+        state = part.get("state") or {}
+        if not isinstance(state, dict):
+            return
+        status = {"running": "running", "completed": "ok", "error": "error"}.get(state.get("status"))
+        if status is None:
+            return                       # pending input is not a running tool
+        key = "%s:%s" % (sid, ident)
+        if part.get("messageID") in self.seen and status != "running" and key not in self.sent:
+            return                       # completed work before this ask
+        item = bridge_event({"id": key, "name": part.get("tool"), "status": status,
+                             "arguments": state.get("input", {}),
+                             "text": state.get("error") or state.get("output") or state.get("title") or ""})
+        if item is not None and self.sent.get(key) != item:
+            if key not in self.sent and len(self.sent) >= 500:
+                return                   # the UI is bounded even for a runaway session
+            self.sent[key] = item
+            studio_mcp.activity(item["id"], item["name"], item["status"], item.get("arguments"), item["text"])
+
+    def messages(self, msgs, sid):
+        for msg in msgs:
+            if _role(msg) != "assistant":
+                continue
+            for i, part in enumerate(_parts(msg)):
+                if isinstance(part, dict) and part.get("type") == "tool":
+                    self.part({**part, "sessionID": sid, "messageID": _info(msg).get("id"),
+                               "id": part.get("id") or "%s:%d" % (_info(msg).get("id"), i)})
 
 
 # ------------------------------------------------------------- the grants
@@ -805,21 +905,42 @@ def open_todos(sid, t):
     return [words for words, status in todos if status not in ("completed", "cancelled")]
 
 
+def verification_problem(lines):
+    """A failed or unavailable check stays unresolved until it actually passes."""
+    for line in lines:
+        if line.startswith("Tests FAILED"):
+            return ("the tests failed",
+                    "The tests of what you changed failed. Fix the code - change a test only "
+                    "if the test itself is wrong - then run them again. If a failing test has "
+                    "nothing to do with your change, leave it alone and say so.\n\n" + line)
+        if (line.startswith("Tests could not be run:") or
+                (line.startswith("Tests ") and " did not finish in " in line)):
+            return ("the tests could not finish",
+                    "Verification did not finish, so the task is not verified. Inspect the "
+                    "test command and the reported timeout or startup error. Resolve its cause "
+                    "and run the relevant tests again; do not mark them passed or weaken them "
+                    "to avoid the problem.\n\n" + line)
+        if line.startswith("Could not check the task's copy:"):
+            return ("the task's copy could not be checked",
+                    "The bridge could not inspect or checkpoint the task's copy. Inspect the "
+                    "reported error and recover the current state before claiming completion "
+                    "or repeating edits.\n\n" + line)
+    return None
+
+
 def unfinished(sid, lines, nudge=False):
     """Why an ask that ended is not finished, and the prompt that sends
     OpenCode back to it: (why, prompt), or None when it is finished, Agentic
-    does not hold, or it has been sent back AGENTIC_ROUNDS times already.
+    does not hold. The caller enforces the repair limit without calling
+    unfinished work done.
     `lines` is what `after_ask` said; `nudge` is whether the ask wanted a
     change and none has been made."""
     t = agentic_task(sid)
-    if not t or len(t.get("rounds", [])) >= AGENTIC_ROUNDS:
+    if not t:
         return None
-    failed = [l for l in lines if l.startswith("Tests FAILED")]
-    if failed:
-        return ("the tests failed",
-                "The tests of what you changed failed. Fix the code - change a test only "
-                "if the test itself is wrong - then run them again. If a failing test has "
-                "nothing to do with your change, leave it alone and say so.\n\n" + failed[0])
+    problem = verification_problem(lines)
+    if problem:
+        return problem
     todo = open_todos(sid, t)
     if todo:
         return ("%d to-do(s) were open" % len(todo),
@@ -858,6 +979,35 @@ def wants_change(text):
     first = (text.strip().splitlines() or [""])[0].strip().casefold()
     return (bool(first) and not first.endswith("?")
             and re.split(r"[^a-z]+", first.replace("'", ""), 1)[0] not in ASKS)
+
+
+BROWSER_ACTIONS = frozenset("click type fill_form press_key select_option drag hover "
+                            "navigate navigate_back handle_dialog tabs".split())
+
+
+def browser_action_attempted(sid, seen):
+    """A live browser task must not be nudged to edit an unrelated repo.
+    Count attempted actions, including unknown outcomes, without calling them
+    successful. Earlier asks and observations alone do not count."""
+    for message in messages(sid):
+        info = _info(message)
+        if _role(message) != "assistant" or info.get("id") in (seen or set()) \
+                or info.get("sessionID") not in (None, sid):
+            continue
+        for part in _parts(message):
+            name = part.get("tool", "")
+            if part.get("type") != "tool" or not isinstance(name, str) \
+                    or not name.startswith("chrome_browser_") or part.get("sessionID") not in (None, sid):
+                continue
+            action = name[len("chrome_browser_"):]
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            if action not in BROWSER_ACTIONS or state.get("status") not in ("completed", "error", "running"):
+                continue
+            inputs = state.get("input") if isinstance(state.get("input"), dict) else {}
+            if action == "tabs" and inputs.get("action") == "list":
+                continue
+            return True
+    return False
 
 
 def settle(family, log):
@@ -974,6 +1124,7 @@ def follow(sid, seen, clock, log=None):
     directory = task_dir(sid)
     family = Family(sid, directory)
     events = Events(directory)
+    tools = ToolFeed(family, seen)
     log = [] if log is None else log
     started = time.monotonic()
     stopped = None
@@ -988,6 +1139,8 @@ def follow(sid, seen, clock, log=None):
             if studio_mcp.cancelled():
                 raise Stopped("the user pressed Stop")
             tick = time.monotonic()
+            for part in getattr(events, "drain_tools", lambda: [])():
+                tools.part(part)
             asked = settle(family, log)
             if asked:
                 idle_polls = 0
@@ -1007,6 +1160,11 @@ def follow(sid, seen, clock, log=None):
                 look = (todo_count(sid, directory), files_changed(directory))
                 if look != snap:
                     snap, last_act = look, now
+                if not events.alive:
+                    try:
+                        tools.messages(messages(sid), sid)
+                    except OpenCodeError:
+                        pass             # progress is optional; the final report says failures
             last_act = max(last_act, events.last)
             todos, files = snap
             # Said when it changes, and every LOOK seconds so the client sees
@@ -1018,7 +1176,7 @@ def follow(sid, seen, clock, log=None):
                 studio_mcp.progress(line, *(todos or (None, None)))
             events.wait(max(POLL, EVENT_WAIT) if events.alive else POLL)
             if clock.add(time.monotonic() - tick):
-                return "working", report(sid, seen, log)
+                return "working", report(sid, seen, log, tools)
     except Stopped as e:
         stopped = str(e)
         try:
@@ -1027,7 +1185,7 @@ def follow(sid, seen, clock, log=None):
             pass
     finally:
         events.close()
-    text = report(sid, seen, log)
+    text = report(sid, seen, log, tools)
     if stopped:
         return "stopped", "(%s)\n%s" % (stopped.split("\n")[0], text)
     return "done", text
@@ -1055,6 +1213,13 @@ def outcome(sid, state, text, work_limit):
         res = result("The user stopped OpenCode %s. Session %s is halted; what it had "
                      "already changed stays until it is undone or discarded.\n%s"
                      % (why, sid, rest), error=True)
+    elif state == "needs_input":
+        why, _, rest = text.partition("\n")
+        limit = (" OpenCode reached its automatic repair limit."
+                 if len((task(sid) or {}).get("rounds", [])) >= AGENTIC_ROUNDS else "")
+        res = result("Session %s has work left (%s).%s Tell the user what failed and "
+                     "what remains. A new instruction can continue this session.\n%s"
+                     % (sid, why, limit, rest), error=True)
     else:
         res = result("Session %s is done.\n%s" % (sid, text))
     res["_meta"] = {"studio/opencode": {"session": sid, "state": state}}
@@ -1067,7 +1232,7 @@ def run(sid, seen, work_limit):
     return outcome(sid, state, text, work_limit)
 
 
-def report(sid, seen, log):
+def report(sid, seen, log, tool_feed=None):
     """What happened since `seen`: every step the user decided, then what
     OpenCode said and did, newest last, within MAX_REPLY_CHARS."""
     out = []
@@ -1078,6 +1243,8 @@ def report(sid, seen, log):
     chunks, error, msgs = [], None, []
     try:
         msgs = messages(sid)
+        if tool_feed is not None:
+            tool_feed.messages(msgs, sid)
         for m in msgs:
             if _info(m).get("id") in seen or _role(m) != "assistant":
                 continue
@@ -1370,30 +1537,41 @@ def run_tests(root, mods):
     that it is still at it every TEST_LOOK seconds - a run longer than the
     client's patience is not a hung bridge - and ends with the user's Stop."""
     try:
-        p = subprocess.Popen([sys.executable, "-m", "unittest"] + mods, cwd=root,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL,
-                             env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-                             creationflags=NO_WINDOW)
+        child = procs.spawn([sys.executable, "-m", "unittest"] + mods, cwd=root,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL,
+                            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+                            creationflags=NO_WINDOW)
     except OSError as e:
         return "Tests could not be run: %s" % e
+    p = child.proc
     started = time.monotonic()
-    while True:
-        try:
-            out = p.communicate(timeout=TEST_LOOK)[0]
-            break
-        except subprocess.TimeoutExpired:
-            spent = time.monotonic() - started
-            stop = studio_mcp.cancelled()
-            if stop or spent > TEST_TIMEOUT:
-                p.kill()
-                p.communicate()
-                if stop:
-                    raise Stopped("the user pressed Stop")
-                return "Tests %s did not finish in %d seconds." % (", ".join(mods),
-                                                                   TEST_TIMEOUT)
-            studio_mcp.progress("running the tests of what OpenCode changed (%s)"
-                                % _span(spent))
+    try:
+        while True:
+            try:
+                out = p.communicate(timeout=TEST_LOOK)[0]
+                break
+            except subprocess.TimeoutExpired as e:
+                spent = time.monotonic() - started
+                stop = studio_mcp.cancelled()
+                if stop or spent > TEST_TIMEOUT:
+                    # Windows communicate exposes buffered stdout after EOF.
+                    # End the whole tree first, then bound that final drain.
+                    child.terminate()
+                    try:
+                        tail = p.communicate(timeout=5)[0]
+                    except subprocess.TimeoutExpired:
+                        tail = e.output or b""
+                    tail = tail.decode("utf-8", "replace").strip()[-2500:]
+                    if stop:
+                        raise Stopped("the user pressed Stop")
+                    return "Tests %s did not finish in %d seconds.%s" % (
+                        ", ".join(mods), TEST_TIMEOUT,
+                        " Their output ends:\n" + tail if tail else "")
+                studio_mcp.progress("running the tests of what OpenCode changed (%s)"
+                                    % _span(spent))
+    finally:
+        child.stop(grace=0)
     out = out.decode("utf-8", "replace").strip()
     ran = re.search(r"Ran (\d+) tests?", out)
     count = ran.group(1) if ran else "?"
@@ -1412,13 +1590,19 @@ def after_ask(sid, label):
     lines = []
     try:
         files = changed_files(t["dir"])
+        previous = t.get("verification") or {}
+        retry = previous.get("modules", []) if verification_problem([previous.get("result", "")]) else []
+        mods = list(dict.fromkeys(retry + tests_for(t["dir"], files)))
+        if mods:
+            # A failed run was checkpointed too. An unchanged retry still needs
+            # these tests; the absence of a new diff cannot erase their verdict.
+            studio_mcp.progress("running the tests of what OpenCode changed")
+            checked = run_tests(t["dir"], mods)
+            lines.append(checked)
+            update_task(sid, verification={"modules": mods, "result": checked})
+        elif files:
+            lines.append("No test module matches the changed files, so none were run.")
         if files:
-            mods = tests_for(t["dir"], files)
-            if mods:
-                studio_mcp.progress("running the tests of what OpenCode changed")
-                lines.append(run_tests(t["dir"], mods))
-            else:
-                lines.append("No test module matches the changed files, so none were run.")
             sha = checkpoint(sid, label)
             if sha:
                 lines.append("Checkpoint %s saved on %s." % (sha[:8], t["branch"]))
@@ -1781,6 +1965,10 @@ def t_ask(a):
     if (task(sid) or {}).get("undone"):
         text = ("(The user undid your last change in this task: those files are back as "
                 "they were before it. Do not assume it is there.)\n\n" + text)
+    if (task(sid) or {}).get("owed"):
+        # A new instruction replaces the exhausted round even if Agentic
+        # has since been turned off; waiting alone cannot do so.
+        update_task(sid, rounds=[], owed=None)
     if agentic_task(sid):
         # A new ask: its rounds start over, and the to-dos it finds are not its own.
         update_task(sid, rounds=[], owed=None, todos=todo_list(sid, task_dir(sid)))
@@ -1811,8 +1999,32 @@ def finish(sid, seen, work_limit, label, change=False):
             state, text = "stopped", "(%s)\n%s" % (e, text)
             break
         t = task(sid) or {}
-        again = unfinished(sid, extra, change and len(t.get("checkpoints", [])) == before)
+        nudge = change and len(t.get("checkpoints", [])) == before
+        if nudge:
+            try:
+                browser = browser_action_attempted(sid, seen)
+            except OpenCodeError:
+                # With missing evidence, do not encourage replaying a live action.
+                state, text = "needs_input", ("OpenCode's tool activity could not be inspected. "
+                                              "Recover its tool results before repeating work.\n" + text)
+                break
+            if browser:
+                nudge = False
+                extra.append("Browser actions affect the live site; repository checkpoints, "
+                             "undo and merge do not reverse them. A recorded attempt is not "
+                             "proof that the site accepted the change.")
+        again = unfinished(sid, extra, nudge)
+        if not agentic_task(sid):
+            again = verification_problem(extra)
+            if again:
+                update_task(sid, owed=list(again))
+                state, text = "needs_input", "%s\n%s" % (again[0], text)
+                break
         if not again:
+            break
+        if len(t.get("rounds", [])) >= AGENTIC_ROUNDS:
+            update_task(sid, owed=list(again))
+            state, text = "needs_input", "%s\n%s" % (again[0], text)
             break
         if clock.add(time.monotonic() - tick):
             # No work left in this call to follow another round: it is owed,
@@ -1846,6 +2058,13 @@ def t_wait(a):
     seen = {_info(m).get("id") for m in msgs[:last_user + 1]}
     # A round the last call had no work left for is sent now, if Agentic still
     # holds and the session is at rest.
+    t = task(sid)
+    if t and t.get("owed") and (len(t.get("rounds", [])) >= AGENTIC_ROUNDS
+                               or not agentic_task(sid)):
+        # Waiting cannot buy another repair budget or erase a failed verdict
+        # after the failing files were checkpointed. A new ask resets it.
+        return outcome(sid, "needs_input", "%s\n%s" % (t["owed"][0], report(sid, seen, [])),
+                       _work_limit(a))
     t = agentic_task(sid)
     if (t and t.get("owed") and len(t.get("rounds", [])) < AGENTIC_ROUNDS
             and (statuses(t["dir"]).get(sid) or {}).get("type", "idle") == "idle"):
@@ -1862,7 +2081,54 @@ def t_get_session(a):
     chunks = []
     for m in rows[-limit:]:
         chunks.append("%s:\n%s" % (_role(m).upper(), summarize(m, 2500) or "(empty)"))
-    return result("\n\n".join(chunks))
+    body = "\n\n".join(chunks)
+    hint = ("\n\nFor the latest message alone, read opencode_get_session with limit=1; "
+            "recover a tool's saved output with opencode_tool_result and its call_id.")
+    return result(_excerpt(body, MAX_REPLY_CHARS - len(hint)) + hint
+                  if len(body) > MAX_REPLY_CHARS else body)
+
+
+def t_tool_result(a):
+    """Read a bounded window of a saved tool result, scoped to its exact call."""
+    sid, call_id = a["session_id"], a["call_id"]
+    matches = []
+    for message in messages(sid):
+        if _info(message).get("sessionID") not in (None, sid):
+            continue
+        for part in _parts(message):
+            if (part.get("type") == "tool" and part.get("callID") == call_id
+                    and part.get("sessionID") in (None, sid)):
+                matches.append(part)
+    if not matches:
+        return result("No saved tool call %s in session %s." % (call_id, sid), error=True)
+    if len(matches) != 1:
+        return result("Tool call %s is ambiguous in session %s; no result returned." %
+                      (call_id, sid), error=True)
+    part = matches[0]
+    state = part.get("state") or {}
+    saved, unknown = _saved_result(state)
+    header = "Session %s; call_id=%s; tool=%s; status=%s." % (
+        sid, call_id, _excerpt(str(part.get("tool", "?")), 100),
+        _excerpt(str(state.get("status", "unknown")), 80))
+    if part.get("tool") == "bash":
+        exit_code = (state.get("metadata") or {}).get("exit")
+        header += " exit=%s; tool completion is not a passing check." % (
+            exit_code if type(exit_code) is int else "unknown")
+    if saved is None:
+        return result(header + "\n" + unknown, error=True)
+    start, limit = int(a.get("start", 0)), int(a.get("limit", MAX_FILE_CHARS))
+    if start < 0 or not 1 <= limit <= MAX_FILE_CHARS:
+        raise ValueError("start must be nonnegative and limit must be between 1 and %d" % MAX_FILE_CHARS)
+    end = min(len(saved), start + limit)
+    header += "\nSaved result characters %d-%d of %d." % (min(start, len(saved)), end, len(saved))
+    if end < len(saved):
+        header += (" Next page: opencode_tool_result with session_id=%s, call_id=%s, start=%d."
+                   % (sid, call_id, end))
+    if not saved:
+        header += " Empty saved result; silence alone does not prove success."
+    elif start >= len(saved):
+        header += " Start is at or past the end of the saved result."
+    return result(header + "\n\n" + saved[start:end])
 
 
 def t_abort(a):
@@ -2110,6 +2376,17 @@ TOOLS = [
      _obj({"session_id": _s("The session id."),
            "limit": _i("How many messages, newest last. Default 6.", minimum=1, maximum=40)},
           ["session_id"])),
+    ("opencode_tool_result", t_tool_result,
+     "Read a bounded page of the exact saved output/error of one OpenCode tool call. "
+     "Use its call_id from opencode_get_session or the task report to recover omitted "
+     "output. Follow the next start offset to continue. Missing or compacted output "
+     "stays unknown; a completed tool is not proof of a passing check. Reads only.",
+     _obj({"session_id": _s("The exact session id.", minLength=1, maxLength=200),
+           "call_id": _s("The exact saved tool call id.", minLength=1, maxLength=200),
+           "start": _i("Character offset in the saved result, starting at 0.",
+                       minimum=0, maximum=10000000),
+           "limit": _i("Characters to return; default 6000.", minimum=1, maximum=6000)},
+          ["session_id", "call_id"])),
     ("opencode_abort", t_abort,
      "Stop the work OpenCode is doing in a session right now.",
      _obj({"session_id": _s("The session id.")}, ["session_id"])),
@@ -2174,6 +2451,7 @@ TOOLS_BY_NAME = {name: (fn, desc, schema) for name, fn, desc, schema in TOOLS}
 # owe a read-back; opencode_ask is the edit, and its reply is not proof the code
 # works, so it is not listed - the model is expected to check what came back.
 READ_ONLY = {"opencode_status", "opencode_list_sessions", "opencode_get_session",
+             "opencode_tool_result",
              "opencode_list_files", "opencode_read_file", "opencode_search_files",
              "opencode_changes", "opencode_grants"}
 

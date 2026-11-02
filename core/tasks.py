@@ -1200,6 +1200,16 @@ class Executor:
             limits = {"max_tokens": self._output_tokens} if self._output_tokens else {}
             try:
                 if streaming:
+                    prepared = {}
+                    def on_tool(item):
+                        if self.cancel.is_set():
+                            raise Cancelled()
+                        index, name = item["index"], item.get("name")
+                        if name and prepared.get(index) != name:
+                            prepared[index] = name
+                            self.emit("tool_preparing", item)
+                    if getattr(self.llm, "streams_tool_activity", False) is True:
+                        limits["on_tool"] = on_tool
                     def on_text(piece):
                         if self.cancel.is_set():
                             raise Cancelled()

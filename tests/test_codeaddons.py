@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -122,6 +123,97 @@ class TestCodeAddons(unittest.TestCase):
         self.assertEqual(full["permission"]["edit"], "ask")
         self.assertEqual(full["permission"]["external_directory"], "deny")
         self.assertIn("notes", full["mcp"])
+
+    def test_tool_exclusions_keep_approval_for_the_remaining_tools(self):
+        long_name = "x" * 128
+        rec = {"kind": "mcp", "name": "rea", "config": {"type": "local", "command": ["node", "rea.mjs", "mcp"]},
+               "excluded_tools": ["capture_process_scenario", "edit", long_name, "x" * 129, "other_*", "", None]}
+        ca.add(self.dir, rec)
+        full = eng.opencode_config("http://h:1/v1", "m", ["m"], addons=ca.load(self.dir))
+        self.assertEqual(full["permission"]["rea_*"], "ask")
+        self.assertEqual(full["permission"]["rea_capture_process_scenario"], "deny")
+        self.assertEqual(full["permission"]["rea_edit"], "deny")
+        self.assertEqual(full["permission"]["rea_" + long_name], "deny")
+        self.assertNotIn("rea_" + "x" * 129, full["permission"])
+        self.assertEqual(full["permission"]["edit"], "ask")
+        self.assertEqual(full["permission"]["external_directory"], "deny")
+        self.assertNotIn("rea_other_*", full["permission"])
+        ca.set_enabled(self.dir, "mcp:rea", False)
+        self.assertEqual(ca.config(ca.load(self.dir)), {})
+
+    def test_malformed_exclusions_do_not_block_a_server(self):
+        for invalid in (None, "read", {"read": False}):
+            rec = {"kind": "mcp", "name": "rea", "config": {"type": "local", "command": ["node"]},
+                   "excluded_tools": invalid}
+            self.assertEqual(ca.config([rec])["permission"], {"rea_*": "ask"})
+
+    def test_chrome_tools_preserve_the_existing_brief_and_permissions(self):
+        rec = ca.chrome_record()
+        self.assertIn("--extension", rec["config"]["command"])
+        self.assertIn("--no-webmcp", rec["config"]["command"])
+        self.assertNotIn("--ignore-https-errors", rec["config"]["command"])
+        self.assertNotIn("--allow-unrestricted-file-access", rec["config"]["command"])
+        ca.add(self.dir, rec)
+        cfg = eng.opencode_config("http://h:1/v1", "m", ["m"],
+                                  addons=ca.load(self.dir), brief=["project.md", "lessons.md"])
+        self.assertEqual(cfg["instructions"], ["project.md", "lessons.md", ca.CHROME_BRIEF])
+        self.assertEqual(cfg["permission"]["chrome_*"], "ask")
+        self.assertEqual(cfg["permission"]["chrome_browser_run_code_unsafe"], "deny")
+        self.assertEqual(cfg["permission"]["chrome_browser_evaluate"], "deny")
+        self.assertEqual(cfg["permission"]["external_directory"], "deny")
+        self.assertEqual(cfg["permission"]["edit"], "ask")
+        ca.set_enabled(self.dir, "mcp:chrome", False)
+        self.assertEqual(ca.config(ca.load(self.dir)), {})
+        cfg = eng.opencode_config("http://h:1/v1", "m", ["m"], addons=ca.load(self.dir),
+                                  brief="project.md")
+        self.assertEqual(cfg["instructions"], ["project.md"])
+        self.assertNotIn("chrome", cfg["mcp"])
+        ca.remove(self.dir, "mcp:chrome")
+        self.assertEqual(ca.load(self.dir), [])
+
+    def test_chrome_runtime_must_match_the_pinned_package(self):
+        runtime = os.path.join(self.dir, "runtime")
+        os.makedirs(runtime)
+        with open(os.path.join(runtime, "cli.js"), "w") as f:
+            f.write("// fixture, never executed")
+        pkg = os.path.join(runtime, "package.json")
+        with mock.patch.object(ca, "CHROME_RUNTIME", runtime), \
+                mock.patch.object(ca.shutil, "which", return_value="node.exe"):
+            for name, version in (("other", ca.PLAYWRIGHT_VERSION), ("@playwright/mcp", "0.0.0")):
+                with open(pkg, "w") as f:
+                    json.dump({"name": name, "version": version}, f)
+                self.assertEqual(ca.chrome_record()["config"]["command"][:3],
+                                 ["npx", "-y", "@playwright/mcp@" + ca.PLAYWRIGHT_VERSION])
+            with open(pkg, "w") as f:
+                json.dump({"name": "@playwright/mcp", "version": ca.PLAYWRIGHT_VERSION}, f)
+            self.assertEqual(ca.chrome_record()["config"]["command"][:2],
+                             ["node.exe", os.path.join(runtime, "cli.js")])
+
+    def test_browser_contract_keeps_navigation_and_actions_for_a_text_model(self):
+        contract = os.path.join(os.path.dirname(__file__), "fixtures", "chrome-playwright.json")
+        with open(contract, encoding="utf-8") as f:
+            tools = json.load(f)["tools"]
+        names = {tool["name"] for tool in tools}
+        self.assertTrue(set(ca.CHROME_EXCLUDED) <= names)
+        working = names - set(ca.CHROME_EXCLUDED)
+        self.assertEqual(len(working), 14)
+        self.assertTrue({"browser_tabs", "browser_snapshot", "browser_find", "browser_click",
+                         "browser_type", "browser_fill_form", "browser_navigate", "browser_wait_for"}
+                        <= working)
+        for tool in tools:
+            if tool["name"] == "browser_click":
+                self.assertIn("target", tool["inputSchema"]["required"])
+        with open(ca.CHROME_BRIEF, encoding="utf-8") as f:
+            brief = f.read()
+        self.assertLess(len(brief), 3000)
+
+    def test_addon_instructions_are_enabled_scoped_and_deduplicated(self):
+        rec = {"kind": "mcp", "name": "notes", "config": {"type": "local", "command": ["x"]},
+               "instructions": ["notes.md", None, "", "notes.md"]}
+        cfg = eng.opencode_config("http://h", "m", ["m"], addons=[rec], brief="notes.md")
+        self.assertEqual(cfg["instructions"], ["notes.md"])
+        rec["instructions"] = "ignored.md"
+        self.assertNotIn("instructions", ca.config([rec]))
 
     def test_the_registry_offers_only_the_latest_and_what_can_run_here(self):
         cards, nxt = ca.search_mcp("notes")
@@ -267,6 +359,45 @@ class TestAddonsWindow(unittest.TestCase):
         self.app._select(eng.APPS[0].id)
         self.app.update()
         self.assertFalse(self.app.btn_addons.winfo_ismapped())
+
+    def test_chrome_setup_files_an_addon_without_opening_the_browser(self):
+        self.app._select("opencode")
+        self.app._open_code_addons()
+        w = self.app.code_addons
+        original = ca.load(self.spec.state_dir)
+        try:
+            self.assertIn("Connect Chrome…", self.texts(w.tools))
+            w.chrome_form()
+            self.assertEqual(ca.load(self.spec.state_dir), original)
+            buttons = w.list.winfo_children()[0].winfo_children()[-1].winfo_children()
+            with mock.patch("apps.opencode.codeaddons_ui.webbrowser.open") as opened:
+                next(b for b in buttons if b.cget("text") == "Open extension page").invoke()
+                opened.assert_called_once_with(ca.CHROME_EXTENSION)
+            next(b for b in buttons if b.cget("text") == "Add Chrome tools").invoke()
+            cfg = ca.config(ca.load(self.spec.state_dir))
+            self.assertEqual(cfg["permission"]["chrome_*"], "ask")
+            self.assertIn("Choose a tab", w.msg.cget("text"))
+            self.assertIn("Browser extension", self.texts(w.list))
+        finally:
+            ca.save(self.spec.state_dir, original)
+            w.close()
+
+    def test_chrome_setup_preserves_a_different_server_with_the_same_name(self):
+        self.app._select("opencode")
+        self.app._open_code_addons()
+        w = self.app.code_addons
+        original = ca.load(self.spec.state_dir)
+        try:
+            ca.add(self.spec.state_dir, ca.hand_mcp("chrome", "custom-server"))
+            before = ca.load(self.spec.state_dir)
+            w.chrome_form()
+            buttons = w.list.winfo_children()[0].winfo_children()[-1].winfo_children()
+            next(b for b in buttons if b.cget("text") == "Add Chrome tools").invoke()
+            self.assertEqual(ca.load(self.spec.state_dir), before)
+            self.assertIn("different server", w.msg.cget("text"))
+        finally:
+            ca.save(self.spec.state_dir, original)
+            w.close()
 
     def test_install_from_the_catalog_then_turn_off_and_remove(self):
         self.app._select("opencode")
