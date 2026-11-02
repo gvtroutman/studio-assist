@@ -53,6 +53,8 @@ FAMILY_REPOS = {
     "flux1": ("black-forest-labs/FLUX.1-dev",),
     "flux1-kontext": ("black-forest-labs/FLUX.1-Kontext-dev",),
     "flux2": ("black-forest-labs/FLUX.2-dev",),
+    "flux2-klein4b": ("black-forest-labs/FLUX.2-klein-4B",
+                      "black-forest-labs/FLUX.2-klein-base-4B"),
     "sdxl": ("stabilityai/stable-diffusion-xl-base-1.0",),
     "sd15": ("stable-diffusion-v1-5/stable-diffusion-v1-5", "runwayml/stable-diffusion-v1-5"),
     "z-image": ("Tongyi-MAI/Z-Image-Turbo",),

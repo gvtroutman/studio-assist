@@ -728,7 +728,9 @@ class KeptFileTest(unittest.TestCase):
         ig.change_kept(self.lib, ig.CRITIC_LEDGER, lambda led: dict(led, a=1))
         ig.change_kept(self.lib, ig.CRITIC_LEDGER, lambda led: dict(led, b=2))
         self.assertEqual(ig.load_critic_ledger(self.lib), {"a": 1, "b": 2})
-        self.assertEqual(os.listdir(self.dir), [ig.CRITIC_LEDGER])   # no temp left
+        # No temp left (the library itself keeps models-added.json here).
+        self.assertIn(ig.CRITIC_LEDGER, os.listdir(self.dir))
+        self.assertEqual([n for n in os.listdir(self.dir) if n.endswith(".tmp")], [])
 
     def test_a_file_that_will_not_parse_is_set_aside_not_written_over(self):
         with open(self.path, "w", encoding="utf-8") as f:

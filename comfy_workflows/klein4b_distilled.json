@@ -1,0 +1,214 @@
+{
+  "id": "klein4b_distilled",
+  "label": "FLUX.2 Klein 4B distilled",
+  "about": "The official ComfyUI FLUX.2 Klein 4B distilled text-to-image branch, expanded from its subgraph. Apache 2.0. Euler, 4 steps, CFG 1, Flux2Scheduler at the output resolution, EmptyFlux2LatentImage, and a zeroed negative from the positive conditioning. Native core nodes only. No added refinement, face, pose, or reference passes. The FP8 model is an official BFL distribution; the node wiring is unchanged.",
+  "families": [
+    "flux2-klein4b"
+  ],
+  "defaults": {
+    "steps": 4,
+    "guidance": 1,
+    "sampler": "euler",
+    "width": 1024,
+    "height": 1024,
+    "encoder_device": "default",
+    "filename_prefix": "ImageStudio/flux2_klein4b"
+  },
+  "files": {
+    "model": "diffusion_models",
+    "encoder": "text_encoders",
+    "vae": "vae"
+  },
+  "stages": {
+    "loading": [
+      "170",
+      "171",
+      "172",
+      "174",
+      "176"
+    ],
+    "sampling": [
+      "164"
+    ],
+    "decoding": [
+      "165",
+      "9"
+    ]
+  },
+  "provenance": {
+    "reference": "Comfy-Org/workflow_templates/templates/image_flux2_klein_text_to_image.json",
+    "package": "comfyui_workflow_templates_json 0.1.95",
+    "sha256": "f5b2e75448e1ef44ab3d08da00900000f0258f8f963934370c6a1c329d1328c2",
+    "subgraph": "a67caa28-5f85-4917-8396-36004960dd30",
+    "frontend_evidence_id": "ev_55e5830c032ffb29ce65e2f319c98389b712e3c677f2aa611dcd886556bb5e89"
+  },
+  "graph": {
+    "9": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "filename_prefix": "{{filename_prefix}}",
+        "images": [
+          "165",
+          0
+        ]
+      }
+    },
+    "76": {
+      "class_type": "PrimitiveStringMultiline",
+      "inputs": {
+        "value": "{{prompt}}"
+      }
+    },
+    "161": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "{{sampler}}"
+      }
+    },
+    "162": {
+      "class_type": "Flux2Scheduler",
+      "inputs": {
+        "steps": "{{steps}}",
+        "width": [
+          "168",
+          0
+        ],
+        "height": [
+          "169",
+          0
+        ]
+      }
+    },
+    "163": {
+      "class_type": "CFGGuider",
+      "inputs": {
+        "cfg": "{{guidance}}",
+        "model": [
+          "170",
+          0
+        ],
+        "positive": [
+          "174",
+          0
+        ],
+        "negative": [
+          "176",
+          0
+        ]
+      }
+    },
+    "164": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "173",
+          0
+        ],
+        "guider": [
+          "163",
+          0
+        ],
+        "sampler": [
+          "161",
+          0
+        ],
+        "sigmas": [
+          "162",
+          0
+        ],
+        "latent_image": [
+          "166",
+          0
+        ]
+      }
+    },
+    "165": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "164",
+          0
+        ],
+        "vae": [
+          "172",
+          0
+        ]
+      }
+    },
+    "166": {
+      "class_type": "EmptyFlux2LatentImage",
+      "inputs": {
+        "width": [
+          "168",
+          0
+        ],
+        "height": [
+          "169",
+          0
+        ],
+        "batch_size": 1
+      }
+    },
+    "168": {
+      "class_type": "PrimitiveInt",
+      "inputs": {
+        "value": "{{width}}"
+      }
+    },
+    "169": {
+      "class_type": "PrimitiveInt",
+      "inputs": {
+        "value": "{{height}}"
+      }
+    },
+    "170": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "{{model}}",
+        "weight_dtype": "default"
+      }
+    },
+    "171": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "{{encoder}}",
+        "type": "flux2",
+        "device": "{{encoder_device}}"
+      }
+    },
+    "172": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "{{vae}}"
+      }
+    },
+    "173": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": "{{seed}}"
+      }
+    },
+    "174": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": [
+          "76",
+          0
+        ],
+        "clip": [
+          "171",
+          0
+        ]
+      }
+    },
+    "176": {
+      "class_type": "ConditioningZeroOut",
+      "inputs": {
+        "conditioning": [
+          "174",
+          0
+        ]
+      }
+    }
+  }
+}
