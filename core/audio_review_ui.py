@@ -143,6 +143,23 @@ class AudioReviewWindow(tk.Toplevel):
             self.takes.append({'path':path, 'start':self.start.get(), 'end':self.end.get()})
         self.refresh_takes()
 
+    def load_takes(self, takes, *, script='', direction=''):
+        """Prefill an explicit Voice Studio comparison; never start inference."""
+        if self.running or self.closed:
+            return False
+        if not 2 <= len(takes) <= audio_review.MAX_TAKES:
+            raise audio_review.AudioReviewError('Choose two to six voice takes.')
+        self.takes = [dict(t, start='0', end=t.get('end', '')) for t in takes]
+        for widget, text in ((self.script, script), (self.direction, direction)):
+            widget.delete('1.0', 'end')
+            widget.insert('1.0', text)
+        self.result = None
+        self.save_button.configure(state='disabled')
+        self._output('')
+        self.refresh_takes()
+        self.status.set('Voice Studio takes loaded. Review the ranges, choose an audio-capable host, then Compare takes.')
+        return True
+
     def refresh_takes(self):
         self.listbox.delete(0,'end')
         for i,take in enumerate(self.takes,1):
