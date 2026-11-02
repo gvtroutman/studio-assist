@@ -37,6 +37,7 @@ class MCPClient:
 
     on_elicit = None                      # see __init__
     on_progress = None                    # f(text): a call's progress, for a UI
+    on_activity = None                    # f(item): a bridge's nested tool state
     _eliciting = 0
 
     def __init__(self, command, args, quiet=False):
@@ -155,7 +156,7 @@ class MCPClient:
                 return msg.get("result", {})
             if msg.get("id") is None and msg.get("method"):
                 note = msg.get("params") or {}
-                self._notification(msg["method"], note)
+                self._notification(msg["method"], note, rid)
                 if (msg["method"] == "notifications/progress"
                         and note.get("progressToken") == rid):
                     deadline = min(time.monotonic() + timeout, cap)
@@ -210,11 +211,21 @@ class MCPClient:
 
         threading.Thread(target=answer, daemon=True, name="mcp-elicit").start()
 
-    def _notification(self, method, params):
+    def _notification(self, method, params, request_id=None):
         if method == "notifications/message":
             log("  [mcp %s] %s" % (params.get("level", "info"),
                                    json.dumps(params.get("data"))[:300]), self.quiet)
         elif method == "notifications/progress":
+            if request_id is not None and params.get("progressToken") != request_id:
+                return                    # progress from another/expired request
+            from core.activity import progress_event
+            item = progress_event(params)
+            if item is not None and self.on_activity is not None:
+                try:
+                    self.on_activity(item)
+                except Exception:
+                    pass
+                return
             text = params.get("message") or "%s/%s" % (params.get("progress"),
                                                         params.get("total", "?"))
             log("  [mcp] ... " + str(text)[:200], self.quiet)
