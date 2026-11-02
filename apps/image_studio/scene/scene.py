@@ -5002,8 +5002,8 @@ def generation(scene, maps, characters=None, identities=None):
     A scene with people in it says every person's look in their own line,
     so the form's one person is blanked for this job - said twice, the
     picture gets an extra person or a blend of two, and so are the form's
-    item pictures (compose matches them to the form's clothes, now blank;
-    no workflow takes one yet, and the words carry the items). The identity
+    item pictures. Matching character item pictures are carried separately,
+    paired with each scene person's head region for the item pass. The identity
     whose LoRA carries a scene character's face rides along as
     `scene_identities`, for the form to add to its own. `characters` and
     `identities` are {id: record}.
@@ -5029,7 +5029,7 @@ def generation(scene, maps, characters=None, identities=None):
             words = scene_text(scene)
     else:
         words = scene_text(scene)
-    extra = {"width": w, "height": h, "scene_layout": copy.deepcopy(s),
+    extra = {"width": w, "height": h, "scene_layout": copy.deepcopy(s), "scene_wear": [],
              "references": dict(maps), "pose": None, "composition": None}
     shot, factor = framing(s)
     if factor < 1 and ("pose" in maps or "composition" in maps):
@@ -5063,6 +5063,19 @@ def generation(scene, maps, characters=None, identities=None):
                                 "head_depth": round(s["head_depth"], 3),
                                 "real": s["real_faces"],
                                 "people": face_targets(s, characters, identities)}
+        for target in extra["scene_faces"]["people"]:
+            obj = next(o for o in folks if o["id"] == target["id"])
+            rec = (characters or {}).get(obj.get("character")) or {}
+            # Scene clothes stay the scene's: a character's Wearing photos
+            # are tags here, used only when this person's own words name them.
+            refs = dict(rec.get("item_refs") or {})
+            refs.update({i["name"]: i["path"] for i in ig.clean_wearing(rec.get("wearing"))})
+            outfit = ig.outfit_of(dict(obj["look"], item_refs=refs,
+                                      scene=obj["description"]))
+            items = outfit["clothes"] + outfit["accessories"]
+            if items:
+                extra["scene_wear"].append({"person_id": obj["id"], "name": obj["name"],
+                                            "region": list(target["region"]), "items": items})
     if by_character:
         masks = character_masks(scene)
         extra["character_regions"] = [

@@ -377,22 +377,25 @@ def route(studio, settings=None):
 
 def run(client, graph, stop=None, on_progress=None):
     """Queue `graph` and wait. -> the picture's bytes; None if `stop()` said
-    to stop. Raises ComfyError when the run makes nothing."""
+    to stop. Raises ComfyError when the run fails or makes nothing."""
     def on_event(kind, data):
         if kind == "progress" and data[1] and on_progress is not None:
             on_progress(data[0], data[1])
-    pid = client.queue_workflow(graph)
     watch = client.watch()
     try:
+        pid = client.queue_workflow(graph)
         entry = client.listen_for_progress(pid, on_event, stop=stop, watch=watch)
     finally:
         watch.close()
     if entry is None:
         client.cancel_job(pid)
         return None
+    errors = ig.run_errors(entry, graph)
+    if errors:
+        raise ComfyError("; ".join(errors))
     files = outputs_of(entry)
     if not files:
-        raise ComfyError("; ".join(ig.run_errors(entry, graph)) or "the run made no picture")
+        raise ComfyError("the run made no picture")
     return client.fetch(files[0])
 
 

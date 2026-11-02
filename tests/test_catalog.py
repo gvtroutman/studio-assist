@@ -4,6 +4,7 @@ Recycle Bin. CivitAI is a table of canned answers; the one live piece is the
 PowerShell picture conversion, run on a BMP this test writes."""
 
 import base64
+import json
 import os
 import struct
 import sys
@@ -239,9 +240,9 @@ class TestLicenses(unittest.TestCase):
     def test_models_are_listed_by_license_keeping_their_order(self):
         lib = ig.Library(tempfile.mkdtemp())
         ordered = [m["id"] for m in ig.by_license(lib.all("models"), ig.model_license)]
-        self.assertEqual(ordered[:2], ["z-image-turbo", "qwen-image"])
-        self.assertEqual(ordered[2:4], ["flux-dev", "withanyone"])
-        self.assertEqual(ordered[4:], ["klein-9b", "klein-9b-distilled"])
+        self.assertEqual(ordered[:3], ["z-image-turbo", "qwen-image", "klein-4b-distilled"])
+        self.assertEqual(ordered[3:5], ["flux-dev", "withanyone"])
+        self.assertEqual(ordered[5:], ["klein-9b", "klein-9b-distilled"])
 
     def test_records_keep_a_license_and_drop_a_made_up_group(self):
         rec = ig.clean_lora({"file": "a.safetensors", "license_group": "commercial",
@@ -313,8 +314,10 @@ class TestCheckpoints(unittest.TestCase):
 
     def test_qwen_joins_an_existing_library_once(self):
         root = tempfile.mkdtemp()
-        lib = ig.Library(root)
-        lib.save("models", [m for m in lib.all("models") if m["id"] != "qwen-image"])
+        # A library made before Qwen existed has no delivery marker. Removing
+        # it from a current library is a user choice and must stay removed.
+        with open(os.path.join(root, "models.json"), "w", encoding="utf-8") as f:
+            json.dump([m for m in ig._default_models() if m["id"] != "qwen-image"], f)
         lib = ig.Library(root)
         self.assertIsNotNone(lib.get("models", "qwen-image"))
         lib.save("models", [m for m in lib.all("models") if m["id"] != "qwen-image"])
