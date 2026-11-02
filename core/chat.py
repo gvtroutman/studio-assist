@@ -67,6 +67,8 @@ import core.tablog as tablog
 import core.ui as ui
 import core.icons as icons
 import core.tasks as tasks
+from core.activity_ui import ActivityView
+from core.tool_cards import ToolCard
 import studio_update as updater
 import core.toolsmith as toolsmith
 
@@ -349,6 +351,7 @@ class Session:
         self.call_seq = 0                 # folded call rows in the transcript, numbered
         self.open_calls = {}              # tool name -> rows still awaiting a result
         self.pending = {}                 # row number -> its animated dots, while it waits
+        self.tool_cards = {}              # row number -> its readable activity card
         self.stages = []                  # placeholders where a picture is expected to land
         self.stage_seq = 0                # numbers their tags, like call_seq numbers rows
         self.thinking = None              # the dots shown while the model has the floor
@@ -367,11 +370,13 @@ class Session:
         self.used_at = time.time()        # last turn, for unloading an idle model
         self.frame = None
         self.view = None
+        self.activity = None             # live tool state, outside the scrolling text
         self.hero = None                  # the app's mark and name while nothing is said
         self.browser = None               # a panel tab's window (studio_milanote.Browser)
         self.panel_host = None            # ...the frame it is held in
         self.panel_note = None            # ...and the line above it that speaks
         self.images = None                # the Image Studio's form (studio_images_ui)
+        self.voices = None                # the remote Voice Studio's native form
         self.nodes_view = None            # the ComfyUI tab's node editor (studio_nodes_ui)
         self.terminals = None             # the Terminal tab's mirror (studio_terminals_ui)
         self._stream_open = False
@@ -408,6 +413,7 @@ class Session:
         # The widgets these held were embedded in the transcript, and clearing
         # it destroyed them; their animations drop themselves the next frame.
         self.pending = {}
+        self.tool_cards = {}
         self.stages = []
         self.stage_seq = 0
         self.thinking = None
@@ -426,6 +432,9 @@ class Session:
         images, self.images = self.images, None
         if images is not None:
             images.close()                # cancels its jobs on the backends
+        voices, self.voices = self.voices, None
+        if voices is not None:
+            voices.close()
         terminals, self.terminals = self.terminals, None
         if terminals is not None:
             terminals.close()
@@ -929,6 +938,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self.empty_msg.pack(pady=(4, 0))
 
     def _build_transcript(self, s):
+        if s.app.voices:
+            from apps.voice_studio.ui import VoiceStudio
+            s.frame = self._skin(tk.Frame(self.stack), bg="bg")
+            s.voices = VoiceStudio(self, s)
+            s.panel_note = s.voices.note
+            return
         if s.app.terminals:
             s.frame = self._skin(tk.Frame(self.stack), bg="bg")
             s.terminals = terminals_ui.TerminalsView(self, s)
@@ -941,6 +956,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self._build_panel(s)
             return
         s.frame = self._skin(tk.Frame(self.stack), bg="bg")
+        s.activity = ActivityView(s.frame, skin=self._skin, button=self._button,
+                                  selectable=self._selectable, font=self.f_ui,
+                                  mono=self.f_mono, small=self.f_small, px=self._px)
         bar = tk.Scrollbar(s.frame, highlightthickness=0, bd=0, width=11)
         self._skin(bar, bg="bg", troughcolor="bg", activebackground="faint")
         bar.pack(side="right", fill="y")
@@ -950,6 +968,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         self._skin(s.view, bg="bg", fg="text", insertbackground="text")
         self._selectable(s.view)
         s.view.bind("<Key>", self._type_to_composer)
+        s.view.bind("<Configure>", lambda _e: self._fit_tool_cards(s), add="+")
         s.view.pack(side="left", fill="both", expand=True)
         bar.config(command=s.view.yview)
         self._tags(s.view)
@@ -1012,15 +1031,15 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                         spacing3=8)
         v.tag_configure("asst", lmargin1=16, lmargin2=16, rmargin=60, spacing1=8,
                         spacing2=4, spacing3=8)
-        v.tag_configure("tool", foreground=C["faint"], font=self.f_mono, lmargin1=22,
-                        lmargin2=36, rmargin=16, spacing1=2, spacing3=2)
+        v.tag_configure("tool", foreground=C["faint"], font=self.f_mono, lmargin1=self._px(16),
+                        lmargin2=self._px(16), rmargin=self._px(16), spacing1=self._px(4), spacing3=self._px(4))
         # A tool call is one folded row: the header in "tool", the glyph that
         # opens it, a red word when it failed, and the body - the call as the
         # model made it, then the result - hidden by a per-row elide tag until
         # the header is clicked. Steps of a made tool sit one indent in.
         v.tag_configure("glyph", font=self.f_glyph)
         v.tag_configure("call_failed", foreground=C["err"])
-        v.tag_configure("call_step", lmargin1=40, lmargin2=54)
+        v.tag_configure("call_step", lmargin1=self._px(32), lmargin2=self._px(32))
         v.tag_configure("tool_body", foreground=C["muted"], font=self.f_mono, lmargin1=36,
                         lmargin2=36, rmargin=16, spacing3=2)
         v.tag_configure("tool_body_step", lmargin1=54, lmargin2=54)
@@ -1107,10 +1126,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
 
         def paint(_ev=None):
             m = self._tab_margin(sid)
-            w = inner.winfo_reqwidth() + 2 * PAD
+            inset = self._px(2) if self.tab_ui.get(sid, {}).get("compact") else PAD
+            w = inner.winfo_reqwidth() + 2 * inset
             h = inner.winfo_reqheight() + 2 * PAD
             tab.config(width=w + 2 * m, height=h)
-            tab.coords(item, m + PAD, PAD)
+            tab.coords(item, m + inset, PAD)
             tab.delete("chip")
             role = self._tab_role(sid)
             if role == "bg":
@@ -1315,6 +1335,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s = self.sessions[sid]
         if s.images is not None and not s.images.can_close():
             return
+        if s.voices is not None and not s.voices.can_close():
+            return
         self.sessions.pop(sid)
         tablog.log(sid, "tab closed")
         self.log_seen.pop(sid, None)      # reopened, its first status is news again
@@ -1327,6 +1349,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             s.browser.release()           # out of the frame before it goes
         if s.images is not None:
             s.images.release(confirmed=True)  # checked before removing the tab
+        if s.voices is not None:
+            s.voices.release(confirmed=True)
         if s.terminals is not None:
             s.terminals.release()         # every console back on the desktop
         s.frame.destroy()
@@ -2404,12 +2428,18 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s.view.delete("1.0", "end")
         s.view.config(state="disabled")
         for tag in s.view.tag_names():
-            if tag.partition(":")[0] in ("call", "mark", "status", "body", "stage"):
+            if tag.partition(":")[0] in ("call", "mark", "status", "body", "stage", "prog"):
                 s.view.tag_delete(tag)
         s.open_calls = {}
         s.pending = {}
+        s.tool_cards = {}
         s.stages = []
         s.thinking = None
+        s._stream_open = False
+        s._stream_buf = []
+        if s.activity is not None:
+            s.activity.clear()
+        self._forget()
 
     _MD = re.compile(r"\*\*(.+?)\*\*|`([^`\n]+)`")
 
@@ -2428,12 +2458,15 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self._write(s, text[pos:], base)
 
     # ------------------------------------------------------------ tool calls
+    def _fit_tool_cards(self, s):
+        if s.view is None:
+            return
+        width = s.view.winfo_width() - 2 * int(s.view.cget("padx")) - self._px(38)
+        for card in s.tool_cards.values():
+            card.resize(width - card.indent)
+
     def _show_call(self, s, payload):
-        """A tool call as one folded row: the tool's name to read at a glance,
-        and behind a click the call as the model made it - the script, for
-        the tools that take one - with its result once that arrives. The
-        whole header line takes the click; the body is elided under its own
-        tag until then."""
+        """A readable card with the exact call behind it, in selectable text."""
         # First, and not last: the thinking dots sit at the end of the
         # transcript, so a row written past them would be inside the range
         # `_end_thinking` deletes. `_handle` has already done this for the
@@ -2451,15 +2484,19 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         body = ("tool_body", "body:%d" % n) + (("tool_body_step",) if step else ())
         v = s.view
         v.tag_configure("body:%d" % n, elide=True)
+        card = ToolCard(v, name, args, via=payload.get("via"), font=self.f_bold,
+                        small=self.f_small, px=self._px, skin=self._skin,
+                        repaint=self._repaint_on_theme, colours=lambda: self.C,
+                        dots=self._dots, toggle=lambda: self._toggle_call(v, n))
+        s.tool_cards[n] = card
+        s.pending[n] = card.dots
+        self._fit_tool_cards(s)
         v.config(state="normal")
-        v.insert("end", self.g["closed"], row + ("glyph", "mark:%d" % n))
-        v.insert("end", " " + head, row)
-        # The ellipsis this row used to wait behind was three characters that
-        # never moved, and a call that takes a minute looked the same as one
-        # that had hung. The dots are the same promise, kept visibly.
-        v.insert("end", " ", row + ("status:%d" % n,))
-        s.pending[n] = self._embed(v, self._dots(v), row + ("status:%d" % n,))
+        self._embed(v, card, row)
         v.insert("end", "\n", row)
+        v.insert("end", "tool: " + head, body)
+        v.insert("end", " running", body + ("status:%d" % n,))
+        v.insert("end", "\n", body)
         v.insert("end", self._call_text(args), body)
         v.config(state="disabled")
         v.see("end")
@@ -2471,12 +2508,14 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self._stage(s)
 
     def _show_progress(self, s, text):
-        """A bridge's latest progress report beside the dots of the newest
-        call still running - replaced by each report, gone with the dots when
-        the result comes, since it sits inside the row's status range."""
+        """Progress as short badges; its full text stays in the folded details."""
         if not s.pending:
             return
         n = max(s.pending)
+        at_tail = s.view.yview()[1] >= .995
+        card = s.tool_cards.get(n)
+        if card is not None:
+            card.set_progress(text)
         v = s.view
         try:
             v.config(state="normal")
@@ -2485,16 +2524,18 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                 at = v.index(old[0])
                 v.delete(old[0], old[1])
             else:
-                status = v.tag_ranges("status:%d" % n)
-                if not status:
+                body = v.tag_ranges("body:%d" % n)
+                if not body:
                     return
-                at = v.index(status[1])
-            row = tuple(t for t in v.tag_names("%s-1c" % at) if t != "glyph")
-            v.insert(at, " " + text, row + ("status:%d" % n, "prog:%d" % n))
+                at = v.index(body[-1])
+            row = ("tool_body", "body:%d" % n, "prog:%d" % n)
+            v.insert(at, "\nprogress: " + text + "\n", row)
         except tk.TclError:
             pass                          # the transcript was cleared under it
         finally:
             v.config(state="disabled")
+        if at_tail:
+            v.see("end")
 
     def _show_result(self, s, payload):
         """The outcome of the latest call of that name still waiting for one:
@@ -2507,19 +2548,20 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             waiting = s.open_calls[name]
         n = waiting.pop()
         v = s.view
+        dots = s.pending.pop(n, None)
+        if dots is not None:
+            self._unanimate(("dots", str(dots)))
+        card = s.tool_cards.get(n)
+        if card is not None:
+            card.set_status(status)
         v.config(state="normal")
         rng = v.tag_ranges("status:%d" % n)
         if rng:
             at = v.index(rng[0])
-            # Deleting the range destroys the dots embedded in it; stop drawing
-            # them first rather than leave the next frame to find out.
-            dots = s.pending.pop(n, None)
-            if dots is not None:
-                self._unanimate(("dots", str(dots)))
             v.delete(rng[0], rng[1])
-            word = {"error": " failed", "skipped": " not run"}.get(status, "")
-            if word:
-                v.insert(at, word, ("tool", "call_head", "call:%d" % n, "call_failed"))
+            word = {"error": " failed", "skipped": " not run", "unknown": " outcome unknown"}.get(status, " finished")
+            tags = ("tool_body", "body:%d" % n) + (("call_failed",) if status != "ok" else ())
+            v.insert(at, word, tags)
         rng = v.tag_ranges("body:%d" % n)
         if rng:
             body = ("tool_body", "body:%d" % n)
@@ -2767,6 +2809,10 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         body = "body:%d" % n
         hidden = str(v.tag_cget(body, "elide")) in ("1", "true")
         v.tag_configure(body, elide=not hidden)
+        session = next((s for s in self.sessions.values() if s.view is v), None)
+        card = session.tool_cards.get(n) if session is not None else None
+        if card is not None:
+            card.set_expanded(hidden)
         rng = v.tag_ranges("mark:%d" % n)
         if rng:
             at = v.index(rng[0])
@@ -2775,13 +2821,14 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             v.delete(rng[0], rng[1])
             v.insert(at, self.g["open" if hidden else "closed"], tags)
             v.config(state="disabled")
-        if hidden and rng:
+        header = v.tag_ranges("call:%d" % n)
+        if hidden and header:
             # Opened near the fold, the body would land below it. Bring as
             # much of it up as fits, the header staying in view.
             shown = v.tag_ranges(body)
             if shown:
                 v.see(shown[-1])
-            v.see(at)
+            v.see(header[0])
 
     def _show_status(self, text, role, lift):
         """The header's status, with its jumping dots beside it while `lift`
@@ -2845,9 +2892,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self.btn_agentic.pack_forget()
         llm = s.llm
         if llm is not None and not s.app.images and not s.app.terminals:
-            pinned = s.app.id in self.prefs.get("model_pins")
             self.btn_model.pack(side="right", padx=(6, 0), after=self.btn_hist)
-            self.btn_model.set(text="%s · %s" % ("Pinned" if pinned else "Auto",
+            self.btn_model.set(text="%s · %s" % (self._model_mode(s),
                                                       clip(llm.model, 22)),
                                state="disabled" if s.busy or s.booting else "normal")
         else:
@@ -3127,6 +3173,10 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s = self.sessions.get(sid) or self.cur()
 
         if kind == "progress":
+            if s is None:
+                return
+            if s is not None and s.activity is not None:
+                s.activity.handle(kind, payload)
             self._show_progress(s, payload)
             return
         if kind == "icon":
@@ -3189,6 +3239,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             elif kind == "trace":
                 self._log(payload)
             return
+
+        if s.activity is not None and kind in (
+                "tool_preparing", "bridge_activity", "tool", "tool_result", "stream_start",
+                "token", "stream_end", "ask", "elicit", "elicit_done", "status", "error", "idle"):
+            s.activity.handle(kind, s.cancel.is_set() if kind == "idle" else payload)
 
         # Anything about to write into a transcript takes the thinking dots
         # down first: they sit at the end, and whatever is written next would
@@ -3267,6 +3322,11 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             self._sync_bridges()
         elif kind == "idle":
             s.busy = False
+            for n in sorted(s.pending, reverse=True):
+                card = s.tool_cards.get(n)
+                if card is not None:
+                    self._show_result(s, {"name": card.name, "status": "unknown",
+                                          "text": "No result received; the outcome is unconfirmed."})
             self._end_thinking(s)
             self._clear_stages(s)
 
@@ -3813,6 +3873,13 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         if s.ready or s.booting:
             return
         s.booting = True
+        if s.app.voices:
+            s.booting, s.ready = False, True
+            s.status = ("Voice Studio ready", "muted", False)
+            s.bridge = ("ok", "remote voice service")
+            self._apply_status()
+            s.voices.start()
+            return
         if s.app.terminals:
             s.booting, s.ready = False, True   # the watcher runs from startup
             s.terminals.start()
@@ -3887,7 +3954,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             s.booting = False
             self.q.put(("idle", sid, None))
 
-    def _warm(self, s):
+    def _warm(self, s, strict=False):
         """This tab's model loaded with a window that fits its prefix, and
         the prefix paid for once on the host - at boot, and again after the
         model chip swaps the model."""
@@ -3921,9 +3988,13 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                                    offered, max_tokens=1)
             except eng.HostUnreachable as e:
                 self._host_lost()
+                if strict:
+                    raise
                 self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
                 break
             except Exception as e:
+                if strict:
+                    raise
                 self.q.put(("sys", sid, "Warm-up did not finish; the first request may be slower. " + str(e)))
                 break
             self._host_back()
@@ -3933,6 +4004,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s.used_at = time.time()
 
     # ------------------------------------------------------------ the model chip
+
+    def _model_mode(self, s):
+        pinned = self.prefs.get("model_pins").get(s.app.id)
+        if not pinned:
+            return "Auto"
+        return "Pinned" if pinned == getattr(s.llm, "model", None) else "Fallback"
 
     def _model_menu(self):
         """The chip's menu: Auto, then every model the host serves that can
@@ -3950,6 +4027,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                       "Auto - the best this host has for %s" % s.app.name,
                       command=lambda: self._pin_model(s, None))
         m.add_separator()
+        if pinned and pinned not in choices:
+            m.add_command(label=pinned + " (not served)", state="disabled")
+            m.add_separator()
         for mid in choices:
             m.add_command(label=("✓ " if mid == pinned else "   ") + mid,
                           command=lambda x=mid: self._pin_model(s, x))
@@ -3958,6 +4038,12 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
     def _pin_model(self, s, model):
         """Pin `model` for this app (None: back to Auto), kept across restarts,
         and swap the tab onto it now."""
+        if s.busy or s.booting or s.closed or self.sessions.get(s.id) is not s:
+            return
+        if model is not None and model not in self.model_ids:
+            self.q.put(("sys", s.event_id, "The host no longer serves %s; "
+                         "the model selection was kept." % model))
+            return
         pins = dict(self.prefs.get("model_pins"))
         key = "STUDIO_MODEL_" + s.app.id.upper()
         if model:
@@ -3967,8 +4053,6 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             pins.pop(s.app.id, None)
             os.environ.pop(key, None)
         self.prefs.set(model_pins=pins)
-        if s.busy or s.booting or s.closed:
-            return
         s.busy = True
         self._apply_status()
         self._spawn(s.event_id, self._swap_model, s)
@@ -3978,18 +4062,29 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         warmed up like at boot. The conversation carries on; only the model
         reading it changes."""
         sid = s.event_id
+        old_llm = s.llm
+        old_prefix, old_window = s.prefix_tokens, s.window
+        chosen = None
         try:
-            old = getattr(s.llm, "model", None)
-            s.llm = self._llm_for(s)
-            if s.llm.model == old:
+            chosen = self._llm_for(s)
+            if chosen.model == getattr(old_llm, "model", None):
+                s.llm = chosen
                 return
+            s.llm = chosen
             s.prefix_tokens, s.window = None, None
-            self._warm(s)
+            self._warm(s, strict=True)
             note = "This tab now runs on %s." % s.llm.model
             if getattr(s.app, "served", False):
                 note += " OpenCode itself picks it up when it is next started (Start OpenCode)."
             self.q.put(("sys", sid, note))
             self.q.put(("status", sid, ("ready", "ok", False)))
+        except Exception:
+            if chosen is not None and s.llm is chosen:
+                s.llm = old_llm
+                s.prefix_tokens, s.window = old_prefix, old_window
+                self.q.put(("sys", sid, "Model change did not finish; this tab still uses %s."
+                            % old_llm.model))
+            raise
         finally:
             s.busy = False
             self.q.put(("idle", sid, None))
@@ -4060,6 +4155,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
             # A long call's progress goes beside its row, so working and stuck
             # look different.
             mcp.on_progress = lambda text: self.q.put(("progress", sid, text))
+            mcp.on_activity = lambda item: self.q.put(("bridge_activity", sid, item))
             mcp.initialize(timeout=75)
             allt = mcp.list_tools(timeout=45)
         except Exception as e:
@@ -4156,6 +4252,19 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                 for o in self.sessions.values() if o.busy}
         with self.fit_lock:
             eng.make_room(self.host, keep)
+
+    def _voice_make_room(self, voice_url):
+        """Use the image lane's lazy reload policy when speech shares the host."""
+        from urllib.parse import urlsplit
+        if not self.host or urlsplit(voice_url).hostname != urlsplit(self.host).hostname:
+            return
+        keep = {getattr(o.llm or self.llm, "model", None)
+                for o in self.sessions.values() if o.busy and not o.app.panel}
+        with self.fit_lock:
+            _gone, error = eng.make_room(self.host, keep)
+        if error:
+            from apps.voice_studio.catalog import VoiceError
+            raise VoiceError("Could not release idle LM Studio models before voice generation: " + error)
 
     def _fit_panel(self, s, width, height):
         if s.browser is not None:
@@ -4298,6 +4407,9 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         elif kind == "images":
             if s.images is not None:
                 s.images.handle(payload)
+        elif kind == "voices":
+            if s.voices is not None:
+                s.voices.handle(payload)
         elif kind == "terminals":
             if s.terminals is not None:
                 s.terminals.handle(payload)
@@ -4868,6 +4980,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         s.record.briefs.append(task + note)
         s.cancel.clear()
         s.busy = True
+        if s.activity is not None:
+            s.activity.handle("begin")
         s.status = ("working" + ELLIPSIS, "warn", False)
         self._apply_status()
         self._begin_thinking(s)
@@ -5013,9 +5127,18 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         opencode_wait, since no model is here to do it; Stop ends it."""
         emit("status", ("OpenCode is working" + ELLIPSIS, "muted", True))
         stopped = False
+        def call(name, args):
+            emit("tool", {"name": name, "arguments": args})
+            try:
+                res = s.mcp.call_tool(name, args, cancel=s.cancel)
+            except Exception as e:
+                emit("tool_result", {"name": name, "text": str(e), "status": "error"})
+                raise
+            emit("tool_result", {"name": name, "text": eng.mcp_result_to_text(res),
+                                  "status": "error" if isinstance(res, dict) and res.get("isError") else "ok"})
+            return res
         try:
-            res = s.mcp.call_tool("opencode_ask", {"prompt": s.messages[-1]["content"]},
-                                  cancel=s.cancel)
+            res = call("opencode_ask", {"prompt": s.messages[-1]["content"]})
             for _ in range(DIRECT_WAITS):
                 at = ((res.get("_meta") or {}).get("studio/opencode") or {}
                       if isinstance(res, dict) else {})
@@ -5023,8 +5146,7 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
                         or not at.get("session")):
                     break
                 emit("status", ("OpenCode is still working" + ELLIPSIS, "muted", True))
-                res = s.mcp.call_tool("opencode_wait", {"session_id": at["session"]},
-                                      cancel=s.cancel)
+                res = call("opencode_wait", {"session_id": at["session"]})
         except eng.Cancelled:
             # The user's own Stop, which the bridge hears too and halts the
             # session on: said as it is, not as a tool's error.
@@ -5072,6 +5194,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         for s in self.sessions.values():
             if s.images is not None and not s.images.can_close():
                 return
+            if s.voices is not None and not s.voices.can_close():
+                return
         # Flag first, then cancel: a tick that fires between the two sees the
         # flag and does not re-arm. Leaving them armed is what printed
         # "invalid command name ..._drain" over a window that was already gone.
@@ -5083,6 +5207,8 @@ class Chat(ChatThemeMixin, ChatUpdatesMixin, ChatWidgetsMixin,
         for s in self.sessions.values():
             if s.images is not None:
                 s.images.release(confirmed=True)
+            if s.voices is not None:
+                s.voices.release(confirmed=True)
         self.holder.stop()                # every held console back on the desktop
         self.anim.clear()
         for timer in ("drain_timer", "host_timer", "anim_timer", "update_timer", "idle_timer"):

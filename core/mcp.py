@@ -472,7 +472,7 @@ def tools_from_table(table, read_only=(), **hints):
 _ctx = threading.local()
 
 
-def progress(message=None, done=None, total=None):
+def progress(message=None, done=None, total=None, meta=None):
     """Report progress on the call in flight, if the client asked for it.
 
     A no-op unless the request carried `_meta.progressToken`; a tool that
@@ -487,7 +487,18 @@ def progress(message=None, done=None, total=None):
         params["total"] = total
     if message:
         params["message"] = message
+    if meta:
+        params["_meta"] = meta
     server.notify("notifications/progress", params)
+
+
+def activity(ident, name, status, arguments=None, text=""):
+    """A nested tool's observed state as display-only progress metadata."""
+    from core.activity import bridge_event
+    item = bridge_event({"id": ident, "name": name, "status": status,
+                         "arguments": arguments or {}, "text": text})
+    if item is not None:
+        progress("%s: %s" % (name, status), meta={"studio/toolActivity": item})
 
 
 def cancelled():
@@ -857,6 +868,8 @@ class Loopback:
         self.server = server
         self.notifications = []
         self.on_elicit = on_elicit
+        self.on_progress = None
+        self.on_activity = None
         self.server.sink = self._sink
         self._id = 0
         self.protocol_version = None
@@ -867,6 +880,17 @@ class Loopback:
     def _sink(self, msg):
         if msg.get("id") is None:
             self.notifications.append(msg)
+            if msg.get("method") == "notifications/progress":
+                params = msg.get("params") or {}
+                from core.activity import progress_event
+                item = progress_event(params)
+                try:
+                    if item is not None and self.on_activity is not None:
+                        self.on_activity(item)
+                    elif self.on_progress is not None:
+                        self.on_progress(str(params.get("message") or "")[:200])
+                except Exception:
+                    pass                  # a display must not break a call
             return
         if msg.get("method") == "elicitation/create" and self.on_elicit is not None:
             reply = {"jsonrpc": "2.0", "id": msg["id"],

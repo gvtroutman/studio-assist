@@ -1088,10 +1088,12 @@ class TestAppRegistry(unittest.TestCase):
         self.assertTrue(os.path.isfile(eng.OPENCODE_READ_CAP))
         mine = "file:///" + eng.OPENCODE_READ_CAP.replace(os.sep, "/")
         cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"])
-        self.assertEqual(cfg["plugin"], [mine])
+        memory = "file:///" + eng.OPENCODE_TASK_CONTEXT.replace(os.sep, "/")
+        self.assertTrue(os.path.isfile(eng.OPENCODE_TASK_CONTEXT))
+        self.assertEqual(cfg["plugin"], [mine, memory])
         cfg = eng.opencode_config("http://h:1/v1", "m1", ["m1"],
                                   addons=[{"kind": "plugin", "name": "p", "package": "p@1"}])
-        self.assertEqual(cfg["plugin"], [mine, "p@1"])
+        self.assertEqual(cfg["plugin"], [mine, memory, "p@1"])
 
     def test_opencode_always_gets_the_repo_map_server_beside_add_on_servers(self):
         self.assertTrue(os.path.isfile(eng.OPENCODE_REPO_MAP))
@@ -2196,8 +2198,7 @@ class TestGui(unittest.TestCase):
         self.assertEqual(len(set(histories)), len(self.app.order))
 
     def test_tool_calls_fold_to_their_name_and_open_on_the_script(self):
-        """A call is one row: the tool's name to read, the call as the model
-        made it - the whole script - and its result behind a click."""
+        """A readable card opens on the exact tool, whole script and result."""
         sid = self.app.order[0]
         s = self.app.sessions[sid]
         view = s.view
@@ -2220,13 +2221,15 @@ class TestGui(unittest.TestCase):
         self.assertIn("call_head", view.tag_names(head))
         self.assertIsNotNone(view.bbox(head))
         self.assertIsNone(view.bbox(view.tag_ranges("body:%d" % n)[0]))
-        self.assertEqual(view.get(view.tag_ranges("mark:%d" % n)[0]), self.app.g["closed"])
-        # Opened: the script is on screen and the chevron turned.
+        card = s.tool_cards[n]
+        self.assertEqual(card.title, "Run an app script")
+        self.assertFalse(card.expanded)
+        # Opened: the script is on screen and the card's disclosure changed.
         self.app._toggle_call(view, n)
         self.app.update()
         self.assertEqual(str(view.tag_cget("body:%d" % n, "elide")), "0")
         self.assertIsNotNone(view.bbox(view.tag_ranges("body:%d" % n)[0]))
-        self.assertEqual(view.get(view.tag_ranges("mark:%d" % n)[0]), self.app.g["open"])
+        self.assertTrue(card.expanded)
         self.app._toggle_call(view, n)
         self.assertEqual(str(view.tag_cget("body:%d" % n, "elide")), "1")
 
@@ -2251,7 +2254,8 @@ class TestGui(unittest.TestCase):
         self.assertEqual(view.get(failed[2], failed[3]), " not run")
         # The compound tool's header names its action; the step is indented.
         first = view.tag_ranges("call:%d" % (s.call_seq - 2))[0]
-        self.assertIn("timeline add_marker", view.get(first, str(first) + " lineend"))
+        self.assertEqual(s.tool_cards[s.call_seq - 2].title, "Add marker")
+        self.assertIn("timeline add_marker", view.get("1.0", "end"))
         step = view.tag_ranges("call:%d" % (s.call_seq - 1))[0]
         self.assertIn("call_step", view.tag_names(step))
         self.assertNotIn("call_step", view.tag_names(first))
@@ -2274,6 +2278,120 @@ class TestGui(unittest.TestCase):
         self.assertIn("Made Title at 1920x1080.", body)
         self.assertTrue(view.tag_ranges("b"))
         self.assertTrue(view.tag_ranges("code"))
+
+    def test_live_tool_activity_stays_visible_while_text_streams(self):
+        s = self.app.cur()
+        self.app._clear_view(s)
+        s.activity.handle("begin")
+        self.app._handle("tool_preparing", s.event_id, {"name": "read_file"})
+        self.assertEqual(s.activity.label.cget("text"), "Preparing: Read a file")
+        self.assertFalse(s.pending, "preparing a tool cannot execute it")
+        self.app._handle("tool", s.event_id, {"name": "read_file", "arguments": {"path": "brief.txt"}})
+        self.app._handle("progress", s.event_id, "Reading the brief")
+        self.assertIn("Reading the brief", s.tool_cards[s.call_seq].visible_badges)
+        self.app._handle("tool_result", s.event_id, {"name": "read_file", "text": "A saved brief"})
+        self.app._handle("stream_start", s.event_id, None)
+        self.app._handle("token", s.event_id, "The **brief** says…")
+        self.assertEqual(s.activity.label.cget("text"), "Writing reply…")
+        s.activity.toggle.invoke()
+        self.app.update()
+        self.assertTrue(s.activity.frame.winfo_ismapped())
+        self.assertTrue(s.activity.details.winfo_ismapped())
+        self.assertIn("Finished · Read a file", s.activity.details.get("1.0", "end"))
+        self.assertIn("brief.txt", s.activity.details.get("1.0", "end"))
+        self.app._handle("stream_end", s.event_id, None)
+        self.app._handle("idle", s.event_id, None)
+        self.assertIn("The brief says", s.view.get("1.0", "end"))
+        self.assertIn("read_file", s.view.get("1.0", "end"))
+        self.assertEqual(s.activity.model.count, 1)
+        self.app._clear_view(s)
+
+    def test_live_activity_is_per_tab_and_clears_with_new_chat(self):
+        a, b = [self.app.sessions[sid] for sid in self.app.order[:2]]
+        self.app._clear_view(a)
+        self.app._clear_view(b)
+        self.app._handle("tool", a.event_id, {"name": "get_comp", "arguments": {}})
+        self.assertEqual((a.activity.model.count, b.activity.model.count), (1, 0))
+        self.app._handle("idle", a.event_id, None)
+        self.assertIn("Outcome unknown", a.activity.details.get("1.0", "end"))
+        self.app._clear_view(a)
+        self.assertEqual(a.activity.model.count, 0)
+        self.assertFalse(a.activity.frame.winfo_manager())
+        self.assertFalse(a.activity.model.active)
+
+    def test_activity_strip_respects_the_theme_and_minimum_window(self):
+        s = self.app.cur()
+        self.app._clear_view(s)
+        s.activity.handle("begin")
+        s.activity.toggle.invoke()
+        original = self.app.prefs.get("theme")
+        size = self.app.geometry().split("+")[0]
+        try:
+            self.app._theme("light")
+            self.app.geometry("880x520")
+            self.app.update()
+            self.assertEqual(str(s.activity.details.cget("background")), self.app.C["card"])
+            self.assertEqual(str(s.activity.details.cget("selectbackground")), self.app.C["hilite"])
+            self.assertTrue(self.app.btn_send.winfo_ismapped())
+            self.assertGreater(s.view.winfo_height(), 30)
+        finally:
+            self.app.geometry(size)
+            self.app._theme(original)
+            self.app._clear_view(s)
+
+    def test_tool_cards_show_progress_as_badges_and_keep_the_exact_details(self):
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._handle("tool", s.event_id, {"name": "opencode_ask", "arguments": {"prompt": "Improve the UI"}})
+        card = s.tool_cards[s.call_seq]
+        message = "OpenCode is working; 5 file(s) changed; last activity 0s ago"
+        self.app._handle("progress", s.event_id, message)
+        self.assertEqual(card.title, "Work on your request")
+        self.assertEqual(card.visible_badges, ["5 files changed", "Active now"])
+        self.assertIn(message, s.view.get("1.0", "end"))
+        self.assertIn("opencode_ask", s.view.get("1.0", "end"))
+        self.app.update()
+        card.event_generate("<ButtonRelease-1>", x=10, y=10)
+        self.assertTrue(card.expanded)
+        self.app._handle("tool_result", s.event_id, {"name": "opencode_ask", "text": "Complete", "status": "ok"})
+        self.assertEqual(card.visible_badges, ["5 files changed"])
+        self.assertEqual(card.status, "ok")
+        self.app._clear_view(s)
+
+    def test_an_interrupted_tool_card_stops_animating_and_does_not_claim_success(self):
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._handle("tool", s.event_id, {"name": "opencode_ask", "arguments": {}})
+        card = s.tool_cards[s.call_seq]
+        dots = s.pending[s.call_seq]
+        self.app._handle("idle", s.event_id, None)
+        self.assertEqual(card.status, "unknown")
+        self.assertEqual(card.itemcget(card.find_withtag("state")[0], "text"), "Unconfirmed")
+        self.assertFalse(s.pending)
+        self.assertNotIn(("dots", str(dots)), self.app.anim)
+        self.assertIn("the outcome is unconfirmed", s.view.get("1.0", "end"))
+        self.app._clear_view(s)
+
+    def test_cards_fit_the_transcript_after_resize_and_repaint_in_both_themes(self):
+        s = self.app.cur()
+        self.app._clear_view(s)
+        self.app._handle("tool", s.event_id, {"name": "opencode_ask", "arguments": {"prompt": "Long text " * 80}})
+        card = s.tool_cards[s.call_seq]
+        original, size = self.app.prefs.get("theme"), self.app.geometry().split("+")[0]
+        try:
+            self.app.geometry("880x520")
+            for theme in ("light", "dark"):
+                self.app._theme(theme)
+                self.app.update()
+                self.assertLess(card.winfo_width(), s.view.winfo_width())
+                self.assertEqual(card.palette["card"], self.app.C["card"])
+                self.assertEqual(card.cget("background"), self.app.C["bg"])
+                self.assertTrue(self.app.btn_send.winfo_ismapped())
+                self.assertNotIn("_", card.shown_title)
+        finally:
+            self.app.geometry(size)
+            self.app._theme(original)
+            self.app._clear_view(s)
 
     def test_events_for_an_unknown_session_land_on_the_active_tab(self):
         """Host-level failures have no app of their own; they must still be seen."""
@@ -2525,6 +2643,36 @@ class TestGui(unittest.TestCase):
         finally:
             self.app.llm, self.app.model_ids = real_llm, real_ids
             spec.models = real_models
+
+    def test_the_model_chip_shows_the_actual_fallback_and_keeps_the_missing_pin_visible(self):
+        s = self.app.sessions[eng.CHAT.id]
+        old_llm, old_ids = s.llm, self.app.model_ids
+        old_pins = self.app.prefs.data["model_pins"]
+        old_busy, old_booting = s.busy, s.booting
+        menus = []
+        popup = self.app._popup
+        try:
+            s.llm = eng.LLM(self.app.host, "working-model")
+            s.busy, s.booting = False, False
+            self.app.model_ids = ["working-model"]
+            self.app.prefs.data["model_pins"] = {s.id: "uninstalled-model"}
+            self.app._select(s.id)
+            self.app._apply_status()
+            self.assertEqual(self.app.btn_model.text, "Fallback · working-model")
+            self.app._popup = lambda menu, _widget: menus.append(menu)
+            self.app._model_menu()
+            menu = menus[0]
+            choices = {menu.entrycget(i, "label"): menu.entrycget(i, "state")
+                       for i in range(menu.index("end") + 1) if menu.type(i) == "command"}
+            self.assertEqual(choices["uninstalled-model (not served)"], "disabled")
+            self.assertEqual(self.app.prefs.get("model_pins"), {s.id: "uninstalled-model"})
+        finally:
+            self.app._popup = popup
+            s.llm, self.app.model_ids = old_llm, old_ids
+            self.app.prefs.data["model_pins"] = old_pins
+            s.busy, s.booting = old_busy, old_booting
+            for menu in menus:
+                menu.destroy()
 
     def test_a_tab_with_its_own_model_gets_its_own_draft(self):
         """The draft pairs with the executing model, so a tab that departs
@@ -5041,19 +5189,20 @@ class TestGui(unittest.TestCase):
         self.app._select(target)
         self.app.update()
         self.assertTrue(self.app.tab_ui[target]["label"].winfo_ismapped())
-        # Every tab labelled needs more than a 1920 px window, which is close
-        # to as wide as a 150% display lets it be; one closed, the rest fit.
-        # It is put back where it was: other tests close `order[-1]`.
-        at = self.app.order.index("terminals")
-        self.app._close_tab("terminals")
+        # Every tab labelled needs more than a 1920 px window. Close the two
+        # optional utility panels to check unfolding at a realistic width.
+        # Restore their exact positions: other tests close `order[-1]`.
+        before = list(self.app.order)
+        for sid in ("terminals", "voice-studio"):
+            self.app._close_tab(sid)
         self.app.geometry("%dx%d" % (self.app._px(1920), self.app._px(820)))
         self.app.update()
         self.app._fit_tabs()
         self.app.update()
         self.assertFalse([sid for sid, ui in self.app.tab_ui.items() if ui["compact"]])
-        self.app._add_tab("terminals", select=False)
-        self.app.order.remove("terminals")
-        self.app.order.insert(at, "terminals")
+        for sid in ("voice-studio", "terminals"):
+            self.app._add_tab(sid, select=False)
+        self.app.order[:] = before
         self.app.geometry("%dx%d" % (self.app._px(1180), self.app._px(820)))
         self.app.update()
 
