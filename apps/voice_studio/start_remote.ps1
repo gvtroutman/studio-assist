@@ -1,4 +1,4 @@
-param([string]$BindAddress = 'llm-pc', [int]$Port = 17494)
+param([Parameter(Mandatory=$true)][string]$BindAddress, [int]$Port = 17494)
 $ErrorActionPreference = 'Stop'
 $taskRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $taskLaunch = Get-Content -LiteralPath (Join-Path $taskRoot 'voice-launch.json') -Raw | ConvertFrom-Json

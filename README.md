@@ -15,6 +15,7 @@ workstation's ComfyUI or a remote backend, according to its backend settings.
 ## Screenshots
 
 **Image Studio** — camera choices, prompts, style references and the generation queue.
+Shown with an empty example configuration and a generic workstation name.
 
 ![Studio Assist with the Image Studio workspace open](docs/screenshots/image-studio.png)
 
@@ -56,6 +57,12 @@ The Studio Assist process remains standard-library-only; optional image processo
 run in their own environments.
 
 ## Running it
+
+Copy `studio.local.example.json` to `studio.local.json` and replace `llm-pc`
+with your inference machine's hostname or tailnet address. This local file is
+ignored by Git. `STUDIO_HOST`, `COMFYUI_URL` and `STUDIO_VOICE_URL` environment
+variables override these defaults. Keep credentials and personal identity recipes
+out of version control; the app's saved backend settings still take precedence.
 
 Double-click **Studio Assist** on the Desktop or in the Start Menu. No terminal.
 

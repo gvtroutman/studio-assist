@@ -1309,10 +1309,12 @@ Identity experiments follow `docs/identity-recipe.md`. The CLI
 `tools/identity_recipe.py` evaluates installed FLUX adapters in an isolated library:
 portrait baseline/checkpoints at multiple seeds first, then scene changes only for
 checkpoints with explicit passing reviews at every seed for the same recipe hash.
-Render completion never certifies likeness. `recipes/partner-identity.json` records
-the current pending trial. The ordinary Generate button is not gated by this tool.
-`tools/prepare_identity_lora.py` remains a Subject A-specific preparation script;
-its captions/source ordering must not be reused for another person.
+Render completion never certifies likeness. `recipes/example-identity.json` is a
+generic template; put personal recipes and training captions under ignored `.work/`.
+The ordinary Generate button is not gated by this tool. Machine addresses belong in
+ignored `studio.local.json` (see `studio.local.example.json`), never in source code.
+Environment variables override local endpoint defaults. Keep credentials, identity
+photos, captions, local agent settings and machine names out of commits/screenshots.
 
 **Build LoRA** (identity editor, beside Use as primary; Subject B 2026-09-27: "a
 simple build lora into the images of an identity. it needs at least 20 pics").

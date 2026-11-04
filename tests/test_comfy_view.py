@@ -91,7 +91,7 @@ class StepsTest(unittest.TestCase):
     def test_an_origin_ignores_the_path_and_the_case(self):
         self.assertEqual(cv.origin("http://127.0.0.1:8188/"), cv.origin("HTTP://127.0.0.1:8188"))
         self.assertNotEqual(cv.origin("http://127.0.0.1:8188"),
-                            cv.origin("http://llm-pc:8188"))
+                            cv.origin("http://100.64.0.10:8188"))
 
 
 class ShowTest(unittest.TestCase):
@@ -112,14 +112,14 @@ class ShowTest(unittest.TestCase):
     def test_another_backend_is_navigated_to_first(self):
         dt = FakeDevTools([2])
         b = browser(dt)
-        b.show(G1, "t", "http://llm-pc:8188")
-        self.assertEqual(dt.calls[1], ("Page.navigate", {"url": "http://llm-pc:8188"}))
-        self.assertEqual(b.url, "http://llm-pc:8188")
+        b.show(G1, "t", "http://100.64.0.10:8188")
+        self.assertEqual(dt.calls[1], ("Page.navigate", {"url": "http://100.64.0.10:8188"}))
+        self.assertEqual(b.url, "http://100.64.0.10:8188")
         # The graphs there were unsaved workflows: the page asked, and was told Leave.
         self.assertEqual(dt.ws.accepted, [True])
         dt2 = FakeDevTools([2])
         b.page = lambda: dt2
-        b.show(G1, "t", "http://llm-pc:8188/")
+        b.show(G1, "t", "http://100.64.0.10:8188/")
         self.assertNotIn("Page.navigate", [m for m, _p in dt2.calls])
 
     def test_a_reload_answers_leave_app_and_a_quiet_page_is_not_answered(self):
@@ -128,7 +128,7 @@ class ShowTest(unittest.TestCase):
         self.assertEqual([m for m, _p in dt.calls],
                          ["Page.enable", "Page.reload", "Page.handleJavaScriptDialog"])
         dt = FakeDevTools([], dialog=False)
-        browser(dt).goto("http://llm-pc:8188")
+        browser(dt).goto("http://100.64.0.10:8188")
         self.assertEqual(dt.ws.accepted, [])
         self.assertTrue(dt.closed)
 
@@ -241,7 +241,7 @@ class NodesTabTest(unittest.TestCase):
         cls._real_backends = studio_nodes_ui.NodesView._backends
         studio_nodes_ui.NodesView._backends = lambda self: [
             ("5090 Workstation", "http://127.0.0.1:8188"),
-            ("3090 Server", "http://llm-pc:8188")]
+            ("3090 Server", "http://100.64.0.10:8188")]
         cls.app = studio_chat.Chat()
         for _ in range(10):
             cls.app.update()
@@ -288,9 +288,9 @@ class NodesTabTest(unittest.TestCase):
         v.load_step(1)
         self._pump(lambda: len(s.browser.shown) == 2)
         self.assertEqual(s.browser.shown[-1][0], "rec1 · Face pass")
-        v._switch("http://llm-pc:8188")
+        v._switch("http://100.64.0.10:8188")
         self._pump(lambda: s.browser.went)
-        self.assertEqual(s.browser.went, ["http://llm-pc:8188"])
+        self.assertEqual(s.browser.went, ["http://100.64.0.10:8188"])
         self.assertEqual(v.steps, [])
         self.assertFalse(v.b_step.winfo_ismapped())
         # Chat: the transcript and the composer back, the window kept.

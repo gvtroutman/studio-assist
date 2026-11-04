@@ -20,7 +20,7 @@ From the extracted folder in PowerShell, run:
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\apps\voice_studio\setup_remote.ps1 -Python python -Engines voxcpm,qwen,omnivoice
-.\apps\voice_studio\start_remote.ps1
+.\apps\voice_studio\start_remote.ps1 -BindAddress YOUR_TAILNET_IP
 ```
 
 `-Python` can be the absolute path to that Python executable. The first command
@@ -34,9 +34,9 @@ on the remote machine; these environments were not installed on the workstation.
 Setup runs dependency, import and CUDA checks before recording each environment.
 These checks do not download model weights or prove speech generation works.
 
-The start script launches a hidden background server at
-`http://llm-pc:17494`. Change `-BindAddress` if the LLM PC has a different
-tailnet address. Remote listeners require the generated token in
+Replace `YOUR_TAILNET_IP` with the LLM PC's tailnet address. The start script
+requires an explicit bind address and launches a hidden background server on
+port 17494. Remote listeners require the generated token in
 `voice-token.txt`. Enter that token in the tab, alongside the server URL, and click
 **Connect**. The workstation remembers the URL; it does not save the token.
 Startup errors go to `voice-server-error.log` in the extracted folder. The log
@@ -54,7 +54,7 @@ For a foreground server, useful for setup diagnostics:
 
 ```powershell
 $env:STUDIO_VOICE_TOKEN = (Get-Content .\voice-token.txt -Raw).Trim()
-python -m apps.voice_studio.remote --host llm-pc --port 17494
+python -m apps.voice_studio.remote --host YOUR_TAILNET_IP --port 17494
 ```
 
 Stop only the server PID reported by the start script, or press Ctrl+C when

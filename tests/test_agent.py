@@ -858,7 +858,7 @@ class TestHostAlive(unittest.TestCase):
         class Done:
             def __init__(self, code, out):
                 self.returncode, self.stdout = code, out
-        self.answer = Done(0, "pong from llm-pc (llm-pc) via 192.0.2.10:41641 in 2ms\n")
+        self.answer = Done(0, "pong from llm-pc (100.64.0.10) via 192.0.2.10:41641 in 2ms\n")
 
         def fake_run(args, **kw):
             self.ran.append(args)
@@ -867,13 +867,13 @@ class TestHostAlive(unittest.TestCase):
         self.Done = Done
 
     def test_a_tailnet_peer_is_pinged(self):
-        self.assertIs(eng.host_alive("http://llm-pc:1234/v1"), True)
+        self.assertIs(eng.host_alive("http://100.64.0.10:1234/v1"), True)
         args = self.ran[-1]
         self.assertTrue(args[0].endswith("tailscale.exe"))
         self.assertEqual(args[1:3], ["ping", "--c"])
-        self.assertEqual(args[-1], "llm-pc")
+        self.assertEqual(args[-1], "100.64.0.10")
         self.answer = self.Done(1, "")
-        self.assertIs(eng.host_alive("http://llm-pc:1234/v1"), False)
+        self.assertIs(eng.host_alive("http://100.64.0.10:1234/v1"), False)
 
     def test_anything_else_is_not_asked(self):
         for url in ("http://192.0.2.10:1234/v1", "http://llm.local:1234/v1",
@@ -882,7 +882,7 @@ class TestHostAlive(unittest.TestCase):
                 self.assertIsNone(eng.host_alive(url))
         self.assertEqual(self.ran, [])
         eng.shutil.which = lambda name: None
-        self.assertIsNone(eng.host_alive("http://llm-pc:1234/v1"))
+        self.assertIsNone(eng.host_alive("http://100.64.0.10:1234/v1"))
         self.assertEqual(self.ran, [])
 
 
@@ -1018,9 +1018,9 @@ class TestAppRegistry(unittest.TestCase):
             self.assertFalse(app.remote and app.served, app.id)
 
     def test_opencode_config_asks_before_every_change(self):
-        cfg = eng.opencode_config("http://llm-pc:1234/v1", "m1", ["m1", "m2"], 32768)
+        cfg = eng.opencode_config("http://100.64.0.10:1234/v1", "m1", ["m1", "m2"], 32768)
         prov = cfg["provider"]["lmstudio"]
-        self.assertEqual(prov["options"]["baseURL"], "http://llm-pc:1234/v1")
+        self.assertEqual(prov["options"]["baseURL"], "http://100.64.0.10:1234/v1")
         self.assertEqual(set(prov["models"]), {"m1", "m2"})
         self.assertEqual(cfg["model"], "lmstudio/m1")
         self.assertEqual(prov["models"]["m1"]["limit"]["context"], 32768)
@@ -1200,7 +1200,7 @@ class TestAppRegistry(unittest.TestCase):
         oc.child = None
         os.makedirs(oc.workspace)
         try:
-            oc.launch(host="http://llm-pc:1234/v1")
+            oc.launch(host="http://100.64.0.10:1234/v1")
             first = started[-1]
             self.assertEqual(first.args, [r"C:\oc\opencode.exe", "serve", "--hostname",
                                           "127.0.0.1", "--port", "4096"])
@@ -1222,7 +1222,7 @@ class TestAppRegistry(unittest.TestCase):
             self.assertEqual(cfg["instructions"], [eng.OPENCODE_BRIEF_ANY])
             self.assertNotIn("OPENCODE_DISABLE_PROJECT_CONFIG", env)
             # A second start ends the first server and changes the password.
-            oc.launch(host="http://llm-pc:1234/v1")
+            oc.launch(host="http://100.64.0.10:1234/v1")
             self.assertTrue(first.stopped)
             self.assertNotEqual(started[-1].kw["env"]["OPENCODE_SERVER_PASSWORD"],
                                 env["OPENCODE_SERVER_PASSWORD"])
@@ -5207,8 +5207,8 @@ class TestGui(unittest.TestCase):
         self.app.update()
 
     def test_sidebar_labels_do_not_wrap_mid_token(self):
-        self.assertEqual(self.mod.pretty_host("http://llm-pc:1234/v1"),
-                         "llm-pc:1234")
+        self.assertEqual(self.mod.pretty_host("http://100.64.0.10:1234/v1"),
+                         "100.64.0.10:1234")
         self.assertEqual(self.mod.clip("short", 24), "short")
         self.assertEqual(len(self.mod.clip("x" * 40, 24)), 24)
 

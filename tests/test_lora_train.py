@@ -35,8 +35,8 @@ class PlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             refs = photos(d, 20)
             spec = lt.plan({'id': 'partner', 'name': 'Partner', 'references': refs,
-                            'trigger': 'parperson'}, d, toolkit=d, when=0)
-            self.assertEqual(spec['trigger'], 'parperson')
+                            'trigger': 'exampleperson'}, d, toolkit=d, when=0)
+            self.assertEqual(spec['trigger'], 'exampleperson')
             self.assertEqual(spec['photos'], refs)
             self.assertEqual(spec['min_photos'], lt.MIN_PHOTOS)
             self.assertTrue(spec['lora_out'].startswith(d))

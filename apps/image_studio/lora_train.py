@@ -102,7 +102,7 @@ def problem(toolkit=TOOLKIT):
 
 def trigger_for(name):
     """A rare word for the person: the first letters of their name + "person",
-    as Partner's `parperson`."""
+    as Example's `exaperson`."""
     letters = re.sub(r"[^a-z]", "", (name or "").lower())[:3]
     return (letters or "idn") + "person"
 

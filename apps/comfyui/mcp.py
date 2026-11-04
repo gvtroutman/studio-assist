@@ -43,8 +43,9 @@ import uuid
 import zlib
 
 import core.mcp as studio_mcp
+from core.local_config import default as local_default
 
-DEFAULT_URL = "http://llm-pc:8188"
+DEFAULT_URL = local_default("COMFYUI_URL", "http://llm-pc:8188")
 COMFY_URL = os.environ.get("COMFYUI_URL", DEFAULT_URL).rstrip("/")
 # The 5090's own ComfyUI on this PC (the Image Studio's, see studio_imagegen),
 # which comfy_restage gives the background while the LLM PC does the people.

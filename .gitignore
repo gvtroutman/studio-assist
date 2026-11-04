@@ -18,3 +18,30 @@ comfy_nodes/studio_withanyone/vendor/
 /Scene Math Measurements/
 /Scene Enhancements/
 /output/
+
+# Machine configuration, credentials and personal identity material.
+.claude/
+.env
+.env.*
+!.env.example
+/studio.local.json
+*.local.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+credentials.json
+secrets.json
+voice-token.txt
+voice-launch.json
+server.key
+.ssh/
+.aws/
+.gnupg/
+id_rsa
+id_ed25519
+civitai.json
+*-links.json
+/recipes/partner-identity.json
+/tools/prepare_identity_lora.py

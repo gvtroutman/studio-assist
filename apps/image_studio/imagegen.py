@@ -54,6 +54,7 @@ import uuid
 
 import apps.image_studio.critic as critic
 import core.doctor as doctor
+from core.local_config import default as local_default
 import apps.image_studio.scene.mannequin as mq
 from apps.comfyui.mcp import (FACE_EDIT, FACE_MIN, FACE_PAD, FACE_PROMPT, SAM3, ComfyError,
                               Unreachable, _explain, head_square, outputs_of, oval_png,
@@ -825,7 +826,7 @@ def _default_backends():
                                  r"D:\ComfyUI\Start ComfyUI (Image Studio).cmd"),
          "max_megapixels": 6.0},
         {"id": "3090", "name": "3090 Server",
-         "url": os.environ.get("COMFYUI_URL", "http://llm-pc:8188"),
+         "url": os.environ.get("COMFYUI_URL", local_default("COMFYUI_URL", "http://llm-pc:8188")),
          "roles": ["secondary", "batch", "preprocess", "controlnet", "depth_pose",
                    "caption", "upscale", "background"],
          "notes": "The LLM PC. Shares its 24 GB card with LM Studio: a job here unloads "

@@ -55,7 +55,7 @@ class TestWhatIsTheAppsToRemove(unittest.TestCase):
             # Not named: never guessed, not even from where it is started.
             self.assertIsNone(ig.comfy_folder(backend(start=os.path.join(d, "start.cmd"))))
             # Another machine's, whatever folder it names; a folder that is not ComfyUI's.
-            self.assertIsNone(ig.comfy_folder(backend(folder=d, url="http://llm-pc:8188")))
+            self.assertIsNone(ig.comfy_folder(backend(folder=d, url="http://100.64.0.10:8188")))
             self.assertIsNone(ig.comfy_folder(backend(folder=os.path.join(d, "output"))))
         b = ig.clean_backend({"url": "http://127.0.0.1:8188"})
         self.assertEqual((b["folder"], b["keep_days"]), ("", ig.KEEP_DAYS))
@@ -107,7 +107,7 @@ class TestTidy(TempStudioMixin, unittest.TestCase):
     def test_the_days_kept_are_the_backends_and_none_keeps_everything(self):
         old, keep = self.fill()
         for b in (self.backend(keep_days=0), self.backend(folder=""),
-                  self.backend(url="http://llm-pc:8188")):
+                  self.backend(url="http://100.64.0.10:8188")):
             done = self.studio.tidy(b)
             self.assertEqual((done["output"], done["input"]), (0, 0), b)
         # Twenty days: only the picture of a month ago is old enough.

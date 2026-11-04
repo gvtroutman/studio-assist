@@ -1,0 +1,15 @@
+{
+  "name": "Example subject",
+  "trigger": "exampleperson",
+  "description": "Describe the subject from your own reference photographs in a local copy of this recipe.",
+  "backend": {"id": "local", "name": "Local ComfyUI", "url": "http://127.0.0.1:8188", "enabled": true, "release_vram": true, "encoder_on_cpu": true, "shares_llm_gpu": false},
+  "seeds": [1, 2],
+  "candidates": [
+    {"id": "candidate-a", "file": "your_adapter.safetensors", "strength": 1.0}
+  ],
+  "portrait": "A head-and-shoulders photograph of exampleperson facing the camera with a relaxed expression, plain background, soft neutral light.",
+  "scenes": [
+    "A head-and-shoulders photograph of exampleperson facing the camera with a smile, plain background, soft neutral light.",
+    "A head-and-shoulders photograph of exampleperson wearing a blue jacket, plain background, soft neutral light."
+  ]
+}

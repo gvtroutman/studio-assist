@@ -35,6 +35,10 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 
 ## core/ (every tab)
 
+`core/local_config.py` reads optional endpoint defaults from ignored
+`studio.local.json`. Environment variables at the callers override them; the
+tracked `studio.local.example.json` contains generic hostnames only.
+
 Voice Studio: `apps/voice_studio/ui.py` (`VoiceStudio`), `catalog.py` (engine
 capabilities), `client.py` (`Client`, `Library`), `remote.py` (`Jobs`, `make_server`),
 `worker.py` (`loader`, `run`), `bundle.py` (`export`) and the remote PowerShell

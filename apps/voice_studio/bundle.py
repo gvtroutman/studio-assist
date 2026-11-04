@@ -21,7 +21,7 @@ def export(destination):
                   'From this extracted folder in PowerShell:\n'
                   'Set-ExecutionPolicy -Scope Process Bypass\n'
                   '.\\apps\\voice_studio\\setup_remote.ps1 -Python python -Engines voxcpm,qwen,omnivoice\n'
-                  '.\\apps\\voice_studio\\start_remote.ps1\n\n'
+                  '.\\apps\\voice_studio\\start_remote.ps1 -BindAddress YOUR_TAILNET_IP\n\n'
                   'In Studio Assist: + > Voice Studio. Enter the URL and the token\n'
                   'from voice-token.txt, then Connect. Allow remote model downloads\n'
                   'for the first generation. Audition takes before choosing one.\n\n'

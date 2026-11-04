@@ -1,7 +1,7 @@
 # Identity recipe: establish likeness before changing the scene
 
 This is the working evaluation procedure, not a claim that a training recipe has
-already been validated. The initial Subject A trial did not establish likeness.
+already been validated. The initial evaluation did not establish likeness.
 
 1. **Curate originals.** Inspect every photo for a clearly visible subject, focus,
    filters, occlusion and useful angle. Group near-duplicate frames from the same
@@ -30,7 +30,7 @@ already been validated. The initial Subject A trial did not establish likeness.
 7. **Promote deliberately.** A reviewed checkpoint and its tested strength can be
    assigned to the profile. Archive failures and exact settings. Neither the
    evaluation command nor completion of training approves a profile. (The
-   identity editor's **Build LoRA** button, added at Subject B's request, does set
+   identity editor's **Build LoRA** button does set
    its finished LoRA as the person's Identity LoRA; that is a convenience, not a
    likeness pass. Reviewing it here still applies.)
 
@@ -41,8 +41,10 @@ in an isolated library. It requires already installed FLUX adapters; it does not
 train, install weights, or change the user's saved library. `plan` is offline.
 
 ```powershell
-python tools/identity_recipe.py plan recipes/partner-identity.json portrait
-python tools/identity_recipe.py run recipes/partner-identity.json portrait .work/partner-portrait-recipe
+Copy-Item recipes/example-identity.json .work/identity-recipe.json
+# Edit the local copy with your adapter filenames and prompts before running.
+python tools/identity_recipe.py plan .work/identity-recipe.json portrait
+python tools/identity_recipe.py run .work/identity-recipe.json portrait .work/portrait-recipe
 ```
 
 The new output folder contains a frozen recipe, generation history and
@@ -52,8 +54,8 @@ Do not auto-fill passing reviews. The report's `likeness_validated` remains fals
 it is not an automatic certification or an independent benchmark score.
 
 ```powershell
-python tools/identity_recipe.py plan recipes/partner-identity.json scene --portrait-report .work/partner-portrait-recipe/report.json
-python tools/identity_recipe.py run recipes/partner-identity.json scene .work/partner-scene-recipe --portrait-report .work/partner-portrait-recipe/report.json
+python tools/identity_recipe.py plan .work/identity-recipe.json scene --portrait-report .work/portrait-recipe/report.json
+python tools/identity_recipe.py run .work/identity-recipe.json scene .work/scene-recipe --portrait-report .work/portrait-recipe/report.json
 ```
 
 The scene command checks that the portrait report belongs to the same recipe and
@@ -63,15 +65,9 @@ requires a fresh portrait comparison. These gates apply to this evaluation tool,
 not the ordinary Image Studio Generate button. JSON review records are a local
 workflow record, not tamper-proof attestations.
 
-## Subject A's starting trial
+## Local recipes
 
-The checked-in recipe uses the existing 250/500-step adapters, not another training
-run. The previous training used three distinct views plus crops, rank/alpha 16,
-learning rate 0.00005, batch 1 and resolution 512 for 500 steps. Those are historical
-trial settings, not a proven optimum. WithAnyone pooling and the meadow comparison
-did not pass likeness review. The new portrait stage therefore starts pending.
-
-`tools/prepare_identity_lora.py` is still a machine-specific Subject A preparation
-script, not a general training service. Do not apply its hard-coded captions or
-source ordering to another identity. For another person, copy the evaluation JSON,
-choose their installed candidate adapters and describe their familiar appearance.
+Copy `recipes/example-identity.json` to `.work/identity-recipe.json`. Choose your
+installed candidate adapter and write prompts from your own references. The example
+is a template, not a trained identity or a validated likeness. Keep personal
+captions, source ordering, photographs and training scripts outside Git.

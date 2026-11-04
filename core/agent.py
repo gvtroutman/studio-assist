@@ -46,14 +46,15 @@ import urllib.request
 import core.mcp as studio_mcp
 import core.procs as studio_procs
 import core.tablog as tablog
+from core.local_config import default as local_default
 
-DEFAULT_HOST = "http://llm-pc:1234/v1"
+DEFAULT_HOST = local_default("STUDIO_HOST", "http://llm-pc:1234/v1")
 # The longest an MCP call may run while its bridge keeps reporting progress. A
 # silent bridge still times out at the call's own timeout.
 PROGRESS_CAP = 1800
 # ComfyUI shares the inference box: its GPU does the image work so the 5090
 # here stays free for rendering. Same variable the bridge reads.
-COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://llm-pc:8188").rstrip("/")
+COMFYUI_URL = os.environ.get("COMFYUI_URL", local_default("COMFYUI_URL", "http://llm-pc:8188")).rstrip("/")
 
 # OpenCode runs on this machine as a child of this window, in one folder - this
 # repository unless OPENCODE_WORKSPACE names another - and asks the user before

@@ -73,7 +73,7 @@ class WithAnyoneTests(unittest.TestCase):
 
     def test_description_survives_save_and_enters_form_prompt_without_notes(self):
         self.settings.pop('scene_faces')
-        description = 'Rounded cheeks.\nFine rectangular glasses and reddish brown hair.'
+        description = 'Short dark hair.\nA plain blue jacket.'
         self.lib.save('identities', [{'name': 'Left', 'description': description,
             'notes': 'Private bookkeeping, not appearance.', 'references': self.photos[:1]}])
         self.assertEqual(ig.Library(self.tmp.name).get('identities', 'left')['description'], description)

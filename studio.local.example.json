@@ -1,0 +1,5 @@
+{
+  "STUDIO_HOST": "http://llm-pc:1234/v1",
+  "COMFYUI_URL": "http://llm-pc:8188",
+  "STUDIO_VOICE_URL": "http://llm-pc:17494"
+}

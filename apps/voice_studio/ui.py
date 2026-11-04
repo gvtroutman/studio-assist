@@ -8,6 +8,7 @@ import traceback
 import uuid
 
 from core import doctor
+from core.local_config import default as local_default
 from core.ui import Pill
 from .catalog import ENGINES, MAX_TAKES, VoiceError, validate
 from .client import Client, Library, check_wav, reference_wav
@@ -40,7 +41,7 @@ class VoiceStudio:
         if not isinstance(self.saved, dict):
             self.saved = {}
         draft = self.library.data.get('draft') or {}
-        self.url = tk.StringVar(master=app, value=self.saved.get('url') or os.environ.get('STUDIO_VOICE_URL', 'http://llm-pc:17494'))
+        self.url = tk.StringVar(master=app, value=self.saved.get('url') or os.environ.get('STUDIO_VOICE_URL', local_default('STUDIO_VOICE_URL', 'http://llm-pc:17494')))
         self.profile = tk.StringVar(master=app, value=draft.get('profile', 'My voice'))
         self.reference = tk.StringVar(master=app, value=draft.get('reference', ''))
         self.language = tk.StringVar(master=app, value=draft.get('language', 'en'))
