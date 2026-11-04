@@ -127,7 +127,8 @@ this PC's files and the web instead. Two moving parts:
   (`checkpoint_install`), or from the built-in default of that family when the library
   has none; with neither it refuses. **Qwen-Image** is a default model (`qwen_image.json`,
   ComfyUI's own recipe; Apache 2.0; a pose through InstantX's Qwen-Image ControlNet
-  Union on the conditioning, and a face pass on the unposed model at its own CFG), added once to libraries made before it
+  Union on the conditioning, a composition (depth) chained after it, a refine pass
+  redrawing the enlarged picture unposed, a source picture as the starting latent, and a face pass on the unposed model at its own CFG), added once to libraries made before it
   (`Library.ADDED_MODELS`, remembered in `models-added.json`, so a removed one stays
   removed).
 - **`core/icons.py`** — reads an app's own icon out of its `.exe` (PE resource
