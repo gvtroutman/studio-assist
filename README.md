@@ -12,6 +12,16 @@ builds it in the app the current tab points at, one real undo step at a time.
 Chat inference runs on a machine on the tailnet. Image Studio can use either the
 workstation's ComfyUI or a remote backend, according to its backend settings.
 
+## Screenshots
+
+**Image Studio** — camera choices, prompts, style references and the generation queue.
+
+![Studio Assist with the Image Studio workspace open](docs/screenshots/image-studio.png)
+
+**Scene Builder** — frame a mannequin in the camera and adjust its pose before generating.
+
+![Scene Builder with a mannequin and its pose controls](docs/screenshots/scene-builder.png)
+
 ## Image Studio
 
 Open **Image Studio** from **+** for a form-based image workspace. Choose a model,
