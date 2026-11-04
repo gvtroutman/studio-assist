@@ -1,0 +1,169 @@
+{
+  "9": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "ImageStudio/flux2_klein4b",
+      "images": [
+        "165",
+        0
+      ]
+    }
+  },
+  "76": {
+    "class_type": "PrimitiveStringMultiline",
+    "inputs": {
+      "value": "A hedgehog wearing a tiny party hat surrounded by confetti, early digital camera style, slight noise, flash photography, candid moment, 2000s digicam aesthetic, festive birthday celebration atmosphere\n"
+    }
+  },
+  "161": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler"
+    }
+  },
+  "162": {
+    "class_type": "Flux2Scheduler",
+    "inputs": {
+      "steps": 4,
+      "width": [
+        "168",
+        0
+      ],
+      "height": [
+        "169",
+        0
+      ]
+    }
+  },
+  "163": {
+    "class_type": "CFGGuider",
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "170",
+        0
+      ],
+      "positive": [
+        "174",
+        0
+      ],
+      "negative": [
+        "176",
+        0
+      ]
+    }
+  },
+  "164": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "173",
+        0
+      ],
+      "guider": [
+        "163",
+        0
+      ],
+      "sampler": [
+        "161",
+        0
+      ],
+      "sigmas": [
+        "162",
+        0
+      ],
+      "latent_image": [
+        "166",
+        0
+      ]
+    }
+  },
+  "165": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "164",
+        0
+      ],
+      "vae": [
+        "172",
+        0
+      ]
+    }
+  },
+  "166": {
+    "class_type": "EmptyFlux2LatentImage",
+    "inputs": {
+      "width": [
+        "168",
+        0
+      ],
+      "height": [
+        "169",
+        0
+      ],
+      "batch_size": 1
+    }
+  },
+  "168": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 1024
+    }
+  },
+  "169": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 1024
+    }
+  },
+  "170": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "flux-2-klein-4b-fp8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "171": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "flux2",
+      "device": "default"
+    }
+  },
+  "172": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    }
+  },
+  "173": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 0
+    }
+  },
+  "174": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": [
+        "76",
+        0
+      ],
+      "clip": [
+        "171",
+        0
+      ]
+    }
+  },
+  "176": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "174",
+        0
+      ]
+    }
+  }
+}

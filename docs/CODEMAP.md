@@ -16,6 +16,7 @@ apps/
   image_studio/         the Image Studio tab
     addons/             LoRAs per model, CivitAI / Hugging Face catalogs, custom nodes
     scene/              the Scene Builder
+  voice_studio/         the Voice Studio form, remote speech workers and setup bundle
   comfyui/              the ComfyUI tab: bridge and Nodes view
   opencode/             the OpenCode tab: bridge and coding Add-ons
   milanote/             the Milanote tab
@@ -33,9 +34,17 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 - Mock by the new name: `patch("apps.image_studio.facefusion.swap")`.
 
 ## core/ (every tab)
+
+Voice Studio: `apps/voice_studio/ui.py` (`VoiceStudio`), `catalog.py` (engine
+capabilities), `client.py` (`Client`, `Library`), `remote.py` (`Jobs`, `make_server`),
+`worker.py` (`loader`, `run`), `bundle.py` (`export`) and the remote PowerShell
+scripts. Registry: `core.agent.VOICE_STUDIO`; dispatch: `Chat._handle` voices;
+GPU handoff: `Chat._voice_make_room`. Usage: `docs/voice-studio.md`.
 | File | Lines | What it is | Start at |
 | --- | --- | --- | --- |
 | `core/chat.py` | 4.8k | The Tkinter window shell: `__init__`, layout, tabs, the transcript, host/model fit, the send/turn pipeline, the event pump. Inherits the mixins below, so `Chat`'s full method list is split across all of them | `Chat`, `_drain`/`_handle`/`_report`, `_turn`, `_boot_host`/`_fit`/`_make_room`; the rail's dragged width `_build_grip`/`_side_width` |
+| `core/activity.py`, `core/activity_ui.py` | | Per-turn tool activity and its expandable strip above each transcript. Preparations are separate from executed calls; nested bridge calls use stable IDs | `Activity`, `ActivityView`, `bridge_event`; `ToolFeed` in `apps/opencode/mcp.py` |
+| `core/tool_cards.py` | | Readable transcript tool cards: status badges, reported progress counters, responsive layout and disclosure of exact tool evidence | `ToolCard`; `Chat._show_call`, `_show_progress`, `_show_result`, `_fit_tool_cards` |
 | `core/chat_theme.py` | 0.1k | Applying the palette; repainting drawn (not `config()`-able) widgets on a theme switch | `ChatThemeMixin`, `_theme`, `_skin`, `_redraw_marks` |
 | `core/chat_widgets.py` | 0.6k | The drawing primitives every window is built from - buttons, fields, marks, dots, arcs, menus | `ChatWidgetsMixin`, `_button`, `_entry`, `_dots`, `_arc`, `_mark`, `_selectable` (copyable text) |
 | `core/chat_updates.py` | 0.1k | Checking GitHub for updates and pulling them | `ChatUpdatesMixin`, `_check_updates`, `_on_update` |
@@ -60,7 +69,7 @@ tests/  tools/  docs/  comfy_workflows/  comfy_nodes/  recipes/  premiere_panel/
 | `core/appinfo.py` | 0.2k | Each app tab's profile for its prompt: name, installed release, Wikipedia overview (cached in `appinfo/`) | `refresh`, `render`, `WIKI` |
 | `core/toolsmith.py` | 0.4k | Tools the model writes for itself from its own bridge tools | |
 | `core/ui.py` | 0.6k | Palette roles and drawing primitives; every button and slider | `Pill`, `Slider` (made by `Chat._button` / `Chat._scale`), `rounded` |
-| `core/procs.py` | 0.3k | Child processes that die with the parent | |
+| `core/procs.py` | 0.3k | Child processes that die with the parent; terminate a tree before draining its final output, then release handles | `spawn`, `Child.terminate` / `stop` |
 | `core/tablog.py` | 0.1k | Each tab's log: records stamped with their tab, last lines kept per tab | `working_for`, `Stamp`, `BOOK`; the window is `Chat._log_window`, fed by `Chat._log_event` |
 | `core/files.py` | 0.1k | Attachments described for a model | |
 | `core/filedrop.py` | 0.2k | Files and links dragged onto a Tk window: an OLE `IDropTarget` in ctypes (the identity editor's landing pad) | `accept`, `Target`, `read`, `link` |
@@ -88,6 +97,11 @@ After Effects and Resolve use outside npm servers.
   floor (`CLOTHED`, `COVERED`), `anatomy_text` (a workflow's `"anatomy": false`
   leaves it out), `hold_loras` (a workflow's `lora_budget`). AGENTS.md "What the
   pipeline adds to the user's words is drawn".
+- **The look in finishing crops** - `imagegen.detail_style` / `detail_prompt`,
+  composed once into `values.detail_style` by `compose`: effective style words
+  and selected camera chemistry for face/part redraws and Fix a spot, without
+  unrelated whole-scene objects or excluded LoRA triggers. Tests:
+  `tests/test_render_style.py`; investigation: `docs/midjourney-quality-rea.md`.
 - **The refine pass** - `zimage_hq.json` (`refine_model`, nodes 42-49) and the
   block after "A refine pass is sized" in `imagegen.compose`. AGENTS.md "The Z-Image
   refine pass enlarges with an upscale model".
@@ -157,6 +171,9 @@ After Effects and Resolve use outside npm servers.
   `addons/hub.py` (Hugging Face, GitHub node plugins), `addons/nodes.py` (bundled
   `comfy_nodes/` installer), `addons/discovery.py`.
 - Workflows: `comfy_workflows/`, `recipes/`; custom nodes `comfy_nodes/`.
+  `workflows/flux2_klein4b_commercial*.json` are the importable UI and API
+  versions of the commercial Klein 4B baseline; `docs/flux2-commercial.md`
+  records its official reference, REA evidence and model pins.
 
 ## apps/comfyui/
 Bridge `apps/comfyui/mcp.py`. Nodes view: `apps/comfyui/view.py` (the browser window),
@@ -188,6 +205,9 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
   `OPENCODE_GROUPS`, the `id="opencode"` entry in `APPS`, `OPENCODE_PROMPT`.
   `OPENCODE_READ_CAP` = `apps/opencode/read_cap.js`, an OpenCode plugin always loaded:
   a read with no line range on a file over 400 lines gets 400 lines and a grep hint.
+  `OPENCODE_TASK_CONTEXT` = `apps/opencode/task_context.js`, also always loaded:
+  its compaction hook reads saved session requests, todos, edits and shell outcomes
+  into a bounded continuation record. Tests: `tests/test_opencode_context.py`.
   `OPENCODE_REPO_MAP` = `apps/opencode/repomap.py`, MCP server "repo" always loaded:
   `repo_map` (`t_map`: `folder_map` / `file_map`, `outline_py` via ast) and `repo_find`
   (`t_find`), built from disk on each call. Tests: `tests/test_repomap.py`.
@@ -213,6 +233,11 @@ Chat tab (core.chat)  --model briefs-->  apps.opencode.mcp (bridge, stdio)
   working with `opencode_wait`, by the result's `_meta["studio/opencode"]`).
 - **Add-ons** - `apps/opencode/codeaddons.py` (records, `config`, MCP registry / npm / skills
   search and install) and `apps/opencode/codeaddons_ui.py` (`AddonsWindow`).
+- **Results and verification** - `apps/opencode/mcp.py`: `summarize` and
+  `t_tool_result` expose bounded, recoverable saved tool facts;
+  `verification_problem` / `after_ask` / `finish` keep unresolved checks through
+  checkpointed retries and waits. `task_context.js` preserves recent assistant
+  findings alongside the task's recorded tool facts during compaction.
 - **Trainer** - `apps/opencode/trainer_mcp.py`: an MCP server for *Claude Code*
   (`.mcp.json`, "opencode-trainer"), not the app. `t_tasks`/`trouble_in` (the latter now
   `core.lessons.trouble_in`), `t_task` (`transcript`), `t_diff`, `t_session`, `t_lessons`,

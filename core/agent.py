@@ -92,6 +92,13 @@ from core.agent_mcp_client import (
 )
 
 
+class _StreamRefusal(RuntimeError):
+    def __init__(self, url, detail, retryable):
+        super().__init__("inference host %s refused the request: %s" % (url, detail))
+        self.detail = detail
+        self.retryable = retryable
+
+
 class LLM:
     """One model on the OpenAI-compatible host, and the draft model that runs
     ahead of it.
@@ -132,7 +139,16 @@ class LLM:
             self.url, data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"})
 
-    def _open(self, body):
+    def _drop_draft(self, body, reason):
+        """Only a successful retry can disable the pair that was refused."""
+        draft, model = body.get("draft_model"), body.get("model")
+        if draft and self.model == model and self.draft == draft:
+            self.draft_note = ("The host refused %s as a draft model for %s (%s); "
+                               "speculative decoding is off for this model."
+                               % (draft, model, reason))
+            self.draft = None
+
+    def _open(self, body, on_draft_retry=None):
         """POST and return the response, still open.
 
         An HTTP error with a draft model in the request is tried once more
@@ -156,10 +172,14 @@ class LLM:
                 except (urllib.error.HTTPError, urllib.error.URLError):
                     pass
                 else:
-                    self.draft_note = ("The host refused %s as a draft model for %s (HTTP %s - "
-                                       "%s); speculative decoding is off for this model."
-                                       % (self.draft, self.model, e.code, detail.strip()))
-                    self.draft = None
+                    reason = "HTTP %s - %s" % (e.code, detail.strip())
+                    if on_draft_retry:
+                        on_draft_retry(dict(body), reason)
+                    else:
+                        self._drop_draft(body, reason)
+                    # This response belongs to the plain request. A later
+                    # streamed error cannot buy a third attempt with no draft.
+                    body.pop("draft_model", None)
                     return resp
             kind = (ContextLimitError if e.code in (400, 413) and
                     any(word in detail.lower() for word in ("context length", "context window", "context_length_exceeded"))
@@ -180,15 +200,37 @@ class LLM:
 
     def chat(self, messages, tools=None, max_tokens=None):
         extra = {"max_tokens": max_tokens} if max_tokens else {}
-        with self._open(self._body(messages, tools, **extra)) as r:
+        pending = []
+        with self._open(self._body(messages, tools, **extra),
+                        lambda body, reason: pending.append((body, reason))) as r:
             data = json.load(r)
         self._count(data.get("stats"))
+        if pending and data.get("choices") and not data.get("error"):
+            self._drop_draft(*pending[0])
         return data
 
-    def stream(self, messages, tools=None, on_text=None, max_tokens=None):
+    streams_tool_activity = True
+
+    def stream(self, messages, tools=None, on_text=None, max_tokens=None, on_tool=None):
         """Streamed completion. on_text(str) fires per token; returns the final message."""
         limits = {"max_tokens": max_tokens} if max_tokens else {}
-        resp = self._open(self._body(messages, tools, stream=True, **limits))
+        body = self._body(messages, tools, stream=True, **limits)
+        try:
+            return self._stream_response(body, on_text, on_tool)
+        except _StreamRefusal as error:
+            if not body.get("draft_model") or not error.retryable:
+                raise
+            plain = {k: v for k, v in body.items() if k != "draft_model"}
+            try:
+                reply = self._stream_response(plain, on_text, on_tool)
+            except _StreamRefusal:
+                raise error
+            self._drop_draft(body, error.detail.strip()[:300])
+            return reply
+
+    def _stream_response(self, body, on_text, on_tool):
+        pending = []
+        resp = self._open(body, lambda request, reason: pending.append((request, reason)))
 
         content, calls = [], {}
         finish_reason, done, refused = None, False, None
@@ -232,15 +274,11 @@ class LLM:
                         slot["name"] += fn["name"]
                     if fn.get("arguments"):
                         slot["args"] += fn["arguments"]
+                    if on_tool:
+                        on_tool({"index": tc.get("index", 0), "id": slot["id"], "name": slot["name"]})
 
         if refused is not None:
-            if self.draft and not content and not calls:
-                self.draft_note = ("The host refused %s as a draft model for %s (%s); "
-                                   "speculative decoding is off for this model."
-                                   % (self.draft, self.model, refused.strip()[:300]))
-                self.draft = None
-                return self.stream(messages, tools, on_text, max_tokens)
-            raise RuntimeError("inference host %s refused the request: %s" % (self.url, refused))
+            raise _StreamRefusal(self.url, refused, not content and not calls)
         if finish_reason == "length":
             # The host stopped the model, not the model itself: the reply hit
             # the context window it was loaded with (or a response-length
@@ -253,7 +291,7 @@ class LLM:
                 "one is set. On the LLM PC, reload %s with a larger context length (16384 or "
                 "more) or increase its response limit. Saved task evidence can be continued "
                 "through continuation notes; no partial tool call should be replayed."
-                % (self.model, self.model))
+                % (body["model"], body["model"]))
         if not done or finish_reason not in ("stop", "tool_calls"):
             raise RuntimeError("Incomplete inference response (%s); no tools from this response were executed."
                                % (finish_reason or "connection ended"))
@@ -263,6 +301,8 @@ class LLM:
                 {"id": c["id"] or ("call_%d" % i), "type": "function",
                  "function": {"name": c["name"], "arguments": c["args"]}}
                 for i, c in sorted(calls.items())]
+        if pending:
+            self._drop_draft(*pending[0])
         return msg
 
 
@@ -1050,6 +1090,8 @@ class AppSpec:
     # True only for IMAGE_STUDIO below: a panel tab whose body is our own
     # form (apps/image_studio/ui.py) rather than another program's window.
     images = False
+    # A native form backed by remote speech workers.
+    voices = False
     # True only for TERMINALS below: a panel tab that mirrors console windows
     # opened outside the app (core/terminals_ui.py).
     terminals = False
@@ -1117,8 +1159,13 @@ class AppSpec:
         if pinned:
             if pinned in ids:
                 return pinned, "pinned by STUDIO_MODEL_%s" % self.id.upper()
-            return shared, ("STUDIO_MODEL_%s names %s, which the host does not serve; "
-                            "using %s" % (self.id.upper(), pinned, shared))
+        model, note = self._auto_model(ids, shared)
+        if pinned:
+            note = ("STUDIO_MODEL_%s names %s, which the host does not serve; using %s%s"
+                    % (self.id.upper(), pinned, model, (" (%s)" % note) if note else ""))
+        return model, note
+
+    def _auto_model(self, ids, shared):
         for m in self.models:
             if m in ids:
                 return m, ("this app prefers a small model so the GPU stays free for it"
@@ -1264,11 +1311,9 @@ class ServerSpec(AppSpec):
             return loaded
         return context_window(host, model)[0] or want
 
-    def model_for(self, ids, shared):
+    def _auto_model(self, ids, shared):
         """The best coder the host has (`best_coder`), for this tab's chat and
-        OpenCode alike; STUDIO_MODEL_OPENCODE still pins one."""
-        if os.environ.get("STUDIO_MODEL_" + self.id.upper()):
-            return AppSpec.model_for(self, ids, shared)
+        OpenCode alike; a missing pin follows this same automatic choice."""
         coder = best_coder(ids or [])
         if not coder:
             return shared, ""                 # no coder on the host: the shared model, silently
@@ -1458,6 +1503,7 @@ COMFY_GROUPS = {
 
 OPENCODE_GROUPS = {
     "discover": ["opencode_status", "opencode_list_sessions", "opencode_get_session",
+                 "opencode_tool_result",
                  "opencode_changes", "opencode_list_files", "opencode_read_file",
                  "opencode_grants", "opencode_search_files"],
     # Nothing here edits by itself: OpenCode asks the user before each change.
@@ -1568,6 +1614,8 @@ OPENCODE_BRIEF_ANY = os.path.join(os.path.abspath(os.path.join(os.path.dirname(_
 # Our own OpenCode plugin: a read with no line range on a long file gets the
 # first lines and a note to grep and read around the match (apps/opencode/read_cap.js).
 OPENCODE_READ_CAP = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "apps", "opencode", "read_cap.js")
+# Saved requests, todos and check outcomes supplied to OpenCode's compaction.
+OPENCODE_TASK_CONTEXT = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "apps", "opencode", "task_context.js")
 # Our own MCP server "repo": repo_map outlines a folder or file with line
 # ranges, repo_find says where a name is defined (apps/opencode/repomap.py).
 OPENCODE_REPO_MAP = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "apps", "opencode", "repomap.py")
@@ -1604,7 +1652,8 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
         "permission": dict(OPENCODE_PERMISSIONS),
         "autoupdate": False,
         "share": "disabled",
-        "plugin": ["file:///" + OPENCODE_READ_CAP.replace(os.sep, "/")],
+        "plugin": ["file:///" + p.replace(os.sep, "/")
+                   for p in (OPENCODE_READ_CAP, OPENCODE_TASK_CONTEXT)],
     }
     if brief:
         cfg["instructions"] = [brief] if isinstance(brief, str) else list(brief)
@@ -1613,6 +1662,9 @@ def opencode_config(host, model, ids, context=None, addons=None, brief=None):
     for k, v in extra.pop("permission", {}).items():
         cfg["permission"].setdefault(k, v)
     cfg["plugin"] += extra.pop("plugin", [])
+    for instruction in extra.pop("instructions", []):
+        if instruction not in cfg.setdefault("instructions", []):
+            cfg["instructions"].append(instruction)
     # Ours first; an add-on of the same name does not replace it.
     cfg["mcp"] = dict(extra.pop("mcp", {}))
     cfg["mcp"]["repo"] = {"type": "local", "command": [sys.executable, OPENCODE_REPO_MAP],
@@ -1958,6 +2010,17 @@ IMAGE_STUDIO = ImagesSpec(
     fg="#ffffff", bg="#5b3cc4", url="",
     note="The Image Studio sends its work to the ComfyUI backends listed under Backends.")
 
+
+class VoicesSpec(PanelSpec):
+    """The Voice Studio form; all speech inference runs on a remote host."""
+    voices = True
+
+
+VOICE_STUDIO = VoicesSpec(
+    id="voice-studio", name="Voice Studio", tab="Voice Studio", code="VS",
+    fg="#ffffff", bg="#24706b", url="",
+    note="Voice Studio makes and compares voice takes using the LLM PC.")
+
 class TerminalSpec(PanelSpec):
     """Console windows opened outside the app - ComfyUI's, a cmd started by
     hand - hidden from the desktop and mirrored here (core/consoles.py,
@@ -1976,7 +2039,7 @@ TERMINALS = TerminalSpec(
 
 # Everything that can be a tab, apps first. APPS stays the registry of drivable
 # apps; TABS is what the tab strip and the new-tab menu offer.
-TABS = APPS + [MILANOTE, IMAGE_STUDIO, TERMINALS, CHAT]
+TABS = APPS + [MILANOTE, IMAGE_STUDIO, VOICE_STUDIO, TERMINALS, CHAT]
 TABS_BY_ID = {a.id: a for a in TABS}
 from core.agent_bridges import (
     slug, split_command, BridgeSpec, _label, group_by_prefix, add_bridge,

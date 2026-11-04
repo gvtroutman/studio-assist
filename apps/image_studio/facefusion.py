@@ -134,15 +134,28 @@ def selected(library, settings):
     if scene is not None:
         for person in scene.get('people') or []:
             ident = library.get('identities', person.get('identity'))
-            if ident and ident.get('face_swap', True) and (ident.get('references') or not ident.get('lora')):
-                result.append(dict(ident, target_region=person.get('region'),
+            if not ident:
+                continue
+            # Match the base/WithAnyone source order and the saved scene,
+            # including an explicit scene photo or legacy character photos.
+            refs = list(dict.fromkeys(p for p in [person.get('face')] +
+                                      list(person.get('photos') or []) if p))
+            refs = refs or list(ident.get('references') or [])
+            if ident.get('face_swap', True) and (refs or not ident.get('lora')):
+                result.append(dict(ident, references=refs, target_region=person.get('region'),
                                    person_id=person.get('id')))
         return result
-    for item in settings.get('identities') or []:
+    choices = settings.get('identities') or []
+    chosen_ids = {item.get('id') if isinstance(item, dict) else item for item in choices}
+    snapshot = settings.get('face_photos') if len(chosen_ids) == 1 else None
+    for item in choices:
         ident = library.get('identities', item.get('id') if isinstance(item, dict) else item)
-        if ident and ident.get('face_swap', True) and (ident.get('references') or not ident.get('lora')):
+        if not ident:
+            continue
+        refs = list(dict.fromkeys(snapshot)) if snapshot else ident.get('references') or []
+        if ident.get('face_swap', True) and (refs or not ident.get('lora')):
             if ident['id'] not in {r['id'] for r in result}:
-                result.append(ident)
+                result.append(dict(ident, references=refs) if snapshot else ident)
     return result
 
 

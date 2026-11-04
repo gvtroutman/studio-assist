@@ -134,6 +134,7 @@ FAMILIES = {
     "flux1": "FLUX.1",
     "flux1-kontext": "FLUX.1 Kontext",
     "flux2": "FLUX.2",
+    "flux2-klein4b": "FLUX.2 Klein 4B",
     "flux2-klein9b": "FLUX.2 Klein 9B",
     "sdxl": "SDXL",
     "sd15": "SD 1.5",
@@ -169,6 +170,7 @@ FAMILY_LICENSES = {
     "flux1-kontext": ("custom", "FLUX.1 [dev] Non-Commercial License: the pictures may "
                                 "be used commercially, the model may not"),
     "flux2": ("custom", "FLUX.2 [dev] Non-Commercial License: read its terms"),
+    "flux2-klein4b": ("commercial", "Apache 2.0"),
     "flux2-klein9b": ("noncommercial", "FLUX Non-Commercial License: not for commercial use"),
 }
 
@@ -253,6 +255,8 @@ def guess_family(filename):
         return "flux1-kontext"
     if "klein" in n and re.search(r"(^|[^0-9])9b", n):
         return "flux2-klein9b"
+    if "klein" in n and re.search(r"(^|[^0-9])4b", n):
+        return "flux2-klein4b"
     if re.search(r"flux[._-]?2", n):
         return "flux2"
     if "flux" in n:
@@ -939,6 +943,17 @@ def _default_models():
          "notes": "The 4-step Klein 9B the head swap uses: a few seconds a picture, no "
                   "negative. A head LoRA trained on the base barely shows here; use "
                   "the base for a person's likeness. Non-commercial."},
+        {"id": "klein-4b-distilled", "label": "FLUX.2 Klein 4B distilled",
+         "family": "flux2-klein4b", "workflow": "klein4b_distilled",
+         "values": {"model": "flux-2-klein-4b-fp8.safetensors",
+                    "encoder": "qwen_3_4b.safetensors", "vae": "flux2-vae.safetensors"},
+         "backends": {"3090": None},
+         "defaults": {"steps": 4, "guidance": 1.0, "sampler": "euler",
+                      "width": 1024, "height": 1024},
+         "license": "FLUX.2 Klein 4B distilled: Apache 2.0, commercial use allowed.",
+         "notes": "ComfyUI's official 4-step text-to-image pipeline. Native nodes, "
+                  "Euler, Flux2Scheduler and CFG 1; no additional finishing passes. "
+                  "Apache 2.0. Install the official 4B FP8 model to use it."},
     ]
 
 
@@ -1146,7 +1161,7 @@ class Library:
 
     # Default models added after a library was made: each joins it once (a
     # model removed afterwards stays removed), remembered in models-added.json.
-    ADDED_MODELS = ("qwen-image",)
+    ADDED_MODELS = ("qwen-image", "klein-4b-distilled")
 
     def _added_defaults(self, raw):
         mark = os.path.join(self.root, "models-added.json")
@@ -1158,13 +1173,22 @@ class Library:
         have = {d.get("id") for d in raw if isinstance(d, dict)}
         new = [d for d in _default_models() if d["id"] in self.ADDED_MODELS
                and d["id"] not in done and d["id"] not in have]
-        if new:
+        present = set(self.ADDED_MODELS) & (have | {d["id"] for d in new})
+        if new or present - done:
             try:
+                os.makedirs(self.root, exist_ok=True)
+                # Persist an addition before marking it delivered. Otherwise
+                # reopening before the Models editor saves loses the new entry.
+                if new:
+                    with open(self._path("models") + ".tmp", "w", encoding="utf-8") as f:
+                        json.dump(raw + new, f, indent=2)
+                    os.replace(self._path("models") + ".tmp", self._path("models"))
                 with open(mark + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump(sorted(done | set(self.ADDED_MODELS)), f)
+                    json.dump(sorted(done | present), f)
                 os.replace(mark + ".tmp", mark)
-            except OSError:
-                return []         # not remembered, so not added: it would come back
+            except OSError as e:
+                self.problems.append("New default models could not be saved (%s)." % e)
+                return []
         return new
 
     def _path(self, kind):
@@ -1181,7 +1205,7 @@ class Library:
                                      % (path, e))
         if not isinstance(raw, list):
             raw = DEFAULTS[kind]()
-        elif kind == "models":
+        if kind == "models":
             raw = raw + self._added_defaults(raw)
         out, seen = [], set()
         for d in raw:
@@ -1869,7 +1893,7 @@ class ComfyUIClient:
                         on_event("busy", int(now - silent))
                     status = (entry or {}).get("status") or {}
                     if entry and (status.get("completed") or entry.get("outputs")
-                                  or status.get("status_str") == "error"):
+                                  or run_errors(entry)):
                         return entry
                     if missing >= LOST_AFTER:
                         raise ComfyError(
@@ -2196,6 +2220,61 @@ FIX_STRENGTHS = {"light": 0.45, "medium": 0.65, "strong": 0.85}
 # in view, dancing") redrew a glasses crop as a tiny dancer (2026-09-26).
 FIX_PROMPT = "Close-up photo detail of %s, sharp and natural, matching the light and " \
              "colour around it."
+# Crop redraws keep the chosen look without repeating the whole scene: a
+# glasses crop prompted with a dancer drew a tiny dancer in the glasses.
+DETAIL_STYLE_CHARS = 600
+_ART_MEDIUM = (r"(?:watercolou?r(?: painting| illustration)?|oil painting|acrylic painting|"
+               r"gouache(?: painting)?|(?:editorial|digital|anime|cartoon|comic book) illustration|"
+               r"(?:digital|matte) painting|(?:pen[- ]and[- ]ink|ink|charcoal) drawing|"
+               r"pencil sketch|pixel art|3[dD] render|linocut|woodcut|screen print|"
+               r"painting|illustration|drawing|sketch|anime portrait)")
+_ART_START = re.compile(r"^\s*(?:(?:please\s+)?(?:draw|paint|render|create|make|generate)\s+)?"
+                        r"(?:an?\s+)?(" + _ART_MEDIUM + r")(?=\s+(?:of|showing|depicting)\b|\s*:)",
+                        re.I)
+_ART_END = re.compile(r"(?:,\s*|\b(?:in|as)\s+(?:the\s+style\s+of\s+)?(?:an?\s+)?)"
+                      r"(" + _ART_MEDIUM + r")(?:\s+(?:style|medium|look))?\s*[.!]?\s*$", re.I)
+
+
+def detail_style(words, scene=""):
+    """Only a chosen style, or an explicit picture medium, for close-ups.
+
+    Recognise a medium at the start of a brief or in its final style clause,
+    never an artwork mentioned among the scene's objects. Keep the crop's
+    style context bounded; the complete chosen style stays in the base prompt.
+    """
+    text = " ".join(_str(words).split())
+    if not text:
+        match = _ART_START.search(_str(scene)) or _ART_END.search(_str(scene))
+        text = match.group(1) if match else ""
+    if len(text) > DETAIL_STYLE_CHARS:
+        text = text[:DETAIL_STYLE_CHARS + 1].rsplit(" ", 1)[0][:DETAIL_STYLE_CHARS]
+    return text
+
+
+def detail_prompt(what, values=None, face=False, whole=False):
+    """A crop's own subject and its composed look, never unrelated scene words.
+
+    Unstyled photographs retain the measured prompts. An explicit look uses
+    medium-neutral wording instead of requesting photographic pores and
+    'photo detail' even when an illustration or soft instant-film look was chosen.
+    """
+    style = detail_style((values or {}).get("detail_style")).rstrip(" .")
+    if not style:
+        if whole:
+            return what
+        return (FACE_PROMPT if face else FIX_PROMPT) % what
+    words = _str(what).rstrip(" .")
+    if style not in words:
+        words = ". ".join(x for x in (words, style) if x)
+    if whole:
+        return words + "."
+    if face:
+        return ("A close-up of one person's face from this picture, in the same medium, "
+                "texture, light, colour and focus as the rest of it: %s. The face keeps "
+                "its identity, proportions, expression and gaze, with clear eyes, "
+                "eyebrows, lips and teeth.") % words
+    return ("Close-up detail of %s, matching the picture's medium, texture, light, "
+            "colour and focus.") % words
 FIX_AREA_GROW = 0.35                  # of its size Find's box grows: the most redrawn
 FIX_SHAPE_GROW = 24                   # px at FACE_EDIT the found thing's own outline grows
 FIX_AREA_SOFT = (15, 5.0)             # ImageBlur radius and sigma of its edge, at FACE_EDIT
@@ -3104,11 +3183,11 @@ def parts_found(entry, n, words=None, scores=False):
     return int(width), int(height), boxes
 
 
-def fix_prompt(fix, prompt):
+def fix_prompt(fix, prompt, values=None):
     """The close-up prompt a fix's squares are redrawn from."""
     f = clean_fix(fix)
     what = ", ".join(x for x in (f["words"], FIX_TARGETS[f["target"]]) if x) or "this detail"
-    return FIX_PROMPT % what
+    return detail_prompt(what, values)
 
 
 def _is_link(x):
@@ -3536,7 +3615,8 @@ def face_graph(wf, values, loras, image, crops, oval, prefix, faces=None, pulid_
                                            face["prompt"], "_" + n[:-1])
         elif face.get("words") and values.get("face_prompt"):
             positive, negative = _restated(g, links, values["face_prompt"],
-                                           FACE_PROMPT % face["words"], "_" + n[:-1])
+                                           detail_prompt(face["words"], values, face=True),
+                                           "_" + n[:-1])
         images = face.get("images") or ([face["image"]] if face.get("image") else [])
         for j, img in enumerate(images[:REFERENCE_PHOTOS_MAX]):
             rn, pn = (n + "r", n + "p") if j == 0 else (n + "r%d" % (j + 1), n + "p%d" % (j + 1))
@@ -4938,6 +5018,7 @@ class Plan:
         self.items = []              # [(item name, local path)]: Kontext's reference
         self.item_text = ""          # the prompt's line about them
         self.wear = []               # [(item name, local path)]: the item pass's, after
+        self.scene_wear = []         # each scene person's items and explicit face region
 
 
 ITEM_PROMPT = ("The %s %s exactly as in the reference picture, worn by the person. "
@@ -4975,6 +5056,43 @@ def plan_wear(p, items, backend, inventory, nodes, why=""):
     p.notes.append("The %s: put on from %s after the picture is drawn, by FLUX.2 Klein 9B "
                    "(the item pass)." % (names, "its picture" if len(later) == 1
                                          else "their pictures"))
+
+
+def plan_scene_items(p, settings, backend, inventory, nodes):
+    """Freeze each scene person's named item references, without mixing them
+    into a whole-frame Kontext reference or the form's main-person outfit."""
+    import apps.image_studio.facefusion as ff
+    import apps.image_studio.wear as wear
+    for target in settings.get("scene_wear") or []:
+        if not isinstance(target, dict):
+            continue
+        name = target.get("name") or "Scene person"
+        if not ff.valid_region(target.get("region")):
+            p.warnings.append("%s's item pictures need a visible, unambiguous wearer; not used." % name)
+            continue
+        items = []
+        for item in clean_wearing(target.get("items")):
+            if not os.path.isfile(item["path"]):
+                p.warnings.append("%s's picture of the %s (%s) is not on this PC any more; "
+                                  "not used." % (name, item["name"], item["path"]))
+            else:
+                items.append(item)
+        if not items:
+            continue
+        short = wear.lacks(inventory, nodes)
+        if inventory is not None and not any(SAM3 in c.lower()
+                                             for c in inventory.get("checkpoints") or ()):
+            short.append("a SAM3 checkpoint")
+        if short:
+            p.warnings.append("%s's item pictures: %s lacks %s (the item pass), so the "
+                              "words alone describe them." % (name, backend["name"], ", ".join(short)))
+            continue
+        own = dict(target, items=items, region=list(target["region"]))
+        p.scene_wear.append(own)
+        for item in items:
+            p.references["item: %s (%s)" % (item["name"], target.get("person_id") or name)] = item["path"]
+        p.notes.append("%s's %s: put on from their pictures in this person's region by "
+                       "FLUX.2 Klein 9B (the item pass)." % (name, _and([i["name"] for i in items])))
 
 
 def plan_items(p, s, wf, v, backend, short, nodes, inventory=None):
@@ -5505,9 +5623,11 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                        % model["label"])
     if anatomy:
         parts.append(anatomy_text())
+    style_words = ""
     if style:
         extra = " ".join(x for x in (trigger(style["trigger"], style["lora"]),
                                      style["prompt"]) if x)
+        style_words = extra
         if extra:
             parts.append(extra)
     for rec, _, why, _ in applied:
@@ -5553,6 +5673,18 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
     v.update({var: wf["defaults"][var] for var in borrowed})
     v.update(look)
     v["prompt"], v["negative"] = p.prompt, p.negative
+    layout = s.get("scene_layout")
+    if isinstance(layout, dict):
+        scene_camera = layout.get("camera")
+        camera_look = _str(scene_camera.get("chemistry")) if isinstance(scene_camera, dict) else ""
+    else:
+        camera_look = camera_profile_words(cam_body) if cam_body else ""
+    crop_style = ". ".join(x.rstrip(" .") for x in (
+        style_words or detail_style("", scene), camera_look) if x)
+    v["detail_style"] = detail_style(crop_style)
+    if len(" ".join(crop_style.split())) > DETAIL_STYLE_CHARS:
+        p.notes.append("Detail redraws use %d characters of style and camera context; "
+                       "the complete wording stays in the picture's prompt." % DETAIL_STYLE_CHARS)
     v["seed"] = int(s["seed"]) % (MAX_SEED + 1)
     v["encoder_device"] = "cpu" if backend.get("encoder_on_cpu") else "default"
     for k in ("width", "height"):
@@ -5644,6 +5776,7 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
                        "(the %s workflow does not); used as ordinary words instead."
                        % wf.get("label", wid))
     plan_items(p, s, wf, v, backend, lacking("items"), nodes, inventory)
+    plan_scene_items(p, s, backend, inventory, nodes)
     if "source_image" in p.images and s.get("denoise") in (None, ""):
         v["denoise"] = wf.get("source_denoise", 0.65)
     # Denoise below 1 over an empty latent leaves noise in the picture: it
@@ -5776,7 +5909,13 @@ def compose(settings, lib, backend, inventory=None, workflow_loader=load_workflo
         else:
             v["sam3"] = sam[0] if sam else None
             # The face is redrawn without the item pictures, so without their line.
-            v["face_prompt"] = FACE_PROMPT % p.prompt.replace(p.item_text, "").strip()
+            words = p.prompt.replace(p.item_text, "").strip()
+            if v["detail_style"]:
+                # The crop already shows its person; whole-scene objects and
+                # camera framing can draw a miniature scene inside that face.
+                words = ". ".join(x for x in [named, person] + descriptions if x)
+                words = words or "the face already shown in this picture"
+            v["face_prompt"] = detail_prompt(words, v, face=True)
             v.setdefault("face_denoise", (wf.get("defaults") or {}).get("face_denoise", 0.4))
 
     # ------------------------------------------- files and nodes it needs
@@ -5946,7 +6085,7 @@ def pipeline_stages(lib, settings, plan=None):
             stages.append(("face", "Face pass"))
         stages.append(("decoding", "Decoding"))
         worn = outfit_of(settings)
-        if worn["clothes"] or worn["accessories"]:
+        if worn["clothes"] or worn["accessories"] or settings.get("scene_wear"):
             stages.append(("items", "Item pass"))
     profiles = (finish.get("profiles") or [] if settings.get("mode") == "faces"
                 else facefusion.selected(lib, settings))
@@ -6136,7 +6275,7 @@ class JobQueue:
 # ================================================================ history
 
 def run_errors(entry, graph=None):
-    """Why a finished prompt made nothing, from its /history entry, in words:
+    """Why a finished prompt failed, even if it saved partial outputs, in words:
     the node (id and class), the exception and its message, and for a
     missing file the exact name. [] when the entry says nothing."""
     out = []
@@ -6157,6 +6296,8 @@ def run_errors(entry, graph=None):
             out.append(text)
     if not out:
         out = status_messages(dict(entry, status=entry.get("status") or {}))
+    if not out and (entry.get("status") or {}).get("status_str") == "error":
+        out.append("ComfyUI reported that the run failed without an error message.")
     return out
 
 
@@ -6767,10 +6908,9 @@ class Studio:
                     raise
                 entry = None
             if entry:                 # history holds a prompt once it has finished
-                status = entry.get("status") or {}
-                if status.get("status_str") == "error":
-                    raise ComfyError("%s: %s" % (client.backend["name"], "; ".join(
-                        run_errors(entry, graph)) or "the run failed"))
+                errors = run_errors(entry, graph)
+                if errors:
+                    raise ComfyError("%s: %s" % (client.backend["name"], "; ".join(errors)))
                 return entry
             time.sleep(0.5)
         try:
@@ -7246,13 +7386,18 @@ class Studio:
                 watch.close()
         if entry is None:
             return self.queue._finish(job, "cancelled")
+        errors = run_errors(entry, graph)
+        if errors:
+            interrupted = any(isinstance(message, list) and len(message) == 2
+                              and message[0] == "execution_interrupted"
+                              for message in (entry.get("status") or {}).get("messages") or [])
+            return self.queue._finish(job, "cancelled" if interrupted or job.cancel.is_set()
+                                      else "failed", "; ".join(errors))
         files = [f for f in outputs_of(entry)]
         if not files:
-            errors = run_errors(entry, graph)
-            if any("interrupted" in e for e in errors) or job.cancel.is_set():
+            if job.cancel.is_set():
                 return self.queue._finish(job, "cancelled")
-            return self.queue._finish(job, "failed", "; ".join(errors) or
-                                      "The workflow finished on %s without a picture."
+            return self.queue._finish(job, "failed", "The workflow finished on %s without a picture."
                                       % b["name"])
         if values.get("face_detail") and not job.cancel.is_set():
             files, graph2 = self._face_pass(job, client, plan, values, entry, files, say)
@@ -7268,8 +7413,9 @@ class Studio:
         except ComfyError as e:
             return self.queue._finish(job, "failed", "The picture was made but could not be "
                                       "fetched from %s: %s" % (b["name"], e))
-        if plan.wear and not job.cancel.is_set():
-            pictures = self._wear(job, client, values, pictures, plan.wear, say)
+        if (plan.wear or plan.scene_wear) and not job.cancel.is_set():
+            pictures = self._wear(job, client, values, pictures, plan.wear, say,
+                                  targets=plan.scene_wear)
         if profiles:
             pictures = self.finish_profiles(
                 job, graph, pictures, profiles, say,
@@ -7475,7 +7621,7 @@ class Studio:
                                 else "the picture"))
             return out + pictures[len(out):]
 
-    def _wear(self, job, client, values, pictures, items, say):
+    def _wear(self, job, client, values, pictures, items, say, targets=None):
         """After the picture is drawn and before the head and face swap, on
         the lane's thread: each of `items` ([(name, local path)], the plan's
         `wear`) put on the main person by FLUX.2 Klein (`wear`) - SAM3 finds
@@ -7484,6 +7630,11 @@ class Studio:
         given on any failure or a cancel - the item pass is an extra, the
         picture is never lost to it."""
         import apps.image_studio.wear as wear
+        wanted = [{"name": n, "path": p} for n, p in items]
+        for target in targets or []:
+            wanted += [dict(i, target_region=list(target["region"]),
+                            person_id=target.get("person_id"), person_name=target["name"])
+                       for i in target["items"]]
         b = job.backend
         sam = self.sam3_on(b)
         try:
@@ -7494,9 +7645,8 @@ class Studio:
         if not sam or short:
             job.notes.append("No item pass: %s; the words alone describe the %s." % (
                 "%s has no SAM3 checkpoint" % b["name"] if not sam else
-                "%s lacks %s" % (b["name"], ", ".join(short)), _and([n for n, _ in items])))
+                "%s lacks %s" % (b["name"], ", ".join(short)), _and([i["name"] for i in wanted])))
             return pictures
-        wanted = [{"name": n, "path": p} for n, p in items]
         words = wear.find_words(wanted)
         out = []
         passes = len(job.passes)
@@ -7524,7 +7674,7 @@ class Studio:
                 width, height, boxes = said
                 planned, missed = wear.plan(width, height, wanted, boxes)
                 if missed:
-                    job.notes.append("Item pass: no person found to wear the %s."
+                    job.notes.append("Item pass: no unambiguous person found to wear the %s."
                                      % _and(missed))
                 if not planned:
                     out.append((filename, data))
@@ -7702,7 +7852,7 @@ class Studio:
         face pass, the critic)."""
         s = {k: v for k, v in (settings or {}).items()
              if k not in ("mode", "fix", "replay_prompt")}
-        s.update(references={}, item_refs={}, wearing=[], pose=None, composition=None,
+        s.update(references={}, item_refs={}, wearing=[], scene_wear=[], pose=None, composition=None,
                  face_detail=False, critic_notes=False, batch=1)
         return s
 
@@ -7964,7 +8114,7 @@ class Studio:
                         passes.append(("Eye pass", fix_areas(fix_crops(width, height, spots),
                                                              spots),
                                        EYE_DENOISE, EYE_WHAT, "_eyes", None,
-                                       [{"prompt": FIX_PROMPT % (EYE_COLOURED % c)} if c else {}
+                                       [{"prompt": detail_prompt(EYE_COLOURED % c, v)} if c else {}
                                         for c in said]))
                     elif not faces:
                         job.notes.append("SAM3 found no swapped face, so no %s pass was made."
@@ -7987,7 +8137,7 @@ class Studio:
                                             client, "finish", "%s_%d_beard%d.png" % (job.id, n, i),
                                             beard_shape_png(sp, crop, width, height)))
                         passes.append(("Beard", crops, BEARD_DENOISE, BEARD_WHAT, "_beard",
-                                       None, [{"prompt": FIX_PROMPT % sp["prompt"]}
+                                       None, [{"prompt": detail_prompt(sp["prompt"], v)}
                                               for sp in bearded]))
                 if smiles:
                     smiling, skipped = smile.spots(width, height, smiles,
@@ -8000,7 +8150,7 @@ class Studio:
                         crops = smile.crops(width, height, smiling)
                         passes.append((smile.LABEL, crops, smile.DENOISE,
                             "a natural smile", "_smile", None,
-                            [{"prompt": FIX_PROMPT % s["prompt"]} for s in smiling]))
+                            [{"prompt": detail_prompt(s["prompt"], v)} for s in smiling]))
                 if hands:
                     found_hands = found_spots(width, height, real_hands(
                         width, height, [x for x in boxes if x[4] == "hand"]), "hand")
@@ -8026,7 +8176,7 @@ class Studio:
                     def run(reseed, image=image, crops=crops, denoise=denoise, what=what,
                             tag=tag, tone=tone, who=who, label=label):
                         graph = face_graph(plan.workflow, dict(
-                            v, seed=int(v["seed"]) + reseed, face_prompt=FIX_PROMPT % what,
+                            v, seed=int(v["seed"]) + reseed, face_prompt=detail_prompt(what, v),
                             face_denoise=denoise, match_tone=tone), plan.loras, image, crops,
                             oval, values["filename_prefix"] + tag, faces=who)
                         return self._run_pass(job, client, graph, say, label,
@@ -8225,9 +8375,10 @@ class Studio:
             values["filename_prefix"] = "ImageStudio/fix_%s" % job.id
             graphs = []
             if around:
-                values.update(width=size[0], height=size[1], face_prompt=fix["words"] +
-                              ". Keep the existing head in its original position and size; "
-                              "build the body and scene around it.",
+                values.update(width=size[0], height=size[1], face_prompt=detail_prompt(
+                              fix["words"] + ". Keep the existing head in its original "
+                              "position and size; build the body and scene around it.",
+                              values, whole=True),
                               face_denoise=fix["strength"], sam3=None, match_tone=0)
                 graphs.append(("Generating around the locked head", around_head_graph(
                     plan.workflow, values, plan.loras, image, size[0], size[1], locks,
@@ -8273,7 +8424,7 @@ class Studio:
                 if any(c.get("word") for c in crops):    # found things redrawn by their outline
                     values["sam3"] = self.sam3_on(b)
                 boxes = [sp.get("box") for sp in plain] if sam else None
-                values["face_prompt"] = fix_prompt(fix, plan.prompt)
+                values["face_prompt"] = fix_prompt(fix, plan.prompt, values)
                 values["face_denoise"] = fix["strength"]
                 at = {id(sp): i for i, sp in enumerate(plain)}
                 place = {n: at[id(sp)] for n, sp in enumerate(fix["spots"]) if id(sp) in at}
@@ -8295,7 +8446,7 @@ class Studio:
                         dict(values, seed=(int(values["seed"]) + 1000 * n) % (MAX_SEED + 1)),
                         plan.loras, picture, [crops[i] for i in which], oval,
                         "%s_redo%d" % (values["filename_prefix"], n),
-                        faces=[{"prompt": FIX_PROMPT % w, "denoise": critic.harder(
+                        faces=[{"prompt": detail_prompt(w, values), "denoise": critic.harder(
                             fix["strength"], f["tries"], FIX_STRENGTHS["strong"])}
                             for w, f in zip(what, faults)],
                         boxes=[boxes[i] for i in which] if boxes else None, locks=locks,
@@ -8548,9 +8699,9 @@ class Studio:
                     names.get(nid, "dressing"), value, total), value / float(total))
             elif kind == "queued" and job.status in ("queued", "uploading"):
                 say("queued", "queued on %s" % job.backend["name"], None)
-        job.prompt_id = client.queue_workflow(graph)
         watch = client.watch() if hasattr(client, "watch") else None
         try:
+            job.prompt_id = client.queue_workflow(graph)
             entry = client.listen_for_progress(
                 job.prompt_id, on_event, stop=job.cancel.is_set,
                 **({"watch": watch} if watch is not None else {}))
@@ -8559,8 +8710,11 @@ class Studio:
                 watch.close()
         if entry is None:
             raise ComfyError("cancelled")
+        errors = run_errors(entry, graph)
+        if errors:
+            raise ComfyError("; ".join(errors))
         if not outputs_of(entry) and preview_of(entry, "dp") is None:
-            raise ComfyError("; ".join(run_errors(entry, graph)) or "the run made no picture")
+            raise ComfyError("the run made no picture")
         return entry
 
     def dress_route(self, settings):
@@ -8776,12 +8930,9 @@ class Studio:
         width, height, boxes = found
         scene = faces_of(job.settings)
         known = match_faces(width, height, boxes, scene.get("people") or [])
-        # A person's own words stand for the whole prompt in their face's
-        # redraw, so the style goes with them: without it an SX-70 picture
-        # got smooth, grainless faces.
-        style = (self.lib.get("styles", job.settings.get("style"))
-                 if job.settings.get("style") else None)
-        style = " ".join(x for x in (style["trigger"], style["prompt"]) if x) if style else ""
+        # `face_graph` combines each person's own words with the composed
+        # style. That keeps the look, and never revives the trigger of a
+        # style LoRA left out of this job's applied stack.
         for person in scene.get("people") or []:
             if person not in known.values():
                 plan.notes.append("Face pass: %s's face was not found where the scene puts it%s."
@@ -8840,7 +8991,7 @@ class Studio:
                     photos = [p for p in (person.get("photos") or [person["face"]])
                              if os.path.isfile(p)] or [person["face"]]
                     images = [client.upload_image(p) for p in photos[:REFERENCE_PHOTOS_MAX]]
-                words = " ".join(x for x in (person.get("words"), style) if x)
+                words = person.get("words") or ""
                 face = dict({"words": words, "image": images[0] if images else None,
                              "images": images,
                              "denoise": scene.get("likeness") if images else None,
@@ -8857,7 +9008,7 @@ class Studio:
             faces = [dict(f, image=None, images=[], denoise=None) if f else None
                      for f in faces]
             faces += [None] * (len(crops) - len(faces))
-        job.face = {"found": len(boxes), "redrawn": len(crops),
+        face_summary = {"found": len(boxes), "redrawn": len(crops),
                     "denoise": values.get("face_denoise"),
                     "people": [f["name"] for f in faces if f],
                     "likeness": [f["name"] for f in faces if f and f.get("image")],
@@ -8865,6 +9016,7 @@ class Studio:
                     "head_depth": {f["name"]: f["depth_strength"] for f in faces
                                    if f and f.get("depth")}}
         if not crops:
+            job.face = face_summary
             if not boxes or not left:
                 plan.notes.append("Face pass: %s" % ("no face found" if not boxes else
                                                      "every face was already drawn at full size"))
@@ -8881,12 +9033,10 @@ class Studio:
                                boxes=[boxes[i] for i, _ in pairs])
             say("face", "redrawing %d face%s at %d px" % (
                 len(crops), "" if len(crops) == 1 else "s", FACE_EDIT), None)
-            pid = client.queue_workflow(graph)
         except (ComfyError, TemplateError, OSError) as e:
             plan.warnings.append("The face pass could not start (%s); the picture is as made."
                                  % e)
             return files, None
-        job.prompt_id = pid
         n = len(crops)
 
         def on_event(kind, data):
@@ -8898,20 +9048,25 @@ class Studio:
                 value / float(total))
         watch = client.watch() if hasattr(client, "watch") else None
         try:
+            job.prompt_id = client.queue_workflow(graph)
             entry2 = client.listen_for_progress(
-                pid, on_event, stop=job.cancel.is_set,
+                job.prompt_id, on_event, stop=job.cancel.is_set,
                 **({"watch": watch} if watch is not None else {}))
+        except (ComfyError, OSError) as e:
+            plan.warnings.append("The face pass failed (%s); the picture is as made." % e)
+            return files, None
         finally:
             if watch is not None:
                 watch.close()
         if entry2 is None:
             return files, None                # cancelled; run_job says so
+        errors = run_errors(entry2, graph)
         files2 = outputs_of(entry2)
-        if not files2:
-            errors = run_errors(entry2, graph)
+        if errors or not files2:
             plan.warnings.append("The face pass failed (%s); the picture is as made."
                                  % ("; ".join(errors) or "no picture"))
             return files, None
+        job.face = face_summary
         plan.notes.append("Face pass: %d face%s redrawn at %d px, denoise %s" % (
             n, "" if n == 1 else "s", FACE_EDIT, values.get("face_denoise")))
         drawn = [f for f in faces if f and f.get("image")]
@@ -9203,8 +9358,8 @@ class Studio:
         if entry is None:
             return None
         errors = run_errors(entry, graph)
-        if errors or (entry.get("status") or {}).get("status_str") == "error":
-            raise ComfyError("; ".join(errors) or "the run failed")
+        if errors:
+            raise ComfyError("; ".join(errors))
         out = outputs_of(entry)
         if not out:
             raise ComfyError("no picture")
@@ -9237,15 +9392,27 @@ class Studio:
             graph = paste_graph(image, faces, values["seed"],
                                 values["filename_prefix"] + "_real")
             say("face", "matching each face to its photos", None)
-            pid = client.queue_workflow(graph)
-            entry = client.listen_for_progress(pid, lambda *a: None, stop=job.cancel.is_set)
+            watch = client.watch() if hasattr(client, "watch") else None
+            try:
+                job.prompt_id = client.queue_workflow(graph)
+                entry = client.listen_for_progress(job.prompt_id, lambda *a: None,
+                    stop=job.cancel.is_set, **({"watch": watch} if watch is not None else {}))
+            finally:
+                if watch is not None:
+                    watch.close()
         except (ComfyError, OSError) as e:
             plan.warnings.append("The real faces could not be pasted (%s); the faces are "
                                  "PuLID's." % e)
             return files
         if entry is None:
             return files                      # cancelled; run_job says so
-        report, out = paste_report(entry), outputs_of(entry)
+        errors = run_errors(entry, graph)
+        out = outputs_of(entry)
+        if errors or not out:
+            plan.warnings.append("The real-face paste failed (%s); the faces are PuLID's."
+                                 % ("; ".join(errors) or "no picture"))
+            return files
+        report = paste_report(entry)
         for r in report:
             if r.get("reference") in local:
                 r["reference"] = local[r["reference"]]
@@ -9258,11 +9425,6 @@ class Studio:
             else:
                 plan.notes.append("Real face: %s kept as PuLID drew it - %s." % (
                     r.get("name"), r.get("why") or "no reason given"))
-        if not out:
-            errors = run_errors(entry, graph)
-            plan.warnings.append("The real-face paste failed (%s); the faces are PuLID's."
-                                 % ("; ".join(errors) or "no picture"))
-            return files
         if not any(r.get("pasted") for r in report):
             return files
         job.paste_graph = graph

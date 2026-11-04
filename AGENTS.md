@@ -285,6 +285,15 @@ engine for the probe and the bridge label, and again by `apps/comfyui/mcp.py` in
 own process — keep both reading the same variable. ComfyUI must be started with
 `--listen` on that machine or it binds to its own loopback and the probe fails.
 
+### No paid services
+
+The user explicitly ruled out paying for services on 2026-10-15. Do not add
+subscriptions, paid cloud integrations, or API-credit requirements. Use the
+existing self-hosted ComfyUI and remote LM Studio setup for any techniques adapted
+from other products. Higgsfield was investigated, but its paid CLI integration
+was removed before any generation or credit spending. Its public-client research
+remains ignored under `.work/rea-higgsfield/`; no generation algorithm was recovered.
+
 ### What ComfyUI makes, and why it takes the time it does
 
 The bridge has four making tools. `comfy_generate` is text to image, faces redrawn;
@@ -658,6 +667,11 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   `stages.refining`. `fill()` is the whole adapter and refuses an unfilled value or a
   dangling link by name. Check a new template against the server's `/object_info`
   (the tests hold the shipped ones to filling; a live check is by hand).
+- **Commercial FLUX.2 baseline.** `klein4b_distilled.json` reproduces ComfyUI's
+  official four-step Klein 4B text-to-image branch with core nodes only.
+  `flux2-klein4b` is its own Apache 2.0 family, separate from non-commercial
+  Klein 9B and FLUX.2 dev. Importable UI/API graphs are in `workflows/`;
+  source pins, REA evidence and validation are in `docs/flux2-commercial.md`.
 - **Logical names.** A model (`models.json`) has `values` for every machine and a
   `backends` entry per machine that overrides them: other filenames, fp8, even
   another family or workflow, or `null` for "not installed there". A LoRA has `file`
@@ -823,7 +837,9 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   "tattoo" tag's as well. A tag said only in the scene is clothing when its
   word names a Clothes pick's garment and nothing on the head, else an accessory.
   The pictures then go through Kontext as any item picture does. Scenes with people
-  still blank `item_refs` (`apps.image_studio.scene.scene.generation`): tags are the form's person's.
+  still blank the form's `item_refs` (`apps.image_studio.scene.scene.generation`),
+  but carry matching character tags separately in `scene_wear`, with that person's
+  own head region. Shared scene words never activate a person's clothing tag.
 - **Item and person pictures can come from a link** (2026-09-27, the user: "i want to
   use urls for images of items and people"). Beside every Picture… on an item row
   (the form's and the creator's, Tags included) is **Link…**, the Tags tab has
@@ -986,6 +1002,18 @@ events, and `_panel_event` hands them to `ImageStudio.handle`. The rules:
   default style needs its tile (a test checks). Tk scales pictures only by
   whole factors, so `photo_at` zooms and subsamples to hit the tile size, and
   passes a master: a `PhotoImage` without one belongs to the first Tk root.
+- **Finishing keeps the chosen look** (2026-10-14). `compose` carries bounded
+  effective style words and selected camera chemistry in `values.detail_style`;
+  `detail_prompt` uses them for face, eye, beard, smile, hand, glasses and spot
+  redraws. Illustration and film crops must not be prompted as a sharp real
+  photograph by default. Crop prompts name only their part, not unrelated
+  whole-scene objects or framing. Style LoRA triggers follow the applied stack,
+  including missing/incompatible/zero-strength exclusions; `_face_pass` must not
+  rebuild them from a raw style record. Explicit picture media in a scene brief
+  can supply the look, but an artwork mentioned as a scene object cannot. No
+  chosen look retains the measured photographic prompts. Tests:
+  `tests/test_render_style.py`; the REA acquisition boundary and unmeasured
+  visual-quality limits are in `docs/midjourney-quality-rea.md`.
 - **A reference is typed** (face, pose, composition, style, source) and used only
   where the workflow declares that kind. Otherwise it is a warning, not a silent
   reuse. As of 2026-09-25 `flux_hq` takes `source` (image to image) and
@@ -1578,6 +1606,21 @@ profile's optional `avatar` is display-only (generated pictures are allowed);
 it never becomes a face reference. `face_swap` defaults to true independently
 of the older `use_references` switch. Profiles without photos retain their LoRA
 behavior. The profile editor keeps technical fields under Advanced settings.
+
+**Character reference consistency** (2026-10-14). Scene Builder's `scene_wear`
+freezes each visible person's matching item pictures separately from the form's.
+Character Wearing pictures are tags here: they apply only when that person's
+scene look or description names them, so a changed scene outfit stays changed.
+`Plan.scene_wear` runs the existing Klein item pass with explicit face targets;
+missing/ambiguous faces or ambiguous person detections skip that target. Its final blend
+is bounded by the detected wearer's box and excludes every other detected person
+box after feathering. These are conservative boxes, not semantic ownership masks;
+overlapping detections can leave items unapplied. Fix clears these item passes.
+FaceFusion's selected sources use the scene's primary photo and saved photo set,
+or the single form person's saved `face_photos`, before live profile references.
+Legacy scenes without captured photos retain their profile fallback. Tests:
+`tests/test_character_consistency.py`; evidence and visual limits:
+`docs/character-consistency-rea.md`.
 
 **A face FaceFusion will swap is not drawn with PuLID first** (2026-09-28,
 The user: "this is a waste of time otherwise"). In a scene, the face pass
@@ -2748,12 +2791,68 @@ pill per kind, Installed and Catalog tabs, Turn off, Remove on a second click.
   kept in the state folder, as OpenCode's config keeps them.
 - **Installed MCP servers say what OpenCode made of them**: `live_status()` reads
   `GET /mcp` (connected / failed and why / not loaded yet).
+- **Large MCP catalogs can be narrowed**: an MCP add-on record may carry
+  `excluded_tools`, a list of exact upstream tool names. `config()` adds a scoped
+  `<server>_<tool>: deny` permission for each valid name; the server's wildcard
+  remains `ask`, so its other tools still require approval. Disabled records add
+  neither tools nor exclusions. REA's initial JavaScript investigation profile
+  uses this to keep its full catalog out of the local model's request.
 - **Remove**: a downloaded skill's folder goes to the Recycle Bin
   (`apps.image_studio.addons.catalog.recycle`); a folder the user pointed at is left alone.
 - Threads post back with the window-level `("call", None, fn)` event, which `_handle`
   runs before any tab lookup; a stale answer is dropped by `gen`.
 
+### OpenCode in Chrome
+
+**Chrome control (REA investigation, 2026-10-14).** OpenCode Add-ons → MCP servers →
+Installed → Connect Chrome adds the pinned Playwright MCP 0.0.83 in extension mode.
+`codeaddons.chrome_record()` prefers a matching separate `.runtime/browser` install
+with Node on PATH, otherwise npm's pinned runner. The user installs Microsoft's
+Playwright Chrome extension and chooses a tab on first use; MCP connected alone
+does not mean a browser tab is connected. Fourteen page tools remain after exact
+exclusions from the recorded 25-tool contract (`tests/fixtures/chrome-playwright.json`).
+The browser brief (`docs/OPENCODE_BROWSER.md`) is appended to existing instructions
+only while the add-on is enabled. Browser tools still ask, including under Agentic;
+they operate the live site and cannot be undone with repository checkpoints.
+`browser_action_attempted` scopes activity to this ask/session and suppresses only
+the missing-code-edit nudge after a browser interaction, including unknown outcomes;
+it never certifies browser success or hides failed tests/open todos. Missing activity
+evidence yields needs_input before replay. Setup preserves a different server named
+chrome. `docs/chrome-opencode-rea.md` records REA evidence, source hashes, partial
+coverage and the unmeasured live-model path. The installed Claude reference was
+inspected statically and is not executed or shipped; nothing calls Anthropic's API.
+Tests: `test_codeaddons`, `test_opencode`, registry/MCP/executor regressions.
+
 ### OpenCode's trainer: Claude Code, from outside the app
+
+**Continuation and completion (REA investigation, 2026-10-14).**
+`apps/opencode/task_context.js` is loaded with `read_cap.js` by `opencode_config`.
+Its `experimental.session.compacting` hook reads OpenCode's persisted session
+messages and todos, with a four-second timeout, and adds at most ~10k characters
+of requests, corrections, todo statuses, changed files, shell exits and errors.
+It names omissions and stale/pre-edit checks; a completed call is not a passing
+test. It adds context to the default prompt or appends to an existing custom
+compaction prompt. SDK failure costs facts, never compaction. No model calls,
+project writes or permission changes. `docs/opencode-rea.md` records evidence and
+limits; `tests/test_opencode_context.py` runs its JS behavioral checks. After
+`AGENTIC_ROUNDS`, failed tests/open todos yield `needs_input`, retained in `owed`;
+`opencode_wait` preserves that verdict and cannot buy more retries. A new ask
+resets the budget. The model's short brief stays under 4000 characters.
+
+**Claude Code source follow-up (2026-10-14).** REA inspected four inert files from
+a pinned public mirror labelled 2.1.88; attribution to the original source map
+remains unverified. Evidence and the design transfers are in
+`docs/opencode-claude-code-rea.md`. Task records now retain `verification`
+(`modules`, `result`): unresolved checks are rerun after checkpointing, including
+when no fresh diff remains. Timeouts/start failures/copy inspection errors stay
+unfinished, even with Agentic off; waiting cannot silently clear `owed`.
+Compaction additionally preserves recent assistant findings as quoted claims.
+`opencode_tool_result` recovers one persisted tool result by session/call ID in
+bounded windows. Reports retain exits and diagnostic endings. Tests:
+`test_opencode_verification.py`, `test_opencode_results.py` and the context hook.
+The test runner uses `procs.spawn`; `Child.terminate()` ends the tree while
+leaving pipes readable for a bounded final drain, and `stop(grace=0)` then releases
+the job and handles on success, Stop and timeout.
 
 The user asked (2026-09-28) for Claude "beside [OpenCode] as a trainer", and then, firmly,
 **not through the API**: he has a Claude plan and will not buy API credits. So the
@@ -3797,6 +3896,34 @@ name still works, and a refusal carries the tool's schema.
 
 ## Hard-won constraints — read before editing
 
+### Voice Studio
+
+`apps/voice_studio/ui.py` is a native form in `VOICE_STUDIO`, a `PanelSpec` in
+`core.agent.TABS`, outside the drivable registry. It shares a script/reference
+across complementary speech engines and keeps separate WAV takes. `catalog.py`
+owns capabilities and validation; `client.py` owns bounded transport and the
+local library. GUI workers post `("voices", session.event_id, payload)`; only
+the UI consumes library mutations. Audio statistics run off Tk. Named profiles,
+drafts and pending job IDs persist; server tokens never do. A corrupt library
+opens an error tab and remains untouched. Comparison prefills Audio Review;
+it does not start inference or certify a best take.
+
+Speech inference is remote only. `remote.py` is a stdlib HTTP job server on the
+LLM PC (default tailnet port 17494); `worker.py` imports ML in a fresh, contained
+`core.procs` child per job. One worker runs at a time. Cancellation confirms
+worker exit; caller IDs and persisted statuses permit recovery without replay.
+Idle LM Studio models on the same host are unloaded before GPU speech, following
+the image lane's lazy reload policy. Independent ComfyUI jobs are not reserved.
+
+`bundle.py` exports remote source, `setup_remote.ps1`, `start_remote.ps1`, the
+guide and a hash manifest. The user runs setup on the LLM PC; never install these
+dependencies on the workstation. Engine groups have independent environments.
+CosyVoice needs a manual source environment; Pocket may need remote Hugging Face
+license acceptance. No paid API is used. Guide: `docs/voice-studio.md`.
+Tests: `test_voice_studio.py`, `test_voice_studio_ui.py`. Protocol/GUI tests use
+synthetic WAVs; package compatibility, speech quality and GPU speed need live
+remote validation and must never be claimed from those tests.
+
 **Stdlib only.** No `openai`, no `mcp`, no `requests`, no pip step. This runs on a
 workstation where a broken Python environment costs real production time. Tkinter is
 the GUI for the same reason. Do not add dependencies.
@@ -4544,10 +4671,21 @@ composer.
   still pins one. `AppSpec.model_for(ids,
   shared)` resolves it against what the host serves — `STUDIO_MODEL_<APP>` pin, then
   the list, then the shared model, never a model that is not served — and returns a
-  note the tab prints once. The GUI keeps one `Session.llm` per tab, fixed at boot:
+  note the tab prints once. The GUI keeps one `Session.llm` per tab, chosen at boot:
   the executor, both warm-ups and the host's cached prefix must agree, and tabs with
   no preference share the window's handle (`Chat._llm_for`). The CLI resolves the
   same way unless `--model` is given.
+- **A model change keeps the last working client until warm-up succeeds.**
+  Missing pins follow the app's automatic choice (`AppSpec._auto_model`, or
+  `ServerSpec._auto_model`'s best coder), with the missing selection explained.
+  The saved pin stays available for a later restart. The model chip says
+  **Fallback** when that pin differs from the client actually running. A stale
+  menu cannot change a closed, replaced or busy tab, or save an unserved choice.
+  `_swap_model` warms with `_warm(strict=True)` and restores the previous client,
+  prefix count and context window on failure, only if the failed candidate still
+  owns the tab. Conversation and task recovery records carry on. Boot warm-up
+  remains best-effort. `tests/test_model_recovery.py` covers these boundaries;
+  `docs/opencode-rea.md` records the Fable-client evidence and design transfer.
 - **What is in VRAM is not what the user chose, once the app loads models of its
   own.** `pick_model` put "what is loaded" before the known-good list from the start,
   so a model loaded by hand in LM Studio was the one used. After the window began
@@ -4581,8 +4719,13 @@ composer.
   kept. **A streamed request is refused differently:** LM Studio answers `200 OK`
   with an `event: error` line whose data is `{"error": …}` and has no `choices`, so
   `_open` never sees an HTTP error. `LLM.stream` reads that line. When it comes before
-  any content and a draft is set, the draft is dropped with the same note and the
-  request is retried once. Otherwise it raises the host's message. Before this was
+  any content or prepared tool call and a draft is set, the same request is tried
+  once without it. Only a complete retry disables the refused pair and emits its
+  note; failed retries retain the pair. HTTP retries defer that change until the
+  response is read too, so HTTP success followed by a stream error is no proof.
+  A retry never rebuilds the body from newer model settings, and disables only
+  the model/draft pair still selected. An HTTP retry followed by a streamed error
+  cannot make a third request. Otherwise it raises the host's message. Before this was
   fixed (2026-09-27, `qwen3-1.7b` refused as needing "load time"), every reply in the
   tab read "Incomplete inference response (connection ended)".
   `_draft_check` says the note once, in the tab the request was made from, after
@@ -4792,10 +4935,28 @@ tabs.
 
 ### The folded call rows
 
-Every tool call is one row in the transcript: the tool's name (and its `action`,
-for a compound tool), a red *failed* or *not run* when it went wrong, and behind a
-click the call as the model made it - every argument whole, so a `run_jsx` /
-`ps_run_jsx` script reads as the script - with the result under it.
+**Live activity while text is generated** (2026-10-14): `core.activity.Activity`
+keeps the current turn's tool facts, and `core.activity_ui.ActivityView` owns the
+expandable strip above each transcript. It stays visible while text scrolls and
+says Thinking, Preparing a tool, Running, progress, Writing reply, or Interrupted.
+Preparation comes from streamed tool-call deltas (`LLM.stream(on_tool=...)`); it
+does not execute a partial call or increment the tool-call count. Stop is
+checked while arguments stream. Normal tool/result events still own the folded
+rows. OpenCode's `ToolFeed` publishes observed tool parts through display-only
+`studio/toolActivity` progress metadata; call IDs scope updates to the followed
+session/family. This never approves a permission or decides that work is done.
+MCPClient filters progress by the in-flight token; Loopback exposes the same
+activity callback. Unknown outcomes remain unknown after interruption. The strip
+resets for each new request or cleared transcript, bounds its details/history and
+names omissions. Tests: `test_activity.py`, `TestGui` in `test_agent.py`. The REA
+evidence and its limits are documented in `docs/tool-activity-rea.md`.
+
+Every tool call is a compact `core.tool_cards.ToolCard` in the transcript: a
+readable action label, a state badge and, while running, animated dots and short
+progress badges. OpenCode's reported file/step/activity counts are separated into
+badges; a progress bar appears only for an actual reported step fraction. Clicking
+opens selectable text with the exact tool name/action, arguments, progress and
+result, so a `run_jsx` / `ps_run_jsx` script still reads as the whole script.
 
 - **`Executor._call` is the one place a call is announced.** It emits `("tool",
   {"name", "arguments", "via"})` before dispatch and `("tool_result", {"name",
@@ -4806,25 +4967,28 @@ click the call as the model made it - every argument whole, so a `run_jsx` /
   result arrives before the made tool's own. The CLI prints the same events
   clipped; the GUI keeps them whole (`CALL_TEXT_LIMIT` per value is the only cap -
   the task record has the rest).
-- **In the GUI a row is text, not a widget.** `_show_call` writes the header under
-  `tool` + `call_head` + `call:<n>` and the body under `tool_body` + `body:<n>`
-  with `elide` on; `_show_result` finds the newest row of that name still in
+- **The card owns appearance; the transcript owns evidence.** `_show_call` embeds
+  the card under `tool` + `call_head` + `call:<n>` and puts the body under
+  `tool_body` + `body:<n>` with `elide` on. `Session.tool_cards` holds each card;
+  `_show_result` finds the newest row of that name still in
   `Session.open_calls` (a stack, so nested steps pair up) and inserts the result
-  at the end of that body tag. Tag bindings on `call_head` do the click and the
-  hand cursor, and `_toggle_call` flips the elide and the chevron (`g["closed"]` /
-  `g["open"]`, MDL2 by codepoint like the rest). Elided text is invisible but
+  at the end of that body tag. The card's click, Enter or Space reaches
+  `_toggle_call`, which flips the elide and the card's disclosure arrow. Elided text is invisible but
   present: `view.get` returns it, `bbox` is `None` for it, and a `see("end")`
   after an expand near the fold is what keeps the header on screen.
 - **Per-row tags go with the text.** `_clear_view` deletes `call:`, `body:`,
   `mark:`, `status:` and `stage:` tags, empties `open_calls`, and stands down the
   animations of every widget embedded in the transcript before the delete destroys
   them; use it, not a bare `delete("1.0", "end")`, wherever a transcript is emptied.
-- **What the row is waiting for, it says.** The `status:<n>` range holds an embedded
-  `_dots` canvas rather than a static `…`: a call that takes a minute used to look
-  exactly like one that had hung. `_show_result` stands its animation down and
-  deletes the range, which is also what destroys the widget. Embedded widgets go in
-  through `_embed`, which tags the one character they occupy — a `window_create`
-  takes no tags of its own.
+- **What the card is waiting for, it says.** Its child `_dots` canvas remains in
+  `Session.pending` while running. `_show_result` stands its animation down before
+  the card destroys the dots and paints the outcome badge; the card stays. The
+  `status:<n>` text range now records the state inside the folded evidence.
+  A turn ending without a result marks its remaining cards Unconfirmed and stops
+  their animations. Live timing badges disappear on settlement, while reported
+  counters and the exact progress text remain. Cards resize to the transcript and
+  repaint through the shared theme registry. Embedded widgets still go through
+  `_embed`, which tags the one character they occupy.
 - **A tool whose name says it makes a picture gets the space that picture will fill.**
   `makes_a_picture()` decides, generously and on purpose: guessing wrong costs nothing
   either way, because a placeholder nothing arrives for is taken down by

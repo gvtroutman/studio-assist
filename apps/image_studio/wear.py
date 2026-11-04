@@ -13,6 +13,7 @@ swap's machinery (`headswap.head_graph`) aimed at an item: a crop of any
 shape, not a square, and no colour moved toward the crop's, which would
 move the item's colour toward the garment it replaces.
 """
+import math
 import re
 
 import apps.image_studio.headswap as headswap
@@ -130,28 +131,51 @@ def _union(boxes):
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+def _wearer(width, height, item, boxes):
+    """The detected wearer and face. An explicit scene target never falls
+    back to the largest person or to a face belonging to someone else."""
+    people = sorted([b[:4] for b in boxes if len(b) > 4 and b[4] == "person"],
+                    key=lambda b: -b[2] * b[3])
+    faces = [b[:4] for b in boxes if len(b) > 4 and b[4] == "face"]
+    if "target_region" in item:
+        normalized = [[x / float(width), y / float(height), (x + w) / float(width),
+                       (y + h) / float(height)] for x, y, w, h in faces]
+        try:
+            face = faces[headswap.facefusion.target_face(normalized, region=item["target_region"])]
+        except RuntimeError:
+            return None, None, people
+        candidates = [p for p in people if _inside(face, p, 0)]
+        # Overlapping person detections cannot establish who wears the item.
+        if len(candidates) != 1 and people:
+            return None, None, people
+        person = candidates[0] if candidates else None
+    else:
+        person = people[0] if people else None
+        faces = [f for f in faces if person is None or _inside(f, person, 0)]
+        face = max(faces, key=lambda b: b[2] * b[3]) if faces else None
+    if person is None and face is not None:
+        fx, fy, fw, fh = face
+        person = (fx - fw, fy - fh * 0.5, fw * 3, fh * 4)
+    return person, face, people
+
+
 def where(width, height, item, boxes):
     """Where `item` is worn in a picture, from SAM3's boxes on it ([(x, y, w,
-    h, word)], `find_words`): its noun's box on the main person (the biggest
-    person; both of a pair), else the part of them that wears it - a hat
+    h, word)], `find_words`): its noun's box on the scene's explicit wearer,
+    or the main person (the biggest, for the form; both of a pair), else the part of them that wears it - a hat
     above the face, a necklace below it, a shirt on the whole person. ->
     (x, y, w, h), or None when there is no one to put it on."""
     place, noun = place_of(item["name"])
 
     def said(word):
         return [b for b in boxes if len(b) > 4 and b[4] == word]
-    people = sorted(said("person"), key=lambda b: -b[2] * b[3])
-    person = people[0][:4] if people else None
-    faces = [b[:4] for b in said("face") if person is None or _inside(b, person, 0)]
-    face = max(faces, key=lambda b: b[2] * b[3]) if faces else None
+    person, face, people = _wearer(width, height, item, boxes)
     if person is None and face is None:
         return None
-    if person is None:                    # a close-up: the face is the person
-        fx, fy, fw, fh = face
-        person = (fx - fw, fy - fh * 0.5, fw * 3, fh * 4)
     # Someone else's: a box whose middle is in a smaller person's box. A
     # hat SAM3 found on a passer-by behind her is not hers (live, 2026-10-01).
-    others = [b[:4] for b in people[1:] if b[2] * b[3] < person[2] * person[3] * 0.5]
+    others = ([b for b in people if b != person] if "target_region" in item else
+              [b for b in people[1:] if b[2] * b[3] < person[2] * person[3] * 0.5])
     hits = [b[:4] for b in said(noun) if _inside(b, person)
             and not any(_inside(b, o, 0) for o in others)]
     near = None
@@ -172,11 +196,13 @@ def where(width, height, item, boxes):
     if near is not None:
         return near
     if place == "hand":
-        hands = [b[:4] for b in said("hand") if _inside(b, person)]
+        hands = [b[:4] for b in said("hand") if _inside(b, person)
+                 and not any(_inside(b, o, 0) for o in others)]
         if hands:
             return _union(sorted(hands, key=lambda b: -b[2] * b[3])[:2])
     if place == "feet":
-        feet = [b[:4] for b in said("foot") if _inside(b, person)]
+        feet = [b[:4] for b in said("foot") if _inside(b, person)
+                and not any(_inside(b, o, 0) for o in others)]
         if feet:
             return _union(sorted(feet, key=lambda b: -b[2] * b[3])[:2])
         return (px, py + ph * 0.82, pw, ph * 0.18)
@@ -219,8 +245,32 @@ def plan(width, height, items, boxes):
             missed.append(item["name"])
             continue
         place, noun = place_of(item["name"])
-        out.append(dict(item, noun=noun, place=place, crop=crop_for(width, height, box)))
+        own = dict(item, noun=noun, place=place, crop=crop_for(width, height, box))
+        if "target_region" in item:
+            person, _, people = _wearer(width, height, item, boxes)
+            own.update(bounds=person, exclude=[p for p in people if p != person])
+        out.append(own)
     return out, missed
+
+
+def _box_mask(g, name, box, crop, outward=False):
+    """A box clipped into crop-local pixels, for the final blend only.
+    Exclusions round outward; the wearer's bounds round inward."""
+    low, high = (math.floor, math.ceil) if outward else (math.ceil, math.floor)
+    x, y, w, h = box
+    cw, ch = crop["width"], crop["height"]
+    x0, y0 = max(0, low(x - crop["x"])), max(0, low(y - crop["y"]))
+    x1, y1 = min(cw, high(x + w - crop["x"])), min(ch, high(y + h - crop["y"]))
+    g[name + "0"] = {"class_type": "SolidMask", "inputs": {
+        "value": 0.0, "width": cw, "height": ch}}
+    if x0 >= x1 or y0 >= y1:
+        return [name + "0", 0]
+    g[name + "1"] = {"class_type": "SolidMask", "inputs": {
+        "value": 1.0, "width": x1 - x0, "height": y1 - y0}}
+    g[name + "2"] = {"class_type": "MaskComposite", "inputs": {
+        "destination": [name + "0", 0], "source": [name + "1", 0],
+        "x": x0, "y": y0, "operation": "or"}}
+    return [name + "2", 0]
 
 
 def item_graph(image, items, seed, prefix, sam3, size):
@@ -229,7 +279,9 @@ def item_graph(image, items, seed, prefix, sam3, size):
     drawn again by Klein at drawn_size with the item's picture beside it,
     shrunk back and blended in through SAM3's mask of the item's noun in the
     crop before and after, grown, inside a soft frame with no margin where
-    the crop ends at the picture's edge. Each is drawn on the picture the
+    the crop ends at the picture's edge. Targeted items bound the final mask
+    to their wearer's detected box and exclude other people after blurring.
+    Each is drawn on the picture the
     last left; item n is seeded seed+n. Saved under `prefix` by node "save"."""
     g = {
         "unet": {"class_type": "UNETLoader", "inputs": {
@@ -342,9 +394,23 @@ def item_graph(image, items, seed, prefix, sam3, size):
             blurred = [n + "b1", 0]
         g[n + "b2"] = {"class_type": "ImageToMask", "inputs": {
             "image": blurred, "channel": "red"}}
+        mask = [n + "b2", 0]
+        if item.get("bounds"):
+            allowed = _box_mask(g, n + "owner", item["bounds"], crop)
+            g[n + "owned"] = {"class_type": "MaskComposite", "inputs": {
+                "destination": mask, "source": allowed, "x": 0, "y": 0,
+                "operation": "multiply"}}
+            mask = [n + "owned", 0]
+            for j, box in enumerate(item.get("exclude") or []):
+                other = _box_mask(g, n + "other%d_" % j, box, crop, outward=True)
+                key = n + "exclude%d" % j
+                g[key] = {"class_type": "MaskComposite", "inputs": {
+                    "destination": mask, "source": other, "x": 0, "y": 0,
+                    "operation": "subtract"}}
+                mask = [key, 0]
         g[n + "put"] = {"class_type": "ImageCompositeMasked", "inputs": {
             "destination": last, "source": [n + "small", 0], "x": crop["x"], "y": crop["y"],
-            "resize_source": False, "mask": [n + "b2", 0]}}
+            "resize_source": False, "mask": mask}}
         last = [n + "put", 0]
     g["save"] = {"class_type": "SaveImage", "inputs": {"images": last,
                                                        "filename_prefix": prefix}}

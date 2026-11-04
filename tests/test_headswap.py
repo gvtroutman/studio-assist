@@ -25,7 +25,8 @@ class TestHeadSwapParts(unittest.TestCase):
 
     def test_a_klein_9b_lora_is_known_by_its_name_and_fits_only_the_9b(self):
         self.assertEqual(ig.guess_family("partner_klein-9b_head.safetensors"), hs.FAMILY)
-        self.assertEqual(ig.guess_family("flux-2-klein-4b-lora.safetensors"), "flux2")
+        self.assertEqual(ig.guess_family("flux-2-klein-4b-lora.safetensors"), "flux2-klein4b")
+        self.assertIs(ig.compatibility("flux2-klein4b", hs.FAMILY), False)
         self.assertIs(ig.compatibility("flux2", hs.FAMILY), False)
         self.assertIs(ig.compatibility(hs.FAMILY, hs.FAMILY), True)
 
