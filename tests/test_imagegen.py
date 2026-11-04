@@ -2967,6 +2967,22 @@ class TestLibrary(unittest.TestCase):
         self.assertTrue(kept.startswith(lib.root))
         self.assertEqual(kept, lib.keep_reference(src, "Sitter"))
 
+    def test_a_kept_picture_cut_short_is_never_left_under_its_name(self):
+        """keep_bytes wrote straight to the hash-named file and skipped it
+        when it was there, so a write cut short was the reference for good.
+        It goes in as a .part beside it and is moved into place whole."""
+        from unittest.mock import patch
+        lib = ig.Library(os.path.join(tempfile.mkdtemp(), "studio"))
+        folder = os.path.join(lib.root, "references", "sitter")
+        with patch.object(ig.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                lib.keep_bytes(PNG, ".png", "Sitter")
+        self.assertEqual(os.listdir(folder), [])        # no half file, no .part left
+        kept = lib.keep_bytes(PNG, ".png", "Sitter")
+        with open(kept, "rb") as f:
+            self.assertEqual(f.read(), PNG)
+        self.assertEqual(os.listdir(folder), [os.path.basename(kept)])
+
     def test_a_picture_from_a_link_is_kept_like_an_uploaded_one(self):
         """A link's picture becomes a file under references/, named by its
         bytes as an upload is, so the same picture by link or by file is one

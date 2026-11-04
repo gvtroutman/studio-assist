@@ -1350,13 +1350,24 @@ class Library:
 
     def keep_bytes(self, data, ext, owner):
         """A picture's bytes under references/<owner>, named by their hash, so
-        the same picture twice is one file. -> its path."""
+        the same picture twice is one file. -> its path. Written beside it
+        as .part and moved into place whole: a file there is only ever a
+        whole one, since one cut short would be reused for good."""
         folder = os.path.join(self.root, "references", slug(owner))
         os.makedirs(folder, exist_ok=True)
         dest = os.path.join(folder, hashlib.sha1(data).hexdigest()[:16] + ext)
         if not os.path.exists(dest):
-            with open(dest, "wb") as f:
-                f.write(data)
+            part = "%s.%s.part" % (dest, uuid.uuid4().hex[:8])
+            try:
+                with open(part, "wb") as f:
+                    f.write(data)
+                os.replace(part, dest)
+            except OSError:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+                raise
         return dest
 
     def keep_link(self, url, owner, opener=None):
@@ -3182,6 +3193,16 @@ def parts_found(entry, n, words=None, scores=False):
                   + ((_num(x.get("score"), float, 1.0),) if word and scores else ())
                   for x in b if max(x["width"], x["height"]) >= 12]
     return int(width), int(height), boxes
+
+
+def find_failed(entry, graph):
+    """Why a parts_graph run said nothing, when it ended in an error: the
+    failed node's error in words (`run_errors`), as `_run_quick` says it.
+    None when it ran to its end (or was cancelled) - it simply found
+    nothing to say."""
+    if ((entry or {}).get("status") or {}).get("status_str") != "error":
+        return None
+    return "; ".join(run_errors(entry, graph)) or "the run failed"
 
 
 def fix_prompt(fix, prompt, values=None):
@@ -7567,10 +7588,12 @@ class Studio:
                 image = self._upload_made(client, "finish", "%s_head_%d.png" % (job.id, n),
                                           data)
                 say(headswap.STATUS, "Finding the heads", None)
-                job.prompt_id = client.queue_workflow(parts_graph(image, sam, [headswap.FIND]))
+                finder = parts_graph(image, sam, [headswap.FIND])
+                job.prompt_id = client.queue_workflow(finder)
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
                                                    stop=job.cancel.is_set)
                 said = parts_found(entry or {}, 1)
+                failed = find_failed(entry, finder) if said is None else None
                 heads = []
                 if said is not None:
                     width, height, boxes = said
@@ -7599,8 +7622,10 @@ class Studio:
                                           **({"photo_crop": cut} if cut else {})))
                 if not heads:
                     if not job.cancel.is_set():
-                        job.notes.append("SAM3 found no face of a chosen person, so no head "
-                                         "swap was made before the face swap.")
+                        job.notes.append("%s, so no head swap was made before the face swap."
+                                         % ("SAM3 could not look for the heads (%s)" % failed
+                                            if failed else
+                                            "SAM3 found no face of a chosen person"))
                     out.append((filename, data))
                     continue
                 graph = headswap.head_graph(image, heads, int(values.get("seed") or 0),
@@ -8100,14 +8125,18 @@ class Studio:
                 say("eyes" if eyes else ("beard" if beards else ("smile" if smiles else (
                     "hands" if hands else "glasses"))),
                     "Finding the %s" % " and ".join(looking), None)
-                job.prompt_id = client.queue_workflow(parts_graph(image, sam, find))
+                finder = parts_graph(image, sam, find)
+                job.prompt_id = client.queue_workflow(finder)
                 entry = client.listen_for_progress(job.prompt_id, lambda kind, d: None,
                                                    stop=job.cancel.is_set)
                 said = parts_found(entry or {}, len(find), words, scores=True)
                 if said is None:
                     if not job.cancel.is_set():
-                        job.notes.append("SAM3 said nothing about the picture, so no %s was "
-                                         "made." % named)
+                        # A run that ended in an error says which node and why.
+                        failed = find_failed(entry, finder)
+                        job.notes.append("%s, so no %s was made." % (
+                            "SAM3 could not look at the picture (%s)" % failed if failed
+                            else "SAM3 said nothing about the picture", named))
                     out.append((filename, data))
                     continue
                 width, height, boxes = said

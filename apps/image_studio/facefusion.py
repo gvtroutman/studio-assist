@@ -11,6 +11,7 @@ import time
 import math
 import threading
 
+import core.doctor as doctor
 import core.procs as studio_procs
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -254,6 +255,17 @@ def failure(log):
     return ' '.join(lines[-3:])[-600:] or 'FaceFusion ended without saying why.'
 
 
+# How much of a failed swap's run.log goes to the error log. The log itself
+# goes with the swap's folder, and failure() keeps only the last error line,
+# so without this FaceFusion's traceback meant running the swap again.
+LOG_TAIL_LINES = 60
+
+
+def log_tail(log, lines=LOG_TAIL_LINES):
+    """The last `lines` lines of a worker's log, as one text."""
+    return '\n'.join(log.rstrip().splitlines()[-lines:])
+
+
 def _clear(folder, tries=30, wait=0.1):
     """Remove a swap's folder, the picture in it and all. On Windows a worker
     that was stopped lets go of its log a moment after it ends (what it
@@ -312,8 +324,12 @@ def _swap(data, identity, stop=None, face_index=None, face_count=1):
                 time.sleep(0.1)
             if child.proc.returncode or not output.is_file():
                 log.seek(0)
+                said = log.read()
+                doctor.log_error('FaceFusion swap for %s failed (exit code %s); the end of '
+                                 'its log:\n%s' % (identity['name'], child.proc.returncode,
+                                                   log_tail(said) or '(it wrote nothing)'))
                 raise RuntimeError('%s\'s face swap failed: %s' % (identity['name'],
-                                                                  failure(log.read())))
+                                                                  failure(said)))
             report = json.loads(output.with_suffix('.json').read_text(encoding='utf-8'))
             if report['outside_mask_changed_pixels'] != 0:
                 raise RuntimeError('The face swap changed pixels outside its mask.')

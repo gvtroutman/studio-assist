@@ -535,6 +535,29 @@ class TestHeadSwapInGenerate(TempStudioMixin, unittest.TestCase):
         self.assertEqual(head["h1_fit"]["inputs"]["image"], ["h1_photo", 0])
         self.assertEqual(swapped, [HEAD_PNG])
 
+    def test_a_head_finder_that_errors_says_its_error_not_no_face(self):
+        # A SAM3 run that ended in an error node was said as "found no face
+        # of a chosen person", and the node's own error was lost.
+        class FinderFails(KleinClient):
+            def listen_for_progress(self, pid, on_event, stop=None, timeout=0):
+                graph = self.graphs[int(pid[3:]) - 1]
+                if "p0d" in graph and "_head_0" in graph["1"]["inputs"]["image"]:
+                    return {"status": {"status_str": "error", "completed": False,
+                                       "messages": [["execution_error", {
+                                           "node_id": "p0d", "exception_type": "RuntimeError",
+                                           "exception_message": "SAM3 weights would not load"}]]},
+                            "outputs": {}}
+                return super().listen_for_progress(pid, on_event, stop, timeout)
+        job, client, swapped = self.generate(client=FinderFails)
+        self.assertEqual(job.status, "complete", job.detail)
+        self.assertEqual(self.heads(client), [])
+        self.assertEqual(swapped, [PNG])
+        notes = job.record["notes"]
+        self.assertIn("SAM3 could not look for the heads (ComfyUI failed at node p0d "
+                      "(SAM3_Detect): RuntimeError: SAM3 weights would not load), so no head "
+                      "swap was made before the face swap.", notes)
+        self.assertFalse(any("found no face of a chosen person" in n for n in notes), notes)
+
     def test_a_failed_head_swap_leaves_the_face_swap_the_generated_picture(self):
         KleinClient.fail_head = True
         job, client, swapped = self.generate()

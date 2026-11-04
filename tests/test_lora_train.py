@@ -372,19 +372,22 @@ class ButtonTests(unittest.TestCase):
             with mock.patch.object(lt, 'problem', return_value=None), \
                     mock.patch('apps.image_studio.ui.messagebox.askokcancel', return_value=True), \
                     mock.patch('apps.image_studio.ui.BuildView'), \
-                    mock.patch.object(lt.Build, 'run', side_effect=KeyError('surprise')):
+                    mock.patch.object(lt.Build, 'run', side_effect=KeyError('surprise')), \
+                    mock.patch('apps.image_studio.ui.doctor.log_error') as logged:
                 studio.build_lora(editor)
                 self.assertIsNotNone(studio.lora_build)
                 # Idea 575729b8a187: while it builds, no job is routed to its GPU.
                 self.assertIn("building Partner's LoRA", studio.studio.held['5090'])
-                with self.assertRaises(KeyError):
-                    spawned[0]()
+                spawned[0]()        # caught and logged, not raised into the tab's guard
+        self.assertIn('Traceback', logged.call_args[0][0])
+        self.assertIn('KeyError', logged.call_args[0][0])
         calls = [v for k, v in posted if k == 'call']
         self.assertEqual(len(calls), 1)
         calls[0]()
         self.assertIsNone(studio.lora_build)
         self.assertEqual(studio.studio.held, {})      # and the backend is let go
         self.assertIn('not built', studio.say.call_args[0][0])
+        self.assertIn("KeyError: 'surprise'", studio.say.call_args[0][0])
 
     def test_every_kind_of_progress_reaches_the_line_and_the_window(self):
         # `left` was both the photos left out and, in the step branch, the

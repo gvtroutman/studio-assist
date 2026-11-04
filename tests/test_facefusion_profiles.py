@@ -212,6 +212,14 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
         self.assertEqual(made[1:], ['stopped'])
         self.assertFalse(os.path.exists(made[0].folder))
 
+    def test_the_logged_tail_of_a_failed_swap_is_bounded(self):
+        log = ''.join('line %d\n' % n for n in range(500))
+        tail = ff.log_tail(log)
+        self.assertEqual(tail.splitlines(), ['line %d' % n for n in
+                                             range(500 - ff.LOG_TAIL_LINES, 500)])
+        self.assertEqual(ff.log_tail('only\n\n'), 'only')
+        self.assertEqual(ff.log_tail(''), '')
+
     def test_a_folder_still_held_is_tried_again_and_never_the_error(self):
         folder = os.path.join(self.dir, 'held')
         os.makedirs(folder)
@@ -231,12 +239,19 @@ class TestProfiles(TempStudioMixin, unittest.TestCase):
     def test_a_failed_swap_is_the_workers_error_and_a_finished_one_its_report(self):
         profile = self.profile()
         spawn, made = self.fake_child(code=1)
+        logged = []
         with patch.object(ff, 'available', return_value=True), \
-                patch.object(ff.studio_procs, 'spawn', side_effect=spawn):
+                patch.object(ff.studio_procs, 'spawn', side_effect=spawn), \
+                patch.object(ff.doctor, 'log_error', side_effect=logged.append):
             with self.assertRaisesRegex(RuntimeError, r"^Partner's face swap failed: No face "
                                                       r"was swapped; no verified output"):
                 ff.swap(PNG, profile)
         self.assertFalse(os.path.exists(made[0].folder))
+        # run.log went with the folder and only its last error line was
+        # kept; its tail goes to the error log first, traceback and all.
+        self.assertEqual(len(logged), 1)
+        self.assertIn("Partner failed (exit code 1)", logged[0])
+        self.assertIn('RuntimeError: No face was swapped', logged[0])
         report = {'outside_mask_changed_pixels': 0, 'masks': list(ff.SWAP_MASKS),
                   'sources': 'kept', 'target': 'x', 'output': 'y'}
         spawn, made = self.fake_child(code=0, write={

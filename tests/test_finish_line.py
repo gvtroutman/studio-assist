@@ -214,11 +214,12 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertNotIn('finish', listed[0])
 
     def finish_job(self, glasses, hands=(), profile=True, tone=False, masks=None,
-                   enhance=None, drawn=None, **settings):
+                   enhance=None, drawn=None, finder=None, **settings):
         """Generate (with a face profile, unless `profile` is False) on a
         ComfyUI with SAM3, whose finder at the end sees one face, `glasses`
         and `hands` [(x, y, w, h)] or, with SAM3's score, [(x, y, w, h,
-        score)]; `tone`, it has the tone-match node. `masks` is what the
+        score)] - or answers with `finder`, a /history entry, when one is
+        given; `tone`, it has the tone-match node. `masks` is what the
         face swap's report says its masks were (none said, before them),
         `enhance` the face enhancer it says ran after it. `drawn`: it has
         the landmark node, which reads these faces."""
@@ -236,8 +237,10 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
                 if "ll" in graph:             # the drawn face's landmarks
                     return {"status": {"completed": True},
                             "outputs": {"ll": {"text": [json.dumps(drawn)]}}}
+                if "p0d" in graph and finder is not None:
+                    return finder
                 if "p0d" in graph:            # the finder at the end
-                    said = {"face:8": [(450, 250, 80, 90)], "glasses:4": glasses,
+                    said ={"face:8": [(450, 250, 80, 90)], "glasses:4": glasses,
                             "hand:8": hands}
                     outputs = {"7": {"text": ["1024"]}, "8": {"text": ["1024"]}}
                     for k in (k for k in graph if k.endswith("t") and k.startswith("p")):
@@ -448,6 +451,22 @@ class TestFinishRecovery(TempStudioMixin, unittest.TestCase):
         self.assertFalse(any(n.startswith("Eye pass after the face swap") for n in notes), notes)
         self.assertTrue(any(n.endswith("pass after the face swap failed (boom); the picture "
                                        "is kept as it was before it.") for n in notes), notes)
+        self.assertEqual(job.record["passes"], [])
+
+    def test_a_finder_that_errors_says_its_error_not_that_sam3_said_nothing(self):
+        # A SAM3 run that ended in an error node was said as "SAM3 said
+        # nothing about the picture", and the node's own error was lost.
+        errored = {"status": {"status_str": "error", "completed": False, "messages": [
+            ["execution_error", {"node_id": "p0d", "exception_type": "RuntimeError",
+                                 "exception_message": "SAM3 weights would not load"}]]},
+            "outputs": {}}
+        job, client, _ = self.finish_job([], hands=[(200, 600, 70, 80)], finder=errored)
+        self.assertEqual(job.status, 'complete', job.detail)
+        notes = job.record["notes"]
+        self.assertTrue(any(n.startswith(
+            "SAM3 could not look at the picture (ComfyUI failed at node p0d (SAM3_Detect): "
+            "RuntimeError: SAM3 weights would not load), so no ") for n in notes), notes)
+        self.assertFalse(any("SAM3 said nothing" in n for n in notes), notes)
         self.assertEqual(job.record["passes"], [])
 
     def test_an_unexpected_error_in_a_pass_still_saves_the_picture(self):

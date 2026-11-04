@@ -3629,6 +3629,12 @@ class ImageStudio:
                 path, error = run.run(progress), None
             except (RuntimeError, OSError) as e:
                 error = str(e)
+            except Exception as e:
+                # Named in the window and logged here (as a NewPhotos round),
+                # not re-raised into the tab's guard, which would also post
+                # an error and an idle into the tab's transcript.
+                error = "%s: %s" % (type(e).__name__, e)
+                doctor.log_error("Image Studio Build LoRA:\n%s" % traceback.format_exc())
             finally:
                 # Always: a build that died any other way must not leave
                 # `lora_build` set, or Build LoRA offers to stop it until a restart.
